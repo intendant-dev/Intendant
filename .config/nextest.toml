@@ -42,22 +42,18 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 # The mTLS pairing e2e provisions a real access cert store (3× RSA-2048
 # keygen) and boots a TLS daemon before its first assertion — seconds of
 # setup before any poll starts, more under load.
+#
+# (The routes_sessions/dashboard_control home-scan lanes that used to sit
+# below are gone: their fixtures now inject tempdir session stores instead
+# of walking the real ~/.intendant — tests-are-hermetic convention.)
 [[profile.default.overrides]]
 filter = 'test(/ctl_peer_mtls_pairing/)'
 slow-timeout = { period = "120s", terminate-after = 3 }
 
-# These handlers walk the real ~/.intendant/logs via dirs::home_dir()
-# (routes_sessions.rs agent-output / managed-context scans; the S4a
-# golden transcripts and tunnel/HTTP parity fixtures pin missing-session
-# 404s and fallback sweeps through the same live store); on a box whose
-# log tree has grown to tens of GB their ~12s baseline breaches the
-# default terminator under suite parallelism while passing in isolation.
-# Headroom until that home scan is cfg(test)-gated like listener.rs's
-# session-index warm scan.
+# rustc-governor acceptance tests spawn the real governor binary plus
+# /bin/sh fixtures and hand flock permits between processes with
+# deliberately generous deadlines; pure fork/exec + scheduling headroom on
+# a saturated box (same class as the worktree_inventory override above).
 [[profile.default.overrides]]
-filter = 'test(/^web_gateway::routes_sessions::tests::(agent_output_post_response_reads_json_ids|managed_context_anchors_response_reads_trace_anchors_by_backend_session|managed_context_records_response_|golden_session)/)'
-slow-timeout = { period = "60s", terminate-after = 4 }
-
-[[profile.default.overrides]]
-filter = 'test(/^dashboard_control::api_sessions::tests::parity_/)'
+filter = 'package(rustc-governor)'
 slow-timeout = { period = "60s", terminate-after = 4 }

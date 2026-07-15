@@ -421,7 +421,8 @@ function ui2SettingsBuild() {
     if (keys) panes.providers.appendChild(keys);
 
     // External agent → "Managed backend" with a segmented proxy over the
-    // existing select + an Advanced fold for binaries and tier.
+    // existing select, daemon-wide model defaults for both backends, and an
+    // Advanced fold for binaries and tier.
     const ext = cardOf('settings-external-agent-heading');
     if (ext) {
       panes.providers.appendChild(ext);
@@ -438,7 +439,7 @@ function ui2SettingsBuild() {
         'set-codex-command', 'set-codex-managed-command', 'set-claude-command', 'set-codex-service-tier',
       ]);
       const link = ui2SettingsEl('p', 'settings-note ui2-crosslink');
-      link.innerHTML = 'Live backend controls — sandbox, approval policy, model override, thread actions — stay in <a href="#activity/control">Activity → Control</a>.';
+      link.innerHTML = 'Advanced live controls — sandbox, approval policy, allowed tools, and thread actions — are in <a href="#activity/control">Activity → Control</a>.';
       ext.appendChild(link);
     }
 
@@ -538,6 +539,63 @@ function ui2SettingsBuild() {
       'Same token names, remapped — iris deepens, semantics darken, shadows soften.',
     ));
     panes.appearance.appendChild(card);
+
+    // Terminal appearance: browser-local like the theme. CONTRACT with the
+    // terminal owner (44-shell-frames.js): it reads these localStorage keys
+    // at terminal init and listens for the same-tab
+    // CustomEvent('intendant-term-appearance') dispatched after each write.
+    const term = ui2SettingsEl('section', 'ui-card ui2-term-appearance-card');
+    const thead = ui2SettingsEl('div', 'ui-section-head');
+    thead.appendChild(ui2SettingsEl('h3', 'ui-section-title', 'Terminal'));
+    thead.appendChild(ui2SettingsEl(
+      'div', 'ui-section-sub',
+      'Applies to this browser’s terminal views. An already-open terminal picks the change up live.',
+    ));
+    term.appendChild(thead);
+    const mkTermRow = (labelText, spec) => {
+      const row = ui2SettingsEl('div', 'settings-row');
+      row.appendChild(ui2SettingsEl('label', null, labelText));
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min = String(spec.min);
+      input.max = String(spec.max);
+      input.step = String(spec.step);
+      input.id = spec.inputId;
+      let stored = null;
+      try { stored = localStorage.getItem(spec.key); } catch (_) {}
+      const parsed = Number(stored);
+      input.value = String(Number.isFinite(parsed) && stored !== null && stored !== ''
+        ? Math.min(spec.max, Math.max(spec.min, Math.round(parsed)))
+        : spec.fallback);
+      input.addEventListener('change', () => {
+        const raw = Number(input.value);
+        const value = Number.isFinite(raw)
+          ? Math.min(spec.max, Math.max(spec.min, Math.round(raw)))
+          : spec.fallback;
+        input.value = String(value);
+        try { localStorage.setItem(spec.key, String(value)); } catch (_) {}
+        window.dispatchEvent(new CustomEvent('intendant-term-appearance', {
+          detail: { key: spec.key, value },
+        }));
+      });
+      row.appendChild(input);
+      return row;
+    };
+    term.appendChild(mkTermRow('Terminal font size', {
+      key: 'intendant.ui2.termFontSize',
+      inputId: 'ui2-set-term-font-size',
+      min: 8, max: 24, step: 1, fallback: 13,
+    }));
+    term.appendChild(mkTermRow('Terminal scrollback', {
+      key: 'intendant.ui2.termScrollback',
+      inputId: 'ui2-set-term-scrollback',
+      min: 1000, max: 100000, step: 500, fallback: 5000,
+    }));
+    term.appendChild(ui2SettingsEl(
+      'p', 'settings-note',
+      'Font size 8–24 px; scrollback 1,000–100,000 lines. Stored in this browser only.',
+    ));
+    panes.appearance.appendChild(term);
   }
 
   // ── Account & advanced (the old Debug pane, re-homed) ──

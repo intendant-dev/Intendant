@@ -350,6 +350,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         backendSupervisor.startBackend()
         createWindow()
         backendSupervisor.pollUntilReady()
+        checkForUpdatesQuietly()
     }
 
     /// The app historically had no menu bar because closing the window
@@ -362,6 +363,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
         appItem.submenu = appMenu
+        // Standard about panel — shows the CFBundleShortVersionString stamped
+        // by scripts/bundle-macos.sh (the release tag, or a git-describe dev
+        // version), which is how a user answers "what version am I running?".
+        appMenu.addItem(
+            withTitle: "About Intendant",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+            keyEquivalent: ""
+        )
+        let updateItem = appMenu.addItem(
+            withTitle: "Check for Updates…",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = self
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(
             withTitle: "Quit Intendant (stops the daemon)",
             action: #selector(NSApplication.terminate(_:)),
@@ -593,6 +609,101 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         backendSupervisor?.shutdown()
     }
 
+    // MARK: - Update check
+
+    /// Launch-time check: strictly non-intrusive. Dev builds skip it, every
+    /// failure mode (offline, rate limit, no releases yet) is silent, and a
+    /// newer release surfaces as a window sheet — never an app-modal alert.
+    func checkForUpdatesQuietly() {
+        let local = UpdateChecker.bundledVersion()
+        guard !UpdateChecker.isDevBuild(local) else { return }
+        UpdateChecker.fetchLatestRelease { [weak self] release in
+            guard let self = self,
+                  let release = release,
+                  UpdateChecker.isNewer(remote: release.tag, than: local) else { return }
+            // Advisory transparency-log check on the release being
+            // offered — fail-open: every outcome still shows the prompt,
+            // annotated with logged / not logged / couldn't check.
+            UpdateChecker.fetchReleaseLogStatus(tag: release.tag) { [weak self] status in
+                self?.presentUpdatePrompt(release: release, logStatus: status, interactive: false)
+            }
+        }
+    }
+
+    /// "Check for Updates…" menu item. An explicit request deserves explicit
+    /// answers, so unlike the launch check this also reports "no update" and
+    /// "couldn't check".
+    @objc func checkForUpdates(_ sender: Any?) {
+        UpdateChecker.fetchLatestRelease { [weak self] release in
+            guard let self = self else { return }
+            guard let release = release else {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't check for updates"
+                alert.informativeText =
+                    "GitHub releases could not be reached (offline, rate-limited, or nothing published yet)."
+                alert.addButton(withTitle: "OK")
+                alert.addButton(withTitle: "Open Releases Page")
+                if alert.runModal() == .alertSecondButtonReturn {
+                    NSWorkspace.shared.open(UpdateChecker.releasesPageURL)
+                }
+                return
+            }
+            let local = UpdateChecker.bundledVersion()
+            // The explicit check also reports the transparency-log
+            // advisory for the latest release, whichever branch answers.
+            UpdateChecker.fetchReleaseLogStatus(tag: release.tag) { [weak self] status in
+                guard let self = self else { return }
+                if UpdateChecker.isNewer(remote: release.tag, than: local) {
+                    self.presentUpdatePrompt(release: release, logStatus: status, interactive: true)
+                } else {
+                    let alert = NSAlert()
+                    alert.messageText = "No update available"
+                    alert.informativeText =
+                        "This app is version \(local). The latest published release is \(release.tag).\n\n"
+                        + UpdateChecker.advisoryLine(for: status, tag: release.tag)
+                    alert.addButton(withTitle: "OK")
+                    alert.runModal()
+                }
+            }
+        }
+    }
+
+    /// The prompt never downloads anything: "View Release" opens the GitHub
+    /// release page in the default browser and the user takes it from there.
+    /// `logStatus` rides along as an advisory line — whether the offered
+    /// release is committed to the public transparency log (never gates
+    /// the prompt; docs/src/self-hosted-rendezvous.md, "Release
+    /// transparency").
+    func presentUpdatePrompt(
+        release: UpdateChecker.Release,
+        logStatus: UpdateChecker.ReleaseLogStatus,
+        interactive: Bool
+    ) {
+        let alert = NSAlert()
+        alert.messageText = "Intendant \(release.tag) is available"
+        alert.informativeText =
+            "This app is version \(UpdateChecker.bundledVersion()). "
+            + "Updating is manual: View Release opens the GitHub release page in your browser — "
+            + "nothing is downloaded or installed automatically.\n\n"
+            + UpdateChecker.advisoryLine(for: logStatus, tag: release.tag)
+        alert.addButton(withTitle: "View Release")
+        alert.addButton(withTitle: "Not Now")
+        let handle: (NSApplication.ModalResponse) -> Void = { response in
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(release.pageURL)
+            }
+        }
+        if !interactive, let window = window {
+            // Sheet on the (placeholder) window: visible next time the user
+            // looks, steals no focus from other apps.
+            alert.beginSheetModal(for: window, completionHandler: handle)
+        } else if interactive {
+            handle(alert.runModal())
+        }
+        // Launch check with no window (closed before the response arrived):
+        // stay silent; the menu item remains available.
+    }
+
     // MARK: - WKUIDelegate (JS alert/confirm/prompt)
 
     func webView(_ webView: WKWebView,
@@ -798,7 +909,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         webView = WKWebView(frame: .zero, configuration: config)
         webView.uiDelegate = self
         webView.navigationDelegate = self
-        webView.customUserAgent = "Intendant/1.0"
+        webView.customUserAgent = "Intendant/\(UpdateChecker.bundledVersion())"
 
         // Starting in macOS 13.3, the legacy `developerExtrasEnabled` KVC
         // trick above is a no-op for release-signed builds; Safari's Web

@@ -669,6 +669,12 @@ pub(crate) async fn run_external_agent_mode(
                         }
                     }
                     bus_event = external_control_rx.recv() => {
+                        // No native-id normalization here: every drain exit
+                        // `take()`s `stats.announced_native_session_id` (and
+                        // rotates a canonical id into `live_session_id`), so
+                        // by the time this idle select runs the announced id
+                        // is always `None` — post-upgrade targets already
+                        // match via the rotated `live_session_id`/alias.
                         match bus_event {
                             Ok(AppEvent::SessionStopRequested { session_id, reason })
                                 if event_targets_external_session_or_side(
@@ -724,13 +730,17 @@ pub(crate) async fn run_external_agent_mode(
                                     &reason,
                                 );
                                 if cancelled_queue + cancelled_pending == 0 {
-                                    if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                        bus.send(AppEvent::SteerCancelled {
-                                            session_id: target_session_id.or_else(|| live_session_id.clone()),
-                                            id,
-                                            reason,
-                                        });
-                                    }
+                                    // Nothing left to cancel: the steer
+                                    // already delivered or converted to a
+                                    // follow-up — never fabricate
+                                    // `SteerCancelled` (the turn drain's
+                                    // handler documents why).
+                                    emit_steer_cancel_failed_for_unmatched(
+                                        &bus,
+                                        target_session_id.or_else(|| live_session_id.clone()),
+                                        id,
+                                        STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+                                    );
                                 }
                                 continue;
                             }

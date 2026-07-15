@@ -859,7 +859,27 @@ pub struct MaterializedOrgPeerGrant {
 /// fail-closed cap (empty `max_peer_profile` refuses everything),
 /// idempotent-quiet re-presentation, and no resurrection of locally
 /// revoked identities. The audit trail lives in the IAM state.
+#[cfg(test)]
 pub fn materialize_org_peer_grant(
+    state: &mut LocalIamState,
+    cert_dir: &Path,
+    doc: &OrgGrantDocument,
+    daemon_ids: &[String],
+    now_unix_ms: u64,
+) -> AccessResult<MaterializedOrgPeerGrant> {
+    let outcome = plan_org_peer_grant(state, cert_dir, doc, daemon_ids, now_unix_ms)?;
+    if outcome.changed {
+        crate::access::access_policy::write_identity_record(cert_dir, &outcome.record)
+            .map_err(|error| AccessError(error.to_string()))?;
+    }
+    Ok(outcome)
+}
+
+/// Verify and stage a peer grant without enabling the peer identity. The
+/// persisted entry point commits the IAM audit first, then writes this record:
+/// a crash or write failure can therefore leave inert audit history, never an
+/// approved peer whose authorizing IAM transaction failed.
+fn plan_org_peer_grant(
     state: &mut LocalIamState,
     cert_dir: &Path,
     doc: &OrgGrantDocument,
@@ -947,8 +967,6 @@ pub fn materialize_org_peer_grant(
             .first()
             .map(|cert| cert.issuer_key.trim().to_string()),
     };
-    pol::write_identity_record(cert_dir, &record).map_err(|e| AccessError(e.to_string()))?;
-
     state.audit_events.push(IamAuditEvent {
         id: format!("audit:{now_unix_ms}:{}", state.audit_events.len() + 1),
         at_unix_ms: Some(now_unix_ms),
@@ -974,7 +992,7 @@ pub fn materialize_org_peer_grant(
 #[serde(untagged)]
 pub enum PresentedOrgGrant {
     Human(Box<MaterializedOrgGrant>),
-    Peer(MaterializedOrgPeerGrant),
+    Peer(Box<MaterializedOrgPeerGrant>),
 }
 
 impl PresentedOrgGrant {
@@ -1018,7 +1036,11 @@ pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
     push(&mut ids, &host_label);
     push(
         &mut ids,
-        intendant_core::peer_id::PeerId::new(intendant_core::peer_id::PeerKind::Intendant, &host_label).as_str(),
+        intendant_core::peer_id::PeerId::new(
+            intendant_core::peer_id::PeerKind::Intendant,
+            &host_label,
+        )
+        .as_str(),
     );
     ids
 }
@@ -1027,9 +1049,10 @@ pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
 /// can make a daemon parse. Matches the public endpoint's body cap.
 pub const MAX_ORG_GRANT_DOC_BYTES: usize = 16 * 1024;
 
-/// Parse and materialize a raw document value against the given state.
-/// The IO-free core of [`present_org_grant_value`], shared so tests and
-/// the offer ride-along paths exercise the same semantics.
+/// Parse and materialize a raw document value against the given state. This
+/// test-only convenience commits a staged peer record immediately; production
+/// uses [`present_org_grant_value`] so IAM-first grant ordering is mandatory.
+#[cfg(test)]
 pub fn present_org_grant_state(
     state: &mut LocalIamState,
     cert_dir: &Path,
@@ -1037,6 +1060,28 @@ pub fn present_org_grant_state(
     extra_daemon_ids: &[String],
     now_unix_ms: u64,
 ) -> Result<PresentedOrgGrant, String> {
+    let (outcome, pending_peer) =
+        present_org_grant_plan(state, cert_dir, doc_value, extra_daemon_ids, now_unix_ms)?;
+    if let Some(record) = pending_peer {
+        crate::access::access_policy::write_identity_record(cert_dir, &record)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(outcome)
+}
+
+fn present_org_grant_plan(
+    state: &mut LocalIamState,
+    cert_dir: &Path,
+    doc_value: &serde_json::Value,
+    extra_daemon_ids: &[String],
+    now_unix_ms: u64,
+) -> Result<
+    (
+        PresentedOrgGrant,
+        Option<crate::access::access_policy::PeerIdentityRecord>,
+    ),
+    String,
+> {
     if serde_json::to_string(doc_value)
         .map(|s| s.len())
         .unwrap_or(usize::MAX)
@@ -1048,22 +1093,28 @@ pub fn present_org_grant_state(
         .map_err(|e| format!("invalid org grant document: {e}"))?;
     let daemon_ids = org_target_daemon_ids(extra_daemon_ids);
     if doc.subject.is_peer() {
-        materialize_org_peer_grant(state, cert_dir, &doc, &daemon_ids, now_unix_ms)
-            .map(PresentedOrgGrant::Peer)
-            .map_err(|e| e.to_string())
+        let outcome = plan_org_peer_grant(state, cert_dir, &doc, &daemon_ids, now_unix_ms)
+            .map_err(|e| e.to_string())?;
+        let pending = outcome.changed.then(|| outcome.record.clone());
+        Ok((PresentedOrgGrant::Peer(Box::new(outcome)), pending))
     } else {
         materialize_org_grant(state, &doc, &daemon_ids, now_unix_ms)
-            .map(|outcome| PresentedOrgGrant::Human(Box::new(outcome)))
+            .map(|outcome| (PresentedOrgGrant::Human(Box::new(outcome)), None))
             .map_err(|e| e.to_string())
     }
 }
 
 /// Present a raw org-grant document against this daemon's IAM state on
-/// disk: rate-limit, parse, verify, materialize, persist. Shared by the
-/// public presentation endpoint and the offer ride-along paths — the
-/// document is the authorization on all of them, and a failure changes
-/// nothing.
+/// disk: rate-limit, parse, verify, materialize, persist. The public caller is
+/// only a courier: this call neither authenticates it nor creates a control
+/// session. The signed document authorizes only subject-bound verification and
+/// materialization under this daemon's locally pinned org key and cap. A peer
+/// subject must later authenticate over peer mTLS; a browser-key subject is
+/// record-only until a real browser-key ingress exists. A peer grant commits its inert IAM audit before the
+/// identity record, so a partial failure can leave audit history but never
+/// usable peer authority whose IAM commit failed.
 pub fn present_org_grant_value(
+    cert_dir: &std::path::Path,
     doc_value: &serde_json::Value,
     extra_daemon_ids: &[String],
     now_unix_ms: u64,
@@ -1071,21 +1122,22 @@ pub fn present_org_grant_value(
     if !presentation_rate_ok(now_unix_ms) {
         return Err("too many org grant presentations; retry shortly".to_string());
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let outcome = present_org_grant_state(
-        &mut state,
-        &cert_dir,
-        doc_value,
-        extra_daemon_ids,
-        now_unix_ms,
-    )?;
-    if outcome.changed() {
-        crate::access::iam::save_state(&cert_dir, &state)
-            .map_err(|e| format!("save local IAM state: {e}"))?;
-    }
-    Ok(outcome)
+    crate::access::iam::transact_state(cert_dir, |state, transaction| {
+        let (outcome, pending_peer) =
+            present_org_grant_plan(state, cert_dir, doc_value, extra_daemon_ids, now_unix_ms)
+                .map_err(AccessError)?;
+        if let Some(record) = pending_peer {
+            // Grant ordering is deliberately IAM first, authority second.
+            transaction.persist_now(state)?;
+            crate::access::access_policy::write_identity_record(cert_dir, &record)
+                .map_err(|error| AccessError(error.to_string()))?;
+            Ok((outcome, false))
+        } else {
+            let changed = outcome.changed();
+            Ok((outcome, changed))
+        }
+    })
+    .map_err(|error| format!("update local authority state: {error}"))
 }
 
 /// ── Org revocation lists (phase 6 step 5) ──
@@ -1093,7 +1145,9 @@ pub fn present_org_grant_value(
 /// The root signs a cumulative list of revoked document grant ids and
 /// subject fingerprints. The org daemon maintains it next to the root
 /// key; anyone may carry it to a consuming daemon, whose signature check
-/// plus monotonic `seq` make the courier irrelevant. Applying it revokes
+/// plus monotonic `seq` make the courier irrelevant. The public apply door
+/// authenticates no caller and grants no session authority; it accepts only
+/// the signed revocation facts. Applying them revokes
 /// matching materialized grants AND persists the lists on the trusted-org
 /// entry so future materialization/renewal of listed entries is refused.
 pub const ORG_ORL_PROTOCOL: &str = "intendant-org-orl-v1";
@@ -1208,6 +1262,30 @@ pub fn orl_revoke(
     issuer_keys: &[String],
     now_unix_ms: u64,
 ) -> Result<OrgRevocationList, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        orl_revoke_locked(
+            identity,
+            cert_dir,
+            handle,
+            grant_ids,
+            subjects,
+            issuer_keys,
+            now_unix_ms,
+        )
+        .map_err(AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn orl_revoke_locked(
+    identity: &DaemonIdentity,
+    cert_dir: &Path,
+    handle: &str,
+    grant_ids: &[String],
+    subjects: &[String],
+    issuer_keys: &[String],
+    now_unix_ms: u64,
+) -> Result<OrgRevocationList, String> {
     let mut orl = load_or_init_orl(identity, cert_dir, handle, now_unix_ms)?;
     let mut added = false;
     for id in grant_ids {
@@ -1266,8 +1344,11 @@ pub fn orl_revoke(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    std::fs::write(&path, format!("{serialized}\n"))
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    crate::access::authority_store::atomic_write_private_locked(
+        &path,
+        format!("{serialized}\n").as_bytes(),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(orl)
 }
 
@@ -1652,22 +1733,33 @@ pub fn revoke_org(
         grant.revoked_at_unix_ms = Some(now_unix_ms);
         revoked += 1;
     }
-    // Peer identities this org materialized go with it.
-    if let Ok(identities) = crate::access::access_policy::list_identities(cert_dir) {
-        let now_unix = (now_unix_ms / 1000) as i64;
-        for mut record in identities {
-            if record.source.as_deref() == Some(&source as &str)
-                && matches!(
-                    record.status,
-                    crate::access::access_policy::PeerIdentityStatus::Approved
-                )
-            {
-                record.status = crate::access::access_policy::PeerIdentityStatus::Revoked;
-                record.revoked_at_unix = Some(now_unix);
-                if crate::access::access_policy::write_identity_record(cert_dir, &record).is_ok() {
-                    revoked += 1;
-                }
-            }
+    // Peer identities this org materialized go with it. Revocations commit
+    // before the IAM snapshot: a partial failure is fail-closed and leaves the
+    // org revocation retryable instead of silently preserving peer authority.
+    let identities = crate::access::access_policy::list_identities(cert_dir).map_err(|error| {
+        AccessError(format!(
+            "cannot revoke org {handle}: peer identity store unreadable: {error}"
+        ))
+    })?;
+    let now_unix = (now_unix_ms / 1000) as i64;
+    for mut record in identities {
+        if record.source.as_deref() == Some(&source as &str)
+            && matches!(
+                record.status,
+                crate::access::access_policy::PeerIdentityStatus::Approved
+            )
+        {
+            record.status = crate::access::access_policy::PeerIdentityStatus::Revoked;
+            record.revoked_at_unix = Some(now_unix);
+            crate::access::access_policy::write_identity_record(cert_dir, &record).map_err(
+                |error| {
+                    AccessError(format!(
+                        "cannot revoke org {handle}: revoke peer {}: {error}",
+                        record.fingerprint
+                    ))
+                },
+            )?;
+            revoked += 1;
         }
     }
     state.audit_events.push(IamAuditEvent {
@@ -2542,20 +2634,17 @@ mod tests {
         )
         .unwrap();
 
-        // Make the identity record unwritable (the file, not the directory —
-        // truncating an existing file never consults directory permissions):
-        // the apply must fail loudly and must NOT advance the org's
-        // revocation sequence, so a later re-apply still performs the sweep.
-        let record_path = dir
-            .path()
-            .join("peer-access-identities")
-            .join("aabbccdd.json");
-        let writable = std::fs::metadata(&record_path).unwrap().permissions();
+        // Atomic record replacement creates a unique temporary alongside the
+        // identity, so make the directory unwritable. The apply must fail
+        // loudly and must NOT advance the org's revocation sequence, so a
+        // later re-apply still performs the sweep.
+        let identity_dir = dir.path().join("peer-access-identities");
+        let writable = std::fs::metadata(&identity_dir).unwrap().permissions();
         let mut readonly = writable.clone();
-        readonly.set_mode(0o444);
-        std::fs::set_permissions(&record_path, readonly).unwrap();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&identity_dir, readonly).unwrap();
         let err = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap_err();
-        std::fs::set_permissions(&record_path, writable).unwrap();
+        std::fs::set_permissions(&identity_dir, writable).unwrap();
         assert!(err.to_string().contains("NOT recorded"), "{err}");
         assert_eq!(state.trusted_orgs[0].last_orl_seq, 0);
 
@@ -2599,5 +2688,204 @@ mod tests {
         let err =
             materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap_err();
         assert!(err.to_string().contains("does not trust org acme"));
+    }
+
+    #[test]
+    fn concurrent_orl_apply_blocks_stale_grant_presentation() {
+        use std::sync::mpsc;
+
+        let (directory, identity) = org_identity_with_dir();
+        let mut initial = LocalIamState::default();
+        trust_org(
+            &mut initial,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            None,
+            test_now(),
+        )
+        .unwrap();
+        let document = issue(&identity, &initial, "role:session-reader");
+        crate::access::iam::save_state(directory.path(), &initial).unwrap();
+        let orl = orl_revoke(
+            &identity,
+            directory.path(),
+            "acme",
+            &[document.grant_id.clone()],
+            &[],
+            &[],
+            test_now(),
+        )
+        .unwrap();
+
+        let (apply_has_lock_tx, apply_has_lock_rx) = mpsc::channel();
+        let (release_apply_tx, release_apply_rx) = mpsc::channel();
+        let apply_dir = directory.path().to_path_buf();
+        let apply_thread = std::thread::spawn(move || {
+            crate::access::iam::transact_state(&apply_dir, |state, _transaction| {
+                apply_has_lock_tx.send(()).unwrap();
+                release_apply_rx.recv().unwrap();
+                let applied = apply_orl(state, &apply_dir, &orl, test_now())?;
+                let changed = applied.changed;
+                Ok((applied, changed))
+            })
+        });
+        apply_has_lock_rx.recv().unwrap();
+
+        let (presentation_started_tx, presentation_started_rx) = mpsc::channel();
+        let presentation_dir = directory.path().to_path_buf();
+        let document_value = serde_json::to_value(&document).unwrap();
+        let presentation_thread = std::thread::spawn(move || {
+            presentation_started_tx.send(()).unwrap();
+            present_org_grant_value(&presentation_dir, &document_value, &[], test_now())
+        });
+        presentation_started_rx.recv().unwrap();
+        release_apply_tx.send(()).unwrap();
+
+        let applied = apply_thread.join().unwrap().unwrap();
+        assert!(applied.changed);
+        let presentation_error = presentation_thread.join().unwrap().unwrap_err();
+        assert!(
+            presentation_error.contains("revoked"),
+            "{presentation_error}"
+        );
+
+        let persisted = crate::access::iam::load_state(directory.path()).unwrap();
+        let trusted = persisted
+            .trusted_orgs
+            .iter()
+            .find(|org| org.handle == "acme")
+            .unwrap();
+        assert_eq!(trusted.last_orl_seq, applied.seq);
+        assert!(persisted.grants.iter().all(|grant| {
+            grant.id != format!("grant:org:acme:{}", document.grant_id) || grant.status == "revoked"
+        }));
+    }
+
+    #[test]
+    fn concurrent_local_peer_revoke_blocks_org_re_presentation() {
+        use std::sync::mpsc;
+
+        let (directory, identity) = org_identity_with_dir();
+        let mut initial = LocalIamState::default();
+        trust_org(
+            &mut initial,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            Some("session-reader"),
+            test_now(),
+        )
+        .unwrap();
+        let fingerprint = "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+        let document = issue_org_grant(
+            &identity,
+            &initial,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "",
+                peer_fingerprint: fingerprint,
+                subject_label: "Build daemon",
+                role_id: "peer:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        crate::access::iam::save_state(directory.path(), &initial).unwrap();
+        let document_value = serde_json::to_value(&document).unwrap();
+        present_org_grant_value(directory.path(), &document_value, &[], test_now()).unwrap();
+
+        let (revoke_has_lock_tx, revoke_has_lock_rx) = mpsc::channel();
+        let (release_revoke_tx, release_revoke_rx) = mpsc::channel();
+        let revoke_dir = directory.path().to_path_buf();
+        let revoke_thread = std::thread::spawn(move || {
+            crate::access::authority_store::with_lock(&revoke_dir, || {
+                revoke_has_lock_tx.send(()).unwrap();
+                release_revoke_rx.recv().unwrap();
+                crate::access::access_policy::revoke_identity(&revoke_dir, fingerprint)
+                    .map(|_| ())
+                    .map_err(|error| AccessError(error.to_string()))
+            })
+        });
+        revoke_has_lock_rx.recv().unwrap();
+
+        let (presentation_started_tx, presentation_started_rx) = mpsc::channel();
+        let presentation_dir = directory.path().to_path_buf();
+        let presentation_thread = std::thread::spawn(move || {
+            presentation_started_tx.send(()).unwrap();
+            present_org_grant_value(&presentation_dir, &document_value, &[], test_now())
+        });
+        presentation_started_rx.recv().unwrap();
+        release_revoke_tx.send(()).unwrap();
+
+        revoke_thread.join().unwrap().unwrap();
+        let error = presentation_thread.join().unwrap().unwrap_err();
+        assert!(error.contains("revoked locally"), "{error}");
+        let persisted =
+            crate::access::access_policy::lookup_identity(directory.path(), fingerprint)
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            persisted.status,
+            crate::access::access_policy::PeerIdentityStatus::Revoked
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_grant_never_enables_identity_when_iam_commit_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, identity) = org_identity_with_dir();
+        let mut initial = LocalIamState::default();
+        trust_org(
+            &mut initial,
+            "acme",
+            &identity.public_key_b64u(),
+            None,
+            Some("session-reader"),
+            test_now(),
+        )
+        .unwrap();
+        let fingerprint = "bb11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66";
+        let document = issue_org_grant(
+            &identity,
+            &initial,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "",
+                peer_fingerprint: fingerprint,
+                subject_label: "Build daemon",
+                role_id: "peer:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        crate::access::iam::save_state(directory.path(), &initial).unwrap();
+        std::fs::create_dir_all(directory.path().join("peer-access-identities")).unwrap();
+
+        let writable = std::fs::metadata(directory.path()).unwrap().permissions();
+        let mut readonly = writable.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(directory.path(), readonly).unwrap();
+        let result = present_org_grant_value(
+            directory.path(),
+            &serde_json::to_value(&document).unwrap(),
+            &[],
+            test_now(),
+        );
+        std::fs::set_permissions(directory.path(), writable).unwrap();
+
+        assert!(result.is_err());
+        assert!(
+            crate::access::access_policy::lookup_identity(directory.path(), fingerprint)
+                .unwrap()
+                .is_none(),
+            "peer authority must not exist unless its IAM audit committed first"
+        );
     }
 }

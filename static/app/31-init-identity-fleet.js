@@ -4,6 +4,83 @@ import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 import stationInit, { StationWeb } from '/wasm-station/station_web.js';
 import * as THREE from '/three.module.min.js';
 
+// ── Build stamp / stale-tab reload nudge ──
+//
+// Minted by app-html-assembler (sha256 over the manifest-ordered raw
+// fragment bytes, first 16 hex chars). The daemon extracts the same value
+// from its embedded artifact and serves it in /config, so a tab whose
+// stamp differs is a dashboard from an OLDER served bundle — after a
+// daemon upgrade, tabs left open would otherwise keep running old code
+// against the new daemon indefinitely (the "stale photograph" multi-tab
+// failure class).
+const INTENDANT_APP_BUILD = '__INTENDANT_APP_BUILD__';
+
+let staleBuildNudged = false;
+function maybeNudgeStaleBuild(serverBuild) {
+  const server = String(serverBuild || '').trim();
+  // No signal (stampless daemon or config fetch without the field) is
+  // never a mismatch; a placeholder-carrying page (fragment served raw in
+  // dev) can't compare either.
+  if (!server || INTENDANT_APP_BUILD.startsWith('__')) return;
+  if (server === INTENDANT_APP_BUILD || staleBuildNudged) return;
+  staleBuildNudged = true;
+  console.info(`[dashboard] daemon serves build ${server}; this tab runs ${INTENDANT_APP_BUILD} — reload to update`);
+  // A draft in the composer must never be reload-clobbered; hidden tabs
+  // with nothing in flight self-heal invisibly.
+  const reloadSafe = () =>
+    !(document.getElementById('new-session-input')?.value || '').trim();
+  if (document.hidden && reloadSafe()) {
+    location.reload();
+    return;
+  }
+  const banner = document.createElement('div');
+  banner.id = 'ui-stale-build-banner';
+  const text = document.createElement('span');
+  text.textContent = 'The daemon updated — this dashboard is from an older build.';
+  const btn = document.createElement('button');
+  btn.textContent = 'Reload';
+  btn.addEventListener('click', () => location.reload());
+  banner.appendChild(text);
+  banner.appendChild(btn);
+  document.body.appendChild(banner);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && reloadSafe()) location.reload();
+  });
+}
+
+// ── Per-tab identity ──
+//
+// A random id minted once per browser tab (sessionStorage is per-tab and
+// survives reloads). Sent on both event lanes — `?tab=` on the /ws URL
+// and `tab_id` in control-tunnel offers — so the daemon's tab-presence
+// surface (`api_dashboard_tabs`, Access pane) can group one tab's
+// connections and this tab can recognize itself in the list. Opaque and
+// authority-free: the daemon sanitizes it and uses it for display only.
+const INTENDANT_TAB_ID = (() => {
+  try {
+    const stored = sessionStorage.getItem('intendant_tab_id') || '';
+    if (/^[A-Za-z0-9_-]{8,64}$/.test(stored)) return stored;
+    const minted = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    sessionStorage.setItem('intendant_tab_id', minted);
+    return minted;
+  } catch (_) {
+    // Private-mode/storage-denied fallback: stable for this page load only.
+    return 'tab-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+})();
+
+// QA readback (window.qa convention) + one explicit test hook: the build
+// stamp and nudge state are module-scoped, and the mismatch path can only
+// be exercised for real by building a second bundle — the hook lets the
+// lane-verify harness drive it with a synthetic server stamp instead.
+window.qa = Object.assign(window.qa || {}, {
+  buildInfo: () => ({ build: INTENDANT_APP_BUILD, nudged: staleBuildNudged }),
+  tabId: () => INTENDANT_TAB_ID,
+  __testNudgeStaleBuild: (v) => maybeNudgeStaleBuild(v),
+});
+
 // ── Legacy federation auth compatibility ──
 //
 // When the daemon's `[server.auth] bearer_token` is set, federation
@@ -81,11 +158,13 @@ function buildWsUrl(path) {
     const sep = url.includes('?') ? '&' : '?';
     url += sep + 'token=' + encodeURIComponent(token);
   }
+  // Tab presence: browsers can't set headers on WebSocket opens, so the
+  // per-tab id rides the URL the same way the token does.
+  url += (url.includes('?') ? '&' : '?') + 'tab=' + encodeURIComponent(INTENDANT_TAB_ID);
   return url;
 }
 
 // ── Constants (rendering only — all logic in WASM) ──
-const SPINNER_FRAMES = ['\u280b','\u2819','\u2839','\u2838','\u283c','\u2834','\u2826','\u2827','\u2807','\u280f'];
 const LEVEL_ICONS = {
   info: '\u2139', model: '\u2726', agent: '\u25B6', error: '\u2716', warn: '\u26A0',
   subagent: '\u2726', detail: '\u00B7', debug: '\u2022', presence: '\u25C9',
@@ -140,6 +219,34 @@ let _sessionDeepSearch = {
   limit: 0,
   truncatedFiles: 0,
   results: new Map(),
+};
+// Quick-search message lane (default on; ?message_search=off escape): state of
+// the last /api/sessions/message-search request, unioned into the Recent
+// list under the metadata lane. Declared up here with the other sessions
+// module state (deep-link TDZ, above); the lane's code lives in
+// 57-sessions-message-search.js and the render touchpoints in
+// 57-sessions-replay.js.
+let _msgSearchFlagMemo = null;
+let _sessionMsgSearchToken = 0;
+let _sessionMsgSearchAbort = null;
+let _sessionMsgSearchTimer = null;
+let _sessionMsgSearch = {
+  sig: '',            // request signature the current state answers
+  query: '',          // raw query text of that request
+  queryLower: '',     // lowercased twin (the metadata lane compares lowercased)
+  active: false,      // results applied and live
+  loading: false,     // request in flight (or scheduled retry)
+  state: '',          // server coverage state: ready | building | partial
+  partialReason: null,
+  error: '',
+  unavailable: '',    // non-empty: honest "cannot serve here" note
+  hits: new Map(),    // `${source}:${session_id}` → response session entry
+  extrasHint: 0,      // apply-time count of hits with no row in _cachedSessions
+                      // (status-line hint; render-side stubs re-derive
+                      // membership per pass from `hits`)
+  moreAvailable: false, // server returned a cursor (further pages exist)
+  windowDays: 0,
+  seq: 0,             // bumps on every visible change; render keys include it
 };
 let _sessionsHydrationHideTimer = null;
 let _sessionsHydrationState = {
@@ -319,8 +426,9 @@ async function refreshUnfueledEmptyState() {
       return true;
     }
     // The status frame carries an aggregate `fueled` flag readable by
-    // every binding; per-provider api_key_status needs settings.manage,
-    // which the default hosted (operator) binding does not hold.
+    // every authorized binding; per-provider api_key_status needs
+    // settings.manage. Hosted Connect has no daemon-control binding in the
+    // default build.
     const statusFueled = dashboardControlTransport?.lastStatus?.fueled;
     if (typeof statusFueled === 'boolean') {
       if (!statusFueled) await refreshExternalAgentAvailability();
@@ -376,8 +484,19 @@ function applyUnfueledEmptyState(unfueled) {
     }
   } else {
     hint.textContent = 'The daemon found no provider API key for the built-in agent. '
-      + 'Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to .env and restart — '
-      + 'or claim it through a rendezvous and grant a lease from your vault.';
+      + 'Add a provider key in Settings → API Keys — it applies immediately, '
+      + 'no restart. (A .env key on the daemon or a vault credential lease works too.)';
+    if (!document.getElementById('log-empty-fuel')) {
+      const btn = document.createElement('button');
+      btn.id = 'log-empty-fuel';
+      btn.className = 'ui-empty-btn';
+      btn.textContent = 'Add API keys';
+      btn.addEventListener('click', () => {
+        if (typeof focusSettingsApiKeys === 'function') focusSettingsApiKeys();
+        else routeTo('settings');
+      });
+      hint.insertAdjacentElement('afterend', btn);
+    }
   }
   applyUnfueledExternalAgentNote(empty);
 }
@@ -523,8 +642,6 @@ let followUpCounter = 0;
 const pendingFollowUpsById = new Map();
 let editMessageDraft = null;
 const approvalSessionIds = new Map();
-let spinnerIdx = 0;
-let spinnerInterval = null;
 
 // Terminal (lazy)
 
@@ -560,6 +677,8 @@ const SESSIONS_FILTER_PROJECT_KEY = 'intendant_sessions_filter_project';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
 const SESSIONS_SHOW_SUBAGENTS_KEY = 'intendant_sessions_show_subagents';
+// Message-lane superseded toggle (flagged; 57-sessions-message-search.js).
+const SESSIONS_MSG_SUPERSEDED_KEY = 'intendant_sessions_msg_superseded';
 const SESSIONS_DEEP_FILTER_PROJECT_KEY = 'intendant_sessions_deep_filter_project';
 const SESSIONS_DEEP_FILTER_SOURCE_KEY = 'intendant_sessions_deep_filter_source';
 const SESSIONS_DEEP_FILTER_STATUS_KEY = 'intendant_sessions_deep_filter_status';
@@ -607,13 +726,14 @@ let activeStatsHost = '';
 const DAEMONS_KEY = 'intendant_daemons';
 const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
 const ACCESS_FLEET_KEY = 'intendant_access_fleet_v1';
-const dashboardUrlParams = new URLSearchParams(window.location.search);
 const DASHBOARD_ACCESS_PAGE_MODE = /^\/access\/?$/i.test(window.location.pathname || '');
-const DASHBOARD_CONNECT_MODE = dashboardUrlParams.get('connect') === '1';
-const DASHBOARD_CONNECT_DAEMON_ID = String(dashboardUrlParams.get('daemon_id') || '').trim();
-const DASHBOARD_CONNECT_SIGNALING_BASE = String(
-  dashboardUrlParams.get('connect_base') || ''
-).trim().replace(/\/+$/, '');
+// The hosted-origin dashboard experiment is retired. Keep the vocabulary for
+// the remaining trusted daemon-origin transport code, but make URL parameters unable
+// to activate it in the default daemon bundle. Connect serves a separate,
+// discovery-only page and never this SPA.
+const DASHBOARD_CONNECT_MODE = false;
+const DASHBOARD_CONNECT_DAEMON_ID = '';
+const DASHBOARD_CONNECT_SIGNALING_BASE = '';
 if (DASHBOARD_ACCESS_PAGE_MODE) {
   document.body?.classList.add('access-page');
   document.title = 'Intendant Access';
@@ -667,6 +787,12 @@ const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+// Item F4: watermark above which continuous pointer moves ('mm') falling
+// back onto the shared reliable tunnel are dropped instead of queued —
+// 16 KB is already dozens of queued moves; beyond it, replaying stale
+// positions in order reads as remote-control lag, so latest-wins drops
+// are the honest choice. Discrete input (kd/ku/md/mu) is never dropped.
+const DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES = 16 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
@@ -706,6 +832,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'display_approval_pending',
   'user_display_granted',
   'user_display_revoked',
+  'display_request_raised',
+  'display_request_resolved',
   'shared_view',
   // Unique note_id per note makes the JSON.stringify dedupe key exact.
   'session_note',
@@ -715,6 +843,9 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'recording_stopped',
   'recording_deleted',
   'recording_error',
+  // Unique event_id per action: dual-lane duplicates dedupe by id while
+  // two real identical clicks (distinct ids) both render.
+  'cu_action',
   'external_agent_changed',
   'autonomy_changed',
   'codex_thread_action_requested',
@@ -787,6 +918,7 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'release_display',
   'grant_user_display',
   'revoke_user_display',
+  'resolve_display_request',
   'create_virtual_display',
   'create_browser_workspace',
   'close_browser_workspace',
@@ -926,20 +1058,29 @@ async function clientIdentityReset() {
 
 /* ── Signed fleet records (trust architecture phase 5) ──
    Fleet entries that round-trip through the hosted metadata store are
-   signed with this browser's identity key and verified on read, so the
-   store can remember the fleet but cannot invent or alter it unnoticed.
-   Provenance is display metadata only — authority always stays with the
-   target daemon. */
+   signed with this browser's identity key and verified on read. That detects
+   alteration under the current key, but the key travels inside the record:
+   without an owner/device trust set, a malicious store can substitute a new
+   internally valid self-signed record on another device. Provenance is
+   display metadata only — authority always stays with the target daemon. */
 
 function accessFleetRecordPayload(record, signedAt, version = 2) {
   // v3 (encrypted records): the URL fields travel ONLY inside enc_fields,
   // so the signed lines pin them to empty — decrypting into the in-memory
   // record never invalidates the signature.
+  // v4 folds the enc line in unconditionally (may be empty) and appends
+  // the daemon's owner-set trust tier, so alteration under the same signer
+  // cannot relabel an integrated box without breaking the signature.
+  // v5 appends the owner's PETNAME for the daemon — the name the owner
+  // chose, bound under that record's signer. It does not make the self-carried
+  // signer an owner-trusted identity on a different browser.
   const enc = version >= 3 ? String(record.enc_fields || '') : '';
   const blank = version >= 3 && enc;
   const lines = [
-    version >= 3 ? 'intendant-fleet-record-v3'
-      : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
+    version >= 5 ? 'intendant-fleet-record-v5'
+      : version >= 4 ? 'intendant-fleet-record-v4'
+        : version >= 3 ? 'intendant-fleet-record-v3'
+          : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
     blank ? '' : String(record.url || ''),
@@ -951,6 +1092,8 @@ function accessFleetRecordPayload(record, signedAt, version = 2) {
   // device connects through the daemon's own rendezvous, not a default.
   if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
   if (version >= 3) lines.push(enc);
+  if (version >= 4) lines.push(String(record.tier || ''));
+  if (version >= 5) lines.push(String(record.petname || ''));
   lines.push(String(signedAt));
   return new TextEncoder().encode(lines.join('\n'));
 }
@@ -1064,10 +1207,17 @@ async function accessFleetSignRecord(record) {
   if (!identity) return record;
   const signedAt = Date.now();
   try {
+    // Sign at the lowest version that covers the record's fields: a
+    // record without newer fields keeps its older shape, so a hosted
+    // store that predates a field (and would strip it) only downgrades
+    // the records that carry it, not the whole fleet.
+    const version = String(record.petname || '').trim() ? 5
+      : String(record.tier || '').trim() ? 4
+        : (record.enc_fields ? 3 : 2);
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
-      accessFleetRecordPayload(record, signedAt, record.enc_fields ? 3 : 2)
+      accessFleetRecordPayload(record, signedAt, version)
     );
     return {
       ...record,
@@ -1099,7 +1249,7 @@ async function accessFleetVerifyRecord(record) {
       ['verify']
     );
     let valid = false;
-    for (const version of record.enc_fields ? [3, 2, 1] : [2, 1]) {
+    for (const version of record.enc_fields ? [5, 4, 3, 2, 1] : [5, 4, 2, 1]) {
       valid = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,
@@ -1130,4 +1280,3 @@ async function accessFleetRefreshProvenance() {
   }
   if (changed) renderAccessAdminSummaries();
 }
-

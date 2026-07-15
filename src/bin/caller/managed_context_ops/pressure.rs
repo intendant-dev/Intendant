@@ -5,7 +5,9 @@
 
 use super::*;
 
-pub(crate) fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot) -> u64 {
+pub(crate) fn external_context_snapshot_key(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -176,7 +178,10 @@ pub(crate) fn latest_external_context_snapshot_from_log(
             context_window,
             hard_context_window,
             item_count,
-            raw,
+            // The event was just built from the log entry, so this Arc is
+            // uniquely held and try_unwrap recovers the Value without a
+            // deep clone; the fallback only fires if that ever changes.
+            raw: std::sync::Arc::try_unwrap(raw).unwrap_or_else(|arc| (*arc).clone()),
         });
     }
 
@@ -536,7 +541,10 @@ pub(crate) fn shell_command_has_background_operator(command: &str) -> bool {
     false
 }
 
-pub(crate) fn shell_command_has_explicit_dashboard_cleanup(command: &str, tokens: &[String]) -> bool {
+pub(crate) fn shell_command_has_explicit_dashboard_cleanup(
+    command: &str,
+    tokens: &[String],
+) -> bool {
     if !shell_command_has_background_operator(command) {
         return false;
     }
@@ -551,7 +559,10 @@ pub(crate) fn shell_command_has_explicit_dashboard_cleanup(command: &str, tokens
     has_kill && (has_trap || references_background_pid)
 }
 
-pub(crate) fn shell_command_has_owned_dashboard_lifecycle(command: &str, tokens: &[String]) -> bool {
+pub(crate) fn shell_command_has_owned_dashboard_lifecycle(
+    command: &str,
+    tokens: &[String],
+) -> bool {
     let lower = command.to_ascii_lowercase();
     if lower.contains("validate-dashboard.cjs") && lower.contains("--launch-dashboard") {
         return true;
@@ -666,7 +677,9 @@ pub(crate) fn managed_context_recovery_kickstart_text(
     )
 }
 
-pub(crate) fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure) -> String {
+pub(crate) fn managed_context_density_handoff_text(
+    pressure: ManagedContextDensityPressure,
+) -> String {
     let hard = pressure
         .hard_context_window
         .map(|hard| format!(" hard_limit={hard}"))
@@ -967,7 +980,7 @@ pub(crate) async fn emit_external_context_snapshot_if_changed(
                     context_window: snapshot.context_window,
                     hard_context_window: snapshot.hard_context_window,
                     item_count: snapshot.item_count,
-                    raw: snapshot.raw,
+                    raw: std::sync::Arc::new(snapshot.raw),
                 });
                 if let Some(main) = usage {
                     emit_external_context_usage_snapshot_from_usage(config, main);
@@ -1003,13 +1016,10 @@ pub(crate) const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
 
 pub(crate) fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
-    loop {
-        let Some(inner) = current
-            .strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
-            .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
-        else {
-            break;
-        };
+    while let Some(inner) = current
+        .strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+        .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
+    {
         let Some((_, user_followup)) =
             inner.split_once(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
         else {

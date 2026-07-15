@@ -7,23 +7,24 @@
 //   - daemon A (org daemon) holds the `acme` org root key and issues signed
 //     grant documents;
 //   - daemon B (member target) trusts the org key and is the daemon members
-//     actually connect to, over both its own origin (local offer path) and
-//     hosted Connect (rendezvous offer path).
+//     actually connect to over a trusted direct origin. Hosted Connect is
+//     exercised only as authority-free account/route metadata.
 //
 // What is proven, in order:
 //   1. join fold: pasting a document on an untrusting daemon stores it in
 //      the browser and fails harmlessly;
-//   2. offer ride-along (local path): after the daemon trusts the org, a
-//      plain reconnect materializes the stored document and binds the
-//      session to the scoped member principal — no explicit present call;
-//   3. re-presentation is quiet: reconnecting again neither rewrites
-//      iam.json nor grows the audit log;
+//   2. trusted-local presentation: after the daemon trusts the org, its direct
+//      API verifies and materializes the document while the dashboard remains
+//      rooted in the trusted transport, not the browser key;
+//   3. re-presentation is quiet: presenting the same document again neither
+//      rewrites iam.json nor grows the audit log;
 //   4. a tampered document is refused without breaking the connection;
 //   5. local IAM wins: a locally revoked materialized grant is NOT
-//      resurrected by the automatic re-presentation;
-//   6. offer ride-along (hosted rendezvous path): a Connect account with no
-//      local IAM grant of its own connects scoped purely via the document
-//      carried on the offer.
+//      resurrected by a later direct re-presentation;
+//   6. hosted Connect cannot carry the document on an offer: offer/ICE/close
+//      are 403 and the historical `/app` redirects without a control client.
+//   7. PRF fleet encryption still round-trips in the trusted direct dashboard;
+//      the harness transfers the account-derived PRF value across origins.
 //
 // Usage:
 //   PLAYWRIGHT_NODE_PATH=$PWD/node_modules node scripts/validate-org-grants.cjs \
@@ -36,6 +37,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { launchBrowser } = require('./lib/browser-automation.cjs');
+const { assertHostedControlUnavailable } = require('./lib/connect-hosted-refusal.cjs');
 
 const DEFAULT_CONNECT_PORT = 9887;
 const DEFAULT_ORG_DAEMON_PORT = 8898;
@@ -160,16 +162,6 @@ async function waitForBoundConnection(page, label) {
   }, CONNECT_TIMEOUT_MS, label);
 }
 
-async function waitForScopedConnection(page, label) {
-  return waitFor(async () => {
-    const status = await dashboardStatus(page);
-    if (status?.connected && status?.verifiedBinding?.ok && status?.grantKind === 'user-client') {
-      return status;
-    }
-    return null;
-  }, CONNECT_TIMEOUT_MS, label);
-}
-
 async function reloadPage(page) {
   await page.reload({ timeout: START_TIMEOUT_MS }).catch(() => {});
   await page.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
@@ -256,19 +248,20 @@ async function main() {
 
     browser = await launchBrowser({ headless: true });
 
-    // ══ Scenario 1: local offer path on the member daemon ══
+    // ══ Scenario 1: trusted-local org presentation + transport ══
     const page = await browser.newPage();
-    const consoleMessages = [];
-    page.on('console', msg => consoleMessages.push(msg.text()));
     await page.goto(`${memberOrigin}/`, { waitUntil: 'domcontentloaded', timeout: CONNECT_TIMEOUT_MS });
     await page.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
     await page.evaluate(() => localStorage.setItem('intendant_dashboard_transport', 'webrtc-control'));
     await reloadPage(page);
 
-    // Before any org grant: verified key with no local IAM binding keeps
-    // trusted-transport root on the local path.
+    // Before any org grant, loopback + a loopback Host header enters the
+    // explicit trusted-local root lane. The browser key is not what grants
+    // this authority.
     const rootStatus = await waitForBoundConnection(page, 'local dashboard-control before org grant');
-    assert.strictEqual(rootStatus.grantKind, 'user-client-root', `expected ungranted key to keep local root: ${JSON.stringify(rootStatus)}`);
+    assert.strictEqual(rootStatus.grantKind, 'trusted-local', `expected trusted-local root lane: ${JSON.stringify(rootStatus)}`);
+    assert.strictEqual(rootStatus.grantLabel, 'trusted-local', `unexpected trusted-local label: ${JSON.stringify(rootStatus)}`);
+    assert.strictEqual(String(rootStatus.accessPrincipal?.role_id || ''), 'role:root', `trusted-local lane was not root: ${JSON.stringify(rootStatus.accessPrincipal)}`);
 
     const fingerprintLocal = await page.evaluate(() =>
       window.intendantDashboardControl._debugClientIdentity().then(i => i && i.fingerprint));
@@ -308,13 +301,21 @@ async function main() {
     const trusted = await postJson(`${memberOrigin}/api/access/orgs/trust`, { handle: 'acme', root_key: rootKey });
     assert.strictEqual(trusted.status, 200, `trust failed: ${JSON.stringify(trusted.body)}`);
 
-    // Reconnect: the offer carries the stored document, the daemon
-    // materializes it, and the same offer resolves the scoped principal.
+    // Present through the daemon's trusted-local API. This is the actual
+    // authority-bearing path: signature verification and materialization
+    // happen on the daemon, not through hosted or ambient browser provenance.
+    const presentedLocal = await postJson(`${memberOrigin}/api/access/org-grants`, doc);
+    assert.strictEqual(presentedLocal.status, 200, `trusted-local presentation failed: ${JSON.stringify(presentedLocal.body)}`);
+
+    // The dashboard transport stays trusted-local root. The narrower org
+    // document is materialized for later direct/mTLS use but does not replace
+    // the trusted anchor as this session's authenticator.
     await reloadPage(page);
-    const scoped = await waitForScopedConnection(page, 'local ride-along scoped connection');
-    assert.strictEqual(scoped.signalingMode, 'local-http', `expected local signaling: ${JSON.stringify(scoped)}`);
-    assert.strictEqual(scoped.grantLabel, 'Member Local', `expected member principal label: ${JSON.stringify(scoped)}`);
-    assert.strictEqual(String(scoped.accessPrincipal?.role_id || ''), 'role:session-reader', `expected session-reader role: ${JSON.stringify(scoped.accessPrincipal)}`);
+    const materializedStatus = await waitForBoundConnection(page, 'trusted-local connection after org materialization');
+    assert.strictEqual(materializedStatus.signalingMode, 'local-http', `expected local signaling: ${JSON.stringify(materializedStatus)}`);
+    assert.strictEqual(materializedStatus.grantKind, 'trusted-local', `trusted anchor was replaced by a browser grant: ${JSON.stringify(materializedStatus)}`);
+    assert.strictEqual(materializedStatus.grantLabel, 'trusted-local', `unexpected trusted-local label: ${JSON.stringify(materializedStatus)}`);
+    assert.strictEqual(String(materializedStatus.accessPrincipal?.role_id || ''), 'role:root', `trusted-local connection was not root: ${JSON.stringify(materializedStatus.accessPrincipal)}`);
 
     let iam = readMemberIam(memberHome);
     const materialized = orgGrants(iam).find(g => g.id === `grant:org:acme:${doc.grant_id}`);
@@ -325,38 +326,35 @@ async function main() {
     const auditAfterFirst = orgAuditCount(iam);
     assert(auditAfterFirst >= 1, 'no materialize audit event recorded');
 
-    // Reconnect again: identical re-presentation is a quiet no-op.
+    // Identical direct re-presentation is a quiet no-op.
+    const presentedAgain = await postJson(`${memberOrigin}/api/access/org-grants`, doc);
+    assert.strictEqual(presentedAgain.status, 200, `idempotent presentation failed: ${JSON.stringify(presentedAgain.body)}`);
     await reloadPage(page);
-    await waitForScopedConnection(page, 'local ride-along reconnect');
+    const reconnected = await waitForBoundConnection(page, 'trusted-local reconnect');
+    assert.strictEqual(reconnected.grantKind, 'trusted-local', `reconnect left trusted-local lane: ${JSON.stringify(reconnected)}`);
     iam = readMemberIam(memberHome);
     assert.strictEqual(orgAuditCount(iam), auditAfterFirst, 'idempotent re-presentation grew the audit log');
     assert.strictEqual(orgGrants(iam).length, 1, 'idempotent re-presentation duplicated the grant');
 
-    // Tampered document: refused without breaking the connection (the
-    // already-materialized grant still resolves).
-    await page.evaluate(() => {
-      const map = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{}');
-      map.acme.role_id = 'role:root';
-      localStorage.setItem('intendant_org_grants_v1', JSON.stringify(map));
-    });
+    // Tampered document: the trusted direct API refuses it without breaking
+    // the independently rooted dashboard connection.
+    const tamperedDoc = JSON.parse(JSON.stringify(doc));
+    tamperedDoc.role_id = 'role:root';
+    const tamperedPresentation = await postJson(`${memberOrigin}/api/access/org-grants`, tamperedDoc);
+    assert.strictEqual(tamperedPresentation.status, 400, `tampered document was accepted: ${JSON.stringify(tamperedPresentation.body)}`);
     await reloadPage(page);
-    const afterTamper = await waitForScopedConnection(page, 'connection despite tampered document');
-    assert.strictEqual(String(afterTamper.accessPrincipal?.role_id || ''), 'role:session-reader', 'tampered document changed the bound role');
+    const afterTamper = await waitForBoundConnection(page, 'connection despite tampered document');
+    assert.strictEqual(afterTamper.grantKind, 'trusted-local', `tampered document changed the trusted transport: ${JSON.stringify(afterTamper)}`);
+    assert.strictEqual(String(afterTamper.accessPrincipal?.role_id || ''), 'role:root', 'tampered document changed the trusted-local role');
     iam = readMemberIam(memberHome);
     assert(!orgGrants(iam).some(g => g.role_id === 'role:root'), 'tampered document materialized');
     assert.strictEqual(orgAuditCount(iam), auditAfterFirst, 'tampered document touched the audit log');
 
-    // Local IAM wins: revoke the materialized grant on the daemon, restore
-    // the honest document in the browser, reconnect — the daemon must
-    // refuse the re-presentation (surfaced in the answer and warned in the
-    // console) and the grant must stay revoked. The session that follows
-    // binds the now-ungranted principal, which is refused per-operation —
-    // asserted here through the daemon-side state, not the client UI.
-    await page.evaluate(docJson => {
-      const map = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{}');
-      map.acme = JSON.parse(docJson);
-      localStorage.setItem('intendant_org_grants_v1', JSON.stringify(map));
-    }, JSON.stringify(doc));
+    // Local IAM wins: revoke the materialized grant on the daemon, then
+    // directly re-present the honest signed document. The daemon must refuse
+    // it and the grant must stay revoked. The trusted-local session
+    // remains independently rooted; revoking the org grant changes only the
+    // materialized remote-member authority asserted in daemon-side state.
     iam = readMemberIam(memberHome);
     for (const grant of iam.grants) {
       if (grant.id === `grant:org:acme:${doc.grant_id}`) {
@@ -365,13 +363,9 @@ async function main() {
       }
     }
     fs.writeFileSync(memberIamPath(memberHome), `${JSON.stringify(iam, null, 2)}\n`);
-    consoleMessages.length = 0;
-    await reloadPage(page);
-    await waitFor(
-      () => consoleMessages.some(m => /offer org grant not accepted/.test(m) && /revoked locally/.test(m)),
-      CONNECT_TIMEOUT_MS,
-      'daemon refusal of the revoked document'
-    );
+    const revokedPresentation = await postJson(`${memberOrigin}/api/access/org-grants`, doc);
+    assert.strictEqual(revokedPresentation.status, 400, `locally revoked document was accepted: ${JSON.stringify(revokedPresentation.body)}`);
+    assert(/revoked locally/.test(String(revokedPresentation.body.error)), `unexpected local-revocation refusal: ${JSON.stringify(revokedPresentation.body)}`);
     iam = readMemberIam(memberHome);
     const revokedGrant = iam.grants.find(g => g.id === `grant:org:acme:${doc.grant_id}`);
     assert.strictEqual(revokedGrant.status, 'revoked', 'local revocation did not survive re-presentation');
@@ -380,8 +374,6 @@ async function main() {
 
     // ══ Scenario 2: hosted Connect rendezvous path ══
     const hosted = await browser.newPage();
-    const hostedConsole = [];
-    hosted.on('console', msg => hostedConsole.push(msg.text()));
     await addVirtualAuthenticator(browser, hosted);
 
     // Claim the member daemon under a fresh Connect account.
@@ -389,87 +381,69 @@ async function main() {
       const all = `${logs.connect.join('')}\n${logs.member.join('')}`;
       const urlMatch = all.match(/claim_code=([^\s"'<>]+)/);
       if (urlMatch) return decodeURIComponent(urlMatch[1]);
-      const codeMatch = all.match(/claim this daemon with code ([^\s"'<>]+)/);
+      const codeMatch = all.match(/one-time claim code ([a-z0-9-]+)/i);
       return codeMatch && codeMatch[1];
     }, START_TIMEOUT_MS, 'claim code');
-    await hosted.goto(`${connectOrigin}/connect?claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
+    const iamBeforeRouteClaim = readMemberIam(memberHome);
+    const claimInvariantBefore = JSON.stringify({
+      principals: iamBeforeRouteClaim.principals || [],
+      grants: iamBeforeRouteClaim.grants || [],
+      role_ceilings: iamBeforeRouteClaim.role_ceilings || {},
+    });
+    await hosted.goto(`${connectOrigin}/connect#claim_code=${encodeURIComponent(claimCode)}`, { timeout: START_TIMEOUT_MS });
     await hosted.evaluate(() => {
       document.getElementById('account').value = `org-member-${Date.now()}`;
     });
     await hosted.locator('#register').click();
     await hosted.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), { timeout: START_TIMEOUT_MS });
     await hosted.locator('#claim').click();
-    await hosted.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), { timeout: START_TIMEOUT_MS });
+    await hosted.waitForFunction(() => document.getElementById('claim-status').textContent.includes('No machine access was granted'), { timeout: START_TIMEOUT_MS });
+    const iamAfterRouteClaim = readMemberIam(memberHome);
+    assert.strictEqual(JSON.stringify({
+      principals: iamAfterRouteClaim.principals || [],
+      grants: iamAfterRouteClaim.grants || [],
+      role_ceilings: iamAfterRouteClaim.role_ceilings || {},
+    }), claimInvariantBefore, 'route-only claim mutated daemon IAM');
 
     // Phase 5 follow-on: the passkey ceremony evaluated the PRF extension,
     // so this tab holds the fleet-encryption secret.
     const prfSecret = await hosted.evaluate(() => sessionStorage.getItem('intendant_fleet_prf_v1'));
     assert(prfSecret, 'PRF secret was not captured at registration');
 
-    // Without any document or account grant, the hosted offer is refused.
-    await hosted.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.memberDaemonId)}#activity`, { timeout: START_TIMEOUT_MS });
-    await hosted.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
-    let refusal = null;
-    try {
-      refusal = await waitFor(async () => {
-        const status = await dashboardStatus(hosted);
-        if (status?.connected) throw new Error(`unexpectedly connected without a grant: ${JSON.stringify(status)}`);
-        if (status?.lastError) return status;
-        if (hostedConsole.some(m => /not authorized by this daemon/.test(m))) {
-          return { lastError: 'not authorized by this daemon (from console)' };
-        }
-        return null;
-      }, CONNECT_TIMEOUT_MS, 'hosted refusal without document');
-    } catch (err) {
-      const status = await dashboardStatus(hosted).catch(() => null);
-      throw new Error(`${err.message}; status=${JSON.stringify(status)}; console tail=${JSON.stringify(hostedConsole.slice(-15))}`);
-    }
-    assert(/not authorized by this daemon/.test(String(refusal.lastError)), `expected IAM refusal: ${JSON.stringify(refusal.lastError)}`);
+    const retiredAttempts = await assertHostedControlUnavailable(
+      hosted,
+      connectOrigin,
+      options.memberDaemonId,
+      START_TIMEOUT_MS
+    );
+    assert.deepStrictEqual(
+      retiredAttempts.map(attempt => attempt.status),
+      [403, 403, 403],
+      'hosted signaling was not retired'
+    );
 
-    // The hosted origin mints its own identity key; the org issues for it,
-    // and the browser keeps the document (as the join fold would).
-    const fingerprintHosted = await hosted.evaluate(() =>
-      window.intendantDashboardControl._debugClientIdentity().then(i => i && i.fingerprint));
-    assert(fingerprintHosted, 'hosted page did not mint a client identity key');
-    assert.notStrictEqual(fingerprintHosted, fingerprintLocal, 'origin-scoped keys should differ');
-    const issuedHosted = await postJson(`${orgApi}/api/access/org-grants/issue`, {
+    // Exercise a second org subject through the trusted direct presentation
+    // API. It deliberately never rides a hosted offer.
+    const fingerprintDirect = 'bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd6677';
+    const issuedDirect = await postJson(`${orgApi}/api/access/org-grants/issue`, {
       handle: 'acme',
-      client_key_fingerprint: fingerprintHosted,
-      label: 'Member Hosted',
+      client_key_fingerprint: fingerprintDirect,
+      label: 'Member Direct',
       role_id: 'role:session-reader',
       targets: [options.memberDaemonId],
       ttl_ms: 60 * 60 * 1000,
     });
-    assert.strictEqual(issuedHosted.status, 200, `hosted issue failed: ${JSON.stringify(issuedHosted.body)}`);
-    const storedHosted = await hosted.evaluate(
-      docJson => window.intendantDashboardControl._debugOrgGrantStore(JSON.parse(docJson)),
-      JSON.stringify(issuedHosted.body.document)
+    assert.strictEqual(issuedDirect.status, 200, `direct issue failed: ${JSON.stringify(issuedDirect.body)}`);
+    const presentedDirect = await postJson(
+      `${memberOrigin}/api/access/org-grants`,
+      issuedDirect.body.document
     );
-    assert.strictEqual(storedHosted, true, 'hosted page did not store the document');
-
-    // The connect page's Advanced drawer lists the stored document
-    // (client-side only — same origin, same localStorage).
-    await hosted.goto(`${connectOrigin}/connect`, { timeout: START_TIMEOUT_MS });
-    await hosted.waitForFunction(
-      () => (document.getElementById('org-rows')?.textContent || '').includes('@acme'),
-      { timeout: START_TIMEOUT_MS }
-    );
-    await hosted.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.memberDaemonId)}#activity`, { timeout: START_TIMEOUT_MS });
-    await hosted.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
-
-    // Reload: the rendezvous offer carries the document; the daemon
-    // materializes it and the Connect session binds the scoped member
-    // principal — the account itself still has no grant of its own.
-    await reloadPage(hosted);
-    const hostedScoped = await waitForScopedConnection(hosted, 'hosted ride-along scoped connection');
-    assert.strictEqual(hostedScoped.signalingMode, 'connect-rendezvous', `expected rendezvous signaling: ${JSON.stringify(hostedScoped)}`);
-    assert.strictEqual(hostedScoped.grantLabel, 'Member Hosted', `expected hosted member label: ${JSON.stringify(hostedScoped)}`);
-    assert.strictEqual(String(hostedScoped.accessPrincipal?.role_id || ''), 'role:session-reader', `expected session-reader role: ${JSON.stringify(hostedScoped.accessPrincipal)}`);
+    assert.strictEqual(presentedDirect.status, 200, `trusted presentation failed: ${JSON.stringify(presentedDirect.body)}`);
 
     iam = readMemberIam(memberHome);
-    const hostedGrant = orgGrants(iam).find(g => g.id === `grant:org:acme:${issuedHosted.body.document.grant_id}`);
-    assert(hostedGrant, `hosted ride-along grant missing: ${JSON.stringify(orgGrants(iam))}`);
-    assert.strictEqual(hostedGrant.status, 'active');
+    const directGrant = orgGrants(iam).find(g => g.id === `grant:org:acme:${issuedDirect.body.document.grant_id}`);
+    assert(directGrant, `trusted-direct grant missing: ${JSON.stringify(orgGrants(iam))}`);
+    assert.strictEqual(directGrant.status, 'active');
 
     // ══ Scenario 3: org revocation list + renewal (phase 6 step 5) ══
     // Renewal first, while nothing is revoked: same grant_id, fresh window.
@@ -483,10 +457,10 @@ async function main() {
       'renewal changed the lifetime span'
     );
 
-    // The org revokes the hosted member by subject fingerprint.
+    // The org revokes the direct member by subject fingerprint.
     const revokedMember = await postJson(`${orgApi}/api/access/org-grants/revoke-member`, {
       handle: 'acme',
-      subject: fingerprintHosted,
+      subject: fingerprintDirect,
     });
     assert.strictEqual(revokedMember.status, 200, `revoke-member failed: ${JSON.stringify(revokedMember.body)}`);
     assert.strictEqual(revokedMember.body.orl.seq, 1, `expected first revocation at seq 1: ${JSON.stringify(revokedMember.body.orl)}`);
@@ -497,7 +471,7 @@ async function main() {
     assert.deepStrictEqual(served.body.orl, revokedMember.body.orl, 'served list differs from the revoke response');
 
     // Renewal of the revoked member's document is refused by the org.
-    const renewRevoked = await postJson(`${orgApi}/api/access/org-grants/renew`, issuedHosted.body.document);
+    const renewRevoked = await postJson(`${orgApi}/api/access/org-grants/renew`, issuedDirect.body.document);
     assert.strictEqual(renewRevoked.status, 400, `revoked renewal unexpectedly succeeded: ${JSON.stringify(renewRevoked.body)}`);
     assert(/revoked/.test(String(renewRevoked.body.error)), `expected revoked-refusal: ${JSON.stringify(renewRevoked.body)}`);
 
@@ -529,27 +503,24 @@ async function main() {
     assert.strictEqual(applied.body.applied.changed, false, `courier should have applied seq 1 already: ${JSON.stringify(applied.body.applied)}`);
     iam = readMemberIam(memberHome);
     assert.strictEqual(
-      iam.grants.find(g => g.id === hostedGrant.id).status,
+      iam.grants.find(g => g.id === directGrant.id).status,
       'revoked',
-      'ORL apply did not revoke the hosted grant'
+      'ORL apply did not revoke the trusted-direct grant'
     );
     const trustedEntry = (iam.trusted_orgs || []).find(o => o.handle === 'acme');
     assert.strictEqual(trustedEntry.last_orl_seq, 1, 'seq not persisted');
-    assert(trustedEntry.orl_revoked_subjects.includes(fingerprintHosted), 'subject not persisted');
+    assert(trustedEntry.orl_revoked_subjects.includes(fingerprintDirect), 'subject not persisted');
 
-    // The revoked member reconnects with its still-signed document: the
-    // ride-along is refused by the persisted list (daemon-side log), and
-    // the revoked grant stays revoked.
-    const memberLogMark = logs.member.length;
-    await reloadPage(hosted);
-    await waitFor(
-      () => logs.member.slice(memberLogMark).join('').includes('offer org grant not accepted')
-        && logs.member.slice(memberLogMark).join('').includes('revocation list'),
-      CONNECT_TIMEOUT_MS,
-      'daemon refusal of the ORL-revoked document'
+    // Re-presenting the still-signed document over the trusted direct API is
+    // refused by the persisted list; no hosted presentation path exists.
+    const rePresentRevoked = await postJson(
+      `${memberOrigin}/api/access/org-grants`,
+      issuedDirect.body.document
     );
+    assert.strictEqual(rePresentRevoked.status, 400, `revoked document re-presented: ${JSON.stringify(rePresentRevoked.body)}`);
+    assert(/revocation|revoked/.test(String(rePresentRevoked.body.error)), `expected ORL refusal: ${JSON.stringify(rePresentRevoked.body)}`);
     iam = readMemberIam(memberHome);
-    assert.strictEqual(iam.grants.find(g => g.id === hostedGrant.id).status, 'revoked', 'reconnect resurrected an ORL-revoked grant');
+    assert.strictEqual(iam.grants.find(g => g.id === directGrant.id).status, 'revoked', 're-presentation resurrected an ORL-revoked grant');
 
     // ══ Scenario 4: peer-daemon subjects (phase 6 step 6a) ══
     const peerFp = 'aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66';
@@ -652,10 +623,21 @@ async function main() {
     const renewDeputy = await postJson(`${orgApi}/api/access/org-grants/renew`, deputyIssued.body.document);
     assert.strictEqual(renewDeputy.status, 400, `revoked-issuer doc renewed: ${JSON.stringify(renewDeputy.body)}`);
 
-    // ══ Scenario 6: PRF-encrypted fleet sync (phase 5 follow-on) ══
-    // Seed a private fleet record in the hosted tab, push it, and check
-    // the store holds only ciphertext while the tab reads plaintext back.
-    const fleetProbe = await hosted.evaluate(async () => {
+    // ══ Scenario 6: PRF-encrypted fleet data on a trusted direct origin ══
+    // Connect's account ceremony derived the PRF value, but Connect serves no
+    // dashboard code. Transfer that test value into a trusted daemon-origin
+    // tab and exercise the same fleet crypto helpers there.
+    const fleetPage = await browser.newPage();
+    await fleetPage.goto(`${memberOrigin}/`, { waitUntil: 'domcontentloaded', timeout: CONNECT_TIMEOUT_MS });
+    await fleetPage.evaluate(secret => {
+      sessionStorage.setItem('intendant_fleet_prf_v1', secret);
+      localStorage.setItem('intendant_dashboard_transport', 'webrtc-control');
+    }, prfSecret);
+    await reloadPage(fleetPage);
+    const fleetStatus = await waitForBoundConnection(fleetPage, 'trusted-direct fleet crypto dashboard');
+    assert.strictEqual(fleetStatus.grantKind, 'trusted-local', `fleet crypto tab was not trusted-local: ${JSON.stringify(fleetStatus)}`);
+    assert.strictEqual(fleetStatus.signalingMode, 'local-http', `fleet crypto tab was not direct: ${JSON.stringify(fleetStatus)}`);
+    const fleetProbe = await fleetPage.evaluate(async () => {
       const record = {
         id: 'e2e-private-daemon',
         host_id: 'e2e-private-daemon',
@@ -676,6 +658,7 @@ async function main() {
         locked: decrypted.fleet_locked === true,
       };
     });
+    await fleetPage.close();
     assert.strictEqual(fleetProbe.encHasCiphertext, true, `no ciphertext envelope: ${JSON.stringify(fleetProbe)}`);
     assert.strictEqual(fleetProbe.encBlankedUrl, true, `plaintext leaked beside envelope: ${JSON.stringify(fleetProbe)}`);
     assert.strictEqual(fleetProbe.roundTripUrl, 'https://10.9.8.7:8765/', `decrypt round-trip failed: ${JSON.stringify(fleetProbe)}`);
@@ -684,12 +667,13 @@ async function main() {
 
     console.log(JSON.stringify({
       ok: true,
-      fleet_encryption: { prf: true, round_trip: true },
+      fleet_encryption: { prf: true, round_trip: true, origin: 'trusted-direct' },
       issuer: { key: issuerKey, revoked: true },
       peer_subject: { fingerprint: peerFp, final_status: peerRecord.status },
       org_root_key: rootKey,
       local_fingerprint: fingerprintLocal,
-      hosted_fingerprint: fingerprintHosted,
+      direct_subject_fingerprint: fingerprintDirect,
+      hosted_refusal: 'hosted control endpoints retired (403)',
       orl_seq: revokedMember.body.orl.seq,
       materialized_grants: orgGrants(iam).map(g => ({ id: g.id, status: g.status, role: g.role_id })),
     }, null, 2));

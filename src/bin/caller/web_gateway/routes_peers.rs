@@ -53,41 +53,102 @@ pub(crate) async fn handle_doorbell(
     finalize_http_stream(&mut stream).await;
 }
 
+/// The peers family's historical JSON framing: the family predates the
+/// posture-derived CORS renderers, so its wildcard tail (`Cache-Control`,
+/// `Access-Control-Allow-Origin: *`, the per-handler `Allow-Methods`
+/// list, `Allow-Headers`, `Connection: close`) rides the response
+/// headers verbatim — the row posture (`OwnOrigin`) appends nothing on
+/// top. The golden transcripts pin these bytes.
+fn peers_family_api_response(
+    status: u16,
+    body: String,
+    allow_methods: &'static str,
+) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        headers: vec![
+            ("Cache-Control", "no-cache".to_string()),
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Access-Control-Allow-Methods", allow_methods.to_string()),
+            ("Access-Control-Allow-Headers", "Content-Type".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_peers_sub_router(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     request_line: &str,
     req_method: &str,
+    cert_dir: PathBuf,
     bus: EventBus,
     project_root: Option<PathBuf>,
     peer_registry: Option<crate::peer::PeerRegistry>,
 ) {
-    // Peer registry endpoints. Dispatch:
-    //   GET    /api/peers                  → list
-    //   POST   /api/peers                  → add
-    //   DELETE /api/peers                  → remove
-    //   POST   /api/peers/pairing/invite   → issue pairing invite
-    //   POST   /api/peers/pairing/join     → import pairing invite
-    //   POST   /api/peers/{id}/message     → send message
-    //   POST   /api/peers/{id}/task        → delegate task
-    //   POST   /api/peers/{id}/approval    → resolve approval
-    //
-    // When no registry is wired in (test call sites
-    // that pass None), every request returns 503 so
-    // the dashboard can render "peers unavailable"
-    // instead of the empty list that a working-but-
-    // empty registry would produce.
-    use tokio::io::AsyncWriteExt;
-
-    // Extract subpath after `/api/peers`. The list/
-    // add/remove ops have an empty subpath; per-peer
-    // ops have `/{id}/{op}`. Extract the *path*
-    // token from the request line first (the second
-    // whitespace-separated word) — splitting on
-    // `/api/peers` directly would walk into the
-    // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
-    // for path segments.
+    // Extract the *path* token from the request line (the second
+    // whitespace-separated word) — splitting on `/api/peers` directly
+    // would walk into the ` HTTP/1.1` suffix and mistake `HTTP` and
+    // `1.1` for path segments.
     let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+    let response = peers_sub_router_api_response(
+        req_method,
+        path_token,
+        &body_text,
+        &cert_dir,
+        &bus,
+        project_root.as_deref(),
+        peer_registry.as_ref(),
+    )
+    .await;
+    write_api_response(
+        stream,
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    )
+    .await;
+}
+
+/// The peers sub-router, transport-neutral (transport-unification S7):
+/// one handler unit — per-leaf resolution (path-addressed here; the
+/// datachannel twins address the same leaves by method name and
+/// params) plus the family's historical envelope. Deliberately still
+/// one function: the leaves stay intact and the handler keeps owning
+/// the JSON 404/405 shapes for garbage subpaths (design §2.7; per-leaf
+/// route rows exist for declaration, the `Any` catch-all row keeps
+/// dispatch behavior).
+///
+/// Dispatch:
+///   GET    /api/peers                  → list
+///   POST   /api/peers                  → add
+///   DELETE /api/peers                  → remove
+///   GET    /api/peers/eligible         → capability-filtered list
+///   POST   /api/peers/pairing/invite   → issue pairing invite
+///   POST   /api/peers/pairing/join     → import pairing invite
+///   POST   /api/peers/pairing/request-access[/poll] → doorbell client
+///   GET    /api/peers/pairing/requests|identities   → pairing reads
+///   POST   /api/peers/pairing/requests/{code}/{op}  → decision
+///   POST   /api/peers/pairing/identities/revoke     → revoke identity
+///   POST   /api/peers/{id}/message|task|approval    → quick controls
+///   POST   /api/peers/{id}/webrtc|file-transfer-webrtc|
+///          dashboard-control-webrtc                 → signaling relays
+///
+/// When no registry is wired in (test call sites that pass None),
+/// every registry-backed leaf returns 503 so the dashboard can render
+/// "peers unavailable" instead of the empty list that a working-but-
+/// empty registry would produce.
+pub(crate) async fn peers_sub_router_api_response(
+    req_method: &str,
+    path_token: &str,
+    body_text: &str,
+    cert_dir: &Path,
+    bus: &EventBus,
+    project_root: Option<&Path>,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+) -> ApiResponse {
     // Split path from query string. `/api/peers/eligible
     // ?capability=display` needs the query stripped before
     // we extract subpath segments.
@@ -102,30 +163,25 @@ pub(crate) async fn handle_peers_sub_router(
     let segments: Vec<&str> = subpath.split('/').filter(|s| !s.is_empty()).collect();
 
     let (status, body) = if segments == ["pairing", "invite"] && req_method == "POST" {
-        peers_pairing_invite(&body_text)
+        peers_pairing_invite(body_text)
     } else if segments == ["pairing", "request-access"] && req_method == "POST" {
-        peers_pairing_request_access(&body_text).await
+        peers_pairing_request_access(cert_dir, body_text).await
     } else if segments == ["pairing", "request-access", "poll"] && req_method == "POST" {
-        peers_pairing_request_access_poll(
-            peer_registry.as_ref(),
-            project_root.as_deref(),
-            &body_text,
-        )
-        .await
+        peers_pairing_request_access_poll(peer_registry, project_root, cert_dir, body_text).await
     } else if segments == ["pairing", "requests"] && req_method == "GET" {
-        peers_pairing_requests_list()
+        peers_pairing_requests_list(cert_dir)
     } else if segments == ["pairing", "identities"] && req_method == "GET" {
-        peers_pairing_identities_list()
+        peers_pairing_identities_list_from_cert_dir(cert_dir)
     } else if segments == ["pairing", "identities", "revoke"] && req_method == "POST" {
-        peers_pairing_identity_revoke(&body_text)
+        peers_pairing_identity_revoke_from_cert_dir(cert_dir, body_text)
     } else if segments.len() == 4
         && segments[0] == "pairing"
         && segments[1] == "requests"
         && req_method == "POST"
     {
-        peers_pairing_request_decision(segments[2], segments[3], &body_text)
+        peers_pairing_request_decision(cert_dir, segments[2], segments[3], body_text)
     } else {
-        match peer_registry.as_ref() {
+        match peer_registry {
             None => (
                 503,
                 serde_json::json!({
@@ -140,9 +196,9 @@ pub(crate) async fn handle_peers_sub_router(
                 if segments.is_empty() && (req_method == "POST" || req_method == "DELETE") =>
             {
                 if req_method == "POST" {
-                    peers_add(registry, project_root.as_deref(), &body_text).await
+                    peers_add(registry, project_root, body_text).await
                 } else {
-                    peers_remove(registry, &body_text).await
+                    peers_remove(registry, body_text).await
                 }
             }
             Some(registry) if segments == ["eligible"] && req_method == "GET" => {
@@ -157,21 +213,21 @@ pub(crate) async fn handle_peers_sub_router(
                 peers_eligible(registry, query_str)
             }
             Some(registry) if segments == ["pairing", "join"] && req_method == "POST" => {
-                peers_pairing_join(registry, project_root.as_deref(), &body_text).await
+                peers_pairing_join(registry, project_root, body_text).await
             }
             Some(registry) if segments.len() == 2 && req_method == "POST" => {
                 let id = url_path_decode(segments[0]);
                 let op = segments[1];
                 match op {
-                    "message" => peers_send_message(registry, &id, &body_text).await,
-                    "task" => peers_delegate_task(registry, &id, &body_text).await,
-                    "approval" => peers_resolve_approval(registry, &id, &body_text).await,
-                    "webrtc" => peers_webrtc_signal(registry, &id, &body_text, &bus).await,
+                    "message" => peers_send_message(registry, &id, body_text).await,
+                    "task" => peers_delegate_task(registry, &id, body_text).await,
+                    "approval" => peers_resolve_approval(registry, &id, body_text).await,
+                    "webrtc" => peers_webrtc_signal(registry, &id, body_text, bus).await,
                     "file-transfer-webrtc" => {
-                        peers_file_transfer_signal(registry, &id, &body_text, &bus).await
+                        peers_file_transfer_signal(registry, &id, body_text, bus).await
                     }
                     "dashboard-control-webrtc" => {
-                        peers_dashboard_control_signal(registry, &id, &body_text, &bus).await
+                        peers_dashboard_control_signal(registry, &id, body_text, bus).await
                     }
                     other => (
                         404,
@@ -193,30 +249,14 @@ pub(crate) async fn handle_peers_sub_router(
             ),
         }
     };
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response =
-        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .header("Connection", "close")
-            .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    // The family reason ladder is status_reason's: every status the
+    // leaves produce (200/400/404/405/500/502/503) maps identically,
+    // pinned by peers_family_reason_ladder_is_preserved below.
+    peers_family_api_response(status, body, "GET, POST, DELETE, OPTIONS")
 }
 
 pub(crate) async fn handle_coordinator_route(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     req_method: &str,
     peer_registry: Option<crate::peer::PeerRegistry>,
@@ -228,8 +268,26 @@ pub(crate) async fn handle_coordinator_route(
     // ..., "client_correlation_id": "..."}}.
     // Response: {"peer_id": "...", "task_id": "..."}
     // on success, structured error otherwise.
-    use tokio::io::AsyncWriteExt;
-    let (status, body) = match peer_registry.as_ref() {
+    let response =
+        coordinator_route_api_response(req_method, &body_text, peer_registry.as_ref()).await;
+    write_api_response(
+        stream,
+        response,
+        crate::gateway_routes::CorsPosture::OwnOrigin,
+        None,
+    )
+    .await;
+}
+
+/// The coordinator route, transport-neutral (transport-unification
+/// S7): the same core the `api_coordinator_route` datachannel twin
+/// runs, under the family's historical envelope.
+pub(crate) async fn coordinator_route_api_response(
+    req_method: &str,
+    body_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+) -> ApiResponse {
+    let (status, body) = match peer_registry {
         None => (
             503,
             serde_json::json!({
@@ -244,28 +302,9 @@ pub(crate) async fn handle_coordinator_route(
             })
             .to_string(),
         ),
-        Some(registry) => coordinator_route(registry, &body_text).await,
+        Some(registry) => coordinator_route(registry, body_text).await,
     };
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response =
-        HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Access-Control-Allow-Methods", "POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type")
-            .header("Connection", "close")
-            .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    peers_family_api_response(status, body, "POST, OPTIONS")
 }
 
 /// Wrapper for the `GET /api/peers` JSON body.
@@ -555,7 +594,13 @@ pub(crate) fn peer_access_request_status(request_id: &str) -> (u16, String) {
     }
 }
 
-pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
+/// `cert_dir` arrives from the transport edges (hermeticity convention)
+/// — as on the other pairing leaves below: the HTTP dispatch arm and
+/// the tunnel arms resolve the ambient store; fixtures inject tempdirs.
+pub(crate) async fn peers_pairing_request_access(
+    cert_dir: &Path,
+    body_text: &str,
+) -> (u16, String) {
     let req: PairingAccessRequestStart = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
@@ -571,9 +616,8 @@ pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, Strin
             serde_json::json!({"error": "target_url is required"}).to_string(),
         );
     }
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     match crate::peer::access_request::initiate_access_request(
-        &cert_dir,
+        cert_dir,
         crate::peer::access_request::InitiateAccessRequestOptions {
             target_url: req.target_url,
             requester_label: req.label,
@@ -605,6 +649,7 @@ pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, Strin
 pub(crate) async fn peers_pairing_request_access_poll(
     registry: Option<&crate::peer::PeerRegistry>,
     project_root: Option<&Path>,
+    cert_dir: &Path,
     body_text: &str,
 ) -> (u16, String) {
     let req: PairingAccessRequestPoll = match serde_json::from_str(body_text) {
@@ -622,14 +667,13 @@ pub(crate) async fn peers_pairing_request_access_poll(
             serde_json::json!({"error": "project root not available"}).to_string(),
         );
     };
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
         Ok(project) => project,
         Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
     };
     match crate::peer::access_request::poll_access_request(
         &mut project,
-        &cert_dir,
+        cert_dir,
         req.request_id.trim(),
         req.label.as_deref(),
     )
@@ -706,9 +750,8 @@ pub(crate) async fn peers_pairing_request_access_poll(
     }
 }
 
-pub(crate) fn peers_pairing_requests_list() -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    match crate::peer::access_request::list_requests(&cert_dir) {
+pub(crate) fn peers_pairing_requests_list(cert_dir: &Path) -> (u16, String) {
+    match crate::peer::access_request::list_requests(cert_dir) {
         Ok(requests) => {
             let items: Vec<serde_json::Value> = requests
                 .into_iter()
@@ -724,6 +767,7 @@ pub(crate) fn peers_pairing_requests_list() -> (u16, String) {
 }
 
 pub(crate) fn peers_pairing_request_decision(
+    cert_dir: &Path,
     code_or_id: &str,
     op: &str,
     body_text: &str,
@@ -741,14 +785,13 @@ pub(crate) fn peers_pairing_request_decision(
             }
         }
     };
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
     let result = match op {
         "approve" => crate::peer::access_request::approve_request(
-            &cert_dir,
+            cert_dir,
             code_or_id,
             body.profile.as_deref(),
         ),
-        "deny" => crate::peer::access_request::deny_request(&cert_dir, code_or_id),
+        "deny" => crate::peer::access_request::deny_request(cert_dir, code_or_id),
         _ => {
             return (
                 404,
@@ -763,11 +806,6 @@ pub(crate) fn peers_pairing_request_decision(
             serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
         ),
     }
-}
-
-pub(crate) fn peers_pairing_identities_list() -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    peers_pairing_identities_list_from_cert_dir(&cert_dir)
 }
 
 pub(crate) fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String) {
@@ -785,11 +823,6 @@ pub(crate) fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u
             serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
         ),
     }
-}
-
-pub(crate) fn peers_pairing_identity_revoke(body_text: &str) -> (u16, String) {
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    peers_pairing_identity_revoke_from_cert_dir(&cert_dir, body_text)
 }
 
 pub(crate) fn peers_pairing_identity_revoke_from_cert_dir(
@@ -830,6 +863,10 @@ pub(crate) fn access_request_summary_json(
         "requester_label": request.requester_label,
         "requested_profile": request.requested_profile,
         "approved_profile": request.approved_profile,
+        // Present only when the claim was signed inside a verified
+        // caller-ID (docs/src/trust-tiers.md § Where fleet metadata
+        // rides) — the store never holds an unverified tier.
+        "requester_tier": request.requester_tier,
         "source_hint": request.source_hint,
         "target_card_url": request.target_card_url,
         "created_at_unix": request.created_at_unix,
@@ -1302,21 +1339,6 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             advertise_tcp_via_url,
             ..
         } => {
-            let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
-                Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
-                _ => None,
-            };
-            bus.send(AppEvent::LogEntry {
-                session_id: None,
-                level: "debug".to_string(),
-                source: LOG_SOURCE.to_string(),
-                content: format!(
-                    "file-transfer offer resolved advertise_tcp_via_url={:?} -> tcp_candidate={:?}",
-                    advertise_tcp_via_url.as_deref().unwrap_or(""),
-                    tcp_advertised_addr
-                ),
-                turn: None,
-            });
             let Some(identity) = identity else {
                 bus.send(AppEvent::LogEntry {
                     session_id: None,
@@ -1334,9 +1356,16 @@ pub(crate) async fn handle_peer_file_transfer_signal(
                 label: identity.label,
                 profile: identity.profile,
                 filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
             };
             match registry
-                .answer_offer(session_id.clone(), sdp, authorization, tcp_advertised_addr)
+                .answer_offer(
+                    session_id.clone(),
+                    sdp,
+                    authorization,
+                    advertise_tcp_via_url,
+                )
                 .await
             {
                 Ok(answer_sdp) => {
@@ -1386,18 +1415,41 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             }
         }
         crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping file-transfer ICE without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
             match registry
-                .add_ice_candidate(&session_id, &candidate_json)
+                .add_ice_candidate_for_peer(&session_id, &candidate_json, &identity.fingerprint)
                 .await
             {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::Applied) => {}
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::NotFound) => {
                     bus.send(AppEvent::LogEntry {
                         session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
                             "dropping file-transfer ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Ok(crate::peer_file_transfer::PeerFileTransferSessionMutation::Forbidden) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing cross-peer file-transfer ICE for session {session_id}"
                         ),
                         turn: None,
                     });
@@ -1414,7 +1466,33 @@ pub(crate) async fn handle_peer_file_transfer_signal(
             }
         }
         crate::peer::WebRtcSignal::Close => {
-            registry.close(&session_id).await;
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping file-transfer close without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            if registry
+                .close_for_peer(&session_id, &identity.fingerprint)
+                .await
+                == crate::peer_file_transfer::PeerFileTransferSessionMutation::Forbidden
+            {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "refusing cross-peer file-transfer close for session {session_id}"
+                    ),
+                    turn: None,
+                });
+            }
         }
         crate::peer::WebRtcSignal::Answer { .. } => {
             bus.send(AppEvent::LogEntry {
@@ -1445,6 +1523,46 @@ pub(crate) async fn handle_peer_file_transfer_signal(
 /// and future dashboard RPC. The federation transport authenticates the primary
 /// daemon; the resulting DataChannel runtime then enforces that primary's
 /// approved peer profile and filesystem roots per frame/method.
+/// Resolve delegation-lane attribution for a relayed dashboard-control
+/// offer (docs/src/trust-tiers.md § Two lanes). Pure core — the caller
+/// (the transport edge) resolves the ambient IAM state and the daemon's
+/// own card id:
+/// - fields absent → `Ok(None)`: an unattributed connection from a
+///   dashboard that predates the field (admitted; the peer profile is
+///   the ceiling either way).
+/// - valid signature → `Ok(Some(_))`, with the enrolled principal's
+///   label when the key matches one in the target's local IAM.
+/// - present-but-invalid (bad signature, stale timestamp, wrong target
+///   id, spliced SDP/nonce) → `Err`: the caller refuses the offer, so a
+///   relay cannot tamper with an attributable handshake and keep it
+///   alive as merely unattributed.
+pub(crate) fn resolve_peer_offer_attribution(
+    fields: &crate::access::client_key::ClientKeyOfferFields,
+    local_card_id: &str,
+    client_nonce: &str,
+    sdp: &str,
+    now_unix_ms: i64,
+    iam_state: Option<&crate::access::iam::LocalIamState>,
+) -> Result<Option<crate::dashboard_control::PeerAttribution>, String> {
+    let verified = match fields.verify(local_card_id, client_nonce, sdp, now_unix_ms)? {
+        Some(verified) => verified,
+        None => return Ok(None),
+    };
+    let enrolled_label = iam_state.and_then(|state| {
+        crate::access::iam::principal_for_client_key(
+            state,
+            &verified.fingerprint,
+            "peer-dashboard-control",
+        )
+        .map(|principal| principal.label)
+    });
+    Ok(Some(crate::dashboard_control::PeerAttribution {
+        fingerprint: verified.fingerprint,
+        public_key_b64u: verified.public_key_b64u,
+        enrolled_label,
+    }))
+}
+
 pub(crate) async fn handle_peer_dashboard_control_signal(
     session_id: String,
     signal: crate::peer::WebRtcSignal,
@@ -1474,6 +1592,7 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             sdp,
             advertise_tcp_via_url,
             client_nonce,
+            client_key,
         } => {
             let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
                 Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
@@ -1502,11 +1621,62 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                 });
                 return;
             };
+            // Delegation-lane attribution (docs/src/trust-tiers.md § Two
+            // lanes). The transport edge resolves the ambient IAM state;
+            // the resolution itself is the testable core below.
+            let cert_dir = crate::access::backend::select_backend().cert_dir();
+            let iam_state = crate::access::iam::load_state(&cert_dir).ok();
+            let attributed = match resolve_peer_offer_attribution(
+                &client_key,
+                registry.local_card_id().as_str(),
+                client_nonce.as_deref().unwrap_or(""),
+                &sdp,
+                crate::access::client_key::now_unix_ms(),
+                iam_state.as_ref(),
+            ) {
+                Ok(attributed) => attributed,
+                Err(reason) => {
+                    // Present-but-invalid signature: a relay tampering
+                    // with the handshake looks exactly like this — refuse
+                    // the offer rather than admit an unattributable
+                    // channel that claimed to be attributable.
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing dashboard-control offer: client-key attribution failed (session={session_id}): {reason}"
+                        ),
+                        turn: None,
+                    });
+                    return;
+                }
+            };
+            if let Some(attributed) = attributed.as_ref() {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "info".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dashboard-control offer attributed to {} (key {}…, via peer {}, session={session_id})",
+                        attributed
+                            .enrolled_label
+                            .as_deref()
+                            .unwrap_or("unenrolled key"),
+                        &attributed.fingerprint[..attributed.fingerprint.len().min(12)],
+                        identity.label,
+                    ),
+                    turn: None,
+                });
+            }
             let grant = crate::dashboard_control::DashboardControlGrant::Peer {
                 fingerprint: identity.fingerprint,
                 label: identity.label,
                 profile: identity.profile,
                 filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(cert_dir),
+                attributed,
             };
             match registry
                 .answer_offer_with_session_id_grant_and_tcp(
@@ -1570,6 +1740,18 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             }
         }
         crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping dashboard-control ICE without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
             let candidate = match serde_json::from_str::<serde_json::Value>(&candidate_json) {
                 Ok(candidate) => candidate,
                 Err(e) => {
@@ -1585,15 +1767,38 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
                     return;
                 }
             };
-            match registry.add_ice_candidate(&session_id, &candidate).await {
-                Ok(true) => {}
-                Ok(false) => {
+            let caller = crate::dashboard_control::DashboardControlGrant::Peer {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
+                attributed: None,
+            };
+            match registry
+                .add_ice_candidate_for_grant(&session_id, &candidate, &caller)
+                .await
+            {
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::Applied) => {}
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::NotFound) => {
                     bus.send(AppEvent::LogEntry {
                         session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
                             "dropping dashboard-control ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Ok(crate::dashboard_control::DashboardControlSessionMutation::Forbidden) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "refusing cross-peer dashboard-control ICE for session {session_id}"
                         ),
                         turn: None,
                     });
@@ -1612,7 +1817,40 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
             }
         }
         crate::peer::WebRtcSignal::Close => {
-            registry.close(&session_id).await;
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping dashboard-control close without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            let caller = crate::dashboard_control::DashboardControlGrant::Peer {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+                identity_record: identity.record,
+                iam_cert_dir: Some(crate::access::backend::select_backend().cert_dir()),
+                attributed: None,
+            };
+            if registry.close_for_grant(&session_id, &caller).await
+                == crate::dashboard_control::DashboardControlSessionMutation::Forbidden
+            {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "refusing cross-peer dashboard-control close for session {session_id}"
+                    ),
+                    turn: None,
+                });
+            }
         }
         crate::peer::WebRtcSignal::Answer { .. } => {
             bus.send(AppEvent::LogEntry {
@@ -1637,6 +1875,7 @@ pub(crate) async fn handle_peer_dashboard_control_signal(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn handle_federated_webrtc_signal(
     display_id: u32,
     session_id: String,
@@ -1652,12 +1891,15 @@ pub(crate) async fn handle_federated_webrtc_signal(
     // (see [`DisplayInputHolder::FederatedWebRtc`]). The remaining
     // refs route to the same shared registry + broadcast the local 5c
     // path uses, so cross-provenance arbitration (local takes from
-    // federated and vice versa) goes through one source of truth.
+    // federated and vice versa) goes through one source of truth. The
+    // live predicate is bound by the caller to the exact opening peer/IAM
+    // grant and federation-WS lifetime; both the authority handler and the
+    // queued-input guard re-evaluate it instead of retaining a bool snapshot.
     federation_connection_id: String,
-    display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    display_input_authority: Arc<DisplayInputAuthority>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     federated_authority_subscribers: FederatedAuthoritySubscribers,
-    federated_display_input_allowed: bool,
+    federated_display_input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) {
     // Short tag used as the `source` on every log line this handler
     // emits, so the operator can filter the session log to just the
@@ -1718,13 +1960,15 @@ pub(crate) async fn handle_federated_webrtc_signal(
         }
     };
 
-    // Stable PeerId per session_id. Same string hashes to the same
-    // u64, so subsequent IceCandidate / Close signals — and the
-    // federation WS-close cleanup path — all route to the same
-    // WebRtcPeer in the session's peer map. Centralized via
-    // `peer_id_for_federated_session` so the cleanup path can't drift
-    // from this derivation.
-    let peer_id: crate::display::PeerId = peer_id_for_federated_session(&session_id);
+    // Stable PeerId per authenticated federation connection + browser
+    // session. The browser session id is connection-scoped, so including both
+    // prevents another connection from replacing or tearing down this peer.
+    // Subsequent IceCandidate / Close signals — and federation WS-close
+    // cleanup — use the same centralized derivation.
+    let peer_id: crate::display::PeerId = crate::display_peer_ids::peer_id_for_federated_session(
+        &federation_connection_id,
+        &session_id,
+    );
 
     match signal {
         crate::peer::WebRtcSignal::Offer {
@@ -1793,33 +2037,32 @@ pub(crate) async fn handle_federated_webrtc_signal(
             // shape to the local 5c authorizer above — the closure is
             // the entire boundary, `display/mod.rs` doesn't see the
             // registry. Strict deny-by-default for unclaimed (no
-            // holder); only the matching federated holder identity
-            // returns true. See [`build_federated_input_authorizer`]
-            // for the matching positive/negative test cases.
-            let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
-                if federated_display_input_allowed {
-                    build_federated_input_authorizer(
-                        display_id,
-                        federation_connection_id.clone(),
-                        session_id.clone(),
-                        Arc::clone(&display_input_authority),
-                    )
-                } else {
-                    Arc::new(|| false)
-                };
+            // holder); only a still-authorized session with the matching
+            // federated holder identity returns true. The display queue
+            // retains this closure and checks it again before injection.
+            // See [`build_federated_input_authorizer`] for the matching
+            // positive, holder-handoff, and live-revocation tests.
+            let input_authorized = build_federated_input_authorizer(
+                display_id,
+                federation_connection_id.clone(),
+                session_id.clone(),
+                Arc::clone(&display_input_authority),
+                Arc::clone(&federated_display_input_authorized),
+            );
             // F-1.3b3: real federated authority handler. Identity is
             // captured at construction so messages from this peer
             // always arbitrate against this peer's
             // `(federation_connection_id, session_id)`. Display-ID
             // mismatches drop silently (the federated peer is bound
-            // to one display).
+            // to one display). Authority requests also recheck the live
+            // session predicate so a revoked peer cannot reclaim the slot.
             let authority_handler = build_federated_authority_handler(
                 display_id,
                 federation_connection_id.clone(),
                 session_id.clone(),
                 Arc::clone(&display_input_authority),
                 authority_change_tx.clone(),
-                federated_display_input_allowed,
+                Arc::clone(&federated_display_input_authorized),
             );
             let answer_result = session
                 .handle_offer(
@@ -1829,7 +2072,10 @@ pub(crate) async fn handle_federated_webrtc_signal(
                     Some(tcp_peer_registry.clone()),
                     tcp_advertised_addr,
                     ice_tx,
-                    input_authorized,
+                    crate::display::BrowserInputAuthorization::versioned(
+                        input_authorized,
+                        display_input_authority.revision(display_id),
+                    ),
                     authority_handler,
                 )
                 .await;
@@ -2118,7 +2364,20 @@ pub(crate) async fn peers_delegate_task(
         Err(resp) => return resp,
     };
     match handle.delegate_task(task).await {
-        Ok(task_id) => (200, serde_json::json!({"task_id": task_id.0}).to_string()),
+        // `delivery` distinguishes a peer-acknowledged dispatch
+        // ("acknowledged": task_id is the peer's real session id) from
+        // the fire-and-forget fallback ("unconfirmed": older peer or
+        // repeatedly dropped link; task_id is a sender-side marker).
+        Ok(delegation) => (
+            200,
+            serde_json::json!({
+                "task_id": delegation.task_id.0,
+                "delegation_id": delegation.delegation_id,
+                "delivery": if delegation.confirmed { "acknowledged" } else { "unconfirmed" },
+                "sends": delegation.sends,
+            })
+            .to_string(),
+        ),
         Err(e) => peer_error_response(e),
     }
 }
@@ -2277,6 +2536,8 @@ pub(crate) async fn coordinator_route(
             serde_json::json!({
                 "peer_id": routed.peer_id.as_str(),
                 "task_id": routed.task_id.0,
+                "delegation_id": routed.delegation_id,
+                "delivery": if routed.confirmed { "acknowledged" } else { "unconfirmed" },
             })
             .to_string(),
         ),
@@ -2322,6 +2583,7 @@ pub(crate) fn peer_filesystem_query_request(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn peer_identity_allows_operation(
     identity: Option<&PeerConnectionIdentity>,
     op: crate::peer::access_policy::PeerOperation,
@@ -2353,6 +2615,123 @@ pub(crate) fn is_public_peer_access_request_path(request_line: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn iam_state_with_enrolled_key(fingerprint: &str) -> crate::access::iam::LocalIamState {
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:client:tablet".to_string(),
+            kind: "browser_certificate".to_string(),
+            label: "Living-room tablet".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "client_key",
+                "fingerprint": fingerprint,
+            })],
+            notes: None,
+            created_at_unix_ms: Some(1),
+        });
+        // The lookup binds a principal only through an active grant.
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:client:tablet".to_string(),
+            principal_id: "principal:client:tablet".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:operator".to_string(),
+            policy_id: String::new(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: String::new(),
+            created_at_unix_ms: Some(1),
+            revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
+            issued_via: None,
+            fs_scope: None,
+        });
+        state
+    }
+
+    #[test]
+    fn peer_offer_attribution_absent_fields_admit_unattributed() {
+        let attributed = resolve_peer_offer_attribution(
+            &Default::default(),
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            1_700_000_000_000,
+            None,
+        )
+        .expect("absent fields are not an error");
+        assert!(attributed.is_none());
+    }
+
+    #[test]
+    fn peer_offer_attribution_binds_valid_signature_and_enrollment() {
+        use crate::access::client_key::test_support::{generate_key, sign};
+        let key = generate_key();
+        let ts = 1_700_000_000_000;
+        let fields = crate::access::client_key::ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign(&key, "daemon-b", "nonce-1", "v=0 sdp", ts)),
+            client_key_ts: Some(ts),
+            ..Default::default()
+        };
+        // Unenrolled key: attributed, no label.
+        let attributed = resolve_peer_offer_attribution(
+            &fields,
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            ts + 500,
+            None,
+        )
+        .expect("valid signature verifies")
+        .expect("attribution present");
+        assert!(attributed.enrolled_label.is_none());
+        assert!(!attributed.fingerprint.is_empty());
+        // Enrolled key: the principal's label rides along.
+        let state = iam_state_with_enrolled_key(&attributed.fingerprint);
+        let enrolled = resolve_peer_offer_attribution(
+            &fields,
+            "daemon-b",
+            "nonce-1",
+            "v=0 sdp",
+            ts + 500,
+            Some(&state),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            enrolled.enrolled_label.as_deref(),
+            Some("Living-room tablet")
+        );
+    }
+
+    #[test]
+    fn peer_offer_attribution_refuses_spliced_or_misdirected_offers() {
+        use crate::access::client_key::test_support::{generate_key, sign};
+        let key = generate_key();
+        let ts = 1_700_000_000_000;
+        let fields = crate::access::client_key::ClientKeyOfferFields {
+            client_key: Some(key.raw_point_b64u.clone()),
+            client_key_sig: Some(sign(&key, "daemon-b", "nonce-1", "v=0 sdp", ts)),
+            client_key_ts: Some(ts),
+            ..Default::default()
+        };
+        // A relay swapping the SDP (splice), the nonce, or forwarding the
+        // signed offer to a different target must all fail closed.
+        for (card, nonce, sdp) in [
+            ("daemon-b", "nonce-1", "v=0 TAMPERED"),
+            ("daemon-b", "nonce-2", "v=0 sdp"),
+            ("daemon-c", "nonce-1", "v=0 sdp"),
+        ] {
+            assert!(
+                resolve_peer_offer_attribution(&fields, card, nonce, sdp, ts + 500, None).is_err(),
+                "must refuse: card={card} nonce={nonce} sdp={sdp}"
+            );
+        }
+    }
+
     #[test]
     fn public_peer_access_request_path_is_narrow() {
         assert!(is_public_peer_access_request_path(
@@ -2374,11 +2753,31 @@ mod tests {
     }
 
     #[test]
-    fn http_access_principal_maps_root_and_peer_routes() {
+    fn http_access_principal_maps_explicit_owner_and_peer_routes() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let root = http_access_context(tmp.path(), None, Some("unbound-fp"), true, true).unwrap();
-        assert_eq!(root.principal.kind, "root_session");
-        assert_eq!(root.principal.source, "browser-mtls");
+        crate::access::certs::ensure_certs(
+            tmp.path(),
+            &crate::access::certs::ServerNames::new(
+                "127.0.0.1".parse().unwrap(),
+                Vec::<std::net::IpAddr>::new(),
+                Vec::<String>::new(),
+            )
+            .unwrap(),
+            "owner",
+            false,
+        )
+        .unwrap();
+        let owner_fingerprint =
+            crate::access::certs::read_owner_client_cert_fingerprint(tmp.path()).unwrap();
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(tmp.path())
+                .unwrap()
+        );
+        let root =
+            http_access_context(tmp.path(), None, Some(&owner_fingerprint), true, true).unwrap();
+        assert_eq!(root.principal.kind, "browser_certificate");
+        assert_eq!(root.principal.source, "local_iam_state");
+        assert_eq!(root.principal.role_id, "role:root");
         assert_eq!(root.principal.transport, "https");
         assert_eq!(
             root.principal
@@ -2393,11 +2792,20 @@ mod tests {
                 .allowed
         );
 
+        let unknown = http_access_context(tmp.path(), None, Some("aabbccdd"), true, true).unwrap();
+        assert_eq!(unknown.principal.role_id, "role:none");
+        assert!(
+            !unknown
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+
         let peer_identity = PeerConnectionIdentity {
             fingerprint: "abc123".to_string(),
             label: "peer-a".to_string(),
             profile: "peer-operator".to_string(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            record: None,
         };
         let peer =
             http_access_context(tmp.path(), Some(&peer_identity), Some("abc123"), true, true)
@@ -2484,17 +2892,330 @@ mod tests {
         assert!(parsed["identities"][0]["revoked_at_unix"].is_number());
     }
 
-    /// Same `session_id` → same `PeerId` on every call. The Offer
-    /// arm in `handle_federated_webrtc_signal` derives the
-    /// `WebRtcPeer` key from this; WS-close cleanup must derive
-    /// the same key to find the inserted peer. A divergence here
-    /// would leak peers (cleanup would target a different key than
-    /// the one Offer inserted), which is exactly the bug the helper
-    /// extraction prevents.
+    // ── S7 golden transcripts: the peers sub-router + coordinator ──
+    //
+    // Byte pins captured BEFORE the family's neutral-core conversion
+    // (design §6 S7, risk R1). The family predates the posture-derived
+    // CORS renderers: both handlers answer under a hand-rolled
+    // wildcard tail — `Cache-Control`, `Access-Control-Allow-Origin: *`,
+    // a per-handler `Access-Control-Allow-Methods` list,
+    // `Access-Control-Allow-Headers: Content-Type`, `Connection: close`
+    // — with the family's own reason ladder (notably `502 Bad Gateway`,
+    // which the relay-failure paths produce; those need a connected
+    // failing peer and stay smoke-covered by the peer validators).
+    // Store-dependent leaves run over injected tempdir cert stores and
+    // a fresh in-memory registry (hermeticity convention) — never the
+    // machine's real peer or cert state.
+
+    async fn collect_peers_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> String
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(DemuxStream::new(Box::pin(server))).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// The peers sub-router's historical JSON framing, spelled out
+    /// literally.
+    fn golden_peers_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The coordinator's historical framing: same tail, POST-only
+    /// methods list.
+    fn golden_coordinator_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn empty_test_registry() -> crate::peer::PeerRegistry {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        crate::peer::PeerRegistry::new(log_tx)
+    }
+
+    async fn peers_sub_router_transcript(
+        method: &str,
+        path: &str,
+        body: &str,
+        cert_dir: &Path,
+        registry: Option<crate::peer::PeerRegistry>,
+    ) -> String {
+        let request_line = format!("{method} {path} HTTP/1.1");
+        let cert_dir = cert_dir.to_path_buf();
+        let body = body.to_string();
+        collect_peers_handler_response(move |stream| async move {
+            handle_peers_sub_router(
+                stream,
+                body,
+                &request_line,
+                method,
+                cert_dir,
+                EventBus::new(),
+                None,
+                registry,
+            )
+            .await;
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn golden_peers_sub_router_transcripts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cert_dir = tmp.path();
+
+        // No registry wired in: every non-pairing leaf answers the
+        // deterministic 503.
+        let response = peers_sub_router_transcript("GET", "/api/peers", "", cert_dir, None).await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "503 Service Unavailable",
+                &serde_json::json!({"error": "peer registry not configured"}).to_string(),
+            )
+        );
+
+        // Empty in-memory registry: the list leaf's 200.
+        let response = peers_sub_router_transcript(
+            "GET",
+            "/api/peers",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"peers": []}).to_string())
+        );
+
+        // Unknown per-peer op: the handler-owned JSON 404.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/nope/badop",
+            "{}",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "unknown peer op: badop"}).to_string(),
+            )
+        );
+
+        // Absent peer on a quick control (body decodes first): the
+        // peer_handle_or_404 shape.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/nope/message",
+            &serde_json::json!({"text": "hi"}).to_string(),
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "peer not found: nope"}).to_string(),
+            )
+        );
+
+        // Undeclared method on the registry root: the handler-owned 405.
+        let response = peers_sub_router_transcript(
+            "PUT",
+            "/api/peers",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "405 Method Not Allowed",
+                &serde_json::json!({"error": "method not allowed"}).to_string(),
+            )
+        );
+
+        // Eligible without a capability: the query-string 400 (also
+        // pins the path/query split on the request-line token).
+        let response = peers_sub_router_transcript(
+            "GET",
+            "/api/peers/eligible",
+            "",
+            cert_dir,
+            Some(empty_test_registry()),
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": "at least one ?capability=... is required"})
+                    .to_string(),
+            )
+        );
+
+        // Pairing invite, unparseable body: the decode 400 (answers
+        // before any store or listener state is touched).
+        let invalid = "{not-json";
+        let serde_error = serde_json::from_str::<PairingInviteRequest>(invalid)
+            .err()
+            .expect("invite body must not decode");
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/pairing/invite",
+            invalid,
+            cert_dir,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                    .to_string(),
+            )
+        );
+
+        // Pairing reads over the injected empty store.
+        let response =
+            peers_sub_router_transcript("GET", "/api/peers/pairing/requests", "", cert_dir, None)
+                .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"requests": []}).to_string())
+        );
+        let response =
+            peers_sub_router_transcript("GET", "/api/peers/pairing/identities", "", cert_dir, None)
+                .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript("200 OK", &serde_json::json!({"identities": []}).to_string())
+        );
+
+        // Unknown pairing decision op: the handler's own 404.
+        let response = peers_sub_router_transcript(
+            "POST",
+            "/api/peers/pairing/requests/zzz/badop",
+            "",
+            cert_dir,
+            None,
+        )
+        .await;
+        assert_eq!(
+            response,
+            golden_peers_transcript(
+                "404 Not Found",
+                &serde_json::json!({"error": "unknown pairing request decision"}).to_string(),
+            )
+        );
+    }
+
+    /// The family's pre-conversion handlers carried their own reason
+    /// ladder; the neutral core renders through the shared
+    /// `status_reason`. For every status the leaves can produce
+    /// (peer_error_response's 404/405/502/500, the decode 400s, the
+    /// registry 503s, and 200) the two ladders agree — pinned here so
+    /// the 502 relay class (unreachable in a hermetic fixture) keeps
+    /// its historical `Bad Gateway` status line.
+    #[test]
+    fn peers_family_reason_ladder_is_preserved() {
+        for (status, legacy_reason) in [
+            (200, "OK"),
+            (400, "Bad Request"),
+            (404, "Not Found"),
+            (405, "Method Not Allowed"),
+            (500, "Internal Server Error"),
+            (502, "Bad Gateway"),
+            (503, "Service Unavailable"),
+        ] {
+            assert_eq!(status_reason(status), format!("{status} {legacy_reason}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn golden_coordinator_route_transcripts() {
+        async fn coordinator_transcript(
+            method: &str,
+            body: &str,
+            registry: Option<crate::peer::PeerRegistry>,
+        ) -> String {
+            let method = method.to_string();
+            let body = body.to_string();
+            collect_peers_handler_response(move |stream| async move {
+                handle_coordinator_route(stream, body, &method, registry).await;
+            })
+            .await
+        }
+
+        // No registry: the deterministic 503.
+        let response = coordinator_transcript("POST", "{}", None).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "503 Service Unavailable",
+                &serde_json::json!({"error": "peer registry not configured"}).to_string(),
+            )
+        );
+
+        // Wrong method with a registry: the handler-owned 405.
+        let response = coordinator_transcript("GET", "", Some(empty_test_registry())).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "405 Method Not Allowed",
+                &serde_json::json!({"error": "method not allowed"}).to_string(),
+            )
+        );
+
+        // Unparseable body: the decode 400.
+        let invalid = "{not-json";
+        let serde_error = serde_json::from_str::<CoordinatorRouteRequest>(invalid)
+            .err()
+            .expect("coordinator body must not decode");
+        let response = coordinator_transcript("POST", invalid, Some(empty_test_registry())).await;
+        assert_eq!(
+            response,
+            golden_coordinator_transcript(
+                "400 Bad Request",
+                &serde_json::json!({"error": format!("invalid request body: {serde_error}")})
+                    .to_string(),
+            )
+        );
+    }
+
+    /// Same federation connection + `session_id` → same `PeerId` on every
+    /// call. The Offer arm in `handle_federated_webrtc_signal` derives the
+    /// `WebRtcPeer` key from this; WS-close cleanup must derive the same key to
+    /// find the inserted peer. A divergence here would leak peers (cleanup
+    /// would target a different key than the one Offer inserted), which is
+    /// exactly the bug the helper extraction prevents.
     #[test]
     fn peer_id_for_federated_session_is_deterministic() {
-        let a = peer_id_for_federated_session("sess-A");
-        let b = peer_id_for_federated_session("sess-A");
-        assert_eq!(a, b, "the same session id must hash to the same peer id");
+        let a = crate::display_peer_ids::peer_id_for_federated_session("connection-A", "sess-A");
+        let b = crate::display_peer_ids::peer_id_for_federated_session("connection-A", "sess-A");
+        assert_eq!(
+            a, b,
+            "the same connection/session pair must hash to the same peer id"
+        );
     }
 }

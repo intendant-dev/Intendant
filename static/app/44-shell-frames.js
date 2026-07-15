@@ -138,6 +138,9 @@ function utf8ToBase64(s) {
 
 // Send a raw WS message object by going through the WASM app's send_raw.
 // Falls back to send_server_action if send_raw isn't available.
+// Returns whether the frame reached an open /ws (only an explicit false
+// from the wasm send refuses — QA stubs return undefined); a refused send
+// kicks the event-lane fallback so the tunnel comes up.
 function sendRawMessage(obj) {
   if (dashboardConnectModeEnabled()) {
     console.warn('[dashboard-control] legacy WebSocket message unavailable in Connect mode', obj?.t || obj);
@@ -145,15 +148,16 @@ function sendRawMessage(obj) {
   }
   if (!app) return false;
   const payload = JSON.stringify(obj);
+  let sent = false;
   if (app.send_raw) {
-    app.send_raw(payload);
-    return true;
+    sent = app.send_raw(payload) !== false;
+  } else if (app.send_server_action) {
+    sent = app.send_server_action(obj) !== false;
   }
-  if (app.send_server_action) {
-    app.send_server_action(obj);
-    return true;
+  if (!sent && typeof dashboardTriggerEventLaneFallback === 'function') {
+    dashboardTriggerEventLaneFallback('legacy /ws frame found no open event lane');
   }
-  return false;
+  return sent;
 }
 
 const dashboardPresenceWarned = new Set();
@@ -248,14 +252,23 @@ function dashboardControlServerSender(message) {
     return true;
   }
   if (message.action) {
-    if (!dashboardTransport || !dashboardTransport.canUseRpc || !dashboardTransport.canUseRpc()) {
+    // Transport F7: voice actions ride the facade's request verb. This is
+    // a Connect-only path (guarded at the top of this function) and
+    // api_control_msg is WS-twin residue, so the tunnel is the only lane —
+    // the availability derivation also folds in the daemon's own word
+    // (denied session / too-old daemon) instead of firing RPCs that can
+    // only bounce.
+    if (!daemonApi.availability('api_control_msg').ok) {
       dashboardWarnPresenceOnce(
         'control_action',
         '[dashboard-control] voice action unavailable until dashboard access reconnects'
       );
       return false;
     }
-    dashboardTransport.request('api_control_msg', { message }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (!resp.ok) console.warn('[dashboard-control] voice action RPC refused', resp.body?.error || resp.status);
+      })
       .catch(err => console.warn('[dashboard-control] voice action RPC failed', err));
     return true;
   }
@@ -592,6 +605,56 @@ function ui2ShellTheme() {
   };
 }
 
+// ── Terminal appearance settings (item 9) ──
+// CONTRACT with the Appearance settings pane (owned elsewhere): it writes
+// the two localStorage keys below and, for same-tab immediacy, dispatches
+// the `intendant-term-appearance` custom event on window (cross-tab edits
+// arrive via the native `storage` event). Values are parsed defensively
+// and clamped; anything unparsable falls back to the historical defaults
+// (fontSize 13, scrollback 5000).
+const TERM_FONT_SIZE_KEY = 'intendant.ui2.termFontSize';
+const TERM_SCROLLBACK_KEY = 'intendant.ui2.termScrollback';
+
+function termAppearanceSettings() {
+  const clampInt = (raw, lo, hi, dflt) => {
+    const n = Math.round(Number(raw));
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  let fontRaw = null;
+  let scrollRaw = null;
+  try {
+    fontRaw = window.localStorage ? localStorage.getItem(TERM_FONT_SIZE_KEY) : null;
+    scrollRaw = window.localStorage ? localStorage.getItem(TERM_SCROLLBACK_KEY) : null;
+  } catch { /* storage disabled (private mode etc.) — use defaults */ }
+  return {
+    fontSize: (fontRaw === null || fontRaw === '') ? 13 : clampInt(fontRaw, 8, 24, 13),
+    scrollback: (scrollRaw === null || scrollRaw === '') ? 5000 : clampInt(scrollRaw, 1000, 100000, 5000),
+  };
+}
+
+// Apply the font size to the live terminal (scrollback deliberately only
+// applies at terminal creation — i.e. the next dashboard load, since the
+// shell terminal is created once per page).
+function applyTermAppearanceLive() {
+  if (!shellTerm) return;
+  const { fontSize } = termAppearanceSettings();
+  if (shellTerm.options.fontSize !== fontSize) {
+    shellTerm.options.fontSize = fontSize;
+    if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+  }
+}
+
+// Cross-tab (and DevTools) edits: the storage event carries the key; a
+// null key means clear() — re-apply in both cases.
+window.addEventListener('storage', (e) => {
+  if (e.key === null || e.key === TERM_FONT_SIZE_KEY || e.key === TERM_SCROLLBACK_KEY) {
+    applyTermAppearanceLive();
+  }
+});
+// Same-tab edits from the Appearance settings pane.
+window.addEventListener('intendant-term-appearance', applyTermAppearanceLive);
+
 // Loads the vendored xterm.js on first use. Sends
 // terminal_open / terminal_input / terminal_resize / terminal_close
 // messages to the server; handleShellOutput/handleShellExited receive
@@ -609,11 +672,12 @@ function initShell() {
     // if the tokens ever fail to resolve.
     const theme = ui2ShellTheme() || undefined;
     const mono = getComputedStyle(document.documentElement).getPropertyValue('--mono').trim();
+    const appearance = termAppearanceSettings();
     shellTerm = new Terminal({
       theme,
       fontFamily: mono || "'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace",
-      fontSize: 13, allowProposedApi: true,
-      scrollback: 5000,
+      fontSize: appearance.fontSize, allowProposedApi: true,
+      scrollback: appearance.scrollback,
       cursorBlink: true,
     });
     shellFitAddon = new FitAddon.FitAddon();

@@ -27,7 +27,7 @@ const CLAUDE_CODE_BOOTSTRAP_ADDENDUM: &str = r#"
 
 ### Intendant Supervision
 This session runs under Intendant, which adds desktop and display capabilities beyond your own tools:
-- The connected `intendant` MCP server carries the bootstrap set: `read_screen` for the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame), `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for giving the user live dashboard visibility into agent-owned displays (sandboxes, VMs, virtual displays). Sharing the user's own screen (`user_session`) is an explicit opt-in the user initiates; input authority is only ever granted by the user from the dashboard.
+- The connected `intendant` MCP server carries the bootstrap set: `read_screen` for the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame), `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `clear_shared_view_focus`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for giving the user live dashboard visibility into agent-owned displays (sandboxes, VMs, virtual displays). Sharing the user's own screen (`user_session`) is an explicit opt-in the user initiates; input authority is only ever granted by the user from the dashboard.
 - The broad control surface (browser workspaces, frames, approvals, tasks, audio) is discovered lazily through the CLI: run `"$INTENDANT" ctl --help`, then focused help like `"$INTENDANT" ctl cu actions --help`. `ctl tools list` / `ctl tools schema TOOL` / `ctl tools call TOOL` cover anything not wrapped.
 - When the user should visually stay in the loop (demoing a result, watching you operate a GUI or browser, an auth handoff), open the shared view with `show_shared_view` before acting and `hide_shared_view` when the moment is over.
 - Do not drive the desktop with `cliclick`/`osascript`/`xdotool` or ad-hoc scripts — go through the Intendant tools so actions run under the user's approval settings.
@@ -170,9 +170,9 @@ struct CcShared {
     /// `GoalUpdated`/`GoalCleared` rails (window chip, log persistence, and
     /// replay all come for free from the Codex-built plumbing).
     goal: StdMutex<GoalEngine>,
-    /// Fresh tokens spent by this process — uncached input + cache creation
-    /// + output, accumulated per result. The goal-budget currency: cache
-    /// reads are excluded so a budget measures real work, not re-reads.
+    /// Fresh tokens spent by this process — uncached input + cache creation +
+    /// output, accumulated per result. The goal-budget currency: cache reads
+    /// are excluded so a budget measures real work, not re-reads.
     cumulative_fresh_tokens: AtomicU64,
     /// True while a turn runs (user message written, result pending). Goal
     /// notices are written mid-turn (absorbed by the running turn) instead
@@ -233,7 +233,10 @@ impl CcShared {
 
 /// Human preview for a tool invocation: shell command, file path (plus the
 /// model's own description when present), or a truncated JSON dump.
-fn tool_input_preview(input: &serde_json::Value) -> String {
+/// `pub(crate)`: the disk-transcript reconstruction
+/// (`session_catalog::transcripts::parse_claude_session_entries`) builds the
+/// same preview so hydrated tool-call rows are byte-identical to live ones.
+pub(crate) fn tool_input_preview(input: &serde_json::Value) -> String {
     let raw = if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
         cmd.to_string()
     } else if let Some(path) = input.get("file_path").and_then(|p| p.as_str()) {
@@ -436,8 +439,14 @@ fn usage_snapshot_from_api_usage(
     if tokens_used == 0 {
         return None;
     }
-    let usage_pct = if context_window > 0 {
-        (tokens_used as f64 / context_window as f64) * 100.0
+    // A footprint above the window means the WINDOW figure is stale, not
+    // that the context is over-full (a resumed 1M-window session divided by
+    // the 200k default read >100% until the first result corrected it).
+    // Divide by the larger of the two: the meter tops out at 100% and the
+    // corrected window restores precision on the next result.
+    let effective_window = context_window.max(tokens_used);
+    let usage_pct = if effective_window > 0 {
+        (tokens_used as f64 / effective_window as f64) * 100.0
     } else {
         0.0
     };
@@ -462,12 +471,13 @@ fn usage_snapshot_from_api_usage(
         provider: "anthropic".to_string(),
         model: model.to_string(),
         tokens_used,
-        context_window,
-        hard_context_window: Some(context_window),
+        context_window: effective_window,
+        hard_context_window: Some(effective_window),
         usage_pct,
         prompt_tokens,
         completion_tokens: output,
         cached_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
         last_cache_read_tokens: cache_read,
         last_cache_creation_tokens: cache_creation,
         last_uncached_input_tokens: input,
@@ -810,12 +820,13 @@ impl CcReader {
                     }
                     _ => self.handle_user(&msg, &mut child_out, Some(child_id.as_str())),
                 }
-                out.events.extend(child_out.events.into_iter().map(|ev| match ev {
-                    // Already-scoped events (a nested task's terminal state
-                    // targets the grandchild) keep their own scope.
-                    ev @ AgentEvent::Scoped { .. } => ev,
-                    ev => AgentEvent::scoped(Some(child_id.clone()), None, ev),
-                }));
+                out.events
+                    .extend(child_out.events.into_iter().map(|ev| match ev {
+                        // Already-scoped events (a nested task's terminal state
+                        // targets the grandchild) keep their own scope.
+                        ev @ AgentEvent::Scoped { .. } => ev,
+                        ev => AgentEvent::scoped(Some(child_id.clone()), None, ev),
+                    }));
                 out.outbound.extend(child_out.outbound);
                 return out;
             }
@@ -840,7 +851,11 @@ impl CcReader {
     /// transcript replay, or a spawn that predates this supervisor). The
     /// registration event this may push must stay unscoped: the drain
     /// learns the child→parent route from it.
-    fn task_scope_for(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) -> Option<String> {
+    fn task_scope_for(
+        &mut self,
+        msg: &serde_json::Value,
+        out: &mut CcLineOutcome,
+    ) -> Option<String> {
         let ptid = msg
             .get("parent_tool_use_id")
             .and_then(|v| v.as_str())
@@ -848,6 +863,14 @@ impl CcReader {
             .filter(|s| !s.is_empty())?
             .to_string();
         if !self.task_children.contains_key(&ptid) {
+            // The lazy path exists for resume replays whose Agent tool_use
+            // was never observed. An id currently open as an ordinary tool
+            // is that command's own tool_use, never a spawn scope — route
+            // such envelopes to the main thread instead of materializing a
+            // ghost child (the task_started guard's belt, mirrored here).
+            if self.open_tools.contains_key(&ptid) {
+                return None;
+            }
             let spawn = CcTaskSpawn {
                 description: msg
                     .get("task_description")
@@ -1048,8 +1071,12 @@ impl CcReader {
             }
             // task_progress duplicates what the child's scoped tool events
             // already show live; task_updated's terminal patch is followed
-            // by the authoritative task_notification.
-            Some("task_progress") | Some("task_updated") => return,
+            // by the authoritative task_notification;
+            // background_tasks_changed (2.1.206) mirrors the background-task
+            // tray, which the per-task signals already cover.
+            Some("task_progress") | Some("task_updated") | Some("background_tasks_changed") => {
+                return
+            }
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
@@ -1112,10 +1139,19 @@ impl CcReader {
         }
     }
 
-    /// `system:task_started`: the spawn signal for an async sub-agent.
-    /// Usually the Agent tool_use block already registered the child; this
-    /// event contributes the `task_id` correlation key (and is the
-    /// registration fallback if the tool_use was never seen).
+    /// `system:task_started`: the spawn signal for an async task. Usually
+    /// the Agent tool_use block already registered the child; this event
+    /// contributes the `task_id` correlation key (and is the registration
+    /// fallback if the tool_use was never seen).
+    ///
+    /// Only *sub-agent* tasks may register a child session: since 2.1.206
+    /// the task system also announces background and auto-backgrounded
+    /// Bash commands (`task_type:"local_bash"`), and registering those
+    /// opens one ghost child window per slow command. Agent tasks are
+    /// identified affirmatively — `task_type` naming an agent
+    /// (`local_agent`), or, on CLIs predating `task_type`, a
+    /// `subagent_type`/`prompt` field. An id that is already open as an
+    /// ordinary tool is that command's own tool_use, never a spawn.
     fn handle_task_started(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let tool_use_id = msg
             .get("tool_use_id")
@@ -1125,6 +1161,9 @@ impl CcReader {
         let Some(tool_use_id) = tool_use_id else {
             return;
         };
+        // The correlation key is recorded for every task kind: it only
+        // feeds task_notification's id resolution, and a stray entry for a
+        // Bash task resolves to an id with no registered child (no-op).
         if let Some(task_id) = msg
             .get("task_id")
             .and_then(|v| v.as_str())
@@ -1133,6 +1172,23 @@ impl CcReader {
         {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
+        }
+        // `subagent_type` only ever rides agent spawns (live-probed: Bash
+        // payloads carry neither it nor `prompt`), so its presence is
+        // affirmative regardless of task_type — a future CLI renaming the
+        // agent task kind (e.g. "subagent") must not drop registration
+        // while the field still identifies the spawn.
+        let is_agent_task = msg.get("subagent_type").and_then(|v| v.as_str()).is_some()
+            || match msg.get("task_type").and_then(|v| v.as_str()) {
+                Some(task_type) => task_type == "agent" || task_type.ends_with("_agent"),
+                // Pre-task_type CLIs (< 2.1.206) emitted task_started only
+                // for Agent spawns, and those payloads carried `prompt`
+                // (live-probed) — the affirmative check stays fail-closed
+                // for unknown task kinds.
+                None => msg.get("prompt").and_then(|v| v.as_str()).is_some(),
+            };
+        if !is_agent_task || self.open_tools.contains_key(tool_use_id) {
+            return;
         }
         if !self.task_children.contains_key(tool_use_id) {
             let spawn = CcTaskSpawn {
@@ -1619,6 +1675,16 @@ impl CcReader {
             if was_interrupt {
                 out.log("info", "Claude Code turn interrupted");
             } else {
+                // The budget backstop is cumulative for the process AND its
+                // resumes — without a hint this reads as a mystery failure.
+                let recovery_hint = (subtype == "error_max_budget_usd").then(|| {
+                    "The session hit its --max-budget-usd backstop (spend is \
+                     cumulative across resumes, and forks/side conversations \
+                     inherit the parent session's counted spend); raise \
+                     [agent.claude_code] max_budget_usd (or unset it) and \
+                     restart the session"
+                        .to_string()
+                });
                 out.events.push(AgentEvent::BackendError {
                     message: message
                         .clone()
@@ -1628,7 +1694,7 @@ impl CcReader {
                     details: None,
                     will_retry: false,
                     likely_generation_starvation: false,
-                    recovery_hint: None,
+                    recovery_hint,
                 });
             }
         }
@@ -1751,22 +1817,36 @@ impl CcReader {
             .get("rateLimitType")
             .and_then(|t| t.as_str())
             .unwrap_or("unknown");
-        // Vitals gauge: every event with a utilization updates the window
-        // (live wire: {"status":"allowed_warning","resetsAt":…,
-        // "rateLimitType":"seven_day","utilization":0.49}). Attached to
-        // the next usage snapshot rather than emitted on its own — an
-        // all-zero usage event would stomp the dashboard meter.
-        if let Some(utilization) = info.get("utilization").and_then(|v| v.as_f64()) {
-            self.limit_windows.insert(
-                kind.to_string(),
-                crate::types::SessionLimitWindow {
-                    label: cc_rate_limit_label(kind),
-                    used_pct: (utilization * 100.0).round().clamp(0.0, 100.0) as u8,
-                    resets_at_epoch: info.get("resetsAt").and_then(|v| v.as_u64()),
-                },
-            );
-        }
+        // Vitals gauge: every event updates its window. Older CLIs carried a
+        // `utilization` fraction; 2.1.2xx dropped it in normal operation
+        // (live wire: {"status":"allowed","resetsAt":…,"rateLimitType":
+        // "five_hour","overageStatus":…}), so the pct is optional and the
+        // status/reset still feed the gauge. A newer event without
+        // utilization keeps the last known pct — it says nothing about
+        // consumption, only about status. Attached to the next usage
+        // snapshot rather than emitted on its own — an all-zero usage event
+        // would stomp the dashboard meter.
         let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        let used_pct = info
+            .get("utilization")
+            .and_then(|v| v.as_f64())
+            .map(|utilization| (utilization * 100.0).round().clamp(0.0, 100.0) as u8);
+        let window = self
+            .limit_windows
+            .entry(kind.to_string())
+            .or_insert_with(|| crate::types::SessionLimitWindow {
+                label: cc_rate_limit_label(kind),
+                ..Default::default()
+            });
+        if used_pct.is_some() {
+            window.used_pct = used_pct;
+        }
+        if let Some(resets_at) = info.get("resetsAt").and_then(|v| v.as_u64()) {
+            window.resets_at_epoch = Some(resets_at);
+        }
+        if !status.is_empty() {
+            window.status = Some(status.to_string());
+        }
         if status.is_empty() || status == "allowed" {
             return;
         }
@@ -1856,9 +1936,17 @@ pub struct ClaudeCodeAgent {
     command: String,
     model: Option<String>,
     permission_mode: String,
-    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max);
-    /// `None` omits the flag.
+    /// Reasoning-effort level for `--effort` (low/medium/high/xhigh/max/
+    /// ultracode); `None` omits the flag.
     effort: Option<String>,
+    /// Hard dollar backstop for `--max-budget-usd`; `None` omits the flag.
+    /// On exceed the CLI fails every further turn with a `result` of
+    /// subtype `error_max_budget_usd` (probed 2.1.206) — cumulative across
+    /// the process, its resumes, AND forks (a forked child inherits the
+    /// parent's counted spend, probed: forking an over-budget parent fails
+    /// immediately). Deliberately still armed on forks — an uncapped
+    /// side/fork child would violate the operator's explicit ceiling.
+    max_budget_usd: Option<f64>,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
     working_dir: Option<PathBuf>,
@@ -1906,6 +1994,7 @@ impl ClaudeCodeAgent {
             model,
             permission_mode,
             effort: crate::project::normalize_claude_effort(effort.as_deref()),
+            max_budget_usd: None,
             allowed_tools,
             web_port,
             working_dir: None,
@@ -1923,6 +2012,23 @@ impl ClaudeCodeAgent {
             shared: Arc::new(CcShared::new(None)),
             control_counter: AtomicU64::new(0),
         }
+    }
+
+    /// Arm the CLI-enforced dollar backstop (`--max-budget-usd`). Kept out
+    /// of `new()` so the many existing constructor sites stay unchanged.
+    /// The value is kept verbatim and validated at `initialize`: a
+    /// non-positive or non-finite cap refuses the spawn instead of silently
+    /// disarming (fail-closed — and the CLI itself crashes on
+    /// `--max-budget-usd 0`, probed 2.1.206).
+    pub fn with_max_budget_usd(mut self, budget: Option<f64>) -> Self {
+        self.max_budget_usd = budget;
+        self
+    }
+
+    /// The configured budget when it cannot be passed to the CLI (zero,
+    /// negative, or non-finite). `initialize` refuses to spawn on `Some`.
+    fn invalid_max_budget(&self) -> Option<f64> {
+        self.max_budget_usd.filter(|b| !(b.is_finite() && *b > 0.0))
     }
 
     /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
@@ -1956,17 +2062,21 @@ impl ClaudeCodeAgent {
         }
     }
 
-    /// Deliver an operator-goal notice to the model: written immediately
-    /// when a turn is running (the turn absorbs it, no extra cost), queued
-    /// as a prelude on the next user message when idle (a standalone user
-    /// message would start — and pay for — a whole turn).
+    /// Deliver an operator-goal notice to the model: queued as a prelude on
+    /// the next user message, always. Mid-turn stdin writes were the old
+    /// delivery for running turns, but 2.1.2xx discards user lines while a
+    /// turn runs (see `steer_turn`) — the notice would silently vanish. A
+    /// standalone user message is no better: it would start — and pay for —
+    /// a whole turn. The prelude path costs nothing and cannot be dropped;
+    /// a notice raced by an in-flight turn reaches the model one turn later.
     async fn deliver_goal_notice(&mut self, notice: String) -> Result<(), CallerError> {
-        if self.shared.turn_active.load(Ordering::SeqCst) && self.writer.is_some() {
-            self.write_user_message(&notice).await
-        } else {
-            self.pending_goal_notice = Some(notice);
-            Ok(())
-        }
+        self.pending_goal_notice = match self.pending_goal_notice.take() {
+            // Coalesce an undelivered notice instead of overwriting it —
+            // both statements still reach the model, in order.
+            Some(previous) => Some(format!("{previous}\n{notice}")),
+            None => Some(notice),
+        };
+        Ok(())
     }
 
     /// Wrapper-level `/goal` engine (Claude Code has no native goals).
@@ -2034,10 +2144,7 @@ impl ClaudeCodeAgent {
     /// Live model switch. Only changes the RUNNING process (and the latch a
     /// respawn reads); the persisted per-session pin is the Launch-config
     /// overlay's job (`ConfigureSessionAgent`).
-    async fn set_model_live(
-        &mut self,
-        params: &serde_json::Value,
-    ) -> Result<String, CallerError> {
+    async fn set_model_live(&mut self, params: &serde_json::Value) -> Result<String, CallerError> {
         let model = params
             .get("model")
             .or_else(|| params.get("value"))
@@ -2075,7 +2182,7 @@ impl ClaudeCodeAgent {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 CallerError::ExternalAgent(
-                    "permission-mode requires a mode (default, acceptEdits, plan, bypassPermissions)"
+                    "permission-mode requires a mode (default, acceptEdits, plan, auto, dontAsk, bypassPermissions)"
                         .into(),
                 )
             })?;
@@ -2122,6 +2229,13 @@ impl ExternalAgent for ClaudeCodeAgent {
         &mut self,
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+        if let Some(budget) = self.invalid_max_budget() {
+            return Err(CallerError::ExternalAgent(format!(
+                "claude-code max_budget_usd must be a positive dollar amount, got {budget}; \
+                 unset [agent.claude_code] max_budget_usd to run without the backstop \
+                 (the claude CLI itself rejects --max-budget-usd 0)"
+            )));
+        }
         self.working_dir = Some(config.working_dir.clone());
         self.resume_session = config
             .resume_session
@@ -2175,6 +2289,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(ref effort) = self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
+        }
+
+        if let Some(budget) = self.max_budget_usd {
+            args.push("--max-budget-usd".into());
+            args.push(budget.to_string());
         }
 
         if !self.allowed_tools.is_empty() {
@@ -2332,10 +2451,11 @@ impl ExternalAgent for ClaudeCodeAgent {
             "permission-mode" | "permission_mode" | "permissions" => {
                 self.set_permission_mode_live(params).await
             }
-            // `fork` never reaches this method: the drain sees
-            // `ForkHandling::RespawnResume` and respawns instead.
+            // `fork` and `side`/`btw` never reach this method: the drain
+            // sees `ForkHandling::RespawnResume` and respawns instead
+            // (side carries the boundary + question as the first prompt).
             other => Err(CallerError::ExternalAgent(format!(
-                "thread action /{} not supported by Claude Code (supported: compact, fork, goal…, model, permission-mode)",
+                "thread action /{} not supported by Claude Code (supported: compact, fork, side, goal…, model, permission-mode)",
                 other
             ))),
         }
@@ -2370,14 +2490,26 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
-        // A user message written while a turn is running is absorbed into
-        // the running turn — Claude Code queues it and the model reads it
-        // between tool calls (verified against 2.1.200). That matches
-        // Intendant's steer contract exactly; no separate protocol needed.
-        if self.writer.is_none() {
-            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        // 2.1.200 absorbed a user message written mid-turn into the running
+        // turn; that was a bug, and 2.1.2xx removed it — the CLI silently
+        // DISCARDS stdin user lines while a turn is running (probed live on
+        // 2.1.207: the text never enters the conversation, no ack, no next
+        // turn; init capabilities advertise no replacement protocol yet).
+        // Writing the bytes anyway produced phantom "delivered" steers. So:
+        // report the truth and let the drain queue the steer for the turn
+        // boundary (the load-bearing "mid-turn steering not supported"
+        // wording — see external_steer_queue_reason), or, when no turn is
+        // running, hand it back as an immediate follow-up ("no active
+        // turn" marker).
+        let _ = text;
+        if !self.shared.turn_active.load(Ordering::SeqCst) {
+            return Err(CallerError::ExternalAgent(
+                "claude-code has no active turn to steer".into(),
+            ));
         }
-        self.write_user_message(text).await
+        Err(CallerError::ExternalAgent(
+            "mid-turn steering not supported by Claude Code 2.1.x — stream-json input applies user messages only at turn boundaries".into(),
+        ))
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
@@ -2529,6 +2661,55 @@ mod tests {
     }
 
     #[test]
+    fn invalid_max_budget_flags_nonpositive_for_spawn_refusal() {
+        // A bad cap must refuse the spawn (initialize errors on
+        // `invalid_max_budget().is_some()`), never silently disarm: the CLI
+        // crashes on --max-budget-usd 0, and dropping the flag would run the
+        // session uncapped against the operator's explicit ceiling.
+        let base =
+            || ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(2.5)).invalid_max_budget(),
+            None
+        );
+        assert_eq!(base().with_max_budget_usd(None).invalid_max_budget(), None);
+        assert_eq!(
+            base().with_max_budget_usd(Some(0.0)).invalid_max_budget(),
+            Some(0.0)
+        );
+        assert_eq!(
+            base().with_max_budget_usd(Some(-1.0)).invalid_max_budget(),
+            Some(-1.0)
+        );
+        assert!(base()
+            .with_max_budget_usd(Some(f64::NAN))
+            .invalid_max_budget()
+            .is_some_and(f64::is_nan));
+        // The raw value is preserved so the refusal names what was configured.
+        assert_eq!(
+            base().with_max_budget_usd(Some(0.0)).max_budget_usd,
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn max_budget_error_result_carries_recovery_hint() {
+        // Probed on 2.1.206: exceeding --max-budget-usd fails the turn with
+        // subtype error_max_budget_usd and result null; the process
+        // survives (and keeps failing) — the hint tells the user which
+        // knob to turn.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"result":null,"num_turns":1,"total_cost_usd":0.0119,"session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::BackendError { code: Some(code), recovery_hint: Some(hint), .. }
+                if code == "error_max_budget_usd" && hint.contains("max_budget_usd")
+        )));
+    }
+
+    #[test]
     fn claude_code_agent_with_options() {
         let agent = ClaudeCodeAgent::new(
             "/usr/local/bin/claude".into(),
@@ -2586,11 +2767,50 @@ mod tests {
         assert!(!agent.shared.interrupt_pending.load(Ordering::SeqCst));
     }
 
+    /// The steer contract the drain keys on: idle → "no active turn"
+    /// (immediate follow-up path); running → "mid-turn steering not
+    /// supported" (queue-for-turn-boundary path). CC 2.1.2xx discards
+    /// stdin user lines mid-turn, so steer_turn never writes — writing
+    /// produced phantom "delivered" steers the model never saw.
     #[tokio::test]
-    async fn steer_before_initialize_errors() {
+    async fn steer_reports_queue_semantics_instead_of_writing() {
         let mut agent =
             ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
-        assert!(agent.steer_turn("more context").await.is_err());
+        let idle_err = agent.steer_turn("more context").await.unwrap_err();
+        assert!(
+            idle_err.to_string().contains("no active turn"),
+            "got: {idle_err}"
+        );
+        agent.shared.turn_active.store(true, Ordering::SeqCst);
+        let running_err = agent.steer_turn("more context").await.unwrap_err();
+        assert!(
+            running_err
+                .to_string()
+                .contains("mid-turn steering not supported"),
+            "got: {running_err}"
+        );
+    }
+
+    /// Goal notices always queue as the next prompt's prelude — a mid-turn
+    /// stdin write would be discarded by the CLI, and consecutive notices
+    /// coalesce in order instead of overwriting each other.
+    #[tokio::test]
+    async fn goal_notices_queue_and_coalesce() {
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), None, vec![], None);
+        agent.shared.turn_active.store(true, Ordering::SeqCst);
+        agent
+            .deliver_goal_notice("first notice".into())
+            .await
+            .unwrap();
+        agent
+            .deliver_goal_notice("second notice".into())
+            .await
+            .unwrap();
+        let queued = agent.pending_goal_notice.clone().expect("queued prelude");
+        let first = queued.find("first notice").expect("first present");
+        let second = queued.find("second notice").expect("second present");
+        assert!(first < second, "notices keep arrival order");
     }
 
     #[test]
@@ -2757,9 +2977,19 @@ mod tests {
 
     #[test]
     fn permission_mode_normalization() {
-        // The legacy Intendant default "auto" is not a Claude Code mode;
-        // the CLI coerces it to default, so we don't pass the flag at all.
-        assert_eq!(normalize_permission_mode("auto"), None);
+        // "auto" is a documented CLI mode since 2.1.x (classifier-based
+        // approvals; accepted on 2.1.206) — it passes through. "manual" is
+        // the CLI's alias for default, so like default the flag is omitted.
+        assert_eq!(normalize_permission_mode("auto").as_deref(), Some("auto"));
+        assert_eq!(
+            normalize_permission_mode("dontAsk").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(
+            normalize_permission_mode("dont-ask").as_deref(),
+            Some("dontAsk")
+        );
+        assert_eq!(normalize_permission_mode("manual"), None);
         assert_eq!(normalize_permission_mode("default"), None);
         assert_eq!(normalize_permission_mode(""), None);
         assert_eq!(
@@ -3270,6 +3500,106 @@ mod tests {
                     AgentEvent::SubAgentToolCall { status, agents, .. }
                         if status == "failed" && agents[0].status == "errored"
                 )
+        )));
+    }
+
+    #[test]
+    fn bash_task_started_never_opens_a_child() {
+        // 2.1.206 announces background and auto-backgrounded Bash commands
+        // through the same task system (`task_type:"local_bash"`); those
+        // must not materialize ghost child sessions (observed live: one
+        // ghost grid window per slow command).
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","description":"Slow foreground probe loop","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        // (First line also announces NativeSessionId — only the spawn is
+        // forbidden.)
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "bash task spawned: {:?}",
+            out.events
+        );
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01SLOWBASH00000000"));
+        // Its notification stays silent too (no child to end).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b7mlg8ym4","tool_use_id":"toolu_01SLOWBASH00000000","status":"completed","output_file":"","summary":"Slow foreground probe loop","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn subagent_typed_task_started_registers_despite_unknown_task_type() {
+        // subagent_type identifies a spawn even if a future CLI renames the
+        // agent task_type to something outside the *_agent vocabulary.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz9","tool_use_id":"toolu_01RENAMEDAGENT0000","description":"probe","subagent_type":"general-purpose","task_type":"subagent","prompt":"go","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, .. } if status == "inProgress"
+        )));
+    }
+
+    #[test]
+    fn lazy_scope_for_an_open_tool_never_materializes_a_child() {
+        // An envelope parented to an id that is currently open as an
+        // ordinary tool must not ghost a child through the lazy
+        // resume-replay path; it routes to the main thread instead.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENLAZY00000000","name":"Bash","input":{"command":"sleep 5","description":"slow"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"partial output"}]},"parent_tool_use_id":"toolu_01OPENLAZY00000000","session_id":"s1"}"#,
+        );
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01OPENLAZY00000000"));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::SubAgentToolCall { .. })),
+            "lazy path spawned: {:?}",
+            out.events
+        );
+    }
+
+    #[test]
+    fn task_started_for_an_open_tool_never_spawns() {
+        // An id already open as an ordinary tool is that command's own
+        // tool_use — never a spawn, even if the task fields claim agent.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01OPENBASH00000000","name":"Bash","input":{"command":"find . -name '*.rs'","description":"Find all key Rust files by name"}}]},"parent_tool_use_id":null,"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"zz1","tool_use_id":"toolu_01OPENBASH00000000","description":"Find all key Rust files by name","task_type":"local_agent","session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "open tool spawned: {:?}", out.events);
+        assert!(!reader
+            .task_children
+            .contains_key("toolu_01OPENBASH00000000"));
+    }
+
+    #[test]
+    fn agent_task_started_registers_without_prior_tool_use() {
+        // The registration fallback (resume replay: task_started seen,
+        // tool_use never observed) still works for real agent tasks.
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"a66eab8","tool_use_id":"toolu_01FALLBACKAGENT000","description":"Probe echo child","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Run echo and report.","session_id":"s1"}"#,
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::SubAgentToolCall { status, receiver_thread_ids, .. }
+                if status == "inProgress"
+                    && receiver_thread_ids == &vec!["task-FALLBACKAGENT000".to_string()]
         )));
     }
 
@@ -3842,7 +4172,10 @@ mod tests {
             payload["updatedInput"]["questions"][0]["question"],
             "Which DB?"
         );
-        assert_eq!(payload["updatedInput"]["answers"]["Which DB?"], "PostgreSQL");
+        assert_eq!(
+            payload["updatedInput"]["answers"]["Which DB?"],
+            "PostgreSQL"
+        );
     }
 
     #[test]
@@ -3925,16 +4258,63 @@ mod tests {
         assert_eq!(usage.limits.len(), 2);
         // BTreeMap order: five_hour before seven_day.
         assert_eq!(usage.limits[0].label, "5h");
-        assert_eq!(usage.limits[0].used_pct, 12);
+        assert_eq!(usage.limits[0].used_pct, Some(12));
         assert_eq!(usage.limits[0].resets_at_epoch, Some(1_783_300_000));
         assert_eq!(usage.limits[1].label, "7d");
-        assert_eq!(usage.limits[1].used_pct, 49);
-        // Events without a utilization leave the gauges untouched.
+        assert_eq!(usage.limits[1].used_pct, Some(49));
+    }
+
+    /// 2.1.2xx dropped `utilization` from rate_limit_event in normal
+    /// operation (live wire probed on 2.1.207: status/resetsAt/
+    /// rateLimitType/overageStatus only). The window still feeds the gauge
+    /// — status and reset, no pct — instead of vanishing.
+    #[test]
+    fn utilization_less_rate_limit_event_still_builds_window() {
         let mut reader = test_reader();
         reader.process_line(
-            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1783929600,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false},"session_id":"s1"}"#,
         );
-        assert!(reader.current_limit_windows().is_empty());
+        let windows = reader.current_limit_windows();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].used_pct, None);
+        assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_600));
+        assert_eq!(windows[0].status.as_deref(), Some("allowed"));
+
+        // A later utilization-bearing event fills the pct; a still-later
+        // utilization-less event keeps it (it says nothing about
+        // consumption) while refreshing status/reset.
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1783929700,"rateLimitType":"five_hour","utilization":0.34},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1783929800,"rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let windows = reader.current_limit_windows();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].used_pct, Some(34));
+        assert_eq!(windows[0].resets_at_epoch, Some(1_783_929_800));
+        assert_eq!(windows[0].status.as_deref(), Some("allowed_warning"));
+    }
+
+    /// A resumed big-context session reports usage before the first result
+    /// corrects the window: the meter divides by the LARGER of window and
+    /// footprint so it tops out at 100% instead of reading 250%.
+    #[test]
+    fn stale_window_usage_caps_at_hundred_pct() {
+        let usage = serde_json::json!({
+            "input_tokens": 400_000,
+            "cache_read_input_tokens": 100_000,
+            "output_tokens": 500
+        });
+        let snapshot =
+            usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000).expect("snapshot");
+        assert!(snapshot.usage_pct <= 100.0, "pct {}", snapshot.usage_pct);
+        assert_eq!(snapshot.context_window, 500_500);
+        // A corrected window restores the honest ratio.
+        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000)
+            .expect("snapshot");
+        assert!((corrected.usage_pct - 50.05).abs() < 0.01);
     }
 
     #[test]

@@ -237,13 +237,25 @@ let annotationCanvas = null;
 let annotationMode = false;
 let annotationCounter = 0;
 let annotationContext = null;
+// Captured once at boot: the toolbar ELEMENT rides along with its home
+// position, and later moves resolve through this reference rather than
+// getElementById. A live-annotation host container can be wiped while
+// the toolbar is parked inside it (peer panes are innerHTML-rebuilt on
+// daemons-list re-renders); a detached toolbar is unreachable by id, so
+// an id-based lookup would lose it permanently — the element reference
+// lets restore re-attach it to its home slot.
 const annotationToolbarHome = (() => {
   const toolbar = document.getElementById('annotation-toolbar');
-  return toolbar ? { parent: toolbar.parentNode, nextSibling: toolbar.nextSibling } : null;
+  return toolbar ? { toolbar, parent: toolbar.parentNode, nextSibling: toolbar.nextSibling } : null;
 })();
 
+function annotationToolbarEl() {
+  return (annotationToolbarHome && annotationToolbarHome.toolbar)
+    || document.getElementById('annotation-toolbar');
+}
+
 function moveAnnotationToolbar(parent, beforeNode = null) {
-  const toolbar = document.getElementById('annotation-toolbar');
+  const toolbar = annotationToolbarEl();
   if (!toolbar || !parent) return;
   if (toolbar.parentNode !== parent || toolbar.nextSibling !== beforeNode) {
     parent.insertBefore(toolbar, beforeNode);
@@ -255,37 +267,95 @@ function restoreAnnotationToolbar() {
   moveAnnotationToolbar(annotationToolbarHome.parent, annotationToolbarHome.nextSibling);
 }
 
-function setLiveAnnotationButton(slot, active) {
-  if (!slot || !slot.annotateBtn) return;
-  slot.annotateBtn.classList.toggle('active', !!active);
-  slot.annotateBtn.innerHTML = active ? '&#x2715; Annotating' : '&#9998; Annotate';
-  slot.annotateBtn.title = active ? 'Exit live annotation' : 'Freeze current frame and annotate it';
+// ── Live-annotation surface provider ─────────────────────────────────
+//
+// enterLiveAnnotationMode used to take a DisplaySlot directly. The
+// provider contract below is derived from every use the live-annotation
+// path actually made of that slot (this module plus the two 45-displays
+// lifecycle call sites) — exactly this list, nothing more:
+//   1. slot.canvasEl    → stageEl(): the stage container the frozen
+//      source canvas + drawing overlay are appended into; also the
+//      wrapper rect for letterbox alignment and a ResizeObserver target.
+//   2. slot.videoEl     → liveSurfaceEl(): the live <video> (or tile
+//      <canvas>) whose rendered rect + intrinsic resolution drive
+//      alignLiveAnnotationSource's letterbox math.
+//   3. slot.annotateBtn → annotateBtn(): the toolbar button whose
+//      active state / label setLiveAnnotationButton toggles.
+//   4. slot.el          → toolbarHostEl(): the element the shared
+//      annotation toolbar is reparented into while editing.
+//   5. slot.displayId   → displayId + streamBase: wire naming — the
+//      editor submits on stream `${streamBase}_annotation` with frame
+//      ids `ann-${streamBase}-N`. streamBase is `display_<id>` locally
+//      (byte-identical to the pre-provider strings) and
+//      `peer_<host>_display_<id>` on peer panes so ids stay unique
+//      across surfaces.
+//   6. identity (annotationContext.slot === slot) → owner: the wrapping
+//      DisplaySlot / PeerDisplayConnection instance, compared by
+//      shouldSuppressDisplayInputForAnnotation (input suppression while
+//      drawing) and teardownLiveSurfaceForOwner (removeDisplaySlot /
+//      peer close lifecycle).
+// (slot.statusEl is deliberately NOT in the contract — the
+// live-annotation path never touched it.)
+// The element getters are functions, not captured nodes, because peer
+// pane DOM is rebuilt across daemons-list re-renders.
+
+function setLiveAnnotationButton(provider, active) {
+  const btn = provider && typeof provider.annotateBtn === 'function'
+    ? provider.annotateBtn()
+    : null;
+  if (!btn) return;
+  btn.classList.toggle('active', !!active);
+  btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  btn.innerHTML = active ? '&#x2715; Annotating' : '&#9998; Annotate';
+  btn.title = active ? 'Exit live annotation' : 'Freeze current frame and annotate it';
 }
 
-function alignLiveAnnotationSource(slot, source) {
-  if (!slot || !source || !slot.canvasEl || !slot.videoEl) return;
-  const wrapRect = slot.canvasEl.getBoundingClientRect();
-  const videoRect = slot.videoEl.getBoundingClientRect();
-  const videoWidth = Number(slot.videoEl.videoWidth) || source.width || videoRect.width;
-  const videoHeight = Number(slot.videoEl.videoHeight) || source.height || videoRect.height;
-  if (wrapRect.width <= 0 || wrapRect.height <= 0 || videoRect.width <= 0 || videoRect.height <= 0) return;
-  const scale = Math.min(videoRect.width / videoWidth, videoRect.height / videoHeight);
-  const frameW = videoWidth * scale;
-  const frameH = videoHeight * scale;
-  const frameX = videoRect.left - wrapRect.left + ((videoRect.width - frameW) / 2);
-  const frameY = videoRect.top - wrapRect.top + ((videoRect.height - frameH) / 2);
-  source.style.left = frameX + 'px';
-  source.style.top = frameY + 'px';
-  source.style.width = frameW + 'px';
-  source.style.height = frameH + 'px';
+/** Letterbox math shared by the live-annotation editor and callout
+ *  arming: the rect (stage-local px) the surface's rendered content
+ *  actually occupies inside `stageEl`, accounting for the aspect-
+ *  preserving bars. Same formula as 45-displays' renderSharedViewFocus.
+ *  `fallbackW/H` substitute for intrinsic dimensions when the surface
+ *  reports none (e.g. a <video> whose stream dropped mid-edit). */
+function surfaceContentBox(stageEl, surfaceEl, fallbackW, fallbackH) {
+  if (!stageEl || !surfaceEl) return null;
+  const wrapRect = stageEl.getBoundingClientRect();
+  const surfRect = surfaceEl.getBoundingClientRect();
+  const intrinsicW = Number(surfaceEl.videoWidth) || Number(surfaceEl.width) || fallbackW || surfRect.width;
+  const intrinsicH = Number(surfaceEl.videoHeight) || Number(surfaceEl.height) || fallbackH || surfRect.height;
+  if (wrapRect.width <= 0 || wrapRect.height <= 0 || surfRect.width <= 0 || surfRect.height <= 0) return null;
+  if (!intrinsicW || !intrinsicH) return null;
+  const scale = Math.min(surfRect.width / intrinsicW, surfRect.height / intrinsicH);
+  const w = intrinsicW * scale;
+  const h = intrinsicH * scale;
+  return {
+    x: surfRect.left - wrapRect.left + ((surfRect.width - w) / 2),
+    y: surfRect.top - wrapRect.top + ((surfRect.height - h) / 2),
+    w,
+    h,
+  };
 }
 
-function shouldSuppressDisplayInputForAnnotation(slot) {
+function alignLiveAnnotationSource(provider, source) {
+  if (!provider || !source) return;
+  const box = surfaceContentBox(
+    provider.stageEl(), provider.liveSurfaceEl(), source.width, source.height
+  );
+  if (!box) return;
+  source.style.left = box.x + 'px';
+  source.style.top = box.y + 'px';
+  source.style.width = box.w + 'px';
+  source.style.height = box.h + 'px';
+}
+
+// `surfaceOwner` is the DisplaySlot / PeerDisplayConnection whose
+// interactive input handlers are asking; both classes pass `this`.
+function shouldSuppressDisplayInputForAnnotation(surfaceOwner) {
   return !!(
     annotationMode &&
     annotationContext &&
     annotationContext.kind === 'live' &&
-    annotationContext.slot === slot
+    annotationContext.provider &&
+    annotationContext.provider.owner === surfaceOwner
   );
 }
 
@@ -320,15 +390,24 @@ function enterAnnotationMode() {
   window._annResizeObserver.observe(document.getElementById('recording-player-wrap'));
 }
 
-function enterLiveAnnotationMode(slot, frame) {
-  if (!slot || !frame || !slot.canvasEl) return;
+// `provider` is a live-annotation surface provider (contract enumerated
+// above setLiveAnnotationButton). DisplaySlot and PeerDisplayConnection
+// each wrap themselves via their `_annotationSurfaceProvider()`.
+function enterLiveAnnotationMode(provider, frame) {
+  if (!provider || !frame) return;
+  const stage = provider.stageEl();
+  if (!stage) return;
   if (annotationMode) {
-    if (annotationContext && annotationContext.kind === 'live' && annotationContext.slot === slot) {
+    if (annotationContext && annotationContext.kind === 'live' &&
+        annotationContext.provider && annotationContext.provider.owner === provider.owner) {
       exitAnnotationMode();
       return;
     }
     exitAnnotationMode();
   }
+  // The editor and an armed callout are both drag layers on the stage —
+  // the newest mode wins.
+  disarmLiveCallout();
 
   const source = frame.canvas;
   source.className = 'live-annotation-source';
@@ -339,33 +418,34 @@ function enterLiveAnnotationMode(slot, frame) {
   overlay.width = frame.width;
   overlay.height = frame.height;
 
-  slot.canvasEl.appendChild(source);
-  slot.canvasEl.appendChild(overlay);
-  alignLiveAnnotationSource(slot, source);
+  stage.appendChild(source);
+  stage.appendChild(overlay);
+  alignLiveAnnotationSource(provider, source);
 
   annotationCanvas = new AnnotationCanvas(overlay, source);
   annotationCanvas.activate();
   annotationMode = true;
   annotationContext = {
     kind: 'live',
-    slot,
-    stream: `display_${slot.displayId}_annotation`,
+    provider,
+    streamBase: provider.streamBase,
+    stream: `${provider.streamBase}_annotation`,
     source,
     overlay,
   };
-  setLiveAnnotationButton(slot, true);
-  moveAnnotationToolbar(slot.el, null);
-  document.getElementById('annotation-toolbar').classList.remove('hidden');
+  setLiveAnnotationButton(provider, true);
+  moveAnnotationToolbar(provider.toolbarHostEl(), null);
+  annotationToolbarEl().classList.remove('hidden');
   if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
 
   if (window._annResizeObserver) window._annResizeObserver.disconnect();
   window._annResizeObserver = new ResizeObserver(() => {
     if (annotationCanvas && annotationMode) {
-      alignLiveAnnotationSource(slot, source);
+      alignLiveAnnotationSource(provider, source);
       annotationCanvas._alignToSource();
     }
   });
-  window._annResizeObserver.observe(slot.canvasEl);
+  window._annResizeObserver.observe(stage);
   window._annResizeObserver.observe(source);
 }
 
@@ -380,12 +460,280 @@ function exitAnnotationMode() {
   if (context && context.kind === 'live') {
     if (context.source && context.source.parentNode) context.source.parentNode.removeChild(context.source);
     if (context.overlay && context.overlay.parentNode) context.overlay.parentNode.removeChild(context.overlay);
-    setLiveAnnotationButton(context.slot, false);
+    setLiveAnnotationButton(context.provider, false);
   }
   annotationMode = false;
   annotationContext = null;
-  document.getElementById('annotation-toolbar').classList.add('hidden');
+  annotationToolbarEl().classList.add('hidden');
   restoreAnnotationToolbar();
+}
+
+// Provider-level lifecycle teardown: end any live-annotation edit or
+// armed callout owned by `owner`. removeDisplaySlot (45-displays) and
+// PeerDisplayConnection.close (52-peer-display) call this so surface
+// destruction always tears the editor / arm down with it.
+function teardownLiveSurfaceForOwner(owner) {
+  if (liveCalloutArm && liveCalloutArm.owner === owner) disarmLiveCallout();
+  if (
+    annotationMode &&
+    annotationContext &&
+    annotationContext.kind === 'live' &&
+    annotationContext.provider &&
+    annotationContext.provider.owner === owner
+  ) {
+    exitAnnotationMode();
+  }
+}
+
+// Softer sibling for pane REBUILDS (peer panes are innerHTML-rebuilt on
+// daemons-list re-renders): only tears down when the mode's overlay DOM
+// actually died with the old pane — a rebuild of some other container
+// for the same host leaves a still-connected editor alone.
+function reconcileLiveSurfaceForOwner(owner) {
+  if (
+    liveCalloutArm && liveCalloutArm.owner === owner &&
+    liveCalloutArm.overlayEl && !liveCalloutArm.overlayEl.isConnected
+  ) {
+    disarmLiveCallout();
+  }
+  if (
+    annotationMode &&
+    annotationContext &&
+    annotationContext.kind === 'live' &&
+    annotationContext.provider &&
+    annotationContext.provider.owner === owner &&
+    annotationContext.overlay &&
+    !annotationContext.overlay.isConnected
+  ) {
+    exitAnnotationMode();
+  }
+}
+
+// ── Toolbar-armed Callout mode ────────────────────────────────────────
+//
+// The safe variant of the reverse-callout idea (bare alt-drag was
+// rejected — it collides with X11 window-manager gestures). The Callout
+// toolbar button (local display slots + peer panes, enabled only while
+// that surface's input authority is 'you') arms one-shot region
+// flagging: the next pointer-drag on the frame draws a live rectangle,
+// and a release covering >= ~1% of the frame area captures the current
+// frame, strokes the rectangle onto the copy (amber), and ships it
+// through the annotation-attach lane as a pending attachment (stream
+// `${streamBase}_callout`, note 'user callout'). Firing, Escape, or a
+// second button click disarms. While armed, the arm overlay swallows
+// the drag's pointer events (and the surface input handlers belt-and-
+// braces on liveCalloutArmedFor) so no md/mm/mu reaches the remote
+// display; keyboard input keeps flowing.
+let liveCalloutArm = null; // { owner, provider, button, captureFrame, overlayEl, onKeyDown }
+let liveCalloutCounter = 0;
+const LIVE_CALLOUT_MIN_AREA_FRAC = 0.01; // ~1% of the frame area
+const LIVE_CALLOUT_STROKE = '#ffb454'; // amber; vivid on light and dark content
+
+function liveCalloutArmedFor(owner) {
+  return !!(liveCalloutArm && liveCalloutArm.owner === owner);
+}
+
+function disarmLiveCallout() {
+  const arm = liveCalloutArm;
+  if (!arm) return;
+  liveCalloutArm = null;
+  document.removeEventListener('keydown', arm.onKeyDown, true);
+  if (arm.overlayEl && arm.overlayEl.parentNode) {
+    arm.overlayEl.parentNode.removeChild(arm.overlayEl);
+  }
+  if (arm.button) {
+    arm.button.classList.remove('armed');
+    arm.button.setAttribute('aria-pressed', 'false');
+  }
+}
+
+// `spec`: { provider, button, captureFrame(quality) → frame|null }.
+// `provider` is the same surface-provider contract the annotation editor
+// consumes; `captureFrame` is the class's own captureCurrentFrame.
+function toggleLiveCallout(spec) {
+  if (!spec || !spec.provider) return;
+  if (liveCalloutArmedFor(spec.provider.owner)) {
+    disarmLiveCallout();
+    return;
+  }
+  disarmLiveCallout(); // only one armed surface at a time
+  armLiveCallout(spec);
+}
+
+function armLiveCallout(spec) {
+  const provider = spec.provider;
+  const stage = provider.stageEl();
+  const box = surfaceContentBox(stage, provider.liveSurfaceEl());
+  if (!stage || !box) {
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'No live frame to call out yet');
+    }
+    return;
+  }
+  // Arming while the live-annotation editor is open would stack two
+  // drag layers on the stage — the newest mode wins.
+  if (annotationMode && annotationContext && annotationContext.kind === 'live') {
+    exitAnnotationMode();
+  }
+
+  const overlayEl = document.createElement('div');
+  overlayEl.className = 'callout-arm-overlay';
+  const rectEl = document.createElement('div');
+  rectEl.className = 'callout-arm-rect';
+  rectEl.style.display = 'none';
+  const hintEl = document.createElement('div');
+  hintEl.className = 'callout-arm-hint';
+  hintEl.textContent = 'Drag to call out a region — Esc cancels';
+  overlayEl.appendChild(rectEl);
+  overlayEl.appendChild(hintEl);
+  stage.appendChild(overlayEl);
+
+  // Pin the overlay to the rendered frame's content box (letterbox math
+  // shared with renderSharedViewFocus via surfaceContentBox), so drag
+  // fractions ARE frame fractions.
+  const align = () => {
+    const b = surfaceContentBox(provider.stageEl(), provider.liveSurfaceEl());
+    if (!b) return;
+    overlayEl.style.left = b.x + 'px';
+    overlayEl.style.top = b.y + 'px';
+    overlayEl.style.width = b.w + 'px';
+    overlayEl.style.height = b.h + 'px';
+  };
+  align();
+
+  let drag = null;
+  const fracPoint = (e) => {
+    const r = overlayEl.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return null;
+    return {
+      x: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+    };
+  };
+  const renderDragRect = () => {
+    if (!drag) return;
+    rectEl.style.left = (Math.min(drag.x0, drag.x1) * 100) + '%';
+    rectEl.style.top = (Math.min(drag.y0, drag.y1) * 100) + '%';
+    rectEl.style.width = (Math.abs(drag.x1 - drag.x0) * 100) + '%';
+    rectEl.style.height = (Math.abs(drag.y1 - drag.y0) * 100) + '%';
+  };
+  const resetDrag = () => {
+    drag = null;
+    rectEl.style.display = 'none';
+    hintEl.style.display = '';
+  };
+  overlayEl.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (drag) return; // ignore extra pointers mid-drag
+    align(); // layout may have shifted since arming
+    const p = fracPoint(e);
+    if (!p) return;
+    drag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, pointerId: e.pointerId };
+    try { overlayEl.setPointerCapture(e.pointerId); } catch (_) {}
+    hintEl.style.display = 'none';
+    rectEl.style.display = '';
+    renderDragRect();
+  });
+  overlayEl.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    e.preventDefault();
+    const p = fracPoint(e);
+    if (!p) return;
+    drag.x1 = p.x;
+    drag.y1 = p.y;
+    renderDragRect();
+  });
+  overlayEl.addEventListener('pointerup', (e) => {
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    e.preventDefault();
+    const p = fracPoint(e);
+    if (p) { drag.x1 = p.x; drag.y1 = p.y; }
+    const rect = {
+      x: Math.min(drag.x0, drag.x1),
+      y: Math.min(drag.y0, drag.y1),
+      w: Math.abs(drag.x1 - drag.x0),
+      h: Math.abs(drag.y1 - drag.y0),
+    };
+    if (rect.w * rect.h < LIVE_CALLOUT_MIN_AREA_FRAC) {
+      // Too small to be a deliberate callout — stay armed, keep hinting.
+      resetDrag();
+      return;
+    }
+    disarmLiveCallout(); // one-shot: the gesture consumed the arm
+    submitLiveCallout(spec, rect);
+  });
+  overlayEl.addEventListener('pointercancel', () => resetDrag());
+
+  // Escape disarms. Capture phase so neither the surface's interactive
+  // keydown forwarder nor the global annotation Escape handler sees it.
+  const onKeyDown = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      disarmLiveCallout();
+    }
+  };
+  document.addEventListener('keydown', onKeyDown, true);
+
+  if (spec.button) {
+    spec.button.classList.add('armed');
+    spec.button.setAttribute('aria-pressed', 'true');
+  }
+  liveCalloutArm = {
+    owner: provider.owner,
+    provider,
+    button: spec.button || null,
+    captureFrame: spec.captureFrame,
+    overlayEl,
+    onKeyDown,
+  };
+}
+
+async function submitLiveCallout(spec, rect) {
+  const frame = typeof spec.captureFrame === 'function' ? spec.captureFrame(0.92) : null;
+  if (!frame || !frame.canvas) {
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'No frame available to call out');
+    }
+    return;
+  }
+  // Stroke the rectangle onto the captured copy (never the live surface).
+  const ctx = frame.canvas.getContext('2d');
+  ctx.save();
+  ctx.strokeStyle = LIVE_CALLOUT_STROKE;
+  ctx.lineWidth = Math.max(4, frame.width / 300);
+  ctx.strokeRect(
+    rect.x * frame.width,
+    rect.y * frame.height,
+    Math.max(1, rect.w * frame.width),
+    Math.max(1, rect.h * frame.height)
+  );
+  ctx.restore();
+  const dataUrl = frame.canvas.toDataURL('image/jpeg', 0.92);
+  const b64 = dataUrl.split(',')[1];
+  liveCalloutCounter++;
+  const stream = `${spec.provider.streamBase}_callout`;
+  const frameId = `${stream}-f${String(liveCalloutCounter).padStart(5, '0')}`;
+  const note = 'user callout';
+  try {
+    await sendDashboardMediaUpload(
+      'api_media_annotation_attach',
+      { frame_id: frameId, stream, note },
+      dashboardControlBase64ToBytes(b64),
+      { t: 'annotation_attach', frame_id: frameId, stream, data: b64, note },
+      'callout attach'
+    );
+  } catch (err) {
+    dashboardMediaTransferFailed(err, 'callout attach');
+    return;
+  }
+  addPendingAttachment({ frameId, stream, note, dataUrl });
+  if (spec.button) {
+    const orig = spec.button.innerHTML;
+    spec.button.innerHTML = '&#x2713; Attached';
+    window.setTimeout(() => { spec.button.innerHTML = orig; }, 1500);
+  }
 }
 
 // ── Pending attachments (frame IDs queued for the next task) ──
@@ -439,10 +787,10 @@ function pendingAttachmentUploadId(att) {
 function deletePendingUploadRecord(uploadId) {
   const id = String(uploadId || '').trim();
   if (!id) return;
-  const url = `/api/session/current/uploads/${encodeURIComponent(id)}`;
-  dashboardJsonFetch('api_session_current_upload_delete', { id }, () => (
-    fetch(url, { method: 'DELETE' })
-  ), 'api_session_current_upload_delete', { fallbackAfterRpcFailure: false })
+  // Transport F8a: facade DELETE twin — the verb-derived no-replay policy
+  // is the legacy fallbackAfterRpcFailure:false semantics. The descriptor
+  // row captures `upload_id` (the tunnel handler accepts both names).
+  daemonApi.request('api_session_current_upload_delete', { upload_id: id })
     .then(resp => {
       if (!resp.ok && resp.status !== 404) {
         console.warn(`[upload] Delete failed (${id}): ${resp.status}`);
@@ -493,13 +841,8 @@ function clearPendingAttachments(options = {}) {
 const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 let activeUploadFlows = 0;
 
-/// Short human-readable file-size string, matches the server's formatter.
-function humanBytes(n) {
-  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
-  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
-  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
-  return n + ' B';
-}
+// humanBytes lives in 46-recording-replay.js (the canonical dashboard
+// bytes formatter; `_fmtBytes` there is its legacy alias).
 
 // "Can staged uploads ride the TUNNEL upload-frame / byte-stream lane?"
 // Derived through the facade (F1b): reason 'connected' folds the live
@@ -972,7 +1315,7 @@ async function submitAnnotation(action) {
     ? annotationContext.stream
     : (activeRecordingStream || 'annotation');
   const framePrefix = annotationContext && annotationContext.kind === 'live'
-    ? `ann-display_${annotationContext.slot.displayId}`
+    ? `ann-${annotationContext.streamBase}`
     : `ann-${activeRecordingStream || 'recording'}`;
   const frameId = `${framePrefix}-${annotationCounter}`;
 
@@ -1048,23 +1391,39 @@ function renderAnnotationRefs() {
   }
   panel.style.display = savedAnnotations.length > 0 ? '' : 'none';
 
+  // Daemon-derived strings never ride an inline onclick: rows carry the
+  // frame id in a data attribute and get real listeners after the build.
   const items = savedAnnotations.map(a => {
     const badge = a.injected ? '<span style="color:var(--green);font-size:10px"> sent</span>' : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
-    return `<span class="ann-ref-item" title="Click to copy frame ID" onclick="copyAnnotationRef('${a.frameId}')">${a.frameId}${badge}</span>`;
+    return `<span class="ann-ref-item" title="Click to copy frame ID" data-frame-id="${escapeHtml(a.frameId)}">${escapeHtml(a.frameId)}${badge}</span>`;
   }).join('');
 
   const framesPath = currentSessionFullId ? `~/.intendant/logs/${currentSessionFullId}/frames/` : '';
   panel.innerHTML = `
     <span style="font-size:11px;color:var(--subtext1);font-weight:600">Annotations:</span>
     ${items}
-    <button class="ann-copy-all-btn" onclick="copyAllAnnotationRefs()" title="Copy all frame IDs to clipboard">Copy all</button>
-    ${framesPath ? `<span class="ann-path-hint" style="display:block;font-size:10px;color:var(--overlay0);margin-top:4px;cursor:pointer" title="Click to copy" onclick="navigator.clipboard.writeText('${framesPath}').then(()=>{this.textContent='Copied!';setTimeout(()=>{this.textContent='${framesPath}'},1000)})">${framesPath}</span>` : ''}
+    <button class="ann-copy-all-btn" title="Copy all frame IDs to clipboard">Copy all</button>
+    ${framesPath ? `<span class="ann-path-hint" style="display:block;font-size:10px;color:var(--overlay0);margin-top:4px;cursor:pointer" title="Click to copy">${escapeHtml(framesPath)}</span>` : ''}
   `;
+  panel.querySelectorAll('.ann-ref-item').forEach(el => {
+    el.addEventListener('click', () => copyAnnotationRef(el.dataset.frameId || ''));
+  });
+  panel.querySelector('.ann-copy-all-btn')?.addEventListener('click', copyAllAnnotationRefs);
+  const pathHint = panel.querySelector('.ann-path-hint');
+  if (pathHint) {
+    pathHint.addEventListener('click', () => {
+      navigator.clipboard.writeText(framesPath).then(() => {
+        pathHint.textContent = 'Copied!';
+        setTimeout(() => { pathHint.textContent = framesPath; }, 1000);
+      });
+    });
+  }
 }
 
 window.copyAnnotationRef = function(frameId) {
   navigator.clipboard.writeText(frameId).then(() => {
-    const el = document.querySelector(`.ann-ref-item[onclick*="${frameId}"]`);
+    const el = [...document.querySelectorAll('#annotation-refs-panel .ann-ref-item')]
+      .find(item => item.dataset.frameId === frameId);
     if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
   });
 };
@@ -2106,24 +2465,31 @@ function renderClipRefs() {
   }
   panel.style.display = savedClips.length > 0 ? '' : 'none';
 
+  // Same discipline as renderAnnotationRefs: ids ride data attributes and
+  // real listeners, never string-interpolated inline handlers.
   const items = savedClips.map(c => {
     const badge = c.injected
       ? '<span style="color:var(--green);font-size:10px"> sent</span>'
       : '<span style="color:var(--overlay0);font-size:10px"> saved</span>';
-    const info = `${c.clipId} (${c.frameCount} frames)`;
-    return `<span class="ann-ref-item" title="Click to copy clip ID" onclick="copyClipRef('${c.clipId}')">${info}${badge}</span>`;
+    const info = `${escapeHtml(c.clipId)} (${escapeHtml(String(c.frameCount))} frames)`;
+    return `<span class="ann-ref-item" title="Click to copy clip ID" data-clip-id="${escapeHtml(c.clipId)}">${info}${badge}</span>`;
   }).join('');
 
   panel.innerHTML = `
     <span style="font-size:11px;color:var(--subtext1);font-weight:600">Clips:</span>
     ${items}
-    <button class="ann-copy-all-btn" onclick="copyAllClipRefs()" title="Copy all clip IDs to clipboard">Copy all</button>
+    <button class="ann-copy-all-btn" title="Copy all clip IDs to clipboard">Copy all</button>
   `;
+  panel.querySelectorAll('.ann-ref-item').forEach(el => {
+    el.addEventListener('click', () => copyClipRef(el.dataset.clipId || ''));
+  });
+  panel.querySelector('.ann-copy-all-btn')?.addEventListener('click', copyAllClipRefs);
 }
 
 window.copyClipRef = function(clipId) {
   navigator.clipboard.writeText(clipId).then(() => {
-    const el = document.querySelector(`.ann-ref-item[onclick*="${clipId}"]`);
+    const el = [...document.querySelectorAll('#clip-refs-panel .ann-ref-item')]
+      .find(item => item.dataset.clipId === clipId);
     if (el) { const orig = el.innerHTML; el.textContent = 'Copied!'; setTimeout(() => { el.innerHTML = orig; }, 1000); }
   });
 };
@@ -2208,4 +2574,3 @@ document.getElementById('recording-timeline').addEventListener('contextmenu', (e
     deleteClipAnnotationLayer(layerId);
   }
 });
-

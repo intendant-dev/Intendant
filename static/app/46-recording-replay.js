@@ -66,6 +66,10 @@ class RecordingPlayer {
     this._hlsObjectUrls = [];
     this._hlsFallbackHandler = null;
     this._hlsLoadGeneration = 0;
+    // Live-recording segment poll — owned by the instance so destroy()
+    // covers every teardown path (an externally attached interval leaked
+    // one 5s timer per stream switch/delete).
+    this._refreshTimer = null;
 
     // Bound handlers — stored so destroy() can remove them
     this._onEnded = () => this._onSegmentEnd();
@@ -76,9 +80,35 @@ class RecordingPlayer {
       this.seekToGlobal(pct * this.totalDuration);
     };
     this._onPlayClick = () => this.togglePlayback();
+    // The element is the source of truth for playing state: browsers
+    // pause media on their own (WebKit parks hidden-tab video; OS media
+    // keys; power saving), and a `playing` flag written only by our
+    // play()/pause() methods desyncs — the rAF label loop keeps running
+    // and the play button shows the wrong glyph. End-of-media is the one
+    // carve-out: the spec fires `pause` immediately before `ended`, and
+    // segment advance (_onSegmentEnd → _loadSegment) relies on `playing`
+    // staying true to auto-resume the next segment — so ended-adjacent
+    // pauses stay owned by _onSegmentEnd (which calls pause() itself on
+    // the last segment). Both handlers are idempotent against the events
+    // our own play()/pause() methods queue.
+    this._onVideoPause = () => {
+      if (this.video.ended) return;
+      if (!this.playing) return;
+      this.playing = false;
+      this.playBtn.textContent = '\u25B6';
+      this._stopAnimLoop();
+    };
+    this._onVideoPlay = () => {
+      if (this.playing) return;
+      this.playing = true;
+      this.playBtn.textContent = '\u23F8';
+      this._startAnimLoop();
+    };
 
     this.video.addEventListener('ended', this._onEnded);
     this.video.addEventListener('timeupdate', this._onTimeUpdate);
+    this.video.addEventListener('pause', this._onVideoPause);
+    this.video.addEventListener('play', this._onVideoPlay);
     this.timelineEl.addEventListener('click', this._onTimelineClick);
     playBtn.addEventListener('click', this._onPlayClick);
   }
@@ -282,10 +312,35 @@ class RecordingPlayer {
     }
   }
 
+  /* Poll the segment list while this stream is actively recording (no
+     per-segment event flows from the daemon — segments just land on
+     disk). No-op for finished/session recordings: their stream is not in
+     the live `recordingStreams` registry, so the timer never starts. */
+  _startRefreshTimer() {
+    this._stopRefreshTimer();
+    // Live lane only: session-replay players (a session recordings
+    // baseUrl) look at finished streams whose names can collide with the
+    // live registry's — never poll those.
+    if (this.baseUrl !== '/recordings') return;
+    if (!recordingStreams.has(this.streamName)) return;
+    this._refreshTimer = setInterval(() => {
+      const info = recordingStreams.get(this.streamName);
+      if (info && info.active) this.refresh();
+    }, 5000);
+  }
+
+  _stopRefreshTimer() {
+    if (this._refreshTimer) {
+      clearInterval(this._refreshTimer);
+      this._refreshTimer = null;
+    }
+  }
+
   async load(streamName) {
     this.streamName = streamName;
     this.useMSE = false;
     this._mseReady = false;
+    this._startRefreshTimer();
     try {
       this.segments = await this._loadSegmentsList();
     } catch { this.segments = []; }
@@ -570,10 +625,13 @@ class RecordingPlayer {
 
   destroy() {
     this._stopAnimLoop();
+    this._stopRefreshTimer();
     this.video.pause();
     // Remove event listeners to prevent stale handlers on the shared video element
     this.video.removeEventListener('ended', this._onEnded);
     this.video.removeEventListener('timeupdate', this._onTimeUpdate);
+    this.video.removeEventListener('pause', this._onVideoPause);
+    this.video.removeEventListener('play', this._onVideoPlay);
     this.timelineEl.removeEventListener('click', this._onTimelineClick);
     this.playBtn.removeEventListener('click', this._onPlayClick);
     // Abort any in-flight MSE loading
@@ -717,11 +775,20 @@ function fmtTime(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+/// Short human-readable file-size string, matches the server's formatter.
+/// The one canonical bytes formatter for the dashboard (this fragment is
+/// the earliest that needs it); `_fmtBytes` below is a legacy alias kept
+/// for its many call sites (stats disk usage, station diff, debug,
+/// session replay).
+function humanBytes(n) {
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+  if (n >= 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+
 function _fmtBytes(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  return humanBytes(bytes);
 }
 
 function _getOrCreateOptgroup(select, label) {
@@ -828,9 +895,14 @@ function removeRecordingStream(streamName) {
   const info = recordingStreams.get(streamName);
   if (info) info.active = false;
   document.getElementById('rec-status').textContent = 'Stopped';
-  // Refresh segments after recording stops — the final segment is now available
+  // Refresh segments after recording stops — the final segment is now
+  // available. Capture the instance: the player can be destroyed and
+  // replaced (stream switch/delete) inside the 500ms window.
   if (recPlayer && activeRecordingStream === streamName) {
-    setTimeout(() => recPlayer.refresh(), 500);
+    const player = recPlayer;
+    setTimeout(() => {
+      if (recPlayer === player) player.refresh();
+    }, 500);
   }
 }
 
@@ -842,9 +914,7 @@ function deleteRecordingStream(streamName) {
     if (slot.recordingStreamName === streamName) {
       slot.recordingStreamName = null;
       slot.recording = false;
-      slot.recordBtn.innerHTML = '&#x23FA; Record';
-      slot.recordBtn.classList.remove('active');
-      slot.deleteRecBtn.style.display = 'none';
+      slot._renderRecordingControls();
     }
   }
 
@@ -889,14 +959,9 @@ function switchRecordingStream(streamName) {
   speedSelect.value = '1';
   speedSelect.onchange = () => recPlayer.setSpeed(parseFloat(speedSelect.value));
 
+  // load() also starts the instance-owned segment poll for active
+  // recordings; destroy() (every switch/delete/reset path) clears it.
   recPlayer.load(streamName);
-
-  // Periodically refresh segment list for active recordings
-  if (recPlayer._refreshInterval) clearInterval(recPlayer._refreshInterval);
-  recPlayer._refreshInterval = setInterval(() => {
-    const info = recordingStreams.get(streamName);
-    if (info && info.active) recPlayer.refresh();
-  }, 5000);
 }
 
 // ── Displays collapse toggle ──
@@ -972,12 +1037,31 @@ document.getElementById('recording-stream-select').addEventListener('change', (e
   if (e.target.value) switchRecordingStream(e.target.value);
 });
 
+// Transport F8a (media residue): api_recordings is a tunnel-only method —
+// no HTTP row exists (CONTROL_ONLY_METHODS residue), so the facade serves
+// the tunnel leg and this call site keeps its own legacy /recordings lane
+// for tunnel-down dashboards (never in Connect mode), exactly like the
+// F7 WS-twin residue dispatchers keep their /ws fallback.
+async function fetchRecordingsListPayload() {
+  if (daemonApi.availability('api_recordings').ok) {
+    try {
+      return (await daemonApi.request('api_recordings', {}, { fallback: 'never' })).body;
+    } catch (err) {
+      if (err?.kind === 'abort' || dashboardConnectModeEnabled()) throw err;
+      console.warn('[dashboard-control] api_recordings RPC failed, falling back to HTTP', err);
+    }
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_recordings');
+  }
+  const resp = await fetch('/recordings');
+  return resp.json();
+}
+
 // Reconcile replay UI with the backend. Historical log replay can mention a
 // recording that has since been deleted, so the disk/API list is authoritative.
 async function reconcileRecordingStreams() {
   try {
-    const resp = await dashboardJsonFetch('api_recordings', {}, () => fetch('/recordings'), 'api_recordings');
-    const streams = await resp.json();
+    const streams = await fetchRecordingsListPayload();
     const liveNames = new Set();
     for (const s of streams) {
       if (s.stream_name) liveNames.add(s.stream_name);
@@ -993,4 +1077,3 @@ async function reconcileRecordingStreams() {
     }
   } catch { /* no recordings available */ }
 }
-

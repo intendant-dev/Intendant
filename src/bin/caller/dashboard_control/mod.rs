@@ -1,9 +1,11 @@
 //! Daemon-scoped WebRTC control tunnel for dashboard RPC experiments.
 //!
 //! The dashboard still uses HTTP plus the main WebSocket by default. This
-//! module provides the first substrate for a future public-origin dashboard:
-//! WebSocket signaling creates a direct browser-to-daemon WebRTC data channel,
-//! then the channel carries small JSON RPC frames.
+//! module provides a lower-latency path for clients already admitted through a
+//! trusted local, independently verified direct-mTLS, or authenticated peer
+//! transport: daemon/peer signaling creates a direct WebRTC data channel, then
+//! the channel carries small JSON RPC frames. Hosted Connect has no signaling
+//! or control path into this module.
 
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
@@ -32,7 +34,7 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -53,6 +55,10 @@ mod api_control;
 pub(crate) use api_control::*;
 
 const CONTROL_CHANNEL_LABEL: &str = "intendant-dashboard-control";
+/// Maximum idle-session delay before a long-lived dashboard transport notices
+/// that its opening IAM authority changed and tears itself down. Active
+/// inbound/outbound paths re-check synchronously before processing a frame.
+pub(crate) const LIVE_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
 const CONTROL_PROTOCOL_VERSION: u32 = 1;
 const CONTROL_SIGNATURE_CONTEXT: &str = "intendant-dashboard-control-v1";
 const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
@@ -63,7 +69,6 @@ const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
-static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// One dashboard-control method's declared surface. The effective method
 /// table (`all_control_methods`) is the single source the method authorizer
 /// (`authorize_dashboard_control_method`), the advertised feature list
@@ -73,9 +78,9 @@ static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 /// sync in the others. It is the union of two declaration sources, resolved
 /// rows-first: tunnel columns on `gateway_routes::ROUTES` rows (twinned
 /// methods, whose IAM operation derives from the route row — transport-
-/// unification design §2.2) and the residue `CONTROL_METHODS` below (methods
-/// whose family has not yet ported, plus tunnel-only methods with no HTTP
-/// twin). The `tunnel_method_partition_is_pinned` differential test freezes
+/// unification design §2.2) and the residue `CONTROL_ONLY_METHODS` below
+/// (tunnel-only methods with no HTTP twin). The
+/// `tunnel_method_partition_is_pinned` differential test freezes
 /// which methods live on which side. Composite rollup booleans the SPA also
 /// reads (peer mutations, managed context, …) stay hand-written next to the
 /// derived block in `status_response_frame`.
@@ -122,66 +127,65 @@ const fn uploadable(name: &'static str, op: PeerOperation) -> ControlMethodSpec 
     }
 }
 
-/// Upload-frame-only method (no request-lane dispatch, no feature entry).
-const fn upload_only(name: &'static str, op: PeerOperation) -> ControlMethodSpec {
-    ControlMethodSpec {
-        name,
-        op: Some(op),
-        advertised: false,
-        upload: true,
-    }
-}
-
-/// The residue half of the tunnel method table: methods not (yet) declared
-/// as a `tunnel:` column on a `gateway_routes::ROUTES` row. Do NOT add a
-/// method here if its HTTP twin has a route row — declare it on the row
-/// (`Route::with_tunnel`) so its IAM operation derives from the shared
-/// declaration; this list is for tunnel-only methods and families the
-/// migration has not reached. Never read directly outside this module's
-/// union plumbing and pins — consume `all_control_methods()` /
-/// `control_method_spec()`.
-const CONTROL_METHODS: &[ControlMethodSpec] = &[
+/// The residue half of the tunnel method table: methods with no HTTP twin
+/// — transport/handshake, credential custody (tunnel-scoped by design),
+/// connection-scoped signaling/authority RPCs whose HTTP-era twin is the
+/// `/ws` socket, `ControlMsg` intent lanes, media/clip upload lanes, and
+/// the bootstrap/replay reads (the tunnel-only set the transport-
+/// unification program's S11 removal stage left behind; `/session`,
+/// `/recordings*`, and custody HTTP rows stay parked future decisions —
+/// design §2.7). Do NOT add a method here if its HTTP twin has a route
+/// row — declare it on the row (`Route::with_tunnel`) so its IAM
+/// operation derives from the shared declaration. Never read directly
+/// outside this module's union plumbing and pins — consume
+/// `all_control_methods()` / `control_method_spec()`.
+const CONTROL_ONLY_METHODS: &[ControlMethodSpec] = &[
     ControlMethodSpec {
         name: "ping",
         op: None,
         advertised: true,
         upload: false,
     },
-    method("config", PeerOperation::RuntimeControl),
+    method("config", PeerOperation::PresenceRead),
     method("status", PeerOperation::PresenceRead),
     method("api_agent_card", PeerOperation::PresenceRead),
     method("api_cached_bootstrap_events", PeerOperation::SessionInspect),
     internal("subscribe_events", PeerOperation::SessionInspect),
     internal("unsubscribe_events", PeerOperation::SessionInspect),
-    method("api_access_overview", PeerOperation::AccessInspect),
-    method("api_access_iam_state", PeerOperation::AccessInspect),
-    method("api_access_enrollment_requests", PeerOperation::AccessInspect),
-    method("api_dashboard_targets", PeerOperation::AccessInspect),
-    // Connect rendezvous administration. Status is inspect-grade and
-    // never carries the claim phrase; the phrase reveal, config toggle,
-    // and unclaim are manage-gated (mirrors the HTTP route rows).
-    method("api_access_connect_status", PeerOperation::AccessInspect),
-    method("api_access_connect_claim_code", PeerOperation::AccessManage),
-    method("api_access_connect_config", PeerOperation::AccessManage),
-    method("api_access_connect_unclaim", PeerOperation::AccessManage),
-    // Trust-tier settings (docs/src/trust-tiers.md): the tier label and
-    // the hosted-control ceiling knob (mirrors the HTTP route rows).
-    method("api_access_set_tier", PeerOperation::AccessManage),
-    method("api_access_set_hosted_ceiling", PeerOperation::AccessManage),
-    // Fleet certificate: publish this daemon's addresses for its fleet
-    // name and run the ACME DNS-01 order (fleet_cert.rs). Slow flow,
-    // started async; progress rides the connect status payload.
-    method("api_fleet_cert_request", PeerOperation::AccessManage),
+    // The access inspect reads (api_access_overview, api_access_iam_state,
+    // api_access_enrollment_requests, api_dashboard_targets), the connect
+    // admin quartet (status, claim-code, config, unclaim), and the
+    // trust-tier setter lives as a tunnel column on its route row — its IAM
+    // operation derives from that row (S6). Hosted ceilings are immutable
+    // `role:none`; the former setter is deliberately absent.
+    // api_fleet_cert_request lives as a tunnel column on its ROW-NEW
+    // (POST /api/access/fleet-cert/request — S6 closed the family's one
+    // missing HTTP twin).
     // Credential custody (vault leases + client egress): granting, renewing,
     // revoking, and even reading lease status all sit behind the dedicated
     // gate — a scoped guest session can neither fuel nor drain a daemon, nor
     // see which providers are fueled. Raw egress_* relay frames are a
     // separate wire family and deliberately not methods here.
-    method("api_credential_lease_grant", PeerOperation::CredentialsManage),
-    method("api_credential_lease_renew", PeerOperation::CredentialsManage),
-    method("api_credential_lease_revoke", PeerOperation::CredentialsManage),
-    method("api_credential_lease_status", PeerOperation::CredentialsManage),
-    method("api_credential_custody_trail", PeerOperation::CredentialsManage),
+    method(
+        "api_credential_lease_grant",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_renew",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_revoke",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_lease_status",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_credential_custody_trail",
+        PeerOperation::CredentialsManage,
+    ),
     // Daemon-local vault blob storage (the local-vault half of custody):
     // blind E2E ciphertext the daemon can neither read nor forge, so a
     // direct dashboard has a vault home without any Connect service in
@@ -189,6 +193,26 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     // and revision history are custody-sensitive.
     method("api_daemon_vault_fetch", PeerOperation::CredentialsManage),
     method("api_daemon_vault_publish", PeerOperation::CredentialsManage),
+    // Write-only vault deposits (vault_deposits.rs): the dashboard
+    // publishes the vault's deposit public key here and folds queued
+    // deposits into the blob on unlock. All ciphertext/public material —
+    // the daemon can neither read deposits nor mint vault entries.
+    method(
+        "api_daemon_vault_deposit_key_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposit_key_publish",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_fetch",
+        PeerOperation::CredentialsManage,
+    ),
+    method(
+        "api_daemon_vault_deposits_consume",
+        PeerOperation::CredentialsManage,
+    ),
     method(
         "api_credential_egress_register",
         PeerOperation::CredentialsManage,
@@ -197,113 +221,57 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_credential_egress_unregister",
         PeerOperation::CredentialsManage,
     ),
-    method("api_credential_egress_probe", PeerOperation::CredentialsManage),
     method(
-        "api_access_iam_upsert_user_client_grant",
-        PeerOperation::AccessManage,
+        "api_credential_egress_probe",
+        PeerOperation::CredentialsManage,
     ),
-    method("api_access_iam_update_grant", PeerOperation::AccessManage),
-    method("api_access_enrollment_decide", PeerOperation::AccessManage),
-    method("api_access_org_trust", PeerOperation::AccessManage),
-    method("api_access_org_revoke", PeerOperation::AccessManage),
-    method("api_access_org_issue", PeerOperation::AccessManage),
-    method("api_access_org_revoke_member", PeerOperation::AccessManage),
-    method("api_access_org_issuer_init", PeerOperation::AccessManage),
-    method("api_access_org_issuer_delegate", PeerOperation::AccessManage),
-    method("api_access_org_issuer_install", PeerOperation::AccessManage),
-    // Presenting a signed org document (or list) only requires a session;
-    // the document itself is the authorization and is fully re-verified.
-    // Same for reading the org's public revocation list and renewing a
-    // still-valid document.
-    method("api_access_org_present", PeerOperation::AccessInspect),
-    method("api_access_org_orl", PeerOperation::AccessInspect),
-    method("api_access_org_renew", PeerOperation::AccessInspect),
-    // Applying a root-signed revocation list mirrors a PUBLIC doorbell
-    // (`POST /api/access/orgs/revocations/apply`): the signature is the
-    // authority, so any session may courier one through the tunnel.
-    method("api_access_org_orl_apply", PeerOperation::PresenceRead),
-    method("api_peer_pairing_requests", PeerOperation::AccessInspect),
-    method("api_peer_pairing_identities", PeerOperation::AccessInspect),
-    method(
-        "api_peer_pairing_request_decision",
-        PeerOperation::AccessManage,
-    ),
-    method(
-        "api_peer_pairing_identity_revoke",
-        PeerOperation::AccessManage,
-    ),
-    method("api_peer_pairing_invite", PeerOperation::AccessManage),
-    method("api_peers", PeerOperation::PeerInspect),
-    method("api_peer_eligible", PeerOperation::PeerInspect),
-    // Acting through a connected peer — signaling relays that open tunnels,
-    // and the message/task/approval quick controls — is peer use, not peer
-    // administration: the receiving peer authorizes each action against its
-    // own grants for this daemon. Mirrors the HTTP lane's
-    // `federation_http_operation`.
-    method("api_peer_webrtc_signal", PeerOperation::PeerUse),
-    method("api_peer_file_transfer_signal", PeerOperation::PeerUse),
-    method("api_peer_dashboard_control_signal", PeerOperation::PeerUse),
-    method("api_peer_message", PeerOperation::PeerUse),
-    method("api_peer_task", PeerOperation::PeerUse),
-    method("api_peer_approval", PeerOperation::PeerUse),
-    method("api_peer_add", PeerOperation::PeerManage),
-    method("api_peer_remove", PeerOperation::PeerManage),
-    method("api_peer_pairing_join", PeerOperation::PeerManage),
-    method("api_peer_pairing_request_access", PeerOperation::PeerManage),
-    method(
-        "api_peer_pairing_request_access_poll",
-        PeerOperation::PeerManage,
-    ),
-    method("api_coordinator_route", PeerOperation::PeerManage),
+    // The IAM grant mutations (upsert/update), enrollment decide, and
+    // the seven org-manage methods live as tunnel columns on their route
+    // rows — their IAM operations derive from the rows (S6).
+    // The signed-org doorbell methods (present, orl, orl_apply, renew)
+    // live as tunnel columns on their PUBLIC route rows with documented
+    // op overrides — session-gated on the tunnel by design (S6; the
+    // override enumeration test in gateway_routes pins the set).
+    // The peers/coordinator federation family (registry, eligibility,
+    // pairing, quick controls, signaling relays, coordinator routing)
+    // lives as tunnel columns on its carved per-leaf route rows (S7):
+    // each twin's IAM operation derives from federation_http_operation
+    // on its row's canonical leaf — acting through a connected peer
+    // (quick controls + signaling relays) classifies as peer use, not
+    // peer administration, exactly as the HTTP gate has always ruled.
+    // Coordinator routing joined that rule on the 2026-07-11 owner
+    // decision: it delegates this daemon's peer identity like the quick
+    // controls, so both lanes gate on PeerUse (its historical
+    // PeerManage-tunnel / Task-HTTP op override is gone).
     // The sessions read-core methods (api_sessions, api_sessions_search,
     // api_session_detail, api_session_agent_output,
     // api_session_context_snapshot) live as tunnel columns on their
     // route rows — their IAM operations derive from the rows (S4a; the
     // formerly divergent agent-output/context-snapshot twins are now
     // derivation-equal by construction).
-    method("api_sessions_stream", PeerOperation::SessionInspect),
-    method("api_session_report", PeerOperation::SessionInspect),
-    method("api_session_recordings", PeerOperation::SessionInspect),
-    method("api_session_recording_asset", PeerOperation::SessionInspect),
-    method("api_session_frame_asset", PeerOperation::SessionInspect),
-    method("api_worktrees", PeerOperation::SessionInspect),
-    method("api_worktrees_inspect", PeerOperation::SessionInspect),
-    method("api_session_delete", PeerOperation::SessionManage),
-    method("api_session_current_history", PeerOperation::SessionManage),
-    method("api_session_current_rollback", PeerOperation::SessionManage),
-    method("api_session_current_redo", PeerOperation::SessionManage),
-    method("api_session_current_prune", PeerOperation::SessionManage),
-    method("api_session_current_changes", PeerOperation::SessionManage),
-    method("api_session_current_uploads", PeerOperation::SessionManage),
-    method("api_session_current_upload_raw", PeerOperation::SessionManage),
-    method(
-        "api_session_current_upload_delete",
-        PeerOperation::SessionManage,
-    ),
-    method(
-        "api_session_current_agent_output",
-        PeerOperation::SessionManage,
-    ),
+    // The session artifact reads (api_session_report,
+    // api_session_recordings, api_session_recording_asset,
+    // api_session_frame_asset), api_session_delete, and the worktrees
+    // quartet live as tunnel columns on their route rows (S4b), and so
+    // does the whole current-session family — history/rollback/redo/
+    // prune, changes, agent-output, uploads list/raw/delete, the
+    // upload-frame-only api_session_current_upload (S4c), and the
+    // Stream-lane api_sessions_stream (S10).
     method("api_session_control_msg", PeerOperation::SessionManage),
-    method("api_worktrees_scan", PeerOperation::SessionManage),
-    method("api_worktrees_remove", PeerOperation::SessionManage),
-    upload_only("api_session_current_upload", PeerOperation::SessionManage),
-    method("api_transfer_jobs", PeerOperation::FilesystemRead),
-    method("api_transfer_download_read", PeerOperation::FilesystemRead),
     // The api_fs_* methods live as tunnel columns on their route rows
     // (gateway_routes::ROUTES, /api/fs/*) — the first family whose tunnel
-    // ops derive from the rows instead of entries here. The api_transfer_*
-    // methods join them when their HTTP rows land (design §4, task #6).
-    method("api_transfer_job_create", PeerOperation::FilesystemWrite),
-    method("api_transfer_job_delete", PeerOperation::FilesystemWrite),
-    // Transfer chunks arrive only as upload frames; their destination was
-    // path-scoped when the transfer job was created, so the chunk itself
-    // only needs the write operation (`authorize_dashboard_control_upload`).
-    uploadable("api_transfer_upload_chunk", PeerOperation::FilesystemWrite),
-    method("api_transfer_upload_commit", PeerOperation::FilesystemWrite),
+    // ops derive from the rows instead of entries here — and the
+    // api_transfer_* family joined them with its /api/transfers rows
+    // (S9, design §4, task #6). Tunnel-side transfer chunks still arrive
+    // only as upload frames: their destination was path-scoped when the
+    // job was created, so the chunk needs only the write operation
+    // (`authorize_dashboard_control_upload`), which now derives from the
+    // chunk row like everything else.
     method("api_display_bootstrap", PeerOperation::DisplayView),
     method("api_display_webrtc_signal", PeerOperation::DisplayView),
-    method("api_displays", PeerOperation::DisplayView),
+    // api_displays and api_diagnostics_visual_freshness live as tunnel
+    // columns on their route rows (S5); the signaling/authority methods
+    // below stay residue (their HTTP-era twin is /ws, not a route).
     method(
         "api_display_input_authority_snapshot",
         PeerOperation::DisplayInput,
@@ -316,18 +284,12 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         "api_display_input_authority_release",
         PeerOperation::DisplayInput,
     ),
-    method(
-        "api_diagnostics_visual_freshness",
-        PeerOperation::DisplayInput,
-    ),
     method("api_control_msg", PeerOperation::Message),
     method("api_dashboard_action_msg", PeerOperation::Message),
     method("api_mcp_tool_call", PeerOperation::Message),
-    method("api_settings", PeerOperation::Settings),
-    method("api_settings_save", PeerOperation::Settings),
-    method("api_key_status", PeerOperation::Settings),
-    method("api_api_keys_save", PeerOperation::Settings),
-    method("api_project_root", PeerOperation::Settings),
+    // The settings/keys family (api_settings, api_settings_save,
+    // api_key_status, api_api_keys_save, api_project_root) lives as
+    // tunnel columns on its route rows (S5).
     method("api_voice_session", PeerOperation::RuntimeControl),
     uploadable("api_presence_video_frame", PeerOperation::RuntimeControl),
     uploadable("api_media_annotation_attach", PeerOperation::RuntimeControl),
@@ -338,7 +300,10 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
     method("api_media_clip_cancel", PeerOperation::RuntimeControl),
     method("api_recordings", PeerOperation::RuntimeControl),
     method("api_recording_asset", PeerOperation::RuntimeControl),
-    method("api_browser_workspace_snapshot", PeerOperation::SessionInspect),
+    method(
+        "api_browser_workspace_snapshot",
+        PeerOperation::SessionInspect,
+    ),
     method("api_state_snapshot", PeerOperation::SessionInspect),
     method("api_session_log_replay", PeerOperation::SessionInspect),
     method(
@@ -346,15 +311,14 @@ const CONTROL_METHODS: &[ControlMethodSpec] = &[
         PeerOperation::SessionInspect,
     ),
     method("api_dashboard_bootstrap", PeerOperation::SessionInspect),
-    method("api_managed_context_records", PeerOperation::SessionInspect),
-    method("api_managed_context_anchors", PeerOperation::SessionInspect),
-    method("api_managed_context_fission", PeerOperation::SessionInspect),
-    method("api_external_agents", PeerOperation::SessionInspect),
+    // The api_managed_context_* trio lives as tunnel columns on the
+    // /api/managed-context/* route rows (S4c); api_external_agents on
+    // its row (S5).
 ];
 
 /// The effective method table: route-row tunnel specs first (in ROUTES
 /// declaration order, with the IAM operation derived from each row —
-/// `Route::tunnel_operation`), then the residue `CONTROL_METHODS`.
+/// `Route::tunnel_operation`), then the residue `CONTROL_ONLY_METHODS`.
 /// Materialized once; every consumer sees the same union. Resolution is
 /// deterministic — rows win — so even the (unlandable, pin-tested) state
 /// of a method declared on both sides cannot flap between operations. A
@@ -376,7 +340,7 @@ fn all_control_methods() -> &'static [ControlMethodSpec] {
                 })
             })
             .collect();
-        methods.extend_from_slice(CONTROL_METHODS);
+        methods.extend_from_slice(CONTROL_ONLY_METHODS);
         methods
     })
 }
@@ -404,7 +368,7 @@ const CONTROL_WIRE_FEATURES: &[&str] = &[
 ];
 
 /// The advertised `features` list: every advertised method in the
-/// effective table (route-row tunnel specs ∪ the `CONTROL_METHODS`
+/// effective table (route-row tunnel specs ∪ the `CONTROL_ONLY_METHODS`
 /// residue) plus the wire features. Consumers membership-test — order
 /// carries no meaning.
 fn control_features() -> &'static [&'static str] {
@@ -438,12 +402,17 @@ fn control_method_runtime_ready(runtime: &ControlRuntime, method: &str) -> bool 
         | "api_peer_file_transfer_signal"
         | "api_peer_dashboard_control_signal"
         | "api_coordinator_route" => runtime.peer_registry.is_some(),
-        "api_settings_save" => runtime.project_root.is_some(),
+        // Settings have their own durable root even when the daemon is
+        // projectless; method execution resolves it from RuntimeSettingsState.
+        "api_settings_save" => true,
         "api_access_connect_config" | "api_access_connect_unclaim" => {
             runtime.project_root.is_some()
         }
         "api_mcp_tool_call" => runtime.mcp_server.is_some(),
-        method if method.starts_with("api_transfer_") => runtime.project_root.is_some(),
+        // api_transfer_* deliberately has no project_root gate: the store
+        // resolves through StoreScope (daemon-global fallback on projectless
+        // daemons), and the S9 HTTP rows already serve projectless — the
+        // old gate made the tunnel lane lie about the same store.
         method if method.starts_with("api_display_input_authority_") => {
             runtime.display_authority.is_some()
         }
@@ -473,56 +442,239 @@ pub struct DashboardControlRegistry {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+    tabs: crate::web_gateway::DashboardTabsRegistry,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub enum DashboardControlGrant {
-    #[default]
     TrustedLocal,
-    UserClientRoot {
-        principal: crate::access::iam::AccessPrincipal,
-    },
     UserClient {
         principal: crate::access::iam::AccessPrincipal,
         iam_state: crate::access::iam::LocalIamState,
+        /// Production sessions reload this daemon-owned IAM directory through
+        /// the stat-fingerprint cache before every authorization decision.
+        /// `None` is reserved for hermetic in-memory tests.
+        iam_cert_dir: Option<PathBuf>,
     },
     Peer {
         fingerprint: String,
         label: String,
         profile: String,
         filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+        /// Exact active peer-identity record that authenticated the opening,
+        /// plus its daemon-owned directory for live revocation checks.
+        identity_record: Option<crate::peer::access_policy::PeerIdentityRecord>,
+        iam_cert_dir: Option<PathBuf>,
+        /// Delegation-lane attribution (docs/src/trust-tiers.md § Two
+        /// lanes): the browser identity key that signed the relayed
+        /// offer, when one did. Attribution never widens authority —
+        /// the peer profile above remains the ceiling — it gives the
+        /// audit trail and the UI badge a human identity beside the
+        /// daemon principal.
+        attributed: Option<PeerAttribution>,
     },
 }
 
+/// Stable identity of the transport credential + principal + grant that
+/// opened a dashboard-control session. Follow-up HTTP signaling is stateless,
+/// so the registry retains this binding and refuses ICE/close from another
+/// CA-valid certificate or from a principal whose grant changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DashboardControlSessionOwner {
+    TrustedLocal,
+    UserClient {
+        principal_id: String,
+        grant_id: Option<String>,
+        authn_kind: Option<String>,
+        authn_binding: Option<String>,
+    },
+    Peer {
+        fingerprint: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DashboardControlSessionMutation {
+    Applied,
+    NotFound,
+    Forbidden,
+}
+
+/// The verified human identity behind a delegation-lane connection.
+#[derive(Clone, Debug)]
+pub struct PeerAttribution {
+    /// base64url(sha256(raw P-256 point)) — the IAM binding value.
+    pub fingerprint: String,
+    /// The raw public key, retained for display/audit.
+    #[allow(dead_code)] // recorded for the delegation-lane audit surface; not read yet
+    pub public_key_b64u: String,
+    /// The label of the enrolled user/client principal this key matches
+    /// in the TARGET's local IAM, when it matches one. `None` = a valid
+    /// signature from a key this daemon has never enrolled (attribution
+    /// is still recorded; the audit shows the fingerprint).
+    pub enrolled_label: Option<String>,
+}
+
 impl DashboardControlGrant {
-    fn label(&self) -> &str {
+    fn current_user_client_state(&self) -> Result<Arc<crate::access::iam::LocalIamState>, String> {
+        let Self::UserClient {
+            iam_state,
+            iam_cert_dir,
+            ..
+        } = self
+        else {
+            return Err("dashboard grant is not a local IAM user/client".to_string());
+        };
+        match iam_cert_dir {
+            Some(cert_dir) => crate::access::iam::load_state_cached_arc(cert_dir)
+                .map_err(|error| format!("reload local IAM state: {error}")),
+            None => Ok(Arc::new(iam_state.clone())),
+        }
+    }
+
+    /// A long-lived browser session must never outlive the exact IAM record
+    /// that opened it. Any grant/principal mutation (including downgrade,
+    /// revocation, expiry/ORL materialization, scope edit, deletion, or a
+    /// reload error) makes the session stale and forces a reconnect under the
+    /// new authority. Unrelated IAM edits do not disturb it.
+    pub(crate) fn opening_authority_is_current(&self) -> bool {
+        match self {
+            Self::UserClient {
+                principal,
+                iam_state,
+                ..
+            } => {
+                let Some(grant_id) = principal.grant_id.as_deref() else {
+                    return false;
+                };
+                let Ok(current) = self.current_user_client_state() else {
+                    return false;
+                };
+                let Some(opening_grant) =
+                    iam_state.grants.iter().find(|grant| grant.id == grant_id)
+                else {
+                    return false;
+                };
+                let Some(current_grant) = current.grants.iter().find(|grant| grant.id == grant_id)
+                else {
+                    return false;
+                };
+                let Some(opening_principal) = iam_state
+                    .principals
+                    .iter()
+                    .find(|record| record.id == principal.id)
+                else {
+                    return false;
+                };
+                let Some(current_principal) = current
+                    .principals
+                    .iter()
+                    .find(|record| record.id == principal.id)
+                else {
+                    return false;
+                };
+                let role_id = if opening_grant.role_id.trim().is_empty() {
+                    "role:scoped-human"
+                } else {
+                    opening_grant.role_id.as_str()
+                };
+                let Some(opening_role) = iam_state.roles.iter().find(|role| role.id == role_id)
+                else {
+                    return false;
+                };
+                let Some(current_role) = current.roles.iter().find(|role| role.id == role_id)
+                else {
+                    return false;
+                };
+                let hosted_provenance_unchanged = principal.authn_kind.as_deref()
+                    != Some("client_key")
+                    || iam_state.hosted_origins == current.hosted_origins;
+                opening_grant == current_grant
+                    && opening_principal == current_principal
+                    && opening_role == current_role
+                    && hosted_provenance_unchanged
+                    && current_grant.is_active_at(crate::access::client_key::now_unix_ms())
+                    && crate::access::iam::is_enforced_status(&current_principal.status)
+            }
+            Self::Peer {
+                fingerprint,
+                identity_record,
+                iam_cert_dir,
+                ..
+            } => match (identity_record, iam_cert_dir) {
+                (None, None) => true,
+                (Some(opening), Some(cert_dir)) => {
+                    let now_unix = crate::access::client_key::now_unix_ms() / 1000;
+                    matches!(
+                        crate::peer::access_policy::lookup_identity_cached_arc(cert_dir, fingerprint),
+                        Ok(Some(current)) if current.as_ref() == opening && current.is_active(now_unix)
+                    )
+                }
+                _ => false,
+            },
+            Self::TrustedLocal => true,
+        }
+    }
+
+    fn signaling_owner(&self) -> DashboardControlSessionOwner {
+        match self {
+            Self::TrustedLocal => DashboardControlSessionOwner::TrustedLocal,
+            Self::UserClient { principal, .. } => DashboardControlSessionOwner::UserClient {
+                principal_id: principal.id.clone(),
+                grant_id: principal.grant_id.clone(),
+                authn_kind: principal.authn_kind.clone(),
+                authn_binding: principal.authn_binding.clone(),
+            },
+            Self::Peer { fingerprint, .. } => DashboardControlSessionOwner::Peer {
+                fingerprint: fingerprint.clone(),
+            },
+        }
+    }
+
+    pub(crate) fn label(&self) -> &str {
         match self {
             Self::TrustedLocal => "trusted-local",
-            Self::UserClientRoot { principal } => principal.label.as_str(),
             Self::UserClient { principal, .. } => principal.label.as_str(),
             Self::Peer { label, .. } => label.as_str(),
         }
     }
 
+    /// Coarse provenance bucket for the tabs-presence surface: the
+    /// owner's own dashboard, an enrolled client key, or a federated
+    /// peer / delegation-lane connection.
+    pub(crate) fn connection_kind(&self) -> &'static str {
+        match self {
+            Self::TrustedLocal => "local",
+            Self::UserClient { .. } => "client",
+            Self::Peer { .. } => "peer",
+        }
+    }
+
     fn profile(&self) -> Option<&str> {
         match self {
-            Self::TrustedLocal | Self::UserClientRoot { .. } | Self::UserClient { .. } => None,
+            Self::TrustedLocal | Self::UserClient { .. } => None,
             Self::Peer { profile, .. } => Some(profile.as_str()),
         }
     }
 
-    pub(crate) fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+    pub(crate) fn filesystem(&self) -> Option<crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
-            // TrustedLocal is the owner's own dashboard; a root client key
-            // is equivalent. Scoping applies to granted principals.
-            Self::TrustedLocal | Self::UserClientRoot { .. } => None,
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::fs_scope_for_principal(iam_state, principal),
-            Self::Peer { filesystem, .. } => Some(filesystem),
+            // TrustedLocal is the owner's own dashboard. Every enrolled
+            // client, including a root-role client, is re-derived from IAM.
+            Self::TrustedLocal => None,
+            Self::UserClient { principal, .. } => match self.current_user_client_state() {
+                Ok(state) => crate::access::iam::fs_scope_for_principal(&state, principal).cloned(),
+                // A malformed/unreadable live IAM file must not turn a scoped
+                // grant into unrestricted filesystem access.
+                Err(_) => Some(crate::peer::access_policy::FilesystemAccessPolicy::default()),
+            },
+            Self::Peer { filesystem, .. } => Some(if self.opening_authority_is_current() {
+                filesystem.clone()
+            } else {
+                crate::peer::access_policy::FilesystemAccessPolicy::default()
+            }),
         }
     }
 
@@ -532,8 +684,22 @@ impl DashboardControlGrant {
                 "dashboard-control",
                 "webrtc-datachannel",
             ),
-            Self::UserClientRoot { principal } => principal.clone(),
-            Self::UserClient { principal, .. } => principal.clone(),
+            Self::UserClient { principal, .. } => {
+                let mut current = principal.clone();
+                if let Ok(state) = self.current_user_client_state() {
+                    if let Some(grant_id) = principal.grant_id.as_deref() {
+                        if let Some(grant) = state.grants.iter().find(|grant| grant.id == grant_id)
+                        {
+                            current.role_id = if grant.role_id.trim().is_empty() {
+                                "role:scoped-human".to_string()
+                            } else {
+                                grant.role_id.clone()
+                            };
+                        }
+                    }
+                }
+                current
+            }
             Self::Peer {
                 fingerprint,
                 label,
@@ -551,34 +717,161 @@ impl DashboardControlGrant {
     /// Origin class of this session for the custody trail —
     /// `hosted` / `direct` / `local` / `peer`
     /// (`access::iam::session_origin_class`). `UserClient` grants carry
-    /// their IAM snapshot's `hosted_origins`; the root-equivalent
-    /// variants classify against the compiled default list.
+    /// their IAM snapshot's `hosted_origins`.
     pub(crate) fn custody_origin_class(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "local",
-            Self::UserClientRoot { principal } => crate::access::iam::session_origin_class(
-                &crate::access::iam::default_hosted_origins(),
-                principal,
-            ),
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::session_origin_class(&iam_state.hosted_origins, principal),
+            Self::UserClient { principal, .. } => self
+                .current_user_client_state()
+                .map(|state| {
+                    crate::access::iam::session_origin_class(&state.hosted_origins, principal)
+                })
+                .unwrap_or("direct"),
             Self::Peer { .. } => "peer",
         }
     }
 
-    /// The terminal actor lane for this connection: root-equivalent
-    /// grants (trusted local, unbound mTLS root) own the root lane and
-    /// see every shell session; everyone else acts as their principal id
-    /// and sees only owned or shared sessions.
+    /// The terminal actor lane for this connection: trusted-local and
+    /// explicitly granted root principals own the root lane and see every
+    /// shell session; everyone else acts as their principal id and sees only
+    /// owned or shared sessions.
     pub(crate) fn terminal_actor(&self) -> crate::terminal::TerminalActor {
         let principal = self.access_principal();
-        if principal.kind == "root_session" {
+        let is_root = match self {
+            Self::TrustedLocal => true,
+            Self::UserClient { .. } => {
+                principal.role_id == "role:root" && self.opening_authority_is_current()
+            }
+            Self::Peer { .. } => false,
+        };
+        if is_root {
             crate::terminal::TerminalActor::Root
         } else {
             crate::terminal::TerminalActor::Principal(principal.id)
         }
+    }
+
+    /// Whether this connection is one of the owner's authenticated dashboard
+    /// surfaces. Private user-session displays and actions that mint access to
+    /// them must never be exposed merely by granting `display.view` or
+    /// `display.input` to a delegate.
+    pub(crate) fn has_owner_dashboard_authority(&self) -> bool {
+        match self {
+            Self::TrustedLocal => true,
+            Self::UserClient { principal, .. } => {
+                principal.role_id == "role:root" && self.opening_authority_is_current()
+            }
+            Self::Peer { .. } => false,
+        }
+    }
+
+    /// Resolve a display through this connection's visibility boundary.
+    /// Generic display permissions expose agent-visible displays only; the
+    /// owner's authenticated dashboard may additionally resolve private user
+    /// views.
+    pub(crate) fn display_session(
+        &self,
+        registry: &crate::display::SessionRegistry,
+        display_id: u32,
+    ) -> Option<Arc<crate::display::DisplaySession>> {
+        if self.has_owner_dashboard_authority() {
+            registry.get_any(display_id)
+        } else {
+            registry.get(display_id)
+        }
+    }
+
+    /// Enumerate displays through the same visibility boundary as
+    /// [`Self::display_session`].
+    pub(crate) fn display_ids(&self, registry: &crate::display::SessionRegistry) -> Vec<u32> {
+        if self.has_owner_dashboard_authority() {
+            registry.all_display_ids()
+        } else {
+            registry.display_ids()
+        }
+    }
+
+    /// Apply the owner-only boundary to dashboard event streams. This hides
+    /// explicit private ready/grant records, display-request prompts, and
+    /// portal approval prompts from scoped dashboards. Display lifecycle
+    /// failure/teardown metadata does not carry the original visibility bit
+    /// and remains audit metadata rather than a secrecy boundary.
+    pub(crate) fn allows_dashboard_event_line(&self, line: &str) -> bool {
+        self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
+    }
+
+    pub(crate) fn dashboard_event_line_requires_owner(line: &str) -> bool {
+        if !line.contains("display_request_raised")
+            && !line.contains("display_request_resolved")
+            && !line.contains("display_approval_pending")
+            && !line.contains("\"agent_visible\"")
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return false;
+        };
+        match value.get("event").and_then(serde_json::Value::as_str) {
+            Some(
+                "display_request_raised" | "display_request_resolved" | "display_approval_pending",
+            ) => true,
+            Some("display_ready" | "user_display_granted") => {
+                value
+                    .get("agent_visible")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove owner-only display events from a browser bootstrap replay.
+    ///
+    /// Session logs remain the daemon's audit record; this filters only the
+    /// live dashboard projection so a historical private `display_ready`
+    /// cannot recreate a denied display slot for a scoped client.
+    pub(crate) fn filter_dashboard_replay_payload(&self, replay: &mut serde_json::Value) {
+        if self.has_owner_dashboard_authority() {
+            return;
+        }
+        let Some(entries) = replay
+            .get_mut("entries")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        entries.retain(|entry| {
+            serde_json::to_string(entry)
+                .ok()
+                .is_none_or(|line| !Self::dashboard_event_line_requires_owner(&line))
+        });
+    }
+
+    /// Display target carried by a serialized dashboard event, when present.
+    /// Live event loops use it to suppress every event for an active private
+    /// session, including variants such as resize that do not repeat the
+    /// `agent_visible` bit.
+    pub(crate) fn dashboard_event_display_id(line: &str) -> Option<u32> {
+        if !line.contains("\"display_id\"") {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()?
+            .get("display_id")?
+            .as_u64()
+            .and_then(|display_id| u32::try_from(display_id).ok())
+    }
+
+    pub(crate) fn dashboard_event_targets_hidden_display(
+        &self,
+        line: &str,
+        registry: &crate::display::SessionRegistry,
+    ) -> bool {
+        let Some(display_id) = Self::dashboard_event_display_id(line) else {
+            return false;
+        };
+        registry.get_any(display_id).is_some()
+            && self.display_session(registry, display_id).is_none()
     }
 
     pub(crate) fn access_decision(
@@ -586,20 +879,85 @@ impl DashboardControlGrant {
         op: crate::peer::access_policy::PeerOperation,
     ) -> crate::access::iam::AccessDecision {
         match self {
-            Self::UserClient {
-                principal,
-                iam_state,
-            } => crate::access::iam::evaluate_principal_operation_with_state(
-                iam_state, principal, op,
-            ),
+            Self::UserClient { principal, .. } => match self.current_user_client_state() {
+                Ok(state) => crate::access::iam::evaluate_principal_operation_with_state(
+                    &state, principal, op,
+                ),
+                Err(error) => crate::access::iam::AccessDecision::denied(
+                    principal,
+                    op,
+                    format!("local IAM state is unavailable: {error}"),
+                ),
+            },
+            Self::Peer { .. } if !self.opening_authority_is_current() => {
+                let principal = self.access_principal();
+                crate::access::iam::AccessDecision::denied(
+                    &principal,
+                    op,
+                    "peer identity changed, expired, was revoked, or could not be reloaded",
+                )
+            }
             _ => crate::access::iam::evaluate_principal_operation(&self.access_principal(), op),
         }
+    }
+
+    /// Authorize the concrete action carried inside a multiplexed control RPC.
+    /// The outer method's permission is only a conservative admission floor;
+    /// it must not become a confused-deputy grant for every action in the
+    /// method's allowlist.
+    pub(crate) fn control_msg_access_decision(
+        &self,
+        ctrl: &ControlMsg,
+    ) -> crate::access::iam::AccessDecision {
+        let operation = crate::access::access_policy::control_msg_operation(ctrl);
+        if crate::access::access_policy::control_msg_requires_owner_dashboard(ctrl)
+            && !self.has_owner_dashboard_authority()
+        {
+            let principal = self.access_principal();
+            return crate::access::iam::AccessDecision::denied(
+                &principal,
+                operation,
+                "owner dashboard authority is required for this action",
+            );
+        }
+        self.access_decision(operation)
+    }
+
+    /// Pre-session fail-closed gate for transports that push snapshots or
+    /// transcripts immediately after opening. A principal with no effective
+    /// operation must not reach the WebSocket/DataChannel stage, because
+    /// inbound frame authorization cannot retract already-sent outbound data.
+    pub(crate) fn has_any_effective_operation(&self) -> bool {
+        crate::access::access_policy::ALL_OPERATIONS
+            .iter()
+            .copied()
+            .any(|operation| self.access_decision(operation).allowed)
+    }
+
+    /// Whether this grant may enter the legacy `/ws` event lane. That lane
+    /// sends a whole-dashboard bootstrap and then an unfiltered broadcast
+    /// stream, so method-level inbound authorization cannot make a narrower
+    /// role safe. Until outbound events are permission-filtered, require the
+    /// complete built-in observer read set. Root/operator and an equivalent
+    /// custom role pass; scoped-human and single-purpose roles do not.
+    pub(crate) fn allows_unfiltered_websocket_stream(&self) -> bool {
+        use crate::access::access_policy::PeerOperation;
+
+        [
+            PeerOperation::PresenceRead,
+            PeerOperation::StatsRead,
+            PeerOperation::DisplayView,
+            PeerOperation::AccessInspect,
+            PeerOperation::PeerInspect,
+            PeerOperation::SessionInspect,
+        ]
+        .into_iter()
+        .all(|operation| self.access_decision(operation).allowed)
     }
 
     pub(crate) fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
-            Self::UserClientRoot { .. } => "user-client-root",
             Self::UserClient { .. } => "user-client",
             Self::Peer { .. } => "peer",
         }
@@ -710,24 +1068,36 @@ impl DashboardPresenceBridge {
     }
 }
 
+/// Callback signatures for [`DashboardDisplayAuthorityBridge`]: each takes the
+/// dashboard client id (and a display id / id list) and returns event JSON.
+type AuthoritySnapshotFn = dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityStateFrameFn = dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync;
+type AuthorityRequestFn = dyn Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityEventsFn = dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync;
+type AuthorityInputAuthorizedFn = dyn Fn(&str, u32) -> bool + Send + Sync;
+type AuthorityInputRevisionFn = dyn Fn(u32) -> Arc<AtomicU64> + Send + Sync;
+
 #[derive(Clone)]
 pub struct DashboardDisplayAuthorityBridge {
-    snapshot: Arc<dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync>,
-    state_frame: Arc<dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync>,
-    request: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    release: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
-    input_authorized: Arc<dyn Fn(&str, u32) -> bool + Send + Sync>,
+    snapshot: Arc<AuthoritySnapshotFn>,
+    state_frame: Arc<AuthorityStateFrameFn>,
+    request: Arc<AuthorityRequestFn>,
+    release: Arc<AuthorityEventsFn>,
+    input_authorized: Arc<AuthorityInputAuthorizedFn>,
+    input_revision: Arc<AuthorityInputRevisionFn>,
     cleanup: Arc<dyn Fn(&str) + Send + Sync>,
     subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
 }
 
 impl DashboardDisplayAuthorityBridge {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot: impl Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync + 'static,
         state_frame: impl Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync + 'static,
-        request: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        request: impl Fn(&str, u32, bool) -> Vec<serde_json::Value> + Send + Sync + 'static,
         release: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
         input_authorized: impl Fn(&str, u32) -> bool + Send + Sync + 'static,
+        input_revision: impl Fn(u32) -> Arc<AtomicU64> + Send + Sync + 'static,
         cleanup: impl Fn(&str) + Send + Sync + 'static,
         subscribe: impl Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync + 'static,
     ) -> Self {
@@ -737,6 +1107,7 @@ impl DashboardDisplayAuthorityBridge {
             request: Arc::new(request),
             release: Arc::new(release),
             input_authorized: Arc::new(input_authorized),
+            input_revision: Arc::new(input_revision),
             cleanup: Arc::new(cleanup),
             subscribe: Arc::new(subscribe),
         }
@@ -750,8 +1121,13 @@ impl DashboardDisplayAuthorityBridge {
         (self.state_frame)(session_id, display_id)
     }
 
-    fn request(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
-        (self.request)(session_id, display_id)
+    fn request(
+        &self,
+        session_id: &str,
+        display_id: u32,
+        include_private: bool,
+    ) -> Vec<serde_json::Value> {
+        (self.request)(session_id, display_id, include_private)
     }
 
     fn release(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
@@ -760,6 +1136,10 @@ impl DashboardDisplayAuthorityBridge {
 
     fn input_authorized(&self, session_id: &str, display_id: u32) -> bool {
         (self.input_authorized)(session_id, display_id)
+    }
+
+    fn input_revision(&self, display_id: u32) -> Arc<AtomicU64> {
+        (self.input_revision)(display_id)
     }
 
     fn cleanup(&self, session_id: &str) {
@@ -772,6 +1152,18 @@ impl DashboardDisplayAuthorityBridge {
 }
 
 impl DashboardControlRegistry {
+    /// This daemon's own agent-card id — the target-id expectation for
+    /// delegation-lane attribution (the browser signs the id it dialed;
+    /// we verify it meant us).
+    pub fn local_card_id(&self) -> String {
+        self.agent_card
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
@@ -789,6 +1181,7 @@ impl DashboardControlRegistry {
         presence: Option<DashboardPresenceBridge>,
         ice_config: crate::display::IceConfig,
         tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+        tabs: crate::web_gateway::DashboardTabsRegistry,
     ) -> Self {
         Self {
             config,
@@ -807,25 +1200,23 @@ impl DashboardControlRegistry {
             presence,
             ice_config,
             tcp_peer_registry,
+            tabs,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn answer_offer(
-        &self,
-        offer_sdp: String,
-        session_grant: Option<String>,
-        client_nonce: Option<String>,
-    ) -> Result<DashboardControlAnswer, String> {
-        self.answer_offer_with_grant(
-            offer_sdp,
-            session_grant,
-            client_nonce,
-            DashboardControlGrant::TrustedLocal,
-        )
-        .await
+    /// The live tabs-presence registry (shared with the `/ws` lane); the
+    /// HTTP `GET /api/dashboard/tabs` handler reads it through here.
+    pub(crate) fn tabs(&self) -> &crate::web_gateway::DashboardTabsRegistry {
+        &self.tabs
+    }
+
+    /// Annotate a control session with the client-declared tab id from
+    /// its offer body (the offer paths learn the id after `answer_offer`
+    /// has registered the session).
+    pub(crate) fn note_tab_id(&self, session_id: &str, tab_id: &str) {
+        self.tabs.note_tab_id(session_id, tab_id);
     }
 
     pub async fn answer_offer_with_grant(
@@ -875,6 +1266,18 @@ impl DashboardControlRegistry {
         tcp_advertised_addr: Option<SocketAddr>,
     ) -> Result<DashboardControlAnswer, String> {
         let identity = self.identity().await?;
+        // Captured before `grant` moves into the session task; the tab id
+        // (when the offer carried one) is annotated post-answer via
+        // `note_tab_id`.
+        let tab_entry = crate::web_gateway::DashboardTabConnection {
+            lane: crate::web_gateway::DashboardTabLane::ControlTunnel,
+            kind: grant.connection_kind(),
+            label: grant.label().to_string(),
+            tab_id: None,
+            remote: None,
+            user_agent: None,
+            connected_at_unix_ms: crate::web_gateway::now_unix_ms(),
+        };
         let (peer, answer_sdp, binding) = DashboardControlPeer::answer_offer(
             session_id.clone(),
             offer_sdp,
@@ -899,10 +1302,22 @@ impl DashboardControlRegistry {
             tcp_advertised_addr,
             identity,
             grant,
+            self.tabs.clone(),
         )
         .await
         .map_err(|e| e.to_string())?;
-        self.peers.lock().await.insert(session_id.clone(), peer);
+        let rejected = {
+            let mut peers = self.peers.lock().await;
+            insert_dashboard_control_peer_if_vacant(&mut peers, session_id.clone(), peer).err()
+        };
+        if let Some(rejected) = rejected {
+            rejected.close().await;
+            return Err(
+                "dashboard-control session id is already occupied; refusing to replace it"
+                    .to_string(),
+            );
+        }
+        self.tabs.register(&session_id, tab_entry);
         Ok(DashboardControlAnswer {
             session_id,
             sdp: answer_sdp,
@@ -923,15 +1338,65 @@ impl DashboardControlRegistry {
         Ok(true)
     }
 
-    pub async fn close(&self, session_id: &str) {
+    pub(crate) async fn add_ice_candidate_for_grant(
+        &self,
+        session_id: &str,
+        candidate_json: &serde_json::Value,
+        caller: &DashboardControlGrant,
+    ) -> Result<DashboardControlSessionMutation, String> {
+        let peers = self.peers.lock().await;
+        let Some(peer) = peers.get(session_id) else {
+            return Ok(DashboardControlSessionMutation::NotFound);
+        };
+        if !peer.belongs_to(caller) {
+            return Ok(DashboardControlSessionMutation::Forbidden);
+        }
+        peer.add_ice_candidate(candidate_json).await?;
+        Ok(DashboardControlSessionMutation::Applied)
+    }
+
+    pub(crate) async fn close_for_grant(
+        &self,
+        session_id: &str,
+        caller: &DashboardControlGrant,
+    ) -> DashboardControlSessionMutation {
+        let peer = {
+            let mut peers = self.peers.lock().await;
+            let Some(peer) = peers.get(session_id) else {
+                return DashboardControlSessionMutation::NotFound;
+            };
+            if !peer.belongs_to(caller) {
+                return DashboardControlSessionMutation::Forbidden;
+            }
+            peers
+                .remove(session_id)
+                .expect("dashboard-control peer existed under the same lock")
+        };
+        // Kill the live transport guard before any cleanup callback can yield.
+        // Once an explicit close is accepted, no buffered control frame may
+        // retain the opening grant while presence/authority teardown runs.
+        peer.close().await;
+        self.tabs.unregister(session_id);
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
         }
         if let Some(bridge) = &self.presence {
             bridge.cleanup(session_id.to_string()).await;
         }
-        if let Some(peer) = self.peers.lock().await.remove(session_id) {
+        DashboardControlSessionMutation::Applied
+    }
+
+    pub async fn close(&self, session_id: &str) {
+        let peer = self.peers.lock().await.remove(session_id);
+        if let Some(peer) = peer {
             peer.close().await;
+        }
+        self.tabs.unregister(session_id);
+        if let Some(bridge) = &self.display_authority {
+            bridge.cleanup(session_id);
+        }
+        if let Some(bridge) = &self.presence {
+            bridge.cleanup(session_id.to_string()).await;
         }
     }
 
@@ -1034,9 +1499,29 @@ impl DashboardControlBinding {
 pub struct DashboardControlPeer {
     command_tx: mpsc::Sender<ControlCommand>,
     shutdown: CancellationToken,
+    owner: DashboardControlSessionOwner,
+}
+
+fn insert_dashboard_control_peer_if_vacant(
+    peers: &mut HashMap<String, DashboardControlPeer>,
+    session_id: String,
+    peer: DashboardControlPeer,
+) -> Result<(), DashboardControlPeer> {
+    match peers.entry(session_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(peer);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(_) => Err(peer),
+    }
 }
 
 impl DashboardControlPeer {
+    fn belongs_to(&self, caller: &DashboardControlGrant) -> bool {
+        self.owner == caller.signaling_owner()
+    }
+
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     async fn answer_offer(
         session_id: String,
         offer_sdp: String,
@@ -1061,7 +1546,9 @@ impl DashboardControlPeer {
         tcp_advertised_addr: Option<SocketAddr>,
         identity: Arc<DaemonIdentity>,
         grant: DashboardControlGrant,
+        tabs: crate::web_gateway::DashboardTabsRegistry,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
+        let owner = grant.signaling_owner();
         let local_ufrag = new_control_ice_fragment();
         let local_pwd = new_control_ice_password();
         let mut setting_engine = SettingEngine::default();
@@ -1146,6 +1633,11 @@ impl DashboardControlPeer {
             session_grant.as_deref(),
             client_nonce.as_deref(),
         );
+        let display_peer_id = crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+            .ok_or_else(|| {
+                CallerError::WebRtc("dashboard display peer-id namespace exhausted".to_string())
+            })?;
+        let shutdown = CancellationToken::new();
         let runtime = ControlRuntime {
             session_id,
             daemon_public_key: identity.public_key_b64u(),
@@ -1171,11 +1663,14 @@ impl DashboardControlPeer {
             tcp_advertised,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
+            display_peer_id,
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant,
+            shutdown: shutdown.clone(),
+            tabs,
+            state_root: crate::platform::intendant_home(),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
-        let shutdown = CancellationToken::new();
         tokio::spawn(control_driver(
             rtc,
             sockets,
@@ -1191,6 +1686,7 @@ impl DashboardControlPeer {
             Self {
                 command_tx,
                 shutdown,
+                owner,
             },
             answer_sdp,
             binding,
@@ -1247,30 +1743,43 @@ pub(crate) struct ControlRuntime {
     presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
-    /// The ICE-TCP tuple this control session itself advertised (the
-    /// rendezvous-observed public address on the gateway port for hosted
-    /// Connect sessions; `None` for locally-signaled sessions, whose
-    /// browsers signal displays over the gateway WS instead). Display
-    /// offers arriving on the control channel advertise the same tuple —
-    /// the browser reached us through it, so display traffic can too.
+    /// The ICE-TCP tuple supplied by an authenticated peer signaling path.
+    /// Trusted local and independently verified direct-mTLS sessions use
+    /// `None` and signal displays over the gateway WebSocket instead. Display
+    /// offers arriving on a peer control channel advertise the same tuple —
+    /// that peer reached us through it, so display traffic can too.
     tcp_advertised: Option<SocketAddr>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
+    /// Display sessions on which this control transport has attempted to
+    /// register `display_peer_id`. A display's media WebRTC transport is
+    /// separate from this control peer, so the control driver tracks sessions
+    /// so teardown can close a still-live media peer on disconnect or IAM
+    /// revocation without retaining a completed display session. The weak
+    /// vector is pointer-deduplicated and pruned when offers arrive.
+    display_peer_sessions: Arc<Mutex<Vec<std::sync::Weak<crate::display::DisplaySession>>>>,
     grant: DashboardControlGrant,
+    /// Lifetime of the authenticated control transport. Interactive display
+    /// channels created through it retain this token so queued input and
+    /// clipboard access die with the session even if the separate display
+    /// WebRTC transport has not reaped yet.
+    shutdown: CancellationToken,
+    /// The live tabs-presence registry (shared with the `/ws` lane) —
+    /// serves the `api_dashboard_tabs` twin.
+    tabs: crate::web_gateway::DashboardTabsRegistry,
+    /// The daemon state root (`intendant_home()`), resolved once at the
+    /// control-channel edge. Adapters that fall back to the daemon-global
+    /// store (uploads, transfers) resolve their scope against this instead
+    /// of ambient state, so the test runtime's scratch root keeps
+    /// projectless fixtures out of the machine's real `~/.intendant`.
+    state_root: PathBuf,
 }
 
-#[derive(Debug)]
-pub(crate) struct DashboardMediaClipOperation {
-    stream: String,
-    note: String,
-    inject: bool,
-    in_secs: f64,
-    out_secs: f64,
-    fps: u32,
-    expected_frames: usize,
-    frames: Vec<(String, String)>,
-}
+// The clip-operation type moved to web_gateway::media_store
+// (transport-unification S8): the /ws lane accumulates with the same
+// type the tunnel's media_clip_ops map stores.
+pub(crate) use crate::web_gateway::DashboardMediaClipOperation;
 
 pub(crate) enum ControlCommand {
     AddIceCandidate(String),
@@ -1332,6 +1841,24 @@ pub(crate) struct InboundUploadState {
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
+}
+
+impl InboundUploadState {
+    /// The upload-frame spool as the Streaming lane's common handle
+    /// (transport-unification S8): the frame params plus the spooled
+    /// bytes, for handlers that commit the spool wholesale — the staged
+    /// upload today, the S9 transfer-chunk appends next. The media
+    /// handlers keep reading the tempfile in-memory instead (their
+    /// stores take byte slices).
+    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
+        (
+            self.params,
+            crate::web_gateway::SpooledBody {
+                tmp: self.tmp,
+                len: self.received_bytes,
+            },
+        )
+    }
 }
 
 pub(crate) struct OutboundControlQueue {
@@ -1447,6 +1974,378 @@ impl OutboundControlQueue {
 mod fs_scope_grant_tests {
     use super::*;
 
+    fn browser_grant_for_role(role_id: &str, fingerprint: &str) -> DashboardControlGrant {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some(fingerprint.to_string()),
+                role_id: Some(role_id.to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&state, fingerprint, "https")
+                .unwrap();
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+            iam_cert_dir: None,
+        }
+    }
+
+    #[test]
+    fn scoped_human_and_files_read_cannot_enter_unfiltered_websocket_bootstrap() {
+        for (role, fingerprint) in [("role:scoped-human", "AA:01"), ("role:files-read", "AA:02")] {
+            let grant = browser_grant_for_role(role, fingerprint);
+            assert!(grant.has_any_effective_operation());
+            assert!(
+                !grant.allows_unfiltered_websocket_stream(),
+                "{role} must be rejected before /ws upgrade and bootstrap"
+            );
+        }
+
+        assert!(
+            browser_grant_for_role("role:observer", "AA:03").allows_unfiltered_websocket_stream(),
+            "the complete observer read set is the conservative /ws floor"
+        );
+        assert!(DashboardControlGrant::TrustedLocal.allows_unfiltered_websocket_stream());
+    }
+
+    #[test]
+    fn private_display_owner_authority_requires_local_or_current_root() {
+        let local = DashboardControlGrant::TrustedLocal;
+        let root = browser_grant_for_role("role:root", "AA:ROOT");
+        let observer = browser_grant_for_role("role:observer", "AA:OBSERVER");
+        assert!(local.has_owner_dashboard_authority());
+        assert!(root.has_owner_dashboard_authority());
+        assert!(
+            !browser_grant_for_role("role:operator", "AA:OPERATOR").has_owner_dashboard_authority()
+        );
+        assert!(!observer.has_owner_dashboard_authority());
+
+        let private_ready = r#"{"event":"display_ready","display_id":9,"agent_visible":false}"#;
+        let public_ready = r#"{"event":"display_ready","display_id":8,"agent_visible":true}"#;
+        let request = r#"{"event":"display_request_raised","id":1}"#;
+        let approval = r#"{"event":"display_approval_pending","display_id":9,"backend":"wayland"}"#;
+        assert!(root.allows_dashboard_event_line(private_ready));
+        assert!(!observer.allows_dashboard_event_line(private_ready));
+        assert!(observer.allows_dashboard_event_line(public_ready));
+        assert!(!observer.allows_dashboard_event_line(request));
+        assert!(!observer.allows_dashboard_event_line(approval));
+
+        let replay = serde_json::json!({
+            "t": "log_replay",
+            "entries": [
+                serde_json::from_str::<serde_json::Value>(private_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(public_ready).unwrap(),
+                serde_json::from_str::<serde_json::Value>(request).unwrap(),
+                serde_json::from_str::<serde_json::Value>(approval).unwrap(),
+                {"event": "display_capture_lost", "display_id": 9, "reason": "closed"},
+            ],
+        });
+        let mut owner_replay = replay.clone();
+        root.filter_dashboard_replay_payload(&mut owner_replay);
+        assert_eq!(owner_replay, replay);
+
+        let mut replay = replay;
+        observer.filter_dashboard_replay_payload(&mut replay);
+        let events = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("event").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec!["display_ready", "display_capture_lost"]);
+    }
+
+    #[test]
+    fn live_iam_change_or_reload_failure_invalidates_opening_authority() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert!(LIVE_AUTHORITY_RECHECK_INTERVAL <= Duration::from_millis(500));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:55".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:55",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.has_owner_dashboard_authority());
+        assert!(grant.access_decision(PeerOperation::RuntimeControl).allowed);
+
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        assert!(!grant.has_owner_dashboard_authority());
+        assert!(!grant.access_decision(PeerOperation::RuntimeControl).allowed);
+        assert!(matches!(
+            grant.terminal_actor(),
+            crate::terminal::TerminalActor::Principal(_)
+        ));
+
+        std::fs::write(crate::access::iam::iam_state_path(tmp.path()), b"not-json").unwrap();
+        assert!(!grant.opening_authority_is_current());
+        let denied = grant.access_decision(PeerOperation::PresenceRead);
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("unavailable"), "{}", denied.reason);
+    }
+
+    #[test]
+    fn live_custom_role_downgrade_invalidates_opening_authority() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:56".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let mut custom_role = state
+            .roles
+            .iter()
+            .find(|role| role.id == "role:observer")
+            .unwrap()
+            .clone();
+        custom_role.id = "role:test-custom-observer".to_string();
+        custom_role.label = "Test custom observer".to_string();
+        custom_role.source = "local-test".to_string();
+        state.roles.push(custom_role);
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                role_id: Some("role:test-custom-observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:56",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.allows_unfiltered_websocket_stream());
+
+        let role = state
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:test-custom-observer")
+            .unwrap();
+        role.permissions
+            .retain(|permission| permission != "presence.read");
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        assert!(!grant.allows_unfiltered_websocket_stream());
+    }
+
+    #[test]
+    fn live_peer_revocation_invalidates_opening_authority() {
+        use crate::peer::access_policy::PeerOperation;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let record = crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            fingerprint,
+            "peer-a",
+            "peer-operator",
+            None,
+            None,
+        )
+        .unwrap();
+        let grant = DashboardControlGrant::Peer {
+            fingerprint: record.fingerprint.clone(),
+            label: record.label.clone(),
+            profile: record.profile.clone(),
+            filesystem: record.filesystem.clone(),
+            identity_record: Some(record),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+            attributed: None,
+        };
+        assert!(grant.opening_authority_is_current());
+        assert!(grant.access_decision(PeerOperation::PresenceRead).allowed);
+
+        crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
+        assert!(!grant.opening_authority_is_current());
+        let denied = grant.access_decision(PeerOperation::PresenceRead);
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("peer identity changed"));
+    }
+
+    #[test]
+    fn followup_signaling_rejects_unknown_revoked_and_different_openers() {
+        let opening = browser_grant_for_role("role:files-read", "AA:10");
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let peer = DashboardControlPeer {
+            command_tx,
+            shutdown: CancellationToken::new(),
+            owner: opening.signaling_owner(),
+        };
+        assert!(peer.belongs_to(&opening));
+
+        let different_principal = browser_grant_for_role("role:files-read", "BB:20");
+        assert!(!peer.belongs_to(&different_principal));
+
+        // A single human principal may carry several certificates. Matching
+        // principal/grant ids are insufficient: the exact certificate that
+        // opened the session remains part of the signaling binding.
+        let mut different_certificate = opening.clone();
+        if let DashboardControlGrant::UserClient { principal, .. } = &mut different_certificate {
+            principal.authn_binding = Some("cc30".to_string());
+        }
+        assert!(!peer.belongs_to(&different_certificate));
+
+        // Revocation keeps the binding recognizable for audit, but the HTTP
+        // pre-gate denies it before ICE/close can reach the owner comparison.
+        let mut revoked = opening.clone();
+        if let DashboardControlGrant::UserClient { iam_state, .. } = &mut revoked {
+            iam_state.grants[0].status = "revoked".to_string();
+            iam_state.grants[0].revoked_at_unix_ms = Some(1);
+        }
+        assert!(peer.belongs_to(&revoked));
+        assert!(!revoked.has_any_effective_operation());
+
+        let unknown = DashboardControlGrant::UserClient {
+            principal: crate::access::iam::AccessPrincipal::ungranted_browser_mtls(
+                Some("DD:40"),
+                "webrtc-datachannel",
+            ),
+            iam_state: crate::access::iam::LocalIamState::default(),
+            iam_cert_dir: None,
+        };
+        assert!(!peer.belongs_to(&unknown));
+        assert!(!unknown.has_any_effective_operation());
+
+        let peer_a = DashboardControlGrant::Peer {
+            fingerprint: "peer-a".to_string(),
+            label: "Peer A".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let peer_b = DashboardControlGrant::Peer {
+            fingerprint: "peer-b".to_string(),
+            label: "Peer B".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let peer_session = DashboardControlPeer {
+            command_tx,
+            shutdown: CancellationToken::new(),
+            owner: peer_a.signaling_owner(),
+        };
+        assert!(peer_session.belongs_to(&peer_a));
+        assert!(!peer_session.belongs_to(&peer_b));
+    }
+
+    #[test]
+    fn caller_selected_session_collision_never_replaces_existing_owner() {
+        let peer_a = DashboardControlGrant::Peer {
+            fingerprint: "peer-a".to_string(),
+            label: "Peer A".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let peer_b = DashboardControlGrant::Peer {
+            fingerprint: "peer-b".to_string(),
+            label: "Peer B".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+            attributed: None,
+        };
+        let mut peers = HashMap::new();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        assert!(insert_dashboard_control_peer_if_vacant(
+            &mut peers,
+            "chosen-id".to_string(),
+            DashboardControlPeer {
+                command_tx: tx_a,
+                shutdown: CancellationToken::new(),
+                owner: peer_a.signaling_owner(),
+            },
+        )
+        .is_ok());
+        let (tx_b, _rx_b) = mpsc::channel(1);
+        let rejected = insert_dashboard_control_peer_if_vacant(
+            &mut peers,
+            "chosen-id".to_string(),
+            DashboardControlPeer {
+                command_tx: tx_b,
+                shutdown: CancellationToken::new(),
+                owner: peer_b.signaling_owner(),
+            },
+        )
+        .unwrap_err();
+        assert!(rejected.belongs_to(&peer_b));
+        assert_eq!(peers.len(), 1);
+        let existing = peers.get("chosen-id").unwrap();
+        assert!(existing.belongs_to(&peer_a));
+        assert!(!existing.belongs_to(&peer_b));
+    }
+
     #[test]
     fn user_client_grant_resolves_fs_scope_and_owner_paths_stay_open() {
         // Platform-absolute fixture path: `/srv/shared` is not absolute on
@@ -1483,21 +2382,13 @@ mod fs_scope_grant_tests {
         let scoped = DashboardControlGrant::UserClient {
             principal,
             iam_state: state.clone(),
+            iam_cert_dir: None,
         };
         let scope = scoped.filesystem().expect("scoped grant exposes fs scope");
         assert_eq!(scope.read_roots, vec![std::path::PathBuf::from(srv_shared)]);
 
         // Owner surfaces stay unrestricted.
         assert!(DashboardControlGrant::TrustedLocal.filesystem().is_none());
-        let unscoped_principal = crate::access::iam::AccessPrincipal::root_dashboard_session(
-            "root-key",
-            "dashboard-control",
-        );
-        assert!(DashboardControlGrant::UserClientRoot {
-            principal: unscoped_principal
-        }
-        .filesystem()
-        .is_none());
     }
 }
 
@@ -1515,34 +2406,16 @@ fn runtime_operation_decision(
     runtime.grant.access_decision(op)
 }
 
-fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
-    use crate::peer::access_policy::PeerOperation;
-    match t {
-        "display_input" => Some(PeerOperation::DisplayInput),
-        // Floor operations: terminal_open may additionally require
-        // shell.spawn (when the session doesn't exist yet) and every
-        // terminal frame is scoped to sessions the actor can see — both
-        // enforced statefully in the frame handlers.
-        "terminal_open" => Some(PeerOperation::TerminalView),
-        "terminal_input" | "terminal_resize" | "terminal_close" | "terminal_share" => {
-            Some(PeerOperation::TerminalWrite)
-        }
-        "presence_frame" => Some(PeerOperation::Message),
-        // Upload frames carry no blanket authority: upload_start is
-        // authorized by the operation of the method it delivers (a media
-        // annotation is runtime control, a transfer chunk is a filesystem
-        // write, …) inside control_upload_start_frame, and chunk/end only
-        // act on an entry an authorized start created on this connection.
-        "upload_start" | "upload_chunk" | "upload_end" => None,
-        // Client-egress response frames: only a session that could have
-        // registered as a relay (credentials.manage) may answer, and the
-        // handler additionally binds each frame to the request's own
-        // registering session.
-        "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
-            Some(PeerOperation::CredentialsManage)
-        }
-        _ => None,
-    }
+/// Map a typed tunnel frame to the `PeerOperation` it exercises — the
+/// datachannel lookup into the shared `access_policy::FRAME_LANES`
+/// declaration (`web_gateway::ws_frame_operation` reads the same table),
+/// so the same IAM grant answers the same way whichever transport a client
+/// speaks — parity by construction. `None` means the frame carries no
+/// blanket authority of its own here; each table row's `note` says why.
+pub(crate) fn dashboard_control_frame_operation(
+    t: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
+    crate::peer::access_policy::frame_operation(crate::peer::access_policy::FrameLane::Tunnel, t)
 }
 
 /// Paths a filesystem method touches, for scope checks and the audit trail.
@@ -1567,21 +2440,76 @@ fn dashboard_control_filesystem_paths(
         .collect()
 }
 
+/// On success carries an optional audit-path override — the transfer
+/// re-check's resolved job path (or the create's kind-aware target),
+/// which the method's params don't name — for
+/// `audit_dashboard_control_filesystem`; `Ok(None)` means the audit
+/// trail derives its path from the params as before.
 fn authorize_dashboard_control_filesystem(
     runtime: &ControlRuntime,
     method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     use crate::peer::access_policy::{FilesystemAccessKind, PeerOperation};
     let kind = match op {
         PeerOperation::FilesystemRead => FilesystemAccessKind::Read,
         PeerOperation::FilesystemWrite => FilesystemAccessKind::Write,
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
     let Some(policy) = runtime.grant.filesystem() else {
-        return Ok(());
+        return Ok(None);
     };
+    // The transfer family: create scope-checks the kind-aware path the
+    // create will actually target; the job-addressed methods re-check
+    // the resolved job's *real* filesystem path through the shared
+    // transport-neutral helper (HTTP's rows call the same fn, so both
+    // lanes decide and word identically); the list method is never
+    // blanket-denied — its handler scope-filters the listing instead.
+    match method {
+        "api_transfer_jobs" => return Ok(None),
+        "api_transfer_job_create" => {
+            let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+            let target = crate::web_gateway::classify_transfer_create(&params)
+                .ok()
+                .and_then(|request| match request {
+                    crate::web_gateway::TransferCreateRequest::Path(kind) => {
+                        crate::web_gateway::transfer_create_target_path(&params, kind)
+                    }
+                    // Artifact-shaped creates resolve daemon-internal
+                    // sources no user grant names (divergence #24):
+                    // pathless, so scoped callers fail closed below.
+                    crate::web_gateway::TransferCreateRequest::Artifact(_) => None,
+                });
+            let Some(target) = target else {
+                return Err("filesystem request missing path".to_string());
+            };
+            let path = crate::web_gateway::expand_dashboard_fs_path(&target)?;
+            crate::peer::access_policy::filesystem_access_allowed(&policy, kind, &path)?;
+            return Ok(Some(target));
+        }
+        "api_transfer_upload_chunk"
+        | "api_transfer_upload_commit"
+        | "api_transfer_job_delete"
+        | "api_transfer_download_read" => {
+            let access = match method {
+                "api_transfer_download_read" => crate::web_gateway::TransferJobAccess::ReadSource,
+                "api_transfer_job_delete" => crate::web_gateway::TransferJobAccess::WriteJobPath,
+                _ => crate::web_gateway::TransferJobAccess::WriteDestination,
+            };
+            let handle = params
+                .map(crate::web_gateway::transfer_id_param)
+                .unwrap_or_default();
+            let store = transfer_store_scope(runtime);
+            let check =
+                crate::web_gateway::check_scoped_transfer_job(&store, &policy, &handle, access);
+            if check.allowed {
+                return Ok(check.path.map(|path| path.display().to_string()));
+            }
+            return Err(crate::web_gateway::TRANSFER_JOB_SCOPE_DENIED.to_string());
+        }
+        _ => {}
+    }
     let raw_paths = dashboard_control_filesystem_paths(method, params);
     // Fail closed on missing params: a rename that names only one leg must
     // not slip past the scope check and let the handler report a plain 400.
@@ -1590,9 +2518,9 @@ fn authorize_dashboard_control_filesystem(
     }
     for raw_path in &raw_paths {
         let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
-        crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)?;
+        crate::peer::access_policy::filesystem_access_allowed(&policy, kind, &path)?;
     }
-    Ok(())
+    Ok(None)
 }
 
 fn authorize_dashboard_control_method(
@@ -1601,7 +2529,7 @@ fn authorize_dashboard_control_method(
     params: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     // Fail closed: a method must be declared — as a route row's tunnel
-    // column or a residue `CONTROL_METHODS` entry — to be callable at
+    // column or a residue `CONTROL_ONLY_METHODS` entry — to be callable at
     // all; a dispatch arm added without a declaration is denied here
     // instead of shipping ungated.
     let Some(spec) = control_method_spec(method) else {
@@ -1615,19 +2543,21 @@ fn authorize_dashboard_control_method(
         .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))
         .and_then(|()| authorize_dashboard_control_filesystem(runtime, method, op, params));
     audit_dashboard_control_filesystem(runtime, method, op, params, &result);
-    result
+    result.map(|_| ())
 }
 
 /// Audit twin of the HTTP lane's `[peer-fs]` / `[grant-fs]` lines
 /// (`web_gateway::audit_peer_filesystem_access`) for filesystem methods that
 /// arrive over the dashboard-control tunnel, so both transports leave the
 /// same trail: peer grants log allow and deny, other grants log denials.
+/// A successful transfer re-check overrides the logged path with the
+/// resolved job path (the params name only a job handle).
 fn audit_dashboard_control_filesystem(
     runtime: &ControlRuntime,
     method: &str,
     op: crate::peer::access_policy::PeerOperation,
     params: Option<&serde_json::Value>,
-    result: &Result<(), String>,
+    result: &Result<Option<String>, String>,
 ) {
     use crate::peer::access_policy::PeerOperation;
     if !matches!(
@@ -1636,7 +2566,10 @@ fn audit_dashboard_control_filesystem(
     ) {
         return;
     }
-    let path = dashboard_control_filesystem_paths(method, params).join(" -> ");
+    let path = match result {
+        Ok(Some(resolved)) => resolved.clone(),
+        _ => dashboard_control_filesystem_paths(method, params).join(" -> "),
+    };
     match &runtime.grant {
         DashboardControlGrant::Peer {
             fingerprint,
@@ -1645,7 +2578,7 @@ fn audit_dashboard_control_filesystem(
             ..
         } => {
             let (allowed, detail) = match result {
-                Ok(()) => (true, "allowed".to_string()),
+                Ok(_) => (true, "allowed".to_string()),
                 Err(e) => (false, e.clone()),
             };
             runtime.bus.send(AppEvent::PresenceLog {
@@ -1687,15 +2620,17 @@ fn audit_dashboard_control_filesystem(
 
 /// Upload frames are authorized by the method they deliver — the same
 /// operation that method needs on the direct routes — not by a blanket
-/// filesystem grant. Transfer chunks skip path scoping: their destination
-/// was scoped when the transfer job was created and the chunk only names
-/// that job.
+/// filesystem grant. Path scoping runs at `upload_end`, where the params
+/// are final: `api_fs_write` re-authorizes through the full method gate,
+/// and a transfer chunk's job-path re-check
+/// (`web_gateway::check_scoped_transfer_job`) resolves the named job and
+/// scope-checks its destination the same way.
 fn authorize_dashboard_control_upload(
     runtime: &ControlRuntime,
     method: &str,
 ) -> Result<(), String> {
     // Fail closed twice over: the method must be declared upload-deliverable
-    // (route-row tunnel column or residue `CONTROL_METHODS` entry), and
+    // (route-row tunnel column or residue `CONTROL_ONLY_METHODS` entry), and
     // upload methods are always operation-gated.
     let Some(op) = control_method_spec(method)
         .filter(|spec| spec.upload)
@@ -1763,23 +2698,6 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
     }
 }
 
-fn http_wire_response(id: String, response: String, label: &str) -> serde_json::Value {
-    let (status, body) = split_http_response(&response);
-    http_body_response(id, status, body.to_string(), label)
-}
-
-fn split_http_response(response: &str) -> (u16, &str) {
-    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", response));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
-        .and_then(|line| line.split_whitespace().next())
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(200);
-    (status, body)
-}
-
 // One status-line parser across both lanes (the api core's (status,
 // body) helper vocabulary).
 pub(crate) use crate::web_gateway::status_line_code;
@@ -1811,6 +2729,16 @@ async fn api_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_sessions_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+async fn api_sessions_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let limit = control_session_limit(&params);
     let ids = control_session_ids(&params);
@@ -1824,8 +2752,9 @@ async fn api_sessions_response(
     } else {
         (Some(ids), None)
     };
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::sessions_list_api_response(ids_filter, limit, usage_view)
+        crate::web_gateway::sessions_list_api_response(&home, ids_filter, limit, usage_view)
     })
     .await;
     let response = match result {
@@ -2157,54 +3086,10 @@ async fn active_recording_registry(
     session.recording_registry.clone()
 }
 
-fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
-    for name in names {
-        if let Some(value) = params.get(*name) {
-            if let Some(text) = value.as_str() {
-                return text.trim().to_string();
-            }
-            if !value.is_null() {
-                return value.to_string();
-            }
-        }
-    }
-    String::new()
-}
-
-fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
-    let value = string_param(params, names);
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn optional_u64_param(params: &serde_json::Value, names: &[&str]) -> Result<Option<u64>, String> {
-    for name in names {
-        let Some(value) = params.get(*name) else {
-            continue;
-        };
-        if value.is_null() {
-            return Ok(None);
-        }
-        if let Some(number) = value.as_u64() {
-            return Ok(Some(number));
-        }
-        if let Some(text) = value.as_str() {
-            let text = text.trim();
-            if text.is_empty() {
-                return Ok(None);
-            }
-            return text
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|_| format!("invalid {name}"));
-        }
-        return Err(format!("invalid {name}"));
-    }
-    Ok(None)
-}
+// The lenient alias-param readers moved to the neutral api core
+// (`web_gateway::api_core`) with the S9 transfer conversion — the
+// re-export keeps every dashboard_control reference compiling.
+pub(crate) use crate::web_gateway::{optional_string_param, optional_u64_param, string_param};
 
 fn split_control_session_ids(value: &str) -> impl Iterator<Item = String> + '_ {
     value
@@ -2329,8 +3214,26 @@ mod tests {
             tcp_advertised: None,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
-            display_peer_id: 1,
+            display_peer_id: crate::display_peer_ids::allocate_dashboard_control_display_peer_id()
+                .expect("test dashboard-control peer id"),
+            display_peer_sessions: Arc::new(Mutex::new(Vec::new())),
             grant: DashboardControlGrant::TrustedLocal,
+            shutdown: CancellationToken::new(),
+            tabs: crate::web_gateway::DashboardTabsRegistry::new(
+                Arc::new(std::sync::Mutex::new(None)),
+                Arc::new(crate::web_gateway::DisplayInputAuthority::default()),
+            ),
+            // Per-instance scratch (never the machine's real ~/.intendant):
+            // projectless adapters resolve the daemon-global store under
+            // this root. PID+nanos, per the state_paths uniqueness rule.
+            state_root: std::env::temp_dir().join(format!(
+                "intendant-test-state-root-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            )),
         }
     }
 
@@ -2372,6 +3275,7 @@ mod tests {
         DashboardControlGrant::UserClient {
             principal,
             iam_state,
+            iam_cert_dir: None,
         }
     }
 
@@ -2385,6 +3289,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(
             text,
             runtime,
@@ -2394,6 +3299,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
     }
 
@@ -2466,6 +3372,9 @@ mod tests {
             label: "peer-root".into(),
             profile: "peer-root".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
 
         let status = test_control_frame_response(
@@ -2566,6 +3475,9 @@ mod tests {
             label: "peer-operator".into(),
             profile: "peer-operator".into(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+            attributed: None,
+            identity_record: None,
+            iam_cert_dir: None,
         };
         let denied = test_control_frame_response(
             r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
@@ -2790,20 +3702,23 @@ mod tests {
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
-        assert_eq!(status["result"]["api_transfer_jobs_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_create_available"], false);
-        assert_eq!(status["result"]["api_transfer_job_delete_available"], false);
+        // Projectless runtime: transfers stay available — the store resolves
+        // through the daemon-global StoreScope fallback, matching the S9
+        // HTTP rows (the old project_root gate made the tunnel lane lie).
+        assert_eq!(status["result"]["api_transfer_jobs_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_create_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_delete_available"], true);
         assert_eq!(
             status["result"]["api_transfer_download_read_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_chunk_available"],
-            false
+            true
         );
         assert_eq!(
             status["result"]["api_transfer_upload_commit_available"],
-            false
+            true
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
@@ -2814,7 +3729,7 @@ mod tests {
         assert_eq!(status["result"]["api_fs_delete_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
-        assert_eq!(status["result"]["api_settings_save_available"], false);
+        assert_eq!(status["result"]["api_settings_save_available"], true);
         assert_eq!(status["result"]["api_control_msg_available"], true);
         assert_eq!(status["result"]["api_session_control_msg_available"], true);
         assert_eq!(status["result"]["api_dashboard_action_msg_available"], true);
@@ -2932,7 +3847,7 @@ mod tests {
     }
 
     /// The operation a method's declaration carries (route-row tunnel
-    /// column or residue `CONTROL_METHODS` entry — the effective table).
+    /// column or residue `CONTROL_ONLY_METHODS` entry — the effective table).
     fn method_operation(method: &str) -> Option<crate::peer::access_policy::PeerOperation> {
         control_method_spec(method).and_then(|spec| spec.op)
     }
@@ -2972,9 +3887,26 @@ mod tests {
     }
 
     #[test]
+    fn cached_bootstrap_hides_private_display_grants_from_non_owners() {
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+        *rt.bootstrap_caches.last_user_display_json.lock().unwrap() = Some(
+            r#"{"event":"user_display_granted","display_id":9,"agent_visible":false}"#.to_string(),
+        );
+
+        let filtered = cached_bootstrap_events_response_frame(
+            "private-cache".to_string(),
+            &rt.bootstrap_caches,
+            &rt.grant,
+        );
+        assert_eq!(filtered["result"]["event_count"], 0);
+        assert_eq!(filtered["result"]["events"], serde_json::json!([]));
+    }
+
+    #[test]
     fn control_method_table_is_coherent() {
         // Coherence holds over the effective union (route-row tunnel
-        // specs ∪ the CONTROL_METHODS residue): a name declared on both
+        // specs ∪ the CONTROL_ONLY_METHODS residue): a name declared on both
         // sides is a duplicate here just like two residue rows were.
         let mut seen = HashSet::new();
         for spec in all_control_methods() {
@@ -3002,15 +3934,18 @@ mod tests {
     /// R2/R4): the complete tunnel-method partition — every wire method
     /// name, the declaration source that carries it (`Row` = a `tunnel:`
     /// column on a `gateway_routes::ROUTES` row, `Residue` = a
-    /// `CONTROL_METHODS` entry), and the IAM operation gating it —
+    /// `CONTROL_ONLY_METHODS` entry), and the IAM operation gating it —
     /// frozen as a literal table. Re-gating a method (operation change
     /// on either side), losing one (gone from both sources), duplicating
     /// one (declared on both), or moving one between sources fails here
     /// until this table is updated in the same change, deliberately.
-    /// Permanent program infrastructure: the migration stages move
-    /// families from `Residue` to `Row` by flipping tags here alongside
-    /// their declarations, and the removal stage shrinks the residue to
-    /// the tunnel-only set — the union below never changes by accident.
+    /// Permanent program infrastructure, and the S11 flip's union-
+    /// equality proof: the assertions below check the live union against
+    /// the frozen partition in BOTH directions (every pinned name lives
+    /// with the pinned source and operation; every live name is pinned),
+    /// so the full name × operation union is provably unchanged by the
+    /// dispatch flip — the residue below is the final tunnel-only set,
+    /// and the union never changes by accident.
     #[test]
     fn tunnel_method_partition_is_pinned() {
         use crate::peer::access_policy::PeerOperation as Op;
@@ -3022,7 +3957,7 @@ mod tests {
         use Source::{Residue, Row};
         let frozen: &[(&str, Source, Option<Op>)] = &[
             ("ping", Residue, None),
-            ("config", Residue, Some(Op::RuntimeControl)),
+            ("config", Residue, Some(Op::PresenceRead)),
             ("status", Residue, Some(Op::PresenceRead)),
             ("api_agent_card", Residue, Some(Op::PresenceRead)),
             (
@@ -3032,37 +3967,21 @@ mod tests {
             ),
             ("subscribe_events", Residue, Some(Op::SessionInspect)),
             ("unsubscribe_events", Residue, Some(Op::SessionInspect)),
-            ("api_access_overview", Residue, Some(Op::AccessInspect)),
-            ("api_access_iam_state", Residue, Some(Op::AccessInspect)),
+            ("api_access_overview", Row, Some(Op::AccessInspect)),
+            ("api_access_iam_state", Row, Some(Op::AccessInspect)),
             (
                 "api_access_enrollment_requests",
-                Residue,
+                Row,
                 Some(Op::AccessInspect),
             ),
-            ("api_dashboard_targets", Residue, Some(Op::AccessInspect)),
-            (
-                "api_access_connect_status",
-                Residue,
-                Some(Op::AccessInspect),
-            ),
-            (
-                "api_access_connect_claim_code",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            ("api_access_connect_config", Residue, Some(Op::AccessManage)),
-            (
-                "api_access_connect_unclaim",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            ("api_access_set_tier", Residue, Some(Op::AccessManage)),
-            (
-                "api_access_set_hosted_ceiling",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            ("api_fleet_cert_request", Residue, Some(Op::AccessManage)),
+            ("api_dashboard_targets", Row, Some(Op::AccessInspect)),
+            ("api_dashboard_tabs", Row, Some(Op::AccessInspect)),
+            ("api_access_connect_status", Row, Some(Op::AccessInspect)),
+            ("api_access_connect_claim_code", Row, Some(Op::AccessManage)),
+            ("api_access_connect_config", Row, Some(Op::AccessManage)),
+            ("api_access_connect_unclaim", Row, Some(Op::AccessManage)),
+            ("api_access_set_tier", Row, Some(Op::AccessManage)),
+            ("api_fleet_cert_request", Row, Some(Op::AccessManage)),
             (
                 "api_credential_lease_grant",
                 Residue,
@@ -3099,6 +4018,26 @@ mod tests {
                 Some(Op::CredentialsManage),
             ),
             (
+                "api_daemon_vault_deposit_key_fetch",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposit_key_publish",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposits_fetch",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
+                "api_daemon_vault_deposits_consume",
+                Residue,
+                Some(Op::CredentialsManage),
+            ),
+            (
                 "api_credential_egress_register",
                 Residue,
                 Some(Op::CredentialsManage),
@@ -3115,97 +4054,69 @@ mod tests {
             ),
             (
                 "api_access_iam_upsert_user_client_grant",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_iam_update_grant",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_enrollment_decide",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            ("api_access_org_trust", Residue, Some(Op::AccessManage)),
-            ("api_access_org_revoke", Residue, Some(Op::AccessManage)),
-            ("api_access_org_issue", Residue, Some(Op::AccessManage)),
-            (
-                "api_access_org_revoke_member",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            (
-                "api_access_org_issuer_init",
-                Residue,
-                Some(Op::AccessManage),
-            ),
+            ("api_access_iam_update_grant", Row, Some(Op::AccessManage)),
+            ("api_access_enrollment_decide", Row, Some(Op::AccessManage)),
+            ("api_access_org_trust", Row, Some(Op::AccessManage)),
+            ("api_access_org_revoke", Row, Some(Op::AccessManage)),
+            ("api_access_org_issue", Row, Some(Op::AccessManage)),
+            ("api_access_org_revoke_member", Row, Some(Op::AccessManage)),
+            ("api_access_org_issuer_init", Row, Some(Op::AccessManage)),
             (
                 "api_access_org_issuer_delegate",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            (
-                "api_access_org_issuer_install",
-                Residue,
-                Some(Op::AccessManage),
-            ),
-            ("api_access_org_present", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_orl", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_renew", Residue, Some(Op::AccessInspect)),
-            ("api_access_org_orl_apply", Residue, Some(Op::PresenceRead)),
-            (
-                "api_peer_pairing_requests",
-                Residue,
-                Some(Op::AccessInspect),
-            ),
-            (
-                "api_peer_pairing_identities",
-                Residue,
-                Some(Op::AccessInspect),
-            ),
+            ("api_access_org_issuer_install", Row, Some(Op::AccessManage)),
+            ("api_access_org_present", Row, Some(Op::AccessInspect)),
+            ("api_access_org_orl", Row, Some(Op::AccessInspect)),
+            ("api_access_org_renew", Row, Some(Op::AccessInspect)),
+            ("api_access_org_orl_apply", Row, Some(Op::PresenceRead)),
+            // The peers/coordinator family flipped Residue → Row in S7
+            // with every operation unchanged (the no-re-gating proof);
+            // the ops now derive from federation_http_operation on each
+            // row's canonical leaf, asserted per method by
+            // gateway_routes::peers_family_tunnel_ops_assert_against_the_federation_ladder.
+            ("api_peer_pairing_requests", Row, Some(Op::AccessInspect)),
+            ("api_peer_pairing_identities", Row, Some(Op::AccessInspect)),
             (
                 "api_peer_pairing_request_decision",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
             (
                 "api_peer_pairing_identity_revoke",
-                Residue,
+                Row,
                 Some(Op::AccessManage),
             ),
-            ("api_peer_pairing_invite", Residue, Some(Op::AccessManage)),
-            ("api_peers", Residue, Some(Op::PeerInspect)),
-            ("api_peer_eligible", Residue, Some(Op::PeerInspect)),
-            ("api_peer_webrtc_signal", Residue, Some(Op::PeerUse)),
-            ("api_peer_file_transfer_signal", Residue, Some(Op::PeerUse)),
-            (
-                "api_peer_dashboard_control_signal",
-                Residue,
-                Some(Op::PeerUse),
-            ),
-            ("api_peer_message", Residue, Some(Op::PeerUse)),
-            ("api_peer_task", Residue, Some(Op::PeerUse)),
-            ("api_peer_approval", Residue, Some(Op::PeerUse)),
-            ("api_peer_add", Residue, Some(Op::PeerManage)),
-            ("api_peer_remove", Residue, Some(Op::PeerManage)),
-            ("api_peer_pairing_join", Residue, Some(Op::PeerManage)),
-            (
-                "api_peer_pairing_request_access",
-                Residue,
-                Some(Op::PeerManage),
-            ),
+            ("api_peer_pairing_invite", Row, Some(Op::AccessManage)),
+            ("api_peers", Row, Some(Op::PeerInspect)),
+            ("api_peer_eligible", Row, Some(Op::PeerInspect)),
+            ("api_peer_webrtc_signal", Row, Some(Op::PeerUse)),
+            ("api_peer_file_transfer_signal", Row, Some(Op::PeerUse)),
+            ("api_peer_dashboard_control_signal", Row, Some(Op::PeerUse)),
+            ("api_peer_message", Row, Some(Op::PeerUse)),
+            ("api_peer_task", Row, Some(Op::PeerUse)),
+            ("api_peer_approval", Row, Some(Op::PeerUse)),
+            ("api_peer_add", Row, Some(Op::PeerManage)),
+            ("api_peer_remove", Row, Some(Op::PeerManage)),
+            ("api_peer_pairing_join", Row, Some(Op::PeerManage)),
+            ("api_peer_pairing_request_access", Row, Some(Op::PeerManage)),
             (
                 "api_peer_pairing_request_access_poll",
-                Residue,
+                Row,
                 Some(Op::PeerManage),
             ),
-            ("api_coordinator_route", Residue, Some(Op::PeerManage)),
+            // Coordinator routing derives PeerUse from the ladder like
+            // the quick controls (owner decision 2026-07-11; its
+            // historical PeerManage override is gone).
+            ("api_coordinator_route", Row, Some(Op::PeerUse)),
             ("api_sessions", Row, Some(Op::SessionInspect)),
-            ("api_sessions_stream", Residue, Some(Op::SessionInspect)),
+            ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
-            ("api_session_report", Residue, Some(Op::SessionInspect)),
+            ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
             (
                 "api_session_context_snapshot",
@@ -3213,102 +4124,58 @@ mod tests {
                 Some(Op::SessionInspect),
             ),
             ("api_sessions_search", Row, Some(Op::SessionInspect)),
-            ("api_session_recordings", Residue, Some(Op::SessionInspect)),
-            (
-                "api_session_recording_asset",
-                Residue,
-                Some(Op::SessionInspect),
-            ),
-            ("api_session_frame_asset", Residue, Some(Op::SessionInspect)),
-            ("api_worktrees", Residue, Some(Op::SessionInspect)),
-            ("api_worktrees_inspect", Residue, Some(Op::SessionInspect)),
-            ("api_session_delete", Residue, Some(Op::SessionManage)),
-            (
-                "api_session_current_history",
-                Residue,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_rollback",
-                Residue,
-                Some(Op::SessionManage),
-            ),
-            ("api_session_current_redo", Residue, Some(Op::SessionManage)),
-            (
-                "api_session_current_prune",
-                Residue,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_changes",
-                Residue,
-                Some(Op::SessionManage),
-            ),
-            (
-                "api_session_current_uploads",
-                Residue,
-                Some(Op::SessionManage),
-            ),
+            ("api_sessions_message_search", Row, Some(Op::SessionInspect)),
+            ("api_session_recordings", Row, Some(Op::SessionInspect)),
+            ("api_session_recording_asset", Row, Some(Op::SessionInspect)),
+            ("api_session_frame_asset", Row, Some(Op::SessionInspect)),
+            ("api_worktrees", Row, Some(Op::SessionInspect)),
+            ("api_worktrees_inspect", Row, Some(Op::SessionInspect)),
+            ("api_session_delete", Row, Some(Op::SessionManage)),
+            ("api_session_current_history", Row, Some(Op::SessionManage)),
+            ("api_session_current_rollback", Row, Some(Op::SessionManage)),
+            ("api_session_current_redo", Row, Some(Op::SessionManage)),
+            ("api_session_current_prune", Row, Some(Op::SessionManage)),
+            ("api_session_current_changes", Row, Some(Op::SessionManage)),
+            ("api_session_current_uploads", Row, Some(Op::SessionManage)),
             (
                 "api_session_current_upload_raw",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_upload_delete",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             (
                 "api_session_current_agent_output",
-                Residue,
+                Row,
                 Some(Op::SessionManage),
             ),
             ("api_session_control_msg", Residue, Some(Op::SessionManage)),
-            ("api_worktrees_scan", Residue, Some(Op::SessionManage)),
-            ("api_worktrees_remove", Residue, Some(Op::SessionManage)),
+            ("api_worktrees_scan", Row, Some(Op::SessionManage)),
+            ("api_worktrees_remove", Row, Some(Op::SessionManage)),
             ("api_worktrees_merge", Row, Some(Op::SessionManage)),
-            (
-                "api_session_current_upload",
-                Residue,
-                Some(Op::SessionManage),
-            ),
-            ("api_transfer_jobs", Residue, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_download_read",
-                Residue,
-                Some(Op::FilesystemRead),
-            ),
+            ("api_session_current_upload", Row, Some(Op::SessionManage)),
+            // The transfer family flipped Residue → Row with its
+            // /api/transfers rows (S9, task #6): ops now derive from
+            // the rows, same classes as always.
+            ("api_transfer_jobs", Row, Some(Op::FilesystemRead)),
+            ("api_transfer_download_read", Row, Some(Op::FilesystemRead)),
             ("api_fs_stat", Row, Some(Op::FilesystemRead)),
             ("api_fs_list", Row, Some(Op::FilesystemRead)),
             ("api_fs_read", Row, Some(Op::FilesystemRead)),
-            (
-                "api_transfer_job_create",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_job_delete",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_chunk",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
-            (
-                "api_transfer_upload_commit",
-                Residue,
-                Some(Op::FilesystemWrite),
-            ),
+            ("api_transfer_job_create", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_job_delete", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_chunk", Row, Some(Op::FilesystemWrite)),
+            ("api_transfer_upload_commit", Row, Some(Op::FilesystemWrite)),
             ("api_fs_mkdir", Row, Some(Op::FilesystemWrite)),
             ("api_fs_write", Row, Some(Op::FilesystemWrite)),
             ("api_fs_rename", Row, Some(Op::FilesystemWrite)),
             ("api_fs_delete", Row, Some(Op::FilesystemWrite)),
             ("api_display_bootstrap", Residue, Some(Op::DisplayView)),
             ("api_display_webrtc_signal", Residue, Some(Op::DisplayView)),
-            ("api_displays", Residue, Some(Op::DisplayView)),
+            ("api_displays", Row, Some(Op::DisplayView)),
             (
                 "api_display_input_authority_snapshot",
                 Residue,
@@ -3326,17 +4193,17 @@ mod tests {
             ),
             (
                 "api_diagnostics_visual_freshness",
-                Residue,
+                Row,
                 Some(Op::DisplayInput),
             ),
             ("api_control_msg", Residue, Some(Op::Message)),
             ("api_dashboard_action_msg", Residue, Some(Op::Message)),
             ("api_mcp_tool_call", Residue, Some(Op::Message)),
-            ("api_settings", Residue, Some(Op::Settings)),
-            ("api_settings_save", Residue, Some(Op::Settings)),
-            ("api_key_status", Residue, Some(Op::Settings)),
-            ("api_api_keys_save", Residue, Some(Op::Settings)),
-            ("api_project_root", Residue, Some(Op::Settings)),
+            ("api_settings", Row, Some(Op::Settings)),
+            ("api_settings_save", Row, Some(Op::Settings)),
+            ("api_key_status", Row, Some(Op::Settings)),
+            ("api_api_keys_save", Row, Some(Op::Settings)),
+            ("api_project_root", Row, Some(Op::Settings)),
             ("api_voice_session", Residue, Some(Op::RuntimeControl)),
             (
                 "api_presence_video_frame",
@@ -3372,22 +4239,10 @@ mod tests {
                 Some(Op::SessionInspect),
             ),
             ("api_dashboard_bootstrap", Residue, Some(Op::SessionInspect)),
-            (
-                "api_managed_context_records",
-                Residue,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_anchors",
-                Residue,
-                Some(Op::SessionInspect),
-            ),
-            (
-                "api_managed_context_fission",
-                Residue,
-                Some(Op::SessionInspect),
-            ),
-            ("api_external_agents", Residue, Some(Op::SessionInspect)),
+            ("api_managed_context_records", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_anchors", Row, Some(Op::SessionInspect)),
+            ("api_managed_context_fission", Row, Some(Op::SessionInspect)),
+            ("api_external_agents", Row, Some(Op::SessionInspect)),
         ];
 
         // Live partition: rows first (the resolution order), then the
@@ -3406,11 +4261,11 @@ mod tests {
                 spec.name
             );
         }
-        for spec in CONTROL_METHODS {
+        for spec in CONTROL_ONLY_METHODS {
             assert!(
                 live.insert(spec.name, (Residue, spec.op)).is_none(),
                 "{} is declared BOTH as a route-row tunnel column and in \
-                 CONTROL_METHODS — remove the residue entry",
+                 CONTROL_ONLY_METHODS — remove the residue entry",
                 spec.name
             );
         }
@@ -3456,9 +4311,15 @@ mod tests {
     /// against the table — same pattern as
     /// `spa_action_msg_rpc_set_mirrors_dashboard_action_allowlist`
     /// (api_control.rs). Four facts per entry: the tunnel twin exists in
-    /// `CONTROL_METHODS`; the verb + instantiated path resolve to a
+    /// `CONTROL_ONLY_METHODS`; the verb + instantiated path resolve to a
     /// declared route whose verb is declared exactly (never via `Any`);
-    /// the row's IAM operation equals the tunnel method's; and the path
+    /// the row's IAM operation equals the tunnel method's (the signed-org
+    /// courier rows are Public on HTTP by design — public authenticates no
+    /// caller and creates no control session; the verified document can only
+    /// affect its named subject — and instead pin their
+    /// documented tunnel op-override; the peers/coordinator federation
+    /// rows pin the row's own derivation — the federation ladder on the
+    /// canonical leaf); and the path
     /// template restates the row's declared pattern (captures by name).
     /// Plus the exact coverage set, so entries appear and disappear
     /// deliberately. When the route table grows its `tunnel:` column
@@ -3477,7 +4338,9 @@ mod tests {
             .expect("DAEMON_API_HTTP_MAP not found in app.html")
             + start.len();
         let rest = &app[from..];
-        let to = rest.find("});").expect("DAEMON_API_HTTP_MAP is unterminated");
+        let to = rest
+            .find("});")
+            .expect("DAEMON_API_HTTP_MAP is unterminated");
 
         // One `name: { verb: '…', path: '…', … },` entry per line — the
         // fragment documents that contract next to the literal.
@@ -3487,8 +4350,7 @@ mod tests {
             let rest = &entry[at..];
             Some(rest[..rest.find('\'')?].to_string())
         }
-        let mut entries: std::collections::BTreeMap<String, (String, String)> =
-            Default::default();
+        let mut entries: std::collections::BTreeMap<String, (String, String)> = Default::default();
         for line in rest[..to].lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
@@ -3508,10 +4370,48 @@ mod tests {
             );
         }
 
-        // Coverage pin: exactly the F1 family's twinned methods (fs +
-        // staged uploads). The `api_transfer_*` methods join when their
-        // HTTP rows land (task #6, /api/transfers); adding or dropping an
-        // entry updates this list in the same change, deliberately.
+        // Coverage pin: the F1 family's twinned methods (fs + staged
+        // uploads), the F2 sessions-family reads (managed-context,
+        // worktrees, the session list and its NDJSON stream, search,
+        // detail, report, context snapshots) plus the F8a sessions
+        // stragglers (recordings list, agent output by id and for the
+        // current session, session delete via the {id}/{target} shape,
+        // and the current-session rounds family — changes, history,
+        // rollback, redo, prune), the F3 settings/keys
+        // family (settings GET/POST, api-keys save, key-status,
+        // project-root, external-agents, displays), and the F4 access
+        // family: the dialogs set (overview, IAM state, enrollment reads
+        // + decide, IAM grant upsert/update, the connect admin quartet,
+        // the tier pair, fleet-cert request, dashboard targets) plus the
+        // org set (trust/revoke, issuance, issuer keys, and the
+        // signed-org doorbell quartet), and the F5 peers/coordinator
+        // family (registry list/add/remove, eligible, the quick
+        // controls — message/task/approval, the three signal relays,
+        // the pairing set, and the coordinator route), plus the
+        // `api_transfer_*` sextet riding the S9 /api/transfers rows
+        // (task #6 / F1c — the SPA feature-detects the rows with one
+        // GET probe before using the lane, so old daemons keep honest
+        // availability); adding or dropping an entry updates this list
+        // in the same change, deliberately. The F6 credential-custody
+        // family (api_credential_*,
+        // api_daemon_vault_*) is deliberately NOT here and stays out:
+        // custody is tunnel-scoped by design with no HTTP rows planned
+        // (docs/src/credential-custody.md; the transport design parks
+        // custody rows as an explicit future decision), so its facade
+        // calls run with no fallback lane — absence below is the contract,
+        // not a gap. The F7 control-msg trio (api_control_msg,
+        // api_session_control_msg, api_dashboard_action_msg) is likewise
+        // deliberately absent: WS-twin residue whose HTTP-era twin is the
+        // /ws intent stream, not a route (transport design §2.7) — the
+        // facade serves the tunnel leg only and the dispatchers keep
+        // their own /ws fallback. So is the F7 display residue
+        // (api_display_bootstrap, api_display_webrtc_signal, the
+        // api_display_input_authority_* trio): their HTTP-era twin is
+        // the /ws signaling socket. api_diagnostics_visual_freshness IS
+        // here — the family's one twinned row (S5), and the descriptor's
+        // one rawBody entry (the tunnel carries the NDJSON transcript as
+        // a `body` param; the HTTP twin appends its raw body verbatim,
+        // so the adapter must never JSON-encode it).
         let expected: std::collections::BTreeSet<&str> = [
             "api_fs_stat",
             "api_fs_list",
@@ -3520,20 +4420,101 @@ mod tests {
             "api_fs_write",
             "api_fs_rename",
             "api_fs_delete",
+            "api_transfer_jobs",
+            "api_transfer_job_create",
+            "api_transfer_upload_chunk",
+            "api_transfer_upload_commit",
+            "api_transfer_job_delete",
+            "api_transfer_download_read",
             "api_session_current_uploads",
             "api_session_current_upload",
             "api_session_current_upload_raw",
             "api_session_current_upload_delete",
+            "api_sessions",
+            "api_sessions_stream",
+            "api_sessions_search",
+            "api_sessions_message_search",
+            "api_session_detail",
+            "api_session_report",
+            "api_session_context_snapshot",
+            "api_session_recordings",
+            "api_session_agent_output",
+            "api_session_delete",
+            "api_session_current_changes",
+            "api_session_current_history",
+            "api_session_current_rollback",
+            "api_session_current_redo",
+            "api_session_current_prune",
+            "api_session_current_agent_output",
+            "api_managed_context_records",
+            "api_managed_context_anchors",
+            "api_managed_context_fission",
+            "api_worktrees",
+            "api_worktrees_inspect",
+            "api_worktrees_scan",
+            "api_worktrees_remove",
+            "api_worktrees_merge",
+            "api_settings",
+            "api_settings_save",
+            "api_api_keys_save",
+            "api_key_status",
+            "api_project_root",
+            "api_external_agents",
+            "api_displays",
+            "api_diagnostics_visual_freshness",
+            "api_access_overview",
+            "api_access_iam_state",
+            "api_access_enrollment_requests",
+            "api_access_enrollment_decide",
+            "api_access_iam_upsert_user_client_grant",
+            "api_access_iam_update_grant",
+            "api_access_connect_status",
+            "api_access_connect_claim_code",
+            "api_access_connect_config",
+            "api_access_connect_unclaim",
+            "api_access_set_tier",
+            "api_fleet_cert_request",
+            "api_dashboard_targets",
+            "api_dashboard_tabs",
+            "api_access_org_trust",
+            "api_access_org_revoke",
+            "api_access_org_issue",
+            "api_access_org_revoke_member",
+            "api_access_org_issuer_init",
+            "api_access_org_issuer_delegate",
+            "api_access_org_issuer_install",
+            "api_access_org_present",
+            "api_access_org_renew",
+            "api_access_org_orl",
+            "api_access_org_orl_apply",
+            "api_peers",
+            "api_peer_add",
+            "api_peer_remove",
+            "api_peer_eligible",
+            "api_peer_message",
+            "api_peer_task",
+            "api_peer_approval",
+            "api_peer_webrtc_signal",
+            "api_peer_file_transfer_signal",
+            "api_peer_dashboard_control_signal",
+            "api_peer_pairing_invite",
+            "api_peer_pairing_join",
+            "api_peer_pairing_request_access",
+            "api_peer_pairing_request_access_poll",
+            "api_peer_pairing_requests",
+            "api_peer_pairing_request_decision",
+            "api_peer_pairing_identities",
+            "api_peer_pairing_identity_revoke",
+            "api_coordinator_route",
         ]
         .into_iter()
         .collect();
-        let actual: std::collections::BTreeSet<&str> =
-            entries.keys().map(String::as_str).collect();
+        let actual: std::collections::BTreeSet<&str> = entries.keys().map(String::as_str).collect();
         assert_eq!(actual, expected, "DAEMON_API_HTTP_MAP coverage drifted");
 
         for (method_name, (verb, template)) in &entries {
             let spec = control_method_spec(method_name).unwrap_or_else(|| {
-                panic!("{method_name}: descriptor entry has no CONTROL_METHODS row")
+                panic!("{method_name}: descriptor entry has no CONTROL_ONLY_METHODS row")
             });
             let tunnel_op = spec
                 .op
@@ -3577,6 +4558,65 @@ mod tests {
                     op, tunnel_op,
                     "{method_name}: tunnel op {tunnel_op:?} != route op {op:?}"
                 ),
+                // The signed-org courier rows are Public on HTTP by
+                // design. Public means no caller/session authentication:
+                // the verified document authorizes only subject-bound
+                // processing, never daemon control by its courier.
+                // while their tunnel twins gate stricter through
+                // documented op-overrides (F4). Require the row to carry
+                // this method's tunnel column with an override matching
+                // the effective tunnel operation; the override list
+                // itself is pinned closed by the gateway's
+                // tunnel_op_overrides_are_a_closed_documented_enumeration.
+                RouteAuthz::Public => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: Public descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved Public row carries a different tunnel method"
+                    );
+                    let (override_op, _reason) = tunnel.op_override.unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: Public twinned rows must carry a \
+                             documented tunnel op-override"
+                        )
+                    });
+                    assert_eq!(
+                        override_op, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != declared override {override_op:?}"
+                    );
+                }
+                // The peers/coordinator family rows delegate HTTP authz to
+                // the federation ladder (F5). Their tunnel op derives from
+                // the row itself — `Route::tunnel_operation` applies the
+                // same ladder to the row's canonical leaf
+                // (api_coordinator_route included: both of its lanes gate
+                // on PeerUse since the 2026-07-11 owner decision retired
+                // its historical PeerManage override). Require the
+                // resolved row to carry THIS method's tunnel column and
+                // its derivation to equal the effective tunnel operation.
+                RouteAuthz::PeerFederation => {
+                    let tunnel = route.tunnel.as_ref().unwrap_or_else(|| {
+                        panic!("{method_name}: federation descriptor row lost its tunnel column")
+                    });
+                    assert_eq!(
+                        tunnel.name,
+                        method_name.as_str(),
+                        "{method_name}: resolved federation row carries a different tunnel method"
+                    );
+                    let derived = route.tunnel_operation().unwrap_or_else(|| {
+                        panic!(
+                            "{method_name}: federation twinned rows must derive \
+                             a fail-closed tunnel operation"
+                        )
+                    });
+                    assert_eq!(
+                        derived, tunnel_op,
+                        "{method_name}: tunnel op {tunnel_op:?} != row derivation {derived:?}"
+                    );
+                }
                 _ => panic!("{method_name}: twinned rows must be Operation-gated"),
             }
 
@@ -3584,7 +4624,10 @@ mod tests {
             // happen to resolve through it.
             match route.pattern {
                 PathPattern::Exact(base) => {
-                    assert_eq!(template, base, "{method_name}: template != exact route path")
+                    assert_eq!(
+                        template, base,
+                        "{method_name}: template != exact route path"
+                    )
                 }
                 PathPattern::Under(base) => assert!(
                     template == base || template.starts_with(&format!("{base}/")),
@@ -3635,8 +4678,9 @@ mod tests {
     #[test]
     fn contract_pins_for_deliberate_method_gates() {
         use crate::peer::access_policy::PeerOperation;
-        // ORL apply is courierable by any session — the root signature is
-        // the authority (see the table row comment).
+        // ORL apply is courierable by any session. The root signature
+        // authorizes only application of signed revocation facts; it does
+        // not authenticate the courier or grant that session daemon control.
         assert_eq!(
             method_operation("api_access_org_orl_apply"),
             Some(PeerOperation::PresenceRead)
@@ -4058,6 +5102,9 @@ mod tests {
                     read_roots: vec![],
                     write_roots: vec![dir.path().to_path_buf()],
                 },
+                attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             };
             rt
         };
@@ -4380,16 +5427,4 @@ mod tests {
         );
         assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
     }
-
-    #[test]
-    fn http_wire_response_preserves_http_status_metadata() {
-        let response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"missing\"}";
-        let frame = http_wire_response("m1".into(), response.into(), "managed context");
-        assert_eq!(frame["t"], "response");
-        assert_eq!(frame["ok"], true);
-        assert_eq!(frame["result"]["error"], "missing");
-        assert_eq!(frame["result"]["_httpStatus"], 404);
-        assert_eq!(frame["result"]["_httpOk"], false);
-    }
-
 }

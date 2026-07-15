@@ -60,29 +60,94 @@ pub struct ControlPlaneState {
     pub codex_config: SharedCodexConfig,
     pub claude_config: SharedClaudeConfig,
     pub bus: EventBus,
-    /// Project root for `intendant.toml` writes. When set, changes to
-    /// `external_agent` (from any frontend) also persist to the config
-    /// file so the setting survives daemon restarts. `None` in tests
-    /// or when no project context is available.
+    /// Config root for `intendant.toml` writes: the project root on a
+    /// rooted daemon, or the daemon state root when projectless. This is
+    /// persistence scope only and never grants project/sandbox access.
+    /// `None` is reserved for isolated tests or modes with no durable store.
     pub project_root: Option<PathBuf>,
 }
 
 /// Spawn the control plane as a background task. Returns a JoinHandle.
-pub fn spawn(
-    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
-    state: ControlPlaneState,
-) -> tokio::task::JoinHandle<()> {
+///
+/// Consumes the bus's lossless intent lane
+/// ([`EventBus::subscribe_intents`]), not the lossy broadcast ring: every
+/// event this loop acts on — user intents plus the session-end /
+/// display-revoke hygiene — rides that lane, in emission order, immune to
+/// `RecvError::Lagged` drops during model-stream floods.
+pub fn spawn(state: ControlPlaneState) -> tokio::task::JoinHandle<()> {
+    let mut intent_rx = state.bus.subscribe_intents();
     tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(AppEvent::ControlCommand(msg)) => {
+        // Shared-view focus-annotation lifecycle (CU-05): fold the ordered
+        // shared-view stream so a display revoke or the owning session's
+        // end auto-clears an annotation that outlived its content. The
+        // emitted `focus_clear` re-enters this loop and folds to a no-op.
+        let mut shared_view_annotations =
+            crate::shared_view_lifecycle::SharedViewAnnotations::new();
+        while let Some(event) = intent_rx.recv().await {
+            match event {
+                AppEvent::ControlCommand(msg) => {
                     handle_control_msg(&msg, &state).await;
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                _ => {} // Other events, lagged -- ignore
+                // Display-request rail hygiene (single-writer side effects):
+                // a session's end cancels its pending doorbell request and
+                // auto-revokes a this-session grant it originated; any
+                // revoke ends the rail's timed/this-session arrangement.
+                AppEvent::SessionEnded { session_id, .. } => {
+                    apply_display_request_session_end(
+                        crate::display_requests::registry(),
+                        &session_id,
+                        &state.bus,
+                    );
+                    if let Some(clear) = shared_view_annotations.on_session_ended(&session_id) {
+                        state.bus.send(clear);
+                    }
+                }
+                AppEvent::UserDisplayRevoked { display_id, .. } => {
+                    crate::display_requests::registry().note_revoked();
+                    if let Some(clear) = shared_view_annotations.on_user_display_revoked(display_id)
+                    {
+                        state.bus.send(clear);
+                    }
+                }
+                AppEvent::SharedView { .. } => {
+                    shared_view_annotations.observe(&event);
+                }
+                // Other intent-lane events (identity/relationship
+                // bookkeeping) belong to the session supervisor.
+                _ => {}
             }
         }
     })
+}
+
+/// Session-end hygiene for the display-request rail: notify the waiting
+/// tool + dashboards that a pending request died with its session, and
+/// route a this-session grant's auto-revocation through the EXISTING
+/// revoke path (`ControlMsg::RevokeUserDisplay` back onto the bus — the
+/// same guard clear + `UserDisplayRevoked` event every other revoke takes).
+/// The registry is a parameter (production passes the process global) so
+/// tests run against isolated instances.
+fn apply_display_request_session_end(
+    registry: &crate::display_requests::DisplayRequestRegistry,
+    session_id: &str,
+    bus: &EventBus,
+) {
+    let actions = registry.on_session_ended(session_id);
+    if let Some(id) = actions.cancelled_request_id {
+        bus.send(AppEvent::DisplayRequestResolved {
+            session_id: Some(session_id.to_string()),
+            id,
+            outcome: "cancelled".to_string(),
+            access: None,
+            duration: None,
+        });
+    }
+    if let Some(display_id) = actions.revoke_display_id {
+        bus.send(AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+            display_id: Some(display_id),
+            note: Some("display request grant ended with its session".to_string()),
+        }));
+    }
 }
 
 async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
@@ -491,6 +556,15 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
         }
         ControlMsg::SetClaudePermissionMode { mode } => {
             let normalized = crate::project::normalize_claude_permission_mode(mode);
+            // Unknown values deliberately pass through to `--permission-mode`
+            // (future CLI modes stay usable without an Intendant update), but
+            // a typo would only surface at the NEXT spawn — warn at ingestion.
+            if !crate::project::CLAUDE_PERMISSION_MODES.contains(&normalized.as_str()) {
+                eprintln!(
+                    "[control_plane] claude_code.permission_mode {normalized:?} is not a known mode; passing it to the CLI as-is (known: {})",
+                    crate::project::CLAUDE_PERMISSION_MODES.join(", ")
+                );
+            }
             {
                 let mut guard = state.claude_config.write().await;
                 guard.permission_mode = normalized.clone();
@@ -669,19 +743,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // agent. `Some(false)` is the dashboard's "View this machine"
             // — a private view that must never mint agent authority.
             let agent_visible = agent_visible.unwrap_or(true);
-            if agent_visible {
-                // The autonomy guard is the single holder of the grant;
-                // runtime children observe it via the env derivation at the
-                // spawn boundary (agent_runner). A private view leaves the
-                // guard untouched: viewing your own machine grants the
-                // agent nothing.
-                let mut guard = state.autonomy.write().await;
-                guard.user_display_granted = true;
-            }
-            state.bus.send(AppEvent::UserDisplayGranted {
-                display_id: did,
-                agent_visible,
-            });
+            // A manual owner grant supersedes any request-rail arrangement
+            // (timed / this-session auto-revoke must not fire on it).
+            crate::display_requests::registry().note_manual_grant();
+            apply_user_display_grant(state, did, agent_visible, agent_visible).await;
+        }
+        ControlMsg::ResolveDisplayRequest {
+            session_id,
+            id,
+            decision,
+            duration,
+        } => {
+            resolve_display_request(
+                state,
+                crate::display_requests::registry(),
+                session_id.as_deref(),
+                *id,
+                decision,
+                duration.as_deref().unwrap_or(""),
+            )
+            .await;
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
             let did = display_id.unwrap_or(0);
@@ -699,6 +780,172 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             });
         }
         _ => {} // Other control messages don't update shared state
+    }
+}
+
+/// The single legitimate user-display mint: flip the autonomy guard (when
+/// the grant carries computer-use reach) and announce the activation. The
+/// direct `GrantUserDisplay` arm and the display-request rail's approve
+/// path both come through here — derive, don't mirror.
+///
+/// `grant_cu_reach` is what separates the rail's "view" access from the
+/// full grant: a view shares the display stream with the agent
+/// (`agent_visible: true` activates capture + frames) while the guard —
+/// the `computer_use::execute_actions` chokepoint's single input — stays
+/// untouched, so CU input/screenshots against `user_session` remain denied.
+async fn apply_user_display_grant(
+    state: &ControlPlaneState,
+    display_id: u32,
+    agent_visible: bool,
+    grant_cu_reach: bool,
+) {
+    if grant_cu_reach {
+        // The autonomy guard is the single holder of the grant; runtime
+        // children observe it via the env derivation at the spawn
+        // boundary (agent_runner). A private view leaves the guard
+        // untouched: viewing your own machine grants the agent nothing.
+        let mut guard = state.autonomy.write().await;
+        guard.user_display_granted = true;
+    }
+    state.bus.send(AppEvent::UserDisplayGranted {
+        display_id,
+        agent_visible,
+    });
+}
+
+/// Resolve a pending display request: the owner's popup click arrived as
+/// `ControlMsg::ResolveDisplayRequest`. Approve mints the grant through
+/// [`apply_user_display_grant`] (the same path `GrantUserDisplay` takes)
+/// and arms the duration's auto-revocation; deny/deny_session only update
+/// the registry (cooldown / suppression). Every outcome is announced as
+/// `DisplayRequestResolved` so dashboards drop the popup and the
+/// attention chain clears. The registry is a parameter (`'static` because
+/// the timed auto-revoke task holds it) — production passes the process
+/// global; tests pass leaked isolated instances.
+async fn resolve_display_request(
+    state: &ControlPlaneState,
+    registry: &'static crate::display_requests::DisplayRequestRegistry,
+    session_id: Option<&str>,
+    id: u64,
+    decision: &str,
+    duration: &str,
+) {
+    use crate::display_requests::{
+        self, DisplayGrantDuration, DisplayRequestDecision, ResolveAction,
+        DISPLAY_REQUEST_TIMED_GRANT_SECS,
+    };
+
+    let Some(decision) = DisplayRequestDecision::parse(decision) else {
+        eprintln!("[control_plane] ignoring resolve_display_request with invalid decision {decision:?} (expected approve/deny/deny_session)");
+        return;
+    };
+    let Some(duration) = DisplayGrantDuration::parse(duration) else {
+        eprintln!("[control_plane] ignoring resolve_display_request with invalid duration {duration:?} (expected this_session/15m/until_revoked)");
+        return;
+    };
+    let session_key = display_requests::session_key(session_id);
+    let action = match registry.resolve(
+        &session_key,
+        id,
+        decision,
+        duration,
+        display_requests::now_unix_ms(),
+    ) {
+        Ok(action) => action,
+        Err(_) => {
+            // Already resolved / timed out / never existed: nothing to
+            // mint, nothing to announce (the earlier resolution already
+            // cleared the popup).
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[display-request] resolution for {session_key}#{id} ignored: not pending"
+                ),
+                level: Some(crate::types::LogLevel::Detail),
+                turn: None,
+            });
+            return;
+        }
+    };
+
+    let event_session_id = session_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    match action {
+        ResolveAction::MintGrant {
+            access,
+            duration,
+            grant_token,
+        } => {
+            let grant_cu_reach = access == display_requests::DisplayRequestAccess::ViewAndControl;
+            apply_user_display_grant(state, 0, true, grant_cu_reach).await;
+            // Foreground the freshly shared display in connected
+            // dashboards — the user just granted it; show them what the
+            // agent now sees (the shared-view presentation rail).
+            state.bus.send(AppEvent::SharedView {
+                session_id: event_session_id.clone(),
+                action: "show".to_string(),
+                display_target: Some("user_session".to_string()),
+                display_id: Some(0),
+                reason: None,
+                region: None,
+                note: Some("display request approved".to_string()),
+            });
+            if duration == DisplayGrantDuration::Timed {
+                // Auto-revocation goes through the EXISTING revoke path
+                // (guard clear + UserDisplayRevoked) via the bus; the
+                // compare-and-take on the token means a manual grant or
+                // revoke in the meantime disarms this timer.
+                let bus = state.bus.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        DISPLAY_REQUEST_TIMED_GRANT_SECS,
+                    ))
+                    .await;
+                    if let Some(display_id) = registry.take_grant_if_current(grant_token) {
+                        bus.send(AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+                            display_id: Some(display_id),
+                            note: Some("15-minute display request grant expired".to_string()),
+                        }));
+                    }
+                });
+            }
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "[display-request] approved for {session_key}#{id}: {} ({})",
+                    access.as_str(),
+                    duration.as_str()
+                ),
+                level: Some(crate::types::LogLevel::Info),
+                turn: None,
+            });
+            state.bus.send(AppEvent::DisplayRequestResolved {
+                session_id: event_session_id,
+                id,
+                outcome: "approved".to_string(),
+                access: Some(access.as_str().to_string()),
+                duration: Some(duration.as_str().to_string()),
+            });
+        }
+        ResolveAction::NoGrant => {
+            let outcome = match decision {
+                DisplayRequestDecision::Deny => "denied",
+                DisplayRequestDecision::DenyForSession => "denied_for_session",
+                DisplayRequestDecision::Approve => unreachable!("approve always mints"),
+            };
+            state.bus.send(AppEvent::PresenceLog {
+                message: format!("[display-request] {outcome} for {session_key}#{id}"),
+                level: Some(crate::types::LogLevel::Info),
+                turn: None,
+            });
+            state.bus.send(AppEvent::DisplayRequestResolved {
+                session_id: event_session_id,
+                id,
+                outcome: outcome.to_string(),
+                access: None,
+                duration: None,
+            });
+        }
     }
 }
 
@@ -969,6 +1216,483 @@ mod tests {
         assert!(!autonomy.read().await.user_display_granted);
     }
 
+    fn display_request_test_state(
+        bus: &EventBus,
+    ) -> (ControlPlaneState, crate::autonomy::SharedAutonomy) {
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let state = ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: Arc::new(RwLock::new(None)),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        };
+        (state, autonomy)
+    }
+
+    /// A leaked isolated registry: the resolve path's timed auto-revoke
+    /// task requires `'static`, and isolation keeps parallel tests off the
+    /// process-global singleton.
+    fn test_registry() -> &'static crate::display_requests::DisplayRequestRegistry {
+        Box::leak(Box::new(
+            crate::display_requests::DisplayRequestRegistry::new(),
+        ))
+    }
+
+    /// Drain everything currently on the bus receiver into a Vec.
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// End-to-end wiring of the CU-05 focus-annotation lifecycle through
+    /// the REAL control-plane loop: `SharedView` events ride the intent
+    /// lane into the tracker, and the session-end / display-revoke arms
+    /// broadcast the `focus_clear`. (The transition matrix itself is
+    /// unit-tested in `shared_view_lifecycle`.) Session ids are unique to
+    /// this test because the loop also feeds the process-global
+    /// display-request registry.
+    #[tokio::test]
+    async fn control_plane_loop_clears_focus_annotations_on_lifecycle_events() {
+        let bus = EventBus::new();
+        let (state, _autonomy) = display_request_test_state(&bus);
+        let _loop_task = spawn(state);
+        let mut rx = bus.subscribe();
+
+        async fn await_focus_clear(
+            rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        ) -> (Option<String>, Option<u32>, Option<String>) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::SharedView {
+                            action,
+                            session_id,
+                            display_id,
+                            reason,
+                            ..
+                        }) if action == "focus_clear" => {
+                            return (session_id, display_id, reason);
+                        }
+                        Ok(_) => {}
+                        Err(err) => panic!("bus closed while waiting for focus_clear: {err}"),
+                    }
+                }
+            })
+            .await
+            .expect("focus_clear must be broadcast")
+        }
+
+        // A session draws an annotation on an agent-owned display; the
+        // session's end must clear it.
+        bus.send(AppEvent::SharedView {
+            session_id: Some("cp-svl-owner".to_string()),
+            action: "focus".to_string(),
+            display_target: Some("display_7".to_string()),
+            display_id: Some(7),
+            reason: None,
+            region: Some(crate::types::SharedViewRegion {
+                x: 0.1,
+                y: 0.1,
+                width: 0.5,
+                height: 0.5,
+            }),
+            note: Some("watch this".to_string()),
+        });
+        bus.send(AppEvent::SessionEnded {
+            session_id: "cp-svl-owner".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        let (session_id, display_id, reason) = await_focus_clear(&mut rx).await;
+        assert_eq!(session_id.as_deref(), Some("cp-svl-owner"));
+        assert_eq!(display_id, Some(7));
+        assert_eq!(reason.as_deref(), Some("owning session ended"));
+
+        // Re-arm on the user display; revoking the grant must clear it.
+        // (The emitted clear above re-entered the loop and folded to a
+        // no-op — a stale record would mis-attribute this second clear.)
+        bus.send(AppEvent::SharedView {
+            session_id: Some("cp-svl-owner-2".to_string()),
+            action: "focus".to_string(),
+            display_target: Some("user_session".to_string()),
+            display_id: Some(0),
+            reason: None,
+            region: Some(crate::types::SharedViewRegion {
+                x: 0.2,
+                y: 0.2,
+                width: 0.3,
+                height: 0.3,
+            }),
+            note: None,
+        });
+        bus.send(AppEvent::UserDisplayRevoked {
+            display_id: 0,
+            note: None,
+        });
+        let (session_id, display_id, reason) = await_focus_clear(&mut rx).await;
+        assert_eq!(session_id.as_deref(), Some("cp-svl-owner-2"));
+        assert_eq!(display_id, Some(0));
+        assert_eq!(reason.as_deref(), Some("display access revoked"));
+    }
+
+    #[tokio::test]
+    async fn resolve_display_request_approve_control_mints_the_full_grant() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        // A scoped agent rang the doorbell.
+        let session = "cp-approve-control";
+        let (id, mut rx) = match registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::ViewAndControl,
+            "verify the fix on your screen",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        ) {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+
+        // The user's click arrives as the dedicated control message.
+        resolve_display_request(
+            &state,
+            registry,
+            Some(session),
+            id,
+            "approve",
+            "until_revoked",
+        )
+        .await;
+
+        assert!(
+            autonomy.read().await.user_display_granted,
+            "approve(view_and_control) mints the full user-display grant"
+        );
+        let observed = drain_events(&mut events);
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::UserDisplayGranted {
+                    display_id: 0,
+                    agent_visible: true
+                }
+            )),
+            "the grant activates display 0 agent-visible, got {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::SharedView { action, display_id: Some(0), .. } if action == "show"
+            )),
+            "approval foregrounds the shared view, got {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::DisplayRequestResolved { id: event_id, outcome, access: Some(access), duration: Some(duration), .. }
+                    if *event_id == id && outcome == "approved" && access == "view_and_control" && duration == "until_revoked"
+            )),
+            "the resolution is announced, got {observed:?}"
+        );
+        // The blocked tool call gets its structured outcome.
+        assert_eq!(
+            rx.try_recv().expect("waiter resolved"),
+            crate::display_requests::DisplayRequestOutcome::Approved {
+                access: crate::display_requests::DisplayRequestAccess::ViewAndControl,
+                duration: crate::display_requests::DisplayGrantDuration::UntilRevoked,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_display_request_approve_view_leaves_the_cu_guard_closed() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        let session = "cp-approve-view";
+        let raise = registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::View,
+            "watch the migration run",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        );
+        let (id, mut rx) = match raise {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+
+        resolve_display_request(
+            &state,
+            registry,
+            Some(session),
+            id,
+            "approve",
+            "this_session",
+        )
+        .await;
+
+        // THE view/control split: the stream activates agent-visible while
+        // the computer_use chokepoint's single input stays closed.
+        assert!(
+            !autonomy.read().await.user_display_granted,
+            "a view grant must never flip the CU user-display guard"
+        );
+        let observed = drain_events(&mut events);
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::UserDisplayGranted {
+                    display_id: 0,
+                    agent_visible: true
+                }
+            )),
+            "view still activates display 0 agent-visible, got {observed:?}"
+        );
+        assert!(matches!(
+            rx.try_recv().expect("waiter resolved"),
+            crate::display_requests::DisplayRequestOutcome::Approved {
+                access: crate::display_requests::DisplayRequestAccess::View,
+                duration: crate::display_requests::DisplayGrantDuration::ThisSession,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_display_request_deny_grants_nothing_and_arms_the_cooldown() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        let session = "cp-deny";
+        let (id, mut rx) = match registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::ViewAndControl,
+            "why",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        ) {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+
+        resolve_display_request(&state, registry, Some(session), id, "deny", "").await;
+
+        assert!(!autonomy.read().await.user_display_granted);
+        let observed = drain_events(&mut events);
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, AppEvent::UserDisplayGranted { .. })),
+            "deny must not emit any grant event, got {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::DisplayRequestResolved { outcome, access: None, .. } if outcome == "denied"
+            )),
+            "deny announces the resolution, got {observed:?}"
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::display_requests::DisplayRequestOutcome::Denied
+        );
+        // The deny cooldown is armed: an immediate re-ask is refused
+        // without a popup.
+        assert!(matches!(
+            registry.raise(
+                session,
+                crate::display_requests::DisplayRequestAccess::View,
+                "again",
+                120,
+                true,
+                crate::display_requests::now_unix_ms(),
+            ),
+            crate::display_requests::RaiseOutcome::Cooldown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_actions_cannot_touch_a_display_request() {
+        let bus = EventBus::new();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        let session = "cp-approval-isolated";
+        let (id, mut rx) = match registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::ViewAndControl,
+            "why",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        ) {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+
+        // The command-approval vocabulary — including ApproveAll — must not
+        // reach the display request: it lives outside the approval
+        // registry's id space by construction, and the control plane's
+        // dispatch has no path from approval actions to the request rail.
+        for msg in [
+            ControlMsg::Approve {
+                session_id: Some(session.to_string()),
+                id,
+            },
+            ControlMsg::ApproveAll {
+                session_id: Some(session.to_string()),
+                id,
+            },
+        ] {
+            handle_control_msg(&msg, &state).await;
+        }
+        assert!(
+            !autonomy.read().await.user_display_granted,
+            "approve/approve_all must never mint a display grant"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the display request must still be pending after approval actions"
+        );
+
+        // Only the dedicated resolution lands.
+        resolve_display_request(&state, registry, Some(session), id, "deny_session", "").await;
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::display_requests::DisplayRequestOutcome::DeniedForSession
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_cancels_pending_and_routes_revocation_through_the_revoke_path() {
+        let bus = EventBus::new();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        // An approved this-session grant…
+        let session = "cp-session-end";
+        let (id, _rx) = match registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::ViewAndControl,
+            "why",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        ) {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+        resolve_display_request(
+            &state,
+            registry,
+            Some(session),
+            id,
+            "approve",
+            "this_session",
+        )
+        .await;
+        assert!(autonomy.read().await.user_display_granted);
+
+        // …plus a fresh pending request from the same session.
+        let (id2, mut rx2) = match registry.raise(
+            session,
+            crate::display_requests::DisplayRequestAccess::View,
+            "still watching?",
+            120,
+            true,
+            crate::display_requests::now_unix_ms(),
+        ) {
+            crate::display_requests::RaiseOutcome::Raised { id, rx, .. } => (id, rx),
+            _ => panic!("expected Raised"),
+        };
+
+        let mut events = bus.subscribe();
+        apply_display_request_session_end(registry, session, &bus);
+
+        let observed = drain_events(&mut events);
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::DisplayRequestResolved { id, outcome, .. }
+                    if *id == id2 && outcome == "cancelled"
+            )),
+            "the pending request is cancelled with its session, got {observed:?}"
+        );
+        // The auto-revocation dispatches the EXISTING revoke path rather
+        // than duplicating the guard clear here.
+        assert!(
+            observed.iter().any(|event| matches!(
+                event,
+                AppEvent::ControlCommand(ControlMsg::RevokeUserDisplay {
+                    display_id: Some(0),
+                    ..
+                })
+            )),
+            "session end routes revocation through RevokeUserDisplay, got {observed:?}"
+        );
+        assert!(matches!(
+            rx2.try_recv().unwrap(),
+            crate::display_requests::DisplayRequestOutcome::Cancelled { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_display_request_ignores_unknown_or_stale_ids() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let (state, autonomy) = display_request_test_state(&bus);
+        let registry = test_registry();
+
+        // Straight through the ControlMsg arm (this one may touch the
+        // global registry: a guaranteed-unknown id resolves nothing there).
+        handle_control_msg(
+            &ControlMsg::ResolveDisplayRequest {
+                session_id: Some("cp-nonexistent".to_string()),
+                id: u64::MAX,
+                decision: "approve".to_string(),
+                duration: None,
+            },
+            &state,
+        )
+        .await;
+        // And an invalid decision through the parser gate.
+        resolve_display_request(
+            &state,
+            registry,
+            Some("cp-nonexistent"),
+            1,
+            "approve_all",
+            "",
+        )
+        .await;
+        assert!(
+            !autonomy.read().await.user_display_granted,
+            "resolving a non-pending request must mint nothing"
+        );
+        let observed = drain_events(&mut events);
+        assert!(
+            !observed.iter().any(|event| matches!(
+                event,
+                AppEvent::UserDisplayGranted { .. } | AppEvent::DisplayRequestResolved { .. }
+            )),
+            "no grant or resolution events for a stale id, got {observed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_autonomy_updates_shared_state() {
         let bus = EventBus::new();
@@ -976,17 +1700,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let mut events = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Verify initial state
         assert_eq!(autonomy.read().await.level, AutonomyLevel::Medium);
@@ -1022,17 +1743,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // tool_call defaults to Auto.
         assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Auto);
@@ -1055,17 +1773,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Verify initial state
         assert!(external_agent.read().await.is_none());
@@ -1100,17 +1815,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // AutonomyLevel::from_str_loose returns Medium for unknown strings
         bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
@@ -1131,17 +1843,14 @@ mod tests {
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(Some(external_agent::AgentBackend::Codex)));
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy: autonomy.clone(),
-                external_agent: external_agent.clone(),
-                codex_config: test_codex_config(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy: autonomy.clone(),
+            external_agent: external_agent.clone(),
+            codex_config: test_codex_config(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         // Send SetExternalAgent with empty string -- should clear
         bus.send(AppEvent::ControlCommand(ControlMsg::SetExternalAgent {
@@ -1162,17 +1871,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
             command: Some("  /opt/bin/codex  ".to_string()),
@@ -1196,17 +1902,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         assert_eq!(codex_config.read().await.sandbox, "workspace-write");
 
@@ -1233,17 +1936,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexApprovalPolicy {
@@ -1263,17 +1963,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexModel {
             model: Some("gpt-5".to_string()),
@@ -1298,17 +1995,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexReasoningEffort {
@@ -1340,17 +2034,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
             service_tier: Some("fast".to_string()),
@@ -1386,17 +2077,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
             enabled: true,
@@ -1429,17 +2117,14 @@ mod tests {
         // Subscribe BEFORE spawning so we don't miss the broadcast.
         let mut rx = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config,
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config,
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
             session_id: Some("sess-action".to_string()),
@@ -1485,17 +2170,14 @@ mod tests {
 
         let mut rx = bus.subscribe();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config,
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config,
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
             session_id: None,
@@ -1542,17 +2224,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexWritableRoots {
@@ -1579,17 +2258,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexManagedContext {
@@ -1617,17 +2293,14 @@ mod tests {
         let external_agent = Arc::new(RwLock::new(None));
         let codex_config = test_codex_config();
 
-        let handle = spawn(
-            bus.subscribe(),
-            ControlPlaneState {
-                autonomy,
-                external_agent,
-                codex_config: codex_config.clone(),
-                claude_config: test_claude_config(),
-                bus: bus.clone(),
-                project_root: None,
-            },
-        );
+        let handle = spawn(ControlPlaneState {
+            autonomy,
+            external_agent,
+            codex_config: codex_config.clone(),
+            claude_config: test_claude_config(),
+            bus: bus.clone(),
+            project_root: None,
+        });
 
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexContextArchive {

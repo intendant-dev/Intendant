@@ -26,10 +26,10 @@ pub(crate) const SESSION_NOTE_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 /// under the `POST /mcp` body cap — pinned by a test below.
 pub(crate) const SESSION_NOTE_MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
-/// Raster image MIME types a note may attach. SVG is deliberately
-/// excluded: the `/raw` route serves blobs inline with their stored MIME,
-/// and an inline SVG document executes scripts on the daemon origin when
-/// opened via the thumbnail's click-through link. Raster types cannot.
+/// Raster image MIME types a note may attach. SVG remains deliberately
+/// excluded as defense in depth for preview consumers. The `/raw` route
+/// forces attachment disposition and disables MIME sniffing, so even a
+/// stored active document cannot execute in the daemon origin.
 const SESSION_NOTE_ALLOWED_MIME: [&str; 5] = [
     "image/png",
     "image/jpeg",
@@ -208,7 +208,11 @@ impl IntendantServer {
                         Some(fallback.to_string())
                     }
                 });
-            (session_id, state.project_root.clone(), state.log_dir.clone())
+            (
+                session_id,
+                state.project_root.clone(),
+                state.log_dir.clone(),
+            )
         };
         let Some(session_id) = session_id else {
             return Err(
@@ -332,7 +336,11 @@ mod tests {
         let png = vec![0x89u8, b'P', b'N', b'G', 1, 2, 3];
         let decoded = decode_session_note_images(&[
             image("image/png", b64(&png), Some("shot one.png")),
-            image("image/jpg", format!("data:image/jpeg;base64,{}", b64(&png)), None),
+            image(
+                "image/jpg",
+                format!("data:image/jpeg;base64,{}", b64(&png)),
+                None,
+            ),
             // Whitespace-wrapped base64 (agents often hard-wrap).
             image("image/webp", format!("{}\n", b64(&png)), None),
         ])
@@ -353,12 +361,11 @@ mod tests {
         let err = decode_session_note_images(&[image("text/html", b64(b"x"), None)]).unwrap_err();
         assert!(err.contains("unsupported media_type"), "{err}");
         // SVG is deliberately not an accepted note attachment type.
-        let err =
-            decode_session_note_images(&[image("image/svg+xml", b64(b"<svg/>"), None)])
-                .unwrap_err();
-        assert!(err.contains("unsupported media_type"), "{err}");
-        let err = decode_session_note_images(&[image("image/png", "!!".to_string(), None)])
+        let err = decode_session_note_images(&[image("image/svg+xml", b64(b"<svg/>"), None)])
             .unwrap_err();
+        assert!(err.contains("unsupported media_type"), "{err}");
+        let err =
+            decode_session_note_images(&[image("image/png", "!!".to_string(), None)]).unwrap_err();
         assert!(err.contains("invalid base64"), "{err}");
         let err =
             decode_session_note_images(&[image("image/png", "  ".to_string(), None)]).unwrap_err();
@@ -405,10 +412,7 @@ mod tests {
         );
         state.project_root = Some(project_root.to_path_buf());
         state.session_id = session_id.to_string();
-        let server = IntendantServer::new(
-            Arc::new(tokio::sync::RwLock::new(state)),
-            bus.clone(),
-        );
+        let server = IntendantServer::new(Arc::new(tokio::sync::RwLock::new(state)), bus.clone());
         (server, bus)
     }
 

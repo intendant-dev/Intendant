@@ -14,12 +14,19 @@ path, and dashboard TLS/mTLS setup. For the local display pipeline
 those federated displays plug into, see [Display Pipeline](./display-pipeline.md).
 
 Peer federation is **not** the same security domain as a browser dashboard login.
-Hosted Connect passkeys and browser mTLS client certificates authenticate a
-human/client route to one daemon and are root dashboard access for the owner
-today. Peer federation authenticates a daemon route to another daemon and should
-use peer-scoped mTLS identities plus peer profiles. Future coworker/team access
-belongs in user-scoped IAM unless the federation trust model is deliberately
-expanded.
+Connect passkeys authenticate the hosted account and route UI only; they never
+authenticate to a daemon. Human/client daemon authentication uses browser mTLS
+or trusted local presence in this alpha. Browser identity keys sign fleet
+records and can be stored as IAM/org subject metadata. Peer offers can verify
+one for attribution, but no live alpha ingress admits it as the controlling IAM
+principal; recording or approving such a key does not create a session.
+Hosted provenance is immutable `role:none` in the default build; all human
+control remains local or independently reached direct mTLS. The packaged
+macOS app contains a local bridge, but no signed/notarized release exists for
+this alpha. Peer federation authenticates a daemon route to another daemon
+and should use peer-scoped mTLS identities plus peer profiles. Future
+coworker/team access belongs in user-scoped IAM unless the federation trust
+model is deliberately expanded.
 
 The dashboard now describes both domains with the same access vocabulary:
 principal, target, grant, policy, and transport. In that model a peer daemon is
@@ -110,6 +117,15 @@ ahead of auto-detected URLs; auto-detected entries are always appended as
 fallbacks. The merged list also seeds the **primary-relay TCP fallback** for
 cross-machine display (see below).
 
+> **Whose authority do peer-routed panes spend?** The intermediary
+> daemon's peer grant — never yours. The dashboard surfaces that reach a
+> peer through this machinery (terminal, files, folded sessions,
+> displays) run in the **delegation lane**: the target admits them under
+> `DashboardControlGrant::Peer` and its audit names the daemon, not the
+> person. Access administration and credential custody are user-lane-only
+> by doctrine. The lane model, its rules, and the tracked attribution
+> primitive live in [Trust Tiers → Two lanes](./trust-tiers.md#two-lanes-whose-authority-a-pane-spends).
+
 ## The Peer Actor / Registry / Coordinator Model
 
 ```
@@ -162,6 +178,11 @@ cross-machine display (see below).
   eligible peer — one that is `Connected` *and* whose card advertises every
   required capability — in lexicographic `PeerId` order (deterministic, so
   idempotent retries route to the same peer) and delegates via the handle.
+  Routing through the coordinator (`POST /api/coordinator/route` and its
+  `api_coordinator_route` tunnel twin) is authorized as `peer.use` on both
+  transport lanes, same as the per-peer quick controls: the routed task is
+  delegated under *this daemon's* peer identity, and the receiving peer
+  authorizes it against its own grants for this daemon.
 
 ### Per-peer sessions — the folded `SessionInfo` rail
 
@@ -269,7 +290,40 @@ shapes with identical semantics:
 label, connection state, capabilities, and the folded per-peer `sessions`
 and `displays` rails above. `peer_send_message` (`peer_id`, `message`, optional `session`)
 sends a message to the peer's agent. `peer_delegate_task` (`peer_id`,
-`instructions`, optional `context`) delegates a task and returns a `task_id`.
+`instructions`, optional `context`) delegates a task and returns a `task_id`
+plus a `delivery` verdict (below).
+
+### Delegation delivery receipts (at-least-once)
+
+A StartTask write proves only that the frame entered the sender's socket —
+the `/ws` control plane echoes nothing back — so delivery is resolved at the
+application level. Every delegation stamps its StartTask frame with a
+`delegation_id`; a receiving daemon that **dispatches** the task (not merely
+reads the frame) answers with a broadcast `task_received` event carrying that
+id and its real local session id, and the sender's `delegate_task` waits
+(bounded) for the correlated receipt:
+
+- **`delivery: "acknowledged"`** — the peer accepted: `task_id` is the peer's
+  real session id, so the id `ctl peer task` prints means "accepted by the
+  peer" and is actionable for follow-ups.
+- **Connection drops before an ack** — the sender re-sends the **same**
+  `delegation_id` a bounded number of times after the actor reconnects; the
+  receiver dedups by that id and re-acks with the *original* session instead
+  of starting a duplicate task (at-least-once with dedup).
+- **`delivery: "unconfirmed"`** — the connection stayed up for the whole
+  grace window with no ack: the old-receiver signature (pre-receipt builds
+  run the task but never ack). The sender falls back to the historical
+  fire-and-forget semantics — synthetic `task-out-{n}` id, clearly marked —
+  and deliberately does **not** re-send, because an old receiver has no
+  dedup and a re-send would duplicate the task.
+
+Responses also carry the `delegation_id` (pass it back as
+`client_correlation_id` to retry a delegation idempotently) and `sends` (how
+many StartTask frames were written; >1 means a reconnect re-send happened).
+Receipts are informational and carry no authority — the receiving daemon's
+IAM evaluates the StartTask exactly as before. The precise wire shapes and
+the old/new compatibility matrix live in the module docs of
+`peer/transport/intendant.rs`.
 
 Delegation keeps the sibling-not-subordinate contract: a delegated task
 executes on the peer's machine, by the peer's own agent, under the peer's own
@@ -575,11 +629,11 @@ compatibility path. Subcommands:
 
 | Command | Action |
 |---|---|
-| `intendant access setup` | Generate CA + server/client certs and start the strict HTTPS enrollment server |
+| `intendant access setup` | Generate CA + server/client certs and seed the local owner grant; start enrollment on macOS/Linux or print local import commands on Windows |
 | `intendant access recert` | Re-issue certs |
 | `intendant access remove` | Remove the per-user access cert store |
 | `intendant access list` | List issued client certs |
-| `intendant access serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
+| `intendant access serve-certs` | macOS/Linux only: run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
 intendant access setup --name nicks-mac --port 8765
@@ -590,10 +644,11 @@ addresses belong in SANs and advertised URLs, not in the label. When setup is
 run without `--name`, Intendant uses the system hostname when available and uses
 the primary IP only as a last resort.
 
-The interactive `intendant access` setup/enrollment flow is currently validated on
-Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
-Windows daemon can still use native HTTPS/mTLS and
-`read_server_cert_fingerprint` to publish a pinned fingerprint. See
+`setup`, `recert`, `list`, and `remove` are cross-platform. Windows setup uses
+the same pure-Rust generation and local-IAM seeding, then prints exact
+PowerShell commands to import `ca.crt` into `Cert:\CurrentUser\Root` and
+`client.p12` into `Cert:\CurrentUser\My`; it never starts `serve-certs`.
+Remote interactive enrollment remains macOS/Linux-only. See
 [Windows Support](./windows-support.md).
 
 Enrollment is not a plain unauthenticated download. The temporary
@@ -610,20 +665,19 @@ configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
 
-When the daemon holds a live **fleet certificate**
+Even when the daemon holds a live **fleet certificate**
 ([Self-Hosted Rendezvous → Fleet DNS](./self-hosted-rendezvous.md#fleet-dns-real-certificates-for-daemons)),
-`serve-certs` also serves it for the fleet name on the enrollment port and
-leads with that URL instead: the page then loads warning-free under WebPKI,
-and the fingerprint transcription is skipped — the operator just presses
-Enter to reveal the secret once the page is open. That path bootstraps
-device trust through [first-contact rung two](./trust-tiers.md#first-contact-three-rungs)
-(active-only betrayal, CT-logged, tripwire-watched) rather than rung one;
-the classic fingerprint ceremony against the IP URL remains available from
-the same prompt for trustless assurance. There is deliberately no
-short-code/PAKE variant: until the device trusts the daemon's certificate,
-a code typed into the *page* goes to whoever served the page — under an
-active MITM, the attacker — so the trustless leg keeps reading from browser
-chrome into the trusted terminal.
+`serve-certs` deliberately serves only the direct access certificate and never
+accepts an Enter/presence-only confirmation. The shared owner/root client bundle
+is released only after the browser-observed fingerprint matches the local
+certificate. A fleet name is valuable for warning-free discovery/public shell
+bytes, but it is not a dashboard-control or root-bootstrap origin: the daemon
+rejects protected fleet-SNI traffic before considering browser mTLS. Hosted
+DNS/origin control could otherwise proxy the ceremony, steal the bundle, or
+drive a previously enrolled certificate. There is likewise no short-code/PAKE variant:
+until the device trusts the daemon's certificate, a code typed into the *page*
+goes to whoever served the page — under an active MITM, the attacker — so the
+ceremony keeps reading from browser chrome into the trusted terminal.
 
 Native access TLS also solves browser secure-context requirements for access clients
 once the CA/client identity are installed. That matters for Station's WebGPU
@@ -829,7 +883,7 @@ dashboard or daemon-to-daemon UX.
 
 - [Display Pipeline](./display-pipeline.md) — the local capture/encode/WebRTC
   pipeline that federated displays plug into, and the `[webrtc]` config
-- [Windows Support](./windows-support.md) — why `intendant access` is gated off
-  Windows and what to use instead
+- [Windows Support](./windows-support.md) — local access setup/import support
+  and the remaining remote-enrollment limitation
 - [`docs/design-federated-input-authority.md`](https://github.com/intendant-dev/Intendant/blob/main/docs/design-federated-input-authority.md)
   — the full federated input-authority protocol

@@ -149,6 +149,106 @@ function renderStatsForActiveHost(options = {}) {
 // ── Settings ──
 // settingsLoaded lives with the minimal JS state block (deep-link TDZ).
 
+function settingsCodexModelValue() {
+  const select = document.getElementById('set-codex-model-select');
+  if (!select) return '';
+  if (select.value === '__custom__') {
+    return document.getElementById('set-codex-model-custom')?.value.trim() || '';
+  }
+  return select.value || '';
+}
+
+function settingsCodexCatalogEntry() {
+  const model = settingsCodexModelValue();
+  if (!model) return null;
+  return newSessionCodexModelCatalog
+    .filter(entry => entry.id === model || model.startsWith(`${entry.id}-`))
+    .sort((a, b) => b.id.length - a.id.length)[0] || null;
+}
+
+function updateSettingsCodexCustomModelRow() {
+  const custom = document.getElementById('set-codex-model-select')?.value === '__custom__';
+  document.getElementById('set-codex-model-custom-row')?.classList.toggle('hidden', !custom);
+}
+
+function populateSettingsCodexReasoningEfforts(configuredEffort = null) {
+  const select = document.getElementById('set-codex-reasoning-effort');
+  if (!select) return;
+  const previous = configuredEffort === null ? (select.value || '') : String(configuredEffort || '').trim();
+  const model = settingsCodexCatalogEntry();
+  const efforts = model?.reasoning_efforts?.length
+    ? model.reasoning_efforts
+    : newSessionCodexReasoningEfforts;
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = model?.default_reasoning_effort
+    ? `Model default (${model.default_reasoning_effort})`
+    : 'Model / Codex default';
+  select.appendChild(inherit);
+  for (const effort of efforts) {
+    const option = document.createElement('option');
+    option.value = effort;
+    option.textContent = effort === 'ultra'
+      ? 'ultra — automatic task delegation'
+      : effort;
+    select.appendChild(option);
+  }
+  select.value = efforts.includes(previous) ? previous : '';
+}
+
+function populateSettingsCodexModel(configuredModel, configuredEffort) {
+  const select = document.getElementById('set-codex-model-select');
+  const customInput = document.getElementById('set-codex-model-custom');
+  if (!select) return;
+  const model = String(configuredModel || '').trim();
+  select.replaceChildren();
+  const inherit = document.createElement('option');
+  inherit.value = '';
+  inherit.textContent = 'Codex account default';
+  select.appendChild(inherit);
+  for (const entry of newSessionCodexModelCatalog) {
+    const option = document.createElement('option');
+    option.value = entry.id;
+    option.textContent = `${entry.display_name} — ${entry.id}`;
+    select.appendChild(option);
+  }
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = 'Custom model id…';
+  select.appendChild(custom);
+  const isCatalogModel = newSessionCodexModelCatalog.some(entry => entry.id === model);
+  select.value = !model ? '' : (isCatalogModel ? model : '__custom__');
+  if (customInput) customInput.value = model && !isCatalogModel ? model : '';
+  updateSettingsCodexCustomModelRow();
+  populateSettingsCodexReasoningEfforts(configuredEffort);
+}
+
+function settingsClaudeModelValue() {
+  const select = document.getElementById('set-claude-model-select');
+  if (!select) return '';
+  if (select.value === '__custom__') {
+    return document.getElementById('set-claude-model-custom')?.value.trim() || '';
+  }
+  return select.value || '';
+}
+
+function updateSettingsClaudeCustomModelRow() {
+  const custom = document.getElementById('set-claude-model-select')?.value === '__custom__';
+  document.getElementById('set-claude-model-custom-row')?.classList.toggle('hidden', !custom);
+}
+
+function populateSettingsClaudeModel(configuredModel) {
+  const select = document.getElementById('set-claude-model-select');
+  const customInput = document.getElementById('set-claude-model-custom');
+  if (!select) return;
+  const model = String(configuredModel || '').trim();
+  const aliases = ['fable', 'opus', 'sonnet', 'haiku'];
+  select.value = !model ? '' : (aliases.includes(model) ? model : '__custom__');
+  if (customInput) customInput.value = model && !aliases.includes(model) ? model : '';
+  updateSettingsClaudeCustomModelRow();
+}
+
 async function loadSettings() {
   try {
     const d = await fetchDashboardSettings();
@@ -179,11 +279,29 @@ async function loadSettings() {
     document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
-    controlCodexConfig.command = d.codex_command || 'codex';
-    controlCodexConfig.service_tier = normalizeCodexServiceTier(d.codex_service_tier || '');
-    controlCodexConfig.managed_context = d.codex_managed_context || 'vanilla';
-    controlCodexConfig.context_archive = d.codex_context_archive || 'summary';
+    controlCodexConfig = {
+      command: d.codex_command || 'codex',
+      managed_command: d.codex_managed_command || '',
+      sandbox: normalizeCodexSandbox(d.codex_sandbox || 'workspace-write'),
+      approval_policy: normalizeCodexApprovalPolicy(d.codex_approval_policy || 'on-request'),
+      model: d.codex_model || '',
+      reasoning_effort: d.codex_reasoning_effort || '',
+      service_tier: normalizeCodexServiceTier(d.codex_service_tier || ''),
+      web_search: !!d.codex_web_search,
+      network_access: !!d.codex_network_access,
+      writable_roots: Array.isArray(d.codex_writable_roots) ? d.codex_writable_roots : [],
+      managed_context: d.codex_managed_context || 'vanilla',
+      context_archive: d.codex_context_archive || 'summary',
+    };
+    controlClaudeConfig = {
+      model: d.claude_model || '',
+      permission_mode: d.claude_permission_mode || 'default',
+      allowed_tools: Array.isArray(d.claude_allowed_tools) ? d.claude_allowed_tools : [],
+    };
     setNewSessionAgentDefaults(d);
+    populateSettingsCodexModel(d.codex_model, d.codex_reasoning_effort);
+    populateSettingsClaudeModel(d.claude_model);
+    document.getElementById('set-claude-permission-mode').value = controlClaudeConfig.permission_mode;
     // External agent: persisted to intendant.toml via `[agent]
     // default_backend`. Sync the Settings dropdown and status bar
     // worker identity here — on a fresh daemon boot there are no
@@ -205,7 +323,7 @@ async function loadSettings() {
     const debugEmpty = document.getElementById('debug-empty');
     if (d.env_overrides && Object.keys(d.env_overrides).length > 0) {
       envDiv.innerHTML = Object.entries(d.env_overrides)
-        .map(([k, v]) => '<div><code style="color:var(--peach)">' + k + '</code> = <code>' + v + '</code></div>')
+        .map(([k, v]) => '<div><code style="color:var(--peach)">' + escapeHtml(k) + '</code> = <code>' + escapeHtml(v) + '</code></div>')
         .join('');
       envWrap.classList.remove('hidden');
       if (debugEmpty) debugEmpty.classList.add('hidden');
@@ -225,13 +343,11 @@ async function loadSettings() {
 async function saveSettings() {
   const g = id => document.getElementById(id);
   const selectedCodexServiceTier = normalizeCodexServiceTier(g('set-codex-service-tier')?.value ?? controlCodexConfig.service_tier ?? '');
+  const selectedCodexModel = settingsCodexModelValue();
+  const selectedCodexReasoningEffort = g('set-codex-reasoning-effort')?.value || '';
+  const selectedClaudeModel = settingsClaudeModelValue();
+  const selectedClaudePermissionMode = g('set-claude-permission-mode')?.value || 'default';
   const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
-  controlCodexConfig.service_tier = selectedCodexServiceTier;
-  newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
-  newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
-  if (!newSessionCodexFastModeTouched) {
-    newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
-  }
   const payload = {
     cu_provider: g('set-cu-provider').value || null,
     cu_model: g('set-cu-model').value || null,
@@ -259,8 +375,10 @@ async function saveSettings() {
     claude_command: selectedClaudeCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
-    codex_model: controlCodexConfig.model || null,
-    codex_reasoning_effort: controlCodexConfig.reasoning_effort || null,
+    // Empty strings are explicit clears. `null`/omission means "leave this
+    // field untouched" to partial API clients on the daemon.
+    codex_model: selectedCodexModel,
+    codex_reasoning_effort: selectedCodexReasoningEffort,
     codex_service_tier: selectedCodexServiceTier,
     codex_web_search: !!controlCodexConfig.web_search,
     codex_network_access: !!controlCodexConfig.network_access,
@@ -269,16 +387,24 @@ async function saveSettings() {
       : [],
     codex_managed_context: controlCodexConfig.managed_context || 'vanilla',
     codex_context_archive: controlCodexConfig.context_archive || 'summary',
+    claude_model: selectedClaudeModel,
+    claude_permission_mode: selectedClaudePermissionMode,
+    claude_allowed_tools: Array.isArray(controlClaudeConfig.allowed_tools)
+      ? controlClaudeConfig.allowed_tools
+      : [],
   };
+  let settingsSaved = false;
   try {
-    const resp = await dashboardTransport.jsonFetch('api_settings_save', payload, () => fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_settings_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — the fallback policy derives
+    // no-replay from the verb, exactly the legacy
+    // fallbackAfterRpcFailure:false semantics (a delivered tunnel attempt
+    // is never replayed over HTTP; with no tunnel the write goes direct).
+    // Sensitive write: the payload shape is unchanged.
+    const resp = await daemonApi.request('api_settings_save', payload);
+    const data = resp.body;
     const status = g('settings-status');
     if (data.ok) {
+      settingsSaved = true;
       status.textContent = 'Saved';
       status.style.color = 'var(--green)';
     } else {
@@ -287,14 +413,38 @@ async function saveSettings() {
     }
     setTimeout(() => { status.textContent = ''; }, 3000);
   } catch (e) {
+    // Mirror saveApiKeys: a network/transport failure must not be
+    // console-only — the user just clicked Save and needs the verdict.
     console.error('Failed to save settings:', e);
+    const status = g('settings-status');
+    if (status) {
+      status.textContent = 'Save failed: ' + (e?.message || 'network error');
+      status.style.color = 'var(--red)';
+      setTimeout(() => { status.textContent = ''; }, 5000);
+    }
+    showControlToast?.('error', 'Settings save failed: ' + (e?.message || 'network error'));
+  }
+  if (!settingsSaved) return;
+  // Commit the browser-side mirrors only after persistence succeeds. A
+  // failed POST must not make New Session behave as though the defaults had
+  // been saved.
+  controlCodexConfig.model = selectedCodexModel;
+  controlCodexConfig.reasoning_effort = selectedCodexReasoningEffort;
+  controlCodexConfig.service_tier = selectedCodexServiceTier;
+  controlClaudeConfig.model = selectedClaudeModel;
+  controlClaudeConfig.permission_mode = selectedClaudePermissionMode;
+  newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
+  newSessionCodexGlobalModel = selectedCodexModel;
+  newSessionCodexGlobalReasoningEffort = selectedCodexReasoningEffort;
+  newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
+  if (!newSessionCodexFastModeTouched) {
+    newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
   }
   // Also emit the control messages so the in-memory shared state
   // updates immediately (without waiting for the next daemon restart
   // to re-read the TOML). The POST above persists — and the gateway
-  // re-dispatches the codex fields server-side too — but keep this
-  // list complete so the dashboard never depends on that, and cover
-  // every codex field with a live control-plane setter.
+  // re-dispatches the external-agent fields server-side too — but keep
+  // this list complete so the dashboard never depends on that path.
   const agentVal = g('set-external-agent').value || null;
   dispatchControlMsg({ action: 'set_external_agent', agent: agentVal });
   dispatchControlMsg({
@@ -304,6 +454,16 @@ async function saveSettings() {
   dispatchControlMsg({
     action: 'set_codex_managed_command',
     command: (g('set-codex-managed-command').value || '').trim() || null,
+  });
+  dispatchControlMsg({ action: 'set_codex_sandbox', mode: controlCodexConfig.sandbox || 'workspace-write' });
+  dispatchControlMsg({ action: 'set_codex_approval_policy', policy: controlCodexConfig.approval_policy || 'on-request' });
+  dispatchControlMsg({ action: 'set_codex_model', model: selectedCodexModel || null });
+  dispatchControlMsg({ action: 'set_codex_reasoning_effort', effort: selectedCodexReasoningEffort || null });
+  dispatchControlMsg({ action: 'set_codex_web_search', enabled: !!controlCodexConfig.web_search });
+  dispatchControlMsg({ action: 'set_codex_network_access', enabled: !!controlCodexConfig.network_access });
+  dispatchControlMsg({
+    action: 'set_codex_writable_roots',
+    roots: Array.isArray(controlCodexConfig.writable_roots) ? controlCodexConfig.writable_roots : [],
   });
   dispatchControlMsg({
     action: 'set_codex_managed_context',
@@ -317,10 +477,24 @@ async function saveSettings() {
     action: 'set_codex_service_tier',
     service_tier: selectedCodexServiceTier || null,
   });
+  dispatchControlMsg({ action: 'set_claude_model', model: selectedClaudeModel || null });
+  dispatchControlMsg({ action: 'set_claude_permission_mode', mode: selectedClaudePermissionMode });
+  dispatchControlMsg({
+    action: 'set_claude_allowed_tools',
+    tools: Array.isArray(controlClaudeConfig.allowed_tools) ? controlClaudeConfig.allowed_tools : [],
+  });
 }
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
+document.getElementById('set-codex-model-select')?.addEventListener('change', () => {
+  updateSettingsCodexCustomModelRow();
+  populateSettingsCodexReasoningEfforts();
+});
+document.getElementById('set-codex-model-custom')?.addEventListener('input', () => {
+  populateSettingsCodexReasoningEfforts();
+});
+document.getElementById('set-claude-model-select')?.addEventListener('change', updateSettingsClaudeCustomModelRow);
 document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
 document.getElementById('connect-self-test-btn')?.addEventListener('click', () => {
   runConnectSelfTests().catch(err => {
@@ -411,12 +585,13 @@ async function saveApiKeys() {
   }
 
   try {
-    const resp = await dashboardTransport.jsonFetch('api_api_keys_save', { keys }, () => fetch('/api/api-keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ keys }),
-    }), 'api_api_keys_save', { fallbackAfterRpcFailure: false });
-    const data = await resp.json();
+    // daemonApi (transport F3): POST twin — no-replay after a delivered
+    // tunnel attempt (legacy fallbackAfterRpcFailure:false), direct HTTP
+    // only when no attempt was made. Sensitive write: the { keys } payload
+    // shape is unchanged, and the lane answers 200 with failures in the
+    // body on both transports (data.ok carries the verdict).
+    const resp = await daemonApi.request('api_api_keys_save', { keys });
+    const data = resp.body;
     const status = document.getElementById('settings-keys-status');
     if (data.ok) {
       status.textContent = 'Saved';
@@ -444,6 +619,14 @@ async function saveApiKeys() {
 document.getElementById('settings-save-keys').addEventListener('click', saveApiKeys);
 
 // ── All Sessions Usage (in Stats tab) ──
+
+// Every Stats tab entry used to force a whole-corpus refetch
+// (renderStatsForActiveHost({forceSessions:true}) → loadAllSessionsUsage
+// force). The corpus is a couple of MB and changes slowly; a short TTL
+// makes tab flips free while keeping the data fresh. An explicit
+// {ignoreTtl:true} (a manual Refresh affordance) still forces through.
+const STATS_USAGE_FORCE_TTL_MS = 45_000;
+const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
 
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
@@ -479,37 +662,41 @@ function fetchSessionsForHost(hostId, options = {}) {
       if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
       return r.json();
     }
-    if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-      try {
-        return await dashboardTransport.request('api_sessions', rpcParams);
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_sessions RPC failed, falling back to HTTP', err);
+    if (hostId === selfPeerId) {
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy; Connect mode never falls back. The
+      // availability pre-check keeps the exact reconnect copy this pane
+      // always showed for the tunnel-down Connect case.
+      if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions').ok) {
+        throw new Error('Session list is unavailable until dashboard access reconnects');
       }
+      const resp = await daemonApi.request('api_sessions', rpcParams, { signal: options.signal });
+      if (!resp.ok) throw new Error(resp.body?.error || `/api/sessions returned ${resp.status}`);
+      return resp.body;
     }
-    if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-      throw new Error('Session list is unavailable until dashboard access reconnects');
-    }
-    if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
+    if (peerDashboardControlSignalAvailable(hostId)) {
       try {
-        const conn = await peerDashboardControlConnectionForHost(hostId, {
-          signal: options.signal,
-          timeoutMs: 30000,
-        });
-        return await conn.request('api_sessions', rpcParams, {
+        const resp = await daemonApi.request('api_sessions', rpcParams, {
+          target: hostId,
           signal: options.signal,
           timeoutMs: 60000,
         });
+        return resp.body;
       } catch (err) {
-        if (err?.name === 'AbortError') throw err;
+        // Facade aborts are DaemonApiError kind:'abort' (name differs
+        // from the DOM AbortError the old path threw).
+        if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
         if (dashboardConnectModeEnabled()) throw err;
         console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
       }
     }
-    if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+    if (dashboardConnectModeEnabled()) {
       throw new Error('Peer sessions are unavailable for this target');
     }
-    const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
+    // Cross-origin peer HTTP is an explicit remote lane (the fleet Stats
+    // CORS design), never a facade fallback — the browser holds no
+    // authenticated HTTP lane to a peer.
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
     return r.json();
   };
@@ -519,6 +706,9 @@ function fetchSessionsForHost(hostId, options = {}) {
         throw new Error('/api/sessions returned a non-array payload');
       }
       sessionsListCache.set(cacheKey, sessions);
+      // Only real network loads land here (cache hits returned above) —
+      // record usage-corpus freshness for the force-TTL gate.
+      if (view === 'usage') statsUsageCorpusFetchedAt.set(hostId, Date.now());
       if (hostId === selfPeerId && cacheSessionMetadata) cacheSessionWindowMetadata(sessions);
       return sessions;
     })
@@ -577,80 +767,58 @@ async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
     baseUrl = d.url.replace(/\/$/, '');
   }
   const limit = sessionListRequestLimit(options);
-  if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
-    const state = { finalSessions: null };
-    try {
-      await dashboardTransport.stream('api_sessions_stream', { limit }, {
-        signal: options.signal,
-        timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
-      return state.finalSessions;
-    } catch (err) {
-      if (err?.name === 'AbortError') throw err;
-      if (dashboardConnectModeEnabled()) throw err;
-      console.warn('[dashboard-control] api_sessions_stream RPC failed, falling back to HTTP stream', err);
+  const state = { finalSessions: null };
+  const streamCallbacks = {
+    event(event) {
+      handleSessionStreamEvent(event, onEvent, state);
+    },
+  };
+  if (hostId === selfPeerId) {
+    // daemonApi (transport F2): tunnel stream first; on a failed lane the
+    // facade replays the GET twin as a chunked NDJSON read — the HTTP
+    // endpoint emits the same event objects, and consumers merge rows
+    // idempotently (exactly what the hand-rolled fallback here did).
+    // Connect mode never uses HTTP; keep the exact reconnect copy for the
+    // tunnel-down Connect case.
+    if (dashboardConnectModeEnabled() && !daemonApi.availability('api_sessions_stream').ok) {
+      throw new Error('Session stream is unavailable until dashboard access reconnects');
     }
+    await daemonApi.stream('api_sessions_stream', { limit }, {
+      signal: options.signal,
+      timeoutMs: 120000,
+    }, streamCallbacks);
+    return state.finalSessions;
   }
-  if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-    throw new Error('Session stream is unavailable until dashboard access reconnects');
-  }
-  if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
-    const state = { finalSessions: null };
+  if (peerDashboardControlSignalAvailable(hostId)) {
     try {
-      const conn = await peerDashboardControlConnectionForHost(hostId, {
-        signal: options.signal,
-        timeoutMs: 30000,
-      });
-      await conn.stream('api_sessions_stream', { limit }, {
+      await daemonApi.stream('api_sessions_stream', { limit }, {
+        target: hostId,
         signal: options.signal,
         timeoutMs: 120000,
-      }, {
-        event(event) {
-          handleSessionStreamEvent(event, onEvent, state);
-        },
-      });
+      }, streamCallbacks);
       return state.finalSessions;
     } catch (err) {
-      if (err?.name === 'AbortError') throw err;
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the old path threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') throw err;
       if (dashboardConnectModeEnabled()) throw err;
       console.warn('[peer-dashboard-control] api_sessions_stream RPC failed, falling back to direct peer HTTP stream', err);
     }
   }
-  if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+  if (dashboardConnectModeEnabled()) {
     throw new Error('Peer session updates are unavailable for this target');
   }
+  // Cross-origin peer HTTP stream: an explicit remote lane, never a facade
+  // fallback (the browser holds no authenticated HTTP lane to a peer). The
+  // NDJSON reader is the facade's — declared once.
   const url = sessionListStreamUrl(baseUrl, limit);
-  const request = hostId === selfPeerId
-    ? authedFetch(url, { signal: options.signal })
-    : fetch(url, { signal: options.signal });
-  const response = await request;
+  const response = await fetch(url, { signal: options.signal });
   if (!response.ok || !response.body) {
     throw new Error(`/api/sessions/stream returned ${response.status}`);
   }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  const state = { finalSessions: null };
-  const handleLine = line => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    const event = JSON.parse(trimmed);
-    handleSessionStreamEvent(event, onEvent, state);
-  };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) handleLine(line);
-  }
-  buffer += decoder.decode();
-  if (buffer.trim()) handleLine(buffer);
+  await daemonApiReadNdjsonBody(response, line => {
+    handleSessionStreamEvent(JSON.parse(line), onEvent, state);
+  });
   return state.finalSessions;
 }
 
@@ -1513,10 +1681,16 @@ function loadAllSessionsUsage(hostId, options = {}) {
     clearStatsSessionSections();
     setStatsSessionLoading(hostId, true);
   }
+  // Tab-entry forces respect the freshness TTL: a corpus fetched within
+  // the last 45s is served from cache instead of re-downloaded. A manual
+  // refresh passes {ignoreTtl:true} to force regardless.
+  const fetchedAt = statsUsageCorpusFetchedAt.get(hostId) || 0;
+  const fresh = Date.now() - fetchedAt < STATS_USAGE_FORCE_TTL_MS;
+  const force = !!options.force && (options.ignoreTtl === true || !fresh);
   // The usage view fetches the same corpus at ~a tenth of the payload
   // (usage/cost/day-bucket/disk fields only) — the stats fold reads
   // nothing else. Older peer daemons ignore the param and send full rows.
-  fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all', view: 'usage', cacheSessionMetadata: false })
+  fetchSessionsForHost(hostId, { force, limit: 'all', view: 'usage', cacheSessionMetadata: false })
     .then(sessions => {
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
@@ -2088,4 +2262,3 @@ function focusActivityForSessionEvent(options = {}) {
     showBadge('activity', '\u2022');
   }
 }
-

@@ -70,9 +70,7 @@ pub async fn send_message_json(
         content: MessageContent::Text { text: message },
     };
     match handle.send_message(message).await {
-        Ok(message_id) => {
-            serde_json::json!({ "ok": true, "message_id": message_id.0 }).to_string()
-        }
+        Ok(message_id) => serde_json::json!({ "ok": true, "message_id": message_id.0 }).to_string(),
         Err(err) => error_json(err.to_string()),
     }
 }
@@ -96,10 +94,23 @@ pub async fn delegate_task_json(
         client_correlation_id: None,
     };
     match handle.delegate_task(task).await {
-        Ok(task_id) => serde_json::json!({
+        Ok(delegation) => serde_json::json!({
             "ok": true,
-            "task_id": task_id.0,
-            "note": "the peer's agent executes this under its own autonomy and approval policy",
+            "task_id": delegation.task_id.0,
+            "delegation_id": delegation.delegation_id,
+            // "acknowledged": the peer confirmed acceptance and task_id
+            // is its real session id. "unconfirmed": fire-and-forget
+            // fallback (older peer build, or the link kept dropping
+            // before an ack) — task_id is a sender-side marker only.
+            "delivery": if delegation.confirmed { "acknowledged" } else { "unconfirmed" },
+            // StartTask frames written (>1 = re-sent across a reconnect).
+            "sends": delegation.sends,
+            "note": if delegation.confirmed {
+                "accepted by the peer; its agent executes this under its own autonomy and approval policy"
+            } else {
+                "the peer did not acknowledge receipt (pre-receipt build or unstable link); \
+                 delivery is fire-and-forget and the task id is a local marker"
+            },
         })
         .to_string(),
         Err(err) => error_json(err.to_string()),
@@ -138,7 +149,7 @@ impl PeerToolOutput {
 
 /// Fold a peer `/mcp` reply into [`PeerToolOutput`]. Tool-level
 /// failures keep their images (a partially failed CU batch still
-/// attaches the annotated post-action screenshot) but wrap the peer's
+/// attaches its post-action screenshot) but wrap the peer's
 /// diagnostic in the `{"ok": false, ...}` envelope so every surface
 /// reports errors the same way.
 fn peer_tool_output(result: Result<PeerToolReply, String>) -> PeerToolOutput {
@@ -199,8 +210,12 @@ pub async fn take_screenshot(
         arguments.insert("display_target".into(), target.into());
     }
     peer_tool_output(
-        mcp_http::call_peer_mcp_tool(&handle, "take_screenshot", serde_json::Value::Object(arguments))
-            .await,
+        mcp_http::call_peer_mcp_tool(
+            &handle,
+            "take_screenshot",
+            serde_json::Value::Object(arguments),
+        )
+        .await,
     )
 }
 
@@ -208,14 +223,20 @@ pub async fn take_screenshot(
 /// `execute_cu_actions`, DisplayInput-gated peer-side — only the
 /// peer-operator and peer-root profiles hold it). `actions` is passed
 /// through verbatim in the peer's own `CuAction` vocabulary; the
-/// reply text carries per-action status and the annotated post-action
-/// screenshot rides `images`.
+/// reply text carries per-action status plus the observation the peer
+/// chose (a post-action screenshot rides `images` by default; `observe`
+/// and `settle` forward the peer's observation/quiescence policies,
+/// which older peers ignore).
+#[allow(clippy::too_many_arguments)] // verbatim passthrough of the remote tool's optional params
 pub async fn execute_cu_actions(
     registry: Option<&PeerRegistry>,
     peer_id: &str,
     actions: serde_json::Value,
     display_target: Option<String>,
     coordinate_space: Option<String>,
+    observe: Option<String>,
+    annotate: Option<bool>,
+    settle: Option<serde_json::Value>,
 ) -> PeerToolOutput {
     let handle = match peer_handle(registry, peer_id) {
         Ok(handle) => handle,
@@ -228,6 +249,15 @@ pub async fn execute_cu_actions(
     }
     if let Some(space) = coordinate_space {
         arguments.insert("coordinate_space".into(), space.into());
+    }
+    if let Some(observe) = observe {
+        arguments.insert("observe".into(), observe.into());
+    }
+    if let Some(annotate) = annotate {
+        arguments.insert("annotate".into(), annotate.into());
+    }
+    if let Some(settle) = settle {
+        arguments.insert("settle".into(), settle);
     }
     peer_tool_output(
         mcp_http::call_peer_mcp_tool(

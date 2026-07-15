@@ -5,6 +5,7 @@
             <div id="access-identity-hero" class="acc-hero-grid"></div>
             <div id="access-tier-card"></div>
             <div id="access-connect-card"></div>
+            <div id="access-tabs-card"></div>
             <div class="acc-section-head">
               <div class="acc-section-title">Fleet</div>
               <div class="acc-section-sub">Every daemon you can reach from here. Each one still decides locally what you may do.</div>
@@ -53,6 +54,7 @@
                   <div class="coord-row">
                     <input id="coord-route-caps" type="text" placeholder="display, computer-use" autocomplete="off">
                   </div>
+                  <div id="coord-route-preview" class="coord-result coord-route-preview" aria-live="polite"></div>
                   <textarea id="coord-route-instructions" class="coord-textarea" placeholder="Instructions for the chosen peer…" rows="3"></textarea>
                   <div class="coord-row">
                     <button id="coord-route-btn" type="button">Route</button>
@@ -70,7 +72,7 @@
           <div class="access-pane-body">
             <div class="acc-section-head">
               <div class="acc-section-title">People &amp; Devices</div>
-              <div class="acc-section-sub">Humans and their browsers, certificates, and Connect accounts — everyone who may operate <em>this</em> daemon. Daemon-to-daemon trust lives under Peers.</div>
+              <div class="acc-section-sub">Humans and their trusted local or independently enrolled direct-mTLS browser identities. Connect account fields are discovery metadata only in this alpha; no signed/notarized native release exists yet, and daemon-to-daemon trust lives under Peers.</div>
             </div>
             <div id="access-people-current" class="acc-hero-grid"></div>
             <div id="access-enrollment-requests"></div>
@@ -78,7 +80,7 @@
             <details class="acc-fold" id="access-org-join-fold">
               <summary>Join with an org grant</summary>
               <div class="acc-fold-body">
-                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails. The document is also kept in this browser and presented automatically whenever you connect to a daemon that trusts the org, so you only do this once.</p>
+                <p class="acc-fold-hint">Paste a signed client-key document for verification and storage. Browser-key login is staged in this alpha, so materializing this document does not authorize the current session. Peer-subject org grants are usable today through peer mTLS. Nothing changes if verification fails.</p>
                 <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
                 <div class="acc-grant-flow-actions">
                   <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
@@ -239,7 +241,7 @@
           <div class="access-pane-body">
             <div class="acc-section-head">
               <div class="acc-section-title">Credential vault</div>
-              <div class="acc-section-sub">Provider credentials, end-to-end encrypted under your passkeys and a recovery phrase. The hosted store holds only ciphertext; daemons only ever borrow time-boxed leases.</div>
+              <div class="acc-section-sub">Provider credentials sealed under passkey/recovery-derived keys. Passive hosted storage receives ciphertext, but code served by that origin can access entries while this page unlocks them. The Connect-account vault has no trusted delivery bridge to a daemon in this alpha; daemon-local vaults, local configuration, and time-boxed leases remain separate paths.</div>
             </div>
             <div id="access-vault-section"></div>
 
@@ -349,7 +351,7 @@
         <div class="subtab-pane" id="settings-pane-agent">
           <div class="settings-pane-body">
             <p class="settings-note">
-              Settings are saved to <code>intendant.toml</code> and take effect on the next task.
+              Settings are saved to the current project's <code>intendant.toml</code>, or to the daemon-wide <code>~/.intendant/intendant.toml</code> when no project is attached. Agent defaults take effect on the next task.
             </p>
 
             <section class="ui-card" aria-labelledby="settings-external-agent-heading">
@@ -363,6 +365,49 @@
                   <option value="">None (internal agent)</option>
                   <option value="codex">Codex (OpenAI)</option>
                   <option value="claude-code">Claude Code (Anthropic)</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-model-select">Codex model</label>
+                <select id="set-codex-model-select">
+                  <option value="">Codex account default</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-codex-model-custom-row">
+                <label for="set-codex-model-custom">Custom Codex id</label>
+                <input id="set-codex-model-custom" type="text" placeholder="e.g. staged-model-id" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-codex-reasoning-effort">Codex reasoning</label>
+                <select id="set-codex-reasoning-effort">
+                  <option value="">Model default</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-model-select">Claude model</label>
+                <select id="set-claude-model-select">
+                  <option value="">Claude account default</option>
+                  <option value="fable">fable — latest Fable</option>
+                  <option value="opus">opus — latest Opus</option>
+                  <option value="sonnet">sonnet — latest Sonnet</option>
+                  <option value="haiku">haiku — latest Haiku</option>
+                  <option value="__custom__">Custom model id…</option>
+                </select>
+              </div>
+              <div class="settings-row hidden" id="set-claude-model-custom-row">
+                <label for="set-claude-model-custom">Custom Claude id</label>
+                <input id="set-claude-model-custom" type="text" placeholder="e.g. claude-haiku-4-5-20251001" autocomplete="off" spellcheck="false">
+              </div>
+              <div class="settings-row">
+                <label for="set-claude-permission-mode">Claude permissions</label>
+                <select id="set-claude-permission-mode">
+                  <option value="default">default</option>
+                  <option value="acceptEdits">acceptEdits</option>
+                  <option value="plan">plan</option>
+                  <option value="auto">auto</option>
+                  <option value="dontAsk">dontAsk</option>
+                  <option value="bypassPermissions">bypassPermissions</option>
                 </select>
               </div>
               <div class="settings-row">
@@ -757,6 +802,8 @@
         <option value="default">default</option>
         <option value="acceptEdits">acceptEdits</option>
         <option value="plan">plan</option>
+        <option value="auto">auto</option>
+        <option value="dontAsk">dontAsk</option>
         <option value="bypassPermissions">bypassPermissions</option>
       </select>
     </div>
@@ -773,6 +820,7 @@
         <option value="high">high</option>
         <option value="xhigh">xhigh</option>
         <option value="max">max</option>
+        <option value="ultracode">ultracode</option>
       </select>
     </div>
     <div class="session-config-status" id="session-config-status"></div>

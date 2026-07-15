@@ -231,6 +231,31 @@ pub(crate) fn event_targets_external_session_or_optional_side(
     }
 }
 
+/// Non-blocking peek at a persistent external agent's event channel: returns
+/// a buffered event if one is already waiting, and disables the receiver
+/// (sets it to `None`) when the reader task is gone so the caller's select
+/// arm logic stays consistent with a `recv() -> None`.
+///
+/// Used by the idle queued-steer flush: a buffered event means the backend
+/// is (or is about to be) mid-turn — e.g. Claude Code starting a spontaneous
+/// task-notification round — and CC 2.1.2xx discards stdin written mid-turn,
+/// so flushing first would emit `SteerDelivered` for text the model never
+/// saw. Processing the buffered event first routes a turn start through the
+/// spontaneous-round drain, which delivers queued steers at a real boundary.
+pub(crate) fn try_buffered_idle_agent_event(
+    event_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>>,
+) -> Option<external_agent::AgentEvent> {
+    let rx = event_rx.as_mut()?;
+    match rx.try_recv() {
+        Ok(event) => Some(event),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            *event_rx = None;
+            None
+        }
+    }
+}
+
 pub(crate) fn emit_user_message_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
@@ -270,10 +295,6 @@ pub(crate) fn emit_external_session_loop_error(
         turn: None,
     });
     bus.send(AppEvent::LoopError(message));
-}
-
-pub(crate) fn json_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
-    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
 }
 
 /// Resolve external agent backend from an explicit override, falling back to
@@ -491,7 +512,10 @@ pub(crate) fn resolve_diff_file_path(project_root: &Path, display_path: &str) ->
     Some(project_root.join(path))
 }
 
-pub(crate) fn read_diff_file_text(project_root: &Path, display_path: &str) -> Option<Option<String>> {
+pub(crate) fn read_diff_file_text(
+    project_root: &Path,
+    display_path: &str,
+) -> Option<Option<String>> {
     let path = resolve_diff_file_path(project_root, display_path)?;
     match std::fs::read_to_string(path) {
         Ok(text) => Some(Some(text)),
@@ -651,6 +675,7 @@ pub(crate) fn codex_context_trace_dir(
 ///
 /// Returns the agent, thread handle, and event receiver. The caller owns the
 /// agent lifetime and is responsible for sending messages and draining events.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn create_external_agent(
     backend: &external_agent::AgentBackend,
     project: &Project,
@@ -750,14 +775,17 @@ pub(crate) async fn create_external_agent(
         }
         AgentBackend::ClaudeCode => {
             let cfg = &project.config.agent.claude_code;
-            let agent = Box::new(external_agent::claude_code::ClaudeCodeAgent::new(
-                cfg.command.clone(),
-                cfg.model.clone(),
-                cfg.permission_mode.clone(),
-                cfg.effort.clone(),
-                cfg.allowed_tools.clone(),
-                web_port,
-            ));
+            let agent = Box::new(
+                external_agent::claude_code::ClaudeCodeAgent::new(
+                    cfg.command.clone(),
+                    cfg.model.clone(),
+                    cfg.permission_mode.clone(),
+                    cfg.effort.clone(),
+                    cfg.allowed_tools.clone(),
+                    web_port,
+                )
+                .with_max_budget_usd(cfg.max_budget_usd),
+            );
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
@@ -877,7 +905,7 @@ pub(crate) enum DrainOutcome {
     /// waits until the backend reports the turn complete, then returns this so
     /// the caller can apply the rollback while the thread is idle.
     ContextRewindRequested {
-        request: ExternalContextRewindRequest,
+        request: Box<ExternalContextRewindRequest>,
         message: Option<String>,
         turns_in_round: usize,
         turn_stop_status: ManagedContextRewindTurnStopStatus,
@@ -892,7 +920,9 @@ pub(crate) struct ExternalBackendRecovery {
 
 /// Build the control plane's live Claude Code runtime config from the
 /// project TOML. Mirrors the inline Codex/Gemini seeding blocks.
-pub(crate) fn shared_claude_config_from_project(project: &Project) -> control_plane::SharedClaudeConfig {
+pub(crate) fn shared_claude_config_from_project(
+    project: &Project,
+) -> control_plane::SharedClaudeConfig {
     let cfg = &project.config.agent.claude_code;
     Arc::new(tokio::sync::RwLock::new(
         control_plane::ClaudeRuntimeConfig {
@@ -913,26 +943,49 @@ pub(crate) fn shared_codex_config_from_project(
     project: &Project,
 ) -> control_plane::SharedCodexConfig {
     let cfg = &project.config.agent.codex;
-    Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-        command: cfg.command.clone(),
-        managed_command: cfg.managed_command.clone(),
-        sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-        approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-        model: cfg.model.clone(),
-        reasoning_effort: project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref()),
-        service_tier: project::normalize_codex_service_tier(cfg.service_tier.as_deref()),
-        web_search: cfg.web_search,
-        network_access: cfg.network_access,
-        writable_roots: cfg.writable_roots.clone(),
-        managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
-        context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
-    }))
+    Arc::new(tokio::sync::RwLock::new(
+        control_plane::CodexRuntimeConfig {
+            command: cfg.command.clone(),
+            managed_command: cfg.managed_command.clone(),
+            sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+            approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+            model: cfg.model.clone(),
+            reasoning_effort: project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref()),
+            service_tier: project::normalize_codex_service_tier(cfg.service_tier.as_deref()),
+            web_search: cfg.web_search,
+            network_access: cfg.network_access,
+            writable_roots: cfg.writable_roots.clone(),
+            managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+            context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::*;
+
+    #[test]
+    fn buffered_idle_agent_event_preempts_and_disables_on_disconnect() {
+        // A buffered event is returned (the flush must yield to it) …
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut event_rx = Some(rx);
+        tx.send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        assert!(matches!(
+            try_buffered_idle_agent_event(&mut event_rx),
+            Some(external_agent::AgentEvent::TurnCompleted { .. })
+        ));
+        // … an empty channel yields nothing and keeps the receiver armed …
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+        assert!(event_rx.is_some());
+        // … and a closed channel disables the receiver like `recv() -> None`.
+        drop(tx);
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+        assert!(event_rx.is_none());
+        // A disabled receiver stays disabled.
+        assert!(try_buffered_idle_agent_event(&mut event_rx).is_none());
+    }
 
     #[test]
     fn external_rollback_turn_in_progress_matches_codex_rpc_error() {

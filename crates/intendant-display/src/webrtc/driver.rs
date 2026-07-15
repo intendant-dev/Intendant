@@ -157,6 +157,16 @@ pub(crate) struct InboundPacket {
 pub(crate) const TCP_OUT_QUEUE: usize = 256;
 pub(crate) type TcpFrameSender = mpsc::Sender<Vec<u8>>;
 
+struct InteractiveSourceGuard(Option<Arc<crate::BrowserInputSource>>);
+
+impl Drop for InteractiveSourceGuard {
+    fn drop(&mut self) {
+        if let Some(source) = self.0.as_ref() {
+            source.invalidate("the WebRTC display driver stopped");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     peer_id: PeerId,
@@ -169,7 +179,9 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
+    interactive_source: Option<Arc<crate::BrowserInputSource>>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
+    clipboard_authorized: crate::BrowserInputAuthorization,
     authority_handler: AuthorityChannelHandler,
     tile_control_handler: TileControlHandler,
     keyframe_request_tx: mpsc::Sender<SimulcastRid>,
@@ -183,6 +195,9 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     ice_tx: mpsc::Sender<(PeerId, String)>,
     shutdown: CancellationToken,
 ) {
+    // Every driver exit path (explicit close, ICE failure, socket error,
+    // malformed state) synchronously invalidates interactive traffic via RAII.
+    let _interactive_source_guard = InteractiveSourceGuard(interactive_source);
     if rtp_config.encodings.is_empty() {
         eprintln!(
             "[display/webrtc] peer {peer_id}: RtpSendConfig.encodings is empty; \
@@ -678,7 +693,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 }
             }
             Some(cmd) = command_rx.recv() => {
-                handle_command(&mut rtc, &mut state, cmd);
+                handle_command(&mut rtc, &mut state, cmd, &clipboard_authorized);
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_timeout after command failed: {e:?}"
@@ -1090,17 +1105,16 @@ pub(crate) fn handle_event<I: rtc::interceptor::Interceptor>(
                 );
             }
         }
-        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(cid)) => {
+        RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(cid))
             if state.channels.get(TILE_DELTAS_CHANNEL_LABEL).copied() == Some(cid)
-                && state.tile_delta_backpressure.on_buffered_amount_low()
-            {
-                let stats = state.tile_delta_backpressure.stats();
-                eprintln!(
-                    "[display/webrtc] tile-deltas backpressure low: \
+                && state.tile_delta_backpressure.on_buffered_amount_low() =>
+        {
+            let stats = state.tile_delta_backpressure.stats();
+            eprintln!(
+                "[display/webrtc] tile-deltas backpressure low: \
                      resuming supersedable deltas (sent={} dropped={})",
-                    stats.sent_frames, stats.dropped_frames
-                );
-            }
+                stats.sent_frames, stats.dropped_frames
+            );
         }
         _ => {}
     }
@@ -1602,6 +1616,7 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     state: &mut DriverState,
     cmd: Command,
+    clipboard_authorized: &crate::BrowserInputAuthorization,
 ) {
     match cmd {
         Command::AddIceCandidate(s) => {
@@ -1616,7 +1631,13 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                 eprintln!("[display/webrtc] parse remote candidate failed: {e}");
             }
         }
-        Command::SendClipboard(content) => {
+        Command::SendClipboard {
+            content,
+            admitted_revision,
+        } => {
+            if !clipboard_authorized.remains_current(admitted_revision) {
+                return;
+            }
             let Some(cid) = state.channels.get("clipboard").copied() else {
                 return;
             };

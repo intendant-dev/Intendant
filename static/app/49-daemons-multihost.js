@@ -177,6 +177,10 @@ function dashboardControlTransportEnabled() {
   // path — always on (localStorage is also unreliable on the custom
   // intendant:// scheme, so this cannot be a stored preference there).
   if (window.__intendantPort && window.__intendantBackendTls) return true;
+  // Capability fallback: this browser proved unable to open the legacy
+  // /ws (see dashboardTriggerEventLaneFallback below) — the tunnel is
+  // the lane now. Derived state, never stored.
+  if (dashboardControlAutoFallback) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
@@ -186,6 +190,235 @@ function dashboardControlTransportEnabled() {
 
 function dashboardConnectModeEnabled() {
   return DASHBOARD_CONNECT_MODE;
+}
+
+// The explicit localStorage opt-in on its own: an opt-in tunnel is a lane
+// the user asked for, so it self-heals like a primary lane even while the
+// legacy /ws carries events (a dead optional lane that never comes back
+// is how the transport chip gets stuck red forever).
+function dashboardControlUserOptInEnabled() {
+  if (dashboardConnectModeEnabled()) return false;
+  try {
+    return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
+  } catch {
+    return false;
+  }
+}
+
+// "Should a dead tunnel be brought back?" — yes when it is the primary
+// event lane (events depend on it) or explicitly opted in (the user asked
+// for it). Gate for the reconnect machinery.
+function dashboardControlTunnelWanted() {
+  return dashboardControlTunnelIsPrimaryEventLane() || dashboardControlUserOptInEnabled();
+}
+
+// True when the dashboard-control tunnel is the PRIMARY event lane — the
+// postures where losing the tunnel means losing events entirely:
+//   - hosted Connect dashboards (?connect=1),
+//   - the macOS-app mTLS bundle, where the legacy WebSocket can never
+//     present the client certificate (36-voice-wasm-init.js skips it), so
+//     the tunnel is the only event path, and
+//   - the capability fallback below, for exactly as long as the /ws
+//     stays down: a plain browser whose /ws proved unable to open is in
+//     the same boat as the app bundle. If the /ws does open later it
+//     resumes event duty and the tunnel drops back to the opt-in role
+//     (kept, not torn down — dual delivery is the opt-in posture and the
+//     event dedup absorbs it).
+// The localStorage `webrtc-control` opt-in is deliberately excluded: there
+// the legacy /ws lane still carries events, and reload semantics own that
+// toggle. Gate for the event-lane reconnect machinery below.
+function dashboardControlTunnelIsPrimaryEventLane() {
+  if (dashboardConnectModeEnabled()) return true;
+  if (window.__intendantPort && window.__intendantBackendTls) return true;
+  return dashboardControlAutoFallback && !dashboardLegacyWsConnected;
+}
+
+// ── Legacy /ws capability probe → tunnel fallback ──
+//
+// The plain-browser posture assumes the legacy /ws is the event lane, but
+// that assumption is not universally true: WebKit (Safari, and WKWebViews
+// outside the packaged app) never attaches an mTLS client certificate to
+// a WebSocket upgrade — against an mTLS daemon the socket hangs in
+// CONNECTING forever, firing neither open nor close nor error, while
+// fetch/XHR mTLS keeps working. The page looks healthy and every intent
+// send is refused. Rather than sniffing browsers, probe the capability:
+// if the /ws has not opened within DASHBOARD_LEGACY_WS_FALLBACK_MS of an
+// attempt (or an intent send reports no open lane), promote the control
+// tunnel to primary event lane — the posture the packaged macOS app runs
+// permanently — and let the existing event-lane reconnect machinery own
+// start, hydration (api_dashboard_bootstrap replay), retry, backoff, and
+// status. The promotion is derived, never stored: a browser that can
+// open the /ws never enters it; one that cannot re-derives it each load.
+const DASHBOARD_LEGACY_WS_FALLBACK_MS = 3000;
+let dashboardControlAutoFallback = false;
+let dashboardLegacyWsConnected = false;
+let dashboardLegacyWsEverConnected = false;
+let dashboardLegacyWsWatchdog = null;
+// Visibility-aware quiescence: Safari throttles background-tab timers into
+// uselessness, so probing/reconnect churn while hidden mostly burns cycles
+// and mints failures nobody sees. Hidden tabs park; the visibilitychange
+// handler below heals the lane the moment the tab is seen again. A tab
+// with live voice is exempt — it is doing real work while hidden.
+let dashboardTabHidden = typeof document !== 'undefined' && document.hidden === true;
+let dashboardEventLaneDownSince = 0;
+const DASHBOARD_LANE_STALE_GRACE_MS = 8000;
+
+function dashboardTabQuiesced() {
+  if (!dashboardTabHidden) return false;
+  return !(typeof dashboardVoiceIsLive === 'function' && dashboardVoiceIsLive());
+}
+
+// The posture where the /ws is attempted at all (36-voice-wasm-init.js
+// branch order): not hosted Connect, not the packaged-app bundle.
+function dashboardLegacyWsPostureApplies() {
+  if (dashboardConnectModeEnabled()) return false;
+  return !(window.__intendantPort && window.__intendantBackendTls);
+}
+
+// Fed from the wasm client's server-state callback (open/close); the boot
+// path arms the watchdog right after connect_server. Open clears the
+// watchdog; closed (re-)arms it.
+function dashboardNoteLegacyWsState(connected) {
+  const reconnected = connected && !dashboardLegacyWsConnected && dashboardLegacyWsEverConnected;
+  if (connected) dashboardLegacyWsEverConnected = true;
+  dashboardLegacyWsConnected = !!connected;
+  if (connected) {
+    if (dashboardLegacyWsWatchdog) {
+      clearTimeout(dashboardLegacyWsWatchdog);
+      dashboardLegacyWsWatchdog = null;
+    }
+    // A RE-connect usually means the daemon restarted: refetch /config so
+    // the build-stamp comparison (and any other config drift) lands even
+    // in the /ws-only posture, whose lane carries no config on its own.
+    // Boot-time connects skip this — the boot path fetches /config itself.
+    if (reconnected) {
+      fetch('/config')
+        .then(r => r.json())
+        .then(cfg => { if (typeof applyGatewayConfig === 'function') applyGatewayConfig(cfg); })
+        .catch(() => {});
+    }
+    // The /ws proved able to open after all (e.g. a browser that merely
+    // weathered a daemon restart): demote the promotion — autoFallback is
+    // derived "ws proven down past the deadline" state, and a live /ws
+    // resumes event duty. An already-running tunnel is left alone (dual
+    // delivery is the opt-in posture; dedup absorbs it) but loses its
+    // primary-lane reconnect duty; a later /ws drop re-derives the
+    // promotion through the watchdog.
+    dashboardControlAutoFallback = false;
+    if (typeof dashboardUpdateTransportStatus === 'function') dashboardUpdateTransportStatus();
+    return;
+  }
+  dashboardArmLegacyWsWatchdog('legacy WebSocket disconnected');
+}
+
+function dashboardArmLegacyWsWatchdog(reason) {
+  if (!dashboardLegacyWsPostureApplies()) return;
+  if (dashboardLegacyWsConnected || dashboardLegacyWsWatchdog) return;
+  if (dashboardTabQuiesced()) return;
+  dashboardLegacyWsWatchdog = window.setTimeout(() => {
+    dashboardLegacyWsWatchdog = null;
+    if (dashboardLegacyWsConnected) return;
+    dashboardTriggerEventLaneFallback(reason || 'legacy WebSocket did not connect');
+  }, DASHBOARD_LEGACY_WS_FALLBACK_MS);
+}
+
+// Promote the tunnel to event lane now (watchdog expiry, or an intent
+// send that found no open lane). Idempotent; safe to call eagerly.
+function dashboardTriggerEventLaneFallback(reason) {
+  if (!dashboardLegacyWsPostureApplies() || dashboardLegacyWsConnected) return false;
+  if (!window.RTCPeerConnection) {
+    setConnectEventStatus('err',
+      'No dashboard event lane: this browser could not open the WebSocket and has no WebRTC');
+    return false;
+  }
+  if (!dashboardControlAutoFallback) {
+    dashboardControlAutoFallback = true;
+    console.info('[dashboard-control] legacy /ws unavailable — promoting the control tunnel to event lane:', reason);
+  }
+  // Already carrying events (the localStorage opt-in started it at boot):
+  // nothing to start — the promotion above re-labels it primary.
+  if (dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive) {
+    setConnectEventStatus('ok', 'Dashboard events are live through the control tunnel');
+    return true;
+  }
+  scheduleDashboardConnectReconnect(reason || 'legacy WebSocket unavailable', { delayMs: 0 });
+  return true;
+}
+
+// One question, one answer: "can an intent sent right now reach the
+// daemon?" — either lane counts.
+function dashboardEventLaneUp() {
+  if (dashboardLegacyWsConnected) return true;
+  return Boolean(dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive);
+}
+
+// QA/debug readback (window.qa.daemonApi() and DashboardTransport.status()
+// fold this in).
+function dashboardEventLaneQa() {
+  return {
+    legacyWsConnected: dashboardLegacyWsConnected,
+    autoFallback: dashboardControlAutoFallback,
+    watchdogArmed: Boolean(dashboardLegacyWsWatchdog),
+    tunnelEventsActive: Boolean(dashboardControlEventsActive),
+    hidden: dashboardTabHidden,
+    laneDownSinceUnixMs: dashboardEventLaneDownSince,
+  };
+}
+
+// Content-level staleness truth: while no event lane is up, everything the
+// page shows is a photograph aging in place — say so, instead of letting a
+// dead-feed tab present its last-known world as live. Lane transitions
+// (dashboardUpdateTransportStatus fires on every one) drive this; the slow
+// tick below only advances the grace window on quiet failures.
+function updateEventLaneStalenessBanner() {
+  const now = Date.now();
+  if (dashboardEventLaneUp()) {
+    dashboardEventLaneDownSince = 0;
+  } else if (!dashboardEventLaneDownSince) {
+    dashboardEventLaneDownSince = now;
+  }
+  const show = Boolean(dashboardEventLaneDownSince)
+    && now - dashboardEventLaneDownSince >= DASHBOARD_LANE_STALE_GRACE_MS
+    && !dashboardTabHidden;
+  let banner = document.getElementById('ui-event-lane-banner');
+  if (!show) {
+    if (banner) banner.remove();
+    return;
+  }
+  const since = new Date(dashboardEventLaneDownSince);
+  const hh = String(since.getHours()).padStart(2, '0');
+  const mm = String(since.getMinutes()).padStart(2, '0');
+  const text = `Live updates paused since ${hh}:${mm} — reconnecting. What you see may be stale.`;
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'ui-event-lane-banner';
+    document.body.appendChild(banner);
+  }
+  if (banner.textContent !== text) banner.textContent = text;
+}
+setInterval(updateEventLaneStalenessBanner, 5000);
+
+function dashboardNoteVisibilityChange() {
+  dashboardTabHidden = document.hidden === true;
+  if (!dashboardTabHidden && !dashboardEventLaneUp()) {
+    // Just became visible with no lane: Safari throttled every timer
+    // while hidden, so probe and heal NOW instead of waiting out
+    // watchdogs and backoff that never ran.
+    if (!dashboardLegacyWsConnected) {
+      dashboardArmLegacyWsWatchdog('tab became visible with no event lane');
+    }
+    if (dashboardControlTunnelWanted() && !dashboardTransport?.canUseRpc?.()) {
+      scheduleDashboardConnectReconnect('tab became visible with no event lane', { delayMs: 0 });
+    }
+  }
+  updateEventLaneStalenessBanner();
+}
+document.addEventListener('visibilitychange', dashboardNoteVisibilityChange);
+
+// Human wording for the active primary event lane, used by the reconnect
+// status copy so app-posture messages don't claim "Hosted Connect".
+function dashboardEventLaneDescription() {
+  return dashboardConnectModeEnabled() ? 'Hosted Connect' : 'the control tunnel';
 }
 
 function dashboardConnectSignalUrl(path) {
@@ -205,8 +438,8 @@ function dashboardSetControlLastError(message = '', kind = '') {
 // a button that can only fail on macOS/Windows hosts. Two sources, because
 // each covers a transport the other can't: the displays payload reaches
 // direct dashboards over HTTP, and the dashboard-control status capability
-// reaches Connect dashboards once the channel is up (the HTTP probe is
-// impossible there, so dashboardUpdateTransportStatus re-applies the gate
+  // reaches authenticated dashboard-control tunnels once the channel is up
+  // (the HTTP probe is impossible there, so dashboardUpdateTransportStatus re-applies the gate
 // whenever transport state changes). Declared HERE, before that function's
 // first eval-time call — a later-fragment `let` would be a TDZ trap that
 // kills the whole module.
@@ -246,6 +479,7 @@ function dashboardUpdateTransportStatus() {
     refreshFilesDownloadAvailability();
     if (activeTab === 'files') refreshFilesTransferJobs();
     maybeOpenShellAfterTransportReady();
+    updateEventLaneStalenessBanner();
     return;
   }
   dot.className = `conn-dot ${summary.kind}`;
@@ -263,6 +497,7 @@ function dashboardUpdateTransportStatus() {
   updateVirtualDisplayAvailabilityUi();
   if (activeTab === 'files') refreshFilesTransferJobs();
   maybeOpenShellAfterTransportReady();
+  updateEventLaneStalenessBanner();
 }
 
 function dashboardTransportStatusSummary(status = {}) {
@@ -271,6 +506,29 @@ function dashboardTransportStatusSummary(status = {}) {
       kind: 'ok',
       label: 'Ready',
       title: 'Dashboard access is ready. Open Connection Diagnostics for transport details.',
+    };
+  }
+
+  // Lane-aware framing: this chip reports dashboard ACCESS, not one
+  // transport's health. While the legacy /ws carries events (and the
+  // tunnel is not the primary lane), access is fine regardless of the
+  // optional tunnel's condition — report Ready and relegate the tunnel
+  // state to the detail title instead of alarming over a lane nothing
+  // depends on right now. A healthy connected tunnel falls through to
+  // the richer connected arm below.
+  if (dashboardLegacyWsConnected
+      && !dashboardControlTunnelIsPrimaryEventLane()
+      && !(status.connected && status.verifiedBinding?.ok)) {
+    const pcNow = String(status.pcState || '').toLowerCase();
+    const tunnelNote = status.reconnecting
+      ? 'the optional control tunnel is reconnecting'
+      : (String(status.lastError || status.error || '').trim() || pcNow === 'failed' || pcNow === 'closed')
+        ? 'the optional control tunnel is down'
+        : 'the optional control tunnel is idle';
+    return {
+      kind: 'ok',
+      label: 'Ready',
+      title: `Dashboard access is ready — events ride the WebSocket; ${tunnelNote}. Open Connection Diagnostics for transport details.`,
     };
   }
 
@@ -396,6 +654,23 @@ function connectHealthState(statusArg = null, summaryArg = null) {
       { label: 'Events', value: status.eventsActive ? 'active' : 'inactive', kind: connectHealthKindForBoolean(status.eventsActive) },
     ],
   };
+}
+
+// Chip-click affordance: land the user ON the diagnostics panel — a bare
+// routeTo leaves the panel below the fold with nothing announcing itself,
+// which reads as "clicking did nothing".
+function openConnectionDiagnostics() {
+  routeTo('access', 'diagnostics');
+  // The pane switch may render-defer the panel mount; give it a beat.
+  setTimeout(() => {
+    const panel = document.getElementById('connect-health-panel');
+    if (!panel) return;
+    try { panel.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    panel.classList.remove('ui-attention-flash');
+    void panel.offsetWidth;
+    panel.classList.add('ui-attention-flash');
+    setTimeout(() => panel.classList.remove('ui-attention-flash'), 1800);
+  }, 250);
 }
 
 function renderConnectHealthPanel(statusArg = null, summaryArg = null) {
@@ -690,6 +965,14 @@ class DashboardTransport {
       if (dashboardControlTransport) {
         dashboardControlTransport.lastError = dashboardControlLastError;
         dashboardControlTransport.lastErrorKind = dashboardControlLastErrorKind;
+        // Close the failed transport with reconnect suppressed before
+        // abandoning it: a zombie RTCPeerConnection can fire a late
+        // `failed` transition long after a fresh transport is healthy,
+        // and that stray event must not restart the reconnect loop
+        // outside its backoff.
+        try {
+          dashboardControlTransport.close({ suppressReconnect: true });
+        } catch (_) {}
       }
       dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
@@ -711,7 +994,9 @@ class DashboardTransport {
     dashboardSetControlLastError('');
     if (dashboardConnectModeEnabled()) return;
     localStorage.removeItem(DASHBOARD_TRANSPORT_KEY);
-    dashboardControlTransport?.close();
+    // Explicit user disconnect: never let the close event re-arm the
+    // event-lane reconnect loop in the window before the reload lands.
+    dashboardControlTransport?.close({ suppressReconnect: true });
     dashboardControlTransport = null;
     this.controlStartPromise = null;
     dashboardUpdateTransportStatus();
@@ -720,31 +1005,33 @@ class DashboardTransport {
 
   status() {
     const reconnect = dashboardConnectReconnectStatus();
-    return dashboardControlTransport?.debugStatus() || {
+    const base = dashboardControlTransport?.debugStatus() || {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
       lastErrorKind: dashboardControlLastErrorKind,
       ...reconnect,
     };
+    return { ...base, lane: dashboardEventLaneQa() };
   }
 
   canUseRpc() {
     return Boolean(dashboardControlTransport?.canUseRpc());
   }
 
+  // Transport F7: the display capability booleans are one-line
+  // derivations over daemonApi.availability (§3.4) — the per-method
+  // status booleans once landed (each equals the daemon's
+  // api_display_input_authority_available composite by construction:
+  // same operation, same runtime-ready ladder), the hello_ack features
+  // list before that. They gate both the RPC wrappers below and the
+  // display_input frame sender — the frame lane itself stays bespoke.
   canUseDisplayInputAuthority() {
-    return Boolean(
-      this.canUseRpc() &&
-      dashboardControlTransport?.lastStatus?.api_display_input_authority_available === true
-    );
+    return daemonApi.availability('api_display_input_authority_request').ok;
   }
 
   canUseDisplayWebRtcSignal() {
-    return Boolean(
-      this.canUseRpc() &&
-      dashboardControlTransport?.lastStatus?.api_display_webrtc_signal_available === true
-    );
+    return daemonApi.availability('api_display_webrtc_signal').ok;
   }
 
   canUsePeerFileTransferSignal() {
@@ -807,78 +1094,85 @@ class DashboardTransport {
     return dashboardControlTransport.displayInput(displayId, event);
   }
 
+  // The display authority/signaling RPC wrappers (transport F7): the RPC
+  // legs ride daemonApi.request and unwrap the envelope body, keeping the
+  // pre-facade result contract every consumer reads (result.ok /
+  // result.frames / result.sdp — the authority-unavailable 503 keeps its
+  // body ok:false shape). All four are WS-twin residue with no HTTP row
+  // by design, so the facade can only take the tunnel: a signaling or
+  // authority mutation is never replayed on another lane, and the
+  // availability guards refuse before firing RPCs that can only bounce.
+  // The display slots' own /ws fallback stays at their call sites.
   displayAuthoritySnapshot(options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_snapshot',
       {},
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   requestDisplayInputAuthority(displayId, options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_request',
       { display_id: Number(displayId) || 0 },
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   releaseDisplayInputAuthority(displayId, options = {}) {
     if (!this.canUseDisplayInputAuthority()) {
       return Promise.reject(new Error('dashboard control display authority is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_input_authority_release',
       { display_id: Number(displayId) || 0 },
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
   displayWebRtcSignal(params = {}, options = {}) {
     if (!this.canUseDisplayWebRtcSignal()) {
       return Promise.reject(new Error('dashboard control display signaling is not available'));
     }
-    return dashboardControlTransport.request(
+    return daemonApi.request(
       'api_display_webrtc_signal',
       params,
-      options
-    );
+      { signal: options.signal, timeoutMs: options.timeoutMs }
+    ).then(resp => resp.body);
   }
 
+  // The two peer signal relays (transport F5). Signaling is a
+  // delivered-once mutation: the facade derives no-replay from the POST
+  // verb (§3.7 — never replayed over HTTP after a tunnel attempt that MAY
+  // have reached the daemon, the exact legacy fallbackAfterRpcFailure:false
+  // semantics; Connect mode never uses HTTP), while a dashboard with no
+  // tunnel at all still signals over direct HTTP — that pre-attempt lane
+  // is how peer tunnels bootstrap on direct/mTLS dashboards. Both return
+  // the facade envelope {ok, status, body}.
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_file_transfer_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   peerDashboardControlSignal(peerId, params = {}, options = {}) {
     const id = String(peerId || '').trim();
     if (!id) return Promise.reject(new Error('peer id is required'));
-    const body = { peer_id: id, ...params };
-    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
-      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: options.signal,
-      }
-    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+    return daemonApi.request(
+      'api_peer_dashboard_control_signal',
+      { peer_id: id, ...params },
+      { signal: options.signal }
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -888,7 +1182,17 @@ class DashboardTransport {
     return dashboardControlTransport.stream(method, params, options, onEvent);
   }
 
+  // ── F8a warn-logging shims ────────────────────────────────────────────
+  // rpcOrHttp / jsonFetch (and the free-function dashboardJsonFetch that
+  // delegates here) have ZERO in-repo callers after the F8a flip — every
+  // product call site rides the daemonApi facade. The legacy bodies are
+  // kept verbatim (same signature, same tunnel-then-fallback semantics)
+  // for one soak week so a call path the census missed still WORKS while
+  // dashboardTransportShimRecord (32-daemon-api.js) warns once per
+  // caller and counts every hit for window.qa.transportShimHits(). F8b
+  // deletes both shims plus responseFromPayload below after a clean soak.
   async rpcOrHttp(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('rpcOrHttp', label);
     if (this.canUseRpc()) {
       try {
         return await dashboardControlTransport.request(
@@ -909,6 +1213,7 @@ class DashboardTransport {
   }
 
   async jsonFetch(method, params, fallback, label = method, options = {}) {
+    dashboardTransportShimRecord('jsonFetch', label);
     if (this.canUseRpc()) {
       try {
         const payload = await dashboardControlTransport.request(
@@ -930,6 +1235,9 @@ class DashboardTransport {
     return fallback();
   }
 
+  // The fake-Response builder the jsonFetch shim resolves with — its only
+  // remaining consumer. Deleted with the shims at F8b (the facade's
+  // envelope normalizer, daemonApiEnvelopeFromPayload, is the live twin).
   responseFromPayload(payload) {
     const rawStatus = Number(payload?._httpStatus);
     const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599
@@ -1023,37 +1331,74 @@ function dashboardConnectReconnectStatus() {
   };
 }
 
+// Arm one reconnect cycle for the primary event tunnel (hosted Connect or
+// the macOS-app mTLS posture — see dashboardControlTunnelIsPrimaryEventLane).
+// One timer at a time: while a timer is armed, further schedule calls are
+// deduped. Callers may pass an explicit small `delayMs` for the FIRST
+// schedule after a healthy period (the transport's own event handlers do);
+// the retry loop (runDashboardConnectReconnect's finally) re-arms without
+// it, so repeated failures walk the capped exponential backoff. Jitter
+// (±25%) keeps a fleet of tabs from thundering-herding a daemon that just
+// came back; the attempt counter resets on a successful reconnect.
 function scheduleDashboardConnectReconnect(reason = 'dashboard transport disconnected', options = {}) {
-  if (!dashboardConnectModeEnabled()) return;
+  if (!dashboardControlTunnelWanted()) return;
+  if (dashboardTabQuiesced()) return;
   if (dashboardConnectReconnectTimer) return;
   const attempt = dashboardConnectReconnectAttempt;
-  const backoffMs = Math.min(
+  const backoffBaseMs = Math.min(
     DASHBOARD_CONNECT_RECONNECT_MAX_MS,
     DASHBOARD_CONNECT_RECONNECT_MIN_MS * Math.pow(2, Math.min(attempt, 5))
+  );
+  const backoffMs = Math.min(
+    DASHBOARD_CONNECT_RECONNECT_MAX_MS,
+    Math.round(backoffBaseMs * (0.75 + Math.random() * 0.5))
   );
   const delayMs = Math.max(0, Number(options.delayMs ?? backoffMs) || 0);
   dashboardConnectReconnectAttempt = attempt + 1;
   dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
   dashboardConnectReconnectNextUnixMs = Date.now() + delayMs;
   dashboardSetControlLastError('');
-  setConnectEventStatus('warn', 'Reconnecting dashboard events through Hosted Connect');
+  // The primary-event chip belongs to whichever lane carries events: only
+  // narrate this reconnect there when the tunnel IS that lane — an opt-in
+  // tunnel healing beside a healthy /ws must not stomp the ws status.
+  if (dashboardControlTunnelIsPrimaryEventLane()) {
+    setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  }
   dashboardUpdateTransportStatus();
   dashboardConnectReconnectTimer = window.setTimeout(() => {
     dashboardConnectReconnectTimer = null;
     dashboardConnectReconnectNextUnixMs = 0;
     runDashboardConnectReconnect(dashboardConnectReconnectReason).catch(err => {
-      console.warn('[dashboard-control] Hosted Connect reconnect task failed', err);
+      console.warn('[dashboard-control] event-lane reconnect task failed', err);
     });
   }, delayMs);
 }
 
 async function runDashboardConnectReconnect(reason = 'dashboard transport disconnected') {
-  if (!dashboardConnectModeEnabled() || dashboardConnectReconnectInFlight) return;
+  if (!dashboardControlTunnelWanted() || dashboardConnectReconnectInFlight) return;
+  // The transport healed while the retry timer was pending (ICE
+  // `disconnected` is often a transient blip that recovers on its own) —
+  // tearing it down now would drop a healthy tunnel. Treat as success.
+  if (dashboardTransport?.canUseRpc?.() && dashboardControlEventsActive) {
+    dashboardConnectReconnectAttempt = 0;
+    dashboardConnectReconnectReason = '';
+    dashboardConnectReconnectNextUnixMs = 0;
+    dashboardSetControlLastError('');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('ok', dashboardConnectModeEnabled()
+        ? 'Dashboard events are live through verified Hosted Connect'
+        : 'Dashboard events are live through the control tunnel');
+    }
+    dashboardUpdateTransportStatus();
+    return;
+  }
   dashboardConnectReconnectInFlight = true;
   dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
   let retryReason = '';
   dashboardSetControlLastError('');
-  setConnectEventStatus('warn', 'Reconnecting dashboard events through Hosted Connect');
+  if (dashboardControlTunnelIsPrimaryEventLane()) {
+    setConnectEventStatus('warn', `Reconnecting dashboard events through ${dashboardEventLaneDescription()}`);
+  }
   dashboardUpdateTransportStatus();
   try {
     const previous = dashboardControlTransport;
@@ -1063,19 +1408,40 @@ async function runDashboardConnectReconnect(reason = 'dashboard transport discon
     }
     dashboardControlTransport = null;
     if (dashboardTransport) dashboardTransport.controlStartPromise = null;
-    await maybeStartDashboardControlTransport();
+    const started = await maybeStartDashboardControlTransport();
+    if (started === false) {
+      // Non-Connect postures resolve false instead of throwing (see
+      // DashboardTransport.startControl) — fail the cycle now rather
+      // than waiting out the 30 s readiness poll on a transport that
+      // never began connecting. This also covers a send-refused offer:
+      // sendWsSignal reports send_server_action's verdict, so an offer
+      // with no open signaling lane (daemon down in the macOS-app
+      // posture) rejects connect() and lands here in well under a
+      // second instead of burning the full poll each cycle.
+      const err = new Error(dashboardControlLastError || 'dashboard control transport failed to start');
+      err.controlErrorKind = dashboardControlLastErrorKind || 'transport';
+      throw err;
+    }
     await waitForDashboardControlReady(30000);
     await hydrateDashboardFromControl();
     dashboardConnectReconnectAttempt = 0;
     dashboardConnectReconnectReason = '';
     dashboardConnectReconnectNextUnixMs = 0;
     dashboardSetControlLastError('');
-    setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('ok', dashboardConnectModeEnabled()
+        ? 'Dashboard events are live through verified Hosted Connect'
+        : 'Dashboard events are live through the control tunnel');
+    }
   } catch (err) {
     retryReason = err?.message || String(err);
-    console.warn('[dashboard-control] Hosted Connect reconnect failed', err);
+    console.warn('[dashboard-control] event-lane reconnect failed', err);
     dashboardSetControlLastError(retryReason, err?.controlErrorKind || '');
-    setConnectEventStatus('err', 'Hosted Connect dashboard reconnect failed');
+    if (dashboardControlTunnelIsPrimaryEventLane()) {
+      setConnectEventStatus('err', dashboardConnectModeEnabled()
+        ? 'Hosted Connect dashboard reconnect failed'
+        : 'Dashboard control tunnel reconnect failed');
+    }
   } finally {
     dashboardConnectReconnectInFlight = false;
     dashboardUpdateTransportStatus();
@@ -1240,22 +1606,26 @@ window.intendantDashboardControl = {
     };
   },
   async _debugProbeControlNoReplay() {
+    // Injects at the protocol client — the same seam the daemonApi facade's
+    // local tunnel adapter calls (transport F7; the same pattern as
+    // _debugProbePeerMutationConnectNoHttp), so the probe exercises the
+    // path dispatchControlMsg actually takes.
     if (
       typeof dispatchControlMsg !== 'function' ||
-      !dashboardTransport ||
-      typeof dashboardTransport.request !== 'function'
+      !dashboardControlTransport ||
+      typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         dispatchType: typeof dispatchControlMsg,
-        hasDashboardTransport: Boolean(dashboardTransport),
-        requestType: typeof dashboardTransport?.request,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        requestType: typeof dashboardControlTransport?.request,
         rpcAttempts: 0,
         wsReplayCount: 0,
         rpcFailureWarnings: 0,
       };
     }
-    const previousRequest = dashboardTransport.request;
+    const previousRequest = dashboardControlTransport.request;
     const previousWarn = console.warn;
     const previousApp = app;
     const previousSend = app && typeof app.send_server_action === 'function'
@@ -1281,7 +1651,7 @@ window.intendantDashboardControl = {
       }
       return previousWarn.apply(this, args);
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') {
         rpcAttempts += 1;
         return Promise.reject(new Error('synthetic api_control_msg failure'));
@@ -1293,7 +1663,7 @@ window.intendantDashboardControl = {
       await new Promise(resolve => setTimeout(resolve, 50));
       return { skipped: false, rpcAttempts, wsReplayCount, rpcFailureWarnings };
     } finally {
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
       console.warn = previousWarn;
       if (previousApp && previousSend) {
         previousApp.send_server_action = previousSend;
@@ -1424,19 +1794,22 @@ window.intendantDashboardControl = {
     return { skipped: false, threw, error, wsReplayCount };
   },
   async _debugProbePeerMutationConnectNoHttp() {
+    // Probes the path the UI actually takes (transport F5): peer add rides
+    // daemonApi.request, whose POST-derived mutation policy must throw the
+    // tunnel failure — never re-POST over HTTP, and never any HTTP in
+    // Connect mode. The synthetic rejection is injected at the protocol
+    // client, the same seam the facade's local tunnel adapter calls.
     if (
       !dashboardConnectModeEnabled() ||
-      !dashboardTransport ||
       !dashboardControlTransport ||
-      typeof dashboardTransport.jsonFetch !== 'function' ||
+      typeof daemonApi?.request !== 'function' ||
       typeof dashboardControlTransport.request !== 'function'
     ) {
       return {
         skipped: true,
         connectMode: dashboardConnectModeEnabled(),
-        hasDashboardTransport: Boolean(dashboardTransport),
+        hasDaemonApi: typeof daemonApi?.request === 'function',
         hasControlTransport: Boolean(dashboardControlTransport),
-        jsonFetchType: typeof dashboardTransport?.jsonFetch,
         requestType: typeof dashboardControlTransport?.request,
         threw: false,
         rpcAttempts: 0,
@@ -1464,14 +1837,10 @@ window.intendantDashboardControl = {
     let threw = false;
     let error = '';
     try {
-      await dashboardTransport.jsonFetch('api_peer_add', {
+      await daemonApi.request('api_peer_add', {
         url: 'https://127.0.0.1:9/.well-known/agent-card.json',
         persist: false,
-      }, () => authedFetch('/api/peers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: '{}',
-      }), 'api_peer_add', { fallbackAfterRpcFailure: false });
+      });
     } catch (err) {
       threw = true;
       error = err?.message || String(err);
@@ -1669,9 +2038,15 @@ window.intendantDashboardControl = {
         releaseReplayCount += 1;
       },
     };
+    // The capability derivation reads the per-method status booleans
+    // (transport F7); the composite rollup stays stubbed alongside for
+    // the pre-facade readers (debugStatus mirrors).
     dashboardControlTransport.lastStatus = {
       ...(previousStatus || {}),
       api_display_input_authority_available: false,
+      api_display_input_authority_snapshot_available: false,
+      api_display_input_authority_request_available: false,
+      api_display_input_authority_release_available: false,
     };
     let requestResult = null;
     let releaseResult = null;
@@ -2025,7 +2400,10 @@ window.intendantDashboardControl = {
     }
     const previousStatus = dashboardControlTransport.lastStatus;
     const previousPresenceFrame = dashboardTransport.presenceFrame;
-    const previousRequest = dashboardTransport.request;
+    // The action leg rides the daemonApi facade (transport F7), whose
+    // local tunnel adapter calls the protocol client directly — inject
+    // there, not at the DashboardTransport wrapper.
+    const previousRequest = dashboardControlTransport.request;
     let presenceFrameCount = 0;
     let actionRpcCount = 0;
     dashboardControlTransport.lastStatus = {
@@ -2040,7 +2418,7 @@ window.intendantDashboardControl = {
       }
       return true;
     };
-    dashboardTransport.request = function(method, params, options) {
+    dashboardControlTransport.request = function(method, params, options) {
       if (method === 'api_control_msg') actionRpcCount += 1;
       return Promise.resolve({ ok: true, _httpOk: true });
     };
@@ -2052,7 +2430,7 @@ window.intendantDashboardControl = {
     } finally {
       dashboardControlTransport.lastStatus = previousStatus;
       dashboardTransport.presenceFrame = previousPresenceFrame;
-      dashboardTransport.request = previousRequest;
+      dashboardControlTransport.request = previousRequest;
     }
     return {
       skipped: false,
@@ -2261,4 +2639,3 @@ window.intendantDashboardControl = {
     return dashboardTransport.peerDashboardControlSignal(peerId, params, options);
   },
 };
-

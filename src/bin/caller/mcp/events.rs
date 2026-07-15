@@ -70,6 +70,7 @@ pub(crate) fn usage_snapshot_from_context_snapshot_event(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn apply_context_snapshot_usage_to_mcp_state(
     s: &mut McpAppState,
     session_id: Option<&str>,
@@ -148,8 +149,8 @@ pub fn spawn_event_listener(
                 // Exhaustive match — no wildcard. Adding a new AppEvent variant
                 // will cause a compile error here, enforcing parity.
                 match event {
-                    AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
+                    | AppEvent::CuActionExecuted { .. }
                     | AppEvent::SessionNote { .. }
                     | AppEvent::UserNotification { .. }
                     | AppEvent::UserMessageRewind { .. }
@@ -162,12 +163,15 @@ pub fn spawn_event_listener(
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
+                    | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
                     | AppEvent::SharedView { .. }
+                    | AppEvent::DisplayRequestRaised { .. }
+                    | AppEvent::DisplayRequestResolved { .. }
                     | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..
@@ -329,11 +333,6 @@ pub fn spawn_event_listener(
                         }
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::Quit => {
-                        s.should_quit = true;
-                        break;
-                    }
-
                     AppEvent::TurnStarted {
                         turn,
                         budget_pct,
@@ -789,6 +788,7 @@ pub fn spawn_event_listener(
                         s.session_prompt_tokens = 0;
                         s.session_completion_tokens = 0;
                         s.session_cached_tokens = 0;
+                        s.session_cache_creation_tokens = 0;
                         s.active_session_source = s.session_sources.get(session_id).cloned();
                         if s.is_active_codex_session() {
                             let enabled = s
@@ -1009,6 +1009,20 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
+                    AppEvent::SteerCancelFailed {
+                        ref id, ref reason, ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Steer cancel failed{}: {}", id_part, reason),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
                     AppEvent::FollowUpStatus {
                         ref id,
                         ref status,
@@ -1144,6 +1158,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             s.session_prompt_tokens = 0;
             s.session_completion_tokens = 0;
             s.session_cached_tokens = 0;
+            s.session_cache_creation_tokens = 0;
             s.active_session_source = s.session_sources.get(session_id).cloned();
             if s.is_active_codex_session() {
                 let enabled = s
@@ -1307,7 +1322,10 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
     }
 }
 
-pub(crate) fn session_log_dir_matches_requested_session(log_dir: &std::path::Path, session_id: &str) -> bool {
+pub(crate) fn session_log_dir_matches_requested_session(
+    log_dir: &std::path::Path,
+    session_id: &str,
+) -> bool {
     if log_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -1330,6 +1348,7 @@ pub(crate) fn session_log_dir_matches_requested_session(log_dir: &std::path::Pat
 }
 
 pub(crate) fn requested_session_log_dirs(
+    home: &std::path::Path,
     current_log_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
@@ -1339,7 +1358,8 @@ pub(crate) fn requested_session_log_dirs(
     {
         dirs.push(current_log_dir.to_path_buf());
     }
-    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id(session_id) {
+    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)
+    {
         if !dirs.iter().any(|existing| existing == &dir) {
             dirs.push(dir);
         }
@@ -1353,13 +1373,14 @@ pub(crate) fn requested_session_log_dirs(
 /// session — supervised parents log under `~/.intendant/logs/<id>/`, which is
 /// not necessarily the MCP server's own log dir.
 pub(crate) fn status_ledger_candidate_dirs(
+    home: &std::path::Path,
     primary_log_dir: &std::path::Path,
     session_id: &str,
 ) -> Vec<std::path::PathBuf> {
     let mut dirs = vec![primary_log_dir.to_path_buf()];
     let session_id = session_id.trim();
     if !session_id.is_empty() {
-        for dir in requested_session_log_dirs(primary_log_dir, session_id) {
+        for dir in requested_session_log_dirs(home, primary_log_dir, session_id) {
             if !dirs.contains(&dir) {
                 dirs.push(dir);
             }
@@ -1442,12 +1463,16 @@ pub(crate) fn merged_fission_ledger_document_for_session(
     merged
 }
 
-pub(crate) fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, session_id: &str) -> bool {
+pub(crate) fn hydrate_requested_session_status_from_logs(
+    home: &std::path::Path,
+    s: &mut McpAppState,
+    session_id: &str,
+) -> bool {
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return false;
     }
-    let dirs = requested_session_log_dirs(&s.log_dir, session_id);
+    let dirs = requested_session_log_dirs(home, &s.log_dir, session_id);
     if dirs.is_empty() {
         return false;
     }
@@ -1462,6 +1487,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, se
     let session_prompt_tokens = s.session_prompt_tokens;
     let session_completion_tokens = s.session_completion_tokens;
     let session_cached_tokens = s.session_cached_tokens;
+    let session_cache_creation_tokens = s.session_cache_creation_tokens;
     let context_window = s.context_window;
     let hard_context_window = s.hard_context_window;
     let active_session_id = s.session_id.clone();
@@ -1496,6 +1522,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, se
     s.session_prompt_tokens = session_prompt_tokens;
     s.session_completion_tokens = session_completion_tokens;
     s.session_cached_tokens = session_cached_tokens;
+    s.session_cache_creation_tokens = session_cache_creation_tokens;
     s.context_window = context_window;
     s.hard_context_window = hard_context_window;
     s.session_id = active_session_id;
@@ -1851,6 +1878,7 @@ mod tests {
                     source,
                     session_id,
                     resume_id,
+                    relationship_kind: _,
                     fork: _,
                     project_root: resumed_project_root,
                     task,
@@ -2163,6 +2191,7 @@ mod tests {
                     source,
                     session_id,
                     resume_id,
+                    relationship_kind: _,
                     fork: _,
                     task,
                     direct,
@@ -2530,7 +2559,7 @@ mod tests {
                 context_window: Some(258_400),
                 hard_context_window: Some(272_000),
                 item_count: Some(300),
-                raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+                raw: std::sync::Arc::new(serde_json::json!({ "model": "gpt-5.2-codex" })),
             },
         );
         let pressure = s.context_pressure_snapshot();
@@ -3348,7 +3377,7 @@ mod tests {
                         context_window: Some(1_000),
                         hard_context_window: Some(1_200),
                         item_count: Some(12),
-                        raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+                        raw: std::sync::Arc::new(serde_json::json!({ "model": "gpt-5.2-codex" })),
                     },
                 );
             }

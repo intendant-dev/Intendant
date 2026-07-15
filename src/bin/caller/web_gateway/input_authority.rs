@@ -91,7 +91,11 @@ impl DisplayInputHolder {
     /// `(federation_connection_id, session_id)` pair. Used by the
     /// federated input gate (in F-2) and the federated close-cleanup
     /// path.
-    pub(crate) fn matches_federated(&self, federation_connection_id: &str, session_id: &str) -> bool {
+    pub(crate) fn matches_federated(
+        &self,
+        federation_connection_id: &str,
+        session_id: &str,
+    ) -> bool {
         match self {
             Self::FederatedWebRtc {
                 federation_connection_id: c,
@@ -123,15 +127,9 @@ impl DisplayInputHolder {
     /// equality-comparison pitfalls in collections / `.contains()` /
     /// pattern guards.
     ///
-    /// Production callers don't need this yet — every F-1 / F-2
-    /// release-or-preempt site already knows which provenance kind it's
-    /// matching against and uses `matches_local_ws` /
-    /// `matches_federated` directly. The method is pinned by unit
-    /// tests as the documented identity-equality contract for future
-    /// arbitration work (e.g. F-2's per-primary multi-operator
-    /// scoping, where the comparison is against an opaque
-    /// `DisplayInputHolder` snapshot).
-    #[allow(dead_code)]
+    /// Grant installation uses this contract to make a repeated request by
+    /// the current holder idempotent: the notification handle may refresh,
+    /// but the authority epoch must not advance and break an in-flight drag.
     pub(crate) fn same_identity(&self, other: &DisplayInputHolder) -> bool {
         match (self, other) {
             (
@@ -161,6 +159,140 @@ impl DisplayInputHolder {
     }
 }
 
+/// Holder map and its monotonic identity-transition revision, owned by one
+/// gateway. Identity changes advance `revision` while holding the write lock;
+/// same-identity re-grants may refresh a notification handle without changing
+/// the epoch. Queued input snapshots the revision at admission and rechecks it
+/// at injection. Keeping both in one object prevents fast A -> B -> A handoffs
+/// from resurrecting stale events without coupling independent gateways or
+/// parallel tests.
+pub(crate) struct DisplayInputAuthority {
+    holders: StdRwLock<HashMap<u32, DisplayInputHolder>>,
+    revisions: Mutex<HashMap<u32, Arc<AtomicU64>>>,
+}
+
+impl Default for DisplayInputAuthority {
+    fn default() -> Self {
+        Self {
+            holders: StdRwLock::new(HashMap::new()),
+            revisions: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl DisplayInputAuthority {
+    pub(crate) fn read(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, HashMap<u32, DisplayInputHolder>>>
+    {
+        self.holders.read()
+    }
+
+    pub(crate) fn write(
+        &self,
+    ) -> std::sync::LockResult<std::sync::RwLockWriteGuard<'_, HashMap<u32, DisplayInputHolder>>>
+    {
+        self.holders.write()
+    }
+
+    pub(crate) fn revision(&self, display_id: u32) -> Arc<AtomicU64> {
+        Arc::clone(
+            self.revisions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entry(display_id)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
+    }
+
+    fn bump_revision(&self, display_id: u32) -> u64 {
+        self.revision(display_id)
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    /// Install a holder and return `(prior, revision)`. Repeating a grant for
+    /// the same provenance + identity replaces the stored value (refreshing a
+    /// local WS notification sender) but deliberately preserves the revision;
+    /// only a real authority handoff starts a new input epoch.
+    fn install_holder(
+        &self,
+        display_id: u32,
+        new_holder: DisplayInputHolder,
+    ) -> (Option<DisplayInputHolder>, u64) {
+        let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        let same_identity = holders
+            .get(&display_id)
+            .is_some_and(|current| current.same_identity(&new_holder));
+        let prior = holders.insert(display_id, new_holder);
+        let revision = if same_identity {
+            self.revision(display_id).load(Ordering::SeqCst)
+        } else {
+            self.bump_revision(display_id)
+        };
+        (prior, revision)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_entry_counts(&self) -> (usize, usize) {
+        let holder_count = self
+            .holders
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        let revision_count = self
+            .revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        (holder_count, revision_count)
+    }
+
+    fn revision_is_current(&self, display_id: u32, revision: u64) -> bool {
+        self.revision(display_id).load(Ordering::SeqCst) == revision
+    }
+
+    pub(crate) fn clear_display(&self, display_id: u32) -> (Option<DisplayInputHolder>, u64) {
+        let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        let removed = holders.remove(&display_id);
+        // Recreating an unclaimed display is still a new authority epoch.
+        let revision = self.bump_revision(display_id);
+        drop(holders);
+        (removed, revision)
+    }
+
+    /// Fail-closed recovery after an authority/lifecycle event gap.
+    ///
+    /// The holder map and every revision already handed to a live input source
+    /// advance under the same holder write lock. Returning the affected IDs
+    /// lets callers publish an unclaimed state without exposing holder details.
+    pub(crate) fn clear_all(&self) -> Vec<(u32, u64)> {
+        let mut holders = self.write().unwrap_or_else(|error| error.into_inner());
+        let mut revisions = self
+            .revisions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut display_ids = holders.keys().copied().collect::<Vec<_>>();
+        for display_id in revisions.keys().copied() {
+            if !display_ids.contains(&display_id) {
+                display_ids.push(display_id);
+            }
+        }
+        holders.clear();
+        display_ids
+            .into_iter()
+            .map(|display_id| {
+                let revision = revisions
+                    .entry(display_id)
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                (display_id, revision)
+            })
+            .collect()
+    }
+}
+
 /// Phase 5a.1: dedicated internal broadcast event for display input
 /// authority transitions.
 ///
@@ -180,6 +312,17 @@ impl DisplayInputHolder {
 pub(crate) struct DisplayInputAuthorityChange {
     pub(crate) display_id: u32,
     pub(crate) holder: Option<DisplayInputHolder>,
+    /// Exact holder-map epoch that produced this event. Broadcast sends happen
+    /// after releasing the holder lock, so concurrent mutations may enqueue
+    /// events out of order. Consumers must discard an event once a newer
+    /// revision is live instead of letting stale UI/queue state win.
+    pub(crate) revision: u64,
+}
+
+impl DisplayInputAuthorityChange {
+    pub(crate) fn is_current(&self, authority: &DisplayInputAuthority) -> bool {
+        authority.revision_is_current(self.display_id, self.revision)
+    }
 }
 
 /// Build the per-peer "may this connection inject input now?" closure
@@ -208,7 +351,7 @@ pub(crate) struct DisplayInputAuthorityChange {
 pub(crate) fn build_local_ws_input_authorizer(
     display_id: u32,
     connection_id: String,
-    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: Arc<DisplayInputAuthority>,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
         let auth = authority.read().unwrap_or_else(|e| e.into_inner());
@@ -229,8 +372,9 @@ pub(crate) fn build_local_ws_input_authorizer(
 pub(crate) const AUTHORITY_CHANGE_CAPACITY: usize = 64;
 
 /// F-2: federated path's input-authorization closure. Returns `true`
-/// iff the current holder for `display_id` is `FederatedWebRtc` matching
-/// THIS peer's `(federation_connection_id, session_id)`. Anything else
+/// iff the transport/session grant is still live AND the current holder
+/// for `display_id` is `FederatedWebRtc` matching THIS peer's
+/// `(federation_connection_id, session_id)`. Anything else
 /// — no holder, a `LocalWs` holder, a `FederatedWebRtc` with a different
 /// session id (e.g. another tab from the same primary), or a different
 /// connection — returns `false` and the federated input handler drops
@@ -245,17 +389,24 @@ pub(crate) const AUTHORITY_CHANGE_CAPACITY: usize = 64;
 /// any other condition is a protocol bug or a stale post-release race
 /// and silent drop is correct.
 ///
-/// The closure is the entire boundary: `display/mod.rs` invokes it per
-/// event and never sees the registry, the holder identity, or the
-/// connection/session IDs. F-2's gate flip is the single semantic change
-/// from F-1's `Arc::new(|| false)` deny-everything stub.
+/// The closure is the entire boundary: `display/mod.rs` invokes it when an
+/// event arrives and the display input queue retains it for a second check
+/// immediately before injection. The caller-supplied `session_authorized`
+/// predicate binds the exact peer/IAM grant and federation-WS lifetime that
+/// admitted the offer; composing it here with the holder check ensures a
+/// buffered event dies on peer revocation, grant mutation, transport teardown,
+/// or an input-authority handoff.
 pub(crate) fn build_federated_input_authorizer(
     display_id: u32,
     federation_connection_id: String,
     session_id: String,
-    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: Arc<DisplayInputAuthority>,
+    session_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
     Arc::new(move || {
+        if !session_authorized() {
+            return false;
+        }
         let auth = authority.read().unwrap_or_else(|e| e.into_inner());
         match auth.get(&display_id) {
             Some(entry) => entry.matches_federated(&federation_connection_id, &session_id),
@@ -279,7 +430,7 @@ pub(crate) fn apply_grant_input_authority(
     display_id: u32,
     requester_connection_id: String,
     requester_direct_tx: mpsc::UnboundedSender<String>,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Option<DisplayInputHolder> {
     let new_holder = DisplayInputHolder::LocalWs {
@@ -291,10 +442,7 @@ pub(crate) fn apply_grant_input_authority(
     // downstream but cheap because mpsc::UnboundedSender is
     // Arc-backed).
     let broadcast_holder = new_holder.clone();
-    let prior = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(display_id, new_holder)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     // Only `LocalWs` prior holders get the direct revoke confirmation
     // — `direct_tx` is local-only by design (see `DisplayInputHolder`
     // doc). A `FederatedWebRtc` prior holder learns of the preempt
@@ -318,6 +466,7 @@ pub(crate) fn apply_grant_input_authority(
     let _ = authority_change_tx.send(DisplayInputAuthorityChange {
         display_id,
         holder: Some(broadcast_holder),
+        revision,
     });
     prior
 }
@@ -332,26 +481,27 @@ pub(crate) fn apply_grant_input_authority(
 pub(crate) fn apply_release_input_authority(
     display_id: u32,
     releaser_connection_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
-    let removed = {
+    let removed_revision = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
             Some(entry) if entry.matches_local_ws(releaser_connection_id) => {
                 map.remove(&display_id);
-                true
+                Some(authority.bump_revision(display_id))
             }
-            _ => false,
+            _ => None,
         }
     };
-    if removed {
+    if let Some(revision) = removed_revision {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
             display_id,
             holder: None,
+            revision,
         });
     }
-    removed
+    removed_revision.is_some()
 }
 
 /// F-1.3b: federated grant. Constructs a `FederatedWebRtc` holder
@@ -380,7 +530,7 @@ pub(crate) fn apply_grant_input_authority_federated(
     display_id: u32,
     federation_connection_id: String,
     session_id: String,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Option<DisplayInputHolder> {
     let new_holder = DisplayInputHolder::FederatedWebRtc {
@@ -388,10 +538,7 @@ pub(crate) fn apply_grant_input_authority_federated(
         session_id: session_id.clone(),
     };
     let broadcast_holder = new_holder.clone();
-    let prior = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(display_id, new_holder)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     // Prior LocalWs holder gets the legacy direct revoke; prior
     // FederatedWebRtc gets nothing here because the personalized
     // broadcast below carries `"other"` to it on its own data channel.
@@ -411,6 +558,7 @@ pub(crate) fn apply_grant_input_authority_federated(
     let _ = authority_change_tx.send(DisplayInputAuthorityChange {
         display_id,
         holder: Some(broadcast_holder),
+        revision,
     });
     prior
 }
@@ -427,32 +575,33 @@ pub(crate) fn apply_release_input_authority_federated(
     display_id: u32,
     federation_connection_id: &str,
     session_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
-    let removed = {
+    let removed_revision = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
             Some(entry) if entry.matches_federated(federation_connection_id, session_id) => {
                 map.remove(&display_id);
-                true
+                Some(authority.bump_revision(display_id))
             }
-            _ => false,
+            _ => None,
         }
     };
-    if removed {
+    if let Some(revision) = removed_revision {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
             display_id,
             holder: None,
+            revision,
         });
     }
-    removed
+    removed_revision.is_some()
 }
 
 pub(crate) fn dashboard_control_authority_state_frame(
     session_id: &str,
     display_id: u32,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
 ) -> serde_json::Value {
     let state = {
         let auth = authority.read().unwrap_or_else(|e| e.into_inner());
@@ -472,7 +621,7 @@ pub(crate) fn dashboard_control_authority_state_frame(
 pub(crate) fn dashboard_control_authority_snapshot_frames(
     session_id: &str,
     display_ids: &[u32],
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
 ) -> Vec<serde_json::Value> {
     display_ids
         .iter()
@@ -485,17 +634,14 @@ pub(crate) fn dashboard_control_authority_snapshot_frames(
 pub(crate) fn apply_grant_input_authority_dashboard_control(
     display_id: u32,
     session_id: String,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Option<DisplayInputHolder> {
     let new_holder = DisplayInputHolder::DashboardControl {
         session_id: session_id.clone(),
     };
     let broadcast_holder = new_holder.clone();
-    let prior = {
-        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
-        map.insert(display_id, new_holder)
-    };
+    let (prior, revision) = authority.install_holder(display_id, new_holder);
     if let Some(DisplayInputHolder::LocalWs {
         direct_tx: prior_tx,
         ..
@@ -512,6 +658,7 @@ pub(crate) fn apply_grant_input_authority_dashboard_control(
     let _ = authority_change_tx.send(DisplayInputAuthorityChange {
         display_id,
         holder: Some(broadcast_holder),
+        revision,
     });
     prior
 }
@@ -519,34 +666,35 @@ pub(crate) fn apply_grant_input_authority_dashboard_control(
 pub(crate) fn apply_release_input_authority_dashboard_control(
     display_id: u32,
     session_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
-    let removed = {
+    let removed_revision = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
             Some(entry) if entry.matches_dashboard_control(session_id) => {
                 map.remove(&display_id);
-                true
+                Some(authority.bump_revision(display_id))
             }
-            _ => false,
+            _ => None,
         }
     };
-    if removed {
+    if let Some(revision) = removed_revision {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
             display_id,
             holder: None,
+            revision,
         });
     }
-    removed
+    removed_revision.is_some()
 }
 
 pub(crate) fn apply_dashboard_control_close_input_authority(
     session_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
-    let released: Vec<u32> = {
+    let released: Vec<(u32, u64)> = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| {
@@ -557,21 +705,27 @@ pub(crate) fn apply_dashboard_control_close_input_authority(
                 true
             }
         });
-        out
+        out.into_iter()
+            .map(|display_id| (display_id, authority.bump_revision(display_id)))
+            .collect()
     };
-    for did in &released {
+    for (display_id, revision) in &released {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
-            display_id: *did,
+            display_id: *display_id,
             holder: None,
+            revision: *revision,
         });
     }
     released
+        .into_iter()
+        .map(|(display_id, _)| display_id)
+        .collect()
 }
 
 pub(crate) fn dashboard_control_input_authorized(
     session_id: &str,
     display_id: u32,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
 ) -> bool {
     let auth = authority.read().unwrap_or_else(|e| e.into_inner());
     match auth.get(&display_id) {
@@ -597,10 +751,10 @@ pub(crate) fn dashboard_control_input_authorized(
 /// Lock discipline: matches [`apply_grant_input_authority_federated`].
 pub(crate) fn apply_federated_ws_close_input_authority(
     federation_connection_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
-    let released: Vec<u32> = {
+    let released: Vec<(u32, u64)> = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| match entry {
@@ -613,15 +767,21 @@ pub(crate) fn apply_federated_ws_close_input_authority(
             }
             _ => true,
         });
-        out
+        out.into_iter()
+            .map(|display_id| (display_id, authority.bump_revision(display_id)))
+            .collect()
     };
-    for did in &released {
+    for (display_id, revision) in &released {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
-            display_id: *did,
+            display_id: *display_id,
             holder: None,
+            revision: *revision,
         });
     }
     released
+        .into_iter()
+        .map(|(display_id, _)| display_id)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -662,36 +822,12 @@ pub(crate) fn apply_federated_ws_close_input_authority(
 /// count to the `WebRtcPeer` decrements. Any peer-teardown work that
 /// the registry needs (e.g. tearing down WebRtcPeers on federation
 /// WS-close) lives separately at the gateway level via
-/// [`peer_id_for_federated_session`] + `DisplaySession::remove_peer`,
+/// [`crate::display_peer_ids::peer_id_for_federated_session`] +
+/// `DisplaySession::remove_peer`,
 /// not by holding a duplicate Arc here.
 pub(crate) struct FederatedAuthoritySubscriber {
     shutdown: tokio_util::sync::CancellationToken,
-}
-
-/// Stable mapping from a federated `session_id` (the
-/// browser-supplied per-`PeerDisplayConnection` id round-tripped in
-/// `ControlMsg::WebRtcSignal`) to the [`crate::display::PeerId`]
-/// (`u64`) used as the `WebRtcPeer` key inside `DisplaySession`.
-///
-/// Used in two places that must agree exactly:
-/// 1. [`handle_federated_webrtc_signal`] — derives the key on
-///    Offer/IceCandidate/Close so subsequent signals route to the
-///    same peer.
-/// 2. WS-close cleanup — derives the key from each `(session_id,
-///    display_id)` returned by
-///    [`unregister_all_federated_subscribers_for_connection`] so
-///    the federation WS-close can call `DisplaySession::remove_peer`
-///    on every WebRtcPeer owned by the dropping connection.
-///
-/// A divergence between the two callers would leak peers (cleanup
-/// would target a different key than was inserted on Offer), which
-/// is exactly the bug fixed by extracting this helper.
-pub(crate) fn peer_id_for_federated_session(session_id: &str) -> crate::display::PeerId {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    session_id.hash(&mut h);
-    h.finish()
+    identity: Arc<()>,
 }
 
 /// Gateway-side registry of federated authority subscribers, keyed by
@@ -744,15 +880,15 @@ pub(crate) fn build_federated_authority_handler(
     display_id: u32,
     federation_connection_id: String,
     session_id: String,
-    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: Arc<DisplayInputAuthority>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
-    allow_input_authority: bool,
+    session_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> crate::display::webrtc::AuthorityChannelHandler {
     use crate::display::webrtc::AuthorityChannelMessage;
     Arc::new(move |msg| match msg {
         AuthorityChannelMessage::Request {
             display_id: req_did,
-        } if req_did == display_id && allow_input_authority => {
+        } if req_did == display_id && session_authorized() => {
             apply_grant_input_authority_federated(
                 display_id,
                 federation_connection_id.clone(),
@@ -761,11 +897,10 @@ pub(crate) fn build_federated_authority_handler(
                 &authority_change_tx,
             );
         }
-        AuthorityChannelMessage::Request { .. } if !allow_input_authority => {
-            // Read-only peer profile: view signaling is allowed, input authority
-            // requests are ignored. The input-injection authorizer below is also
-            // deny-all, so a malformed client cannot bypass this by sending input
-            // without first becoming the holder.
+        AuthorityChannelMessage::Request { .. } => {
+            // Read-only, revoked, or disconnected peer: ignore authority requests.
+            // The input-injection authorizer composes the same live predicate with
+            // the holder check, so a stale holder cannot keep injecting either.
         }
         AuthorityChannelMessage::Release {
             display_id: req_did,
@@ -778,7 +913,7 @@ pub(crate) fn build_federated_authority_handler(
                 &authority_change_tx,
             );
         }
-        AuthorityChannelMessage::Request { .. } | AuthorityChannelMessage::Release { .. } => {
+        AuthorityChannelMessage::Release { .. } => {
             // Display-ID mismatch — drop silently. See doc comment.
         }
     })
@@ -796,15 +931,16 @@ pub(crate) fn build_federated_authority_handler(
 ///    nor the fanout, and the chip would end up stale until the
 ///    next change.
 /// 2. Compute the initial personalized snapshot from the current
-///    registry state and send it via `peer.send_authority_state`.
+///    registry state.
 ///    F-1.2's pending-authority queue absorbs the case where the
 ///    `display_input_authority` data channel hasn't opened yet on
 ///    the federated browser side — the queued state flushes on
 ///    `OnDataChannel(OnOpen)` so the chip cannot start stuck on
 ///    `unknown`.
-/// 3. Spawn the fanout task with the rx from step 1. It
-///    personalizes each inbound change for this subscriber's
-///    identity and pushes via `peer.send_authority_state`. Lagged
+/// 3. Spawn one fanout task with the snapshot and rx from steps 1-2. It
+///    sends the snapshot first, then personalizes each inbound change for
+///    this subscriber's identity and pushes via
+///    `peer.send_authority_state`. Lagged
 ///    subscribers re-snapshot from the registry — same recovery
 ///    pattern as the local 5c lagged path so a momentary catch-up
 ///    cannot leave the chip on stale state.
@@ -812,25 +948,23 @@ pub(crate) fn build_federated_authority_handler(
 ///    `(federation_connection_id, session_id, display_id)` so
 ///    cleanup edges can reach it.
 ///
-/// Snapshot-vs-change ordering across the wire is FIFO via
-/// `WebRtcPeer::send_authority_state`'s underlying `Command`
-/// channel. If a change races the initial snapshot, both land on
-/// the channel in the order they were enqueued; the more recent
-/// one wins on the browser side, so the chip ends up correct
-/// regardless of which arrives last.
+/// Snapshot-vs-change ordering is owned by that one task: it awaits the
+/// snapshot's enqueue before it starts receiving changes. Independent spawned
+/// senders are deliberately forbidden here because the newer change could
+/// otherwise enter `WebRtcPeer`'s command channel before the stale snapshot.
 pub(crate) fn register_federated_authority_subscriber(
     federation_connection_id: String,
     session_id: String,
     display_id: u32,
     peer: Arc<crate::display::webrtc::WebRtcPeer>,
-    authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: Arc<DisplayInputAuthority>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     subscribers: FederatedAuthoritySubscribers,
 ) {
     // 1. Subscribe BEFORE snapshot — closes the race window where a
     //    change between snapshot read and subscribe lands on neither
     //    path.
-    let mut auth_rx = authority_change_tx.subscribe();
+    let auth_rx = authority_change_tx.subscribe();
 
     // 2. Initial snapshot. F-1.2's queue handles "channel not open yet."
     let initial_state = {
@@ -841,60 +975,32 @@ pub(crate) fn register_federated_authority_subscriber(
             &session_id,
         )
     };
-    let peer_for_initial = Arc::clone(&peer);
-    tokio::spawn(async move {
-        let _ = peer_for_initial
-            .send_authority_state(display_id, initial_state)
-            .await;
-    });
-
-    // 3. Fanout task.
+    // 3. One snapshot-then-fanout task.
     let shutdown = tokio_util::sync::CancellationToken::new();
+    let registration_identity = Arc::new(());
     let task_shutdown = shutdown.clone();
     let task_authority = Arc::clone(&authority);
     let task_fcid = federation_connection_id.clone();
     let task_sid = session_id.clone();
     let task_did = display_id;
+    let peer_closed = peer.closed();
+    let peer_for_cleanup = Arc::clone(&peer);
     let task_peer = peer; // moved — registry doesn't keep a copy.
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = task_shutdown.cancelled() => break,
-                msg = auth_rx.recv() => match msg {
-                    Ok(change) if change.display_id == task_did => {
-                        let state = personalize_authority_for_federated(
-                            change.holder.as_ref(),
-                            &task_fcid,
-                            &task_sid,
-                        );
-                        let _ = task_peer
-                            .send_authority_state(task_did, state)
-                            .await;
-                    }
-                    Ok(_) => {} // change for a different display
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Re-snapshot from registry — same recovery
-                        // pattern as the local 5c lagged subscriber so
-                        // the chip is never left stuck on stale state.
-                        let state = {
-                            let map = task_authority
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner());
-                            personalize_authority_for_federated(
-                                map.get(&task_did),
-                                &task_fcid,
-                                &task_sid,
-                            )
-                        };
-                        let _ = task_peer
-                            .send_authority_state(task_did, state)
-                            .await;
-                    }
-                }
+    tokio::spawn(run_federated_authority_fanout(
+        initial_state,
+        auth_rx,
+        task_shutdown,
+        task_authority,
+        task_fcid,
+        task_sid,
+        task_did,
+        move |display_id, state| {
+            let peer = Arc::clone(&task_peer);
+            async move {
+                let _ = peer.send_authority_state(display_id, state).await;
             }
-        }
-    });
+        },
+    ));
 
     // 4. Insert into the registry. Replace-on-collision: a duplicate
     //    `(fcid, sid, did)` would mean a renegotiated peer for the
@@ -904,11 +1010,115 @@ pub(crate) fn register_federated_authority_subscriber(
         .write()
         .unwrap_or_else(|e| e.into_inner())
         .insert(
-            (federation_connection_id, session_id, display_id),
-            FederatedAuthoritySubscriber { shutdown },
+            (
+                federation_connection_id.clone(),
+                session_id.clone(),
+                display_id,
+            ),
+            FederatedAuthoritySubscriber {
+                shutdown: shutdown.clone(),
+                identity: Arc::clone(&registration_identity),
+            },
         )
     {
         prior.shutdown.cancel();
+    }
+
+    // Driver/ICE teardown can happen without an explicit signaling Close.
+    // Remove and release only if this exact registration still owns the key;
+    // a renegotiated replacement with the same public identity must survive
+    // the old peer's late close notification.
+    tokio::spawn(async move {
+        peer_closed.await;
+        // A spontaneous driver/pool shutdown can cancel the peer token before
+        // the driver's RAII invalidator runs. Close explicitly first so the
+        // lifecycle write gate orders all in-flight authority requests before
+        // holder release; none can re-grant after cleanup.
+        peer_for_cleanup.close().await;
+        let key = (
+            federation_connection_id.clone(),
+            session_id.clone(),
+            display_id,
+        );
+        let removed = {
+            let mut registry = subscribers.write().unwrap_or_else(|e| e.into_inner());
+            let matches = registry
+                .get(&key)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &registration_identity));
+            if matches {
+                registry.remove(&key)
+            } else {
+                None
+            }
+        };
+        if let Some(entry) = removed {
+            entry.shutdown.cancel();
+            apply_release_input_authority_federated(
+                display_id,
+                &federation_connection_id,
+                &session_id,
+                &authority,
+                &authority_change_tx,
+            );
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_federated_authority_fanout<SendState, SendFuture>(
+    initial_state: crate::display::webrtc::DisplayInputAuthorityState,
+    mut auth_rx: broadcast::Receiver<DisplayInputAuthorityChange>,
+    shutdown: tokio_util::sync::CancellationToken,
+    authority: Arc<DisplayInputAuthority>,
+    federation_connection_id: String,
+    session_id: String,
+    display_id: u32,
+    mut send_state: SendState,
+) where
+    SendState: FnMut(u32, crate::display::webrtc::DisplayInputAuthorityState) -> SendFuture,
+    SendFuture: std::future::Future<Output = ()>,
+{
+    // The subscribed receiver is already collecting concurrent changes. Send
+    // the snapshot first in this same task so none of those newer changes can
+    // be overtaken by a late-polled bootstrap sender.
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => return,
+        _ = send_state(display_id, initial_state) => {}
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            msg = auth_rx.recv() => match msg {
+                Ok(change) if change.display_id == display_id => {
+                    if !change.is_current(&authority) {
+                        continue;
+                    }
+                    let state = personalize_authority_for_federated(
+                        change.holder.as_ref(),
+                        &federation_connection_id,
+                        &session_id,
+                    );
+                    send_state(display_id, state).await;
+                }
+                Ok(_) => {} // change for a different display
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Re-snapshot from registry — same recovery pattern as the
+                    // local subscriber so the chip never stays stale.
+                    let state = {
+                        let map = authority.read().unwrap_or_else(|e| e.into_inner());
+                        personalize_authority_for_federated(
+                            map.get(&display_id),
+                            &federation_connection_id,
+                            &session_id,
+                        )
+                    };
+                    send_state(display_id, state).await;
+                }
+            }
+        }
     }
 }
 
@@ -968,6 +1178,7 @@ pub(crate) fn unregister_federated_authority_subscriber(
 /// for the same session) both fall through silently as no-ops on
 /// `remove_peer`.
 pub(crate) async fn close_federated_peers_for_sessions(
+    federation_connection_id: &str,
     released: &[(String, u32)],
     session_registry: Option<&Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>>,
 ) -> usize {
@@ -993,7 +1204,13 @@ pub(crate) async fn close_federated_peers_for_sessions(
             // `get_any`: teardown must reach every session that could
             // have accepted this connection's peers.
             if let Some(session) = reg.get_any(*did) {
-                targets.push((session, peer_id_for_federated_session(sid)));
+                targets.push((
+                    session,
+                    crate::display_peer_ids::peer_id_for_federated_session(
+                        federation_connection_id,
+                        sid,
+                    ),
+                ));
             }
         }
     }
@@ -1038,10 +1255,10 @@ pub(crate) fn unregister_all_federated_subscribers_for_connection(
 /// Lock discipline: matches [`apply_grant_input_authority`].
 pub(crate) fn apply_ws_close_input_authority(
     connection_id: &str,
-    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority: &Arc<DisplayInputAuthority>,
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
-    let released: Vec<u32> = {
+    let released: Vec<(u32, u64)> = {
         let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| {
@@ -1052,15 +1269,21 @@ pub(crate) fn apply_ws_close_input_authority(
                 true
             }
         });
-        out
+        out.into_iter()
+            .map(|display_id| (display_id, authority.bump_revision(display_id)))
+            .collect()
     };
-    for did in &released {
+    for (display_id, revision) in &released {
         let _ = authority_change_tx.send(DisplayInputAuthorityChange {
-            display_id: *did,
+            display_id: *display_id,
             holder: None,
+            revision: *revision,
         });
     }
     released
+        .into_iter()
+        .map(|(display_id, _)| display_id)
+        .collect()
 }
 
 /// Phase 5a.1 / 5c.2: build the personalized
@@ -1107,7 +1330,7 @@ pub(crate) fn compute_bootstrap_authority_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web_gateway::tests::{seed_holder};
+    use crate::web_gateway::tests::seed_holder;
 
     // ---------------------------------------------------------------
     // Phase 5a.1: input-authority closure semantics + emission tests
@@ -1115,8 +1338,8 @@ mod tests {
 
     /// Build an empty `display_input_authority` map of the production
     /// shape, for the helper-shape tests below.
-    fn empty_authority_map() -> Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> {
-        Arc::new(StdRwLock::new(HashMap::new()))
+    fn empty_authority_map() -> Arc<DisplayInputAuthority> {
+        Arc::new(DisplayInputAuthority::default())
     }
 
     /// Closure semantics: unclaimed map → authorized.  Matches the
@@ -1177,6 +1400,129 @@ mod tests {
         // Release.
         map.write().unwrap_or_else(|e| e.into_inner()).remove(&0);
         assert!(authz(), "after release back to unclaimed → authorized");
+    }
+
+    #[test]
+    fn authority_revisions_are_isolated_per_display() {
+        let authority = empty_authority_map();
+        let display_a = authority.revision(1);
+        let display_b = authority.revision(2);
+        let (change_tx, _change_rx) = broadcast::channel(4);
+        let (direct_tx, _direct_rx) = mpsc::unbounded_channel();
+
+        apply_grant_input_authority(2, "conn-b".to_string(), direct_tx, &authority, &change_tx);
+
+        assert_eq!(display_a.load(Ordering::SeqCst), 0);
+        assert_eq!(display_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn same_identity_regrants_preserve_revision_across_all_input_lanes() {
+        let authority = empty_authority_map();
+        let (change_tx, mut change_rx) = broadcast::channel(16);
+
+        let (local_tx_first, mut local_rx_first) = mpsc::unbounded_channel();
+        apply_grant_input_authority(
+            10,
+            "local-A".to_string(),
+            local_tx_first,
+            &authority,
+            &change_tx,
+        );
+        let local_first = change_rx.try_recv().expect("first local grant");
+        let (local_tx_refresh, _local_rx_refresh) = mpsc::unbounded_channel();
+        let local_prior = apply_grant_input_authority(
+            10,
+            "local-A".to_string(),
+            local_tx_refresh,
+            &authority,
+            &change_tx,
+        )
+        .expect("same local holder is returned as prior");
+        let local_refresh = change_rx.try_recv().expect("local refresh broadcast");
+        assert!(local_prior.matches_local_ws("local-A"));
+        assert_eq!(local_refresh.revision, local_first.revision);
+        assert_eq!(authority.revision(10).load(Ordering::SeqCst), 1);
+        assert!(
+            local_rx_first.try_recv().is_err(),
+            "refreshing the current local holder must not revoke it"
+        );
+
+        apply_grant_input_authority_federated(
+            11,
+            "federation-A".to_string(),
+            "peer-session-A".to_string(),
+            &authority,
+            &change_tx,
+        );
+        let federated_first = change_rx.try_recv().expect("first federated grant");
+        let federated_prior = apply_grant_input_authority_federated(
+            11,
+            "federation-A".to_string(),
+            "peer-session-A".to_string(),
+            &authority,
+            &change_tx,
+        )
+        .expect("same federated holder is returned as prior");
+        let federated_refresh = change_rx.try_recv().expect("federated refresh broadcast");
+        assert!(federated_prior.matches_federated("federation-A", "peer-session-A"));
+        assert_eq!(federated_refresh.revision, federated_first.revision);
+        assert_eq!(authority.revision(11).load(Ordering::SeqCst), 1);
+
+        apply_grant_input_authority_dashboard_control(
+            12,
+            "control-A".to_string(),
+            &authority,
+            &change_tx,
+        );
+        let dashboard_first = change_rx.try_recv().expect("first dashboard grant");
+        let dashboard_prior = apply_grant_input_authority_dashboard_control(
+            12,
+            "control-A".to_string(),
+            &authority,
+            &change_tx,
+        )
+        .expect("same dashboard holder is returned as prior");
+        let dashboard_refresh = change_rx.try_recv().expect("dashboard refresh broadcast");
+        assert!(dashboard_prior.matches_dashboard_control("control-A"));
+        assert_eq!(dashboard_refresh.revision, dashboard_first.revision);
+        assert_eq!(authority.revision(12).load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authority_change_rejects_an_event_after_a_newer_revision_wins() {
+        let authority = empty_authority_map();
+        let (change_tx, mut change_rx) = broadcast::channel(4);
+        let (direct_tx_a, _direct_rx_a) = mpsc::unbounded_channel();
+        let (direct_tx_b, _direct_rx_b) = mpsc::unbounded_channel();
+
+        apply_grant_input_authority(7, "conn-a".to_string(), direct_tx_a, &authority, &change_tx);
+        let older = change_rx.try_recv().expect("first authority event");
+        apply_grant_input_authority(7, "conn-b".to_string(), direct_tx_b, &authority, &change_tx);
+        let newer = change_rx.try_recv().expect("second authority event");
+
+        assert!(older.revision < newer.revision);
+        assert!(
+            !older.is_current(&authority),
+            "a delayed first broadcast must not overwrite the newer holder"
+        );
+        assert!(newer.is_current(&authority));
+    }
+
+    #[test]
+    fn clear_all_revokes_holders_and_every_live_display_revision() {
+        let authority = empty_authority_map();
+        let display_a = authority.revision(1);
+        let display_b = authority.revision(2);
+        seed_holder(&authority, 1, "conn-a");
+
+        let mut cleared = authority.clear_all();
+        cleared.sort_unstable_by_key(|(display_id, _)| *display_id);
+
+        assert_eq!(cleared, vec![(1, 1), (2, 1)]);
+        assert!(authority.read().unwrap().is_empty());
+        assert_eq!(display_a.load(Ordering::SeqCst), 1);
+        assert_eq!(display_b.load(Ordering::SeqCst), 1);
     }
 
     /// `apply_grant_input_authority` emits a personalized authority
@@ -1439,7 +1785,7 @@ mod tests {
     /// that need to set up cross-provenance scenarios. Mirrors
     /// `seed_holder` for `LocalWs`.
     fn seed_federated_holder(
-        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        map: &Arc<DisplayInputAuthority>,
         display_id: u32,
         federation_connection_id: &str,
         session_id: &str,
@@ -1809,8 +2155,43 @@ mod tests {
             "fed-1".to_string(),
             "sess-A".to_string(),
             Arc::clone(&map),
+            Arc::new(|| true),
         );
         assert!(authz(), "matching identity must authorize input");
+    }
+
+    /// The holder tuple is necessary but not sufficient: the predicate bound
+    /// to the opening peer/IAM grant is re-evaluated on every call. This is the
+    /// queued-event revocation edge — the holder can remain present while the
+    /// peer record is revoked or its federation WebSocket is torn down.
+    #[test]
+    fn federated_input_authorizer_rechecks_live_session_authority() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let map = empty_authority_map();
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            0,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: "fed-1".to_string(),
+                session_id: "sess-A".to_string(),
+            },
+        );
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_guard = Arc::clone(&live);
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            Arc::new(move || live_for_guard.load(Ordering::Acquire)),
+        );
+
+        assert!(authz(), "live opening grant + matching holder authorizes");
+        live.store(false, Ordering::Release);
+        assert!(
+            !authz(),
+            "revoked session must deny even while its holder entry remains"
+        );
     }
 
     /// F-2: negative — unclaimed (`None`) is strict deny on the
@@ -1820,8 +2201,13 @@ mod tests {
     #[test]
     fn federated_input_authorizer_returns_false_when_no_holder() {
         let map = empty_authority_map();
-        let authz =
-            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+            Arc::new(|| true),
+        );
         assert!(
             !authz(),
             "unclaimed display must drop federated input — different \
@@ -1836,8 +2222,13 @@ mod tests {
     fn federated_input_authorizer_returns_false_when_local_holder() {
         let map = empty_authority_map();
         seed_holder(&map, 0, "local-conn-A");
-        let authz =
-            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+            Arc::new(|| true),
+        );
         assert!(
             !authz(),
             "LocalWs holder must drop federated input even though the \
@@ -1858,8 +2249,13 @@ mod tests {
                 session_id: "sess-OTHER".to_string(),
             },
         );
-        let authz =
-            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+            Arc::new(|| true),
+        );
         assert!(
             !authz(),
             "same connection + different session must deny — distinct \
@@ -1881,8 +2277,13 @@ mod tests {
                 session_id: "sess-A".to_string(),
             },
         );
-        let authz =
-            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
+        let authz = build_federated_input_authorizer(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            map,
+            Arc::new(|| true),
+        );
         assert!(
             !authz(),
             "different federation_connection_id must deny even when \
@@ -1971,6 +2372,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn federated_fanout_sends_snapshot_before_an_already_queued_change() {
+        use crate::display::webrtc::DisplayInputAuthorityState;
+
+        let authority = empty_authority_map();
+        let (change_tx, change_rx) = broadcast::channel(8);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+
+        // Subscribe and capture the empty snapshot, then let a grant race ahead
+        // before the fanout task is even polled. The old two-task shape could
+        // enqueue You followed by stale Unclaimed in exactly this schedule.
+        let initial_state = DisplayInputAuthorityState::Unclaimed;
+        apply_grant_input_authority_federated(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            &authority,
+            &change_tx,
+        );
+
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(run_federated_authority_fanout(
+            initial_state,
+            change_rx,
+            task_shutdown,
+            Arc::clone(&authority),
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
+            move |_display_id, state| {
+                let sent_tx = sent_tx.clone();
+                async move {
+                    let _ = sent_tx.send(state);
+                }
+            },
+        ));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sent_rx.recv())
+            .await
+            .expect("snapshot send timed out")
+            .expect("fanout sender closed");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sent_rx.recv())
+            .await
+            .expect("change send timed out")
+            .expect("fanout sender closed");
+        assert_eq!(first, DisplayInputAuthorityState::Unclaimed);
+        assert_eq!(second, DisplayInputAuthorityState::You);
+
+        shutdown.cancel();
+        task.await.expect("fanout task joins");
+    }
+
     /// The handler closure built by `build_federated_authority_handler`
     /// dispatches a `Request` to `apply_grant_input_authority_federated`,
     /// resulting in a holder bound to this peer's identity in the
@@ -1987,7 +2441,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
-            true,
+            Arc::new(|| true),
         );
 
         handler(AuthorityChannelMessage::Request { display_id: 0 });
@@ -2028,7 +2482,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
-            true,
+            Arc::new(|| true),
         );
         handler(AuthorityChannelMessage::Release { display_id: 0 });
 
@@ -2065,7 +2519,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
-            true,
+            Arc::new(|| true),
         );
         handler(AuthorityChannelMessage::Release { display_id: 0 });
 
@@ -2095,7 +2549,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
-            true,
+            Arc::new(|| true),
         );
 
         handler(AuthorityChannelMessage::Request { display_id: 99 });
@@ -2108,24 +2562,29 @@ mod tests {
     }
 
     #[test]
-    fn build_federated_authority_handler_denies_request_when_profile_read_only() {
+    fn build_federated_authority_handler_rechecks_live_session_authority() {
         use crate::display::webrtc::AuthorityChannelMessage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let map = empty_authority_map();
         let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let live = Arc::new(AtomicBool::new(true));
+        let live_for_handler = Arc::clone(&live);
         let handler = build_federated_authority_handler(
             0,
             "fed-1".to_string(),
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
-            false,
+            Arc::new(move || live_for_handler.load(Ordering::Acquire)),
         );
 
+        live.store(false, Ordering::Release);
         handler(AuthorityChannelMessage::Request { display_id: 0 });
 
         assert!(
             map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
-            "read-only profile must not grant federated input authority"
+            "revoked session must not grant federated input authority"
         );
     }
 
@@ -2323,27 +2782,74 @@ mod tests {
     // session.remove_peer side effect requires a real
     // DisplaySession (which needs a real backend) and is exercised
     // by the F-3 smoke; these unit tests pin the contract that
-    // must hold for the smoke to be meaningful: the same session_id
-    // hashes to the same PeerId on both the Offer (insert) and the
-    // WS-close (cleanup) sides.
+    // must hold for the smoke to be meaningful: the same federation
+    // connection + session pair hashes to the same PeerId on both the Offer
+    // (insert) and the WS-close (cleanup) sides.
     // ---------------------------------------------------------------
 
-
-    /// Distinct `session_id`s map to distinct `PeerId`s in
-    /// practice. (`u64` hash collisions are theoretically possible
-    /// but vanishingly unlikely between any two real session ids
-    /// generated by the browser.) Without this property, two
-    /// federated tabs from one primary would alias to the same
+    /// Distinct connection/session identities map to distinct `PeerId`s in
+    /// practice. (62-bit federated-payload collisions are theoretically possible
+    /// but vanishingly unlikely between any two real identities.) Without this
+    /// property, two federated tabs or two federation transports would alias the same
     /// `WebRtcPeer` slot — cleanup of one tab would tear down the
     /// other.
     #[test]
-    fn peer_id_for_federated_session_distinct_for_distinct_sessions() {
-        let a = peer_id_for_federated_session("sess-A");
-        let b = peer_id_for_federated_session("sess-B");
+    fn peer_id_for_federated_session_distinguishes_connection_session_pairs() {
+        let a = crate::display_peer_ids::peer_id_for_federated_session("conn-A", "sess-A");
+        let other_session =
+            crate::display_peer_ids::peer_id_for_federated_session("conn-A", "sess-B");
+        let other_connection =
+            crate::display_peer_ids::peer_id_for_federated_session("conn-B", "sess-A");
+        assert_ne!(a, other_session, "distinct sessions must not alias");
         assert_ne!(
-            a, b,
-            "distinct session ids should produce distinct peer ids"
+            a, other_connection,
+            "the same browser session id on different connections must not alias"
         );
+    }
+
+    #[tokio::test]
+    async fn same_session_id_on_two_federation_connections_tears_down_independently() {
+        let display_id = 7;
+        let session_id = "shared-browser-session";
+        let connection_a = "federation-connection-A";
+        let connection_b = "federation-connection-B";
+        let peer_a =
+            crate::display_peer_ids::peer_id_for_federated_session(connection_a, session_id);
+        let peer_b =
+            crate::display_peer_ids::peer_id_for_federated_session(connection_b, session_id);
+        assert_ne!(peer_a, peer_b);
+
+        let display = Arc::new(crate::display::DisplaySession::new(
+            display_id,
+            Arc::new(crate::display::synthetic::SyntheticBackend::new()),
+        ));
+        display.register_test_peer_for_cleanup(peer_a).await;
+        display.register_test_peer_for_cleanup(peer_b).await;
+        assert_eq!(display.metrics().await.peer_count, 2);
+
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry
+            .write()
+            .await
+            .insert(display_id, Arc::clone(&display));
+        let released = [(session_id.to_string(), display_id)];
+
+        assert_eq!(
+            close_federated_peers_for_sessions(connection_a, &released, Some(&registry)).await,
+            1
+        );
+        assert!(display.get_peer(peer_a).await.is_none());
+        assert!(display.get_peer(peer_b).await.is_some());
+        assert_eq!(display.metrics().await.peer_count, 1);
+
+        assert_eq!(
+            close_federated_peers_for_sessions(connection_b, &released, Some(&registry)).await,
+            1
+        );
+        assert!(display.get_peer(peer_b).await.is_none());
+        assert_eq!(display.metrics().await.peer_count, 0);
     }
 
     /// `close_federated_peers_for_sessions` short-circuits to 0 on
@@ -2356,7 +2862,7 @@ mod tests {
         let reg = Arc::new(tokio::sync::RwLock::new(
             crate::display::SessionRegistry::new(),
         ));
-        let count = close_federated_peers_for_sessions(&[], Some(&reg)).await;
+        let count = close_federated_peers_for_sessions("conn-A", &[], Some(&reg)).await;
         assert_eq!(count, 0, "empty release must short-circuit");
     }
 
@@ -2366,7 +2872,8 @@ mod tests {
     /// must not panic in that mode.
     #[tokio::test]
     async fn close_federated_peers_for_sessions_noop_on_no_registry() {
-        let count = close_federated_peers_for_sessions(&[("sess-A".to_string(), 0)], None).await;
+        let count =
+            close_federated_peers_for_sessions("conn-A", &[("sess-A".to_string(), 0)], None).await;
         assert_eq!(count, 0, "missing registry must short-circuit");
     }
 
@@ -2380,6 +2887,7 @@ mod tests {
             crate::display::SessionRegistry::new(),
         ));
         let count = close_federated_peers_for_sessions(
+            "conn-A",
             &[("sess-A".to_string(), 0), ("sess-B".to_string(), 1)],
             Some(&reg),
         )

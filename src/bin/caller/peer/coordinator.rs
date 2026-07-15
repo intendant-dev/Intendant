@@ -56,8 +56,15 @@ pub struct TaskRequest {
 pub struct RoutedTask {
     /// Which peer was selected.
     pub peer_id: PeerId,
-    /// The peer-assigned task id (from `PeerOpAck::TaskId`).
+    /// The peer's task identity: its real session id when `confirmed`,
+    /// the transport's synthetic marker otherwise.
     pub task_id: TaskId,
+    /// Whether the peer acknowledged acceptance with a delivery
+    /// receipt (see `PeerHandle::delegate_task`).
+    pub confirmed: bool,
+    /// The delegation's dedup/correlation id — pass it back as
+    /// `client_correlation_id` to retry idempotently.
+    pub delegation_id: String,
 }
 
 /// Errors from the coordinator's routing logic.
@@ -155,7 +162,12 @@ impl Coordinator {
         let peer_id = winner.id().clone();
 
         match winner.delegate_task(request.task).await {
-            Ok(task_id) => Ok(RoutedTask { peer_id, task_id }),
+            Ok(delegation) => Ok(RoutedTask {
+                peer_id,
+                task_id: delegation.task_id,
+                confirmed: delegation.confirmed,
+                delegation_id: delegation.delegation_id,
+            }),
             Err(error) => Err(CoordinatorError::DelegationFailed {
                 peer: peer_id,
                 error,

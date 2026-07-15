@@ -99,7 +99,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the annotated post-action screenshot. Needs a peer-granted profile with display input (peer-operator or peer-root)."
+        description = "Execute computer-use actions on a federated peer daemon's display (click, type, scroll, etc — the peer's CuAction vocabulary). Returns per-action status plus the peer's post-action observation (a clean screenshot by default; observe=\"ax\"/\"auto\"/\"none\" forwards the peer's element-tree/no-capture policies). Needs a peer-granted profile with display input (peer-operator or peer-root)."
     )]
     pub(crate) async fn peer_execute_cu_actions(
         &self,
@@ -112,6 +112,11 @@ impl IntendantServer {
                 serde_json::Value::Array(params.actions),
                 params.display_target,
                 params.coordinate_space,
+                params.observe.map(|mode| mode.label().to_string()),
+                params.annotate,
+                params
+                    .settle
+                    .and_then(|settle| serde_json::to_value(settle).ok()),
             )
             .await,
         ))
@@ -227,6 +232,9 @@ mod tests {
                     actions: vec![serde_json::json!({ "type": "screenshot" })],
                     display_target: None,
                     coordinate_space: None,
+                    observe: None,
+                    annotate: None,
+                    settle: None,
                 }))
                 .await
                 .unwrap();

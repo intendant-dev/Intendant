@@ -1,10 +1,9 @@
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use bip39::Mnemonic;
 use passkey_auth::{
     AuthenticationResponse, AuthenticationState, CredentialId, PasskeyCredential,
     RegistrationResponse, RegistrationState, Webauthn,
@@ -16,11 +15,11 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex, Notify};
-use url::{form_urlencoded, Url};
+use url::Url;
 use uuid::Uuid;
 
 mod ui;
@@ -39,6 +38,7 @@ mod dns;
 pub(crate) use dns::*;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
+const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
 /// v2 claim proofs bind the claiming account (user id + handle at claim
 /// time) into the payload the daemon signs, so the account↔daemon binding
@@ -53,6 +53,7 @@ const UNCLAIM_PROTOCOL: &str = "intendant-connect-unclaim-v1";
 /// timestamp so a captured release cannot be replayed to evict a future
 /// re-claim. Fleet-DNS publishes reuse the same window.
 const UNCLAIM_MAX_SKEW_MS: u64 = 5 * 60 * 1000;
+const REGISTER_PROOF_MAX_SKEW_MS: u64 = 5 * 60 * 1000;
 /// Daemon-signed fleet-DNS publishes: address records for the daemon's
 /// own name, and short-lived ACME DNS-01 TXT tokens. The registered
 /// identity key is the only authority over a name (docs/src/trust-tiers.md).
@@ -65,17 +66,15 @@ const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 const NOTIFY_PROTOCOL: &str = "intendant-connect-daemon-notify-v1";
 const COOKIE_NAME: &str = "ic_session";
 const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-const OFFER_TIMEOUT_MS: u64 = 30_000;
 const CLAIM_TIMEOUT_MS: u64 = 60_000;
 const CLAIM_CODE_TTL_MS: u64 = 10 * 60 * 1000;
-const CLAIM_CODE_ENTROPY_BYTES: usize = 16;
-const CLAIM_CODE_GENERATION_ATTEMPTS: usize = 32;
+/// Registration rotates this credential every minute. Five minutes covers a
+/// lost refresh without turning it into a durable daemon secret.
+const DAEMON_SESSION_TTL_MS: u64 = 5 * 60 * 1000;
 const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
+const DAEMON_SESSION_HEADER: &str = "x-intendant-daemon-session";
 const FLEET_TARGET_LIMIT: usize = 100;
-/// Cap on a relayed org-grant document (matches the daemon's public
-/// presentation endpoint body cap).
-const MAX_ORG_GRANT_RELAY_BYTES: usize = 16 * 1024;
 const FLEET_TEXT_MAX: usize = 160;
 /// AES-GCM envelope for the owner-encrypted private fields (three URLs
 /// plus overhead, base64url) — roomy but bounded.
@@ -99,7 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let had_keys = store.vapid_private_pk8_b64.is_some() && store.log_private_pk8_b64.is_some();
     let vapid = load_or_create_vapid_keypair(&mut store)?;
     let log_key = load_or_create_log_keypair(&mut store)?;
-    if !had_keys {
+    // Code transparency: commit what this process will serve before it
+    // serves anything (docs/src/self-hosted-rendezvous.md). Appends only
+    // when the manifest changed since the last logged one.
+    let manifest_logged = record_artifact_manifest(&mut store, &config);
+    if !had_keys || manifest_logged {
         save_store(&config.data_file, &store).map_err(|e| format!("persist service keys: {e}"))?;
     }
     // Fleet DNS: build the zone, hydrate persisted records, and bind the
@@ -141,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_claims: Mutex::new(HashMap::new()),
         event_queues: Mutex::new(HashMap::new()),
         event_notify: Notify::new(),
-        claim_codes: Mutex::new(HashMap::new()),
+        daemon_sessions: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(HashMap::new()),
         active_sessions: Mutex::new(HashMap::new()),
         dns_zone,
@@ -164,16 +167,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let app = Router::new()
+    let app = connect_router(state);
+
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    eprintln!(
+        "[connect] listening on http://{} with origin {} rp_id {}",
+        config.listen, config.public_origin, config.rp_id
+    );
+    eprintln!("[connect] state file {}", config.data_file.display());
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The complete production HTTP surface. Startup and route-boundary tests use
+/// this same constructor so a new route or fallback cannot bypass the hosted
+/// static/control cutoff without changing the exercised router.
+fn connect_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/", get(landing_ui))
         .route("/connect", get(connect_ui))
         .route("/access", get(access_ui))
         .route("/app", get(app_html))
+        .route("/app.html", get(app_html))
         .route("/healthz", get(healthz))
         .route("/install.sh", get(install_sh))
         .route("/install.ps1", get(install_ps1))
         .route("/favicon.png", get(favicon_png))
         .route("/logo.svg", get(logo_svg))
+        .route("/sw.js", get(service_worker_js))
         .route("/assets/landing/{name}", get(landing_asset))
         .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
@@ -194,7 +215,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/vault", get(api_vault_fetch).post(api_vault_publish))
         .route("/api/claims/claim", post(api_claim_start))
         .route("/api/claims/{claim_id}", get(api_claim_status))
-        .route("/api/claims/{claim_id}/arm", post(api_claim_arm))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
         .route("/api/attest/dns", post(attest_dns))
@@ -211,6 +231,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(log_consistency).options(orl_preflight),
         )
         .route("/api/log/find", get(log_find).options(orl_preflight))
+        .route(
+            "/api/log/artifact-manifest",
+            get(log_artifact_manifest).options(orl_preflight),
+        )
+        .route(
+            "/api/log/release-manifest",
+            get(log_release_manifest)
+                .post(release_manifest_submit)
+                .options(orl_preflight),
+        )
         .route("/api/push/vapid-public-key", get(push_vapid_public_key))
         .route("/api/push/subscribe", post(push_subscribe))
         .route("/api/push/unsubscribe", post(push_unsubscribe))
@@ -231,7 +261,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/api/orgs/revocations",
             get(orl_fetch).options(orl_preflight),
         )
-        .route("/api/daemon/register", post(daemon_register))
+        .route(
+            "/api/daemon/register",
+            post(daemon_register).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
         .route("/api/daemon/next", get(daemon_next))
         .route("/api/daemon/answer", post(daemon_answer))
         .route("/api/daemon/error", post(daemon_error))
@@ -244,17 +277,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
         .route("/api/browser/close", post(browser_close))
-        .fallback(static_asset)
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    eprintln!(
-        "[connect] listening on http://{} with origin {} rp_id {}",
-        config.listen, config.public_origin, config.rp_id
-    );
-    eprintln!("[connect] state file {}", config.data_file.display());
-    axum::serve(listener, app).await?;
-    Ok(())
+        .fallback(not_found)
+        .with_state(state)
 }
 
 #[derive(Debug, Clone)]
@@ -262,9 +286,14 @@ struct ServiceConfig {
     listen: SocketAddr,
     public_origin: String,
     rp_id: String,
-    static_root: PathBuf,
     data_file: PathBuf,
     daemon_token: Option<String>,
+    /// Bearer token for release-manifest submissions (the release
+    /// pipeline's credential). Deliberately separate from the operator
+    /// `daemon_token`: a CI secret that can only append release
+    /// manifests to the public log must not double as the admin key.
+    /// Unset = the submission endpoint answers 503 (reads stay public).
+    release_token: Option<String>,
     cookie_secure: bool,
     /// Refuse new-account registration without a valid invite code.
     /// Off by default so self-hosted instances stay zero-friction; the
@@ -303,9 +332,10 @@ impl ServiceConfig {
         let mut rp_id = std::env::var("INTENDANT_CONNECT_RP_ID")
             .ok()
             .filter(|v| !v.trim().is_empty());
-        let mut static_root = std::env::var("INTENDANT_CONNECT_STATIC_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("static"));
+        // Deprecated compatibility input. Connect deliberately serves no
+        // daemon-dashboard files from disk; retain the env/flag parser only
+        // so existing deployment commands do not fail during migration.
+        let _deprecated_static_root = std::env::var("INTENDANT_CONNECT_STATIC_ROOT").ok();
         let mut data_file = std::env::var("INTENDANT_CONNECT_DATA_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_data_file());
@@ -313,6 +343,10 @@ impl ServiceConfig {
             .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
             .unwrap_or(false);
         let mut daemon_token = std::env::var("INTENDANT_CONNECT_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let mut release_token = std::env::var("INTENDANT_CONNECT_RELEASE_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
@@ -327,16 +361,15 @@ impl ServiceConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let mut dns_listen: Option<SocketAddr> = match std::env::var("INTENDANT_CONNECT_DNS_LISTEN")
-        {
-            Ok(value) if !value.trim().is_empty() => Some(
-                value
-                    .trim()
-                    .parse()
-                    .map_err(|e| format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}"))?,
-            ),
-            _ => None,
-        };
+        let mut dns_listen: Option<SocketAddr> =
+            match std::env::var("INTENDANT_CONNECT_DNS_LISTEN") {
+                Ok(value) if !value.trim().is_empty() => {
+                    Some(value.trim().parse().map_err(|e| {
+                        format!("invalid INTENDANT_CONNECT_DNS_LISTEN {value:?}: {e}")
+                    })?)
+                }
+                _ => None,
+            };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -354,14 +387,16 @@ impl ServiceConfig {
                     rp_id = Some(args.next().ok_or("--rp-id requires a domain")?);
                 }
                 "--static-root" => {
-                    static_root =
-                        PathBuf::from(args.next().ok_or("--static-root requires a path")?);
+                    let _ = args.next().ok_or("--static-root requires a path")?;
                 }
                 "--data-file" => {
                     data_file = PathBuf::from(args.next().ok_or("--data-file requires a path")?);
                 }
                 "--daemon-token" => {
                     daemon_token = Some(args.next().ok_or("--daemon-token requires a token")?);
+                }
+                "--release-token" => {
+                    release_token = Some(args.next().ok_or("--release-token requires a token")?);
                 }
                 "--invite-required" => {
                     invite_required = true;
@@ -421,9 +456,9 @@ impl ServiceConfig {
             listen,
             public_origin: trim_trailing_slash(&public_origin),
             rp_id,
-            static_root,
             data_file,
             daemon_token,
+            release_token,
             invite_required,
             open_daemon_registration,
             cookie_secure,
@@ -438,8 +473,12 @@ fn print_help() {
     println!(
         "Usage: intendant-connect [--listen 127.0.0.1:9876] [--origin https://connect.intendant.dev] [--rp-id intendant.dev]\n\
          \n\
+         Deprecated compatibility: --static-root PATH and INTENDANT_CONNECT_STATIC_ROOT are accepted but ignored;\n\
+         Connect serves only its embedded discovery pages/assets and never the daemon dashboard SPA.\n\
+         \n\
          Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
               INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN,\n\
+              INTENDANT_CONNECT_RELEASE_TOKEN (--release-token: gates POST /api/log/release-manifest),\n\
               INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION,\n\
               INTENDANT_CONNECT_DNS_ZONE, INTENDANT_CONNECT_DNS_NS_NAME, INTENDANT_CONNECT_DNS_LISTEN\n\
               (--dns-zone fleet.example.com --dns-ns-name ns-fleet.example.com --dns-listen 0.0.0.0:53\n\
@@ -483,7 +522,7 @@ struct AppState {
     pending_claims: Mutex<HashMap<String, PendingClaim>>,
     event_queues: Mutex<HashMap<String, VecDeque<RendezvousEvent>>>,
     event_notify: Notify,
-    claim_codes: Mutex<HashMap<String, String>>,
+    daemon_sessions: Mutex<HashMap<String, DaemonSessionCredential>>,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
     active_sessions: Mutex<HashMap<String, ActiveDashboardSession>>,
     vapid: ring::signature::EcdsaKeyPair,
@@ -493,6 +532,56 @@ struct AppState {
     /// live record table the embedded server answers from (hydrated
     /// from `Store::dns_records` at startup).
     dns_zone: Option<Arc<FleetZone>>,
+}
+
+/// Minimal production-shaped state for route-boundary tests. Tests seed the
+/// durable store they need, while sharing the same WebAuthn, signing-key, and
+/// in-memory state construction as the service.
+#[cfg(test)]
+fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> {
+    let config = ServiceConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        public_origin: "https://connect.example.test".to_string(),
+        rp_id: "example.test".to_string(),
+        data_file: root.join("state.json"),
+        daemon_token: None,
+        release_token: None,
+        cookie_secure: true,
+        invite_required: false,
+        open_daemon_registration: false,
+        dns_zone: None,
+        dns_ns_name: None,
+        dns_listen: None,
+    };
+    let webauthn = Webauthn::new(&config.rp_id, "Intendant Connect", &config.public_origin)
+        .require_user_verification(true)
+        .strict_base64(true);
+    let vapid = load_or_create_vapid_keypair(&mut store).unwrap();
+    let log_key = load_or_create_log_keypair(&mut store).unwrap();
+    Arc::new(AppState {
+        config,
+        webauthn,
+        store: Mutex::new(store),
+        sessions: Mutex::new(HashMap::new()),
+        pending_registrations: Mutex::new(HashMap::new()),
+        pending_authentications: Mutex::new(HashMap::new()),
+        pending_offers: Mutex::new(HashMap::new()),
+        pending_claims: Mutex::new(HashMap::new()),
+        event_queues: Mutex::new(HashMap::new()),
+        event_notify: Notify::new(),
+        daemon_sessions: Mutex::new(HashMap::new()),
+        rate_limits: Mutex::new(HashMap::new()),
+        active_sessions: Mutex::new(HashMap::new()),
+        vapid,
+        log_key,
+        push_http: reqwest::Client::new(),
+        dns_zone: None,
+    })
+}
+
+struct DaemonSessionCredential {
+    token: String,
+    expires_unix_ms: u64,
 }
 
 /// A daemon's published fleet-DNS addresses (`d-<label>.<zone>` A/AAAA).
@@ -743,16 +832,25 @@ struct DaemonRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     daemon_public_key: String,
+    /// Connect account association for discovery/routing. The legacy
+    /// field name is retained for store compatibility; it is not a daemon
+    /// IAM owner and carries no daemon authority.
     owner_user_id: Option<Uuid>,
     claim_code_hash: Option<String>,
-    /// True when `claim_code_hash` was minted by the daemon itself
-    /// (first-owner bootstrap): this service holds only the hash, the
-    /// freshness is presence-bound (refreshed on every register poll
-    /// instead of the 10-minute TTL), and a claim against it requires the
-    /// arm step before the challenge fires.
-    #[serde(default)]
-    claim_code_daemon_minted: bool,
     claim_code_created_unix_ms: Option<u64>,
+    /// Latest accepted signed registration timestamp. Equal replays are
+    /// idempotent only when they carry the same code hash; older proofs can
+    /// never restore a superseded route code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_registration_proof_unix_ms: Option<u64>,
+    /// Monotonic route-association generation. Claim and release mutations
+    /// increment it so a delayed signed release cannot unlink a newer claim.
+    #[serde(default)]
+    route_link_revision: u64,
+    /// Latest consumed daemon-signed release timestamp. Persisting it makes a
+    /// captured release single-use across service restarts and later claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_unclaim_proof_unix_ms: Option<u64>,
     registered_unix_ms: u64,
     last_seen_unix_ms: u64,
     updated_unix_ms: u64,
@@ -820,6 +918,15 @@ struct FleetTargetRecord {
     // service stores it blind.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     enc_fields: String,
+    // Owner-set trust tier (docs/src/trust-tiers.md): part of the signed
+    // v4 record payload, relayed verbatim. The service never interprets
+    // it — clients verify it under the record signature.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    tier: String,
+    // Owner-chosen petname (signed v5 line): the anti-lookalike name.
+    // Same relay-blind discipline.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    petname: String,
     #[serde(default)]
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -907,13 +1014,16 @@ struct PendingClaim {
     /// payload byte-for-byte even if the handle is renamed mid-claim.
     account_name: String,
     daemon_id: String,
+    /// Daemon identity key snapshot for this code generation. Key rotation
+    /// invalidates the pending association just like code rotation does.
+    daemon_public_key: String,
     challenge: String,
     created_unix_ms: u64,
-    /// First-owner bootstrap (daemon-minted phrase): the challenge does
-    /// not fire until the browser arms the claim with its identity key
-    /// and phrase-derived tag.
-    bootstrap_required: bool,
-    armed: bool,
+    /// Exact one-time code generation this claim started against. A later
+    /// proof cannot win after the code was rotated, consumed, or claimed
+    /// by a competing account.
+    claim_code_hash: String,
+    claim_code_created_unix_ms: u64,
     status: ClaimStatus,
 }
 
@@ -1019,6 +1129,22 @@ fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
     save_store(&state.config.data_file, store).map_err(ApiError::internal)
 }
 
+/// Apply a durable store mutation transactionally: serialize/write the cloned
+/// next state first, then publish it to the in-memory store. A failed disk
+/// write therefore cannot leave memory ahead of durable state and poison an
+/// otherwise valid retry (notably account/daemon route release).
+fn update_store_transaction<R>(
+    store: &mut Store,
+    mutate: impl FnOnce(&mut Store) -> ApiResult<R>,
+    persist: impl FnOnce(&Store) -> ApiResult<()>,
+) -> ApiResult<R> {
+    let mut next = store.clone();
+    let result = mutate(&mut next)?;
+    persist(&next)?;
+    *store = next;
+    Ok(result)
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1085,10 +1211,6 @@ fn daemon_fleet_target_view(config: &ServiceConfig, daemon: &DaemonRecord) -> se
         .as_deref()
         .filter(|label| !label.trim().is_empty())
         .unwrap_or(&daemon.daemon_id);
-    let url = format!(
-        "/app?connect=1&daemon_id={}",
-        form_urlencoded::byte_serialize(daemon.daemon_id.as_bytes()).collect::<String>()
-    );
     let online = now.saturating_sub(daemon.last_seen_unix_ms) < 45_000;
     json!({
         "id": daemon.daemon_id,
@@ -1096,20 +1218,22 @@ fn daemon_fleet_target_view(config: &ServiceConfig, daemon: &DaemonRecord) -> se
         "label": label,
         "local": false,
         "source": "connect_daemon",
-        "access_domain": "user_client",
-        "access_domain_label": "User/client access",
+        "access_domain": "route_metadata",
+        "access_domain_label": "Route metadata only",
         "route": "hosted_connect",
         "route_label": "Hosted Connect",
-        "auth": "connect_account",
-        "auth_label": "Connect account",
-        "effective_role": "root",
-        "effective_role_label": "Root",
+        "auth": "none",
+        "auth_label": "No daemon authentication",
+        "effective_role": "none",
+        "effective_role_label": "No access",
         "profile": "",
         "connected": online,
         "online": online,
         "claimed_daemon": true,
         "daemon_public_key": daemon.daemon_public_key,
-        "url": url,
+        // Route/account metadata is deliberately not an openable control
+        // target in the default hosted build.
+        "url": "",
         "ws_url": "",
         "browser_tcp_via_url": "",
         "origin": config.public_origin,
@@ -1146,6 +1270,8 @@ fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
         "browser_tcp_via_url": target.browser_tcp_via_url,
         "connect_signaling_base": target.connect_signaling_base,
         "enc_fields": target.enc_fields,
+        "tier": target.tier,
+        "petname": target.petname,
         "origin": target.origin,
         "connect_daemon_id": target.connect_daemon_id,
         "capabilities": target.capabilities,
@@ -1235,5 +1361,4 @@ mod tests {
         assert_eq!(hours.len(), PRESENCE_HOURS_KEPT);
         assert_eq!(*hours.last().unwrap(), 209);
     }
-
 }

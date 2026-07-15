@@ -1,3 +1,8 @@
+// Item F4: pointer moves ('mm') deliberately dropped by displayInput's
+// bufferedAmount watermark instead of queueing behind a congested shared
+// tunnel. Page-session counter, surfaced via qa.liveDisplay().
+let dashboardControlTunnelPointerMovesDropped = 0;
+
 class DashboardControlTransport {
   constructor() {
     this.pc = null;
@@ -161,7 +166,16 @@ class DashboardControlTransport {
   }
 
   scheduleReconnect(reason, options = {}) {
-    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardConnectModeEnabled()) return;
+    // Reconnect whenever this tunnel is WANTED: the primary event lane
+    // (hosted Connect, the macOS-app mTLS posture, the capability
+    // fallback — losing the tunnel there means losing events entirely)
+    // or the explicit localStorage webrtc-control opt-in (the /ws still
+    // carries events, but a lane the user asked for must self-heal
+    // rather than sit dead behind a permanently red chip). Reconnect
+    // status only narrates on the primary-event chip when the tunnel is
+    // that lane. suppressReconnect marks explicit closes (user disable,
+    // deliberate teardown before a replacement connect).
+    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardControlTunnelWanted()) return;
     scheduleDashboardConnectReconnect(reason, options);
   }
 
@@ -205,6 +219,13 @@ class DashboardControlTransport {
         dashboardControlEventsActive = true;
         dashboardRecentServerMessageKeys.clear();
         console.info('[dashboard-control] event stream subscribed');
+        // In the macOS-app mTLS posture nothing else drives the primary
+        // event chip (the legacy WS callbacks never fire); mark the lane
+        // live here. Connect mode owns its own chip transitions in the
+        // bootstrap/reconnect paths.
+        if (this.primaryDashboardControl && !dashboardConnectModeEnabled() && dashboardControlTunnelIsPrimaryEventLane()) {
+          setConnectEventStatus('ok', 'Dashboard events are live through the control tunnel');
+        }
         dashboardUpdateTransportStatus();
       }
     }).catch(err => console.warn('[dashboard-control] event subscribe failed', err));
@@ -273,7 +294,13 @@ class DashboardControlTransport {
       return;
     }
     if (msg.t === 'event_gap') {
-      console.warn('[dashboard-control] event gap', msg.skipped || 0);
+      // Only the primary transport's gaps drive the recovery UX; a peer
+      // tunnel's gap is that peer pane's concern, not the local chip's.
+      if (this.primaryDashboardControl) {
+        dashboardHandleEventGap(msg, 'tunnel');
+      } else {
+        console.warn('[dashboard-control] peer event gap', msg.skipped || 0);
+      }
       dashboardUpdateTransportStatus();
       return;
     }
@@ -739,11 +766,31 @@ class DashboardControlTransport {
 
   displayInput(displayId, event) {
     if (!this.canUseRpc()) return false;
-    this.sendFrame({
-      t: 'display_input',
-      display_id: Number(displayId) || 0,
-      event,
-    });
+    // This channel is reliable+ordered and shared with every RPC,
+    // upload, and terminal frame. Continuous latest-wins pointer moves
+    // must never queue behind a backlog here — stale moves replayed in
+    // order read as catastrophic remote-control lag. Above the
+    // watermark, dropping the move is the honest choice (the next one
+    // supersedes it); discrete events (kd/ku/md/mu) always send. The
+    // per-display lossy `pointer` datachannel is the preferred mm/sc
+    // lane anyway (DisplaySlot._enterInteractive) — this path is its
+    // fallback.
+    if (event?.t === 'mm' &&
+        this.channel.bufferedAmount > DASHBOARD_CONTROL_INPUT_MOVE_DROP_BUFFERED_BYTES) {
+      dashboardControlTunnelPointerMovesDropped += 1;
+      return true; // handled: deliberately dropped — never reroute a stale move
+    }
+    try {
+      this.sendFrame({
+        t: 'display_input',
+        display_id: Number(displayId) || 0,
+        event,
+      });
+    } catch (_) {
+      // Close race / full SCTP buffer: report unsent so the slot can
+      // fall back to its own data channels.
+      return false;
+    }
     return true;
   }
 
@@ -914,8 +961,14 @@ class DashboardControlTransport {
 
   sendWsSignal(frame) {
     if (app && app.send_server_action) {
-      app.send_server_action(frame);
-      return true;
+      // send_server_action reports whether the frame was handed to an OPEN
+      // legacy /ws socket (false: socket missing, not open, or the send
+      // threw). In the macOS-app mTLS posture that socket never connects,
+      // so a refused send must fail the handshake immediately instead of
+      // letting the caller wait out the 30 s readiness poll on an offer
+      // that never left the browser. QA probes stub send_server_action
+      // with undefined-returning counters; only an explicit false refuses.
+      return app.send_server_action(frame) !== false;
     }
     return false;
   }
@@ -948,6 +1001,7 @@ class DashboardControlTransport {
           daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
           sdp,
           client_nonce: this.clientNonce,
+          tab_id: INTENDANT_TAB_ID,
           ...identity,
           ...(orgGrant ? { org_grant: orgGrant } : {}),
         });
@@ -972,6 +1026,7 @@ class DashboardControlTransport {
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
+        tab_id: INTENDANT_TAB_ID,
         ...identity,
         ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
@@ -983,11 +1038,16 @@ class DashboardControlTransport {
       return answer;
     } catch (err) {
       console.warn('[dashboard-control] local offer signaling failed', err);
-      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce })) {
+      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce, tab_id: INTENDANT_TAB_ID })) {
         this.signalingMode = 'websocket-fallback';
         dashboardUpdateTransportStatus();
         return null;
       }
+      // Both signaling lanes refused (local HTTP failed, no open /ws for
+      // the fallback): the offer never left the browser. Classify as a
+      // signaling failure — connect() rejects, startControl resolves
+      // false, and the reconnect runner fails the cycle right away.
+      if (!err.controlErrorKind) err.controlErrorKind = 'signaling';
       throw err;
     }
   }
@@ -1096,6 +1156,20 @@ class DashboardControlTransport {
 
   debugStatus() {
     const connected = this.pc?.connectionState === 'connected';
+    // Availability booleans, derived by iterating the daemon's status
+    // frame instead of hand-copying every `*_available` flag (browser-side
+    // "derive, don't mirror"): each snake_case `*_available` key the
+    // daemon reports appears as its camelCase twin (dashboardControlCamelKey
+    // preserves the historical `WebRtc` hump). Keys the daemon does not
+    // report simply don't appear — consumers already treat missing and
+    // null alike as "unknown".
+    const availability = {};
+    if (this.lastStatus && typeof this.lastStatus === 'object') {
+      for (const [key, value] of Object.entries(this.lastStatus)) {
+        if (!key.endsWith('_available')) continue;
+        availability[dashboardControlCamelKey(key)] = value ?? null;
+      }
+    }
     return {
       enabled: dashboardControlTransportEnabled(),
       mode: connected && this.verifiedBinding ? 'webrtc-control' : 'checking',
@@ -1118,100 +1192,7 @@ class DashboardControlTransport {
       grantKind: this.lastStatus?.grant_kind ?? null,
       grantLabel: this.lastStatus?.grant_label ?? null,
       accessPrincipal: this.lastStatus?.access_principal ?? null,
-      apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
-      apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
-      apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
-      apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
-      apiDisplayBootstrapAvailable: this.lastStatus?.api_display_bootstrap_available ?? null,
-      apiDisplayInputAuthorityAvailable: this.lastStatus?.api_display_input_authority_available ?? null,
-      apiDisplayWebRtcSignalAvailable: this.lastStatus?.api_display_webrtc_signal_available ?? null,
-      apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
-      apiExternalSessionActivityReplayAvailable: this.lastStatus?.api_external_session_activity_replay_available ?? null,
-      apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,
-      apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
-      apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
-      apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
-      byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
-      uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
-      terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
-      presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
-      presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
-      presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
-      accessInspectAvailable: this.lastStatus?.access_inspect_available ?? null,
-      accessManageAvailable: this.lastStatus?.access_manage_available ?? null,
-      apiAccessIamUpsertUserClientGrantAvailable: this.lastStatus?.api_access_iam_upsert_user_client_grant_available ?? null,
-      apiAccessIamUpdateGrantAvailable: this.lastStatus?.api_access_iam_update_grant_available ?? null,
-      peerInspectAvailable: this.lastStatus?.peer_inspect_available ?? null,
-      peerManageAvailable: this.lastStatus?.peer_manage_available ?? null,
-      apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
-      apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
-      apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
-      apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
-      apiSessionAgentOutputAvailable: this.lastStatus?.api_session_agent_output_available ?? null,
-      apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
-      apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
-      apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
-      apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
-      apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
-      apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
-      apiSessionContextSnapshotAvailable: this.lastStatus?.api_session_context_snapshot_available ?? null,
-      apiSessionCurrentUploadAvailable: this.lastStatus?.api_session_current_upload_available ?? null,
-      apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
-      apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
-      apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
-      apiTransferJobsAvailable: this.lastStatus?.api_transfer_jobs_available ?? null,
-      apiTransferJobCreateAvailable: this.lastStatus?.api_transfer_job_create_available ?? null,
-      apiTransferJobDeleteAvailable: this.lastStatus?.api_transfer_job_delete_available ?? null,
-      apiTransferDownloadReadAvailable: this.lastStatus?.api_transfer_download_read_available ?? null,
-      apiTransferUploadChunkAvailable: this.lastStatus?.api_transfer_upload_chunk_available ?? null,
-      apiTransferUploadCommitAvailable: this.lastStatus?.api_transfer_upload_commit_available ?? null,
-      apiMediaEditorAvailable: this.lastStatus?.api_media_editor_available ?? null,
-      apiMediaAnnotationAttachAvailable: this.lastStatus?.api_media_annotation_attach_available ?? null,
-      apiMediaAnnotationSubmitAvailable: this.lastStatus?.api_media_annotation_submit_available ?? null,
-      apiMediaClipStartAvailable: this.lastStatus?.api_media_clip_start_available ?? null,
-      apiMediaClipFrameAvailable: this.lastStatus?.api_media_clip_frame_available ?? null,
-      apiMediaClipEndAvailable: this.lastStatus?.api_media_clip_end_available ?? null,
-      apiMediaClipCancelAvailable: this.lastStatus?.api_media_clip_cancel_available ?? null,
-      apiFsStatAvailable: this.lastStatus?.api_fs_stat_available ?? null,
-      apiFsListAvailable: this.lastStatus?.api_fs_list_available ?? null,
-      apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
-      apiFsReadAvailable: this.lastStatus?.api_fs_read_available ?? null,
-      apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
-      apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
-      apiSettingsSaveAvailable: this.lastStatus?.api_settings_save_available ?? null,
-      apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
-      apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
-      apiDashboardActionMsgAvailable: this.lastStatus?.api_dashboard_action_msg_available ?? null,
-      apiDiagnosticsVisualFreshnessAvailable: this.lastStatus?.api_diagnostics_visual_freshness_available ?? null,
-      apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
-      apiApiKeysSaveAvailable: this.lastStatus?.api_api_keys_save_available ?? null,
-      apiVoiceSessionAvailable: this.lastStatus?.api_voice_session_available ?? null,
-      apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
-      apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
-      apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
-      apiRecordingAssetAvailable: this.lastStatus?.api_recording_asset_available ?? null,
-      apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
-      apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
-      apiSessionFrameAssetAvailable: this.lastStatus?.api_session_frame_asset_available ?? null,
-      apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
-      apiWorktreesInspectAvailable: this.lastStatus?.api_worktrees_inspect_available ?? null,
-      apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
-      apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
-      apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
-      apiMcpToolCallAvailable: this.lastStatus?.api_mcp_tool_call_available ?? null,
-      apiPeerMutationsAvailable: this.lastStatus?.api_peer_mutations_available ?? null,
-      apiPeerPairingAvailable: this.lastStatus?.api_peer_pairing_available ?? null,
-      apiPeerPairingInviteAvailable: this.lastStatus?.api_peer_pairing_invite_available ?? null,
-      apiPeerPairingJoinAvailable: this.lastStatus?.api_peer_pairing_join_available ?? null,
-      apiPeerPairingRequestAccessAvailable: this.lastStatus?.api_peer_pairing_request_access_available ?? null,
-      apiPeerPairingRequestDecisionAvailable: this.lastStatus?.api_peer_pairing_request_decision_available ?? null,
-      apiPeerPairingRequestsAvailable: this.lastStatus?.api_peer_pairing_requests_available ?? null,
-      apiPeerPairingIdentitiesAvailable: this.lastStatus?.api_peer_pairing_identities_available ?? null,
-      apiPeerPairingIdentityRevokeAvailable: this.lastStatus?.api_peer_pairing_identity_revoke_available ?? null,
-      apiPeerWebRtcSignalAvailable: this.lastStatus?.api_peer_webrtc_signal_available ?? null,
-      apiPeerFileTransferSignalAvailable: this.lastStatus?.api_peer_file_transfer_signal_available ?? null,
-      apiPeerDashboardControlSignalAvailable: this.lastStatus?.api_peer_dashboard_control_signal_available ?? null,
-      apiCoordinatorAvailable: this.lastStatus?.api_coordinator_available ?? null,
+      ...availability,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
       pendingByteStreams: this.byteStreams.size,
@@ -1377,6 +1358,17 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
     if (this.advertiseTcpViaUrl) {
       signal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
     }
+    // Delegation-lane attribution (trust-tiers § Two lanes): sign the
+    // offer with this browser's identity key so the TARGET can record
+    // who is behind the relayed channel (and refuse a spliced one).
+    // daemonId = the target we mean; the target verifies it meant it.
+    // No identity key (unsupported browser) → unattributed, admitted.
+    try {
+      const fields = await clientIdentityOfferFields(this.hostId, this.clientNonce, sdp);
+      if (fields) Object.assign(signal, fields);
+    } catch (err) {
+      console.warn(`[peer-dashboard-control ${this.hostId}] offer attribution skipped:`, err?.message || err);
+    }
     await this.sendSignal(signal, options);
     return null;
   }
@@ -1390,6 +1382,8 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
   }
 
   async sendSignal(signal, options = {}) {
+    // Facade envelope (transport F5): {ok, status, body} — a delivered
+    // error response is final (no replay lane exists for signaling).
     const resp = await dashboardTransport.peerDashboardControlSignal(this.hostId, {
       session_id: this.sessionId,
       signal,
@@ -1397,8 +1391,7 @@ class PeerDashboardControlConnection extends DashboardControlTransport {
       signal: options.signal,
     });
     if (!resp.ok) {
-      const detail = await resp.json().catch(() => ({}));
-      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${resp.body?.error || 'unknown'}`);
     }
   }
 
@@ -1520,6 +1513,78 @@ function handlePeerDashboardControlSignal(hostId, sessionId, signal) {
   }
 }
 
+// snake_case → camelCase for status-frame keys (debugStatus derive).
+// `webrtc` keeps its historical `WebRtc` hump: the QA harnesses
+// (validate-dashboard-control-local-signaling.cjs) assert
+// `apiPeerWebRtcSignalAvailable` by that exact name.
+function dashboardControlCamelKey(key) {
+  return String(key || '')
+    .replace(/_([a-z0-9])/g, (_, ch) => ch.toUpperCase())
+    .replace(/Webrtc/g, 'WebRtc');
+}
+
+// ── event_gap recovery ──
+// Both event lanes can report dropped events: the dashboard-control tunnel
+// emits {"t":"event_gap","skipped":N} when its outbound event queue
+// overflows, and the /ws lane is gaining a frame with the same shape. One
+// coalescing window (from the FIRST gap) turns any burst into: a pulse on
+// the lane's status chip, a single "Recovering N missed events…" toast,
+// and one state refresh (sessions metadata + timeline re-pull, plus a
+// rate-limited full bootstrap re-pull over the tunnel when it is up).
+const DASHBOARD_EVENT_GAP_COALESCE_MS = 1500;
+const DASHBOARD_EVENT_GAP_HYDRATE_MIN_INTERVAL_MS = 30000;
+let dashboardEventGapPendingSkipped = 0;
+let dashboardEventGapToastTimer = null;
+let dashboardEventGapLastHydrateAt = 0;
+
+// Visual pulse on the status chip for the lane that reported the gap —
+// Web Animations API only, so no stylesheet dependency.
+function dashboardPulseEventLaneChip(lane) {
+  const id = lane === 'ws' ? 'sb-conn-group' : 'sb-dashboard-transport';
+  const el = document.getElementById(id) || document.getElementById('sb-conn-group');
+  if (!el || typeof el.animate !== 'function') return;
+  try {
+    el.animate(
+      [{ opacity: 1 }, { opacity: 0.25 }, { opacity: 1 }],
+      { duration: 380, iterations: 3, easing: 'ease-in-out' }
+    );
+  } catch (_) {}
+}
+
+function dashboardHandleEventGap(msg, lane = 'tunnel') {
+  const skipped = Math.max(0, Number(msg?.skipped) || 0);
+  dashboardEventGapPendingSkipped += skipped;
+  console.warn('[server-msg] event_gap', lane, skipped || '(count unknown)');
+  dashboardPulseEventLaneChip(lane);
+  if (dashboardEventGapToastTimer) return;
+  dashboardEventGapToastTimer = window.setTimeout(() => {
+    dashboardEventGapToastTimer = null;
+    const n = dashboardEventGapPendingSkipped;
+    dashboardEventGapPendingSkipped = 0;
+    const what = n > 0 ? `${n} missed event${n === 1 ? '' : 's'}` : 'missed events';
+    if (typeof showControlToast === 'function') {
+      showControlToast('info', `Recovering ${what}…`);
+    }
+    if (typeof scheduleSessionsMetadataRefresh === 'function') {
+      scheduleSessionsMetadataRefresh();
+    }
+    if (typeof refreshHistory === 'function') {
+      try { refreshHistory(); } catch (err) { console.warn('[server-msg] event_gap history refresh failed', err); }
+    }
+    const now = Date.now();
+    if (
+      typeof hydrateDashboardFromControl === 'function' &&
+      dashboardTransport?.canUseRpc?.() &&
+      now - dashboardEventGapLastHydrateAt > DASHBOARD_EVENT_GAP_HYDRATE_MIN_INTERVAL_MS
+    ) {
+      dashboardEventGapLastHydrateAt = now;
+      hydrateDashboardFromControl().catch(err => {
+        console.warn('[server-msg] event_gap bootstrap re-pull failed', err);
+      });
+    }
+  }, DASHBOARD_EVENT_GAP_COALESCE_MS);
+}
+
 function dashboardControlAbortError(message = 'dashboard control request aborted') {
   try {
     return new DOMException(message, 'AbortError');
@@ -1578,6 +1643,67 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_session_detail':
       return 15000;
+    // Peer quick controls cross the federation transport and wait for the
+    // remote daemon's ack — the generic 5 s default was sized for local
+    // reads, not a peer round trip (transport F5's deliberate
+    // normalization; the legacy HTTP lane ran signal-less). The same
+    // budget covers the dials that reach a REMOTE daemon before
+    // answering: peer add (card fetch + transport spawn), pairing
+    // join/request-access/poll (doorbell round trips), and coordinator
+    // routing (delegation ack).
+    case 'api_peer_message':
+    case 'api_peer_task':
+    case 'api_peer_approval':
+    case 'api_peer_add':
+    case 'api_peer_pairing_join':
+    case 'api_peer_pairing_request_access':
+    case 'api_peer_pairing_request_access_poll':
+    case 'api_coordinator_route':
+      return 30000;
+    // Credential custody (transport F6): the sealed vault blob rides the
+    // chunked, credit-gated response lane and can run to hundreds of KiB
+    // over a TURN link. The family's pre-facade caller asked for 15 s and
+    // was silently clamped to the 5 s default (this verb ignores
+    // options.timeoutMs) — this table is where that intent actually
+    // lives.
+    case 'api_credential_lease_grant':
+    case 'api_credential_lease_renew':
+    case 'api_credential_lease_revoke':
+    case 'api_credential_lease_status':
+    case 'api_credential_custody_trail':
+    case 'api_credential_egress_register':
+    case 'api_credential_egress_unregister':
+    case 'api_daemon_vault_fetch':
+    case 'api_daemon_vault_publish':
+    case 'api_daemon_vault_deposit_key_fetch':
+    case 'api_daemon_vault_deposit_key_publish':
+    case 'api_daemon_vault_deposits_fetch':
+    case 'api_daemon_vault_deposits_consume':
+      return 15000;
+    // The egress probe reaches beyond this daemon before answering:
+    // daemon -> the relaying browser -> the provider's API -> back. Same
+    // budget as the peer round trips above.
+    case 'api_credential_egress_probe':
+      return 30000;
+    // The control-msg trio (transport F7): interrupts, session lifecycle,
+    // and dashboard actions dispatched while a busy daemon is mid-turn.
+    // The pre-facade call sites asked for 10-15 s and were silently
+    // clamped to the 5 s default (this verb ignores options.timeoutMs) —
+    // the table row is where that intent actually lives.
+    case 'api_control_msg':
+      return 10000;
+    case 'api_session_control_msg':
+    case 'api_dashboard_action_msg':
+      return 15000;
+    // Display WebRTC signaling (transport F7): the offer leg waits for
+    // the server's full answer negotiation (encoder spawn included) and
+    // asked for 30 s pre-facade; ICE posts share the method and resolve
+    // fast, so the longer budget is harmless there. The visual-freshness
+    // transcript flush asked for 10 s.
+    case 'api_display_webrtc_signal':
+      return 30000;
+    case 'api_diagnostics_visual_freshness':
+      return 10000;
     default:
       return 5000;
   }
@@ -1664,6 +1790,10 @@ function sessionDetailErrorIsMissing(data) {
   return String(data?.error || '').trim().toLowerCase() === 'session not found';
 }
 
+// daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+// fallback policy. Callers keep the payload-with-error contract this
+// helper always had — errors surface as data.error, never as throws for
+// delivered responses (sessionDetailErrorIsMissing keys off that).
 async function fetchSessionDetailPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -1675,33 +1805,25 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.before !== undefined && options.before !== null) {
     params.before = options.before;
   }
-  return dashboardTransport.rpcOrHttp('api_session_detail', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    if (options.limit !== undefined && options.limit !== null) {
-      query.set('limit', String(options.limit));
-    }
-    if (options.before !== undefined && options.before !== null) {
-      query.set('before', String(options.before));
-    }
-    const fetchOptions = {};
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    return data;
-  }, 'api_session_detail', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_detail', params, {
+    signal: options.signal,
+    cache: options.cache,
+  });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
+// daemonApi (transport F8a): tunnel first, HTTP twin fallback — a
+// POST-shaped read (the body carries output ids; nothing is written), so
+// the verb-derived policy never replays an attempted send. Callers keep
+// the payload-with-error contract this helper always had — errors surface
+// as data.error, never as throws for delivered responses (the same shape
+// fetchSessionDetailPayload pins above).
 async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) throw new Error('missing session id');
@@ -1710,31 +1832,18 @@ async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
     ? options.ids.map(id => String(id || '').trim()).filter(Boolean)
     : [];
   if (!ids.length) throw new Error('missing output ids');
-  const params = { session_id: sid, source, ids };
-  return dashboardTransport.rpcOrHttp('api_session_agent_output', params, async () => {
-    const query = new URLSearchParams();
-    query.set('source', source);
-    const fetchOptions = {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids }),
-    };
-    if (options.signal) fetchOptions.signal = options.signal;
-    if (options.cache) fetchOptions.cache = options.cache;
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}/agent-output?${query.toString()}`, fetchOptions);
-    let data = {};
-    try {
-      data = await resp.json();
-    } catch {
-      data = {};
-    }
-    if (!resp.ok && !data.error) {
-      data.error = resp.statusText || `HTTP ${resp.status}`;
-    }
-    data._httpStatus = resp.status;
-    data._httpOk = resp.ok;
-    return data;
-  }, 'api_session_agent_output', { signal: options.signal });
+  const resp = await daemonApi.request('api_session_agent_output', {
+    session_id: sid,
+    source,
+    ids,
+  }, { signal: options.signal, cache: options.cache });
+  const data = (resp.body && typeof resp.body === 'object' && !Array.isArray(resp.body))
+    ? resp.body
+    : {};
+  if (!resp.ok && !data.error) {
+    data.error = `HTTP ${resp.status}`;
+  }
+  return data;
 }
 
 async function fetchSessionsSearchPayload(options = {}) {
@@ -1747,54 +1856,106 @@ async function fetchSessionsSearchPayload(options = {}) {
   const projects = Array.isArray(options.projects)
     ? options.projects.map(value => String(value || '').trim()).filter(Boolean)
     : [];
-  return dashboardTransport.rpcOrHttp('api_sessions_search', {
+  // Progress lane first: the HTTP route streams NDJSON progress lines
+  // when asked (stream=ndjson) — one {"type":"deep_search_progress",...}
+  // every ~250 scanned sessions, then the legacy body as the final line.
+  // Hosted/tunnel-only dashboards have no direct HTTP origin: the fetch
+  // fails before any bytes and we fall through to the buffered lane.
+  const streamed = await fetchSessionsSearchStreaming({ query, source, mode, projects, signal: options.signal });
+  if (streamed) return streamed;
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy; the descriptor JSON-encodes `projects` on the HTTP
+  // lane exactly as the hand-built fallback did.
+  const resp = await daemonApi.request('api_sessions_search', {
     q: query,
     source,
     mode,
     projects,
-  }, async () => {
-    const params = new URLSearchParams({ q: query, source, mode });
-    if (projects.length > 0) {
-      params.set('projects', JSON.stringify(projects));
-    }
-    const resp = await authedFetch(`/api/sessions/search?${params.toString()}`, {
-      signal: options.signal,
-    });
-    if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
-    return resp.json();
-  }, 'api_sessions_search', { signal: options.signal });
+  }, { signal: options.signal });
+  if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
+  return resp.body;
 }
 
+async function fetchSessionsSearchStreaming({ query, source, mode, projects, signal }) {
+  if (typeof fetch !== 'function' || !/^https?:$/.test(location.protocol)) return null;
+  const params = new URLSearchParams({ q: query, stream: 'ndjson' });
+  if (source) params.set('source', source);
+  if (mode) params.set('mode', mode);
+  if (projects && projects.length) params.set('projects', JSON.stringify(projects));
+  let resp;
+  try {
+    resp = await fetch('/api/sessions/search?' + params.toString(), {
+      signal,
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/x-ndjson' },
+    });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw e;
+    return null; // no direct HTTP lane — buffered fallback
+  }
+  if (!resp.ok || !resp.body) return null;
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let finalPayload = null;
+  const consumeLine = (line) => {
+    const text = line.trim();
+    if (!text) return;
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { return; }
+    if (parsed && parsed.type === 'deep_search_progress') {
+      if (typeof applySessionDeepSearchProgress === 'function') {
+        try { applySessionDeepSearchProgress(parsed); } catch (err) { console.warn('[deep-search] progress render failed', err); }
+      }
+      return;
+    }
+    finalPayload = parsed;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      consumeLine(buf.slice(0, nl));
+      buf = buf.slice(nl + 1);
+    }
+  }
+  buf += decoder.decode();
+  if (buf.trim()) consumeLine(buf);
+  if (finalPayload === null) throw new Error('/api/sessions/search stream ended without a result');
+  return finalPayload;
+}
+
+// The F3 settings/keys-family reads (below): daemonApi — tunnel first,
+// direct HTTP per the GET-twin fallback policy. These tunnel results ride
+// the body-only envelope (no injected status), so `resp.ok` reflects the
+// HTTP lane exactly where the legacy fallbacks threw on !resp.ok, and the
+// historical always-200 error bodies (settings GET's
+// {"error":"No project root"}) still arrive as ok bodies for callers to
+// inspect.
 async function fetchDashboardSettings() {
-  return dashboardTransport.rpcOrHttp('api_settings', {}, async () => {
-    const resp = await fetch('/api/settings');
-    if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
-    return resp.json();
-  }, 'api_settings');
+  const resp = await daemonApi.request('api_settings');
+  if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchApiKeyStatus() {
-  return dashboardTransport.rpcOrHttp('api_key_status', {}, async () => {
-    const resp = await fetch('/api/api-key-status');
-    if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
-    return resp.json();
-  }, 'api_key_status');
+  const resp = await daemonApi.request('api_key_status');
+  if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchExternalAgentAvailability() {
-  return dashboardTransport.rpcOrHttp('api_external_agents', {}, async () => {
-    const resp = await fetch('/api/external-agents');
-    if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
-    return resp.json();
-  }, 'api_external_agents');
+  const resp = await daemonApi.request('api_external_agents');
+  if (!resp.ok) throw new Error(`/api/external-agents returned ${resp.status}`);
+  return resp.body;
 }
 
 async function fetchProjectRoot() {
-  return dashboardTransport.rpcOrHttp('api_project_root', {}, async () => {
-    const resp = await fetch('/api/project-root');
-    if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
-    return resp.json();
-  }, 'api_project_root');
+  const resp = await daemonApi.request('api_project_root');
+  if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
+  return resp.body;
 }
 
 function dashboardReportRpcAvailable() {
@@ -2080,25 +2241,20 @@ async function downloadSessionReportViaDashboardControl(event) {
       if (link) link.textContent = previousText || 'Download session report';
       return result;
     }
-    const useByteStream = dashboardControlTransport?.lastStatus?.byte_streams_available === true;
-    const report = useByteStream
-      ? await dashboardTransport.requestBytes('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 })
-      : await dashboardTransport.request('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 });
-    if (report?.ok === false || report?._httpOk === false) {
-      throw new Error(report.error || `Session report failed (${report._httpStatus || 'error'})`);
-    }
-    const bytes = report?.bytes instanceof Uint8Array
-      ? report.bytes
-      : dashboardControlBase64ToBytes(report?.data_base64 || '');
+    // daemonApi (transport F2): the bytes verb prefers the tunnel
+    // byte-stream lane and still decodes the pre-byte-stream JSON shape
+    // (data_base64 in the result) that old daemons answer with; a failed
+    // lane may replay the GET twin over direct HTTP (never in Connect
+    // mode). The un-intercepted direct case above keeps the native <a>
+    // navigation.
+    const { bytes, meta } = await daemonApi.bytes('api_session_report', {
+      session_id: 'current',
+    }, { timeoutMs: 120000 });
     if (!bytes.length) throw new Error('Session report was empty');
     downloadDashboardBytes(
       bytes,
-      report.filename || 'intendant-session-report.zip',
-      report.content_type || 'application/zip'
+      meta.filename || 'intendant-session-report.zip',
+      meta.contentType || 'application/zip'
     );
   } catch (err) {
     console.warn('[dashboard-control] api_session_report RPC failed', err);
@@ -2120,12 +2276,13 @@ function normalizeDisplaysPayload(payload) {
 }
 
 async function fetchLocalDisplaysPayload() {
-  return dashboardTransport.rpcOrHttp('api_displays', {}, async () => {
-    const resp = await authedFetch('/api/displays');
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    return data;
-  }, 'api_displays');
+  // daemonApi (transport F3): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (the HTTP error body's message survives as before).
+  const resp = await daemonApi.request('api_displays');
+  if (!resp.ok) {
+    throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
+  }
+  return resp.body;
 }
 
 function dashboardControlBindingPayload(binding) {
@@ -2552,23 +2709,13 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    let data = null;
-    if (dashboardTransport?.canUseRpc()) {
-      try {
-        data = await dashboardTransport.request('api_peers');
-      } catch (err) {
-        if (dashboardConnectModeEnabled()) throw err;
-        console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
-      }
-    }
-    if (!data && dashboardConnectModeEnabled()) {
-      throw new Error('Peer list is unavailable until dashboard access reconnects');
-    }
-    if (!data) {
-      const resp = await authedFetch('/api/peers');
-      if (!resp.ok) return;
-      data = await resp.json();
-    }
+    // GET twin (transport F5): tunnel first, direct-HTTP fallback per the
+    // verb-derived read policy, never HTTP in Connect mode — the exact
+    // legacy tri-form this replaces. A delivered error response leaves
+    // the stale list in place, like the legacy !resp.ok return did.
+    const resp = await daemonApi.request('api_peers');
+    if (!resp.ok) return;
+    const data = resp.body || {};
     if (!data.peers || !Array.isArray(data.peers)) return;
 
     // Build the new daemon entries from the API response via the
@@ -2950,10 +3097,3 @@ function applyDaemonExpandedState(hostId, expanded) {
     btn.title = expanded ? 'Hide peer controls' : 'Show peer controls';
   }
 }
-
-// POST a message to a peer via /api/peers/{id}/message and surface
-// the result in the row's status line. The peer id is embedded in
-// the URL path verbatim — colons are valid path chars per RFC 3986
-// and the server-side parser splits on the literal `:` to recover
-// the kind prefix; URL-encoding `:` as `%3A` would break the lookup
-// because the registry keys on the un-encoded id.

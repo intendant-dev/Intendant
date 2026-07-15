@@ -54,6 +54,7 @@ struct SessionCounters {
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    cache_creation_tokens: u64,
     budget_pct: f64,
     last: Option<TokenUsage>,
 }
@@ -102,6 +103,7 @@ impl UsageRailState {
             prompt_tokens: counters.prompt_tokens,
             completion_tokens: counters.completion_tokens,
             cached_tokens: counters.cached_tokens,
+            cache_creation_tokens: counters.cache_creation_tokens,
             last_cache_read_tokens: last.map(|u| u.cached_tokens).unwrap_or(0),
             last_cache_creation_tokens: last.map(|u| u.cache_creation_tokens).unwrap_or(0),
             last_uncached_input_tokens: last
@@ -164,7 +166,8 @@ impl UsageRailState {
                 let has_usage = usage.total_tokens > 0
                     || usage.prompt_tokens > 0
                     || usage.completion_tokens > 0
-                    || usage.cached_tokens > 0;
+                    || usage.cached_tokens > 0
+                    || usage.cache_creation_tokens > 0;
                 if !has_usage {
                     return None;
                 }
@@ -177,6 +180,7 @@ impl UsageRailState {
                 counters.prompt_tokens += usage.prompt_tokens;
                 counters.completion_tokens += usage.completion_tokens;
                 counters.cached_tokens += usage.cached_tokens;
+                counters.cache_creation_tokens += usage.cache_creation_tokens;
                 counters.last = Some(usage.clone());
                 let main = Self::snapshot(&self.identity, counters);
                 self.evict_over_cap();
@@ -273,8 +277,9 @@ mod tests {
         with_limits.cache_ttl_seconds = Some(300);
         with_limits.rate_limit_windows = vec![crate::types::SessionLimitWindow {
             label: "5h".into(),
-            used_pct: 42,
+            used_pct: Some(42),
             resets_at_epoch: None,
+            status: None,
         }];
         let second = rail
             .on_event(&response(Some("s1"), with_limits))
@@ -287,7 +292,7 @@ mod tests {
                 assert_eq!(main.last_uncached_input_tokens, 50);
                 assert_eq!(main.cache_ttl_seconds, Some(300));
                 assert_eq!(main.limits.len(), 1);
-                assert_eq!(main.limits[0].used_pct, 42);
+                assert_eq!(main.limits[0].used_pct, Some(42));
             }
             other => panic!("expected UsageSnapshot, got {other:?}"),
         }
@@ -297,7 +302,9 @@ mod tests {
     #[test]
     fn zero_usage_responses_are_ignored() {
         let mut rail = UsageRailState::new(identity());
-        assert!(rail.on_event(&response(Some("s1"), usage(0, 0, 0))).is_none());
+        assert!(rail
+            .on_event(&response(Some("s1"), usage(0, 0, 0)))
+            .is_none());
     }
 
     /// Events without a session id scope to the foreground session

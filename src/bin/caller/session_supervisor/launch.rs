@@ -6,6 +6,21 @@
 use super::*;
 
 impl SessionSupervisor {
+    /// Register a launched session's effective project root as its
+    /// git-vitals probe target (worktree sessions pass their checkout).
+    /// No-op when the daemon runs without the vitals producer.
+    fn register_git_vitals(&self, session_id: &str, root: &std::path::Path) {
+        if let Some(targets) = self.config.git_vitals_targets.as_ref() {
+            targets.register(session_id, root.to_path_buf());
+        }
+    }
+
+    /// Create and dispatch a new managed session. Returns the launched
+    /// session id once the task is actually dispatched (the peer-
+    /// delegation receipt keys on this — see
+    /// [`Self::acknowledge_delegation`]); `None` on every failure exit,
+    /// which all narrate their own error before returning.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn start_new_session(
         &self,
         task: String,
@@ -17,6 +32,7 @@ impl SessionSupervisor {
         claude_permission_mode: Option<String>,
         claude_effort: Option<String>,
         codex_model: Option<String>,
+        codex_reasoning_effort: Option<String>,
         codex_sandbox: Option<String>,
         codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
@@ -28,20 +44,20 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         codex_service_tier: Option<String>,
         worktree: Option<SessionWorktreeRequest>,
-    ) {
+    ) -> Option<String> {
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
-        let log_dir = session_log::SessionLog::resolve_path(None);
+        let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
 
@@ -70,11 +86,11 @@ impl SessionSupervisor {
                     reason: format!("error: {reason}"),
                     error_kind: Some(NO_PROJECT_ERROR_KIND.to_string()),
                 });
-                return;
+                return None;
             }
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
         // Worktree launch: branch off the resolved project root's HEAD and
@@ -101,7 +117,7 @@ impl SessionSupervisor {
                             reason: format!("error: {reason}"),
                             error_kind: None,
                         });
-                        return;
+                        return None;
                     }
                 }
             }
@@ -115,7 +131,7 @@ impl SessionSupervisor {
             Ok(project) => project,
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
 
@@ -130,6 +146,7 @@ impl SessionSupervisor {
             task_meta,
             session_name.as_deref(),
         );
+        self.register_git_vitals(&session_id, &project.root);
         if let Some(ref meta) = worktree_meta {
             // Persist the linkage after the meta file exists; it survives
             // later meta rewrites (see SessionLog::write_meta_worktree).
@@ -160,7 +177,8 @@ impl SessionSupervisor {
                 session_id: session_id.clone(),
                 task: Some(task.clone()),
             });
-            return;
+            // Dispatched (as an ephemeral CU task session).
+            return Some(session_id);
         }
 
         let use_direct = direct.unwrap_or(false)
@@ -171,7 +189,7 @@ impl SessionSupervisor {
             Ok(selection) => selection,
             Err(e) => {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         };
         let backend = match agent_selection {
@@ -188,7 +206,7 @@ impl SessionSupervisor {
             Ok(project) => project,
             Err(e) => {
                 self.loop_error(format!("Project load failed: {}", e));
-                return;
+                return None;
             }
         };
         let agent_command = normalize_session_agent_command(agent_command.as_deref());
@@ -197,7 +215,7 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: agent_command requires an external agent".to_string(),
                 );
-                return;
+                return None;
             };
             apply_session_agent_command(&mut project, backend, command);
         }
@@ -210,11 +228,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: claude_model requires Claude Code".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_claude_model(&mut project, backend, model.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) = claude_permission_mode
@@ -227,13 +245,13 @@ impl SessionSupervisor {
                     "Session create failed: claude_permission_mode requires Claude Code"
                         .to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) =
                 apply_session_claude_permission_mode(&mut project, backend, mode.to_string())
             {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(effort) = claude_effort
@@ -245,11 +263,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: claude_effort requires Claude Code".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_claude_effort(&mut project, backend, effort.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(model) = codex_model
@@ -259,21 +277,41 @@ impl SessionSupervisor {
         {
             let Some(ref backend) = backend else {
                 self.loop_error("Session create failed: codex_model requires Codex".to_string());
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_model(&mut project, backend, model.to_string()) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
+            }
+        }
+        if let Some(effort) = codex_reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| {
+                !effort.is_empty() && !matches!(*effort, "inherit" | "default" | "global")
+            })
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: codex_reasoning_effort requires Codex".to_string(),
+                );
+                return None;
+            };
+            if let Err(e) =
+                apply_session_codex_reasoning_effort(&mut project, backend, effort.to_string())
+            {
+                self.loop_error(format!("Session create failed: {}", e));
+                return None;
             }
         }
         if let Some(mode) = normalize_session_codex_sandbox(codex_sandbox.as_deref()) {
             let Some(ref backend) = backend else {
                 self.loop_error("Session create failed: codex_sandbox requires Codex".to_string());
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_sandbox(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(policy) =
@@ -283,11 +321,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_approval_policy requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_approval_policy(&mut project, backend, policy) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) =
@@ -297,11 +335,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_managed_context requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_managed_context(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         if let Some(mode) =
@@ -311,11 +349,11 @@ impl SessionSupervisor {
                 self.loop_error(
                     "Session create failed: codex_context_archive requires Codex".to_string(),
                 );
-                return;
+                return None;
             };
             if let Err(e) = apply_session_codex_context_archive(&mut project, backend, mode) {
                 self.loop_error(format!("Session create failed: {}", e));
-                return;
+                return None;
             }
         }
         let codex_service_tier =
@@ -327,7 +365,7 @@ impl SessionSupervisor {
                     self.loop_error(
                         "Session create failed: codex_service_tier requires Codex".to_string(),
                     );
-                    return;
+                    return None;
                 }
             }
         }
@@ -382,6 +420,7 @@ impl SessionSupervisor {
         if !task.trim().is_empty() {
             emit_task_dispatched_log(&self.config.bus, &session_log, &task, attachments.len());
         }
+        let launched_session_id = session_id.clone();
         self.spawn_agent_session(
             session_id,
             source,
@@ -402,8 +441,10 @@ impl SessionSupervisor {
             None,
         )
         .await;
+        Some(launched_session_id)
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn resume_session(
         &self,
         source: String,
@@ -414,6 +455,7 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         fork: bool,
+        relationship_kind: Option<String>,
         overrides: LaunchOverrides,
         force_new: bool,
     ) {
@@ -477,9 +519,20 @@ impl SessionSupervisor {
             // Record what this session forks from. While the child's own
             // native id is unknown, spawners treat `resume == forked_from`
             // as "add the backend's fork flag"; afterwards it documents
-            // lineage and drives the `fork` relationship emit.
+            // lineage and drives the relationship emit (`fork`, or the
+            // requested kind — `side` for /btw conversations).
             if let Some(config) = session_agent_config.as_mut() {
                 config.forked_from = Some(resume_token.clone());
+                // Only vetted lineage kinds may ride the wire into persisted
+                // lineage: the kind drives frontend gating (side-window
+                // affordances), so an arbitrary string from any ResumeSession
+                // sender must not masquerade as e.g. "subagent". Unknown
+                // kinds degrade to the plain "fork" emit (None).
+                config.fork_relationship = relationship_kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|kind| *kind == "side")
+                    .map(str::to_string);
             }
         }
         let project_root = if external_backend.is_some() {
@@ -595,6 +648,7 @@ impl SessionSupervisor {
                 });
 
                 write_session_meta(&session_log, &project.root, None, None);
+                self.register_git_vitals(&session_id, &project.root);
                 if let Some(config) = effective_session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
@@ -711,7 +765,23 @@ impl SessionSupervisor {
             )
         });
 
-        write_session_meta(&session_log, &project.root, Some(&resume_task), None);
+        // A respawned side child's task is the contract prologue + question;
+        // display surfaces (session meta, SessionStarted) get the bare
+        // question while the agent still receives the full blob.
+        let display_task = crate::thread_actions::side_respawn_display_task(&resume_task)
+            .unwrap_or_else(|| resume_task.clone());
+        write_session_meta(&session_log, &project.root, Some(&display_task), None);
+        // Forks announce under the child wrapper id (see SessionStarted
+        // below); key the git probe the same way so the row lands on the
+        // child window, not the parent's.
+        self.register_git_vitals(
+            if fork {
+                &intendant_session_id
+            } else {
+                &live_session_id
+            },
+            &project.root,
+        );
         if let Some(config) = effective_session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
@@ -723,8 +793,17 @@ impl SessionSupervisor {
             .and_then(|config| config.codex_home.clone());
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
-            session_id: live_session_id.clone(),
-            task: Some(resume_task.clone()),
+            // A fork materializes a NEW wrapper session: announce it under
+            // the child's own id — the resume token is the PARENT's native
+            // id, and stamping the parent's window with the fork's task
+            // mislabels it. (Non-fork resumes keep addressing the resumed
+            // session itself.)
+            session_id: if fork {
+                intendant_session_id.clone()
+            } else {
+                live_session_id.clone()
+            },
+            task: Some(display_task.clone()),
         });
 
         let session_dir = session_log
@@ -770,7 +849,7 @@ impl SessionSupervisor {
             UserAttachments::from_items(resolved_attachments),
             None,
             Some(resume_token.clone()),
-            (external_backend.is_some() && !force_new).then(|| resume_token),
+            (external_backend.is_some() && !force_new).then_some(resume_token),
             false,
             None,
             codex_service_tier,
@@ -812,6 +891,7 @@ impl SessionSupervisor {
 }
 
 impl SessionSupervisor {
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_agent_session(
         &self,
         session_id: String,
@@ -904,8 +984,7 @@ impl SessionSupervisor {
                         // the last layer (whitelisted key names only — see
                         // provider::ProjectEnvKeys).
                         provider::select_provider_for_project(Some(&project.root))
-                    })
-                {
+                    }) {
                     Ok(provider) => provider,
                     Err(e) => {
                         supervisor
@@ -930,9 +1009,7 @@ impl SessionSupervisor {
                 let native = NativeSessionConfig {
                     role: match sub_agent_wiring.as_ref() {
                         Some(w) => w.role.clone(),
-                        None if use_direct => {
-                            sub_agent::SubAgentRole::Custom("direct".to_string())
-                        }
+                        None if use_direct => sub_agent::SubAgentRole::Custom("direct".to_string()),
                         None => sub_agent::SubAgentRole::Orchestrator,
                     },
                     system_prompt_override: sub_agent_wiring
@@ -1010,9 +1087,7 @@ impl SessionSupervisor {
                         let (brief, _) = parse_brief(&full);
                         let status = match stats.terminal_outcome.as_deref() {
                             None | Some("completed") => sub_agent::SubAgentStatus::Completed,
-                            Some(outcome) => {
-                                sub_agent::SubAgentStatus::Failed(outcome.to_string())
-                            }
+                            Some(outcome) => sub_agent::SubAgentStatus::Failed(outcome.to_string()),
                         };
                         sub_agent::SubAgentResult {
                             id: w.child_name.clone(),
@@ -1099,6 +1174,7 @@ impl SessionSupervisor {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn spawn_cu_task(
         &self,
         session_id: &str,
@@ -1137,12 +1213,7 @@ impl SessionSupervisor {
             });
             // Grant state from the autonomy guard (the single source of
             // truth), read when the CU task is dispatched.
-            let user_display_granted = supervisor
-                .config
-                .autonomy
-                .read()
-                .await
-                .user_display_granted;
+            let user_display_granted = supervisor.config.autonomy.read().await.user_display_granted;
             let cu_target = display_target
                 .as_deref()
                 .map(|s| parse_display_target_str(s, user_display_granted));
@@ -1168,7 +1239,7 @@ impl SessionSupervisor {
                         level: None,
                         turn: None,
                     });
-                    Ok(stats)
+                    Ok(*stats)
                 }
                 Ok(CuTaskResult::Escalate { task }) => {
                     bus.send(AppEvent::PresenceLog {
@@ -1351,13 +1422,17 @@ pub(crate) fn native_session_meta_project_root(session_id: &str) -> Option<PathB
     meta.project_root.map(PathBuf::from)
 }
 
-pub(crate) fn external_resume_log_dir_in_home(home: &Path, session_id: &str, force_new: bool) -> PathBuf {
+pub(crate) fn external_resume_log_dir_in_home(
+    home: &Path,
+    session_id: &str,
+    force_new: bool,
+) -> PathBuf {
     if !force_new {
         if let Some(dir) = session_log::SessionLog::find_session_by_id_in_home(home, session_id) {
             return dir;
         }
     }
-    session_log::SessionLog::resolve_path(None)
+    session_log::SessionLog::resolve_path_in_home(home, None)
 }
 
 pub(crate) fn effective_external_resume_token_in_home(
@@ -1433,8 +1508,10 @@ pub(crate) fn persisted_external_identity_for_session_in_home(
     // the wrapper index instead (`effective_external_resume_token_in_home`).
     let identity =
         crate::session_identity::scan_session_dir(&log_dir, session_id)?.latest_matching?;
-    if !external_agent::source_session_id_is_canonical(&identity.source, &identity.backend_session_id)
-    {
+    if !external_agent::source_session_id_is_canonical(
+        &identity.source,
+        &identity.backend_session_id,
+    ) {
         return None;
     }
     Some((identity.source, identity.backend_session_id))
@@ -1486,7 +1563,11 @@ pub(crate) fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-pub(crate) fn external_attach_dedupe_keys(source: &str, session_id: &str, resume_token: &str) -> Vec<String> {
+pub(crate) fn external_attach_dedupe_keys(
+    source: &str,
+    session_id: &str,
+    resume_token: &str,
+) -> Vec<String> {
     let source = source.trim().to_lowercase();
     if source.is_empty() {
         return Vec::new();
@@ -1505,7 +1586,9 @@ pub(crate) fn external_attach_dedupe_keys(source: &str, session_id: &str, resume
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_supervisor::tests::{managed_session, test_supervisor, test_supervisor_with_mock_provider};
+    use crate::session_supervisor::tests::{
+        managed_session, test_supervisor, test_supervisor_with_mock_provider,
+    };
 
     fn write_external_wrapper_identity(
         home: &Path,
@@ -1695,11 +1778,9 @@ mod tests {
     #[test]
     fn project_root_override_with_explicit_root_works_without_default() {
         let dir = tempfile::tempdir().unwrap();
-        let resolved = resolve_project_root_override(
-            Some(dir.path().to_string_lossy().to_string()),
-            None,
-        )
-        .unwrap();
+        let resolved =
+            resolve_project_root_override(Some(dir.path().to_string_lossy().to_string()), None)
+                .unwrap();
         assert_eq!(resolved, dir.path().canonicalize().unwrap());
     }
 
@@ -1967,6 +2048,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -2020,6 +2102,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )
@@ -2208,6 +2291,7 @@ mod tests {
                 Some(true),
                 Vec::new(),
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             ),
@@ -2300,6 +2384,7 @@ mod tests {
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
                 false,
+                None,
                 LaunchOverrides::default(),
                 false,
             )

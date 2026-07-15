@@ -2,7 +2,10 @@
 //! fission spawn/import, context-rewind backout and anchor list/inspect
 //! actions, subagent state emits, and the thread-action dispatcher.
 
+use crate::event::{self, AppEvent, EventBus};
+use crate::external_agent;
 use crate::project::{self, Project};
+use crate::types;
 use crate::{context_rewind, fission_ledger, fission_lifecycle, platform, provider, worktree};
 use crate::{
     drain_external_agent_events, emit_child_turn_complete, emit_child_turn_complete_for_session,
@@ -10,12 +13,9 @@ use crate::{
     external_tool_failure_content, external_tool_preview_text,
     inspect_context_rewind_anchor_from_rollout, list_context_rewind_anchors_from_rollout,
     resolve_managed_context_edit_branch_target, scan_context_rewind_anchor_catalog,
-    truncate_string_copy, ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker, LoopStats,
-    PendingRuntimeSteer, UserTurnRevisionState,
+    truncate_string_copy, ContextRewindAnchorCatalogEntry, DrainOutcome, ExternalDiffDeltaTracker,
+    LoopStats, PendingRuntimeSteer, UserTurnRevisionState,
 };
-use crate::event::{self, AppEvent, EventBus};
-use crate::external_agent;
-use crate::types;
 use crate::{slog, DrainConfig};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -318,13 +318,17 @@ pub(crate) fn goal_fresh_tokens(usage: &provider::TokenUsage) -> u64 {
 /// Thread actions the Claude Code adapter supports: `compact` dispatches a
 /// native `/compact` user message through `ClaudeCodeAgent::thread_action`;
 /// `fork` respawns a resumed process with `--fork-session` via the drain's
-/// `ForkHandling::RespawnResume` path; the `goal*` family runs the
-/// wrapper-level goal engine (adapter-owned state riding the universal
+/// `ForkHandling::RespawnResume` path; `side` (`/btw`) rides the same
+/// respawn with the side boundary + question as the child's first prompt
+/// (CC's native `/btw` is interactive-only — over stream-json the CLI
+/// answers with a synthetic "isn't available in this environment" result,
+/// probed on 2.1.206); the `goal*` family runs the wrapper-level goal
+/// engine (adapter-owned state riding the universal
 /// `GoalUpdated`/`GoalCleared` rails); `model` / `permission-mode`
 /// reconfigure the RUNNING process live via `set_model` /
 /// `set_permission_mode` control requests (verified on CC 2.1.201).
 pub(crate) fn claude_code_thread_action_capabilities() -> Vec<String> {
-    ["compact", "fork"]
+    ["compact", "fork", "side"]
         .into_iter()
         .chain(GOAL_THREAD_ACTION_OPS)
         .chain(["model", "permission-mode"])
@@ -417,6 +421,102 @@ pub(crate) fn side_child_thread_id_from_params(params: &serde_json::Value) -> Op
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
+}
+
+/// Ops served by the respawn path on `ForkHandling::RespawnResume`
+/// backends: `fork` respawns bare; `side`/`btw` respawns with the side
+/// boundary + question as the child's first prompt.
+pub(crate) fn respawn_resume_thread_action_op(op: &str) -> bool {
+    matches!(op, "fork" | "side" | "btw")
+}
+
+/// Marker line separating the side-conversation contract from the
+/// operator's question in a respawned side child's first prompt.
+/// `side_respawn_display_task` splits on it to recover the bare question
+/// for display surfaces; the child still receives the full prologue.
+const SIDE_QUESTION_MARKER: &str = "The side question:";
+
+/// Prologue of a respawned side conversation's first prompt: the
+/// backend-neutral side contract (shared verbatim with Codex's in-process
+/// side threads) plus the question marker.
+fn side_respawn_prologue() -> String {
+    format!(
+        "{}\n\n{SIDE_QUESTION_MARKER}\n",
+        external_agent::SIDE_CONVERSATION_CONTRACT
+    )
+}
+
+/// First prompt of a respawned side conversation: contract + question.
+pub(crate) fn side_respawn_prompt(question: &str) -> String {
+    format!("{}{question}", side_respawn_prologue())
+}
+
+/// Recover the bare side question from a respawn-composed first prompt, for
+/// display surfaces (session meta, `SessionStarted`). `None` when the task
+/// is not one — the match is exact-prefix, so an arbitrary task can never
+/// be mistaken for a side prompt.
+pub(crate) fn side_respawn_display_task(task: &str) -> Option<String> {
+    task.strip_prefix(&side_respawn_prologue())
+        .map(|question| question.trim().to_string())
+        .filter(|question| !question.is_empty())
+}
+
+/// Build the shared respawn `ControlMsg` for `fork`/`side` on backends
+/// without an in-process fork, returning `(success, outcome message)`.
+/// Both dispatch sites (the drain handler and the presence loop's inline
+/// mirror) call this so the two stay in sync by construction.
+pub(crate) fn respawn_resume_thread_action(
+    bus: &EventBus,
+    agent_name: &str,
+    thread_id: Option<String>,
+    op: &str,
+    params: &serde_json::Value,
+    project_root: &std::path::Path,
+    agent_command: Option<String>,
+) -> (bool, String) {
+    let Some(parent_thread_id) = thread_id else {
+        return (
+            false,
+            format!("{op} needs a native session id — run a turn in this session first"),
+        );
+    };
+    let side = op != "fork";
+    let task = if side {
+        let Some(prompt) = side_session_prompt_from_params(params) else {
+            return (false, format!("Usage: /{op} <question>"));
+        };
+        Some(side_respawn_prompt(&prompt))
+    } else {
+        None
+    };
+    bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+        source: agent_name.to_string(),
+        session_id: parent_thread_id.clone(),
+        resume_id: Some(parent_thread_id.clone()),
+        project_root: Some(project_root.to_string_lossy().to_string()),
+        task,
+        direct: Some(true),
+        attachments: Vec::new(),
+        fork: true,
+        relationship_kind: side.then(|| "side".to_string()),
+        agent_command,
+        codex_sandbox: None,
+        codex_approval_policy: None,
+        codex_managed_context: None,
+        codex_context_archive: None,
+    }));
+    let message = if side {
+        format!(
+            "side conversation forking thread {} — it answers in its own session window",
+            short_external_session_id(&parent_thread_id)
+        )
+    } else {
+        format!(
+            "forking thread {} — the fork announces its own session id on its first turn",
+            short_external_session_id(&parent_thread_id)
+        )
+    };
+    (true, message)
 }
 
 pub(crate) fn is_context_rewind_backout_action(op: &str) -> bool {
@@ -580,6 +680,7 @@ pub(crate) async fn fork_managed_context_edit_branch(
             task: Some(replacement_text),
             direct: Some(true),
             fork: false,
+            relationship_kind: None,
             attachments: unresolved_attachment_ids,
             agent_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
             codex_sandbox: launch.as_ref().and_then(|cfg| cfg.codex_sandbox.clone()),
@@ -711,7 +812,11 @@ pub(crate) fn emit_session_relationship(
     });
 }
 
-pub(crate) fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_json::Value) {
+pub(crate) fn emit_codex_fork_session_name(
+    bus: &EventBus,
+    child_id: &str,
+    params: &serde_json::Value,
+) {
     let Some(name) = fork_session_name_from_params(params) else {
         return;
     };
@@ -832,6 +937,7 @@ pub(crate) async fn apply_context_rewind_backout_action(
             task: None,
             direct: Some(true),
             fork: false,
+            relationship_kind: None,
             attachments: Vec::new(),
             agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.agent_command),
@@ -1318,6 +1424,7 @@ pub(crate) async fn spawn_single_fission_branch(
             task: Some(kickoff),
             direct: Some(true),
             fork: false,
+            relationship_kind: None,
             attachments: Vec::new(),
             agent_command: ctx.launch.and_then(|cfg| cfg.agent_command.clone()),
             codex_sandbox: ctx.launch.and_then(|cfg| cfg.codex_sandbox.clone()),
@@ -1654,46 +1761,26 @@ pub(crate) async fn handle_external_thread_action(
     // Backends without an in-process fork (Claude Code) fork by respawning:
     // a NEW supervisor session resumes the current thread with the backend's
     // fork flag, and the child announces its own native id on its first turn
-    // (the `fork` relationship is emitted at that identity upgrade).
-    if op == "fork" {
+    // (the lineage relationship is emitted at that identity upgrade). The
+    // same respawn carries `/side` (`/btw`) conversations there, with the
+    // side boundary + question as the child's first prompt.
+    if respawn_resume_thread_action_op(&op) {
         if let external_agent::ForkHandling::RespawnResume { thread_id } = agent.fork_handling() {
-            let (success, message) = match thread_id {
-                Some(parent_thread_id) => {
-                    let launch = crate::session_config::read_log_dir_config(config.log_dir);
-                    config
-                        .bus
-                        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
-                            source: agent.name().to_string(),
-                            session_id: parent_thread_id.clone(),
-                            resume_id: Some(parent_thread_id.clone()),
-                            project_root: Some(config.project_root.to_string_lossy().to_string()),
-                            task: None,
-                            direct: Some(true),
-                            attachments: Vec::new(),
-                            fork: true,
-                            agent_command: launch.and_then(|cfg| cfg.agent_command),
-                            codex_sandbox: None,
-                            codex_approval_policy: None,
-                            codex_managed_context: None,
-                            codex_context_archive: None,
-                        }));
-                    (
-                        true,
-                        format!(
-                            "forking thread {} — the fork announces its own session id on its first turn",
-                            short_external_session_id(&parent_thread_id)
-                        ),
-                    )
-                }
-                None => (
-                    false,
-                    "fork needs a native session id — run a turn in this session first".to_string(),
-                ),
-            };
+            let launch = crate::session_config::read_log_dir_config(config.log_dir);
+            let (success, message) = respawn_resume_thread_action(
+                config.bus,
+                agent.name(),
+                thread_id,
+                &op,
+                &params,
+                config.project_root,
+                launch.and_then(|cfg| cfg.agent_command),
+            );
             slog(config.session_log, |l| {
                 l.info(&format!(
-                    "{} thread action /fork: {} — {}",
+                    "{} thread action /{}: {} — {}",
                     agent.name(),
+                    op,
                     if success { "ok" } else { "FAILED" },
                     message
                 ))
@@ -1799,6 +1886,7 @@ pub(crate) async fn handle_external_thread_action(
                     task: None,
                     direct: Some(true),
                     fork: false,
+                    relationship_kind: None,
                     attachments: Vec::new(),
                     agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                         .and_then(|cfg| cfg.agent_command),
@@ -1960,7 +2048,10 @@ pub(crate) fn side_rewind_first_turn_for_undo(
     Ok(current_turn_count as u32 - turns + 1)
 }
 
-pub(crate) fn parent_rewind_first_turn_for_undo(current_turn_count: usize, turns: u32) -> Result<u32, String> {
+pub(crate) fn parent_rewind_first_turn_for_undo(
+    current_turn_count: usize,
+    turns: u32,
+) -> Result<u32, String> {
     if turns == 0 {
         return Err("rollback count must be at least 1".to_string());
     }
@@ -2349,7 +2440,9 @@ pub(crate) fn emit_external_subagent_state(
         "interrupted" => (
             "warn",
             message
-                .map(|message| format!("Agent interrupted: {label} subagent interrupted: {message}"))
+                .map(|message| {
+                    format!("Agent interrupted: {label} subagent interrupted: {message}")
+                })
                 .unwrap_or_else(|| format!("Agent interrupted: {label} subagent interrupted")),
         ),
         "errored" => (
@@ -2699,6 +2792,7 @@ pub(crate) fn collab_agent_tool_preview(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_child_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -2847,15 +2941,16 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
     if !content.is_empty() {
         slog(config.session_log, |l| {
-            l.model_response_for_session(
+            let _ = l.model_response_for_session(
                 session_id,
                 content,
                 0,
                 0,
                 0,
                 0,
+                0,
                 config.agent_source.as_deref(),
-            )
+            );
         });
     }
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
@@ -2865,10 +2960,16 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
 }
 
-pub(crate) fn emit_external_tool_output(config: &DrainConfig<'_>, session_id: Option<&str>, stdout: String) {
+pub(crate) fn emit_external_tool_output(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    stdout: String,
+    item_id: Option<&str>,
+) {
     if stdout.is_empty() {
         return;
     }
+    let item_id = item_id.map(str::trim).filter(|id| !id.is_empty());
     let output_id = event::next_agent_output_id();
     slog(config.session_log, |l| {
         l.agent_output_with_session_id(
@@ -2877,6 +2978,7 @@ pub(crate) fn emit_external_tool_output(config: &DrainConfig<'_>, session_id: Op
             "",
             config.agent_source.as_deref(),
             Some(&output_id),
+            item_id,
         )
     });
     config.bus.send(AppEvent::AgentOutput {
@@ -2885,6 +2987,7 @@ pub(crate) fn emit_external_tool_output(config: &DrainConfig<'_>, session_id: Op
         stderr: String::new(),
         source: config.agent_source.clone(),
         output_id: Some(output_id),
+        item_id: item_id.map(str::to_string),
     });
 }
 
@@ -2974,14 +3077,23 @@ pub(crate) fn persist_native_backend_session_id(config: &DrainConfig<'_>, native
         });
     }
     // A forked child announcing its own id is the first moment both ends of
-    // the lineage edge exist — materialize the `fork` relationship now.
+    // the lineage edge exist — materialize the lineage relationship now
+    // (`fork`, or the persisted kind: `side` for /btw conversations).
     if let Some(parent) = launch
         .forked_from
         .as_deref()
         .map(str::trim)
         .filter(|parent| !parent.is_empty() && *parent != native_id)
     {
-        emit_session_relationship(config.bus, Some(parent), native_id, "fork", false);
+        let kind = launch
+            .fork_relationship
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("fork");
+        // Side children are ephemeral Q&A surfaces — same flag Codex's
+        // in-process side start emits; plain forks are durable sessions.
+        emit_session_relationship(config.bus, Some(parent), native_id, kind, kind == "side");
     }
 }
 
@@ -3120,7 +3232,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
             let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
                 return;
             };
-            emit_external_tool_output(config, Some(&child_thread_id), stdout);
+            emit_external_tool_output(config, Some(&child_thread_id), stdout, Some(&item_id));
         }
         external_agent::AgentEvent::ToolCompleted { item_id, status } => {
             if let Some(limiter) = stats
@@ -3128,7 +3240,12 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 .get_mut(&child_thread_id)
             {
                 if let Some(stdout) = limiter.complete(&item_id) {
-                    emit_external_tool_output(config, Some(&child_thread_id), stdout);
+                    emit_external_tool_output(
+                        config,
+                        Some(&child_thread_id),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
             }
             if let external_agent::ToolCompletionStatus::Failed { message } = status {
@@ -3344,14 +3461,14 @@ mod tests {
     #[test]
     fn claude_code_capabilities_advertise_universal_thread_actions() {
         let caps = claude_code_external_session_capabilities();
-        for op in ["compact", "fork", "goal", "goal-edit", "goal-clear"] {
+        for op in ["compact", "fork", "side", "goal", "goal-edit", "goal-clear"] {
             assert!(
                 caps.thread_actions.iter().any(|candidate| candidate == op),
                 "missing advertised Claude thread action: {op}"
             );
         }
         // Never advertise ops the adapter rejects.
-        for op in ["side", "fast", "review", "memory-reset", "undo"] {
+        for op in ["fast", "review", "memory-reset", "undo"] {
             assert!(
                 !caps.thread_actions.iter().any(|candidate| candidate == op),
                 "advertised unsupported Claude thread action: {op}"
@@ -3491,6 +3608,148 @@ mod tests {
             side_thread_ids_from_message("forked into thread child"),
             None
         );
+        // The respawn path's side message must NOT parse as an in-process
+        // side start — run_modes' codex-only child-drain branch keys off
+        // this parser.
+        let (_, respawn_message) = respawn_resume_thread_action(
+            &EventBus::new(),
+            "claude-code",
+            Some("parent-abc".to_string()),
+            "side",
+            &serde_json::json!({ "prompt": "what changed?" }),
+            std::path::Path::new("/tmp"),
+            None,
+        );
+        assert_eq!(side_thread_ids_from_message(&respawn_message), None);
+    }
+
+    #[test]
+    fn respawn_resume_side_sends_fork_resume_with_side_relationship() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (success, message) = respawn_resume_thread_action(
+            &bus,
+            "claude-code",
+            Some("parent-abc".to_string()),
+            "btw",
+            &serde_json::json!({ "prompt": "what is the plan?" }),
+            std::path::Path::new("/repo"),
+            Some("claude".to_string()),
+        );
+        assert!(success, "side respawn failed: {message}");
+        assert!(message.contains("side conversation"), "{message}");
+        match rx.try_recv() {
+            Ok(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                source,
+                session_id,
+                resume_id,
+                task,
+                fork,
+                relationship_kind,
+                direct,
+                ..
+            })) => {
+                assert_eq!(source, "claude-code");
+                assert_eq!(session_id, "parent-abc");
+                assert_eq!(resume_id.as_deref(), Some("parent-abc"));
+                assert!(fork, "side must respawn as a fork");
+                assert_eq!(relationship_kind.as_deref(), Some("side"));
+                assert_eq!(direct, Some(true));
+                let task = task.expect("side carries the question as the first prompt");
+                assert!(
+                    task.contains("side conversation"),
+                    "boundary missing: {task}"
+                );
+                assert!(
+                    task.ends_with("what is the plan?"),
+                    "question missing: {task}"
+                );
+                // The contract prologue is shared verbatim with Codex's
+                // in-process side threads — anti-drift by construction.
+                assert!(
+                    task.starts_with(external_agent::SIDE_CONVERSATION_CONTRACT),
+                    "prologue must be the shared side contract: {task}"
+                );
+                // Display surfaces recover the bare question from the blob.
+                assert_eq!(
+                    side_respawn_display_task(&task).as_deref(),
+                    Some("what is the plan?")
+                );
+            }
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn side_respawn_display_task_only_matches_composed_prompts() {
+        assert_eq!(side_respawn_display_task("fix the login bug"), None);
+        assert_eq!(
+            side_respawn_display_task(external_agent::SIDE_CONVERSATION_CONTRACT),
+            None,
+            "a contract with no question must not display as an empty task"
+        );
+        assert_eq!(side_respawn_display_task(&side_respawn_prompt("")), None);
+    }
+
+    #[test]
+    fn respawn_resume_side_requires_a_prompt_and_a_thread_id() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (success, message) = respawn_resume_thread_action(
+            &bus,
+            "claude-code",
+            Some("parent-abc".to_string()),
+            "side",
+            &serde_json::Value::Null,
+            std::path::Path::new("/repo"),
+            None,
+        );
+        assert!(!success);
+        assert!(message.contains("Usage"), "{message}");
+        let (success, message) = respawn_resume_thread_action(
+            &bus,
+            "claude-code",
+            None,
+            "side",
+            &serde_json::json!({ "prompt": "q" }),
+            std::path::Path::new("/repo"),
+            None,
+        );
+        assert!(!success);
+        assert!(message.contains("native session id"), "{message}");
+        assert!(
+            rx.try_recv().is_err(),
+            "failures must not send ResumeSession"
+        );
+    }
+
+    #[test]
+    fn respawn_resume_fork_stays_bare() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (success, _) = respawn_resume_thread_action(
+            &bus,
+            "claude-code",
+            Some("parent-abc".to_string()),
+            "fork",
+            &serde_json::Value::Null,
+            std::path::Path::new("/repo"),
+            None,
+        );
+        assert!(success);
+        match rx.try_recv() {
+            Ok(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                task,
+                fork,
+                relationship_kind,
+                ..
+            })) => {
+                assert!(fork);
+                assert_eq!(task, None, "a bare fork idles until prompted");
+                assert_eq!(relationship_kind, None);
+            }
+            other => panic!("expected ResumeSession, got {other:?}"),
+        }
     }
 
     #[test]

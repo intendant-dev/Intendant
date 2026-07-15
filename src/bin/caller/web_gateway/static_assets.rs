@@ -7,6 +7,35 @@ use super::*;
 
 pub(crate) const APP_HTML: &str = include_str!("../../../../static/app.html");
 
+/// Build stamp of the embedded dashboard bundle — the value
+/// app-html-assembler substituted for `__INTENDANT_APP_BUILD__` (first 16
+/// hex chars of the sha256 over the raw manifest-ordered fragments).
+/// Extracted once from [`APP_HTML`], so the daemon and the SPA it serves
+/// cannot disagree by construction; `/config` reports it and a dashboard
+/// tab whose own stamp differs knows it predates the served bundle. Empty
+/// when the artifact carries no stamp (pre-stamp checkouts) — the SPA
+/// treats an absent value as "no signal", never as a mismatch.
+pub(crate) fn app_build() -> &'static str {
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| extract_app_build(APP_HTML).unwrap_or_default())
+}
+
+fn extract_app_build(html: &str) -> Option<String> {
+    let marker = "const INTENDANT_APP_BUILD = '";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let value = &rest[..rest.find('\'')?];
+    (value.len() == 16 && value.bytes().all(|b| b.is_ascii_hexdigit())).then(|| value.to_string())
+}
+
+// The vault crypto kernel: the small, separately served worker that owns
+// the vault's key material. app.html pins its sha256 (VAULT_KERNEL_SHA256,
+// minted by crates/app-html-assembler) and the page refuses to instantiate
+// a kernel whose bytes hash differently — the embedded pair below is
+// therefore always self-consistent, and the parity test in this module
+// re-derives the hash to catch a kernel edit that skipped regeneration.
+pub(crate) const VAULT_KERNEL_JS: &str = include_str!("../../../../static/vault-kernel.js");
+
 pub(crate) const AUDIO_PROCESSOR_JS: &str = include_str!("../../../../static/audio-processor.js");
 
 pub(crate) const ICON_128_PNG: &[u8] = include_bytes!("../../../../static/icon-128.png");
@@ -43,9 +72,15 @@ pub(crate) const CODEMIRROR_BUNDLE_CSS: &str =
 
 // Vendored xterm.js (MIT). Previously loaded from jsdelivr with SRI
 // pins — the one external fetch in the dashboard; embedding it keeps
-// the terminal working offline/LAN and on hosted Connect. The vendored
-// bytes hash-match the exact SRI digests the CDN loader pinned.
+// the daemon-served terminal working offline and over trusted LAN/mTLS
+// dashboard routes. These bytes hash-match the exact SRI digests the CDN
+// loader pinned.
 pub(crate) const XTERM_JS: &str = include_str!("../../../../static/xterm.min.js");
+
+// D-2 tile-test harness (parked seed): fetched by the dashboard only
+// when ?tile-test=1 / localStorage.tileTest is set.
+pub(crate) const TILE_TEST_HARNESS_JS: &str =
+    include_str!("../../../../static/tile-test-harness.js");
 
 pub(crate) const XTERM_ADDON_FIT_JS: &str =
     include_str!("../../../../static/xterm-addon-fit.min.js");
@@ -55,7 +90,7 @@ pub(crate) const XTERM_CSS: &str = include_str!("../../../../static/xterm.css");
 // Self-hosted variable fonts (SIL OFL 1.1; license texts ship in
 // static/fonts/). Referenced by the @font-face rules in
 // static/app/09-styles-fonts.css — the dashboard must stay fully
-// self-contained for offline/LAN and hosted-Connect use.
+// self-contained for offline and trusted LAN/mTLS use.
 pub(crate) const FONT_HANKEN_LATIN: &[u8] =
     include_bytes!("../../../../static/fonts/hanken-grotesk-latin.woff2");
 
@@ -194,6 +229,18 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             true,
         );
         insert(
+            "/vault-kernel.js",
+            "application/javascript",
+            VAULT_KERNEL_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/tile-test-harness.js",
+            "application/javascript",
+            TILE_TEST_HARNESS_JS.as_bytes(),
+            true,
+        );
+        insert(
             "/xterm.min.js",
             "application/javascript",
             XTERM_JS.as_bytes(),
@@ -315,12 +362,20 @@ pub(crate) struct StaticAssetView<'a> {
 /// asset: conditional requests (`If-None-Match` → `304 Not Modified` with
 /// an empty body), gzip negotiation via `Accept-Encoding`, HEAD (same
 /// headers as GET, no body), CORS, and the `?v=` Cache-Control policy.
+///
+/// `keep_alive` is the exchange's keep-alive verdict
+/// (`DemuxStream::exchange_reusable` at the serving arm): every shape
+/// this builder emits is self-framing (`Content-Length` on 200, no body
+/// on 304/HEAD), so static assets are prime keep-alive citizens — the
+/// whole point of the request loop is not paying a TCP+TLS handshake
+/// per asset on a cold dashboard load.
 pub(crate) fn build_static_asset_response(
     method: &str,
     header_text: &str,
     query: &str,
     current_version: &str,
     asset: StaticAssetView<'_>,
+    keep_alive: bool,
 ) -> Vec<u8> {
     let cache_control = asset
         .cache_control
@@ -333,13 +388,17 @@ pub(crate) fn build_static_asset_response(
         ""
     };
     if if_none_match_matches(header_text, asset.etag) {
-        return HttpResponse::new("304 Not Modified")
+        let response = HttpResponse::new("304 Not Modified")
             .header("ETag", format!("\"{}\"", asset.etag))
             .header("Cache-Control", cache_control)
             .header_segment(vary)
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Connection", "close")
-            .into_bytes();
+            .header("Access-Control-Allow-Origin", "*");
+        let response = if asset.content_type.starts_with("text/html") {
+            response.deny_framing()
+        } else {
+            response
+        };
+        return response.connection_reuse(keep_alive).into_bytes();
     }
     let gzip_body = asset
         .gzip
@@ -355,9 +414,11 @@ pub(crate) fn build_static_asset_response(
         .header("ETag", format!("\"{}\"", asset.etag))
         .header("Cache-Control", cache_control)
         .header_segment(vary)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_bytes();
+        .header("Access-Control-Allow-Origin", "*");
+    if asset.content_type.starts_with("text/html") {
+        response = response.deny_framing();
+    }
+    let mut response = response.connection_reuse(keep_alive).into_bytes();
     if method != "HEAD" {
         response.extend_from_slice(payload);
     }
@@ -445,6 +506,7 @@ pub(crate) fn app_html_override_response(
     header_text: &str,
     query: &str,
     path: &std::path::Path,
+    keep_alive: bool,
 ) -> Vec<u8> {
     match std::fs::read_to_string(path) {
         Ok(html) => {
@@ -462,6 +524,7 @@ pub(crate) fn app_html_override_response(
                     gzip: None,
                     cache_control: Some("no-cache"),
                 },
+                keep_alive,
             )
         }
         Err(err) => {
@@ -480,7 +543,7 @@ pub(crate) fn app_html_override_response(
                 .header("Content-Length", body.len().to_string())
                 .header("Cache-Control", "no-store")
                 .header("Access-Control-Allow-Origin", "*")
-                .header("Connection", "close")
+                .connection_reuse(keep_alive)
                 .into_bytes();
             if method != "HEAD" {
                 response.extend_from_slice(body.as_bytes());
@@ -488,6 +551,40 @@ pub(crate) fn app_html_override_response(
             response
         }
     }
+}
+
+/// Under the `INTENDANT_APP_HTML_PATH` dev override, serve /vault-kernel.js
+/// from the override file's sibling `vault-kernel.js` when one exists (fresh
+/// disk read per request, like the app.html override itself). The pin inside
+/// the overridden app.html was minted from that sibling by the assembler, so
+/// serving the embedded — possibly stale — kernel would trip the page's
+/// integrity check mid-iteration. `None` (no override dir, no sibling, read
+/// error) falls back to the embedded kernel: fail-open here is correct
+/// because the page's hash check is the enforcement point either way.
+pub(crate) fn vault_kernel_override_response(
+    method: &str,
+    header_text: &str,
+    query: &str,
+    app_html_path: &std::path::Path,
+    keep_alive: bool,
+) -> Option<Vec<u8>> {
+    let sibling = app_html_path.parent()?.join("vault-kernel.js");
+    let body = std::fs::read(&sibling).ok()?;
+    let etag = asset_etag(&body);
+    Some(build_static_asset_response(
+        method,
+        header_text,
+        query,
+        asset_version(),
+        StaticAssetView {
+            content_type: "application/javascript",
+            body: &body,
+            etag: &etag,
+            gzip: None,
+            cache_control: Some("no-cache"),
+        },
+        keep_alive,
+    ))
 }
 
 #[cfg(test)]
@@ -499,6 +596,95 @@ mod tests {
         "/wasm-station/station_web_bg.wasm",
     ];
 
+    /// Lowercase-hex sha256, matching the assembler's pin encoding.
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(data)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// The build stamp: the embedded app.html must carry a minted (16-hex)
+    /// `INTENDANT_APP_BUILD` value, never the raw placeholder — otherwise
+    /// every served tab would see a stampless daemon and the stale-tab
+    /// reload nudge goes blind.
+    #[test]
+    fn app_build_stamp_is_minted_in_embedded_artifact() {
+        let stamp = app_build();
+        assert_eq!(
+            stamp.len(),
+            16,
+            "embedded app.html carries no minted INTENDANT_APP_BUILD stamp — \
+             regenerate with `cargo run -p app-html-assembler` and commit"
+        );
+        assert!(stamp.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            !APP_HTML.contains("__INTENDANT_APP_BUILD__"),
+            "the raw placeholder must never ship"
+        );
+    }
+
+    /// The vault-kernel hash pin: the embedded app.html must pin exactly the
+    /// sha256 of the embedded kernel bytes. This is the daemon-side parity
+    /// gate for the pinned-kernel design (the page refuses to instantiate a
+    /// kernel whose hash differs): an edit to static/vault-kernel.js that
+    /// skips `cargo run -p app-html-assembler` (any cargo build also
+    /// reassembles) fails here instead of shipping a dashboard whose vault
+    /// refuses to unlock.
+    #[test]
+    fn vault_kernel_hash_pin_matches_embedded_kernel() {
+        let marker = "const VAULT_KERNEL_SHA256 = '";
+        let start = APP_HTML
+            .find(marker)
+            .expect("app.html must carry the VAULT_KERNEL_SHA256 pin");
+        let rest = &APP_HTML[start + marker.len()..];
+        let end = rest.find('\'').expect("pin constant must be quoted");
+        let pinned = &rest[..end];
+        assert_eq!(
+            pinned.len(),
+            64,
+            "pin must be a full lowercase-hex sha256, got {pinned:?} — \
+             was app.html assembled without static/vault-kernel.js?"
+        );
+        assert_eq!(
+            pinned,
+            sha256_hex(VAULT_KERNEL_JS.as_bytes()),
+            "static/app.html pins a different kernel hash than \
+             static/vault-kernel.js — regenerate with `cargo run -p \
+             app-html-assembler` and commit both files together"
+        );
+        // The placeholder itself must never ship.
+        assert!(
+            !APP_HTML.contains("__VAULT_KERNEL_SHA256__"),
+            "unsubstituted vault-kernel placeholder in app.html"
+        );
+        // The kernel is served at the path the page fetches.
+        let asset = embedded_static_asset("/vault-kernel.js").expect("kernel must be embedded");
+        assert_eq!(asset.content_type, "application/javascript");
+        assert_eq!(asset.body, VAULT_KERNEL_JS.as_bytes());
+    }
+
+    #[test]
+    fn vault_kernel_override_serves_disk_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_html_path = dir.path().join("app.html");
+        // No sibling yet: fall back to the embedded kernel.
+        assert!(vault_kernel_override_response("GET", "", "", &app_html_path, false).is_none());
+        std::fs::write(
+            dir.path().join("vault-kernel.js"),
+            b"self.onmessage=null;\n",
+        )
+        .unwrap();
+        let resp = vault_kernel_override_response("GET", "", "", &app_html_path, false)
+            .expect("sibling kernel must be served");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Type: application/javascript"));
+        assert!(text.contains("Cache-Control: no-cache"));
+        assert!(text.ends_with("self.onmessage=null;\n"));
+    }
+
     #[test]
     fn test_app_html_embedded() {
         assert!(!APP_HTML.is_empty());
@@ -509,6 +695,186 @@ mod tests {
         assert!(APP_HTML.contains("tab-displays"));
         assert!(APP_HTML.contains("/three.module.min.js"));
         assert!(THREE_MODULE_JS.contains("Three.js Authors"));
+    }
+
+    #[test]
+    fn live_workspace_input_is_released_before_its_surface_is_hidden() {
+        fn section(start: &str, end: &str) -> &'static str {
+            APP_HTML
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(body, _)| body))
+                .unwrap_or_else(|| panic!("missing app.html section {start:?} .. {end:?}"))
+        }
+
+        fn assert_before(body: &str, first: &str, second: &str) {
+            let first_at = body
+                .find(first)
+                .unwrap_or_else(|| panic!("missing {first:?} in app.html section"));
+            let second_at = body
+                .find(second)
+                .unwrap_or_else(|| panic!("missing {second:?} in app.html section"));
+            assert!(
+                first_at < second_at,
+                "{first:?} must precede {second:?} in app.html section"
+            );
+        }
+
+        // Closing a display must flush held-key keyups while the input gate is
+        // still open, then release server-side authority.
+        let disconnect = section(
+            "  disconnect({ userInitiated = false } = {}) {",
+            "\n}\n\nfunction removeDisplaySlot",
+        );
+        assert_before(
+            disconnect,
+            "this._exitInteractive(userInitiated);",
+            "this._releaseAuthority();",
+        );
+
+        // Both ways a live projection can be hidden must release active input,
+        // cancel an in-flight Take, and relinquish authority already granted.
+        for body in [
+            section(
+                "  function teardownSelectedSurface(slot) {",
+                "\n  function selectLiveDisplay(",
+            ),
+            section(
+                "  window.deactivateLiveDisplayWorkspace = function() {",
+                "\n  function reconcileSelectedDisplay(",
+            ),
+        ] {
+            for required in [
+                "slot.interactive",
+                "slot._takeControlPending",
+                "slot.authorityState === 'you'",
+                "slot.releaseControl();",
+            ] {
+                assert!(
+                    body.contains(required),
+                    "live-surface teardown must contain {required:?}"
+                );
+            }
+        }
+
+        // Tab navigation must deactivate Live while it is still the active
+        // workspace, before the pane is hidden.
+        let switch_tab = section(
+            "function switchTab(tabId) {",
+            "\nfunction contextResolveVizTheme(",
+        );
+        assert_before(
+            switch_tab,
+            "window.deactivateLiveDisplayWorkspace()",
+            "activeTab = tabId;",
+        );
+
+        // A shared-view Take originating in Activity or Station must enter the
+        // Live workspace before selecting the target and requesting authority.
+        let shared_take = section(
+            "function takeSharedViewInput() {",
+            "\nfunction handleSharedViewEvent(",
+        );
+        assert_before(
+            shared_take,
+            "routeTo('displays')",
+            "window.selectLiveDisplay(",
+        );
+        assert_before(
+            shared_take,
+            "window.selectLiveDisplay(",
+            "slot.takeControl();",
+        );
+    }
+
+    #[test]
+    fn dashboard_validator_cachebuster_catalog_matches_the_daemon() {
+        const VALIDATOR: &str = include_str!("../../../../scripts/validate-dashboard.cjs");
+        let marker = "const APP_HTML_CACHEBUSTED_ASSET_PATHS = [";
+        let body = VALIDATOR
+            .split_once(marker)
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(body, _)| body)
+            .expect("validator cachebuster catalog");
+        let validator_paths = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| line.trim_end_matches(',').trim_matches('\'').to_string())
+            .collect::<Vec<_>>();
+        let daemon_paths = APP_HTML_VERSIONED_ASSETS
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(validator_paths, daemon_paths);
+    }
+
+    #[test]
+    fn new_session_codex_model_override_is_wired() {
+        assert!(APP_HTML.contains(r#"id="new-session-codex-model""#));
+        assert!(APP_HTML.contains(r#"id="new-session-codex-model-select""#));
+        assert!(APP_HTML.contains(r#"id="new-session-codex-reasoning-effort""#));
+        assert!(APP_HTML.contains("codexModelSel.disabled = !appliesToCodex;"));
+        assert!(APP_HTML.contains("const model = selection || newSessionCodexGlobalModel;"));
+        assert!(APP_HTML.contains("if (model) msg.codex_model = model;"));
+        assert!(APP_HTML.contains("msg.codex_reasoning_effort = reasoningEffort;"));
+    }
+
+    #[test]
+    fn global_codex_and_claude_model_defaults_are_wired_in_settings() {
+        for id in [
+            "set-codex-model-select",
+            "set-codex-model-custom",
+            "set-codex-reasoning-effort",
+            "set-claude-model-select",
+            "set-claude-model-custom",
+            "set-claude-permission-mode",
+        ] {
+            assert!(APP_HTML.contains(&format!(r#"id="{id}""#)), "missing {id}");
+        }
+        assert!(APP_HTML.contains("codex_model: selectedCodexModel"));
+        assert!(APP_HTML.contains("claude_model: selectedClaudeModel"));
+        assert!(APP_HTML.contains("function populateSettingsCodexModel"));
+        assert!(APP_HTML.contains("function populateSettingsClaudeModel"));
+    }
+
+    #[test]
+    fn embedded_codex_picker_fallback_matches_daemon_catalog() {
+        fn marker_json(start: &str, end: &str) -> serde_json::Value {
+            let json = APP_HTML
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end).map(|(json, _)| json.trim()))
+                .unwrap_or_else(|| panic!("missing embedded catalog markers {start} / {end}"));
+            serde_json::from_str(json).expect("embedded catalog marker body is JSON")
+        }
+
+        let actual_models = marker_json(
+            "/* codex-model-catalog:start */",
+            "/* codex-model-catalog:end */",
+        );
+        let expected_models = serde_json::Value::Array(
+            crate::project::CODEX_MODEL_CATALOG
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "id": entry.id,
+                        "display_name": entry.display_name,
+                        "default_reasoning_effort": entry.default_reasoning_effort,
+                        "reasoning_efforts": entry.reasoning_efforts,
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(actual_models, expected_models);
+
+        let actual_efforts = marker_json(
+            "/* codex-reasoning-efforts:start */",
+            "/* codex-reasoning-efforts:end */",
+        );
+        let expected_efforts = serde_json::json!(crate::project::CODEX_REASONING_EFFORTS
+            .iter()
+            .filter(|effort| !effort.is_empty())
+            .collect::<Vec<_>>());
+        assert_eq!(actual_efforts, expected_efforts);
     }
 
     #[test]
@@ -646,6 +1012,7 @@ mod tests {
             "v=cur",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -675,6 +1042,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -695,6 +1063,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"));
@@ -716,6 +1085,7 @@ mod tests {
             "",
             "cur",
             test_asset_view(&body, Some(&gz)),
+            false,
         );
         let (head, payload) = split_http_response(&response);
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -775,6 +1145,14 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_flushes_keys_and_mouse_buttons_on_input_teardown() {
+        assert!(APP_HTML.contains("owner._heldButtons.add(e.button)"));
+        assert!(APP_HTML.contains("sendControl({ t: 'mu', x, y, b })"));
+        assert!(APP_HTML.contains("handlers.pointercancel = (e) =>"));
+        assert!(APP_HTML.contains("owner._flushHeldKeys?.();"));
+    }
+
+    #[test]
     fn app_html_override_rereads_per_request_and_revalidates() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.html");
@@ -783,7 +1161,7 @@ mod tests {
             "<!DOCTYPE html><script src=\"/three.module.min.js\"></script>one",
         )
         .unwrap();
-        let first = app_html_override_response("GET", "", "", &path);
+        let first = app_html_override_response("GET", "", "", &path, false);
         let first = String::from_utf8_lossy(&first);
         assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(first.contains("Content-Type: text/html"));
@@ -793,7 +1171,7 @@ mod tests {
 
         // An edit is visible on the very next request — nothing caches it.
         std::fs::write(&path, "<!DOCTYPE html>two").unwrap();
-        let second = app_html_override_response("GET", "", "", &path);
+        let second = app_html_override_response("GET", "", "", &path, false);
         let second = String::from_utf8_lossy(&second);
         assert!(second.ends_with("two"));
 
@@ -804,8 +1182,13 @@ mod tests {
             .and_then(|rest| rest.split('"').next())
             .expect("override response carries an ETag")
             .to_string();
-        let third =
-            app_html_override_response("GET", &format!("If-None-Match: \"{etag}\"\r\n"), "", &path);
+        let third = app_html_override_response(
+            "GET",
+            &format!("If-None-Match: \"{etag}\"\r\n"),
+            "",
+            &path,
+            false,
+        );
         assert!(String::from_utf8_lossy(&third).starts_with("HTTP/1.1 304"));
     }
 
@@ -813,13 +1196,13 @@ mod tests {
     fn app_html_override_read_failure_is_a_loud_500() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing.html");
-        let resp = app_html_override_response("GET", "", "", &path);
+        let resp = app_html_override_response("GET", "", "", &path, false);
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 500"));
         assert!(text.contains("INTENDANT_APP_HTML_PATH"));
         assert!(text.contains("missing.html"));
         // HEAD keeps the status but sends headers only.
-        let head = app_html_override_response("HEAD", "", "", &path);
+        let head = app_html_override_response("HEAD", "", "", &path, false);
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 500"));
         assert!(head.ends_with("\r\n\r\n"));

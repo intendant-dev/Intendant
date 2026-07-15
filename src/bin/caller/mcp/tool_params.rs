@@ -349,6 +349,26 @@ pub struct RevokeUserDisplayParams {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestUserDisplayParams {
+    /// Short justification shown to the user in the request popup
+    /// (required; capped at 280 bytes).
+    pub reason: String,
+    /// Access level to request: "view" (the agent can see the display
+    /// stream/frames; no input) or "view_and_control" (the full
+    /// user-display grant: screenshots + input). Default: "view".
+    #[serde(default)]
+    pub access: Option<String>,
+    /// How long to wait for the user's decision, in seconds.
+    /// Default 120, capped at 600. Timing out counts as a decline.
+    #[serde(default)]
+    pub wait_seconds: Option<u64>,
+    /// Session the request is attributed to. Normally injected from the
+    /// session-scoped MCP URL; explicit values win.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SpawnLiveAudioParams {
     /// Unique identifier for this live audio session.
@@ -466,6 +486,21 @@ pub struct ReadScreenParams {
     /// "text" (default) for the compact indented tree, or "json".
     #[serde(default)]
     pub format: Option<String>,
+    /// Return element values and window titles uncapped. By default long
+    /// texts are capped at 80 chars with a stable marker (`… [N chars
+    /// total, #hash]`) so one long URL cannot dominate the result; set
+    /// true only when you need an exact long value.
+    #[serde(default)]
+    pub full_values: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DisplayReadinessParams {
+    /// Display target to probe: "user_session", "display_99", etc.
+    /// Auto-detects like take_screenshot if omitted: a live agent virtual
+    /// display when one exists, else the user session.
+    #[serde(default)]
+    pub display_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -533,6 +568,31 @@ pub struct ExecuteCuActionsParams {
     /// if the model outputs coordinates on a 0-1000 grid (e.g. Gemini CU).
     #[serde(default)]
     pub coordinate_space: Option<String>,
+    /// Post-action observation policy. "pixels" (default): attach the
+    /// post-action screenshot. "ax": attach the frontmost UI element tree
+    /// instead — a few hundred tokens instead of an image; user-session
+    /// targets only. "auto": element tree when usable, screenshot fallback.
+    /// "none": per-action results only. The result names the observation it
+    /// carries and why. An explicit trailing screenshot/zoom action always
+    /// returns its pixels.
+    #[serde(default)]
+    pub observe: Option<crate::computer_use::ObserveMode>,
+    /// Draw click markers (crosshairs at click coordinates) on captured
+    /// screenshots. Default false: screenshots are clean — markers obscure
+    /// the controls being verified; the dashboard already overlays actions
+    /// live. The disk artifact carries the same bytes as the returned image.
+    #[serde(default)]
+    pub annotate: Option<bool>,
+    /// Bounded UI-quiescence wait after the last input action, before the
+    /// observation — use instead of guessed wait actions after clicks that
+    /// trigger loading/animation. `true`: wait until the display stops
+    /// changing for ~300ms, up to 2s. A number sets the cap in ms (max
+    /// 5000). The result reports settled / still_loading (+ elapsed);
+    /// platforms without a damage signal run a fixed minimal wait and say
+    /// so. Default off (a plain 300ms freshness floor still applies to
+    /// captures).
+    #[serde(default)]
+    pub settle: Option<crate::computer_use::SettleParam>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -585,6 +645,13 @@ pub struct ShowSharedViewParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HideSharedViewParams {
     /// Optional reason for dismissing the collaboration view.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClearSharedViewFocusParams {
+    /// Optional reason for clearing the focus annotation.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -688,6 +755,20 @@ pub struct PeerExecuteCuActionsParams {
     /// a 0-1000 grid.
     #[serde(default)]
     pub coordinate_space: Option<String>,
+    /// Post-action observation policy, forwarded to the peer's
+    /// execute_cu_actions: "pixels" (default), "ax", "auto", or "none".
+    /// Older peers ignore it and return pixels.
+    #[serde(default)]
+    pub observe: Option<crate::computer_use::ObserveMode>,
+    /// Draw click markers on the peer's captured screenshot (off by
+    /// default: clean pixels). Older peers ignore it.
+    #[serde(default)]
+    pub annotate: Option<bool>,
+    /// Bounded quiescence wait on the peer after its last input action:
+    /// `true` (default cap 2s) or a cap in ms (max 5000). Older peers
+    /// ignore it.
+    #[serde(default)]
+    pub settle: Option<crate::computer_use::SettleParam>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -768,11 +849,12 @@ pub struct GetLogsParams {
 }
 
 pub(crate) fn read_persisted_log_entries_for_session(
+    home: &std::path::Path,
     session_id: Option<&str>,
     params: &GetLogsParams,
 ) -> Option<Vec<LogEntrySnapshot>> {
     let session_id = session_id.map(str::trim).filter(|id| !id.is_empty())?;
-    let log_dir = persisted_log_dir_for_session(session_id)?;
+    let log_dir = persisted_log_dir_for_session_in_home(home, session_id)?;
     read_persisted_log_entries_from_dir(&log_dir, params)
 }
 
@@ -819,11 +901,6 @@ pub(crate) fn read_persisted_log_entries_from_dir(
     Some(entries)
 }
 
-pub(crate) fn persisted_log_dir_for_session(session_id: &str) -> Option<std::path::PathBuf> {
-    let home = crate::platform::home_dir();
-    persisted_log_dir_for_session_in_home(&home, session_id)
-}
-
 pub(crate) fn persisted_log_dir_for_session_in_home(
     home: &std::path::Path,
     session_id: &str,
@@ -834,9 +911,7 @@ pub(crate) fn persisted_log_dir_for_session_in_home(
     ["codex", "claude-code", "gemini"]
         .into_iter()
         .find_map(|source| {
-            crate::external_wrapper_index::wrappers_for(home, source, session_id)
-                .into_iter()
-                .next()
+            crate::external_wrapper_index::active_wrapper_for(home, source, session_id)
                 .map(|record| std::path::PathBuf::from(record.log_path))
         })
 }

@@ -426,8 +426,21 @@ fn cmd_requests() -> Result<(), CallerError> {
         return Ok(());
     }
     for request in requests {
+        let caller = match request.requester_daemon_id.as_deref() {
+            // A stored tier claim only exists when it was signed inside
+            // the verified caller-ID (docs/src/trust-tiers.md § Where
+            // fleet metadata rides), so it always rides the verified arm.
+            Some(id) => match request.requester_tier.as_deref() {
+                Some(tier) => format!(
+                    "caller={}… (verified, says: {tier})",
+                    &id[..id.len().min(12)]
+                ),
+                None => format!("caller={}… (verified)", &id[..id.len().min(12)]),
+            },
+            None => "caller=unverified".to_string(),
+        };
         println!(
-            "{}  {:?}  {}  profile={}  expires={}",
+            "{}  {:?}  {}  profile={}  {}  expires={}",
             request.code,
             request.status,
             request.requester_label,
@@ -435,6 +448,7 @@ fn cmd_requests() -> Result<(), CallerError> {
                 .requested_profile
                 .as_deref()
                 .unwrap_or(crate::peer::access_policy::DEFAULT_PROFILE),
+            caller,
             request.expires_at_unix
         );
     }
@@ -550,8 +564,7 @@ fn cmd_set_profile(args: PeerArgs) -> Result<(), CallerError> {
         CallerError::Config("`intendant peer set-profile` requires --profile <NAME>".into())
     })?;
     let cert_dir = access::backend::select_backend().cert_dir();
-    let change =
-        crate::peer::access_policy::set_identity_profile(&cert_dir, &selector, &profile)?;
+    let change = crate::peer::access_policy::set_identity_profile(&cert_dir, &selector, &profile)?;
     println!(
         ":: peer identity {} ({}) profile: {} -> {}",
         change.record.fingerprint,
@@ -983,10 +996,7 @@ mod tests {
         let args = parse_args(&argv(&["request", "https://t", "--profile", "admin"])).unwrap();
         assert_eq!(args.profile.as_deref(), Some("peer-root"));
         let args = parse_args(&argv(&["set-profile", "aabb", "--profile", "spectator"])).unwrap();
-        assert_eq!(
-            args.profile.as_deref(),
-            Some("shared-session-spectator")
-        );
+        assert_eq!(args.profile.as_deref(), Some("shared-session-spectator"));
     }
 
     #[test]

@@ -2,7 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<!-- viewport-fit=cover: layout extends under notches/home indicator so the
+     env(safe-area-inset-*) vars in ui2-chrome.css get real values (they are
+     0 otherwise and the chrome collides with hardware on phones). No
+     user-scalable=no: pinch-zoom is an accessibility escape hatch — iOS
+     focus-zoom is prevented by 16px input font, double-tap zoom by
+     per-element touch-action:manipulation. -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Intendant</title>
 <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" id="favicon">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">

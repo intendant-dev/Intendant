@@ -569,7 +569,7 @@ async function filesIdeCommitCreate(rawName) {
     renderFilesIdeTree();
     return;
   }
-  const path = creating.dir.replace(/\/+$/, '') + '/' + name;
+  const path = filesIdeJoinPath(creating.dir, name);
   if (creating.kind === 'folder') {
     try {
       const resp = await filesIdeMkdir(hostId, path);
@@ -587,10 +587,65 @@ async function filesIdeCommitCreate(rawName) {
   filesIdeOpenFile(hostId, path, { createNew: true });
 }
 
-function filesIdeParentDir(path) {
-  const trimmed = String(path || '').replace(/\/+$/, '');
+/* ── Separator-aware path math ──
+   The daemon serializes native paths: a Windows peer hands this UI
+   `C:\Users\...` while Unix daemons hand `/home/...`. Every join/dirname
+   below keys off the path's own separator (presence of a backslash or a
+   drive prefix) instead of assuming POSIX. */
+function filesIdePathSeparator(path) {
+  const text = String(path || '');
+  return (text.includes('\\') || /^[A-Za-z]:/.test(text)) ? '\\' : '/';
+}
+
+function filesIdeDirname(path) {
+  const text = String(path || '');
+  if (filesIdePathSeparator(text) === '\\') {
+    const trimmed = text.replace(/[\\/]+$/, '');
+    // A bare drive letter is drive-relative — keep the root form.
+    const rootForm = value => (/^[A-Za-z]:$/.test(value) ? value + '\\' : value);
+    const idx = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+    if (idx <= 0) return rootForm(trimmed) || '\\';
+    return rootForm(trimmed.slice(0, idx));
+  }
+  const trimmed = text.replace(/\/+$/, '');
   const idx = trimmed.lastIndexOf('/');
   return idx > 0 ? trimmed.slice(0, idx) : '/';
+}
+
+function filesIdeJoinPath(dir, name) {
+  const base = String(dir || '');
+  const sep = filesIdePathSeparator(base);
+  const trimmed = base.replace(sep === '\\' ? /[\\/]+$/ : /\/+$/, '');
+  if (!trimmed) return (base.startsWith('/') ? '/' : '') + name; // unix root
+  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed + '\\' + name; // drive root
+  return trimmed + sep + name;
+}
+
+/* "Everything under `path`": the prefix descendants start with, in the
+   path's own separator (rename/delete retargeting, subtree drops). */
+function filesIdeChildPrefix(path) {
+  const text = String(path || '');
+  const sep = filesIdePathSeparator(text);
+  return text.replace(sep === '\\' ? /[\\/]+$/ : /\/+$/, '') + sep;
+}
+
+// Legacy name kept for readability at the call sites that grew up with it.
+function filesIdeParentDir(path) {
+  return filesIdeDirname(path);
+}
+
+/// Forget cached tree state under a renamed or deleted directory: its own
+/// listing, every descendant listing, and their expansion flags. (Called
+/// from the rename/delete flows; without it a stale child listing
+/// resurrects rows for paths that no longer exist.)
+function filesIdeDropSubtreeState(state, path) {
+  const prefix = filesIdeChildPrefix(path);
+  for (const key of Array.from(state.listings.keys())) {
+    if (key === path || key.startsWith(prefix)) state.listings.delete(key);
+  }
+  for (const key of Array.from(state.expanded)) {
+    if (key === path || key.startsWith(prefix)) state.expanded.delete(key);
+  }
 }
 
 function filesIdeBeginRename(path, isDir) {
@@ -631,14 +686,14 @@ async function filesIdeCommitRename(rawName) {
     return;
   }
   const from = renaming.path;
-  const to = renaming.dir.replace(/\/+$/, '') + '/' + name;
+  const to = filesIdeJoinPath(renaming.dir, name);
   try {
     const resp = await filesIdeRename(hostId, from, to);
     if (!resp.ok) throw new Error(resp.body.error || `Rename failed (${resp.status})`);
     const finalPath = typeof resp.body.path === 'string' && resp.body.path ? resp.body.path : to;
     filesIdeRetargetBuffers(hostId, from, finalPath, renaming.isDir);
     if (renaming.isDir) filesIdeDropSubtreeState(state, from);
-    if (state.contextDir === from || (renaming.isDir && state.contextDir.startsWith(from + '/'))) {
+    if (state.contextDir === from || (renaming.isDir && state.contextDir.startsWith(filesIdeChildPrefix(from)))) {
       state.contextDir = renaming.dir;
     }
     state.listings.delete(renaming.dir);
@@ -698,7 +753,7 @@ async function filesIdeExecuteDelete(path, isDir, recursive) {
     }
     filesIdeOrphanOrCloseBuffers(hostId, path, isDir);
     if (isDir) filesIdeDropSubtreeState(state, path);
-    if (state.contextDir === path || (isDir && state.contextDir.startsWith(path + '/'))) {
+    if (state.contextDir === path || (isDir && state.contextDir.startsWith(filesIdeChildPrefix(path)))) {
       state.contextDir = dir;
     }
     state.listings.delete(dir);
@@ -714,14 +769,13 @@ async function filesIdeExecuteDelete(path, isDir, recursive) {
 /// key/path/name. Directory renames retarget every buffer underneath.
 function filesIdeRetargetBuffers(hostId, oldPath, newPath, isDir) {
   const host = hostId || '';
-  const prefix = oldPath.replace(/\/+$/, '') + '/';
-  const newBase = newPath.replace(/\/+$/, '');
+  const prefix = filesIdeChildPrefix(oldPath);
   for (const buffer of Array.from(filesIdeBuffers.values())) {
     if ((buffer.host || '') !== host) continue;
     if (buffer.path === oldPath) {
       filesIdeRekeyBuffer(buffer, newPath);
     } else if (isDir && buffer.path.startsWith(prefix)) {
-      filesIdeRekeyBuffer(buffer, newBase + '/' + buffer.path.slice(prefix.length));
+      filesIdeRekeyBuffer(buffer, filesIdeJoinPath(newPath, buffer.path.slice(prefix.length)));
     }
   }
 }
@@ -729,6 +783,14 @@ function filesIdeRetargetBuffers(hostId, oldPath, newPath, isDir) {
 function filesIdeRekeyBuffer(buffer, newPath) {
   const oldKey = buffer.key;
   const newKey = filesIdeBufferKey(buffer.host, newPath);
+  // Carry any persisted draft along to the new identity.
+  const draft = filesIdeDraftRead(oldKey);
+  if (draft) {
+    filesIdeDraftClear(oldKey);
+    try {
+      localStorage.setItem(filesIdeDraftStorageKey(newKey), JSON.stringify(draft));
+    } catch (_) { /* best-effort */ }
+  }
   buffer.key = newKey;
   buffer.path = newPath;
   buffer.name = String(newPath).split(/[\\/]/).filter(Boolean).pop() || newPath;
@@ -754,7 +816,7 @@ function filesIdeRekeyBuffer(buffer, newPath) {
 /// recreates the file from the buffer.
 function filesIdeOrphanOrCloseBuffers(hostId, path, isDir) {
   const host = hostId || '';
-  const prefix = path.replace(/\/+$/, '') + '/';
+  const prefix = filesIdeChildPrefix(path);
   for (const buffer of Array.from(filesIdeBuffers.values())) {
     if ((buffer.host || '') !== host) continue;
     const hit = buffer.path === path || (isDir && buffer.path.startsWith(prefix));
@@ -786,6 +848,87 @@ function filesIdeModeSpecFor(name) {
   const info = CM.findModeByFileName(String(name || ''));
   if (!info) return null;
   return info.mime && info.mime !== 'null' ? info.mime : info.mode || null;
+}
+
+/* ── Dirty-buffer drafts ──
+   Unsaved edits persist to localStorage (debounced on change) so a tab
+   crash or accidental navigation loses nothing the beforeunload guard
+   could not stop. On reopening a file with a draft present: disk still
+   at the draft's baseline sha → offer "Restore draft"; disk moved on →
+   restore the draft and route through the existing conflict banner
+   (Reload / Overwrite). Cleared on save and on close-clean/discard.
+   Best-effort by design: storage failures never block editing. */
+const FILES_IDE_DRAFT_PREFIX = 'intendant.ui2.draft.';
+const FILES_IDE_DRAFT_MAX_CHARS = 200 * 1024; // ~200 KB per draft
+
+function filesIdeDraftStorageKey(bufferKey) {
+  return FILES_IDE_DRAFT_PREFIX + bufferKey;
+}
+
+function filesIdeDraftRead(bufferKey) {
+  try {
+    const raw = localStorage.getItem(filesIdeDraftStorageKey(bufferKey));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed.text === 'string' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function filesIdeDraftClear(bufferKey) {
+  try { localStorage.removeItem(filesIdeDraftStorageKey(bufferKey)); } catch (_) {}
+}
+
+function filesIdeDraftWrite(buffer) {
+  const text = buffer.doc.getValue('\n');
+  if (text.length > FILES_IDE_DRAFT_MAX_CHARS) {
+    // Too large to keep: drop any older (smaller) draft so a stale copy
+    // can never masquerade as the current buffer, and say so once.
+    filesIdeDraftClear(buffer.key);
+    if (buffer.key === filesIdeActiveKey && !buffer.draftCapNoted) {
+      buffer.draftCapNoted = true;
+      filesIdeSetSaveStatus('', 'Draft not kept — buffer exceeds the 200 KB draft cap');
+    }
+    return;
+  }
+  try {
+    localStorage.setItem(filesIdeDraftStorageKey(buffer.key), JSON.stringify({
+      text,
+      baseSha: buffer.baselineSha || '',
+      eol: buffer.eol,
+      savedAt: Date.now(),
+    }));
+  } catch (_) { /* storage full or blocked — drafts stay best-effort */ }
+}
+
+function filesIdeDraftSchedule(buffer) {
+  clearTimeout(buffer._draftTimer);
+  buffer._draftTimer = setTimeout(() => {
+    buffer._draftTimer = null;
+    if (filesIdeBuffers.get(buffer.key) !== buffer) return; // closed / re-keyed
+    if (filesIdeBufferDirty(buffer)) filesIdeDraftWrite(buffer);
+    else filesIdeDraftClear(buffer.key);
+  }, 800);
+}
+
+function filesIdeRestoreDraftActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer || !buffer.draftOffer) return;
+  const draft = buffer.draftOffer;
+  buffer.draftOffer = null;
+  if (draft.eol === '\r\n' || draft.eol === '\n') buffer.eol = draft.eol;
+  buffer.doc.setValue(draft.text); // change event marks dirty + re-schedules
+  filesIdeRenderTabs();
+  filesIdeRenderChrome();
+}
+
+function filesIdeDiscardDraftActive() {
+  const buffer = filesIdeActiveBuffer();
+  if (!buffer || !buffer.draftOffer) return;
+  buffer.draftOffer = null;
+  filesIdeDraftClear(buffer.key);
+  filesIdeRenderChrome();
 }
 
 async function filesIdeOpenFile(hostId, path, options = {}) {
@@ -828,7 +971,8 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
       sha = read.sha256 || '';
     }
     const eol = filesIdeDetectEol(text);
-    const doc = window.CodeMirror.Doc(text.replace(/\r\n/g, '\n'), filesIdeModeSpecFor(name));
+    const normalized = text.replace(/\r\n/g, '\n');
+    const doc = window.CodeMirror.Doc(normalized, filesIdeModeSpecFor(name));
     const buffer = {
       key,
       host: hostId || '',
@@ -840,9 +984,32 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
       isNew: Boolean(options.createNew),
       saving: false,
       conflict: null,
+      draftOffer: null,
       lastError: '',
       cleanGeneration: doc.changeGeneration(),
     };
+    // Draft recovery: a persisted dirty buffer for this exact file.
+    if (!options.createNew) {
+      const draft = filesIdeDraftRead(key);
+      if (draft && draft.text === normalized) {
+        filesIdeDraftClear(key); // stale leftover — disk already matches
+      } else if (draft) {
+        if (sha && (draft.baseSha || '') === sha) {
+          buffer.draftOffer = draft; // disk unchanged: offer to restore
+        } else {
+          // Disk moved on (or no verifiable baseline): restore the draft
+          // and route through the existing conflict banner. setValue after
+          // cleanGeneration was captured marks the buffer dirty, and the
+          // save baseline becomes the DRAFT's baseline so a plain Save
+          // 409s into the banner instead of silently clobbering the newer
+          // disk content — Overwrite stays the explicit click it is today.
+          if (draft.eol === '\r\n' || draft.eol === '\n') buffer.eol = draft.eol;
+          doc.setValue(draft.text);
+          buffer.baselineSha = draft.baseSha || '';
+          buffer.conflict = { code: 'conflict', currentSha: sha || '' };
+        }
+      }
+    }
     filesIdeBuffers.set(key, buffer);
     // Keystroke-frequency handler: only touch the DOM when the dirty flag
     // actually flips (the tab strip re-render re-attaches listeners).
@@ -854,6 +1021,7 @@ async function filesIdeOpenFile(hostId, path, options = {}) {
         if (saveBtn && !buffer.saving) saveBtn.disabled = !dirty && !buffer.conflict;
         filesIdeFindOnDocChange();
       }
+      filesIdeDraftSchedule(buffer);
     });
     filesIdeSetSaveStatus('', '');
     filesIdeActivate(key);
@@ -908,8 +1076,7 @@ function filesIdeActivate(key) {
         },
       },
     });
-    // Ln/Col statusbar indicator (ui-v2 design add; span is hidden and
-    // stays empty under v1).
+    // Ln/Col statusbar indicator (filesIdeUpdateLnCol reads the cursor).
     filesIdeCm.on('cursorActivity', filesIdeUpdateLnCol);
   }
   if (empty) empty.classList.add('hidden');
@@ -945,6 +1112,11 @@ function filesIdeCloseTab(key, confirmed) {
     }, 3000);
     return;
   }
+  // Close is clean or an explicit "Discard?" confirmation — either way
+  // the persisted draft's job is over.
+  clearTimeout(buffer._draftTimer);
+  buffer._draftTimer = null;
+  filesIdeDraftClear(key);
   filesIdeBuffers.delete(key);
   if (filesIdeActiveKey === key) {
     filesIdeActiveKey = '';
@@ -1005,9 +1177,9 @@ function filesIdeSetSaveStatus(kind, text) {
   el.className = 'files-ide-save-status' + (kind ? ` ${kind}` : '');
 }
 
-// Ln/Col cursor indicator, ui-v2 only: the design statusbar reads
-// `host · Language · LF · Ln 8, Col 24`. Under v1 the span is display:none
-// and kept empty so the flex gap contributes nothing.
+// Ln/Col cursor indicator in the editor statusbar (`host · Language ·
+// LF · Ln 8, Col 24`), fed by CodeMirror's cursorActivity events; kept
+// empty while no buffer is open so the flex gap contributes nothing.
 function filesIdeUpdateLnCol() {
   const el = document.getElementById('files-ide-status-lncol');
   if (!el) return;
@@ -1069,6 +1241,14 @@ function filesIdeRenderChrome() {
         `<span>${escapeHtml(message)}</span>` +
         `<button type="button" class="ui-btn" onclick="filesIdeReloadActive()">Reload from disk</button>` +
         `<button type="button" class="ui-btn" onclick="filesIdeOverwriteActive()">Overwrite</button>`;
+    } else if (buffer?.draftOffer) {
+      const savedAt = Number(buffer.draftOffer.savedAt || 0);
+      const when = savedAt ? ` from ${new Date(savedAt).toLocaleString()}` : '';
+      banner.className = 'files-ide-banner';
+      banner.innerHTML =
+        `<span>${escapeHtml(`An unsaved draft of this file${when} is stored in this browser.`)}</span>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeRestoreDraftActive()">Restore draft</button>` +
+        `<button type="button" class="ui-btn" onclick="filesIdeDiscardDraftActive()">Discard draft</button>`;
     } else if (buffer?.lastError) {
       banner.className = 'files-ide-banner error';
       banner.innerHTML = `<span>${escapeHtml(buffer.lastError)}</span>`;
@@ -1120,12 +1300,17 @@ async function filesIdeSaveActive(saveOptions = {}) {
     buffer.baselineSha = resp.body.sha256 || '';
     buffer.isNew = false;
     buffer.conflict = null;
+    buffer.draftOffer = null;
     // Compare against the generation captured before serialize: keystrokes
     // that landed while the save was in flight keep the buffer dirty.
     buffer.cleanGeneration = generation;
+    // The disk now holds this content — the browser draft is obsolete. A
+    // still-pending draft timer is left alone: it re-checks dirtiness at
+    // fire time, so keystrokes that landed mid-save re-draft themselves.
+    filesIdeDraftClear(buffer.key);
     filesIdeSetSaveStatus('ok', `Saved ${new Date().toLocaleTimeString()}`);
     const state = filesIdeTreeState(buffer.host);
-    const dir = buffer.path.slice(0, buffer.path.lastIndexOf('/')) || '/';
+    const dir = filesIdeDirname(buffer.path);
     if (state.listings.has(dir)) {
       filesIdeLoadListing(buffer.host, dir).then(() => renderFilesIdeTree()).catch(() => {});
     }
@@ -1217,6 +1402,10 @@ function onFilesIdeHostChanged() {
 // -- find in file (vendored searchcursor addon; smart case, live count)
 
 const FILES_IDE_FIND_MARK_CAP = 300;
+const FILES_IDE_FIND_MATCH_CAP = 10000;
+// True when the last scan hit FILES_IDE_FIND_MATCH_CAP — the count pill
+// must say "first N shown" instead of implying completeness.
+let filesIdeFindTruncated = false;
 
 function filesIdeFindInput() {
   return document.getElementById('files-ide-find-input');
@@ -1243,6 +1432,7 @@ function filesIdeCloseFind(focusEditor = true) {
   filesIdeFindClearMarks();
   filesIdeFindMatches = [];
   filesIdeFindIndex = -1;
+  filesIdeFindTruncated = false;
   filesIdeFindSetCount();
   if (focusEditor && filesIdeCm && filesIdeActiveBuffer()) filesIdeCm.focus();
 }
@@ -1260,13 +1450,22 @@ function filesIdeFindSetCount() {
   const query = filesIdeFindInput()?.value || '';
   if (!filesIdeFindOpen || !query) {
     el.textContent = '';
+    el.title = '';
     el.classList.remove('none');
     return;
   }
-  el.textContent = filesIdeFindMatches.length
-    ? `${filesIdeFindIndex + 1} / ${filesIdeFindMatches.length}`
-    : 'No matches';
-  el.classList.toggle('none', !filesIdeFindMatches.length);
+  // Honest caps: the scan stops at FILES_IDE_FIND_MATCH_CAP matches and
+  // only the first FILES_IDE_FIND_MARK_CAP are highlighted — a bare
+  // "1 / 10000" would imply a complete count and full highlighting.
+  const total = filesIdeFindMatches.length;
+  const suffix = filesIdeFindTruncated ? `+ (first ${total} shown)` : '';
+  el.textContent = total ? `${filesIdeFindIndex + 1} / ${total}${suffix}` : 'No matches';
+  el.title = filesIdeFindTruncated
+    ? `Search stopped after the first ${total} matches; refine the query to see the rest.`
+    : (total > FILES_IDE_FIND_MARK_CAP
+      ? `Highlighting the first ${FILES_IDE_FIND_MARK_CAP} matches; stepping still reaches all ${total}.`
+      : '');
+  el.classList.toggle('none', !total);
 }
 
 function filesIdeFindRecompute(options = {}) {
@@ -1274,6 +1473,7 @@ function filesIdeFindRecompute(options = {}) {
   filesIdeFindClearMarks();
   filesIdeFindMatches = [];
   filesIdeFindIndex = -1;
+  filesIdeFindTruncated = false;
   const query = filesIdeFindInput()?.value || '';
   if (!query) {
     filesIdeFindSetCount();
@@ -1285,7 +1485,10 @@ function filesIdeFindRecompute(options = {}) {
   const cursor = filesIdeCm.getSearchCursor(query, CM.Pos(0, 0), { caseFold });
   while (cursor.findNext()) {
     filesIdeFindMatches.push({ from: cursor.from(), to: cursor.to() });
-    if (filesIdeFindMatches.length >= 10000) break;
+    if (filesIdeFindMatches.length >= FILES_IDE_FIND_MATCH_CAP) {
+      filesIdeFindTruncated = true;
+      break;
+    }
   }
   const markCount = Math.min(filesIdeFindMatches.length, FILES_IDE_FIND_MARK_CAP);
   for (let i = 0; i < markCount; i++) {
@@ -1369,10 +1572,15 @@ let fsPickerMultiSelect = false;
 let fsPickerSelectedPaths = [];
 let fsPickerAnchorPath = '';
 let fsPickerUseLabelBase = 'Use path';
+// Whose disk the picker lists: '' = this daemon, a host id = that peer's
+// dashboard-control tunnel (the same daemonApi lane the IDE tree browses
+// peers through). Set per-open by configureFsPicker.
+let fsPickerHostId = '';
 
-function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect }) {
+function configureFsPicker({ mode, target, title, placeholder, useLabel, showCreate, multiSelect, hostId }) {
   fsPickerMode = mode || 'directory';
   fsPickerTarget = target || 'project';
+  fsPickerHostId = String(hostId || '');
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
   fsPickerMultiSelect = fsPickerMode === 'file' && !!multiSelect;
@@ -1555,7 +1763,7 @@ async function resolveFsPickerListTarget(target) {
   if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
     return { listPath: target, selectedPath: '' };
   }
-  const resp = await filesIdeStat('', target);
+  const resp = await filesIdeStat(fsPickerHostId, target);
   const status = resp.body;
   if (!resp.ok) return { listPath: target, selectedPath: '' };
   if (status.exists && status.is_file && status.parent) {
@@ -1589,7 +1797,7 @@ async function loadFsPicker(path) {
     fsPickerSelectedPath = resolved.selectedPath || '';
     fsPickerSelectedPaths = fsPickerSelectedPath ? [fsPickerSelectedPath] : [];
     fsPickerAnchorPath = fsPickerSelectedPath;
-    const resp = await filesIdeList('', resolved.listPath);
+    const resp = await filesIdeList(fsPickerHostId, resolved.listPath);
     const data = resp.body;
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;
@@ -1658,15 +1866,27 @@ function openDownloadFilePicker() {
   loadFsPicker(dashboardProjectRoot || '~');
 }
 
+/* Peer browsing rides the same daemonApi fs lane the IDE tree already
+   proves out (api_fs_list/api_fs_stat with target: hostId); 'never' is
+   the only truly-unreachable availability — 'transport-down' means the
+   request itself will dial the peer tunnel, exactly like the tree. The
+   manual-path input stays as the escape hatch either way. */
+function filesDownloadPeerBrowsable(peerId) {
+  const availability = daemonApi.availability('api_fs_list', peerId);
+  return availability.ok || availability.reason === 'transport-down';
+}
+
 function openFilesDownloadPicker() {
-  if (filesDownloadSelectedPeerId()) {
-    setFilesDownloadStatus('warn', 'Peer browsing is not available yet; enter a full path');
+  const peerId = filesDownloadSelectedPeerId();
+  if (peerId && !filesDownloadPeerBrowsable(peerId)) {
+    setFilesDownloadStatus('warn', `Browsing ${filesDownloadPeerLabel(peerId)} is unavailable from this dashboard; enter a full path`);
     return;
   }
   configureFsPicker({
     mode: 'file',
     target: 'filesDownload',
-    title: 'Choose files to download',
+    hostId: peerId,
+    title: peerId ? `Choose files on ${filesDownloadPeerLabel(peerId)}` : 'Choose files to download',
     placeholder: '/path/to/file',
     useLabel: 'Download',
     showCreate: false,
@@ -1674,8 +1894,14 @@ function openFilesDownloadPicker() {
   });
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'flex';
-  loadFsPicker(filesDownloadPathValue() || dashboardProjectRoot || '~');
+  // dashboardProjectRoot is this daemon's disk — a peer starts at its
+  // own home instead.
+  loadFsPicker(filesDownloadPathValue() || (peerId ? '~' : (dashboardProjectRoot || '~')));
 }
+
+/* 54's transfer gates (onFilesDownloadHostChanged / setFilesDownloadBusy)
+   now consult filesDownloadPeerBrowsable directly, so peer selection no
+   longer force-disables Browse; no reconciliation needed here. */
 
 function openFilesUploadDestinationPicker() {
   configureFsPicker({
@@ -1845,7 +2071,7 @@ async function createPickerDirectory() {
   setFsPickerStatus('', 'Creating directory...');
   // api_fs_mkdir is a POST twin: the facade's no-replay policy covers the
   // fallbackAfterRpcFailure:false this call used to pass by hand.
-  const resp = await filesIdeMkdir('', path);
+  const resp = await filesIdeMkdir(fsPickerHostId, path);
   const data = resp.body;
   if (!resp.ok) {
     setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);
@@ -1864,20 +2090,6 @@ window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 
-// The Claude model picker offers version-safe aliases (the CLI resolves
-// them to the latest model); the free-text id input only appears behind
-// the explicit "Custom model id…" choice.
-function updateNewSessionClaudeCustomModelRow() {
-  const select = document.getElementById('new-session-claude-model-select');
-  const row = document.getElementById('new-session-claude-model-custom-row');
-  if (!select || !row) return;
-  const custom = select.value === '__custom__' && !select.disabled;
-  row.classList.toggle('hidden', !custom);
-}
-function onNewSessionClaudeModelSelectChange() {
-  updateNewSessionClaudeCustomModelRow();
-}
-window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange;
 	window.openDownloadFilePicker = openDownloadFilePicker;
 	window.openFilesDownloadPicker = openFilesDownloadPicker;
 	window.onFilesDownloadHostChanged = onFilesDownloadHostChanged;
@@ -1906,6 +2118,8 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 	window.filesIdeSaveActive = filesIdeSaveActive;
 	window.filesIdeReloadActive = filesIdeReloadActive;
 	window.filesIdeOverwriteActive = filesIdeOverwriteActive;
+	window.filesIdeRestoreDraftActive = filesIdeRestoreDraftActive;
+	window.filesIdeDiscardDraftActive = filesIdeDiscardDraftActive;
 	window.filesIdeFindOnInput = filesIdeFindOnInput;
 	window.filesIdeFindStep = filesIdeFindStep;
 	window.filesIdeCloseFind = filesIdeCloseFind;
@@ -2351,782 +2565,3 @@ window.onNewSessionClaudeModelSelectChange = onNewSessionClaudeModelSelectChange
 
 restoreFilesTransferState();
 renderFilesTransfers();
-
-function normalizeContextArchiveMode(mode) {
-  return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
-}
-
-function normalizeContextArchiveModeOptional(mode) {
-  const v = String(mode || '').trim();
-  return ['summary', 'exact', 'off'].includes(v) ? v : '';
-}
-
-function normalizeCodexSandbox(mode) {
-  const v = String(mode || '').trim();
-  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : 'workspace-write';
-}
-
-function normalizeCodexSandboxOptional(mode) {
-  const v = String(mode || '').trim();
-  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : '';
-}
-
-function normalizeCodexApprovalPolicy(policy) {
-  const v = String(policy || '').trim();
-  return ['on-request', 'never', 'untrusted'].includes(v) ? v : 'on-request';
-}
-
-function normalizeCodexApprovalPolicyOptional(policy) {
-  const v = String(policy || '').trim();
-  return ['on-request', 'never', 'untrusted'].includes(v) ? v : '';
-}
-
-function normalizeCodexServiceTier(tier) {
-  const v = String(tier || '').trim().toLowerCase();
-  if (!v || v === 'inherit' || v === 'default' || v === 'auto' || v === 'codex') return '';
-  if (v === 'fast' || v === 'priority') return 'priority';
-  if (['standard', 'normal', 'none', 'off', 'clear', 'disabled', 'false', '0'].includes(v)) return 'standard';
-  if (v === 'flex') return 'flex';
-  return v;
-}
-
-function codexServiceTierIsFast(tier) {
-  return normalizeCodexServiceTier(tier) === 'priority';
-}
-
-function resetNewSessionCodexFastModeToDefault() {
-  newSessionCodexFastModeTouched = false;
-  newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
-}
-
-function setNewSessionAgentDefaults(settings) {
-  newSessionAgentCommands = {
-    codex: settings.codex_command || 'codex',
-    'claude-code': settings.claude_command || 'claude',
-  };
-  newSessionCodexManagedContext =
-    settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
-  newSessionCodexContextArchive = normalizeContextArchiveMode(settings.codex_context_archive || 'summary');
-  newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
-  newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
-  newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
-  newSessionCodexLaunchDefaultsLoaded = true;
-  if (!newSessionCodexFastModeTouched) {
-    newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
-  }
-  renderNewSessionAgentControls();
-}
-
-function commandDefaultForNewSessionAgent(agentId) {
-  return newSessionAgentCommands[agentId] || ({
-    codex: 'codex',
-    'claude-code': 'claude',
-  }[agentId] || '');
-}
-
-function effectiveNewSessionAgentId() {
-  const select = document.getElementById('new-session-agent');
-  const raw = select?.value || '';
-  if (raw === 'internal') return 'internal';
-  return normalizeAgentId(raw) || newSessionConfiguredAgent || '';
-}
-
-function renderNewSessionAgentControls(options = {}) {
-  const select = document.getElementById('new-session-agent');
-  const commandInput = document.getElementById('new-session-agent-command');
-  const browseBtn = document.getElementById('new-session-agent-command-browse');
-  const sandboxSel = document.getElementById('new-session-codex-sandbox');
-  const approvalSel = document.getElementById('new-session-codex-approval-policy');
-  const managedContextSel = document.getElementById('new-session-codex-managed-context');
-  const contextArchiveSel = document.getElementById('new-session-codex-context-archive');
-  const fastToggle = document.getElementById('new-session-codex-fast');
-  const fastWrap = document.getElementById('new-session-codex-fast-wrap');
-  const managedContextNote = document.getElementById('new-session-managed-context-note');
-  if (!select || !commandInput) return;
-
-  // Grey out backends whose CLI is missing on the daemon host; kick the
-  // probe on first render and re-apply when it lands.
-  if (Array.isArray(externalAgentAvailability)) {
-    applyExternalAgentAvailabilityToNewSessionPicker();
-  } else {
-    refreshExternalAgentAvailability();
-  }
-
-  const currentOption = select.querySelector('option[value=""]');
-  if (currentOption) {
-    currentOption.textContent = newSessionConfiguredAgent
-      ? `Current setting (${prettyAgentName(newSessionConfiguredAgent)})`
-      : 'Current setting (internal agent)';
-  }
-
-  const selectedAgent = normalizeAgentId(select.value);
-  const effectiveAgent = effectiveNewSessionAgentId();
-  const hasExternalAgent = !!selectedAgent;
-  // The external-options fold follows the backend choice: open while an
-  // external agent is selected (or is the configured default), closed for
-  // the internal agent.
-  const externalFold = document.getElementById('new-session-external-fold');
-  if (externalFold) {
-    externalFold.open = hasExternalAgent ||
-      (!!effectiveAgent && effectiveAgent !== 'internal' && effectiveAgent !== 'intendant');
-  }
-  // Execution shape (auto / orchestrate / direct) only applies to the
-  // internal agent — external CLIs run their own loops.
-  const executionSel = document.getElementById('new-session-execution');
-  if (executionSel) {
-    const appliesToInternal =
-      !effectiveAgent || effectiveAgent === 'internal' || effectiveAgent === 'intendant';
-    executionSel.disabled = !appliesToInternal;
-    if (!appliesToInternal) executionSel.value = '';
-    document
-      .getElementById('new-session-execution-wrap')
-      ?.classList.toggle('disabled', !appliesToInternal);
-  }
-  commandInput.disabled = !hasExternalAgent;
-  if (browseBtn) browseBtn.disabled = !hasExternalAgent;
-  commandInput.placeholder = hasExternalAgent
-    ? commandDefaultForNewSessionAgent(selectedAgent)
-    : 'Select an external agent';
-  if (!hasExternalAgent || options.replaceCommand) {
-    commandInput.value = '';
-  }
-  const claudeModelSel = document.getElementById('new-session-claude-model-select');
-  const claudeModelInp = document.getElementById('new-session-claude-model');
-  const claudeModeSel = document.getElementById('new-session-claude-permission-mode');
-  const claudeEffortSel = document.getElementById('new-session-claude-effort');
-  const appliesToClaude = effectiveAgent === 'claude-code';
-  if (claudeModelSel) {
-    claudeModelSel.disabled = !appliesToClaude;
-    if (!appliesToClaude) claudeModelSel.value = '';
-  }
-  if (claudeModelInp) {
-    claudeModelInp.disabled = !appliesToClaude;
-    if (!appliesToClaude) claudeModelInp.value = '';
-  }
-  updateNewSessionClaudeCustomModelRow();
-  if (claudeModeSel) {
-    claudeModeSel.disabled = !appliesToClaude;
-    if (!appliesToClaude) claudeModeSel.value = '';
-  }
-  if (claudeEffortSel) {
-    claudeEffortSel.disabled = !appliesToClaude;
-    if (!appliesToClaude) claudeEffortSel.value = '';
-  }
-  if (managedContextSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
-    managedContextSel.disabled = !appliesToCodex;
-    managedContextSel.value = newSessionCodexManagedContext;
-  }
-  if (sandboxSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
-    sandboxSel.disabled = !appliesToCodex;
-    sandboxSel.value = normalizeCodexSandbox(newSessionCodexSandbox);
-  }
-  if (approvalSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
-    approvalSel.disabled = !appliesToCodex;
-    approvalSel.value = normalizeCodexApprovalPolicy(newSessionCodexApprovalPolicy);
-  }
-  if (contextArchiveSel) {
-    const appliesToCodex = effectiveAgent === 'codex';
-    contextArchiveSel.disabled = !appliesToCodex;
-    contextArchiveSel.value = normalizeContextArchiveMode(newSessionCodexContextArchive);
-  }
-  if (fastToggle) {
-    const appliesToCodex = effectiveAgent === 'codex';
-    fastToggle.disabled = !appliesToCodex;
-    fastToggle.checked = appliesToCodex && !!newSessionCodexFastMode;
-    if (fastWrap) {
-      fastWrap.classList.toggle('disabled', !appliesToCodex);
-      fastWrap.classList.toggle('active', appliesToCodex && !!newSessionCodexFastMode);
-      const defaultFast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
-      fastWrap.title = appliesToCodex
-        ? (defaultFast
-          ? 'Global default is Fast; uncheck to force this new session to normal'
-          : 'Start the new Codex session with Fast service tier')
-        : 'Fast service tier applies to Codex sessions';
-    }
-  }
-  if (managedContextNote) {
-    const mode = managedContextSel?.value || newSessionCodexManagedContext;
-    const appliesToCodex = effectiveAgent === 'codex';
-    managedContextNote.classList.toggle('warn', appliesToCodex && mode === 'managed');
-    managedContextNote.textContent = appliesToCodex && mode === 'managed'
-      ? 'Managed requires a patched Codex binary with the managed app-server protocol.'
-      : '';
-  }
-  updateNewSessionFuelBanner();
-}
-
-function setNewSessionStartButtonPending(pending) {
-  const btn = document.getElementById('new-session-start-btn');
-  if (!btn) return;
-  btn.disabled = !!pending;
-  btn.classList.toggle('pending', !!pending);
-  btn.textContent = pending ? 'Spawning...' : 'Start session';
-  if (!pending) updateNewSessionFuelBanner();
-}
-
-// ── Unfueled preflight ──
-// The status frame's aggregate `fueled` flag (presence-level, no settings
-// permission needed) gates internal launches before they spawn a session
-// that can only die with "No API key found". Strict === false: an unknown
-// state (no status frame yet, older daemon) never blocks.
-
-// Layered like refreshUnfueledEmptyState: the status frame's aggregate
-// wins when present; otherwise a one-shot HTTP key-status probe fills in
-// (the control transport may not be connected yet — or ever, for some
-// bindings). Unknown never blocks.
-let daemonUnfueledCached = null;
-let daemonFuelProbeInFlight = false;
-// ui-v2 fueled-banner detail: which providers the key-status probe saw.
-// null = never probed; [] = probed and none (or probe failed — generic
-// copy, no re-hammering).
-let daemonFuelProviders = null;
-
-function daemonInternalUnfueled() {
-  const status = dashboardControlTransport?.lastStatus;
-  if (status && typeof status.fueled === 'boolean') return status.fueled === false;
-  return daemonUnfueledCached === true;
-}
-
-function refreshFuelStateForBanner() {
-  const status = dashboardControlTransport?.lastStatus;
-  // The green Fueled banner names the fueled providers, so the one-shot
-  // probe also runs when the status frame already answered the boolean.
-  const wantProviders = daemonFuelProviders === null;
-  if (status && typeof status.fueled === 'boolean' && !wantProviders) return;
-  if ((daemonUnfueledCached !== null && !wantProviders) || daemonFuelProbeInFlight) return;
-  if (typeof fetchApiKeyStatus !== 'function') return;
-  daemonFuelProbeInFlight = true;
-  fetchApiKeyStatus()
-    .then(d => {
-      if (d && !d.error) {
-        if (daemonUnfueledCached === null) daemonUnfueledCached = !(d.openai || d.anthropic || d.gemini);
-        daemonFuelProviders = [
-          d.anthropic ? 'Anthropic' : '',
-          d.openai ? 'OpenAI' : '',
-          d.gemini ? 'Gemini' : '',
-        ].filter(Boolean);
-      } else if (daemonFuelProviders === null) {
-        daemonFuelProviders = [];
-      }
-    })
-    .catch(() => { if (daemonFuelProviders === null) daemonFuelProviders = []; })
-    .finally(() => {
-      daemonFuelProbeInFlight = false;
-      updateNewSessionFuelBanner();
-    });
-}
-
-function newSessionAddKeysAction() {
-  return { label: 'Add API keys', onClick: () => focusSettingsApiKeys() };
-}
-
-const NEW_SESSION_UNFUELED_MESSAGE =
-  'This daemon has no model credentials, so the internal agent can’t start. ' +
-  'External agents (Codex, Claude Code) sign in with their own accounts and still work.';
-
-// ── Projectless preflight ──
-// A daemon launched outside any project reports project_root: null and has
-// no default project — a session cannot start without one. Mirrors the
-// unfueled preflight: known-projectless blocks submit with a pointer at the
-// Project field; unknown (fetch failed, older daemon) never blocks — the
-// daemon's structured no_project failure is the backstop.
-let daemonProjectless = null; // null = unknown
-
-const NEW_SESSION_NO_PROJECT_MESSAGE =
-  'This daemon has no project open. Pick a project directory in the Project field to start a session.';
-
-function newSessionPickProjectAction() {
-  return {
-    label: 'Pick project',
-    onClick: () => {
-      const input = document.getElementById('new-session-project-root');
-      input?.focus();
-      input?.scrollIntoView?.({ block: 'center' });
-    },
-  };
-}
-
-// Shared submit guard (Sessions pane + Station launch): true = blocked.
-function newSessionProjectlessBlocked(requestedProjectRoot) {
-  if (requestedProjectRoot || daemonProjectless !== true) return false;
-  setNewSessionSpawnNotice('error', NEW_SESSION_NO_PROJECT_MESSAGE, newSessionPickProjectAction());
-  return true;
-}
-
-// A no_project SessionEnded can only come from a failed create (no session
-// ever starts under it), so one arriving while a spawn is pending is ours:
-// fail the pending notice with the structured class instead of leaving it
-// to the timeout or prose-matched log entries.
-function maybeFailPendingNewSessionSpawnNoProject(errorKind) {
-  if (errorKind !== 'no_project' || !newSessionSpawnPending) return false;
-  clearNewSessionSpawnTimers();
-  clearNewSessionSpawnRecent();
-  newSessionSpawnPending = false;
-  newSessionSpawnTask = '';
-  newSessionSpawnName = '';
-  setNewSessionStartButtonPending(false);
-  setNewSessionSpawnNotice('error', NEW_SESSION_NO_PROJECT_MESSAGE, newSessionPickProjectAction());
-  showControlToast('error', NEW_SESSION_NO_PROJECT_MESSAGE);
-  return true;
-}
-
-// QA readback (window.qa convention): the preflight inputs the
-// validate-dashboard harness asserts on — module scope hides them.
-// Probe functions stay cheap and side-effect-free.
-window.qa = Object.assign(window.qa || {}, {
-  sessionsFuel: () => ({
-    fueled: dashboardControlTransport?.lastStatus?.fueled ?? null,
-    haveStatus: !!dashboardControlTransport?.lastStatus,
-    unfueledCached: daemonUnfueledCached,
-    projectless: daemonProjectless,
-    effectiveAgent: effectiveNewSessionAgentId(),
-    configuredAgent: newSessionConfiguredAgent || '',
-    bannerHidden: !!document.getElementById('new-session-unfueled-banner')?.classList.contains('hidden'),
-    startDisabled: !!document.getElementById('new-session-start-btn')?.disabled,
-  }),
-
-});
-
-// ── ui-v2 execution segmented control (design overhaul) ──
-// The reference's Auto / Orchestrate / Direct segmented choice with a
-// per-choice note (execInfo copy, verbatim — it matches the current
-// semantics). The v1 <select id="new-session-execution"> stays the source
-// of truth (startNewSession reads it; updateNewSessionAgentFields drives
-// its disabled state) — the segments only proxy value + disabled, and the
-// select is hidden by ui2-sessions.css under the flag. v1 DOM untouched.
-const UI2_EXEC_CHOICES = [
-  { value: '', label: 'Auto', note: 'The task-size heuristic decides between a single agent and supervised sub-agents.' },
-  { value: 'orchestrate', label: 'Orchestrate', note: 'Delegates the task to supervised sub-agents working in isolated git worktrees.' },
-  { value: 'direct', label: 'Direct', note: 'A single agent handles the whole task — no delegation.' },
-];
-let ui2ExecSegEl = null;
-let ui2ExecNoteEl = null;
-
-function ui2SyncExecSeg() {
-  if (!ui2ExecSegEl) return;
-  const sel = document.getElementById('new-session-execution');
-  if (!sel) return;
-  const value = sel.value || '';
-  const disabled = !!sel.disabled;
-  ui2ExecSegEl.classList.toggle('disabled', disabled);
-  for (const btn of ui2ExecSegEl.querySelectorAll('button[data-exec]')) {
-    const active = (btn.dataset.exec || '') === value;
-    btn.classList.toggle('is-accent', active && !disabled);
-    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
-    btn.disabled = disabled;
-  }
-  if (ui2ExecNoteEl) {
-    const choice = UI2_EXEC_CHOICES.find(c => c.value === value) || UI2_EXEC_CHOICES[0];
-    ui2ExecNoteEl.textContent = disabled
-      ? 'Execution shape applies to the internal agent — external CLIs run their own loops.'
-      : choice.note;
-  }
-}
-
-{
-  const wrap = document.getElementById('new-session-execution-wrap');
-  if (wrap && wrap.parentElement) {
-    const field = document.createElement('div');
-    field.className = 'sessions-new-session-field ui2-exec-field';
-    const label = document.createElement('span');
-    label.className = 'ui2-exec-label';
-    label.textContent = 'Execution';
-    const seg = document.createElement('div');
-    seg.className = 'ui2-seg ui2-exec-seg';
-    seg.setAttribute('role', 'group');
-    seg.setAttribute('aria-label', 'Execution shape');
-    for (const choice of UI2_EXEC_CHOICES) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.dataset.exec = choice.value;
-      btn.textContent = choice.label;
-      btn.title = choice.note;
-      btn.addEventListener('click', () => {
-        const sel = document.getElementById('new-session-execution');
-        if (!sel || sel.disabled) return;
-        sel.value = choice.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-        ui2SyncExecSeg();
-      });
-      seg.appendChild(btn);
-    }
-    const note = document.createElement('div');
-    note.className = 'sessions-agent-note ui2-exec-note';
-    field.append(label, seg, note);
-    ui2ExecSegEl = seg;
-    ui2ExecNoteEl = note;
-    wrap.after(field);
-    document.getElementById('new-session-execution')?.addEventListener('change', ui2SyncExecSeg);
-    ui2SyncExecSeg();
-  }
-}
-
-function updateNewSessionFuelBanner() {
-  const banner = document.getElementById('new-session-unfueled-banner');
-  if (!banner) return;
-  refreshFuelStateForBanner();
-  const effective = effectiveNewSessionAgentId();
-  const internalSelected = effective === 'internal' || !effective;
-  const show = internalSelected && daemonInternalUnfueled();
-  banner.classList.toggle('hidden', !show);
-  const btn = document.getElementById('new-session-start-btn');
-  if (btn && !newSessionSpawnPending) {
-    btn.disabled = show;
-    btn.title = show ? 'Internal sessions need an API key or a vault credential lease' : '';
-  }
-
-  // The design's green happy-path banner. Shown exclusively when fuel is
-  // positively known (status frame `fueled === true` or the key probe
-  // found a provider) — an unknown state shows neither banner, never a
-  // claimed one.
-  const fueledBanner = document.getElementById('new-session-fueled-banner');
-  if (fueledBanner) {
-    const status = dashboardControlTransport?.lastStatus;
-    const knownFueled = (status && status.fueled === true) || daemonUnfueledCached === false;
-    const showFueled = internalSelected && !show && knownFueled;
-    fueledBanner.classList.toggle('hidden', !showFueled);
-    if (showFueled) {
-      const textEl = document.getElementById('new-session-fueled-text');
-      const names = Array.isArray(daemonFuelProviders) && daemonFuelProviders.length > 0
-        ? daemonFuelProviders.join(' + ')
-        : '';
-      if (textEl) {
-        textEl.textContent = names
-          ? `Fueled — ${names} credentials active, ready to launch.`
-          : 'Fueled — model credentials active, ready to launch.';
-      }
-    }
-  }
-  ui2SyncExecSeg();
-}
-
-function setNewSessionSpawnNotice(kind, text, action) {
-  const notice = document.getElementById('new-session-spawn-notice');
-  const textEl = document.getElementById('new-session-spawn-text');
-  if (!notice || !textEl) return;
-  const hasText = !!String(text || '').trim();
-  const noticeKind = ['ok', 'warn', 'error'].includes(kind) ? kind : 'pending';
-  notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
-  textEl.textContent = text || '';
-  notice.title = text || '';
-  let actionBtn = document.getElementById('new-session-spawn-action');
-  if (action && hasText) {
-    if (!actionBtn) {
-      actionBtn = document.createElement('button');
-      actionBtn.id = 'new-session-spawn-action';
-      actionBtn.type = 'button';
-      actionBtn.className = 'sessions-spawn-action';
-      notice.appendChild(actionBtn);
-    }
-    actionBtn.textContent = action.label;
-    actionBtn.onclick = action.onClick;
-  } else if (actionBtn) {
-    actionBtn.remove();
-  }
-  stationScheduleUpdate();
-}
-
-function clearNewSessionSpawnTimers() {
-  if (newSessionSpawnTimeout) clearTimeout(newSessionSpawnTimeout);
-  if (newSessionSpawnClearTimeout) clearTimeout(newSessionSpawnClearTimeout);
-  newSessionSpawnTimeout = null;
-  newSessionSpawnClearTimeout = null;
-}
-
-function clearNewSessionSpawnRecent() {
-  if (newSessionSpawnRecentTimeout) clearTimeout(newSessionSpawnRecentTimeout);
-  newSessionSpawnRecent = null;
-  newSessionSpawnRecentTimeout = null;
-}
-
-function rememberNewSessionSpawnRecent(sessionId, task) {
-  clearNewSessionSpawnRecent();
-  const sid = String(sessionId || '').trim();
-  if (!sid) return;
-  newSessionSpawnRecent = {
-    sessionId: sid,
-    task: String(task || '').trim(),
-    expiresAt: Date.now() + NEW_SESSION_LAUNCH_FAILURE_GRACE_MS,
-  };
-  newSessionSpawnRecentTimeout = setTimeout(() => {
-    newSessionSpawnRecent = null;
-    newSessionSpawnRecentTimeout = null;
-  }, NEW_SESSION_LAUNCH_FAILURE_GRACE_MS);
-}
-
-function isNewSessionLaunchFailureReason(reason) {
-  const text = String(reason || '').toLowerCase();
-  return text.includes('error') || text.includes('failed') || text.includes('failure');
-}
-
-function formatNewSessionLaunchFailureReason(reason) {
-  const text = String(reason || '').trim();
-  if (!text) return 'Session failed shortly after it started.';
-  return `Session failed: ${text.replace(/^error:\s*/i, '')}`;
-}
-
-function maybeFailRecentNewSessionSpawn(sessionId, reason, errorKind) {
-  const sid = String(sessionId || '').trim();
-  if (!sid || !newSessionSpawnRecent) return false;
-  if (newSessionSpawnRecent.sessionId !== sid) return false;
-  if (Date.now() > Number(newSessionSpawnRecent.expiresAt || 0)) {
-    clearNewSessionSpawnRecent();
-    return false;
-  }
-  if (!isNewSessionLaunchFailureReason(reason)) return false;
-
-  const message = formatNewSessionLaunchFailureReason(reason);
-  clearNewSessionSpawnTimers();
-  clearNewSessionSpawnRecent();
-  newSessionSpawnPending = false;
-  newSessionSpawnTask = '';
-  newSessionSpawnName = '';
-  setNewSessionStartButtonPending(false);
-  // Structured failure classes carry an action instead of prose-parsing.
-  const action = errorKind === 'unfueled'
-    ? newSessionAddKeysAction()
-    : errorKind === 'no_project'
-      ? newSessionPickProjectAction()
-      : null;
-  setNewSessionSpawnNotice('error', message, action);
-  showControlToast('error', message);
-  return true;
-}
-
-function beginNewSessionSpawnNotice(task, text, name = '') {
-  clearNewSessionSpawnTimers();
-  clearNewSessionSpawnRecent();
-  newSessionSpawnPending = true;
-  newSessionSpawnTask = String(task || '').trim();
-  newSessionSpawnName = String(name || '').trim();
-  setNewSessionStartButtonPending(true);
-  setNewSessionSpawnNotice('pending', text || 'Spawning new session...');
-  newSessionSpawnTimeout = setTimeout(() => {
-    if (!newSessionSpawnPending) return;
-    newSessionSpawnPending = false;
-    newSessionSpawnTask = '';
-    newSessionSpawnName = '';
-    setNewSessionStartButtonPending(false);
-    setNewSessionSpawnNotice('warn', 'No start confirmation yet. Check the Activity log before retrying.');
-    showControlToast('info', 'No new-session start confirmation yet.');
-  }, NEW_SESSION_SPAWN_TIMEOUT_MS);
-}
-
-function updateNewSessionSpawnNotice(kind, text) {
-  if (!newSessionSpawnPending) return;
-  setNewSessionSpawnNotice(kind, text);
-}
-
-function failNewSessionSpawnNotice(text) {
-  clearNewSessionSpawnTimers();
-  clearNewSessionSpawnRecent();
-  newSessionSpawnPending = false;
-  newSessionSpawnTask = '';
-  newSessionSpawnName = '';
-  setNewSessionStartButtonPending(false);
-  setNewSessionSpawnNotice('error', text || 'New session did not start.');
-  showControlToast('error', text || 'New session did not start.');
-}
-
-function clearNewSessionDraftIfUnchanged(task, name) {
-  const expectedTask = String(task || '').trim();
-  const input = document.getElementById('new-session-input');
-  if (input && expectedTask && input.value.trim() === expectedTask) {
-    clearTaskTextarea(input);
-  }
-  const expectedName = String(name || '').trim();
-  const nameInput = document.getElementById('new-session-name');
-  if (nameInput && expectedName && nameInput.value.trim() === expectedName) {
-    nameInput.value = '';
-  }
-}
-
-function finishNewSessionSpawnNotice(sessionId, task) {
-  if (!newSessionSpawnPending) return;
-  const expectedTask = newSessionSpawnTask;
-  const expectedName = newSessionSpawnName;
-  const actualTask = String(task || '').trim();
-  if (expectedTask && actualTask && expectedTask !== actualTask) return;
-  clearNewSessionSpawnTimers();
-  newSessionSpawnPending = false;
-  newSessionSpawnTask = '';
-  newSessionSpawnName = '';
-  clearNewSessionDraftIfUnchanged(actualTask || expectedTask, expectedName);
-  setNewSessionStartButtonPending(false);
-  const shortId = sessionId ? ` (${shortSessionId(sessionId)})` : '';
-  setNewSessionSpawnNotice('ok', `Session started${shortId}. Activity is ready.`);
-  showControlToast('success', `Session started${shortId}`);
-  rememberNewSessionSpawnRecent(sessionId, actualTask || expectedTask);
-  newSessionSpawnClearTimeout = setTimeout(() => {
-    setNewSessionSpawnNotice('', '');
-    newSessionSpawnClearTimeout = null;
-  }, 2500);
-}
-
-function maybeFailNewSessionSpawnFromLog(c) {
-  if (!newSessionSpawnPending || !c) return;
-  const level = String(c.level || '').toLowerCase();
-  if (level !== 'error') return;
-  const content = String(c.content || '').trim();
-  if (!/^(Session create failed|Project load failed):/.test(content)) return;
-  failNewSessionSpawnNotice(content);
-}
-
-async function loadNewSessionProjectRoot() {
-  try {
-    const d = await fetchProjectRoot();
-    // project_root: null = projectless daemon (a rooted daemon always
-    // reports a non-empty string). On fetch failure the flag stays
-    // unknown and never blocks.
-    daemonProjectless = !d.project_root;
-    setNewSessionProjectRoot(d.project_root || '');
-  } catch (e) {
-    console.warn('Failed to load project root:', e);
-  }
-}
-
-async function startNewSession() {
-  const input = document.getElementById('new-session-input');
-  if (!input) return;
-  const task = input.value.trim();
-  if (!task) return;
-  if (newSessionSpawnPending) {
-    showControlToast('info', 'A new session is already spawning.');
-    return;
-  }
-  if (!app) {
-    failNewSessionSpawnNotice('Dashboard is not connected to the server.');
-    return;
-  }
-  const effectiveAgent = effectiveNewSessionAgentId();
-  if ((effectiveAgent === 'internal' || !effectiveAgent) && daemonInternalUnfueled()) {
-    // Belt-and-braces behind the banner: the fueled flag may have flipped
-    // since the last render.
-    updateNewSessionFuelBanner();
-    setNewSessionSpawnNotice('error', NEW_SESSION_UNFUELED_MESSAGE, newSessionAddKeysAction());
-    return;
-  }
-
-  const nameInput = document.getElementById('new-session-name');
-  const sessionName = nameInput?.value.trim() || '';
-  const direct = document.getElementById('direct-mode-toggle')?.checked || false;
-  const attachments = pendingAttachments.map(a => a.frameId);
-  const attachmentReceipt = pendingAttachments.slice();
-  const requestedProjectRoot = document.getElementById('new-session-project-root')?.value.trim() || '';
-  if (newSessionProjectlessBlocked(requestedProjectRoot)) return;
-  beginNewSessionSpawnNotice(
-    task,
-    requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...',
-    sessionName
-  );
-
-  let projectRoot = '';
-  try {
-    projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
-  } catch (e) {
-    failNewSessionSpawnNotice(e?.message || 'Project directory check failed.');
-    return;
-  }
-  if (requestedProjectRoot && !projectRoot) {
-    failNewSessionSpawnNotice('Project directory needs attention before the session can start.');
-    return;
-  }
-
-  const msg = { action: 'create_session', task: task };
-  if (sessionName) msg.name = sessionName;
-  if (projectRoot) msg.project_root = projectRoot;
-  const agentValue = document.getElementById('new-session-agent')?.value || '';
-  const selectedAgent = normalizeAgentId(agentValue);
-  if (agentValue === 'internal') {
-    msg.agent = 'internal';
-  } else if (selectedAgent) {
-    msg.agent = selectedAgent;
-    const agentCommand = document.getElementById('new-session-agent-command')?.value.trim() || '';
-    if (agentCommand) msg.agent_command = agentCommand;
-  }
-  if (effectiveNewSessionAgentId() === 'claude-code') {
-    const modelChoice = document.getElementById('new-session-claude-model-select')?.value || '';
-    const model = modelChoice === '__custom__'
-      ? (document.getElementById('new-session-claude-model')?.value.trim() || '')
-      : modelChoice;
-    if (model) msg.claude_model = model;
-    const mode = document.getElementById('new-session-claude-permission-mode')?.value || '';
-    if (mode) msg.claude_permission_mode = mode;
-    const effort = document.getElementById('new-session-claude-effort')?.value || '';
-    if (effort) msg.claude_effort = effort;
-  }
-  if (effectiveNewSessionAgentId() === 'codex') {
-    if (newSessionCodexLaunchDefaultsLoaded) {
-      msg.codex_sandbox = normalizeCodexSandbox(
-        document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
-      );
-      msg.codex_approval_policy = normalizeCodexApprovalPolicy(
-        document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
-      );
-      const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
-        ? 'managed'
-        : 'vanilla';
-      msg.codex_managed_context = mode;
-      const archiveMode = normalizeContextArchiveMode(
-        document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
-      );
-      msg.codex_context_archive = archiveMode;
-      const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
-      if (fastChecked) {
-        msg.codex_service_tier = 'priority';
-      } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
-        msg.codex_service_tier = 'standard';
-      }
-    }
-  }
-  // Execution shape: an explicit per-launch choice beats the global Direct
-  // toggle; Auto (or an external agent — the select is disabled and cleared
-  // then) preserves the old behavior of the toggle forcing direct.
-  const executionSel = document.getElementById('new-session-execution');
-  const execution = executionSel && !executionSel.disabled ? executionSel.value : '';
-  if (execution === 'orchestrate') {
-    msg.orchestrate = true;
-  } else if (execution === 'direct' || direct) {
-    msg.direct = true;
-  }
-  // Worktree launch: the daemon validates/derives the branch, creates the
-  // worktree off the project's HEAD, and roots the session inside it.
-  if (document.getElementById('new-session-worktree')?.checked) {
-    msg.worktree = true;
-    const worktreeBranch = document.getElementById('new-session-worktree-branch')?.value.trim() || '';
-    if (worktreeBranch) msg.worktree_branch = worktreeBranch;
-  }
-  if (attachments.length > 0) msg.attachments = attachments;
-
-  try {
-    const sent = dispatchSessionControlMsg(msg, {
-      onError: err => failNewSessionSpawnNotice(err?.message || 'Failed to send new-session request.'),
-    });
-    if (!sent) throw new Error('Dashboard is not connected to the server.');
-  } catch (e) {
-    failNewSessionSpawnNotice(e?.message || 'Failed to send new-session request.');
-    return;
-  }
-
-  updateNewSessionSpawnNotice('pending', 'Spawning new session...');
-  showControlToast('info', 'Spawning new session...');
-  resetNewSessionCodexFastModeToDefault();
-  renderNewSessionAgentControls();
-  if (attachments.length > 0) {
-    renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
-    clearPendingAttachments({ retainPreviewUrls: true });
-  }
-}
-window.startNewSession = startNewSession;
-
-// Reveal the optional branch-name input only while the worktree launch is
-// requested; an untouched form stays exactly as before.
-function onNewSessionWorktreeToggle() {
-  const checked = !!document.getElementById('new-session-worktree')?.checked;
-  document.getElementById('new-session-worktree-branch-row')?.classList.toggle('hidden', !checked);
-}
-window.onNewSessionWorktreeToggle = onNewSessionWorktreeToggle;
-

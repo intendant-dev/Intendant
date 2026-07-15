@@ -59,7 +59,9 @@ pub(crate) fn openai_function_call_output(call_id: &str, output: &str) -> serde_
 }
 
 /// Parse an OpenAI computer_call action into a CuAction.
-pub(crate) fn parse_openai_cu_action(action: &serde_json::Value) -> Option<crate::computer_use::CuAction> {
+pub(crate) fn parse_openai_cu_action(
+    action: &serde_json::Value,
+) -> Option<crate::computer_use::CuAction> {
     use crate::computer_use::*;
 
     let action_type = action.get("type")?.as_str()?;
@@ -197,6 +199,30 @@ pub(crate) struct ResponsesUsage {
 pub(crate) struct ResponsesInputTokenDetails {
     #[serde(default)]
     cached_tokens: u64,
+    /// GPT-5.6+ prompt tokens written to cache this request.
+    #[serde(default)]
+    cache_write_tokens: u64,
+}
+
+impl ResponsesUsage {
+    fn into_token_usage(self) -> TokenUsage {
+        let details = self
+            .input_tokens_details
+            .unwrap_or(ResponsesInputTokenDetails {
+                cached_tokens: 0,
+                cache_write_tokens: 0,
+            });
+        TokenUsage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            cached_tokens: details.cached_tokens,
+            cache_creation_tokens: details.cache_write_tokens,
+            // GPT-5.6's explicit prompt cache currently has a 30-minute TTL.
+            cache_ttl_seconds: (details.cache_write_tokens > 0).then_some(30 * 60),
+            ..Default::default()
+        }
+    }
 }
 
 pub struct OpenAIProvider {
@@ -417,22 +443,7 @@ impl ChatProvider for OpenAIProvider {
 
         let usage = resp
             .usage
-            .map(|u| {
-                let cached = u
-                    .input_tokens_details
-                    .as_ref()
-                    .map(|d| d.cached_tokens)
-                    .unwrap_or(0);
-                TokenUsage {
-                    prompt_tokens: u.input_tokens,
-                    completion_tokens: u.output_tokens,
-                    total_tokens: u.total_tokens,
-                    cached_tokens: cached,
-                    // OpenAI has no cache-write concept and an undocumented
-                    // (~5–10 min) TTL — no flavor statement.
-                    ..Default::default()
-                }
-            })
+            .map(ResponsesUsage::into_token_usage)
             .unwrap_or_default();
 
         // Extract reasoning summary and full content if present in Responses output.
@@ -767,6 +778,13 @@ impl ChatProvider for OpenAIProvider {
                                             .and_then(|d| d.get("cached_tokens"))
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
+                                        usage.cache_creation_tokens = u
+                                            .get("input_tokens_details")
+                                            .and_then(|d| d.get("cache_write_tokens"))
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
+                                        usage.cache_ttl_seconds =
+                                            (usage.cache_creation_tokens > 0).then_some(30 * 60);
                                     }
                                 }
                             }
@@ -966,7 +984,7 @@ pub(crate) fn build_openai_request_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::tests::{tool_msg_with_images};
+    use crate::provider::tests::tool_msg_with_images;
 
     #[test]
     fn openai_provider_name() {
@@ -1008,6 +1026,25 @@ mod tests {
         assert_eq!(usage.input_tokens, 25);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.total_tokens, 33);
+    }
+
+    #[test]
+    fn responses_api_usage_accounts_for_gpt_5_6_cache_writes() {
+        let json = r#"{
+            "input_tokens": 3000,
+            "output_tokens": 400,
+            "total_tokens": 3400,
+            "input_tokens_details": {
+                "cached_tokens": 1000,
+                "cache_write_tokens": 750
+            }
+        }"#;
+        let usage: ResponsesUsage = serde_json::from_str(json).unwrap();
+        let normalized = usage.into_token_usage();
+        assert_eq!(normalized.prompt_tokens, 3000);
+        assert_eq!(normalized.cached_tokens, 1000);
+        assert_eq!(normalized.cache_creation_tokens, 750);
+        assert_eq!(normalized.cache_ttl_seconds, Some(1800));
     }
 
     #[test]

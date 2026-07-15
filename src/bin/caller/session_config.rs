@@ -21,6 +21,8 @@ pub struct SessionAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_sandbox: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_approval_policy: Option<String>,
@@ -56,6 +58,12 @@ pub struct SessionAgentConfig {
     /// documents lineage and drives the `fork` relationship emit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Relationship kind the `forked_from` edge carries when the child
+    /// announces its native id: `None` = plain `fork`; `side` = an
+    /// ephemeral side conversation (`/btw`) materialized as a respawned
+    /// fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_relationship: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -64,6 +72,7 @@ impl SessionAgentConfig {
             && self.project_root.is_none()
             && self.agent_command.is_none()
             && self.codex_model.is_none()
+            && self.codex_reasoning_effort.is_none()
             && self.codex_sandbox.is_none()
             && self.codex_approval_policy.is_none()
             && self.codex_managed_context.is_none()
@@ -75,6 +84,7 @@ impl SessionAgentConfig {
             && self.claude_allowed_tools.is_none()
             && self.claude_effort.is_none()
             && self.forked_from.is_none()
+            && self.fork_relationship.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -89,6 +99,9 @@ impl SessionAgentConfig {
         }
         if self.codex_model.is_none() {
             self.codex_model = fallback.codex_model;
+        }
+        if self.codex_reasoning_effort.is_none() {
+            self.codex_reasoning_effort = fallback.codex_reasoning_effort;
         }
         if self.codex_sandbox.is_none() {
             self.codex_sandbox = fallback.codex_sandbox;
@@ -123,6 +136,9 @@ impl SessionAgentConfig {
         if self.forked_from.is_none() {
             self.forked_from = fallback.forked_from;
         }
+        if self.fork_relationship.is_none() {
+            self.fork_relationship = fallback.fork_relationship;
+        }
     }
 }
 
@@ -148,6 +164,16 @@ pub fn normalize_codex_model(model: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+/// Per-session Codex reasoning-effort pin. Empty and the explicit inherit
+/// sentinels clear the pin; known values share the project-level normalizer.
+pub fn normalize_codex_reasoning_effort(effort: Option<&str>) -> Option<String> {
+    let trimmed = effort.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    crate::project::normalize_reasoning_effort(Some(trimmed))
 }
 
 pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
@@ -268,6 +294,7 @@ pub struct WireSessionAgentFields<'a> {
     pub source: Option<&'a str>,
     pub agent_command: Option<&'a str>,
     pub codex_model: Option<&'a str>,
+    pub codex_reasoning_effort: Option<&'a str>,
     pub codex_sandbox: Option<&'a str>,
     pub codex_approval_policy: Option<&'a str>,
     pub codex_managed_context: Option<&'a str>,
@@ -314,6 +341,9 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         codex_model: is_codex
             .then(|| normalize_codex_model(fields.codex_model))
             .flatten(),
+        codex_reasoning_effort: is_codex
+            .then(|| normalize_codex_reasoning_effort(fields.codex_reasoning_effort))
+            .flatten(),
         codex_sandbox: is_codex
             .then(|| normalize_codex_sandbox(fields.codex_sandbox))
             .flatten(),
@@ -343,6 +373,7 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
             .then(|| normalize_claude_effort(fields.claude_effort))
             .flatten(),
         forked_from: None,
+        fork_relationship: None,
     }
 }
 
@@ -353,6 +384,9 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.codex.command.clone()),
             codex_model: normalize_codex_model(project.config.agent.codex.model.as_deref()),
+            codex_reasoning_effort: normalize_codex_reasoning_effort(
+                project.config.agent.codex.reasoning_effort.as_deref(),
+            ),
             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
                 &project.config.agent.codex.sandbox,
             )),
@@ -374,6 +408,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             claude_allowed_tools: None,
             claude_effort: None,
             forked_from: None,
+            fork_relationship: None,
         },
         AgentBackend::ClaudeCode => {
             let claude = &project.config.agent.claude_code;
@@ -382,6 +417,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
                 agent_command: Some(claude.command.clone()),
                 codex_model: None,
+                codex_reasoning_effort: None,
                 codex_sandbox: None,
                 codex_approval_policy: None,
                 codex_managed_context: None,
@@ -398,6 +434,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 claude_allowed_tools: Some(claude.allowed_tools.clone()),
                 claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
                 forked_from: None,
+                fork_relationship: None,
             }
         }
     }
@@ -415,6 +452,9 @@ pub fn apply_to_project(
             }
             if let Some(model) = config.codex_model.clone() {
                 project.config.agent.codex.model = Some(model);
+            }
+            if let Some(effort) = config.codex_reasoning_effort.clone() {
+                project.config.agent.codex.reasoning_effort = Some(effort);
             }
             if let Some(mode) = config.codex_sandbox.clone() {
                 project.config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(&mode);
@@ -500,6 +540,9 @@ fn normalize_session_agent_config(
     }
     if let Some(model) = config.codex_model.take() {
         config.codex_model = normalize_codex_model(Some(&model));
+    }
+    if let Some(effort) = config.codex_reasoning_effort.take() {
+        config.codex_reasoning_effort = normalize_codex_reasoning_effort(Some(&effort));
     }
     if let Some(mode) = config.codex_sandbox.take() {
         config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
@@ -794,6 +837,12 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     if let Some(model) = config.codex_model.as_deref() {
         obj.insert("codex_model".to_string(), Value::String(model.to_string()));
     }
+    if let Some(effort) = config.codex_reasoning_effort.as_deref() {
+        obj.insert(
+            "codex_reasoning_effort".to_string(),
+            Value::String(effort.to_string()),
+        );
+    }
     if let Some(model) = config.claude_model.as_deref() {
         obj.insert("claude_model".to_string(), Value::String(model.to_string()));
     }
@@ -947,12 +996,7 @@ fn find_wrapper_config_for_external_session(
         if config_source != source {
             continue;
         }
-        let jsonl = dir.join("session.jsonl");
-        let Ok(contents) = std::fs::read_to_string(jsonl) else {
-            continue;
-        };
-        let mentions = ids.iter().any(|id| contents.contains(id));
-        if mentions {
+        if wrapper_config_matches_external_session(&dir, source, &ids) {
             if config.source.is_none() {
                 config.source = Some(source.to_string());
             }
@@ -960,6 +1004,42 @@ fn find_wrapper_config_for_external_session(
         }
     }
     None
+}
+
+/// A wrapper config belongs to an external thread only when persisted
+/// identity names it. Never infer identity from an arbitrary substring in
+/// `session.jsonl`: prompts, tool output, and project paths routinely contain
+/// other session ids (and can otherwise lend one thread another's launch
+/// config).
+fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[String]) -> bool {
+    let dir_id = dir.file_name().and_then(|name| name.to_str());
+    let canonical_id = crate::session_identity::canonical_session_id_from_meta(dir);
+    if ids
+        .iter()
+        .any(|id| dir_id == Some(id.as_str()) || canonical_id.as_deref() == Some(id.as_str()))
+    {
+        return true;
+    }
+
+    for id in ids {
+        let Some(scan) = crate::session_identity::scan_session_dir(dir, id) else {
+            continue;
+        };
+        if scan.identities.iter().any(|identity| {
+            identity.source == source
+                && (identity.backend_session_id == *id
+                    || identity.wrapper_id.as_deref() == Some(id.as_str()))
+        }) {
+            return true;
+        }
+        // Pre-structured-event logs recorded the backend id in one frozen,
+        // exact message grammar. The shared reader parses only that grammar;
+        // ordinary user/tool text cannot become identity evidence.
+        if scan.count == 0 && scan.legacy_resume_id.as_deref() == Some(id.as_str()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1394,6 +1474,91 @@ mod tests {
     }
 
     #[test]
+    fn resume_does_not_borrow_config_from_arbitrary_session_id_mentions() {
+        let home = tempfile::tempdir().unwrap();
+        let unrelated_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("unrelated-wrapper");
+        let unrelated = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("haiku"),
+            ..Default::default()
+        });
+        write_log_dir_config(&unrelated_dir, &unrelated).unwrap();
+        std::fs::write(
+            unrelated_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "unrelated-wrapper",
+                "project_root": "/tmp/unrelated"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let target_id = "07ca095f-c8aa-4d95-af53-c5f67cad6c3a";
+        std::fs::write(
+            unrelated_dir.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "event": "session_identity",
+                    "data": {
+                        "session_id": "unrelated-wrapper",
+                        "source": "claude-code",
+                        "backend_session_id": "unrelated-backend"
+                    }
+                }),
+                serde_json::json!({
+                    "event": "info",
+                    "message": format!("write /tmp/{target_id}/scratchpad/file.txt")
+                }),
+            ),
+        )
+        .unwrap();
+
+        assert!(load_for_resume(home.path(), "claude-code", target_id, Some(target_id)).is_none());
+    }
+
+    #[test]
+    fn resume_finds_wrapper_config_from_structured_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-id");
+        let config = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            claude_model: Some("fable"),
+            ..Default::default()
+        });
+        write_log_dir_config(&wrapper_dir, &config).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            serde_json::json!({
+                "event": "session_identity",
+                "data": {
+                    "session_id": "wrapper-id",
+                    "source": "claude-code",
+                    "backend_session_id": "backend-thread"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load_for_resume(
+            home.path(),
+            "claude-code",
+            "wrapper-id",
+            Some("backend-thread"),
+        )
+        .expect("structured identity should find the wrapper config");
+        assert_eq!(loaded.claude_model.as_deref(), Some("fable"));
+    }
+
+    #[test]
     fn claude_wire_fields_normalize_and_gate_on_source() {
         let cfg = from_wire_fields(WireSessionAgentFields {
             source: Some("claude-code"),
@@ -1410,7 +1575,13 @@ mod tests {
         assert_eq!(cfg.claude_permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(
             cfg.claude_allowed_tools.as_deref(),
-            Some(&["Read".to_string(), "Edit".into(), "Bash(cargo test *)".into()][..]),
+            Some(
+                &[
+                    "Read".to_string(),
+                    "Edit".into(),
+                    "Bash(cargo test *)".into()
+                ][..]
+            ),
             "comma-split must preserve spaces inside a rule"
         );
         assert_eq!(cfg.claude_effort.as_deref(), Some("xhigh"));
@@ -1427,6 +1598,52 @@ mod tests {
     }
 
     #[test]
+    fn codex_reasoning_effort_round_trips_applies_and_gates_on_source() {
+        let cfg = from_wire_fields(WireSessionAgentFields {
+            source: Some("codex"),
+            codex_model: Some("gpt-5.6-sol"),
+            codex_reasoning_effort: Some(" ultra "),
+            ..Default::default()
+        });
+        assert_eq!(cfg.codex_reasoning_effort.as_deref(), Some("ultra"));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_log_dir_config(dir.path(), &cfg).unwrap();
+        let loaded = read_log_dir_config(dir.path()).expect("reasoning pin round-trips");
+        assert_eq!(loaded.codex_reasoning_effort.as_deref(), Some("ultra"));
+        let mut merged = SessionAgentConfig {
+            source: Some("codex".to_string()),
+            ..Default::default()
+        };
+        merged.merge_missing_from(loaded.clone());
+        assert_eq!(merged.codex_reasoning_effort.as_deref(), Some("ultra"));
+
+        std::fs::write(dir.path().join("intendant.toml"), "").unwrap();
+        let mut project = Project::from_root(dir.path().to_path_buf()).unwrap();
+        apply_to_project(&mut project, &AgentBackend::Codex, &loaded);
+        assert_eq!(
+            project.config.agent.codex.reasoning_effort.as_deref(),
+            Some("ultra")
+        );
+
+        let mut session = serde_json::json!({"source": "codex", "session_id": "sess-1"});
+        apply_config_to_session_json(&mut session, &loaded);
+        assert_eq!(
+            session
+                .get("codex_reasoning_effort")
+                .and_then(|value| value.as_str()),
+            Some("ultra")
+        );
+
+        let cross = from_wire_fields(WireSessionAgentFields {
+            source: Some("claude-code"),
+            codex_reasoning_effort: Some("max"),
+            ..Default::default()
+        });
+        assert!(cross.codex_reasoning_effort.is_none());
+    }
+
+    #[test]
     fn claude_inherit_sentinels_clear_but_default_mode_pins() {
         for sentinel in ["inherit", "global", "", "  "] {
             let cfg = from_wire_fields(WireSessionAgentFields {
@@ -1437,7 +1654,10 @@ mod tests {
                 claude_effort: Some(sentinel),
                 ..Default::default()
             });
-            assert!(cfg.claude_model.is_none(), "model {sentinel:?} should clear");
+            assert!(
+                cfg.claude_model.is_none(),
+                "model {sentinel:?} should clear"
+            );
             assert!(
                 cfg.claude_permission_mode.is_none(),
                 "mode {sentinel:?} should clear"
@@ -1446,7 +1666,10 @@ mod tests {
                 cfg.claude_allowed_tools.is_none(),
                 "tools {sentinel:?} should clear"
             );
-            assert!(cfg.claude_effort.is_none(), "effort {sentinel:?} should clear");
+            assert!(
+                cfg.claude_effort.is_none(),
+                "effort {sentinel:?} should clear"
+            );
         }
         // "default" is a REAL permission mode and must pin, while it clears
         // the other three fields (never a valid model/tool/effort value).

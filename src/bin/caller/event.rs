@@ -122,9 +122,6 @@ pub type ApprovalRegistry =
 /// All events flowing through the system.
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    #[allow(dead_code)]
-    Resize(u16, u16),
-
     // Agent loop lifecycle
     TurnStarted {
         session_id: Option<String>,
@@ -168,6 +165,10 @@ pub enum AppEvent {
         stderr: String,
         source: Option<String>,
         output_id: Option<String>,
+        /// The originating tool call (`AgentStarted.item_id`) when the
+        /// backend correlates output to calls — frontends group output
+        /// under its command instead of coalescing consecutive tools.
+        item_id: Option<String>,
     },
     SubAgentResult {
         formatted: String,
@@ -257,6 +258,16 @@ pub enum AppEvent {
         id: String,
         reason: String,
     },
+    /// A cancel arrived but nothing was left to cancel — the steer already
+    /// delivered, drained into a follow-up, or was handed to the runtime.
+    /// Distinct from `SteerCancelled` so the dashboard never reports a
+    /// clear that did not happen (the old handler fabricated a
+    /// `SteerCancelled` here and the text still reached the model).
+    SteerCancelFailed {
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
     /// Ordinary follow-up lifecycle for targets that cannot be steered
     /// mid-turn. Frontends use this to show "queued for next turn" rather
     /// than making a subagent appear unresponsive while the parent loop is
@@ -296,6 +307,18 @@ pub enum AppEvent {
     SessionStarted {
         session_id: String,
         task: Option<String>,
+    },
+    /// Peer-delegation delivery receipt: the session supervisor accepted a
+    /// `StartTask` that carried a `delegation_id` and dispatched it as
+    /// `session_id`. Broadcast to every connected client as
+    /// `OutboundEvent::TaskReceived`; the delegating daemon's federation
+    /// transport correlates it back to the in-flight
+    /// `PeerOp::DelegateTask` (see `peer::transport::intendant`).
+    /// Re-emitted verbatim (same `session_id`) when a duplicate
+    /// `delegation_id` is deduped instead of dispatched.
+    TaskReceived {
+        delegation_id: String,
+        session_id: String,
     },
     /// Links an Intendant wrapper/log session to a backend-native
     /// session/thread id. Frontends use this to route backend-specific actions
@@ -412,8 +435,8 @@ pub enum AppEvent {
         /// [`crate::display::DisplaySession::agent_visible`]). `false`
         /// marks a private user view: consumers that surface displays to
         /// agents or peers (presence display list, peer upcasters,
-        /// recording auto-start) must skip it; dashboards use it to
-        /// render the "private view" chip on the tile.
+        /// recording auto-start) must skip it; only authority-checked
+        /// owner/root dashboards use it to render the "private view" chip.
         agent_visible: bool,
     },
 
@@ -451,6 +474,31 @@ pub enum AppEvent {
         display_id: u32,
         backend: &'static str,
     },
+    /// One successfully executed computer-use action on a display —
+    /// emitted by [`crate::computer_use::CuActionObserver`] for the
+    /// dashboard's live action overlays and per-display feed. EPHEMERAL by
+    /// design: broadcast-lane only, never session-logged, never replayed
+    /// (the Activity log carries the durable CU trace).
+    CuActionExecuted {
+        /// Unique id (`cu-<ts>-<seq>`) — the browser's dual-lane dedupe key.
+        event_id: String,
+        session_id: Option<String>,
+        display_id: u32,
+        /// Action vocabulary: `left_click`, `type`, `screenshot`, … — see
+        /// `computer_use::cu_action_kind`.
+        kind: String,
+        /// Action point in display pixel space, when the action has one.
+        x: Option<i32>,
+        y: Option<i32>,
+        /// Resolution the coordinates are relative to (0 = unknown; viewers
+        /// fall back to the stream's intrinsic dimensions).
+        ref_w: u32,
+        ref_h: u32,
+        /// Short raw call string for the feed (`left_click(612, 233)`).
+        raw: String,
+        /// Unix milliseconds at execution.
+        ts: u64,
+    },
     /// Agent-requested visual collaboration state for the dashboard.
     ///
     /// This is intentionally presentation-level: it does not grant input
@@ -483,6 +531,39 @@ pub enum AppEvent {
         /// The display ID being revoked.  0 = primary (default).
         display_id: u32,
         note: Option<String>,
+    },
+
+    /// A scoped agent rang the user-display doorbell
+    /// (`request_user_display`): dashboards raise the dedicated popup.
+    /// Deliberately NOT `ApprovalRequired` — display requests never share
+    /// the approval id space, so `approve`/`approve_all`/autonomy rules
+    /// cannot reach them; the only resolution is
+    /// `ControlMsg::ResolveDisplayRequest` from an owner surface.
+    DisplayRequestRaised {
+        session_id: Option<String>,
+        /// Request id in the display-request registry's own id space.
+        id: u64,
+        /// "view" | "view_and_control" (crate::display_requests vocabulary).
+        access: String,
+        /// Short agent-provided justification shown verbatim to the user.
+        reason: String,
+        /// When the requesting tool call stops waiting (unix ms) — the
+        /// popup auto-expires then.
+        expires_unix_ms: u64,
+    },
+    /// A display request left the pending set: the user decided
+    /// ("approved" / "denied" / "denied_for_session"), the wait window
+    /// elapsed ("timeout"), or the requesting session ended ("cancelled").
+    /// Dashboards drop the popup and the attention chain clears the item.
+    DisplayRequestResolved {
+        session_id: Option<String>,
+        id: u64,
+        outcome: String,
+        /// Granted access level, present on "approved".
+        access: Option<String>,
+        /// Granted duration ("this_session" | "15m" | "until_revoked"),
+        /// present on "approved".
+        duration: Option<String>,
     },
 
     /// Browser workspace lifecycle/lease update. Browser workspaces are
@@ -537,6 +618,7 @@ pub enum AppEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
     },
 
     // Live model (Gemini Live / OpenAI Realtime) usage update from browser
@@ -661,7 +743,11 @@ pub enum AppEvent {
         context_window: Option<u64>,
         hard_context_window: Option<u64>,
         item_count: Option<usize>,
-        raw: serde_json::Value,
+        /// The whole serialized provider request context — multi-MB for a
+        /// long session. `Arc`'d so the broadcast ring slot and every
+        /// subscriber's `AppEvent::clone` share one allocation instead of
+        /// deep-copying the payload per subscriber.
+        raw: Arc<serde_json::Value>,
     },
 
     /// Proactive status broadcast (emitted on turn start, phase change, etc.)
@@ -882,6 +968,14 @@ pub enum AppEvent {
     /// (from `HistoryRound`) and `turn_count`; both are passed through
     /// here so the consumer doesn't have to look them up again.
     ConversationRollbackRequested {
+        /// Target session. `None` preserves the legacy shape: the
+        /// daemon's current/boot session (the headless outer loop).
+        /// `Some(id)` targets a supervised session's parked drain, which
+        /// resolves the round from its own ledger — delivery is
+        /// drain-time (a mid-round session is not listening; the
+        /// dashboard observes `ConversationRolledBack` for completion,
+        /// as it already does on the legacy path).
+        session_id: Option<String>,
         /// The round we are rolling back to. Echoed through to the
         /// completion event for UI correlation.
         round_id: u64,
@@ -897,6 +991,9 @@ pub enum AppEvent {
 
     /// Conversation was rolled back to a specific round.
     ConversationRolledBack {
+        /// The session that rolled back; `None` = the legacy
+        /// current-session shape.
+        session_id: Option<String>,
         round_id: u64,
         /// Number of messages/turns removed from the conversation.
         /// Semantics are backend-dependent:
@@ -914,10 +1011,10 @@ pub enum AppEvent {
         method: String,
     },
 
-    // TUI internal
+    /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
+    /// listener consumes it (stuck-phase detection), and only MCP mode
+    /// spawns the timer.
     Tick,
-    #[allow(dead_code)]
-    Quit,
 }
 
 fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
@@ -1278,8 +1375,10 @@ pub enum ControlMsg {
         model: Option<String>,
     },
     /// Set the Claude Code permission mode (`--permission-mode`):
-    /// `"default" | "acceptEdits" | "plan" | "bypassPermissions"` (legacy
-    /// `"auto"` normalizes to `"default"`). Applies to the NEXT task.
+    /// `"default" | "acceptEdits" | "plan" | "auto" | "dontAsk" |
+    /// "bypassPermissions"` (`"manual"` and empty normalize to `"default"`;
+    /// see `project::normalize_claude_permission_mode`). Applies to the
+    /// NEXT task.
     SetClaudePermissionMode {
         mode: String,
     },
@@ -1368,8 +1467,8 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_permission_mode: Option<String>,
         /// Optional one-shot Claude Code reasoning-effort level
-        /// (low/medium/high/xhigh/max) for this session. Only applies when
-        /// the resolved agent is Claude Code.
+        /// (low/medium/high/xhigh/max/ultracode) for this session. Only
+        /// applies when the resolved agent is Claude Code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         claude_effort: Option<String>,
         /// Optional one-shot Codex model override for this session (e.g.
@@ -1379,6 +1478,11 @@ pub enum ControlMsg {
         /// Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_model: Option<String>,
+        /// Optional one-shot Codex reasoning-effort override for this
+        /// session. Accepted values match `model_reasoning_effort`; omitted
+        /// inherits the global/Codex model default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_reasoning_effort: Option<String>,
         /// Optional one-shot Codex sandbox mode for this session. Only applies
         /// when the resolved agent is Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1489,6 +1593,22 @@ pub enum ControlMsg {
         /// use it to correlate queued/delivered/failed status updates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up_id: Option<String>,
+        /// Peer-delegation delivery-receipt correlation id. Set by a
+        /// federating daemon's `PeerOp::DelegateTask` (see
+        /// `peer::transport::intendant`): when a daemon supervisor
+        /// dispatches a new-session StartTask carrying this id, it
+        /// acknowledges acceptance by emitting
+        /// `OutboundEvent::TaskReceived { delegation_id, session_id }`
+        /// on its broadcast, and it dedups repeats of the same id
+        /// (an already-accepted id re-acks with the original session
+        /// identity instead of starting a duplicate task — the sender
+        /// re-sends the same id after a reconnect). Absent on frames
+        /// from browsers, ctl, and pre-receipt peer builds; receivers
+        /// older than this field ignore it (serde default) and never
+        /// ack. Carries no authority — IAM evaluation on the receiving
+        /// gateway is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegation_id: Option<String>,
     },
     ResumeSession {
         /// Session source: "intendant", "codex", "claude-code", or "gemini".
@@ -1521,6 +1641,13 @@ pub enum ControlMsg {
         /// id on the first turn.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fork: bool,
+        /// Lineage kind recorded for a `fork` resume and emitted as the
+        /// parent→child relationship once the child announces its native id.
+        /// `None` means a plain `fork`; `side` marks an ephemeral side
+        /// conversation (`/btw`) on backends whose side conversations are
+        /// respawned forks rather than in-process threads.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relationship_kind: Option<String>,
         /// Per-session executable override. When omitted, the supervisor
         /// rehydrates the persisted session value before falling back to the
         /// global Settings value.
@@ -1625,9 +1752,10 @@ pub enum ControlMsg {
         /// message always meant "share with the agent for computer
         /// use", and old frontends keep that meaning. `Some(false)` is
         /// the dashboard's "View this machine": a private remote view
-        /// streamed to the user's dashboards only, invisible to agent
-        /// display enumeration/screenshot/CU paths and never touching
-        /// the autonomy user-display grant.
+        /// streamed to authority-checked owner/root dashboards only,
+        /// invisible to scoped dashboards and agent display
+        /// enumeration/screenshot/CU paths, and never touching the autonomy
+        /// user-display grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_visible: Option<bool>,
     },
@@ -1638,6 +1766,28 @@ pub enum ControlMsg {
         display_id: Option<u32>,
         #[serde(default)]
         note: Option<String>,
+    },
+    /// Resolve a pending user-display request (the doorbell popup's Allow
+    /// / Deny / Deny-for-this-session buttons). Owner-surface intent only:
+    /// classified `PeerOperation::DisplayInput` like `GrantUserDisplay` —
+    /// resolving a request is exactly as powerful as granting directly.
+    /// On approve, the control plane mints the grant through the same
+    /// state flip + events `grant_user_display` performs; deny arms the
+    /// per-session cooldown; deny_session suppresses the session. NEVER
+    /// reachable through the approval registry: `approve`/`approve_all`
+    /// target command approvals and cannot touch display requests.
+    ResolveDisplayRequest {
+        /// The requesting session (the popup echoes it back verbatim).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        /// Display-request registry id from `DisplayRequestRaised`.
+        id: u64,
+        /// "approve" | "deny" | "deny_session".
+        decision: String,
+        /// Grant duration on approve: "this_session" | "15m" |
+        /// "until_revoked" (absent = until_revoked).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<String>,
     },
     /// Create a virtual (Xvfb) display from a frontend — the keyless path
     /// that gives a claimed headless box a working display without any
@@ -1868,11 +2018,14 @@ pub enum ControlMsg {
 /// subscribe independently. Normal subscribers receive best-effort future
 /// events and must tolerate `RecvError::Lagged`;
 /// [`EventBus::subscribe_session_log`] is the lossless path for the
-/// low-volume event subset persisted to `session.jsonl`.
+/// low-volume event subset persisted to `session.jsonl`, and
+/// [`EventBus::subscribe_intents`] is the lossless path for user intents
+/// (`ControlCommand`) and the session-bookkeeping events that route them.
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
     session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
 }
 
 impl EventBus {
@@ -1881,12 +2034,18 @@ impl EventBus {
         Self {
             tx,
             session_log_sinks: Arc::new(Mutex::new(Vec::new())),
+            intent_sinks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn send(&self, event: AppEvent) {
         if app_event_writes_to_session_log(&event) {
             if let Ok(mut sinks) = self.session_log_sinks.lock() {
+                sinks.retain(|sink| sink.send(event.clone()).is_ok());
+            }
+        }
+        if app_event_rides_intent_lane(&event) {
+            if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
             }
         }
@@ -1915,6 +2074,56 @@ impl EventBus {
         }
         rx
     }
+
+    /// Create a lossless intent subscriber.
+    ///
+    /// User intents (`AppEvent::ControlCommand`) share the bounded broadcast
+    /// ring with per-token `ModelResponseDelta`s and multi-MB
+    /// `ContextSnapshot`s, so a flooded ring could silently drop a user's
+    /// click (approve, interrupt, start task) — consumers that ACT on
+    /// intents must never lose one. This lane mirrors the session-log
+    /// fan-out: an unbounded mpsc fed at the emit point, carrying only the
+    /// low-volume [`app_event_rides_intent_lane`] subset, delivered in
+    /// emission order. Human actions and the lifecycle events ordered with
+    /// them are low-volume, so the unbounded queue is bounded in practice;
+    /// the failure mode of a wedged consumer is memory growth, never a
+    /// silently dropped action.
+    ///
+    /// The broadcast copy of every intent still exists for display-only
+    /// consumers (waiters, UIs) that tolerate loss.
+    pub fn subscribe_intents(&self) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut sinks) = self.intent_sinks.lock() {
+            sinks.push(tx);
+        }
+        rx
+    }
+}
+
+/// The event subset carried by the lossless intent lane
+/// ([`EventBus::subscribe_intents`]): the user intents themselves plus the
+/// low-volume lifecycle/bookkeeping events the intent-acting consumers
+/// (control plane, task dispatcher, session supervisor, recording listener)
+/// fold into the same ordered stream — alias/relationship mapping that routes
+/// FUTURE intents, the end-of-session / display-revoke hygiene the control
+/// plane owns, and display/task boundaries that start or stop recording.
+/// `SharedView` rides along for the same hygiene: the control plane's
+/// focus-annotation tracker (`shared_view_lifecycle`) must fold the
+/// human-scale shared-view verbs in emission order to know what a later
+/// revoke or session end has to clear. Everything here is rare; nothing
+/// high-frequency may join this list.
+pub fn app_event_rides_intent_lane(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::ControlCommand(_)
+            | AppEvent::SessionIdentity { .. }
+            | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionEnded { .. }
+            | AppEvent::UserDisplayRevoked { .. }
+            | AppEvent::SharedView { .. }
+            | AppEvent::DisplayReady { .. }
+            | AppEvent::TaskComplete { .. }
+    )
 }
 
 /// Convert an AppEvent to an OutboundEvent for external consumers.
@@ -1976,12 +2185,14 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             stderr,
             source,
             output_id,
+            item_id,
         } => Some(OutboundEvent::AgentOutput {
             session_id: session_id.clone(),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             source: source.clone(),
             output_id: output_id.clone(),
+            item_id: item_id.clone(),
         }),
         AppEvent::DoneSignal {
             session_id,
@@ -2053,6 +2264,15 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             id: id.clone(),
             reason: reason.clone(),
         }),
+        AppEvent::SteerCancelFailed {
+            session_id,
+            id,
+            reason,
+        } => Some(OutboundEvent::SteerCancelFailed {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            reason: reason.clone(),
+        }),
         AppEvent::FollowUpStatus {
             session_id,
             id,
@@ -2081,6 +2301,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
             session_id: session_id.clone(),
             task: task.clone(),
+        }),
+        AppEvent::TaskReceived {
+            delegation_id,
+            session_id,
+        } => Some(OutboundEvent::TaskReceived {
+            delegation_id: delegation_id.clone(),
+            session_id: session_id.clone(),
         }),
         AppEvent::SessionIdentity {
             session_id,
@@ -2216,6 +2443,29 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             width: *width,
             height: *height,
         }),
+        AppEvent::CuActionExecuted {
+            event_id,
+            session_id,
+            display_id,
+            kind,
+            x,
+            y,
+            ref_w,
+            ref_h,
+            raw,
+            ts,
+        } => Some(OutboundEvent::CuAction {
+            event_id: event_id.clone(),
+            session_id: session_id.clone(),
+            display_id: *display_id,
+            kind: kind.clone(),
+            x: *x,
+            y: *y,
+            ref_w: *ref_w,
+            ref_h: *ref_h,
+            raw: raw.clone(),
+            ts: *ts,
+        }),
         AppEvent::DisplayTaken { display_id } => Some(OutboundEvent::DisplayTaken {
             display_id: *display_id,
         }),
@@ -2236,6 +2486,32 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
                 note: note.clone(),
             })
         }
+        AppEvent::DisplayRequestRaised {
+            session_id,
+            id,
+            access,
+            reason,
+            expires_unix_ms,
+        } => Some(OutboundEvent::DisplayRequestRaised {
+            session_id: session_id.clone(),
+            id: *id,
+            access: access.clone(),
+            reason: reason.clone(),
+            expires_unix_ms: *expires_unix_ms,
+        }),
+        AppEvent::DisplayRequestResolved {
+            session_id,
+            id,
+            outcome,
+            access,
+            duration,
+        } => Some(OutboundEvent::DisplayRequestResolved {
+            session_id: session_id.clone(),
+            id: *id,
+            outcome: outcome.clone(),
+            access: access.clone(),
+            duration: duration.clone(),
+        }),
         AppEvent::ContextManagement { turn } => {
             Some(OutboundEvent::ContextManagement { turn: *turn })
         }
@@ -2272,6 +2548,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             prompt_tokens,
             completion_tokens,
             cached_tokens,
+            cache_creation_tokens,
         } => Some(OutboundEvent::PresenceUsageUpdate {
             total_tokens: *total_tokens,
             context_window: *context_window,
@@ -2281,6 +2558,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
             cached_tokens: *cached_tokens,
+            cache_creation_tokens: *cache_creation_tokens,
         }),
         AppEvent::LiveUsageUpdate {
             provider,
@@ -2656,11 +2934,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             bytes_freed: *bytes_freed,
         }),
         AppEvent::ConversationRolledBack {
+            session_id,
             round_id,
             turns_removed,
             backend,
             method,
         } => Some(OutboundEvent::ConversationRolledBack {
+            session_id: session_id.clone(),
             round_id: *round_id,
             turns_removed: *turns_removed,
             backend: backend.clone(),
@@ -2669,9 +2949,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,
         // Internal events — not broadcast to external consumers
-        AppEvent::Resize(_, _)
-        | AppEvent::Tick
-        | AppEvent::Quit
+        AppEvent::Tick
         | AppEvent::JsonExtracted { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
@@ -2687,26 +2965,102 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
     }
 }
 
+/// How long buffered `ModelResponseDelta` text may wait before the outbound
+/// broadcaster flushes it (see [`spawn_outbound_broadcaster`]).
+const DELTA_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Safety flush: once this much delta text is buffered across sessions,
+/// flush immediately instead of waiting for the tick — bounds worst-case
+/// buffering (and the size of a single outbound line) under a sustained
+/// flood that keeps the event receiver permanently ready.
+const DELTA_COALESCE_MAX_BUFFERED_BYTES: usize = 64 * 1024;
+
+/// Per-session buffered delta text, insertion-ordered so a flush emits
+/// sessions in first-arrival order (per-session text order is exact).
+#[derive(Default)]
+struct DeltaCoalesceBuffer {
+    pending: Vec<(Option<String>, String)>,
+    buffered_bytes: usize,
+}
+
+impl DeltaCoalesceBuffer {
+    fn push(&mut self, session_id: &Option<String>, text: &str) {
+        self.buffered_bytes += text.len();
+        if let Some((_, buffered)) = self
+            .pending
+            .iter_mut()
+            .find(|(pending_session, _)| pending_session == session_id)
+        {
+            buffered.push_str(text);
+            return;
+        }
+        self.pending.push((session_id.clone(), text.to_string()));
+    }
+
+    fn should_flush_early(&self) -> bool {
+        self.buffered_bytes >= DELTA_COALESCE_MAX_BUFFERED_BYTES
+    }
+
+    /// Emit one merged `model_response_delta` line per buffered session.
+    /// Payload shape is identical to an uncoalesced delta — only the text
+    /// spans are concatenated — so consumers that append deltas observe
+    /// the same byte stream.
+    fn flush(&mut self, outbound_tx: &tokio::sync::broadcast::Sender<String>) {
+        for (session_id, text) in self.pending.drain(..) {
+            let outbound = crate::types::OutboundEvent::ModelResponseDelta { session_id, text };
+            if let Ok(json) = serde_json::to_string(&outbound) {
+                let _ = outbound_tx.send(json);
+            }
+        }
+        self.buffered_bytes = 0;
+    }
+}
+
 /// Spawn a task that converts AppEvents to OutboundEvents and broadcasts them.
 ///
 /// This is the single point where AppEvents are converted to the external
 /// format used by the control socket, web gateway, and JSON stdout.
+///
+/// Per-token `ModelResponseDelta` events are coalesced here — the single
+/// outbound choke point — instead of fanning one wire line (and one WS
+/// message per connection) out per token: delta text buffers per session
+/// and flushes on a ~40ms tick, when the buffer crosses a size cap, or
+/// IMMEDIATELY before any non-delta event is forwarded, so deltas never
+/// reorder against other events and per-session text order is preserved.
 pub fn spawn_outbound_broadcaster(
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
     outbound_tx: tokio::sync::broadcast::Sender<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut deltas = DeltaCoalesceBuffer::default();
+        let mut flush_tick = tokio::time::interval(DELTA_COALESCE_INTERVAL);
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    if let Some(outbound) = app_event_to_outbound(&event) {
-                        if let Ok(json) = serde_json::to_string(&outbound) {
-                            let _ = outbound_tx.send(json);
+            tokio::select! {
+                recv = event_rx.recv() => match recv {
+                    Ok(AppEvent::ModelResponseDelta { session_id, text }) => {
+                        deltas.push(&session_id, &text);
+                        if deltas.should_flush_early() {
+                            deltas.flush(&outbound_tx);
                         }
                     }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Ok(event) => {
+                        // Ordering barrier: buffered deltas were emitted
+                        // before this event — flush them first.
+                        deltas.flush(&outbound_tx);
+                        if let Some(outbound) = app_event_to_outbound(&event) {
+                            if let Ok(json) = serde_json::to_string(&outbound) {
+                                let _ = outbound_tx.send(json);
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        deltas.flush(&outbound_tx);
+                        break;
+                    }
+                },
+                _ = flush_tick.tick() => deltas.flush(&outbound_tx),
             }
         }
     })
@@ -2744,6 +3098,7 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
             | AppEvent::SteerAccepted { .. }
             | AppEvent::SteerDelivered { .. }
             | AppEvent::SteerCancelled { .. }
+            | AppEvent::SteerCancelFailed { .. }
             | AppEvent::InterruptRequested { .. }
             | AppEvent::Interrupted { .. }
             | AppEvent::SessionStarted { .. }
@@ -2868,6 +3223,13 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             reason,
         } => {
             log.steer_cancelled(session_id.as_deref(), id, reason);
+        }
+        AppEvent::SteerCancelFailed {
+            session_id,
+            id,
+            reason,
+        } => {
+            log.steer_cancel_failed(session_id.as_deref(), id, reason);
         }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
@@ -3175,6 +3537,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                     usage.completion_tokens,
                     usage.total_tokens,
                     usage.cached_tokens,
+                    usage.cache_creation_tokens,
                     source.as_deref(),
                 );
             }
@@ -3219,6 +3582,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.history_pruned(*branches_removed, *bytes_freed);
         }
         AppEvent::ConversationRolledBack {
+            session_id: _,
             round_id,
             turns_removed,
             backend,
@@ -3239,7 +3603,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         // point of origin.
         //
         // ---- Terminal-only / internal / high-frequency events ----
-        // Key, Resize, Tick, Quit, ControlCommand, SessionDirChanged,
+        // Tick, ControlCommand, SessionDirChanged,
         // ModelResponseDelta (too chatty), StatusUpdate (every tick),
         // UsageSnapshot (periodic, mainly for UI), LogEntry (meta/circular).
         _ => {}
@@ -3314,15 +3678,15 @@ mod tests {
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
             bus.send(AppEvent::Tick);
-            bus.send(AppEvent::Quit);
+            bus.send(AppEvent::PresenceReady);
 
             match rx.recv().await.unwrap() {
                 AppEvent::Tick => {}
                 _ => panic!("expected Tick"),
             }
             match rx.recv().await.unwrap() {
-                AppEvent::Quit => {}
-                _ => panic!("expected Quit"),
+                AppEvent::PresenceReady => {}
+                _ => panic!("expected PresenceReady"),
             }
         });
     }
@@ -3338,17 +3702,262 @@ mod tests {
             let mut rx = bus.subscribe();
             let bus2 = bus.clone();
             bus.send(AppEvent::Tick);
-            bus2.send(AppEvent::Quit);
+            bus2.send(AppEvent::PresenceReady);
 
             match rx.recv().await.unwrap() {
                 AppEvent::Tick => {}
                 _ => panic!("expected Tick"),
             }
             match rx.recv().await.unwrap() {
-                AppEvent::Quit => {}
-                _ => panic!("expected Quit"),
+                AppEvent::PresenceReady => {}
+                _ => panic!("expected PresenceReady"),
             }
         });
+    }
+
+    /// B1: user intents must survive a delta flood that laps the broadcast
+    /// ring. The intent lane is fed at the emit point, so every
+    /// `ControlCommand` arrives, in order, even though a plain broadcast
+    /// subscriber provably lagged over the same window.
+    #[tokio::test]
+    async fn intent_lane_is_lossless_and_ordered_under_delta_flood() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        let mut lossy = bus.subscribe();
+
+        const FLOOD: usize = 10_000;
+        const INTENTS: usize = 100;
+        let deltas_per_intent = FLOOD / INTENTS;
+        for batch in 0..INTENTS {
+            for _ in 0..deltas_per_intent {
+                bus.send(AppEvent::ModelResponseDelta {
+                    session_id: Some("flood".to_string()),
+                    text: "x".to_string(),
+                });
+            }
+            bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+                level: format!("level-{batch}"),
+            }));
+        }
+
+        for expected in 0..INTENTS {
+            let event = intents.recv().await.expect("intent lane closed early");
+            match event {
+                AppEvent::ControlCommand(ControlMsg::SetAutonomy { level }) => {
+                    assert_eq!(level, format!("level-{expected}"), "intents reordered");
+                }
+                other => panic!("unexpected event on intent lane: {other:?}"),
+            }
+        }
+        assert!(
+            intents.try_recv().is_err(),
+            "intent lane must carry exactly the sent intents"
+        );
+
+        // The same window overflowed the plain broadcast ring (10_100 sends
+        // against a 4096-slot buffer with no interleaved recv), so the lossy
+        // subscriber's first recv reports the lag the intent lane is immune to.
+        match lossy.recv().await {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                assert!(skipped > 0);
+            }
+            other => panic!("expected broadcast lag, got {other:?}"),
+        }
+    }
+
+    /// B1: the intent lane carries the session-bookkeeping events its
+    /// consumers act on, interleaved in emission order with the commands.
+    #[tokio::test]
+    async fn intent_lane_orders_bookkeeping_with_commands() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
+            level: "high".to_string(),
+        }));
+        bus.send(AppEvent::SessionEnded {
+            session_id: "s1".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        // Not on the lane: high-frequency stream events.
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: None,
+            text: "ignored".to_string(),
+        });
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "s2".to_string(),
+            source: "codex".to_string(),
+            backend_session_id: "thread-1".to_string(),
+        });
+
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::ControlCommand(ControlMsg::SetAutonomy { .. }))
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::SessionEnded { .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::SessionIdentity { .. })
+        ));
+        assert!(intents.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn intent_lane_orders_recording_lifecycle_with_controls() {
+        let bus = EventBus::new();
+        let mut intents = bus.subscribe_intents();
+        bus.send(AppEvent::DisplayReady {
+            display_id: 7,
+            width: 1280,
+            height: 720,
+            agent_visible: true,
+        });
+        bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
+            stream_name: "display_7".to_string(),
+        }));
+        bus.send(AppEvent::TaskComplete {
+            session_id: Some("s1".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::DisplayReady { display_id: 7, .. })
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::ControlCommand(ControlMsg::StopRecording { .. }))
+        ));
+        assert!(matches!(
+            intents.recv().await,
+            Some(AppEvent::TaskComplete { .. })
+        ));
+        assert!(intents.try_recv().is_err());
+    }
+
+    /// B5, deterministic core: the coalesce buffer concatenates per
+    /// session (insertion-ordered across sessions) and one flush emits one
+    /// wire line per session with the payload shape unchanged.
+    #[test]
+    fn delta_coalesce_buffer_merges_per_session_in_order() {
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut buffer = DeltaCoalesceBuffer::default();
+        let s1 = Some("s1".to_string());
+        let s2 = Some("s2".to_string());
+        buffer.push(&s1, "a");
+        buffer.push(&s2, "z");
+        buffer.push(&s1, "b");
+        buffer.push(&s1, "c");
+        buffer.flush(&outbound_tx);
+
+        let first: serde_json::Value =
+            serde_json::from_str(&outbound_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(first["event"], "model_response_delta");
+        assert_eq!(first["session_id"], "s1");
+        assert_eq!(
+            first["text"], "abc",
+            "per-session text concatenates in order"
+        );
+        let second: serde_json::Value =
+            serde_json::from_str(&outbound_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(second["session_id"], "s2");
+        assert_eq!(second["text"], "z");
+        assert!(
+            outbound_rx.try_recv().is_err(),
+            "one line per session per flush"
+        );
+
+        // Flushing again emits nothing (buffer drained).
+        buffer.flush(&outbound_tx);
+        assert!(outbound_rx.try_recv().is_err());
+    }
+
+    /// B5: no delta may be reordered past a later non-delta event, and no
+    /// delta text may be lost, regardless of where the 40ms tick lands.
+    #[tokio::test]
+    async fn outbound_broadcaster_flushes_deltas_before_later_events() {
+        let bus = EventBus::new();
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(64);
+        let _handle = spawn_outbound_broadcaster(bus.subscribe(), outbound_tx);
+
+        for text in ["a", "b", "c"] {
+            bus.send(AppEvent::ModelResponseDelta {
+                session_id: Some("s1".to_string()),
+                text: text.to_string(),
+            });
+        }
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: Some("s2".to_string()),
+            text: "z".to_string(),
+        });
+        // Non-delta event: every delta sent above must flush before it.
+        bus.send(AppEvent::DoneSignal {
+            session_id: Some("s1".to_string()),
+            message: None,
+        });
+
+        // A tick may split the merged run on a loaded machine, so assert
+        // the invariants rather than one exact framing: concatenated text
+        // per session is exact and complete BEFORE the done event arrives.
+        let mut s1_text = String::new();
+        let mut s2_text = String::new();
+        loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), outbound_rx.recv())
+                .await
+                .expect("timed out waiting for outbound line")
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match json["event"].as_str() {
+                Some("model_response_delta") => {
+                    let text = json["text"].as_str().unwrap();
+                    match json["session_id"].as_str() {
+                        Some("s1") => s1_text.push_str(text),
+                        Some("s2") => s2_text.push_str(text),
+                        other => panic!("unexpected delta session {other:?}"),
+                    }
+                }
+                Some("done_signal") => break,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(s1_text, "abc", "all s1 delta text flushed before done");
+        assert_eq!(s2_text, "z", "all s2 delta text flushed before done");
+    }
+
+    /// B5: deltas buffered AFTER a non-delta event flush after it — the
+    /// barrier works in both directions across a flush boundary.
+    #[tokio::test]
+    async fn outbound_broadcaster_delta_after_event_stays_after_it() {
+        let bus = EventBus::new();
+        let (outbound_tx, mut outbound_rx) = tokio::sync::broadcast::channel::<String>(64);
+        let _handle = spawn_outbound_broadcaster(bus.subscribe(), outbound_tx);
+
+        bus.send(AppEvent::DoneSignal {
+            session_id: Some("s1".to_string()),
+            message: None,
+        });
+        bus.send(AppEvent::ModelResponseDelta {
+            session_id: Some("s1".to_string()),
+            text: "after".to_string(),
+        });
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("timed out waiting for done signal")
+            .unwrap();
+        assert!(first.contains("\"event\":\"done_signal\""));
+        // The trailing delta arrives on the 40ms tick.
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("timed out waiting for tick-flushed delta")
+            .unwrap();
+        let second_json: serde_json::Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(second_json["event"], "model_response_delta");
+        assert_eq!(second_json["text"], "after");
     }
 
     #[test]
@@ -3688,6 +4297,7 @@ mod tests {
                 claude_effort: None,
                 claude_permission_mode: None,
                 codex_model: Some("gpt-5.3-codex".to_string()),
+                codex_reasoning_effort: Some("high".to_string()),
                 codex_sandbox: Some("danger-full-access".to_string()),
                 codex_approval_policy: Some("never".to_string()),
                 codex_managed_context: Some("managed".to_string()),
@@ -3710,6 +4320,7 @@ mod tests {
                 display_target: None,
                 attachments: vec![],
                 follow_up_id: None,
+                delegation_id: None,
             },
             ControlMsg::FollowUp {
                 session_id: None,
@@ -3950,7 +4561,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_model":"gpt-5.3-codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_model":"gpt-5.6-sol","codex_reasoning_effort":"ultra","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -3963,6 +4574,7 @@ mod tests {
                 claude_permission_mode,
                 claude_effort,
                 codex_model,
+                codex_reasoning_effort,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -3984,7 +4596,8 @@ mod tests {
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
-                assert_eq!(codex_model.as_deref(), Some("gpt-5.3-codex"));
+                assert_eq!(codex_model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(codex_reasoning_effort.as_deref(), Some("ultra"));
                 assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
@@ -4150,6 +4763,7 @@ mod tests {
                 source,
                 session_id,
                 resume_id,
+                relationship_kind,
                 project_root,
                 task,
                 direct,
@@ -4174,6 +4788,7 @@ mod tests {
                 assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("summary"));
+                assert_eq!(relationship_kind, None, "absent field defaults to None");
             }
             _ => panic!("expected ResumeSession"),
         }
@@ -4278,6 +4893,7 @@ mod tests {
             display_target: Some("user_session".to_string()),
             attachments: vec!["ann-recording-1".to_string(), "ann-recording-2".to_string()],
             follow_up_id: None,
+            delegation_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ControlMsg = serde_json::from_str(&json).unwrap();
@@ -4586,6 +5202,90 @@ mod tests {
     }
 
     #[test]
+    fn control_msg_resolve_display_request_deserialize() {
+        // The popup's wire shape: approve with a duration.
+        let json = r#"{"action":"resolve_display_request","session_id":"sess-1","id":7,"decision":"approve","duration":"15m"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(id, 7);
+                assert_eq!(decision, "approve");
+                assert_eq!(duration.as_deref(), Some("15m"));
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // Deny needs no duration; session_id may be absent ("main").
+        let json = r#"{"action":"resolve_display_request","id":3,"decision":"deny"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::ResolveDisplayRequest {
+                session_id,
+                id,
+                decision,
+                duration,
+            } => {
+                assert_eq!(session_id, None);
+                assert_eq!(id, 3);
+                assert_eq!(decision, "deny");
+                assert_eq!(duration, None);
+            }
+            _ => panic!("expected ResolveDisplayRequest"),
+        }
+
+        // `id` and `decision` are required: a resolution cannot default
+        // its target or its verdict.
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","decision":"approve"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ControlMsg>(
+            r#"{"action":"resolve_display_request","id":3}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn display_request_events_map_to_outbound_wire_shapes() {
+        let raised = app_event_to_outbound(&AppEvent::DisplayRequestRaised {
+            session_id: Some("sess-1".to_string()),
+            id: 7,
+            access: "view".to_string(),
+            reason: "watch the migration".to_string(),
+            expires_unix_ms: 123_456,
+        })
+        .expect("raised maps to an outbound event");
+        let wire = serde_json::to_value(&raised).unwrap();
+        assert_eq!(wire["event"], "display_request_raised");
+        assert_eq!(wire["session_id"], "sess-1");
+        assert_eq!(wire["id"], 7);
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["reason"], "watch the migration");
+        assert_eq!(wire["expires_unix_ms"], 123_456);
+
+        let resolved = app_event_to_outbound(&AppEvent::DisplayRequestResolved {
+            session_id: None,
+            id: 7,
+            outcome: "approved".to_string(),
+            access: Some("view".to_string()),
+            duration: Some("this_session".to_string()),
+        })
+        .expect("resolved maps to an outbound event");
+        let wire = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(wire["event"], "display_request_resolved");
+        assert_eq!(wire["outcome"], "approved");
+        assert_eq!(wire["access"], "view");
+        assert_eq!(wire["duration"], "this_session");
+        assert!(wire.get("session_id").is_none());
+    }
+
+    #[test]
     fn control_msg_set_diagnostics_visual_marker_default_display() {
         let json = r#"{"action":"set_diagnostics_visual_marker","enabled":true}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
@@ -4685,9 +5385,64 @@ mod tests {
         assert!(app_event_to_outbound(&AppEvent::Tick).is_none());
     }
 
+    fn sample_cu_action_event() -> AppEvent {
+        AppEvent::CuActionExecuted {
+            event_id: "cu-1700000000000-7".to_string(),
+            session_id: Some("sess-1".to_string()),
+            display_id: 99,
+            kind: "left_click".to_string(),
+            x: Some(612),
+            y: Some(233),
+            ref_w: 1280,
+            ref_h: 800,
+            raw: "left_click(612, 233)".to_string(),
+            ts: 1_700_000_000_000,
+        }
+    }
+
     #[test]
-    fn outbound_skips_resize() {
-        assert!(app_event_to_outbound(&AppEvent::Resize(80, 24)).is_none());
+    fn outbound_cu_action_pins_the_wire_shape() {
+        let outbound = app_event_to_outbound(&sample_cu_action_event()).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"cu_action\""), "{json}");
+        assert!(json.contains("\"event_id\":\"cu-1700000000000-7\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
+        assert!(json.contains("\"display_id\":99"));
+        assert!(json.contains("\"kind\":\"left_click\""));
+        assert!(json.contains("\"x\":612"));
+        assert!(json.contains("\"y\":233"));
+        assert!(json.contains("\"ref_w\":1280"));
+        assert!(json.contains("\"ref_h\":800"));
+        assert!(json.contains("\"raw\":\"left_click(612, 233)\""));
+        assert!(json.contains("\"ts\":1700000000000"));
+    }
+
+    #[test]
+    fn outbound_cu_action_omits_absent_point_and_session() {
+        let event = AppEvent::CuActionExecuted {
+            event_id: "cu-1-1".to_string(),
+            session_id: None,
+            display_id: 0,
+            kind: "type".to_string(),
+            x: None,
+            y: None,
+            ref_w: 0,
+            ref_h: 0,
+            raw: "type(\"hi\")".to_string(),
+            ts: 1,
+        };
+        let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
+        assert!(!json.contains("\"session_id\""), "{json}");
+        assert!(!json.contains("\"x\""), "{json}");
+        assert!(!json.contains("\"y\""), "{json}");
+    }
+
+    #[test]
+    fn cu_action_events_never_reach_the_session_log() {
+        // The action-visualization lane is deliberately ephemeral: it rides
+        // the broadcast ring only. A cu_action in session.jsonl (and hence
+        // in log_replay) would violate the no-replay contract.
+        assert!(!app_event_writes_to_session_log(&sample_cu_action_event()));
     }
 
     #[test]
@@ -4755,6 +5510,7 @@ mod tests {
             stderr: "".to_string(),
             source: None,
             output_id: None,
+            item_id: None,
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -4932,6 +5688,7 @@ mod tests {
                 stderr: String::new(),
                 source: Some("Codex".to_string()),
                 output_id: Some("out-1".to_string()),
+                item_id: None,
             },
         );
         drop(shared);
@@ -5046,7 +5803,7 @@ mod tests {
             context_window: Some(128000),
             hard_context_window: Some(128000),
             item_count: Some(2),
-            raw: serde_json::json!({"thread": {"turns": []}}),
+            raw: Arc::new(serde_json::json!({"thread": {"turns": []}})),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
@@ -5055,6 +5812,40 @@ mod tests {
         assert!(json.contains("\"source\":\"codex\""));
         assert!(json.contains("\"request_index\":7"));
         assert!(json.contains("\"raw\""));
+    }
+
+    /// The whole point of `Arc`-ing `ContextSnapshot::raw`: every bus
+    /// subscriber receives the event via `AppEvent::clone`, and that clone
+    /// must share the (multi-MB) payload allocation, not deep-copy it.
+    #[test]
+    fn context_snapshot_clone_shares_raw_allocation() {
+        let event = AppEvent::ContextSnapshot {
+            session_id: Some("sess-ctx".to_string()),
+            source: "native".to_string(),
+            label: "Internal agent request payload".to_string(),
+            request_id: Some("req-share".to_string()),
+            request_index: Some(1),
+            turn: Some(1),
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: None,
+            token_count_kind: None,
+            context_window: Some(128000),
+            hard_context_window: Some(128000),
+            item_count: Some(1),
+            raw: Arc::new(serde_json::json!({"input": [{"role": "user"}]})),
+        };
+        let cloned = event.clone();
+        let (
+            AppEvent::ContextSnapshot { raw: original, .. },
+            AppEvent::ContextSnapshot { raw: copy, .. },
+        ) = (&event, &cloned)
+        else {
+            panic!("expected two context snapshots");
+        };
+        assert!(
+            Arc::ptr_eq(original, copy),
+            "cloning a ContextSnapshot must refcount the raw payload, not deep-copy it"
+        );
     }
 
     #[test]
@@ -5073,10 +5864,10 @@ mod tests {
             context_window: Some(128000),
             hard_context_window: Some(128000),
             item_count: Some(1),
-            raw: serde_json::json!({
+            raw: Arc::new(serde_json::json!({
                 "input": [{"role": "user", "content": large_text}],
                 "model": "codex",
-            }),
+            })),
         };
 
         let outbound = app_event_to_outbound(&event).unwrap();

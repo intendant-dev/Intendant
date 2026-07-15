@@ -60,9 +60,7 @@ fn merge_tree_supported() -> bool {
             .arg("--version")
             .output()
             .ok()
-            .map(|out| {
-                git_version_at_least(&String::from_utf8_lossy(&out.stdout), 2, 38)
-            })
+            .map(|out| git_version_at_least(&String::from_utf8_lossy(&out.stdout), 2, 38))
             .unwrap_or(false)
     })
 }
@@ -97,9 +95,12 @@ impl GitVitalsProber {
             .unwrap_or(0);
 
         // Primary branch: origin's default when known, else local main/master.
-        let mut primary_branch = git(cwd, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-            .await
-            .map(|s| s.trim_start_matches("origin/").to_string());
+        let mut primary_branch = git(
+            cwd,
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .await
+        .map(|s| s.trim_start_matches("origin/").to_string());
         if primary_branch.is_none() {
             for candidate in ["main", "master"] {
                 let refname = format!("refs/heads/{candidate}");
@@ -130,23 +131,38 @@ impl GitVitalsProber {
             } else {
                 primary_branch.to_string()
             };
-            ahead = git_count(cwd, &format!("{primary_ref}..HEAD")).await.unwrap_or(0);
-            behind = git_count(cwd, &format!("HEAD..{primary_ref}")).await.unwrap_or(0);
+            ahead = git_count(cwd, &format!("{primary_ref}..HEAD"))
+                .await
+                .unwrap_or(0);
+            behind = git_count(cwd, &format!("HEAD..{primary_ref}"))
+                .await
+                .unwrap_or(0);
 
             merge_parity = if (ahead > 0) != (behind > 0) {
                 // Fast-forward in one direction: trivially clean.
                 "clean".to_string()
             } else if ahead > 0 && behind > 0 && merge_tree_supported() {
-                self.merge_parity(cwd, &primary_ref).await.unwrap_or_default()
+                self.merge_parity(cwd, &primary_ref)
+                    .await
+                    .unwrap_or_default()
             } else {
                 String::new()
             };
 
             if branch != primary_branch {
                 let primary_upstream = format!("{primary_branch}@{{upstream}}");
-                if git(cwd, &["rev-parse", "--verify", "--quiet", "--abbrev-ref", &primary_upstream])
-                    .await
-                    .is_some()
+                if git(
+                    cwd,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "--abbrev-ref",
+                        &primary_upstream,
+                    ],
+                )
+                .await
+                .is_some()
                 {
                     primary_unpushed =
                         git_count(cwd, &format!("{primary_upstream}..{primary_branch}")).await;
@@ -154,9 +170,18 @@ impl GitVitalsProber {
             }
         }
 
-        let unpushed = if git(cwd, &["rev-parse", "--verify", "--quiet", "--abbrev-ref", "@{upstream}"])
-            .await
-            .is_some()
+        let unpushed = if git(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--abbrev-ref",
+                "@{upstream}",
+            ],
+        )
+        .await
+        .is_some()
         {
             git_count(cwd, "@{upstream}..HEAD").await
         } else {
@@ -322,25 +347,101 @@ fn spawn_cache_vitals_listener(
     })
 }
 
+/// Live registry of (session id → working dir) git-probe targets. The
+/// daemon seeds the primary session at startup; the session supervisor
+/// registers every managed session at launch — which is what puts the
+/// dirty-count / merge-parity / unpushed rows on dashboard-spawned
+/// sessions and on projectless daemons (whose primary has no repo).
+/// `SessionEnded` prunes entries, so a handle owner only has to register.
+#[derive(Clone, Default)]
+pub(crate) struct GitVitalsTargets {
+    targets: Arc<Mutex<HashMap<String, PathBuf>>>,
+}
+
+impl GitVitalsTargets {
+    /// Register (or retarget) a session's git probe root. No-ops on empty
+    /// ids so callers can pass through unresolved values unchecked.
+    pub(crate) fn register(&self, session_id: &str, cwd: PathBuf) {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return;
+        }
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .insert(session_id.to_string(), cwd);
+    }
+
+    pub(crate) fn remove(&self, session_id: &str) {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .remove(session_id.trim());
+    }
+
+    fn snapshot(&self) -> Vec<(String, PathBuf)> {
+        self.targets
+            .lock()
+            .expect("git vitals targets lock")
+            .iter()
+            .map(|(id, cwd)| (id.clone(), cwd.clone()))
+            .collect()
+    }
+}
+
 /// Vitals producer: spawns the cache listener and runs the periodic git
-/// prober for a fixed set of (session id, working dir) targets — today the
-/// primary session. All emission flows through the change-detecting hub;
-/// the session log persists each emission so reconnecting frontends replay
-/// the latest.
+/// prober over the live target registry (seeded with the primary session,
+/// fed by the session supervisor as sessions launch). All emission flows
+/// through the change-detecting hub; the session log persists each
+/// emission so reconnecting frontends replay the latest.
+///
+/// The seed may be empty: the cache/limits sections are usage-driven and
+/// backend-agnostic, so the listener runs wherever a bus exists — a
+/// projectless daemon still reports cache and rate-limit vitals for every
+/// session; only the git segment needs a repo target.
 pub(crate) fn spawn_session_vitals_producer(
     bus: EventBus,
-    targets: Vec<(String, PathBuf)>,
-) -> tokio::task::JoinHandle<()> {
+    seed_targets: Vec<(String, PathBuf)>,
+) -> (GitVitalsTargets, tokio::task::JoinHandle<()>) {
+    let registry = GitVitalsTargets::default();
+    for (session_id, cwd) in seed_targets {
+        registry.register(&session_id, cwd);
+    }
     let hub = SessionVitalsHub::new(bus.clone());
-    let _cache_listener = spawn_cache_vitals_listener(bus, hub.clone());
-    tokio::spawn(async move {
-        let mut prober = GitVitalsProber::default();
-        loop {
-            for (session_id, cwd) in &targets {
-                let probed = prober.probe(cwd).await;
-                hub.apply(session_id, |vitals| vitals.git = probed);
+    let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+    let _target_pruner = spawn_git_target_pruner(bus, registry.clone());
+    let handle = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            let mut prober = GitVitalsProber::default();
+            loop {
+                for (session_id, cwd) in registry.snapshot() {
+                    let probed = prober.probe(&cwd).await;
+                    hub.apply(&session_id, |vitals| vitals.git = probed);
+                }
+                tokio::time::sleep(PROBE_INTERVAL).await;
             }
-            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+    });
+    (registry, handle)
+}
+
+/// Prune git targets when their session ends — mirrors the cache
+/// listener's `SessionEnded` hygiene so registered sessions never leak
+/// probe work past their lifetime.
+fn spawn_git_target_pruner(
+    bus: EventBus,
+    registry: GitVitalsTargets,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(AppEvent::SessionEnded { session_id, .. }) => registry.remove(&session_id),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     })
 }
@@ -359,7 +460,15 @@ mod tests {
     }
 
     fn git_cmd(cwd: &Path, args: &[&str]) {
-        let mut full = vec!["git", "-c", "user.email=t@e2e", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+        let mut full = vec![
+            "git",
+            "-c",
+            "user.email=t@e2e",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ];
         full.extend_from_slice(args);
         sh(cwd, &full);
     }
@@ -426,17 +535,23 @@ mod tests {
     #[test]
     fn cache_vitals_hit_math_and_ttl_resolution() {
         // 90 read / 10 fresh → 90% hit; explicit flavor wins.
-        let vitals =
-            cache_vitals_from_usage(&usage_with_sample("anthropic", 90, 5, 5, Some(3600)), None, 42)
-                .expect("sample present");
+        let vitals = cache_vitals_from_usage(
+            &usage_with_sample("anthropic", 90, 5, 5, Some(3600)),
+            None,
+            42,
+        )
+        .expect("sample present");
         assert_eq!(vitals.hit_pct, Some(90));
         assert_eq!(vitals.last_activity_epoch, 42);
         assert_eq!(vitals.ttl_seconds, Some(3600));
 
         // Read-only response: no flavor statement — sticky TTL survives.
-        let sticky =
-            cache_vitals_from_usage(&usage_with_sample("anthropic", 100, 0, 0, None), Some(3600), 43)
-                .expect("sample present");
+        let sticky = cache_vitals_from_usage(
+            &usage_with_sample("anthropic", 100, 0, 0, None),
+            Some(3600),
+            43,
+        )
+        .expect("sample present");
         assert_eq!(sticky.hit_pct, Some(100));
         assert_eq!(sticky.ttl_seconds, Some(3600));
 
@@ -448,14 +563,17 @@ mod tests {
         assert_eq!(default_flavor.ttl_seconds, Some(300));
 
         // OpenAI: hit receipt without a countdown (TTL undocumented).
-        let openai = cache_vitals_from_usage(&usage_with_sample("openai", 75, 0, 25, None), None, 45)
-            .expect("sample present");
+        let openai =
+            cache_vitals_from_usage(&usage_with_sample("openai", 75, 0, 25, None), None, 45)
+                .expect("sample present");
         assert_eq!(openai.hit_pct, Some(75));
         assert_eq!(openai.ttl_seconds, None);
 
         // No per-request sample → nothing to learn.
-        assert!(cache_vitals_from_usage(&usage_with_sample("anthropic", 0, 0, 0, None), None, 46)
-            .is_none());
+        assert!(
+            cache_vitals_from_usage(&usage_with_sample("anthropic", 0, 0, 0, None), None, 46)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -494,7 +612,11 @@ mod tests {
                 emissions.push((session_id, vitals));
             }
         }
-        assert_eq!(emissions.len(), 3, "changes emit, no-ops and rewrites do not");
+        assert_eq!(
+            emissions.len(),
+            3,
+            "changes emit, no-ops and rewrites do not"
+        );
         assert_eq!(emissions[0].1.git.as_ref().unwrap().branch, "feature");
         assert!(emissions[0].1.cache.is_none());
         assert!(emissions[1].1.git.is_some(), "merged snapshot keeps git");
@@ -503,6 +625,84 @@ mod tests {
             emissions[2].1.cache.is_none(),
             "removed session re-registers from scratch"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_target_probes_and_session_end_prunes() {
+        // Supervisor-registered sessions get git rows without a restart;
+        // SessionEnded prunes the target (registry drops the entry).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "init"]);
+        std::fs::write(root.join("b.txt"), "dirty\n").unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        targets.register("supervised-1", root.to_path_buf());
+
+        let deadline = std::time::Duration::from_secs(20);
+        loop {
+            let event = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("git vitals emission before timeout")
+                .expect("bus open");
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "supervised-1");
+                let git = vitals.git.expect("git section probed");
+                assert_eq!(git.branch, "main");
+                assert_eq!(git.dirty_files, 1);
+                break;
+            }
+        }
+
+        bus.send(AppEvent::SessionEnded {
+            session_id: "supervised-1".into(),
+            reason: "done".into(),
+            error_kind: None,
+        });
+        // The pruner runs on the bus; poll until the entry is gone.
+        let start = std::time::Instant::now();
+        while !targets.snapshot().is_empty() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "SessionEnded did not prune the git target"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn producer_with_no_git_targets_still_serves_cache_vitals() {
+        // A projectless daemon has no git target, but cache/limits vitals
+        // are usage-driven and must keep flowing for every session
+        // (regression: the listener used to die with the git gating,
+        // blanking the dashboard's Prompt cache row daemon-wide).
+        let bus = EventBus::new();
+        let _producer = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        let mut rx = bus.subscribe();
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("cc-session".into()),
+            main: usage_with_sample("anthropic", 80, 10, 10, Some(3600)),
+            presence: None,
+        });
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("vitals emission before timeout")
+                .expect("bus open");
+            if let AppEvent::SessionVitals { session_id, vitals } = event {
+                assert_eq!(session_id, "cc-session");
+                assert_eq!(vitals.cache.as_ref().unwrap().hit_pct, Some(80));
+                assert_eq!(vitals.cache.as_ref().unwrap().ttl_seconds, Some(3600));
+                assert!(vitals.git.is_none(), "no git target, no git section");
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -515,8 +715,9 @@ mod tests {
         let mut with_limits = usage_with_sample("anthropic", 80, 10, 10, Some(300));
         with_limits.limits = vec![crate::types::SessionLimitWindow {
             label: "7d".into(),
-            used_pct: 49,
+            used_pct: Some(49),
             resets_at_epoch: Some(1_783_807_200),
+            status: None,
         }];
         bus.send(AppEvent::UsageSnapshot {
             session_id: Some("s7".into()),
@@ -538,7 +739,7 @@ mod tests {
         assert_eq!(cache.ttl_seconds, Some(300));
         assert!(cache.last_activity_epoch > 0);
         assert_eq!(vitals.limits.len(), 1);
-        assert_eq!(vitals.limits[0].used_pct, 49);
+        assert_eq!(vitals.limits[0].used_pct, Some(49));
 
         // Limits are sticky: a later usage emission without them keeps the
         // last known gauges.
@@ -550,7 +751,8 @@ mod tests {
         let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
-                    if session_id == "s7" && vitals.cache.as_ref().and_then(|c| c.hit_pct) == Some(90)
+                    if session_id == "s7"
+                        && vitals.cache.as_ref().and_then(|c| c.hit_pct) == Some(90)
                     {
                         return vitals;
                     }
@@ -592,5 +794,66 @@ mod tests {
         let again = prober.probe(root).await.expect("git repo probes");
         assert_eq!(again.merge_parity, "conflict");
         assert_eq!(prober.merge_cache.len(), 1);
+    }
+
+    /// The dashboard's vitals symbol catalog (static/app/39-session-windows.js,
+    /// VITALS_SYMBOLS_BEGIN..END) is the single source for every vitals chip,
+    /// rail tooltip, and tap-to-explain popover — and the backend-parity
+    /// surface: all three backends render the same symbol grammar from these
+    /// wire fields. Pin both directions so a `SessionVitals` schema change or
+    /// a catalog refactor fails here instead of shipping as silent drift.
+    #[test]
+    fn vitals_symbol_catalog_covers_wire_fields() {
+        let fragment = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("static/app/39-session-windows.js"),
+        )
+        .expect("dashboard session-windows fragment");
+        let begin = fragment
+            .find("VITALS_SYMBOLS_BEGIN")
+            .expect("catalog begin marker");
+        let end = fragment
+            .find("VITALS_SYMBOLS_END")
+            .expect("catalog end marker");
+        let catalog = &fragment[begin..end];
+        for key in [
+            "health:",
+            "branch:",
+            "worktree:",
+            "dirty:",
+            "divergence:",
+            "parity:",
+            "unpushed:",
+            "'primary-unpushed':",
+            "'cache-hit':",
+            "'cache-ttl':",
+            "limit:",
+        ] {
+            assert!(catalog.contains(key), "catalog lost symbol {key}");
+        }
+        // The serde-camelCase wire fields of SessionVitals/SessionGitVitals/
+        // SessionCacheVitals/SessionLimitWindow the catalog must consume.
+        for field in [
+            "branch",
+            "dirtyFiles",
+            "primaryRef",
+            "ahead",
+            "behind",
+            "mergeParity",
+            "unpushed",
+            "primaryUnpushed",
+            "hitPct",
+            "ttlSeconds",
+            "lastActivityEpoch",
+            "usedPct",
+            "resetsAtEpoch",
+            "status",
+            "label",
+        ] {
+            assert!(
+                catalog.contains(field),
+                "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
+            );
+        }
     }
 }

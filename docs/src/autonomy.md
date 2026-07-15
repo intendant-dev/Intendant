@@ -43,7 +43,7 @@ A pending request does not depend on someone happening to look at a
 dashboard: an open-but-hidden tab badges its title/favicon with the pending
 count and can raise a browser notification
 ([Web Dashboard](./web-dashboard.md)), and when *no* dashboard has been
-connected since the request appeared, a claimed daemon nudges the Connect
+connected since the request appeared, a linked daemon nudges the Connect
 rendezvous after a grace period so opted-in browsers get a Web Push that
 names only the request kind and the daemon/session labels — never the
 command or question itself (`attention_nudge.rs`;
@@ -127,17 +127,89 @@ external-agent approval routing through `external_approval_decision`.
 access to the user's display for the rest of the session (used by both
 [computer use](./computer-use-and-audio.md) and WebRTC streaming). Revoke from
 the same places to drop it. The grant is enforced fail-closed at the CU
-executor on every platform; only the owner's own surfaces (dashboard, local
-`ctl`, the owner-wired stdio MCP transport) may reach the user display
-without it, because their call is the opt-in. Note the grant is a single
-per-daemon flag: once granted, it holds for every principal the IAM layer
-lets at the display tools until revoked.
+executor on every platform; only an owner/root surface (an owner/root
+dashboard, local `ctl`, or the owner-wired stdio MCP transport) may reach the
+user display without it, because its call is the opt-in. A scoped role's
+`display.view` or `display.input` permission covers agent-visible displays
+only; neither permission is proof that the owner chose to expose the private
+user session. Note the grant is a single per-daemon flag: once granted, it
+holds for every principal the IAM layer lets at the display tools until
+revoked.
 
 The dashboard's **View this machine** action is *not* a `DisplayControl`
 grant: it opens a **private user view** — a capture session flagged
-`agent_visible = false` that streams to the owner's dashboards only. It
-never touches this grant, and the session itself is skipped by every
-agent-facing display lookup (a second fence, independent of the flag —
-see [Computer Use](./computer-use-and-audio.md)). Revoking *any*
-user-display session — shared or private — clears the per-daemon grant
-flag: over-revocation is the fail-closed direction.
+`agent_visible = false` that streams only to owner/root dashboards. That
+ceiling applies on both browser transports: the legacy `/ws` signaling/input
+lane and the verified dashboard-control DataChannel. The action never touches
+the standing grant, and the session itself is skipped by every generic,
+agent-facing display lookup (a second fence, independent of the flag — see
+[Computer Use](./computer-use-and-audio.md)). Revoking *any* user-display
+session — shared or private — clears the per-daemon grant flag: over-revocation
+is the fail-closed direction.
+
+## The display request rail (doorbell)
+
+Scoped callers — supervised external agents, session-scoped grants,
+federated peers — cannot perform the owner's opt-in themselves
+(`grant_user_display` refuses them). What they can do is **ask**: the
+`request_user_display` MCP tool (`intendant ctl display request`) raises a
+dedicated dashboard popup with the agent's short reason and the requested
+access level, then blocks until the user decides or the wait window
+(default 120 s, max 600 s) closes.
+
+**Never auto-approved, by construction.** Display requests live in their
+own registry and id space, deliberately outside the approval registry:
+`approve` / `approve_all` / any autonomy level or per-category rule cannot
+reach them. The only resolution is the dedicated
+`ResolveDisplayRequest` control message — the popup's **Allow** /
+**Deny** / **Deny for this session** buttons — accepted only from an
+owner/root surface. Both it and `GrantUserDisplay` are classified
+`display.input`, but that permission is only the coarse admission floor:
+resolving or granting additionally requires owner/root authority on either
+browser transport. `RevokeUserDisplay` remains available to an otherwise
+authorized scoped caller because de-escalation is the fail-safe direction. On
+approve, the control plane mints the grant through the same state flip and
+events the owner's own grant takes.
+
+Two access levels:
+
+- **`view`** — the display stream activates agent-visible (dashboard tile
+  + `list_frames`/`read_frame`), but the `DisplayControl` grant flag stays
+  **off**: computer-use input and screenshots against `user_session`
+  remain denied at the CU executor's fail-closed gate.
+- **`view_and_control`** — the full session grant described above.
+
+Three durations, chosen by the user at approval: **this session**
+(auto-revokes when the requesting session ends), **15 minutes** (a timer
+revokes through the normal revoke path; superseded if the owner grants or
+revokes manually in the meantime), **until revoked**.
+
+Spam resistance: one pending request per session (a second call reports
+the existing one); a deny — or a timeout, which counts as declined by
+absence — starts a 5-minute per-session cooldown during which new
+requests are refused without a popup; **Deny for this session**
+suppresses the session server-side until it ends. Pending requests feed
+the attention chain (tab badge, hidden-tab notification, and the
+Connect Web Push nudge with kind `display_request` — the push carries
+only the kind and session label, never the reason text). On a headless
+daemon with no owner surface, requests are refused immediately
+(`unavailable`) instead of blocking — the same fail-closed posture as
+headless approvals.
+
+## "Approve all" scope, by surface
+
+The same two words appear on several surfaces with deliberately different
+blast radii. What each one actually grants:
+
+| Surface | What "approve all" does | Scope | Lifetime |
+|---|---|---|---|
+| Native runtime approvals | Sets the autonomy level to **Full** (`apply_user_approval`) | **Daemon-wide for native sessions** — one shared autonomy state backs every native session | In-memory: until lowered again (autonomy control or restart, which returns to the configured level) |
+| External agents (Codex / Claude Code) | Auto-approves that backend's subsequent approval requests (`approve_all_session`) | **That one external session only** — deliberately never touches native autonomy | The external session's lifetime |
+| Live audio | Does not exist. Every live-audio spawn requires its own explicit human approval; with no approver surface the spawn is denied outright | Per spawn | One consent per spawn |
+| Questions (`ask_user` and kin) | Nothing. Questions are not permissions: no level or approve-all grant answers one, and an `Answer` aimed at a command approval fails closed (denied) | — | — |
+| Display requests (`user_session` rail) | Nothing. The rail lives outside the approval id space; approve/approve-all can never mint a display grant there. (Approving a **DisplayControl-category runtime action** is different: the first such approval grants agent-visible user-display access session-wide — that approval *is* the opt-in) | Rail: per request | Grant durations are the rail's own (this session / 15 min / until revoked) |
+
+The asymmetry between the first two rows is intentional: a native
+approve-all is the operator saying "run autonomously" to *their daemon*,
+while a button on one supervised Codex/Claude session must not escalate
+every other surface of the daemon.

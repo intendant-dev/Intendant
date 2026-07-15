@@ -224,6 +224,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn route_edit_user_message(
         &self,
         session_id: Option<String>,
@@ -300,6 +301,7 @@ impl SessionSupervisor {
                     Some(attach.direct.unwrap_or(true)),
                     Vec::new(),
                     false,
+                    None,
                     LaunchOverrides::default(),
                     false,
                 )
@@ -757,6 +759,7 @@ impl SessionSupervisor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) async fn restart_session(
         &self,
         source: String,
@@ -810,6 +813,7 @@ impl SessionSupervisor {
             direct,
             attachments,
             false,
+            None,
             overrides,
             true,
         )
@@ -853,8 +857,15 @@ impl SessionSupervisor {
                 )
             })
         };
-        let Some((managed_id, source, project_root, session_dir, tx, relation, requested_is_managed)) =
-            entry
+        let Some((
+            managed_id,
+            source,
+            project_root,
+            session_dir,
+            tx,
+            relation,
+            requested_is_managed,
+        )) = entry
         else {
             self.warn(&format!(
                 "Steer dropped: session {} is not managed by this daemon",
@@ -1047,6 +1058,13 @@ impl SessionSupervisor {
         // Nothing for the supervisor to do — and warning here would
         // misreport a first-class flow as an unknown approval id.
         if crate::mcp::ask_user_question_pending(approval_id) {
+            return;
+        }
+        // A live-audio consent prompt is likewise armed by its own gate
+        // waiter (crate::live_audio), which observes the same ControlCommand
+        // on the bus, resolves, and emits ApprovalResolved — a native-path
+        // prompt also has a registry responder, but the waiter owns it.
+        if crate::live_audio::spawn_consent_pending(approval_id) {
             return;
         }
         let Some(target_id) = self.resolve_target_session_id(session_id).await else {
@@ -1425,7 +1443,10 @@ pub(crate) fn spawn_text_steer_fallback(
     });
 }
 
-pub(crate) fn steer_ack_targets_session(actual: &Option<String>, expected: &Option<String>) -> bool {
+pub(crate) fn steer_ack_targets_session(
+    actual: &Option<String>,
+    expected: &Option<String>,
+) -> bool {
     match (actual.as_deref(), expected.as_deref()) {
         (Some(actual), Some(expected)) => actual == expected,
         (None, _) | (_, None) => true,
@@ -1502,8 +1523,7 @@ mod tests {
                 }
                 AppEvent::SessionEnded {
                     session_id, reason, ..
-                } if session_id == "parent-thread" && reason == "stopped by user" =>
-                {
+                } if session_id == "parent-thread" && reason == "stopped by user" => {
                     saw_session_ended = true;
                 }
                 _ => {}

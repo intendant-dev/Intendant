@@ -19,8 +19,17 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ── Approval / Input / Follow-up actions (from HTML onclick) ──
+// Not fire-and-forget anymore: the panel flips to a disabled "Sending…"
+// state and clears only when the resolution is observed (fragment 41's
+// beginApprovalSend hooks — attention-set drop on approval_resolved, a
+// phase transition out of waiting, or an external panel clear). After 5s
+// with no evidence the buttons re-enable and a toast says the approval may
+// not have reached the daemon.
 window.sendApproval = function(action) {
   if (!app || pendingApprovalId === null) return;
+  // A send is already in flight for the shown approval — don't double-fire
+  // (keyboard shortcuts stay wired; they just no-op while disabled).
+  if (approvalSendPending) return;
   if (pendingApprovalSessionId && sessionWindowIsDetached(pendingApprovalSessionId)) {
     showControlToast('error', 'Approval is no longer live; attach the session and retry if needed');
     approvalSessionIds.delete(String(pendingApprovalId));
@@ -30,11 +39,17 @@ window.sendApproval = function(action) {
   }
   const msg = { action, id: pendingApprovalId };
   if (pendingApprovalSessionId) msg.session_id = pendingApprovalSessionId;
-  dispatchSessionControlMsg(msg);
-  approvalSessionIds.delete(String(pendingApprovalId));
-  clearPendingApproval();
-  hidePanel('approval-panel');
-  setPhase('running');
+  beginApprovalSend(pendingApprovalId, pendingApprovalSessionId);
+  let failed = false;
+  const failSend = (err) => {
+    // Transport said no (sync or async) — don't wait out the ack timeout.
+    if (failed) return;
+    failed = true;
+    resolveApprovalSend();
+    showControlToast('error', err?.message || 'Approval could not be sent — retry');
+  };
+  const sent = dispatchSessionControlMsg(msg, { onError: failSend });
+  if (sent === false) failSend(new Error('Approval could not be sent — no daemon connection; retry'));
 };
 window.sendHumanResponse = function() {
   const input = document.getElementById('human-input');
@@ -118,8 +133,13 @@ function updateStopButtonVisibility(phase) {
   if (!btn) return;
   const key = phaseKey(phase);
   const targetSessionId = resolvePromptTargetSessionId();
+  // Trust the phase the user is LOOKING at: the per-window activity flag
+  // can lag the banner (identity re-keying, optimistic-expiry) and hid
+  // Stop during live turns — an unusable interrupt affordance mid-turn is
+  // the worst failure mode this button has.
   const show = targetSessionId
-    ? isSessionWindowEffectivelyActive(targetSessionId) && sessionSupportsInterrupt(targetSessionId)
+    ? sessionSupportsInterrupt(targetSessionId)
+      && (isSessionWindowEffectivelyActive(targetSessionId) || isAgentActivePhase(key))
     : isAgentActivePhase(key);
   btn.style.display = show ? '' : 'none';
   // Only `interrupting` should show the disabled "Interrupting..." label.
@@ -195,23 +215,90 @@ function updateDisplayMetrics(d) {
 // declared in fragment 32 next to the display maps: earlier fragments
 // render against them at load time.)
 let displayPickerVisible = false;
+let displayPickerReturnFocus = null;
+let displayPickerPositionRaf = 0;
+let displayPickerDrawerModal = false;
 // Which action the open picker performs: 'share' (agent access) or
 // 'view' (private remote view; the agent cannot see the display).
 let displayPickerMode = 'share';
 var cachedDisplays = null;
 
-function hideDisplayPicker() {
+function hideDisplayPicker(restoreFocus = true) {
   const picker = document.getElementById('display-picker');
   picker.classList.remove('visible');
+  picker.setAttribute('aria-hidden', 'true');
   displayPickerVisible = false;
+  if (displayPickerDrawerModal) {
+    const rail = document.getElementById('ui2-live-rail');
+    const railOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    if (rail) {
+      rail.inert = !railOpen;
+      if (railOpen) rail.removeAttribute('aria-hidden');
+      else rail.setAttribute('aria-hidden', 'true');
+      rail.setAttribute('aria-modal', railOpen ? 'true' : 'false');
+    }
+    displayPickerDrawerModal = false;
+  }
+  const returnFocus = displayPickerReturnFocus;
+  displayPickerReturnFocus = null;
+  if (restoreFocus && returnFocus && returnFocus.isConnected &&
+      typeof returnFocus.focus === 'function' && !returnFocus.closest('[inert]')) {
+    returnFocus.focus();
+  }
+}
+
+function positionDisplayPicker() {
+  const picker = document.getElementById('display-picker');
+  if (!displayPickerVisible || picker.parentElement !== document.body) return;
+  const anchor = document.getElementById('ui2-live-yourscreen');
+  const rect = anchor ? anchor.getBoundingClientRect() : null;
+  const margin = 12;
+  const gap = 8;
+  const width = picker.offsetWidth;
+  const height = picker.offsetHeight;
+  picker.style.position = 'fixed';
+  picker.style.zIndex = '95';
+  picker.style.right = 'auto';
+  picker.style.transform = 'none';
+  if (rect && rect.width) {
+    const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+    const left = Math.min(Math.max(margin, rect.left), maxLeft);
+    let top = rect.bottom + gap;
+    if (top + height > window.innerHeight - margin && rect.top - height - gap >= margin) {
+      top = rect.top - height - gap;
+    }
+    const maxTop = Math.max(margin, window.innerHeight - height - margin);
+    picker.style.left = `${Math.round(left)}px`;
+    picker.style.top = `${Math.round(Math.min(Math.max(margin, top), maxTop))}px`;
+  } else {
+    picker.style.left = `${Math.round(Math.max(margin, (window.innerWidth - width) / 2))}px`;
+    picker.style.top = `${Math.round(Math.min(96, Math.max(margin, window.innerHeight - height - margin)))}px`;
+  }
+}
+
+function scheduleDisplayPickerPosition() {
+  if (!displayPickerVisible || displayPickerPositionRaf) return;
+  displayPickerPositionRaf = requestAnimationFrame(() => {
+    displayPickerPositionRaf = 0;
+    positionDisplayPicker();
+  });
 }
 
 function showDisplayPicker(displays, mode) {
   displayPickerMode = mode === 'view' ? 'view' : 'share';
   const picker = document.getElementById('display-picker');
+  displayPickerReturnFocus = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
   picker.innerHTML = '';
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-modal', 'false');
+  picker.setAttribute('aria-label', displayPickerMode === 'view'
+    ? 'Choose a screen for your private dashboard view'
+    : 'Choose a screen to share with the agent');
   for (const d of displays) {
-    const item = document.createElement('div');
+    const item = document.createElement('button');
+    item.type = 'button';
     item.className = 'display-picker-item';
     const label = d.name + ' (' + d.width + 'x' + d.height + ')';
     item.textContent = label;
@@ -228,7 +315,7 @@ function showDisplayPicker(displays, mode) {
     }
     item.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       if (!app) return;
       grantUserDisplayTarget(d, displayPickerMode !== 'view');
     });
@@ -237,13 +324,14 @@ function showDisplayPicker(displays, mode) {
   if (displayPickerMode !== 'view' && virtualDisplaysAvailableNow()) {
     // Virtual displays are agent workspaces — offering one from the
     // private "View this machine" flow would conflate the two concepts.
-    const createItem = document.createElement('div');
+    const createItem = document.createElement('button');
+    createItem.type = 'button';
     createItem.className = 'display-picker-item dp-action';
     createItem.textContent = 'New virtual display';
     createItem.title = 'Launch a virtual display (Xvfb) on the daemon host — no agent or API key needed.';
     createItem.addEventListener('click', (e) => {
       e.stopPropagation();
-      hideDisplayPicker();
+      hideDisplayPicker(true);
       createVirtualDisplay();
     });
     picker.appendChild(createItem);
@@ -257,24 +345,23 @@ function showDisplayPicker(displays, mode) {
     document.body.appendChild(picker);
   }
   if (picker.parentElement === document.body) {
-    const anchor = document.getElementById('ui2-live-yourscreen');
-    const rect = anchor ? anchor.getBoundingClientRect() : null;
-    picker.style.position = 'fixed';
-    picker.style.zIndex = '95';
-    if (rect && rect.width) {
-      picker.style.left = `${Math.round(rect.left)}px`;
-      picker.style.top = `${Math.round(rect.bottom + 8)}px`;
-      picker.style.right = 'auto';
-      picker.style.transform = 'none';
-    } else {
-      picker.style.left = '50%';
-      picker.style.top = '96px';
-      picker.style.right = 'auto';
-      picker.style.transform = 'translateX(-50%)';
+    const drawerOpen = document.getElementById('tab-displays')?.classList.contains('ui2-live-rail-open');
+    picker.setAttribute('aria-modal', drawerOpen ? 'true' : 'false');
+    displayPickerDrawerModal = Boolean(drawerOpen);
+    if (displayPickerDrawerModal) {
+      const rail = document.getElementById('ui2-live-rail');
+      if (rail) {
+        rail.inert = true;
+        rail.setAttribute('aria-hidden', 'true');
+        rail.setAttribute('aria-modal', 'false');
+      }
     }
   }
   picker.classList.add('visible');
+  picker.setAttribute('aria-hidden', 'false');
   displayPickerVisible = true;
+  positionDisplayPicker();
+  requestAnimationFrame(() => picker.querySelector('.display-picker-item')?.focus());
 }
 
 // Keyless "new virtual display": the daemon launches an Xvfb and registers
@@ -372,13 +459,31 @@ function shareUserDisplayWithAgent() {
 window.shareUserDisplayWithAgent = shareUserDisplayWithAgent;
 window.startUserDisplayGrantFlow = startUserDisplayGrantFlow;
 
+// Cycle reads the daemon-confirmed level (fragment 41 tracks it off status
+// frames / autonomy_changed echoes), not the DOM chip text; the optimistic
+// label reverts if no echo confirms within the window. Rapid clicks chain
+// off the pending guess so Low→…→Full still takes three clicks.
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
-  const el = document.getElementById('sb-autonomy');
-  const current = normalizeAutonomyLabel(el.textContent.trim());
+  const domLevel = document.getElementById('sb-autonomy')?.textContent?.trim() || '';
+  const current = normalizeAutonomyLabel(autonomyPendingLevel || lastConfirmedAutonomy || domLevel);
   const idx = levels.indexOf(current);
   const next = levels[(idx + 1) % levels.length];
-  updateStatusBar({ autonomy: next });
+  autonomyPendingLevel = next;
+  updateStatusBar({ autonomy: next }, { optimisticAutonomy: true });
+  if (autonomyRevertTimer) clearTimeout(autonomyRevertTimer);
+  autonomyRevertTimer = setTimeout(() => {
+    autonomyRevertTimer = null;
+    if (!autonomyPendingLevel) return;
+    autonomyPendingLevel = '';
+    // No echo arrived: paint back the last level the daemon actually
+    // reported (when we have one) and say so.
+    if (lastConfirmedAutonomy && lastConfirmedAutonomy !== normalizeAutonomyLabel(
+      document.getElementById('sb-autonomy')?.textContent?.trim() || '')) {
+      updateStatusBar({ autonomy: lastConfirmedAutonomy });
+      showControlToast('error', 'The daemon did not confirm the autonomy change');
+    }
+  }, 5000);
   dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
@@ -431,11 +536,35 @@ function setUserDisplayState(granted, agentVisible = true) {
 document.addEventListener('click', (e) => {
   if (!displayPickerVisible) return;
   const picker = document.getElementById('display-picker');
-  if (!picker.contains(e.target)) hideDisplayPicker();
+  if (!picker.contains(e.target)) hideDisplayPicker(false);
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && displayPickerVisible) hideDisplayPicker();
-});
+  if (!displayPickerVisible) return;
+  const picker = document.getElementById('display-picker');
+  if (e.key === 'Escape') {
+    // Capture owns the first Escape so annotation/callout/drawer layers
+    // underneath cannot consume the same keystroke.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    hideDisplayPicker(true);
+    return;
+  }
+  if (e.key !== 'Tab' || picker.getAttribute('aria-modal') !== 'true') return;
+  const focusable = Array.from(picker.querySelectorAll('button:not([disabled])'))
+    .filter(element => element.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !picker.contains(document.activeElement))) {
+    e.preventDefault();
+    first.focus();
+  }
+}, true);
+window.addEventListener('resize', scheduleDisplayPickerPosition);
+document.addEventListener('scroll', scheduleDisplayPickerPosition, true);
 
 // Rollback modal: Escape closes, click on the backdrop (outside the
 // dialog) also closes — follows the same dismissal pattern as the
@@ -562,7 +691,9 @@ document.getElementById('verbosity-select').addEventListener('change', (e) => {
 // Host filter (Activity tab)
 document.getElementById('host-filter-select').addEventListener('change', (e) => {
   activeHostFilter = e.target.value;
-  localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
+  // Guarded like the neighboring filter persistence: Safari private mode
+  // throws on setItem and would kill the handler before applying.
+  try { localStorage.setItem(HOST_FILTER_KEY, activeHostFilter); } catch (_) {}
   applyHostFilter();
 });
 
@@ -579,12 +710,12 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
   else window.location.href = accessHomeHref('daemons');
 });
 document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
-document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => routeTo('access', 'diagnostics'));
+document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => openConnectionDiagnostics());
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
-// endpoint is public by design (the document is the authorization); using
-// authedFetch keeps it working identically on the trusted paths.
+// HTTP row is public by design (the document is the authorization); the
+// facade rides the tunnel when one is bound and the public row otherwise.
 document.getElementById('access-org-join-btn')?.addEventListener('click', async () => {
   const status = document.getElementById('access-org-join-status');
   const raw = document.getElementById('access-org-join-doc')?.value?.trim();
@@ -602,7 +733,7 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
   const stored = orgGrantStore(doc);
   if (status) status.textContent = 'Presenting…';
   try {
-    const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
+    const data = await accessOrgCall('api_access_org_present', doc);
     const summary = data.peer_identity
       ? `peer profile ${data.peer_identity.profile} for ${data.peer_identity.label} until ${new Date(Number(data.peer_identity.expires_at_unix || 0) * 1000).toLocaleString()}`
       : `${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}`;

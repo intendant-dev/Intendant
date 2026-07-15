@@ -6,15 +6,45 @@
 //! as typed fragments (`.css` / `.js` / `.html`) under `static/app/`, in the
 //! order fixed by `static/app/manifest.txt`, and this crate concatenates them
 //! back into the tracked artifact. The transform is concatenation plus a
-//! generated-file header and one banner comment per fragment — nothing else:
-//! all JS fragments share the single `<script type="module">` scope exactly
-//! as they did in the monolith (the open/close tags live in tiny wrapper
-//! fragments), so hoisting and TDZ order are untouched by construction.
+//! generated-file header, one banner comment per fragment, and exactly two
+//! documented substitutions — the vault-kernel hash pin and the build stamp
+//! (both below) — nothing
+//! else: all JS fragments share the single `<script type="module">` scope
+//! exactly as they did in the monolith (the open/close tags live in tiny
+//! wrapper fragments), so hoisting and TDZ order are untouched by
+//! construction.
+//!
+//! **The vault-kernel hash pin.** `static/vault-kernel.js` is the vault's
+//! crypto kernel: a small, separately served worker that owns the vault key
+//! material, so the code the keys depend on stays one auditable file rather
+//! than the whole bundle. The page refuses to instantiate a kernel it
+//! cannot verify, and the reference it verifies against is minted here: any
+//! fragment may carry the placeholder [`VAULT_KERNEL_HASH_TOKEN`], and
+//! assembly replaces every occurrence with the lowercase-hex sha256 of the
+//! kernel file's exact bytes (deterministic, so the regen gate still
+//! settles). Fail-closed: a placeholder with no kernel file to hash is an
+//! assembly error. A daemon-side parity test
+//! (`web_gateway/static_assets.rs`) recomputes the hash and asserts the
+//! assembled artifact pins it, so editing the kernel without regenerating
+//! app.html fails the suite.
+//!
+//! **The build stamp.** Any fragment may carry [`APP_BUILD_TOKEN`], and
+//! assembly replaces every occurrence with the first 16 lowercase-hex chars
+//! of the sha256 over the *raw* fragment bytes in manifest order (raw =
+//! placeholders un-substituted, so the stamp is well-defined and
+//! deterministic — the regen gate settles). The daemon extracts the stamp
+//! from its embedded artifact and serves it in `/config`; a dashboard tab
+//! whose own stamp differs is from an older served bundle and nudges itself
+//! to reload (`31-init-identity-fleet.js` declares
+//! `const INTENDANT_APP_BUILD = '__INTENDANT_APP_BUILD__'`). A daemon-side
+//! parity test (`web_gateway/static_assets.rs`) asserts the shipped artifact
+//! carries a minted stamp, never the placeholder.
 //!
 //! Fail-closed: any mismatch between the manifest and the fragment directory
 //! is an error, never a silently dropped fragment — a stale or partial
 //! artifact would ship a stale dashboard inside the daemon binary.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +56,19 @@ pub const FRAGMENT_DIR: &str = "static/app";
 pub const MANIFEST_NAME: &str = "manifest.txt";
 /// The generated artifact, relative to the repo root.
 pub const OUTPUT: &str = "static/app.html";
+/// The vault crypto kernel, relative to the repo root — a standalone,
+/// separately served artifact (NOT a fragment) whose sha256 is pinned into
+/// the assembled bundle. See "The vault-kernel hash pin" in the crate docs.
+pub const VAULT_KERNEL_PATH: &str = "static/vault-kernel.js";
+/// Placeholder fragments carry where the kernel's lowercase-hex sha256 is
+/// substituted at assembly time (`32-vault-custody.js` declares
+/// `const VAULT_KERNEL_SHA256 = '__VAULT_KERNEL_SHA256__'`).
+pub const VAULT_KERNEL_HASH_TOKEN: &str = "__VAULT_KERNEL_SHA256__";
+/// Placeholder any fragment may carry where the build stamp — the first 16
+/// lowercase-hex chars of the sha256 over the raw manifest-ordered fragment
+/// bytes — is substituted at assembly time. See "The build stamp" in the
+/// crate docs.
+pub const APP_BUILD_TOKEN: &str = "__INTENDANT_APP_BUILD__";
 
 /// Extensions that count as fragments. Anything else in the directory
 /// (README.md, the manifest itself) is ignored by the completeness check;
@@ -96,18 +139,69 @@ pub fn assemble(repo_root: &Path) -> Result<Outcome, String> {
     let entries = parse_manifest(&manifest)?;
     validate_completeness(&entries, &fragment_dir)?;
 
-    let mut assembled: Vec<u8> = Vec::new();
-    assembled.extend_from_slice(GENERATED_HEADER.as_bytes());
-    // All .js fragments share one <script type="module"> scope in manifest
-    // order; lint them (below) as the single program they become.
-    let mut js_fragments: Vec<(String, String)> = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if let Some(banner) = fragment_banner(entry, index) {
-            assembled.extend_from_slice(banner.as_bytes());
-        }
+    // The vault-kernel hash pin (crate docs): computed lazily on the first
+    // fragment that carries the placeholder, so fragment sets without a pin
+    // (tests, pre-kernel checkouts) never require the kernel file.
+    let mut kernel_hash: Option<String> = None;
+
+    // The build stamp (crate docs): sha256 over the raw fragment bytes in
+    // manifest order, before any substitution — deterministic across
+    // machines and self-consistent (the stamped artifact still hashes the
+    // placeholder form). Fragments are pre-read once and reused below.
+    let mut fragment_bytes: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let mut build_hasher = Sha256::new();
+    for entry in &entries {
         let path = fragment_dir.join(entry);
         let bytes = fs::read(&path)
             .map_err(|e| format!("failed to read fragment {}: {e}", path.display()))?;
+        build_hasher.update(&bytes);
+        fragment_bytes.push(bytes);
+    }
+    let build_stamp = {
+        let mut hex = String::with_capacity(64);
+        for byte in build_hasher.finalize() {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex.truncate(16);
+        hex
+    };
+
+    let mut assembled: Vec<u8> = Vec::new();
+    assembled.extend_from_slice(GENERATED_HEADER.as_bytes());
+    // All .js fragments share one <script type="module"> scope in manifest
+    // order; lint them (below) as the single program they become — with the
+    // pin already substituted, exactly as the browser will evaluate it.
+    let mut js_fragments: Vec<(String, String)> = Vec::new();
+    for (index, (entry, raw)) in entries.iter().zip(fragment_bytes).enumerate() {
+        if let Some(banner) = fragment_banner(entry, index) {
+            assembled.extend_from_slice(banner.as_bytes());
+        }
+        let mut bytes = raw;
+        if find_subslice(&bytes, APP_BUILD_TOKEN.as_bytes()).is_some() {
+            bytes = replace_subslice(&bytes, APP_BUILD_TOKEN.as_bytes(), build_stamp.as_bytes());
+        }
+        if find_subslice(&bytes, VAULT_KERNEL_HASH_TOKEN.as_bytes()).is_some() {
+            if kernel_hash.is_none() {
+                let kernel_path = repo_root.join(VAULT_KERNEL_PATH);
+                let kernel_bytes = fs::read(&kernel_path).map_err(|e| {
+                    format!(
+                        "fragment {entry} pins the vault-kernel hash \
+                         ({VAULT_KERNEL_HASH_TOKEN}) but {VAULT_KERNEL_PATH} is unreadable: {e} \
+                         — the kernel file must exist so the pin can be minted"
+                    )
+                })?;
+                let mut hex = String::with_capacity(64);
+                for byte in Sha256::digest(&kernel_bytes) {
+                    hex.push_str(&format!("{byte:02x}"));
+                }
+                kernel_hash = Some(hex);
+            }
+            bytes = replace_subslice(
+                &bytes,
+                VAULT_KERNEL_HASH_TOKEN.as_bytes(),
+                kernel_hash.as_deref().unwrap_or_default().as_bytes(),
+            );
+        }
         if entry.ends_with(".js") {
             js_fragments.push((
                 format!("{FRAGMENT_DIR}/{entry}"),
@@ -132,6 +226,28 @@ pub fn assemble(repo_root: &Path) -> Result<Outcome, String> {
         fragments: entries.len(),
         bytes: assembled.len(),
     })
+}
+
+/// First byte offset of `needle` in `haystack`, if any. Byte-level so the
+/// substitution never cares about fragment encodings.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Replace every occurrence of `needle` with `replacement`.
+fn replace_subslice(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(idx) = find_subslice(rest, needle) {
+        out.extend_from_slice(&rest[..idx]);
+        out.extend_from_slice(replacement);
+        rest = &rest[idx + needle.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
 }
 
 /// Parse manifest text into ordered fragment paths (relative to the fragment
@@ -281,19 +397,31 @@ mod tests {
         let bytes = expected.len();
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes })
+            Ok(Outcome::Written {
+                fragments: 3,
+                bytes
+            })
         );
-        assert_eq!(fs::read_to_string(dir.path().join(OUTPUT)).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(OUTPUT)).unwrap(),
+            expected
+        );
         // Second run: byte-identical, no rewrite.
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Unchanged { fragments: 3, bytes })
+            Ok(Outcome::Unchanged {
+                fragments: 3,
+                bytes
+            })
         );
         // A hand-edit to the artifact is overwritten by fragment truth.
         write(dir.path(), OUTPUT, "hand edit");
         assert_eq!(
             assemble(dir.path()),
-            Ok(Outcome::Written { fragments: 3, bytes })
+            Ok(Outcome::Written {
+                fragments: 3,
+                bytes
+            })
         );
     }
 
@@ -339,7 +467,10 @@ mod tests {
         write(dir.path(), "static/app/10-b.css", "B\n");
         write(dir.path(), "static/app/manifest.txt", "00-a.html\n");
         let err = assemble(dir.path()).unwrap_err();
-        assert!(err.contains("not listed") && err.contains("10-b.css"), "{err}");
+        assert!(
+            err.contains("not listed") && err.contains("10-b.css"),
+            "{err}"
+        );
 
         write(
             dir.path(),
@@ -347,7 +478,44 @@ mod tests {
             "00-a.html\n10-b.css\n90-gone.js\n",
         );
         let err = assemble(dir.path()).unwrap_err();
-        assert!(err.contains("do not exist") && err.contains("90-gone.js"), "{err}");
+        assert!(
+            err.contains("do not exist") && err.contains("90-gone.js"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_stamp_substitutes_and_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "static/app/00-a.js",
+            "const INTENDANT_APP_BUILD = '__INTENDANT_APP_BUILD__';\n",
+        );
+        write(dir.path(), "static/app/manifest.txt", "00-a.js\n");
+        assemble(dir.path()).unwrap();
+        let out = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
+        assert!(
+            !out.contains(APP_BUILD_TOKEN),
+            "placeholder must be substituted"
+        );
+        let stamp1 = out.split("INTENDANT_APP_BUILD = '").nth(1).unwrap()[..16].to_string();
+        assert!(stamp1.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Settles: a rerun is byte-identical.
+        assert!(matches!(
+            assemble(dir.path()).unwrap(),
+            Outcome::Unchanged { .. }
+        ));
+        // Any fragment edit mints a different stamp.
+        write(
+            dir.path(),
+            "static/app/00-a.js",
+            "const INTENDANT_APP_BUILD = '__INTENDANT_APP_BUILD__'; // v2\n",
+        );
+        assemble(dir.path()).unwrap();
+        let out2 = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
+        let stamp2 = out2.split("INTENDANT_APP_BUILD = '").nth(1).unwrap()[..16].to_string();
+        assert_ne!(stamp1, stamp2);
     }
 
     #[test]
@@ -357,8 +525,16 @@ mod tests {
         // fragment's `let` must fail assembly, not ship a dashboard that
         // dies at module evaluation.
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "static/app/30-open.html", "<script type=\"module\">\n");
-        write(dir.path(), "static/app/40-a.js", "if (laterFlag) { console.log(1); }\n");
+        write(
+            dir.path(),
+            "static/app/30-open.html",
+            "<script type=\"module\">\n",
+        );
+        write(
+            dir.path(),
+            "static/app/40-a.js",
+            "if (laterFlag) { console.log(1); }\n",
+        );
         write(dir.path(), "static/app/50-b.js", "let laterFlag = true;\n");
         write(dir.path(), "static/app/59-close.html", "</script>\n");
         write(
@@ -381,8 +557,87 @@ mod tests {
             "static/app/40-a.js",
             "let laterFlag = true;\nif (laterFlag) { console.log(1); }\n",
         );
-        write(dir.path(), "static/app/50-b.js", "console.log(laterFlag);\n");
+        write(
+            dir.path(),
+            "static/app/50-b.js",
+            "console.log(laterFlag);\n",
+        );
         assemble(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn vault_kernel_hash_pin_substitutes_and_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "static/vault-kernel.js",
+            "self.onmessage = () => {};\n",
+        );
+        write(
+            dir.path(),
+            "static/app/30-a.js",
+            "const VAULT_KERNEL_SHA256 = '__VAULT_KERNEL_SHA256__';\n",
+        );
+        write(dir.path(), "static/app/manifest.txt", "30-a.js\n");
+        assemble(dir.path()).unwrap();
+        let out = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
+        // sha256("self.onmessage = () => {};\n"), lowercase hex.
+        let expected = {
+            let mut hex = String::new();
+            for byte in Sha256::digest("self.onmessage = () => {};\n".as_bytes()) {
+                hex.push_str(&format!("{byte:02x}"));
+            }
+            hex
+        };
+        assert!(
+            out.contains(&format!("const VAULT_KERNEL_SHA256 = '{expected}';")),
+            "assembled artifact must pin the kernel hash: {out}"
+        );
+        assert!(
+            !out.contains(VAULT_KERNEL_HASH_TOKEN),
+            "no placeholder may survive assembly"
+        );
+        // Deterministic: a second run settles (no rewrite churn).
+        assert!(matches!(
+            assemble(dir.path()),
+            Ok(Outcome::Unchanged { .. })
+        ));
+        // A kernel edit changes the pin on the next assembly.
+        write(
+            dir.path(),
+            "static/vault-kernel.js",
+            "self.onmessage = null;\n",
+        );
+        assert!(matches!(assemble(dir.path()), Ok(Outcome::Written { .. })));
+        let out = fs::read_to_string(dir.path().join(OUTPUT)).unwrap();
+        assert!(
+            !out.contains(&expected),
+            "stale pin must not survive a kernel edit"
+        );
+    }
+
+    #[test]
+    fn vault_kernel_pin_without_kernel_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "static/app/30-a.js",
+            "const VAULT_KERNEL_SHA256 = '__VAULT_KERNEL_SHA256__';\n",
+        );
+        write(dir.path(), "static/app/manifest.txt", "30-a.js\n");
+        let err = assemble(dir.path()).unwrap_err();
+        assert!(err.contains("vault-kernel"), "{err}");
+        assert!(err.contains("30-a.js"), "{err}");
+        assert!(!dir.path().join(OUTPUT).exists());
+    }
+
+    #[test]
+    fn replace_subslice_handles_multiple_and_absent_needles() {
+        assert_eq!(replace_subslice(b"a__T__b__T__c", b"__T__", b"X"), b"aXbXc");
+        assert_eq!(replace_subslice(b"abc", b"__T__", b"X"), b"abc");
+        assert_eq!(find_subslice(b"abc", b""), None);
+        assert_eq!(find_subslice(b"ab", b"abc"), None);
+        assert_eq!(find_subslice(b"xabc", b"abc"), Some(1));
     }
 
     #[test]

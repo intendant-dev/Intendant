@@ -47,15 +47,12 @@ impl SessionSupervisor {
         } else {
             backend_session_id.as_deref().unwrap_or(&session_id)
         };
-        let result = match dirs::home_dir() {
-            Some(home) => crate::session_names::rename_session(
-                &home,
-                &normalized_source,
-                persistence_session_id,
-                &name,
-            ),
-            None => Err("could not resolve home directory".to_string()),
-        };
+        let result = crate::session_names::rename_session(
+            &self.logs_home(),
+            &normalized_source,
+            persistence_session_id,
+            &name,
+        );
 
         match result {
             Ok(name) => {
@@ -430,7 +427,13 @@ impl SessionSupervisor {
         };
 
         if let Some(name) = name_to_persist {
-            persist_external_session_name(&self.config.bus, &source, &backend_session_id, &name);
+            persist_external_session_name(
+                &self.logs_home(),
+                &self.config.bus,
+                &source,
+                &backend_session_id,
+                &name,
+            );
         }
     }
 }
@@ -524,6 +527,9 @@ impl LaunchOverrides {
             // switch models mid-session, so configure/restart never carries
             // one and the persisted pin must survive untouched.
             codex_model: None,
+            // Same launch-time pin policy as the model: configure/restart
+            // preserves the persisted effort selected when the session began.
+            codex_reasoning_effort: None,
             codex_sandbox: self.codex_sandbox.as_deref(),
             codex_approval_policy: self.codex_approval_policy.as_deref(),
             codex_managed_context: self.codex_managed_context.as_deref(),
@@ -664,6 +670,31 @@ pub(crate) fn apply_session_codex_model(
     }
 }
 
+pub(crate) fn apply_session_codex_reasoning_effort(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    effort: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            let normalized = crate::project::normalize_reasoning_effort(Some(&effort))
+                .ok_or_else(|| format!("unsupported Codex reasoning effort: {effort}"))?;
+            if let Some(model) = project.config.agent.codex.model.as_deref() {
+                if let Some(entry) = crate::project::codex_model_catalog_entry(model) {
+                    if !entry.reasoning_efforts.contains(&normalized.as_str()) {
+                        return Err(format!(
+                            "Codex model {model} does not support reasoning effort {normalized}"
+                        ));
+                    }
+                }
+            }
+            project.config.agent.codex.reasoning_effort = Some(normalized);
+            Ok(())
+        }
+        _ => Err("codex_reasoning_effort requires Codex".to_string()),
+    }
+}
+
 pub(crate) fn apply_session_codex_sandbox(
     project: &mut Project,
     backend: &external_agent::AgentBackend,
@@ -708,6 +739,12 @@ pub(crate) fn apply_session_codex_context_archive(
     }
 }
 
+/// Rebuild the effective per-session config from the project, re-applying
+/// the per-session facts a project can never supply. This enumerates fields
+/// by hand (the pin policy): when adding a `SessionAgentConfig` field that
+/// isn't project-derivable, extend BOTH `merge_missing_from` and this
+/// copy-over, plus the preservation test below — a field missed here
+/// silently reverts to the project default on the rebuild.
 pub(crate) fn effective_session_agent_config_from_project(
     backend: &external_agent::AgentBackend,
     project: &Project,
@@ -729,18 +766,28 @@ pub(crate) fn effective_session_agent_config_from_project(
         if overrides.forked_from.is_some() {
             config.forked_from = overrides.forked_from.clone();
         }
+        // The lineage KIND rides with it (side conversations emit `side`
+        // instead of `fork` at the child's identity upgrade) — verified
+        // live: dropping it here relabeled a /btw child as a plain fork.
+        if overrides.fork_relationship.is_some() {
+            config.fork_relationship = overrides.fork_relationship.clone();
+        }
     }
     config
 }
 
-pub(crate) fn persist_external_session_name(bus: &EventBus, source: &str, session_id: &str, name: &str) {
+pub(crate) fn persist_external_session_name(
+    home: &std::path::Path,
+    bus: &EventBus,
+    source: &str,
+    session_id: &str,
+    name: &str,
+) {
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" || name.trim().is_empty() {
         return;
     }
-    let result = dirs::home_dir()
-        .ok_or_else(|| "could not resolve home directory".to_string())
-        .and_then(|home| crate::session_names::rename_session(&home, &source, session_id, name));
+    let result = crate::session_names::rename_session(home, &source, session_id, name);
     if let Err(message) = result {
         bus.send(AppEvent::LogEntry {
             session_id: Some(session_id.to_string()),
@@ -756,6 +803,29 @@ pub(crate) fn persist_external_session_name(bus: &EventBus, source: &str, sessio
 mod tests {
     use super::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    #[test]
+    fn effective_config_preserves_fork_lineage_and_kind() {
+        // The effective config is rebuilt from project defaults; fork
+        // lineage (parent id + relationship kind) must survive the rebuild
+        // or a /btw child re-labels as a plain fork (caught live).
+        let project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: Default::default(),
+        };
+        let overrides = crate::session_config::SessionAgentConfig {
+            forked_from: Some("parent-native".to_string()),
+            fork_relationship: Some("side".to_string()),
+            ..Default::default()
+        };
+        let config = effective_session_agent_config_from_project(
+            &external_agent::AgentBackend::ClaudeCode,
+            &project,
+            Some(&overrides),
+        );
+        assert_eq!(config.forked_from.as_deref(), Some("parent-native"));
+        assert_eq!(config.fork_relationship.as_deref(), Some("side"));
+    }
 
     #[tokio::test]
     async fn external_identity_moves_wrapper_session_to_backend_id() {
@@ -1033,9 +1103,8 @@ mod tests {
             ..Default::default()
         };
         // The claude configure path: fields normalize into pins.
-        let config = crate::session_config::from_wire_fields(
-            overrides.as_wire_fields("claude-code"),
-        );
+        let config =
+            crate::session_config::from_wire_fields(overrides.as_wire_fields("claude-code"));
         assert_eq!(config.agent_command.as_deref(), Some("/tmp/claude"));
         assert_eq!(config.claude_model.as_deref(), Some("sonnet"));
         assert_eq!(config.claude_permission_mode.as_deref(), Some("plan"));
@@ -1045,9 +1114,7 @@ mod tests {
         );
         assert_eq!(config.claude_effort.as_deref(), Some("high"));
         // The same overrides against a codex session never leak claude pins.
-        let cross = crate::session_config::from_wire_fields(
-            overrides.as_wire_fields("codex"),
-        );
+        let cross = crate::session_config::from_wire_fields(overrides.as_wire_fields("codex"));
         assert!(cross.claude_model.is_none());
         assert!(cross.claude_permission_mode.is_none());
         assert!(cross.claude_allowed_tools.is_none());
@@ -1098,6 +1165,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("requires Codex"));
+    }
+
+    #[test]
+    fn rejects_reasoning_effort_incompatible_with_catalog_model() {
+        let mut project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: crate::project::ProjectConfig::default(),
+        };
+        project.config.agent.codex.model = Some("gpt-5.6-luna".to_string());
+
+        let err = apply_session_codex_reasoning_effort(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "ultra".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("gpt-5.6-luna"));
+        assert!(err.contains("ultra"));
+
+        apply_session_codex_reasoning_effort(
+            &mut project,
+            &external_agent::AgentBackend::Codex,
+            "max".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            project.config.agent.codex.reasoning_effort.as_deref(),
+            Some("max")
+        );
     }
 
     #[test]

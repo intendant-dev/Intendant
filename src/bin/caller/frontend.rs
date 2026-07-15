@@ -51,6 +51,11 @@ pub struct ModelUsageSnapshot {
     /// Cumulative cached tokens (subset of prompt_tokens, cheaper pricing).
     #[serde(default)]
     pub cached_tokens: u64,
+    /// Cumulative cache-write tokens (subset of prompt_tokens, charged at
+    /// the provider's cache-write rate). GPT-5.6+ and Anthropic expose this
+    /// separately from cache reads.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     /// Latest request's prompt-cache sample (reads / writes / uncached
     /// input) — feeds the cache-vitals hit receipt. All-zero when the
     /// backend reports no per-request split.
@@ -288,4 +293,3 @@ pub fn log_level_to_str(level: &LogLevel) -> &'static str {
         LogLevel::Debug => "debug",
     }
 }
-

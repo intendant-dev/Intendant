@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for release-signed Intendant.app builds
+  (scripts/bundle-macos.sh applies this file to the wrapper bundle AND the
+  embedded intendant-bin / intendant-runtime executables when
+  INTENDANT_SIGN_IDENTITY is set; local-dev builds don't use it).
+
+  This is the minimal set for a hardened-runtime app; keep each key paired
+  with the code that needs it, and delete the key if that code goes away.
+
+  Deliberately absent:
+  - com.apple.security.cs.allow-jit / allow-unsigned-executable-memory:
+    WKWebView on macOS runs JavaScript in Apple's out-of-process WebContent
+    XPC services, which have their own JIT entitlements — the host app needs
+    none, and the Rust daemon does no JIT.
+  - com.apple.security.cs.disable-library-validation: unnecessary because
+    bundle-macos.sh copies every non-system dylib (today: libvpx) into
+    Contents/Frameworks and re-signs it with the same identity.
+  - com.apple.security.network.client / .server: those are App Sandbox keys;
+    this app does not adopt the App Sandbox (it exists to run a daemon that
+    spawns arbitrary tools), and the hardened runtime does not gate network.
+  - Screen Recording / Accessibility: TCC permissions granted by the user at
+    runtime, not entitlements.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Microphone. Live voice: getUserMedia({audio}) in the dashboard
+         WKWebView (static/app/36-voice-wasm-init.js), plus the daemon's own
+         audio capture paths (transcription, live audio). The hardened
+         runtime denies audio input outright — no TCC prompt — without this.
+         Pairs with NSMicrophoneUsageDescription in Info.plist. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <!-- Camera. Dashboard video input to the presence layer
+         (startVideo() in static/app/36-voice-wasm-init.js). Pairs with
+         NSCameraUsageDescription. -->
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <!-- Apple Events. The daemon shells out to osascript (image clipboard in
+         crates/intendant-display/src/clipboard.rs, system-control paths); a
+         hardened-runtime process tree cannot send Apple Events without this.
+         Pairs with NSAppleEventsUsageDescription. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+</dict>
+</plist>

@@ -180,10 +180,8 @@ pub(crate) fn mcp_context_from_request_line(
             "managed_context" => {
                 managed_context = Some(crate::project::codex_managed_context_enabled(value));
             }
-            "tool_profile" | "tools" | "toolset" | "toolsets" => {
-                if !value.trim().is_empty() {
-                    tool_profile = Some(percent_decode_query_value(value));
-                }
+            "tool_profile" | "tools" | "toolset" | "toolsets" if !value.trim().is_empty() => {
+                tool_profile = Some(percent_decode_query_value(value));
             }
             _ => {}
         }
@@ -501,7 +499,7 @@ pub(crate) async fn handle_mcp_stream(mut stream: DemuxStream, header_text: &str
 /// 3. **Browser pages**: requests carrying browser origin markers must come
 ///    from this daemon's own origin (or the app bundle scheme) and then
 ///    bind exactly like any dashboard HTTP request (mTLS certificate
-///    principal or trusted-transport root). Foreign origins are refused —
+///    principal or trusted-local root). Foreign origins are refused —
 ///    the same posture as the rest of `/api/*`.
 /// 4. **mTLS client certificates** bind to their IAM principal.
 /// 5. **Tokenless loopback** processes bind to the `local_process`

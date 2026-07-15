@@ -473,6 +473,51 @@ pub(crate) fn report_user_display_capture_unavailable(
     bus.send(AppEvent::DisplayCaptureLost { display_id, reason });
 }
 
+/// Arm the synthetic display backend when — and only when — the headless
+/// test rig asked for it AND the scripted mock provider is the explicitly
+/// selected provider.
+///
+/// `INTENDANT_MOCK_DISPLAY=synthetic` mirrors the mock provider's own
+/// gating (`PROVIDER=mock` is never auto-selected — see
+/// `provider::select_provider`): it is a test-rig knob, so it fails closed.
+/// A stray or planted env var on a real-provider daemon must never be able
+/// to swap real capture for a fake source, and an unrecognized value must
+/// never half-arm anything — both cases log and change nothing. Called once
+/// from the startup prologue, after `.env` loading and the `--provider`
+/// flag override, before any display machinery exists (the Windows
+/// user-display auto-activation at daemon startup included).
+///
+/// While armed, `display::enumerate_displays` serves the synthetic list and
+/// [`activate_user_display`] constructs [`display::synthetic::SyntheticBackend`]
+/// sessions — no native capture API (ScreenCaptureKit, GDI/DXGI, Media
+/// Foundation, X11, Wayland/PipeWire) is touched anywhere in the process.
+pub(crate) fn arm_synthetic_display_if_requested() {
+    let Ok(value) = std::env::var("INTENDANT_MOCK_DISPLAY") else {
+        return;
+    };
+    if !value.eq_ignore_ascii_case("synthetic") {
+        eprintln!(
+            "[display] INTENDANT_MOCK_DISPLAY={value:?} is not a recognized mode \
+             (expected \"synthetic\"); ignoring"
+        );
+        return;
+    }
+    if std::env::var("PROVIDER").as_deref() != Ok("mock") {
+        eprintln!(
+            "[display] INTENDANT_MOCK_DISPLAY=synthetic ignored: PROVIDER=mock is not \
+             active (the synthetic display backend is a mock-provider test rig and \
+             fails closed without it)"
+        );
+        return;
+    }
+    eprintln!(
+        "[display] synthetic display backend armed (PROVIDER=mock + \
+         INTENDANT_MOCK_DISPLAY=synthetic): display enumeration and capture are \
+         synthetic; no OS capture API will be touched"
+    );
+    display::synthetic::arm();
+}
+
 /// Handle user display grant: create a `DisplaySession` and emit
 /// `DisplayReady` for the selected user display.
 ///
@@ -521,6 +566,42 @@ pub(crate) async fn activate_user_display(
             width,
             height,
             agent_visible: session.agent_visible(),
+        });
+        return;
+    }
+
+    // Synthetic display mode (headless test rigs): serve every activation —
+    // any display id, every platform — from the deterministic synthetic
+    // backend and never reach a platform arm below. Armed only by
+    // [`arm_synthetic_display_if_requested`]'s fail-closed gate.
+    if display::synthetic::armed() {
+        let backend = display::synthetic::SyntheticBackend::new();
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        session.set_agent_visible(agent_visible);
+        if let Err(e) = session
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
+            report_user_display_capture_unavailable(
+                bus,
+                display_id,
+                format!("synthetic display session failed: {e}"),
+            );
+            return;
+        }
+        let (width, height) = session.resolution();
+        let session = Arc::new(session);
+        session.spawn_metrics_logger(Some(display_event_forwarder(bus.clone())));
+        session_registry.write().await.insert(display_id, session);
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+            agent_visible,
         });
         return;
     }
@@ -789,8 +870,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -835,8 +921,13 @@ pub(crate) async fn activate_user_display(
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         session.set_agent_visible(agent_visible);
         if let Err(e) = session
-            .start(30, frame_registry, Some(display_event_forwarder(bus.clone())))
-            .await {
+            .start(
+                30,
+                frame_registry,
+                Some(display_event_forwarder(bus.clone())),
+            )
+            .await
+        {
             report_user_display_capture_unavailable(
                 bus,
                 display_id,
@@ -899,7 +990,7 @@ pub(crate) fn frame_has_visible_rgb(frame: &display::Frame) -> bool {
     for y in 0..frame.height as usize {
         let row = y * stride;
         for x in 0..frame.width as usize {
-            if pixel_index % step == 0 {
+            if pixel_index.is_multiple_of(step) {
                 let px = row + x * 4;
                 if frame.data[px] > 3 || frame.data[px + 1] > 3 || frame.data[px + 2] > 3 {
                     return true;
@@ -960,13 +1051,14 @@ pub(crate) fn detect_wayland_socket() -> Option<String> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Match "wayland-0", "wayland-1", etc. but not ".lock" files
-        if name.starts_with("wayland-") && !name.ends_with(".lock") {
-            if entry.file_type().ok().is_some_and(|ft| {
+        if name.starts_with("wayland-")
+            && !name.ends_with(".lock")
+            && entry.file_type().ok().is_some_and(|ft| {
                 use std::os::unix::fs::FileTypeExt;
                 ft.is_socket() || ft.is_file()
-            }) {
-                return Some(name.to_string());
-            }
+            })
+        {
+            return Some(name.to_string());
         }
     }
     None
@@ -1032,7 +1124,7 @@ pub(crate) const CU_TASK_MAX_TURNS: usize = 20;
 /// Result of an ephemeral CU task.
 pub(crate) enum CuTaskResult {
     /// Task completed by the CU agent.
-    Completed(LoopStats),
+    Completed(Box<LoopStats>),
     /// CU agent determined this isn't a display task; escalate to the full agent.
     Escalate { task: String },
 }
@@ -1065,6 +1157,10 @@ pub(crate) async fn run_cu_task(
 
     let display_target =
         target_override.unwrap_or_else(|| resolve_cu_display_target(user_display_granted));
+
+    // Live action-visualization lane for the dashboard (ephemeral events;
+    // the session log below stays the durable trace).
+    let cu_observer = computer_use::CuActionObserver::new(bus.clone(), session_log_id(session_log));
 
     // CU-first system prompt: handle display tasks or escalate
     let system_prompt =
@@ -1102,6 +1198,7 @@ pub(crate) async fn run_cu_task(
     // Inject reference frames
     if !reference_images.is_empty() {
         conv.add_user_with_images(
+            MessageProvenance::SystemInjection,
             "The user was looking at this screen when they made their request:".to_string(),
             reference_images,
         );
@@ -1112,12 +1209,16 @@ pub(crate) async fn run_cu_task(
 
     // Inject context images
     if !context_images.is_empty() {
-        conv.add_user_with_images("Additional context:".to_string(), context_images);
+        conv.add_user_with_images(
+            MessageProvenance::SystemInjection,
+            "Additional context:".to_string(),
+            context_images,
+        );
         conv.add_assistant("Noted.".to_string());
     }
 
     // Add the task
-    conv.add_user(task.to_string());
+    conv.add_user(MessageProvenance::Task, task.to_string());
 
     slog(session_log, |l| {
         l.cu_task_start(
@@ -1291,7 +1392,9 @@ pub(crate) async fn run_cu_task(
                     ))
                 });
 
-                let results = computer_use::execute_actions(
+                // Provider CU protocols expect a screenshot in every result:
+                // the native loop always observes with pixels.
+                let outcome = computer_use::execute_actions(
                     &cu_call.actions,
                     display_target,
                     backend,
@@ -1300,17 +1403,17 @@ pub(crate) async fn run_cu_task(
                     &session_registry,
                     None,
                     user_display_granted,
+                    Some(&cu_observer),
+                    computer_use::CuExecOptions::default(),
                 )
                 .await;
 
-                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-                let output = if results.iter().all(|r| r.success) {
-                    "Actions executed successfully.".to_string()
-                } else {
-                    let errors: Vec<&str> =
-                        results.iter().filter_map(|r| r.error.as_deref()).collect();
-                    format!("Some actions failed: {}", errors.join("; "))
-                };
+                let last_screenshot = outcome.last_screenshot();
+                let output =
+                    computer_use::summarize_results_for_model(&cu_call.actions, &outcome.results);
+                slog(session_log, |l| {
+                    l.info(&format!("CU batch: {}", outcome.metrics_line()))
+                });
 
                 if let Some(screenshot) = last_screenshot {
                     let images = vec![conversation::ImageData {
@@ -1341,7 +1444,7 @@ pub(crate) async fn run_cu_task(
         }
     }
 
-    Ok(CuTaskResult::Completed(stats))
+    Ok(CuTaskResult::Completed(Box::new(stats)))
 }
 
 /// Execute native computer-use tool calls via the platform-native executor
@@ -1386,22 +1489,31 @@ pub(crate) async fn handle_shared_view_calls(
             ))
         });
 
-        let resolved_target = mcp::shared_view_display_target(display_target, None);
-        let display_id = mcp::shared_view_display_id(resolved_target.as_deref(), None);
-        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
-
         // The user's own screen is an explicit opt-in path: require the
         // existing display grant instead of flipping it from a tool call.
         // Only display-exposing verbs gate — focus/input/hide operate on
-        // whatever view is already shown.
+        // whatever view is already shown. The cleanup verbs (hide,
+        // focus_clear) never auto-resolve a display: they retract
+        // presentation state wherever it is.
         let user_display_granted = autonomy.read().await.user_display_granted;
+        let resolved =
+            mcp::resolve_concrete_shared_view_target(display_target, None).or_else(|| {
+                if matches!(action, "hide" | "focus_clear") {
+                    None
+                } else {
+                    Some(mcp::concrete_shared_view_target(resolve_cu_display_target(
+                        user_display_granted,
+                    )))
+                }
+            });
+        let resolved_target = resolved.as_ref().map(|(target, _)| target.clone());
+        let display_id = resolved.map(|(_, id)| id);
+        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
+
         let effective_user_display = match display_id {
             Some(0) => true,
             Some(_) => false,
-            None => matches!(
-                resolve_cu_display_target(user_display_granted),
-                computer_use::DisplayTarget::UserSession
-            ),
+            None => false,
         };
         if matches!(action, "show" | "capture") && effective_user_display && !user_display_granted {
             conversation.add_tool_result(
@@ -1466,7 +1578,9 @@ pub(crate) async fn handle_shared_view_calls(
                 let screenshot_dir = log_dir.join("screenshots");
                 let _ = std::fs::create_dir_all(&screenshot_dir);
                 let registry = session_registry.cloned();
-                let results = computer_use::execute_actions(
+                let capture_observer =
+                    computer_use::CuActionObserver::new(bus.clone(), session_id.clone());
+                let outcome = computer_use::execute_actions(
                     &[computer_use::CuAction::Screenshot],
                     target,
                     computer_use::DisplayBackend::detect(),
@@ -1475,8 +1589,11 @@ pub(crate) async fn handle_shared_view_calls(
                     &registry,
                     None,
                     user_display_granted,
+                    Some(&capture_observer),
+                    computer_use::CuExecOptions::default(),
                 )
                 .await;
+                let results = outcome.results;
                 match results.first().and_then(|r| r.screenshot.as_ref()) {
                     Some(shot) => {
                         let images = vec![conversation::ImageData {
@@ -1501,19 +1618,31 @@ pub(crate) async fn handle_shared_view_calls(
                 }
             }
             "input" => {
-                bus.send(emit("input", None));
+                // `input` is the tool-call vocabulary; the browser event
+                // vocabulary is `input_request` (shared with the MCP path).
+                // Keeping that boundary canonical makes the dashboard show
+                // its user-clicked Take input affordance without granting
+                // authority automatically.
+                bus.send(emit("input_request", None));
                 format!(
                     "Input authority requested for {label}. The user must accept from the \
                      dashboard control — continue only after they take over or respond."
                 )
+            }
+            "focus_clear" => {
+                // Cleanup verb like hide: no display gate — it only retracts
+                // presentation state and must work after the annotated
+                // content (or the display grant) is already gone.
+                bus.send(emit("focus_clear", None));
+                "Focus highlight cleared; the shared view stays open.".to_string()
             }
             "hide" => {
                 bus.send(emit("hide", None));
                 "Shared view dismissed.".to_string()
             }
             other => format!(
-                "Error: unknown shared_view action '{other}' — use show, focus, capture, \
-                 input, or hide."
+                "Error: unknown shared_view action '{other}' — use show, focus, focus_clear, \
+                 capture, input, or hide."
             ),
         };
         slog(session_log, |l| {
@@ -1524,7 +1653,8 @@ pub(crate) async fn handle_shared_view_calls(
 }
 
 /// `user_display_granted` is the autonomy guard's grant state, read by the
-/// caller before dispatching the batch.
+/// caller before dispatching the batch. `cu_observer` feeds the dashboard's
+/// live action-visualization lane (`None` disables emission).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
@@ -1535,6 +1665,7 @@ pub(crate) async fn execute_cu_calls(
     session_log: &SharedSessionLog,
     session_registry: Option<&display::SharedSessionRegistry>,
     user_display_granted: bool,
+    cu_observer: Option<&computer_use::CuActionObserver>,
 ) {
     // Owned form for execute_actions, which wants `&Option<_>`.
     let session_registry = session_registry.cloned();
@@ -1610,7 +1741,9 @@ pub(crate) async fn execute_cu_calls(
         slog(session_log, |l| l.info(&format!("CU: {}", desc)));
 
         let backend = computer_use::DisplayBackend::detect();
-        let results = computer_use::execute_actions(
+        // Provider CU protocols expect a screenshot in every result: the
+        // native loop always observes with pixels.
+        let outcome = computer_use::execute_actions(
             &cu_call.actions,
             display_target,
             backend,
@@ -1619,17 +1752,17 @@ pub(crate) async fn execute_cu_calls(
             &session_registry,
             None,
             user_display_granted,
+            cu_observer,
+            computer_use::CuExecOptions::default(),
         )
         .await;
 
         // Find the last screenshot from results
-        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
-        let output = if results.iter().all(|r| r.success) {
-            "Actions executed successfully.".to_string()
-        } else {
-            let errors: Vec<&str> = results.iter().filter_map(|r| r.error.as_deref()).collect();
-            format!("Some actions failed: {}", errors.join("; "))
-        };
+        let last_screenshot = outcome.last_screenshot();
+        let output = computer_use::summarize_results_for_model(&cu_call.actions, &outcome.results);
+        slog(session_log, |l| {
+            l.info(&format!("CU batch: {}", outcome.metrics_line()))
+        });
 
         if let Some(screenshot) = last_screenshot {
             let images = vec![conversation::ImageData {
@@ -1646,6 +1779,27 @@ pub(crate) async fn execute_cu_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DisplayEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl DisplayEnvGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("DISPLAY");
+            std::env::set_var("DISPLAY", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for DisplayEnvGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("DISPLAY", value),
+                None => std::env::remove_var("DISPLAY"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn resolve_attachments_includes_uploaded_files_and_images() {
@@ -1950,6 +2104,8 @@ mod tests {
 
     #[tokio::test]
     async fn shared_view_calls_validate_and_gate_user_session() {
+        let _env_lock = crate::test_support::TEST_ENV_LOCK.lock().await;
+        let _display = DisplayEnvGuard::set(":99");
         let tmp = tempfile::tempdir().unwrap();
         let session_log: SharedSessionLog = Arc::new(Mutex::new(
             session_log::SessionLog::open(tmp.path().to_path_buf()).unwrap(),
@@ -1970,6 +2126,13 @@ mod tests {
                 serde_json::json!({"action": "show", "display_target": "user_session"}),
             ),
             ("c4".to_string(), serde_json::json!({"action": "bogus"})),
+            ("c5".to_string(), serde_json::json!({"action": "input"})),
+            // focus_clear is an ungated cleanup verb (CU-05): no region, no
+            // display resolution, callable without any grant.
+            (
+                "c6".to_string(),
+                serde_json::json!({"action": "focus_clear"}),
+            ),
         ];
         handle_shared_view_calls(
             &calls,
@@ -1989,7 +2152,7 @@ mod tests {
             .iter()
             .filter(|m| m.role == "tool")
             .collect();
-        assert_eq!(results.len(), 4, "one result per call");
+        assert_eq!(results.len(), 6, "one result per call");
         assert!(
             results[0].content.contains("dismissed"),
             "{}",
@@ -2010,9 +2173,19 @@ mod tests {
             "{}",
             results[3].content
         );
+        assert!(
+            results[4].content.contains("Input authority requested"),
+            "{}",
+            results[4].content
+        );
+        assert!(
+            results[5].content.contains("Focus highlight cleared"),
+            "{}",
+            results[5].content
+        );
 
-        // Only the valid hide emitted a SharedView event; the gated and
-        // invalid calls must not reach the dashboard.
+        // The valid hide and advisory input request emit SharedView events;
+        // gated and invalid calls must not reach the dashboard.
         match rx.try_recv() {
             Ok(AppEvent::SharedView {
                 action, session_id, ..
@@ -2021,6 +2194,37 @@ mod tests {
                 assert_eq!(session_id.as_deref(), Some("sess-1"));
             }
             other => panic!("expected SharedView hide event, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action,
+                session_id,
+                display_target,
+                display_id,
+                ..
+            }) => {
+                assert_eq!(action, "input_request");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                assert_eq!(display_target.as_deref(), Some(":99"));
+                assert_eq!(display_id, Some(99));
+            }
+            other => panic!("expected SharedView input_request event, got {other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action,
+                session_id,
+                display_target,
+                display_id,
+                ..
+            }) => {
+                assert_eq!(action, "focus_clear");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+                // Cleanup verbs never auto-resolve a display target.
+                assert_eq!(display_target, None);
+                assert_eq!(display_id, None);
+            }
+            other => panic!("expected SharedView focus_clear event, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no further events expected");
     }

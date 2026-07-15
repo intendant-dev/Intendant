@@ -8,17 +8,21 @@ use super::*;
 
 mod replay;
 pub(crate) use replay::*;
+mod replay_cache;
+pub(crate) use replay_cache::*;
 mod external_rows;
 pub(crate) use external_rows::*;
 mod detail_search;
 pub(crate) use detail_search::*;
+mod locate;
+pub(crate) use locate::*;
 mod codex_values;
 pub(crate) use codex_values::*;
 mod caches;
 pub(crate) use caches::*;
 mod rows_usage;
 pub(crate) use rows_usage::*;
-mod backend_lists;
+pub(crate) mod backend_lists;
 pub(crate) use backend_lists::*;
 mod transcripts;
 pub(crate) use transcripts::*;
@@ -111,7 +115,16 @@ pub(crate) struct ExternalTranscriptCacheEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct SessionListResponseCacheEntry {
     generated_at: std::time::Instant,
+    /// Monotonic id minted per stored body. The projection cache
+    /// (limit-slice / usage-view bodies) keys on it, so projections are
+    /// valid exactly as long as the body they were derived from.
+    generation: u64,
     body: String,
+}
+
+pub(crate) fn next_session_list_body_generation() -> u64 {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    GENERATION.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -350,6 +363,7 @@ pub(crate) fn spawn_session_list_refresh(limit_slot: usize) {
 pub(crate) fn store_session_list_response(limit_slot: usize, body: String) {
     let entry = SessionListResponseCacheEntry {
         generated_at: std::time::Instant::now(),
+        generation: next_session_list_body_generation(),
         body,
     };
     if limit_slot >= SESSION_LIST_LIMIT {
@@ -372,15 +386,25 @@ pub(crate) fn serve_session_list_cache_entry(
     limit_slot: usize,
     entry: Option<&SessionListResponseCacheEntry>,
 ) -> Option<String> {
+    serve_session_list_cache_entry_with_generation(limit_slot, entry).map(|(body, _)| body)
+}
+
+/// [`serve_session_list_cache_entry`] plus the served body's generation,
+/// for callers that key derived projections on it.
+pub(crate) fn serve_session_list_cache_entry_with_generation(
+    limit_slot: usize,
+    entry: Option<&SessionListResponseCacheEntry>,
+) -> Option<(String, u64)> {
     let entry = entry?;
     let age = entry.generated_at.elapsed();
     if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS) {
-        return Some(entry.body.clone());
+        return Some((entry.body.clone(), entry.generation));
     }
     if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_STALE_MAX_SECS) {
         let body = entry.body.clone();
+        let generation = entry.generation;
         spawn_session_list_refresh(limit_slot);
-        return Some(body);
+        return Some((body, generation));
     }
     None
 }
@@ -400,43 +424,73 @@ pub(crate) fn invalidate_session_list_response_caches() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
+    // Projections derive from those bodies — invalidated together. (Their
+    // generation keys could never match a future body, but dropping them
+    // now frees the memory with the bodies.)
+    session_list_projection_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 pub(crate) fn cached_list_sessions() -> String {
+    cached_list_sessions_with_generation().0
+}
+
+/// [`cached_list_sessions`] plus the served body's generation for
+/// projection-cache keying (`None` only for exotic paths that bypass the
+/// entry store).
+pub(crate) fn cached_list_sessions_with_generation() -> (String, Option<u64>) {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(body) = serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref()) {
-            return body;
+        if let Some((body, generation)) =
+            serve_session_list_cache_entry_with_generation(SESSION_LIST_LIMIT, guard.as_ref())
+        {
+            return (body, Some(generation));
         }
     }
 
     let body = list_sessions();
+    let generation = next_session_list_body_generation();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(SessionListResponseCacheEntry {
         generated_at: std::time::Instant::now(),
+        generation,
         body: body.clone(),
     });
-    body
+    (body, Some(generation))
 }
 
 pub(crate) fn cached_list_sessions_with_limit(limit: usize) -> String {
+    cached_list_sessions_with_limit_and_generation(limit).0
+}
+
+pub(crate) fn cached_list_sessions_with_limit_and_generation(
+    limit: usize,
+) -> (String, Option<u64>) {
     let limit = limit.clamp(1, SESSION_LIST_LIMIT);
     if limit >= SESSION_LIST_LIMIT {
-        return cached_list_sessions();
+        return cached_list_sessions_with_generation();
     }
 
     let cache = cached_limited_session_list_cache();
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(body) = serve_session_list_cache_entry(limit, guard.get(&limit)) {
-            return body;
+        if let Some((body, generation)) =
+            serve_session_list_cache_entry_with_generation(limit, guard.get(&limit))
+        {
+            return (body, Some(generation));
         }
     }
 
     let body = list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit));
     store_session_list_response(limit, body.clone());
-    body
+    let generation = {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&limit).map(|entry| entry.generation)
+    };
+    (body, generation)
 }
 
 pub(crate) fn cached_session_list_snapshot() -> Option<String> {
@@ -665,7 +719,7 @@ fn cached_session_list_body_if_serveable() -> Option<String> {
     serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref())
 }
 
-pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
+pub(crate) fn cached_list_sessions_for_ids(home: &Path, ids: &[String]) -> String {
     if ids.is_empty() {
         return "[]".to_string();
     }
@@ -689,7 +743,7 @@ pub(crate) fn cached_list_sessions_for_ids(ids: &[String]) -> String {
             }
         }
     }
-    cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
+    cached_list_sessions_for_ids_from_home(home, ids)
 }
 
 /// Strip session rows down to what the Stats tab folds: usage, costs,
@@ -729,6 +783,69 @@ pub(crate) fn session_list_body_usage_view(body: &str) -> String {
         }
     }
     serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
+}
+
+/// Projection-cache key: (source body generation, limit, usage_view).
+type SessionListProjectionKey = (u64, Option<usize>, bool);
+
+/// Cache of derived session-list projections (limit slices, the usage
+/// view), keyed by the source body's generation + the projection params.
+/// A projection is valid exactly while its source generation is being
+/// served, so entries from replaced bodies simply stop matching; the
+/// size cap ages them out.
+fn session_list_projection_cache() -> &'static Mutex<HashMap<SessionListProjectionKey, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<SessionListProjectionKey, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const SESSION_LIST_PROJECTION_CACHE_LIMIT: usize = 16;
+
+#[cfg(test)]
+pub(crate) fn session_list_projection_cache_len() -> usize {
+    session_list_projection_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// The `/api/sessions` response projection (limit truncation, then the
+/// usage view), computed once per source-body generation instead of
+/// re-parsing + re-serializing the multi-megabyte cached list on every
+/// request. `generation: None` (uncachable source) computes directly.
+pub(crate) fn projected_session_list_body(
+    generation: Option<u64>,
+    body: &str,
+    limit: Option<usize>,
+    usage_view: bool,
+) -> String {
+    if limit.is_none() && !usage_view {
+        return body.to_string();
+    }
+    let key = generation.map(|generation| (generation, limit, usage_view));
+    if let Some(key) = &key {
+        let cache = session_list_projection_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(projected) = cache.get(key) {
+            return projected.clone();
+        }
+    }
+    let projected = limit_session_list_body(body, limit);
+    let projected = if usage_view {
+        session_list_body_usage_view(&projected)
+    } else {
+        projected
+    };
+    if let Some(key) = key {
+        let mut cache = session_list_projection_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= SESSION_LIST_PROJECTION_CACHE_LIMIT && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, projected.clone());
+    }
+    projected
 }
 
 pub(crate) fn session_list_usage_view_from_request(request_line: &str) -> bool {
@@ -1273,6 +1390,7 @@ pub(crate) fn worktree_hint_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn push_agent_observed_worktree_hint(
     hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
     home: &Path,
@@ -1487,11 +1605,12 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
 /// next list pass.
 pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint]) -> String {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
-    // Format v3: rows carry the conversation `preview`. Bumping the layout
-    // invalidates every persisted row once, so cached rows without the new
-    // field rebuild on the next list pass instead of lingering until their
-    // dir changes. (v2 moved `updated_at` to transcript activity.)
-    ctx.update(&[3u8]);
+    // Format v4: native rows carry cumulative cache-write usage and price it
+    // separately. Bumping the layout invalidates persisted v3 rows once, so
+    // their old zero-write cost does not linger until the session dir changes.
+    // (v3 added conversation `preview`; v2 moved `updated_at` to transcript
+    // activity.)
+    ctx.update(&[4u8]);
     for entry in entries {
         ctx.update(entry.rel.as_bytes());
         ctx.update(&[0]);
@@ -1556,6 +1675,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut cached_tokens: u64 = 0;
+    let mut cache_creation_tokens: u64 = 0;
     let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
     let mut role: Option<String> = None;
     let mut external_resume_id: Option<String> = None;
@@ -1731,6 +1851,10 @@ pub(crate) fn intendant_session_list_row_from_dir(
                             cached_tokens += cached;
                             event_usage.cached_tokens = cached;
                         }
+                        if let Some(created) = tok.get("cache_creation").and_then(|v| v.as_u64()) {
+                            cache_creation_tokens += created;
+                            event_usage.cache_creation_tokens = created;
+                        }
                         if event_usage.total_tokens == 0 {
                             event_usage.total_tokens =
                                 event_usage.prompt_tokens + event_usage.completion_tokens;
@@ -1784,10 +1908,8 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         ));
                     }
                 }
-                "round_complete" => {
-                    if status != "interrupted" {
-                        status = "idle".to_string();
-                    }
+                "round_complete" if status != "interrupted" => {
+                    status = "idle".to_string();
                 }
                 _ => {}
             }
@@ -1915,7 +2037,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
             prompt_tokens,
             completion_tokens,
             cached_tokens,
-            0,
+            cache_creation_tokens,
         )
     });
 
@@ -1945,7 +2067,7 @@ pub(crate) fn intendant_session_list_row_from_dir(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
-        "cache_creation_tokens": 0,
+        "cache_creation_tokens": cache_creation_tokens,
         "estimated_cost": estimated_cost.unwrap_or(0.0),
         "pricing_known": estimated_cost.is_some(),
         "role": role,
@@ -2156,7 +2278,7 @@ pub(crate) fn list_intendant_skeleton_sessions_with_limit(
             Some((dir, mtime))
         })
         .collect::<Vec<_>>();
-    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
     dirs.truncate(limit);
     dirs.into_iter()
         .filter_map(|(dir, _)| {
@@ -2263,7 +2385,7 @@ pub(crate) fn list_sessions_from_home_impl(
         })
         .collect::<Vec<_>>();
     if let Some(cap) = row_cap {
-        dirs.sort_by(|a, b| b.1.cmp(&a.1));
+        dirs.sort_by_key(|d| std::cmp::Reverse(d.1));
         let scan_limit = cap
             .saturating_add(SESSION_SOURCE_FLOOR * 3)
             .clamp(cap, SESSION_LIST_LIMIT);
@@ -2350,15 +2472,44 @@ pub(crate) fn send_session_stream_rows(
     true
 }
 
-pub(crate) fn stream_sessions_from_request(
-    request_line: &str,
+/// The session-list stream's ONE line source (transport-unification
+/// S10): quick skeleton rows, the hydrating phase marker, the
+/// cache-hydrated replace, done — pushed as complete NDJSON lines into
+/// `tx`. Both transports spawn exactly this function (via
+/// `sessions_stream_api_response`) and own only their writers. This
+/// production entry resolves the ambient home and hydrates through the
+/// process-wide session-list caches; the parity fixture injects a temp
+/// store and the direct scan through `stream_sessions_lines_from_home`.
+pub(crate) fn stream_sessions_lines(
+    requested_limit: Option<usize>,
     tx: tokio::sync::mpsc::Sender<String>,
 ) {
-    let requested_limit = session_list_limit_from_request(request_line);
+    stream_sessions_lines_from_home(
+        &crate::platform::home_dir(),
+        requested_limit,
+        || {
+            requested_limit
+                .map(cached_list_sessions_with_limit)
+                .unwrap_or_else(cached_list_sessions)
+        },
+        tx,
+    )
+}
+
+/// Root-injected body of [`stream_sessions_lines`] (hermetic-test
+/// convention: the quick phase scans `home`; the replace phase's
+/// hydrated list body comes from `hydrated_body` — the response caches
+/// in production, a direct `list_sessions_from_home_with_limit` scan in
+/// fixtures).
+pub(crate) fn stream_sessions_lines_from_home(
+    home: &Path,
+    requested_limit: Option<usize>,
+    hydrated_body: impl FnOnce() -> String,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
     let quick_limit = requested_limit
         .unwrap_or(SESSION_LIST_LIMIT)
         .min(SESSION_LIST_STREAM_QUICK_LIMIT);
-    let home = crate::platform::home_dir();
     if !send_session_stream_event(
         &tx,
         serde_json::json!({
@@ -2372,14 +2523,14 @@ pub(crate) fn stream_sessions_from_request(
 
     let mut quick_rows = Vec::new();
     quick_rows.extend(list_intendant_skeleton_sessions_with_limit(
-        &home,
+        home,
         quick_limit,
     ));
     quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
-        &home,
+        home,
         quick_limit,
     ));
-    merge_quick_session_rows_with_wrapper_index(&home, &mut quick_rows);
+    merge_quick_session_rows_with_wrapper_index(home, &mut quick_rows);
     sort_sessions_newest_first(&mut quick_rows);
     truncate_sessions_preserving_sources_to(&mut quick_rows, quick_limit);
     if !send_session_stream_rows(&tx, quick_rows, true) {
@@ -2395,9 +2546,7 @@ pub(crate) fn stream_sessions_from_request(
         return;
     }
 
-    let body = requested_limit
-        .map(cached_list_sessions_with_limit)
-        .unwrap_or_else(cached_list_sessions);
+    let body = hydrated_body();
     let rows = serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap_or_default();
     let _ = send_session_stream_event(
         &tx,
@@ -2425,10 +2574,13 @@ mod tests {
             *cache.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(SessionListResponseCacheEntry {
                     generated_at: std::time::Instant::now(),
+                    generation: next_session_list_body_generation(),
                     body: "[{\"session_id\":\"stale\"}]".to_string(),
                 });
         }
         store_session_list_response(5, "[]".to_string());
+        // Seed a projection so the invalidation has something to clear.
+        let _ = projected_session_list_body(Some(u64::MAX), "[]", Some(1), false);
         invalidate_session_list_response_caches();
         assert!(SESSION_LIST_RESPONSE_CACHE
             .get()
@@ -2440,6 +2592,58 @@ mod tests {
             .lock()
             .unwrap()
             .is_empty());
+        assert_eq!(session_list_projection_cache_len(), 0);
+    }
+
+    #[test]
+    fn projected_session_list_body_caches_by_generation_and_matches_direct() {
+        let body = serde_json::json!([
+            {"session_id": "s-1", "source": "intendant", "task": "keep",
+             "total_tokens": 10, "model": "m", "project_root": "/repo"},
+            {"session_id": "s-2", "source": "codex", "task": "drop-by-limit",
+             "total_tokens": 20, "model": "m", "project_root": "/repo"},
+        ])
+        .to_string();
+
+        // Identity projection: no limit, no usage view — body passes
+        // through untouched and nothing is cached for it.
+        assert_eq!(
+            projected_session_list_body(Some(9_100), &body, None, false),
+            body
+        );
+
+        for (limit, usage_view) in [(Some(1), false), (Some(1), true), (None, true)] {
+            let direct = {
+                let limited = limit_session_list_body(&body, limit);
+                if usage_view {
+                    session_list_body_usage_view(&limited)
+                } else {
+                    limited
+                }
+            };
+            // Unique generation per case isolates this test from cache
+            // state other tests leave behind.
+            let generation = 9_200 + limit.unwrap_or(0) as u64 * 2 + usage_view as u64;
+            let first = projected_session_list_body(Some(generation), &body, limit, usage_view);
+            assert_eq!(first, direct);
+            // Second call must serve the cached projection (same result);
+            // a DIFFERENT body under the SAME generation proves the cache
+            // is keyed by generation, not by re-deriving from the body.
+            let second = projected_session_list_body(Some(generation), "[]", limit, usage_view);
+            assert_eq!(second, direct);
+            // A new generation recomputes from the supplied body.
+            let recomputed =
+                projected_session_list_body(Some(generation + 5_000), "[]", limit, usage_view);
+            assert_ne!(recomputed, direct);
+        }
+
+        // Uncachable source (generation: None) computes directly.
+        let usage = projected_session_list_body(None, &body, None, true);
+        assert_eq!(usage, session_list_body_usage_view(&body));
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&usage).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].get("task").is_none(), "usage view strips tasks");
+        assert!(parsed[0].get("total_tokens").is_some());
     }
 
     #[test]
@@ -2853,9 +3057,52 @@ mod tests {
     }
 
     #[test]
+    fn intendant_row_prices_gpt_5_6_cache_writes_from_native_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let events = [
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:00Z",
+                "event": "info",
+                "message": "Provider: openai"
+            }),
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:01Z",
+                "event": "info",
+                "message": "Model: gpt-5.6-sol"
+            }),
+            serde_json::json!({
+                "ts": "2026-07-11T12:00:02Z",
+                "event": "model_response",
+                "turn": 1,
+                "message": "done",
+                "data": {"tokens": {
+                    "prompt": 3_000_000,
+                    "completion": 1_000_000,
+                    "total": 4_000_000,
+                    "cached": 1_000_000,
+                    "cache_creation": 1_000_000
+                }}
+            }),
+        ];
+        let jsonl: String = events.iter().map(|event| format!("{event}\n")).collect();
+        std::fs::write(log_dir.join("session.jsonl"), jsonl).unwrap();
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["cache_creation_tokens"].as_u64(), Some(1_000_000));
+        assert_eq!(row["cached_tokens"].as_u64(), Some(1_000_000));
+        assert!((row["estimated_cost"].as_f64().unwrap() - 41.75).abs() < 1e-12);
+    }
+
+    #[test]
     fn intendant_row_preview_collects_prose_and_respects_slots() {
         let home = tempfile::tempdir().unwrap();
-        let log_dir = home.path().join(".intendant").join("logs").join("preview-1");
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("preview-1");
         std::fs::create_dir_all(&log_dir).unwrap();
         std::fs::write(
             log_dir.join("session_meta.json"),

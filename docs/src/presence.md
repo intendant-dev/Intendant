@@ -339,23 +339,28 @@ model or the browser voice model is driving.
 - **callbacks.rs** — JS callback management for voice/tool events.
 
 Normal `cargo build` checks `crates/presence-web`, `crates/presence-core`, and
-`crates/station-web` and auto-rebuilds stale WASM artifacts with `wasm-pack`
-when it is installed. Manual fallback:
+`crates/station-web` and auto-rebuilds stale WASM artifacts with `wasm-pack` —
+but only when the installed `wasm-pack` matches the version pinned in
+`.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts
+are committed; any other version skips the rebuild with a warning). Manual
+fallback — `scripts/build-wasm.sh` is the canonical builder, rebuilding both
+WASM crates with the same flags as `build.rs`:
 
 ```bash
-cd crates/presence-web
-wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+bash scripts/build-wasm.sh
 cargo build --release -p intendant   # re-embed the compiled WASM
 ```
 
-The `static/wasm-web/` files are pre-compiled artifacts. If `wasm-pack` is not
-installed or the build script reports an auto-rebuild failure, run the manual
-command and then `cargo build` to re-embed the compiled WASM.
+The `static/wasm-web/` and `static/wasm-station/` files are pre-compiled,
+committed artifacts. If the pinned `wasm-pack` is not installed or the build
+script reports an auto-rebuild failure, run the script and then `cargo build`
+to re-embed the compiled WASM. Regenerate and commit these artifacts on macOS
+only — the output is not byte-deterministic across host triples.
 
 ## See Also
 
-- [Autonomy & Approvals](./autonomy.md) — how presence narration and approvals surface in
-  the terminal UI.
+- [Autonomy & Approvals](./autonomy.md) — the approval model presence
+  narrates and every frontend surfaces.
 - [Web Dashboard](./web-dashboard.md) — the dashboard host for browser voice.
 - [Computer Use & Live Audio](./computer-use-and-audio.md) — where
   `display_target` / `reference_frame_ids` from `submit_task` route.

@@ -547,24 +547,44 @@ function managedContextSplitLines(id) {
 async function managedContextMcpToolForSession(sessionId, name, args = {}) {
   if (!sessionId) throw new Error('Select a Codex session first.');
   const rpcId = managedContextRpcSeq++;
-  const body = {
-    jsonrpc: '2.0',
-    id: rpcId,
-    method: 'tools/call',
-    params: { name, arguments: args },
-  };
-  const resp = await dashboardJsonFetch('api_mcp_tool_call', {
-    mcp_id: rpcId,
-    session_id: sessionId,
-    name,
-    arguments: args,
-  }, () => authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  }), 'api_mcp_tool_call', { fallbackAfterRpcFailure: false });
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error?.message || `MCP HTTP ${resp.status}`);
+  // Transport F8a (mcp residue): api_mcp_tool_call is tunnel-only — no
+  // HTTP row exists (CONTROL_ONLY_METHODS residue; the /mcp endpoint is
+  // the MCP server's own gate, not a route twin), so the facade serves
+  // the tunnel leg. A tunnel attempt is FINAL (the legacy
+  // fallbackAfterRpcFailure:false semantics — a tool call is a mutation
+  // and must never replay); only a dashboard with no tunnel at all takes
+  // this site's legacy /mcp lane (never in Connect mode).
+  let ok;
+  let status;
+  let payload;
+  if (daemonApi.availability('api_mcp_tool_call').ok) {
+    const r = await daemonApi.request('api_mcp_tool_call', {
+      mcp_id: rpcId,
+      session_id: sessionId,
+      name,
+      arguments: args,
+    }, { fallback: 'never' });
+    ok = r.ok;
+    status = r.status;
+    payload = (r.body && typeof r.body === 'object') ? r.body : {};
+  } else if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect RPC is not available for api_mcp_tool_call');
+  } else {
+    const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: rpcId,
+        method: 'tools/call',
+        params: { name, arguments: args },
+      }),
+    });
+    ok = resp.ok;
+    status = resp.status;
+    payload = await resp.json().catch(() => ({}));
+  }
+  if (!ok) throw new Error(payload.error?.message || `MCP HTTP ${status}`);
   if (payload.error) throw new Error(payload.error.message || 'MCP tool failed');
   const result = payload.result || {};
   const text = Array.isArray(result.content)
@@ -605,13 +625,14 @@ async function fetchManagedContextFission() {
 }
 
 async function fetchManagedContextHistoryJson(kind, query) {
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy. The tunnel contract is one pre-encoded query string
+  // (`{ query }`); the descriptor's rawQuery column turns it back into the
+  // HTTP twin's URL query.
   const method = `api_managed_context_${kind}`;
-  const resp = await dashboardTransport.jsonFetch(method, { query }, () => (
-    authedFetch(`/api/managed-context/${kind}?${query}`)
-  ), method);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `${kind} HTTP ${resp.status}`);
-  return payload;
+  const resp = await daemonApi.request(method, { query });
+  if (!resp.ok) throw new Error(resp.body?.error || `${kind} HTTP ${resp.status}`);
+  return resp.body;
 }
 
 function settleManagedContextPromise(promise) {
@@ -1762,7 +1783,11 @@ function resetSessionWindowLog(win) {
   win.logHistory = [];
   win.renderStart = 0;
   win.renderEnd = 0;
-  win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  if (typeof renderSessionWindowLogPlaceholder === 'function') {
+    renderSessionWindowLogPlaceholder(win);
+  } else {
+    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+  }
   win.followOutput = true;
   win.pendingOutput = false;
   updateSessionWindowJumpButton(win);
@@ -2003,6 +2028,16 @@ function applySessionIdentity(meta = {}) {
     retireExternalWrapperSessionWindow(sid, backendSessionId);
   } else if (sessionWindows.has(sid)) {
     updateSessionWindow(sid, next);
+  }
+  // Vitals arrive keyed to the wrapper/log id (the git prober registers
+  // that id) and fan out through the identity group AS CACHED AT ARRIVAL.
+  // A window keyed by the backend-native id from birth (Codex announces
+  // its thread id before turn 1) therefore missed every vitals emission
+  // sent before this linkage landed — and, because the hub emits on
+  // change only, stayed chip-less until the next change. Re-fan now that
+  // the group is known.
+  if (typeof refanSessionVitalsForIdentityGroup === 'function') {
+    refanSessionVitalsForIdentityGroup(sid);
   }
   persistSessionWindowState();
   updateTaskTargetChip();
@@ -2402,13 +2437,30 @@ function isSessionWindowSteerActive(sessionId) {
 // truthful even when it is not the prompt target (the global banner stays
 // gated on the target in the set_phase command). A server phase is
 // authoritative — it also retires the optimistic-active guard.
+//
+// The session id must go through the identity translation: external
+// sessions re-key their window to the backend-native id while server
+// status events keep riding the wrapper/log id. A direct lookup missed
+// the re-keyed window, so its phase stayed optimistic forever — which is
+// what parked the composer in follow-up mode ("steering doesn't work")
+// via the optimistic-expired steer gate.
 function applyServerPhaseToSessionWindow(sessionId, phase) {
   const sid = String(sessionId || '').trim();
   if (!sid || !phase) return;
-  const win = sessionWindows.get(sid);
+  const targetSid = (typeof sessionWindowTargetForLogSession === 'function'
+    && sessionWindowTargetForLogSession(sid)) || sid;
+  const win = sessionWindows.get(targetSid);
   if (!win) return;
   win.optimisticActiveExpired = false;
   if (!isAgentActivePhase(normalizeSessionPhase(phase))) win.pendingActiveUntil = 0;
-  updateSessionWindow(sid, { phase });
+  // A pending follow-up row's message became this turn's input the moment
+  // the session went active — retire it as delivered. (The daemon lane's
+  // task-envelope channel drops follow_up ids, so no FollowUpStatus echo
+  // will ever come for these; without this the row sat at ⏳ forever.)
+  if (isAgentActivePhase(normalizeSessionPhase(phase))
+      && typeof retirePendingFollowUpRowsForSession === 'function') {
+    retirePendingFollowUpRowsForSession(targetSid, sid);
+  }
+  updateSessionWindow(targetSid, { phase });
 }
 

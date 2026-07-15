@@ -38,7 +38,11 @@ pub(crate) fn read_event_file_span(
     }
 }
 
-pub(crate) fn read_model_response_content(entry: &serde_json::Value, log_dir: &Path, message: &str) -> String {
+pub(crate) fn read_model_response_content(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    message: &str,
+) -> String {
     let data = entry.get("data");
     let has_span = data
         .and_then(|d| d.get("model_offset"))
@@ -316,7 +320,7 @@ pub fn session_log_entry_to_app_event(
                 context_window,
                 hard_context_window,
                 item_count,
-                raw,
+                raw: std::sync::Arc::new(raw),
             })
         }
 
@@ -339,6 +343,10 @@ pub fn session_log_entry_to_app_event(
                     .unwrap_or(0),
                 cached_tokens: tokens
                     .and_then(|t| t.get("cached"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_tokens: tokens
+                    .and_then(|t| t.get("cache_creation"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
                 ..Default::default()
@@ -444,12 +452,17 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("session_id"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let item_id = data
+                .and_then(|d| d.get("item_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::AgentOutput {
                 session_id,
                 stdout,
                 stderr,
                 source,
                 output_id,
+                item_id,
             })
         }
 
@@ -582,6 +595,31 @@ pub fn session_log_entry_to_app_event(
                 .unwrap_or(message.strip_prefix("Steer cancelled: ").unwrap_or(message))
                 .to_string();
             Some(AppEvent::SteerCancelled {
+                session_id,
+                id,
+                reason,
+            })
+        }
+        "steer_cancel_failed" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(
+                    message
+                        .strip_prefix("Steer cancel failed: ")
+                        .unwrap_or(message),
+                )
+                .to_string();
+            Some(AppEvent::SteerCancelFailed {
                 session_id,
                 id,
                 reason,
@@ -1017,6 +1055,7 @@ pub fn session_log_entry_to_app_event(
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         }),
         "live_usage_update" => Some(AppEvent::LiveUsageUpdate {
             provider: data
@@ -1276,6 +1315,36 @@ mod tests {
         }
     }
 
+    /// A failed clear is terminal steer state: without a structured event +
+    /// replay arm the pending strip row resurrected as "queued" on reload
+    /// (the pre-fix writer emitted only a prose `log.warn`).
+    #[test]
+    fn rt_steer_cancel_failed_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.steer_cancel_failed(
+            Some("thread-1"),
+            "steer-9",
+            "nothing pending to clear — the message already delivered or converted to a follow-up",
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "steer_cancel_failed");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SteerCancelFailed {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-1"));
+                assert_eq!(id, "steer-9");
+                assert!(reason.starts_with("nothing pending to clear"), "{reason}");
+            }
+            other => panic!("expected SteerCancelFailed, got {:?}", other),
+        }
+    }
+
     #[test]
     fn rt_session_note_preserves_text_and_attachment_refs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1396,6 +1465,7 @@ mod tests {
             50,
             150,
             10,
+            5,
             Some("Codex"),
         );
         drop(log);
@@ -1419,6 +1489,7 @@ mod tests {
                 assert_eq!(usage.completion_tokens, 50);
                 assert_eq!(usage.total_tokens, 150);
                 assert_eq!(usage.cached_tokens, 10);
+                assert_eq!(usage.cache_creation_tokens, 5);
                 assert!(reasoning.is_none());
                 assert_eq!(source.as_deref(), Some("Codex"));
             }
@@ -1432,8 +1503,8 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(7, 0.5, 100_000);
-        log.model_response("first response", 1, 2, 3, 0, Some("Codex"));
-        log.model_response("second response", 4, 5, 6, 0, Some("Codex"));
+        log.model_response("first response", 1, 2, 3, 0, 0, Some("Codex"));
+        log.model_response("second response", 4, 5, 6, 0, 0, Some("Codex"));
         drop(log);
 
         let entries = read_events(&log_dir, "model_response");
@@ -1503,6 +1574,7 @@ mod tests {
             2,
             3,
             0,
+            0,
             Some("Codex"),
         );
         drop(log);
@@ -1536,6 +1608,7 @@ mod tests {
             "",
             Some("Codex"),
             Some("out-1"),
+            Some("call-9"),
         );
         drop(log);
 
@@ -1546,12 +1619,14 @@ mod tests {
                 stdout,
                 source,
                 output_id,
+                item_id,
                 ..
             } => {
                 assert_eq!(session_id.as_deref(), Some("child-thread"));
                 assert_eq!(stdout, "child stdout");
                 assert_eq!(source.as_deref(), Some("Codex"));
                 assert_eq!(output_id.as_deref(), Some("out-1"));
+                assert_eq!(item_id.as_deref(), Some("call-9"));
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }

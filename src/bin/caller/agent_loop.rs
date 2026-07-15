@@ -5,12 +5,13 @@
 //! submit_result).
 
 use crate::conversation;
+use crate::conversation::MessageProvenance;
 use crate::external_agent;
 use crate::provider;
 use crate::{ExternalToolFailureLogLimiter, ExternalToolOutputLimiter};
 
-use std::time::Duration;
 use crate::*;
+use std::time::Duration;
 
 pub(crate) const SAFETY_CAP: usize = 500;
 pub(crate) const MIN_BUDGET_TOKENS: u64 = 4096;
@@ -309,7 +310,12 @@ pub(crate) async fn handle_spawn_sub_agent_call(
     };
     match orchestration
         .supervisor
-        .start_sub_agent_session(&orchestration.session_id, project, orchestration.depth, params)
+        .start_sub_agent_session(
+            &orchestration.session_id,
+            project,
+            orchestration.depth,
+            params,
+        )
         .await
     {
         Ok(started) => {
@@ -516,24 +522,23 @@ pub(crate) async fn handle_wait_sub_agents_call(
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                                 child.rx = None;
-                                child.completed =
-                                    Some(session_supervisor::SubAgentCompletion {
-                                        child_session_id: id.clone(),
-                                        name: child.name.clone(),
-                                        result: sub_agent::SubAgentResult {
-                                            id: child.name.clone(),
-                                            status: sub_agent::SubAgentStatus::Failed(
-                                                "session ended without a result".to_string(),
-                                            ),
-                                            summary:
-                                                "Sub-agent session ended without reporting a result"
-                                                    .to_string(),
-                                            brief: "Sub-agent ended without a result.".to_string(),
-                                            findings: vec![],
-                                            artifacts: vec![],
-                                            usage: provider::TokenUsage::default(),
-                                        },
-                                    });
+                                child.completed = Some(session_supervisor::SubAgentCompletion {
+                                    child_session_id: id.clone(),
+                                    name: child.name.clone(),
+                                    result: sub_agent::SubAgentResult {
+                                        id: child.name.clone(),
+                                        status: sub_agent::SubAgentStatus::Failed(
+                                            "session ended without a result".to_string(),
+                                        ),
+                                        summary:
+                                            "Sub-agent session ended without reporting a result"
+                                                .to_string(),
+                                        brief: "Sub-agent ended without a result.".to_string(),
+                                        findings: vec![],
+                                        artifacts: vec![],
+                                        usage: provider::TokenUsage::default(),
+                                    },
+                                });
                             }
                         }
                     }
@@ -733,7 +738,10 @@ pub(crate) async fn handle_peer_tool_call(
                 Ok(value) => value,
                 Err(error) => return PeerToolOutput::error(error),
             };
-            let Some(actions) = args.get("actions").filter(|value| value.is_array()).cloned()
+            let Some(actions) = args
+                .get("actions")
+                .filter(|value| value.is_array())
+                .cloned()
             else {
                 return PeerToolOutput::error(
                     serde_json::json!({
@@ -747,12 +755,18 @@ pub(crate) async fn handle_peer_tool_call(
             };
             let display_target = optional_str(args, "display_target");
             let coordinate_space = optional_str(args, "coordinate_space");
+            let observe = optional_str(args, "observe");
+            let annotate = args.get("annotate").and_then(|value| value.as_bool());
+            let settle = args.get("settle").filter(|value| !value.is_null()).cloned();
             crate::peer::ops::execute_cu_actions(
                 peer_registry,
                 peer_id,
                 actions,
                 display_target,
                 coordinate_space,
+                observe,
+                annotate,
+                settle,
             )
             .await
         }
@@ -769,6 +783,7 @@ pub(crate) async fn handle_peer_tool_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn run_agent_loop(
     provider: &dyn provider::ChatProvider,
     conversation: &mut Conversation,
@@ -830,6 +845,9 @@ pub(crate) async fn run_agent_loop(
     // We keep the watcher alive across multiple steers — unlike the interrupt
     // branch which exits after cancelling.
     let local_session_id = session_log_id(&session_log);
+    // Live action-visualization lane for the dashboard: one ephemeral
+    // cu_action event per executed CU action (never session-logged).
+    let cu_observer = computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();
@@ -893,13 +911,17 @@ pub(crate) async fn run_agent_loop(
                             &reason,
                         );
                         if removed == 0 {
-                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                watcher_bus.send(AppEvent::SteerCancelled {
-                                    session_id: watcher_session_id.clone(),
-                                    id,
-                                    reason,
-                                });
-                            }
+                            // Nothing queued to remove: the turn-start drain
+                            // already claimed the steer and put it in the
+                            // conversation (emitting `SteerDelivered`).
+                            // Fabricating `SteerCancelled` here reported a
+                            // clear for text the model already saw.
+                            emit_steer_cancel_failed_for_unmatched(
+                                &watcher_bus,
+                                watcher_session_id.clone(),
+                                id,
+                                STEER_CANCEL_UNMATCHED_NATIVE_REASON,
+                            );
                         }
                     }
                     Ok(_) => continue,
@@ -967,16 +989,24 @@ pub(crate) async fn run_agent_loop(
         // always used.
         if let Ok(mut q) = context_injection.lock() {
             for inj in q.drain(..) {
-                let prefix = if inj.steer_id.is_some() {
-                    "User"
+                let (prefix, provenance) = if inj.steer_id.is_some() {
+                    ("User", MessageProvenance::Steer)
                 } else {
-                    "System"
+                    ("System", MessageProvenance::SystemInjection)
                 };
                 let text = format!("[{}] {}", prefix, inj.text);
-                if inj.images.is_empty() {
-                    conversation.add_user(text.clone());
+                let seq = if inj.images.is_empty() {
+                    conversation.add_user(provenance, text.clone())
                 } else {
-                    conversation.add_user_with_images(text.clone(), inj.images);
+                    conversation.add_user_with_images(provenance, text.clone(), inj.images)
+                };
+                // Delivered steers are message-lane; system injections are
+                // not. The record carries the raw steer text, not the
+                // `[User]`-prefixed conversation string.
+                if provenance == MessageProvenance::Steer {
+                    slog(&session_log, |l| {
+                        let _ = l.conversation_message_user(seq, provenance, &inj.text, None);
+                    });
                 }
                 slog(&session_log, |l| {
                     l.info(&format!("Context injected: {}", inj.text))
@@ -1032,7 +1062,7 @@ pub(crate) async fn run_agent_loop(
                     context_window: Some(conversation.context_window()),
                     hard_context_window: Some(conversation.context_window()),
                     item_count: provider_request_item_count(&raw_context),
-                    raw: raw_context,
+                    raw: std::sync::Arc::new(raw_context),
                 });
             }
             Err(e) => {
@@ -1172,7 +1202,7 @@ pub(crate) async fn run_agent_loop(
         // Store assistant message — with or without tool calls
         let has_tool_calls = !response.tool_calls.is_empty();
         let has_cu_calls = !response.cu_calls.is_empty();
-        if has_tool_calls || has_cu_calls {
+        let assistant_seq = if has_tool_calls || has_cu_calls {
             let refs: Vec<conversation::ToolCallRef> = response
                 .tool_calls
                 .iter()
@@ -1187,21 +1217,37 @@ pub(crate) async fn run_agent_loop(
                 response.content.clone(),
                 refs,
                 response.raw_output.clone(),
-            );
-        } else {
-            conversation.add_assistant(response.content.clone());
-        }
-
-        // Log the full model response (no truncation)
-        slog(&session_log, |l| {
-            l.model_response(
-                &response.content,
-                response.usage.prompt_tokens,
-                response.usage.completion_tokens,
-                response.usage.total_tokens,
-                response.usage.cached_tokens,
-                None,
             )
+        } else {
+            conversation.add_assistant(response.content.clone())
+        };
+
+        // Log the full model response (no truncation). Non-empty content —
+        // on BOTH branches: assistant prose regularly accompanies tool
+        // calls — also gets its canonical conversation_message record,
+        // written by the same call as the sidecar span (no crash window).
+        slog(&session_log, |l| {
+            if response.content.trim().is_empty() {
+                let _ = l.model_response(
+                    &response.content,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cached_tokens,
+                    response.usage.cache_creation_tokens,
+                    None,
+                );
+            } else {
+                let _ = l.model_response_with_message(
+                    assistant_seq,
+                    &response.content,
+                    response.usage.prompt_tokens,
+                    response.usage.completion_tokens,
+                    response.usage.total_tokens,
+                    response.usage.cached_tokens,
+                    response.usage.cache_creation_tokens,
+                );
+            }
         });
 
         // Log reasoning content if available
@@ -1484,6 +1530,42 @@ pub(crate) async fn run_agent_loop(
                     serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
                 match spec_result {
                     Ok(mut spec) => {
+                        // Always-consent gate: `LiveAudioSpawn` is policy-pinned
+                        // to "ask at every autonomy level", and runtime-command
+                        // classification never sees controller-side tools —
+                        // enforce it here, before any audio side effect (bridge
+                        // creation, default-device switch).
+                        let consent_preview = live_audio::spawn_consent_preview(&spec);
+                        let category = autonomy::ActionCategory::LiveAudioSpawn.to_string();
+                        slog(&session_log, |l| {
+                            l.approval(&category, &consent_preview, "waiting")
+                        });
+                        let consent = match live_audio::request_spawn_consent(
+                            live_audio::SpawnConsentRequest {
+                                bus,
+                                approval_registry: Some(approval_registry),
+                                json_approval,
+                                no_approver: headless && json_approval.is_none(),
+                                session_id: local_session_id.clone(),
+                                preview: consent_preview.clone(),
+                            },
+                            live_audio::SPAWN_CONSENT_WAIT,
+                        )
+                        .await
+                        {
+                            Ok(consent) => consent,
+                            Err(denied) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&category, &consent_preview, "denied")
+                                });
+                                conversation.add_tool_result(call_id, "spawn_live_audio", &denied);
+                                continue;
+                            }
+                        };
+                        slog(&session_log, |l| {
+                            l.approval(&category, &consent_preview, "approved")
+                        });
+
                         let system_prompt = prompts::build_live_audio_prompt(
                             &spec.playbook,
                             &spec.response_schema,
@@ -1540,6 +1622,7 @@ pub(crate) async fn run_agent_loop(
 
                         let result = live_audio::run_session(
                             &spec,
+                            consent,
                             &api_key,
                             &bridge,
                             log_dir,
@@ -1661,19 +1744,38 @@ pub(crate) async fn run_agent_loop(
                             .unwrap_or_default(),
                         Ok(_) | Err(_) => String::new(),
                     };
-                    let reply = if answer.trim().is_empty() {
+                    let answered = !answer.trim().is_empty();
+                    let reply = if answered {
+                        slog(&session_log, |l| l.human_response_sent());
+                        answer
+                    } else {
                         "The user dismissed the question without answering. Proceed with \
                          your best judgment; you can re-ask later if it is still relevant."
                             .to_string()
-                    } else {
-                        slog(&session_log, |l| l.human_response_sent());
-                        answer
                     };
+                    let mut first_result_seq: Option<u64> = None;
                     for (call_id, tool_name) in &batch.call_id_names {
                         if handled_call_ids.contains(call_id) {
                             continue;
                         }
-                        conversation.add_tool_result(call_id, tool_name, &reply);
+                        let seq = conversation.add_tool_result(call_id, tool_name, &reply);
+                        first_result_seq.get_or_insert(seq);
+                    }
+                    // Native-tool askHuman answers enter the conversation as
+                    // tool results; project the raw answer into the message
+                    // lane referencing that result's seq (rewind cuts cover
+                    // it through ref_seq).
+                    if answered {
+                        if let Some(seq) = first_result_seq {
+                            slog(&session_log, |l| {
+                                let _ = l.conversation_message_user(
+                                    seq,
+                                    MessageProvenance::AskHumanAnswer,
+                                    &reply,
+                                    Some(seq),
+                                );
+                            });
+                        }
                     }
                     continue;
                 }
@@ -1962,6 +2064,7 @@ pub(crate) async fn run_agent_loop(
                 stderr: output.stderr.clone(),
                 source: None,
                 output_id: Some(output_id),
+                item_id: None,
             });
 
             // Map results back to individual tool responses
@@ -1997,6 +2100,7 @@ pub(crate) async fn run_agent_loop(
                     &session_log,
                     session_registry,
                     autonomy.read().await.user_display_granted,
+                    Some(&cu_observer),
                 )
                 .await;
             }
@@ -2011,6 +2115,7 @@ pub(crate) async fn run_agent_loop(
                 &session_log,
                 session_registry,
                 autonomy.read().await.user_display_granted,
+                Some(&cu_observer),
             )
             .await;
         } else {
@@ -2085,7 +2190,10 @@ pub(crate) async fn run_agent_loop(
                         l.debug(&format!("Turn {}: context management only", turn))
                     });
                     bus.send(AppEvent::ContextManagement { turn });
-                    conversation.add_user("Context updated.".to_string());
+                    conversation.add_user(
+                        MessageProvenance::SystemInjection,
+                        "Context updated.".to_string(),
+                    );
                     continue;
                 } else {
                     empty_command_streak += 1;
@@ -2112,6 +2220,7 @@ pub(crate) async fn run_agent_loop(
                         )
                     });
                     conversation.add_user(
+                        MessageProvenance::SystemInjection,
                         "No commands were produced. If the task is complete, respond with JSON containing done=true. Otherwise provide commands.".to_string(),
                     );
                     continue;
@@ -2128,6 +2237,7 @@ pub(crate) async fn run_agent_loop(
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
                 conversation.add_user(
+                    MessageProvenance::SystemInjection,
                     "askHuman is unavailable in headless mode (--no-tui or non-interactive stdin). \
 Proceed with explicit assumptions and continue without additional questions."
                         .to_string(),
@@ -2171,13 +2281,27 @@ Proceed with explicit assumptions and continue without additional questions."
                 };
                 if answer.trim().is_empty() {
                     conversation.add_user(
+                        MessageProvenance::SystemInjection,
                         "The user dismissed the question without answering. Proceed with \
                          your best judgment; you can re-ask later if it is still relevant."
                             .to_string(),
                     );
                 } else {
                     slog(&session_log, |l| l.human_response_sent());
-                    conversation.add_user(format!("The user's answer to your question: {answer}"));
+                    let seq = conversation.add_user(
+                        MessageProvenance::AskHumanAnswer,
+                        format!("The user's answer to your question: {answer}"),
+                    );
+                    // The canonical record carries the raw answer, closing
+                    // the audit hole where human_response_sent has no text.
+                    slog(&session_log, |l| {
+                        let _ = l.conversation_message_user(
+                            seq,
+                            MessageProvenance::AskHumanAnswer,
+                            &answer,
+                            None,
+                        );
+                    });
                 }
                 continue;
             }
@@ -2418,7 +2542,10 @@ Proceed with explicit assumptions and continue without additional questions."
             }
 
             if should_skip {
-                conversation.add_user("Command skipped by user.".to_string());
+                conversation.add_user(
+                    MessageProvenance::SystemInjection,
+                    "Command skipped by user.".to_string(),
+                );
                 continue;
             }
 
@@ -2454,6 +2581,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 stderr: output.stderr.clone(),
                 source: None,
                 output_id: Some(output_id),
+                item_id: None,
             });
 
             // Format agent output as next user message, include budget summary
@@ -2462,7 +2590,7 @@ Proceed with explicit assumptions and continue without additional questions."
                 user_msg.push_str(&format!("\nStderr:\n{}", output.stderr));
             }
             user_msg.push_str(&format!("\n\n{}", conversation.budget_summary()));
-            conversation.add_user(user_msg);
+            conversation.add_user(MessageProvenance::ToolOutput, user_msg);
         } // end tool_calls vs text branch
 
         // Auto-save conversation for resume capability
@@ -2484,6 +2612,66 @@ Proceed with explicit assumptions and continue without additional questions."
 
     slog(&session_log, |l| l.info("Agent loop finished"));
     Ok((loop_stats, exit_reason))
+}
+
+/// Claim (remove and return) pending user-steer injections targeted at
+/// this session, optionally narrowed to one steer id. The parked
+/// follow-up drain uses this to rescue steers a dying round's watcher
+/// accepted into `context_injection` — acceptance promised "the next
+/// model checkpoint", and when the round ends first, the parked drain IS
+/// that checkpoint (it starts the round that delivers them). Also the
+/// dedup for the acceptance race: a steer both claimed here and queued
+/// by the watcher's corpse must not deliver twice.
+fn claim_steer_injections(
+    context_injection: &event::ContextInjectionQueue,
+    local_session_id: &Option<String>,
+    steer_id: Option<&str>,
+) -> Vec<event::ContextInjection> {
+    let Ok(mut queue) = context_injection.lock() else {
+        return Vec::new();
+    };
+    let mut claimed = Vec::new();
+    let mut index = 0;
+    while index < queue.len() {
+        let injection = &queue[index];
+        let is_steer = injection.steer_id.is_some();
+        let targets_here = injection
+            .target_session_id
+            .as_deref()
+            .is_none_or(|target| Some(target) == local_session_id.as_deref());
+        let id_matches = steer_id.is_none_or(|want| {
+            injection
+                .steer_id
+                .as_deref()
+                .is_some_and(|have| have == want)
+        });
+        if is_steer && targets_here && id_matches {
+            claimed.push(queue.remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    claimed
+}
+
+/// The parked drain's exit when a steer reaches a between-rounds session:
+/// the synthesized next-round follow-up plus the acceptance the steer
+/// protocol expects (empty ids skip the ack — nothing correlates on "").
+fn steer_follow_up(
+    bus: &EventBus,
+    local_session_id: &Option<String>,
+    text: String,
+    steer_id: String,
+) -> FollowUpMessage {
+    if !steer_id.trim().is_empty() {
+        bus.send(AppEvent::SteerAccepted {
+            session_id: local_session_id.clone(),
+            id: steer_id.clone(),
+            reason: "Delivered to the parked session as the next round".to_string(),
+        });
+    }
+    FollowUpMessage::steer(text, UserAttachments::default(), steer_id)
+        .for_target(local_session_id.clone())
 }
 
 /// Wraps `run_agent_loop` in a multi-round loop that waits for follow-up messages
@@ -2514,6 +2702,11 @@ pub(crate) async fn run_round_loop(
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
     let local_session_id = session_log_id(&session_log);
     let mut follow_up_cancel_rx = bus.subscribe();
+    // Per-session round ledger: (round number, native message count at its
+    // end) — the parked drain resolves targeted conversation rollbacks
+    // from it (the supervised twin of the headless shape's file-watcher
+    // History lookup; round numbers are the ones RoundComplete broadcast).
+    let mut round_ledger: Vec<(usize, u32)> = Vec::new();
     let mut cancelled_follow_ups: HashSet<String> = HashSet::new();
 
     loop {
@@ -2569,6 +2762,7 @@ pub(crate) async fn run_round_loop(
                 // truncate the tail back to this point.
                 let turns_in_round = stats.turns;
                 let native_message_count = Some(conversation.messages().len() as u32);
+                round_ledger.push((round, conversation.messages().len() as u32));
                 bus.send(AppEvent::RoundComplete {
                     session_id: local_session_id.clone(),
                     round,
@@ -2576,62 +2770,200 @@ pub(crate) async fn run_round_loop(
                     native_message_count,
                 });
 
-                // Wait for follow-up message, while accepting queued
-                // cancellation requests before the next turn consumes them.
-                let Some(message) = (loop {
-                    while let Ok(AppEvent::FollowUpCancelRequested {
-                        session_id,
-                        id,
-                        reason,
-                    }) = follow_up_cancel_rx.try_recv()
-                    {
-                        if event_targets_session(&session_id, &local_session_id) {
-                            record_cancelled_follow_up_id(
-                                &mut cancelled_follow_ups,
-                                bus,
-                                local_session_id.as_deref(),
-                                id,
-                                &reason,
-                            );
+                // Parked-steer pickup, half 1 (see claim_steer_injections):
+                // a steer accepted by the dying round's watcher sits in
+                // `context_injection` with no next checkpoint — deliver it
+                // as the next round now. The fresh subscription below is
+                // created BEFORE the sweep so a steer cannot land between
+                // sweep and subscribe: it is either already in the queue
+                // (the sweep finds it) or observable on the subscription
+                // (the select arm finds it). It must be fresh — the
+                // round-long `follow_up_cancel_rx` backlog replays
+                // mid-round SteerRequested events the live watcher already
+                // handled.
+                let mut parked_steer_rx = bus.subscribe();
+                let mut orphaned =
+                    claim_steer_injections(context_injection, &local_session_id, None);
+                // One steer round per drain pass: deliver the first, put
+                // the rest back for the next pass (each delivery loops
+                // back through this drain).
+                if orphaned.len() > 1 {
+                    if let Ok(mut queue) = context_injection.lock() {
+                        for injection in orphaned.drain(1..).rev() {
+                            queue.insert(0, injection);
                         }
                     }
-                    tokio::select! {
-                        biased;
-                        bus_event = follow_up_cancel_rx.recv() => {
-                            match bus_event {
-                                Ok(AppEvent::FollowUpCancelRequested { session_id, id, reason })
-                                    if event_targets_session(&session_id, &local_session_id) =>
-                                {
-                                    record_cancelled_follow_up_id(
-                                        &mut cancelled_follow_ups,
-                                        bus,
-                                        local_session_id.as_deref(),
-                                        id,
-                                        &reason,
-                                    );
-                                }
-                                Ok(_) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                }
+
+                // Wait for follow-up message, while accepting queued
+                // cancellation requests before the next turn consumes them.
+                let Some(message) = (if let Some(injection) = orphaned.into_iter().next() {
+                    let steer_id = injection.steer_id.clone().unwrap_or_default();
+                    Some(steer_follow_up(
+                        bus,
+                        &local_session_id,
+                        injection.text,
+                        steer_id,
+                    ))
+                } else {
+                    loop {
+                        while let Ok(AppEvent::FollowUpCancelRequested {
+                            session_id,
+                            id,
+                            reason,
+                        }) = follow_up_cancel_rx.try_recv()
+                        {
+                            if event_targets_session(&session_id, &local_session_id) {
+                                record_cancelled_follow_up_id(
+                                    &mut cancelled_follow_ups,
+                                    bus,
+                                    local_session_id.as_deref(),
+                                    id,
+                                    &reason,
+                                );
                             }
                         }
-                        maybe_message = follow_up_rx.recv() => {
-                            match maybe_message {
-                                Some(message) => {
-                                    if follow_up_message_was_cancelled(
-                                        &mut cancelled_follow_ups,
-                                        &message,
-                                    ) {
-                                        slog(&session_log, |l| {
-                                            l.info("Skipped cancelled queued follow-up")
+                        tokio::select! {
+                            biased;
+                            bus_event = follow_up_cancel_rx.recv() => {
+                                match bus_event {
+                                    Ok(AppEvent::FollowUpCancelRequested { session_id, id, reason })
+                                        if event_targets_session(&session_id, &local_session_id) =>
+                                    {
+                                        record_cancelled_follow_up_id(
+                                            &mut cancelled_follow_ups,
+                                            bus,
+                                            local_session_id.as_deref(),
+                                            id,
+                                            &reason,
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                                }
+                            }
+                            steer_event = parked_steer_rx.recv() => {
+                                match steer_event {
+                                    Ok(AppEvent::SteerRequested { session_id, text, id })
+                                        if event_targets_session(&session_id, &local_session_id) =>
+                                    {
+                                        // Parked-steer pickup, half 2: this
+                                        // drain is the steer's checkpoint.
+                                        // Claim any same-id injection the
+                                        // dying watcher's corpse pushed so it
+                                        // cannot deliver a second time at the
+                                        // next round's turn-top drain.
+                                        if !id.trim().is_empty() {
+                                            let _ = claim_steer_injections(
+                                                context_injection,
+                                                &local_session_id,
+                                                Some(id.as_str()),
+                                            );
+                                        }
+                                        break Some(steer_follow_up(
+                                            bus,
+                                            &local_session_id,
+                                            text,
+                                            id,
+                                        ));
+                                    }
+                                    Ok(AppEvent::ConversationRollbackRequested {
+                                        session_id: Some(target),
+                                        round_id,
+                                        ..
+                                    }) if event_targets_session(
+                                        &Some(target.clone()),
+                                        &local_session_id,
+                                    ) =>
+                                    {
+                                        // Targeted conversation rollback:
+                                        // this parked drain is the
+                                        // supervised session's rollback
+                                        // executor. Resolve the round from
+                                        // the local ledger and truncate;
+                                        // the dashboard observes the
+                                        // completion event (the HTTP
+                                        // response never waited, same as
+                                        // the legacy path).
+                                        let target_count = round_ledger
+                                            .iter()
+                                            .find(|(number, _)| *number as u64 == round_id)
+                                            .map(|(_, count)| *count);
+                                        let removed = match target_count {
+                                            Some(count) => {
+                                                // Capture the surviving
+                                                // tail's seq BEFORE the
+                                                // truncate: truncate_to
+                                                // appends synthetic
+                                                // dangling-call repairs
+                                                // with fresh seqs that must
+                                                // not shift the cut (same
+                                                // rule as the headless
+                                                // path).
+                                                let clamped = (count as usize)
+                                                    .max(1)
+                                                    .min(conversation.len());
+                                                let cut_after_seq = conversation
+                                                    .messages()
+                                                    .get(clamped - 1)
+                                                    .map(|m| m.seq)
+                                                    .unwrap_or(0);
+                                                let removed = conversation
+                                                    .truncate_to(count as usize);
+                                                if removed > 0 {
+                                                    slog(&session_log, |l| {
+                                                        l.conversation_rewound(
+                                                            cut_after_seq,
+                                                            "tail_rollback",
+                                                        )
+                                                    });
+                                                }
+                                                round_ledger.retain(|(number, _)| {
+                                                    *number as u64 <= round_id
+                                                });
+                                                round = round_id as usize;
+                                                removed
+                                            }
+                                            // Unknown round: emit a 0-turn
+                                            // completion so the dashboard
+                                            // clears its pending state (the
+                                            // legacy path does the same
+                                            // when it cannot truncate).
+                                            None => 0,
+                                        };
+                                        bus.send(AppEvent::ConversationRolledBack {
+                                            session_id: local_session_id.clone(),
+                                            round_id,
+                                            turns_removed: removed as u32,
+                                            backend: "native".into(),
+                                            method: "truncated".into(),
                                         });
                                         continue;
                                     }
-                                    break Some(message);
+                                    Ok(_) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                                 }
-                                None => {
-                                    // Channel closed — user quit or sender dropped
-                                    break None;
+                            }
+                            maybe_message = follow_up_rx.recv() => {
+                                match maybe_message {
+                                    Some(message) => {
+                                        if follow_up_message_was_cancelled(
+                                            &mut cancelled_follow_ups,
+                                            &message,
+                                        ) {
+                                            slog(&session_log, |l| {
+                                                l.info("Skipped cancelled queued follow-up")
+                                            });
+                                            continue;
+                                        }
+                                        break Some(message);
+                                    }
+                                    None => {
+                                        // Channel closed — user quit or sender dropped
+                                        break None;
+                                    }
                                 }
                             }
                         }
@@ -2654,11 +2986,41 @@ pub(crate) async fn run_round_loop(
                         }
                     ))
                 });
-                if followup_images.is_empty() {
-                    conversation.add_user(followup_text);
-                } else {
-                    conversation.add_user_with_images(followup_text, followup_images);
+                // Acceptance-race dedup: if the dying watcher's corpse
+                // pushed this steer's injection AFTER the drain arm looked,
+                // claim it now — the text is about to enter the
+                // conversation through this follow-up.
+                if let Some(id) = message
+                    .steer_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    let _ = claim_steer_injections(context_injection, &local_session_id, Some(id));
                 }
+                // A between-rounds steer is delivered through this path
+                // (steer_id set); classify it as such rather than follow_up.
+                let followup_provenance = if message.steer_id.is_some() {
+                    MessageProvenance::Steer
+                } else {
+                    MessageProvenance::FollowUp
+                };
+                let followup_seq = if followup_images.is_empty() {
+                    conversation.add_user(followup_provenance, followup_text)
+                } else {
+                    conversation.add_user_with_images(
+                        followup_provenance,
+                        followup_text,
+                        followup_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        followup_seq,
+                        followup_provenance,
+                        &message.text,
+                        None,
+                    );
+                });
                 if let Some(id) = message.steer_id {
                     bus.send(AppEvent::SteerDelivered {
                         session_id: local_session_id.clone(),
@@ -2686,4 +3048,69 @@ pub(crate) async fn run_round_loop(
     }
 
     Ok(cumulative_stats)
+}
+
+#[cfg(test)]
+mod provenance_parity {
+    //! Emission-site parity: every conversation entry point must declare a
+    //! provenance, and new call sites must be consciously added to the
+    //! pinned counts (message-search plan §3 F1). This is the drift guard
+    //! for the `conversation_message` emit/skip allowlist.
+
+    fn source(file: &str) -> String {
+        let path = format!("{}/src/bin/caller/{}", env!("CARGO_MANIFEST_DIR"), file);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path, e))
+    }
+
+    /// Every add_user-family call's first argument must be a provenance
+    /// expression (`MessageProvenance::…` or a `*provenance` variable).
+    /// Patterns are assembled with `concat!` — and this comment avoids
+    /// spelling them — so the module never matches itself.
+    fn assert_classified(file: &str, pattern: &str, expected: usize) {
+        let text = source(file);
+        let mut count = 0;
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(pattern) {
+            let arg_start = from + pos + pattern.len();
+            let rest: String = text[arg_start..]
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take(80)
+                .collect();
+            let first_arg = rest.split(',').next().unwrap_or("");
+            assert!(
+                first_arg.contains("rovenance"),
+                "{}: `{}` call with unclassified first argument `{}` — every \
+                 conversation entry point declares a MessageProvenance",
+                file,
+                pattern,
+                first_arg
+            );
+            count += 1;
+            from = arg_start;
+        }
+        assert_eq!(
+            count, expected,
+            "{}: expected {} `{}` sites, found {} — a conversation entry \
+             point was added or removed; reconcile the emission map \
+             (message-search plan §4) and re-pin",
+            file, expected, pattern, count
+        );
+    }
+
+    #[test]
+    fn conversation_entry_points_are_classified_and_pinned() {
+        let add_user = concat!(".add_", "user(");
+        let add_user_with_images = concat!(".add_", "user_with_images(");
+        for (file, users, with_images) in [
+            ("agent_loop.rs", 9usize, 2usize),
+            ("main.rs", 17, 1),
+            ("run_modes.rs", 5, 3),
+            ("display_glue.rs", 1, 2),
+            ("presence.rs", 2, 0),
+        ] {
+            assert_classified(file, add_user, users);
+            assert_classified(file, add_user_with_images, with_images);
+        }
+    }
 }

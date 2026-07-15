@@ -108,12 +108,12 @@ loop.
 | MCP injection | Per-process `-c mcp_servers.intendant.{type,url}` overrides plus scoped env; no workspace config file | Inline `--mcp-config '{…}'` JSON string |
 | Multi-thread | Yes — many threads per process | No |
 | Native thread id | Yes | Yes — announced via `AgentEvent::NativeSessionId` on the first turn (placeholder `claude-code-session` until then; `--resume` keeps the id stable so resumed threads are canonical immediately) |
-| Mid-turn steer | Yes (`turn/steer`) | Yes — a user message written mid-turn is absorbed into the running turn |
+| Mid-turn steer | Yes (`turn/steer`) | No — 2.1.2xx discards stdin user messages mid-turn (2.1.200's absorb was a CLI bug, since removed); `steer_turn` reports queue semantics and the steer delivers at the turn boundary (or immediately as its own turn when idle) |
 | Mid-turn interrupt | Yes (`turn/interrupt`) | Yes (`control_request` `interrupt`; the process survives for follow-up turns) |
 | Token usage / context meter | Yes | Yes (`message_delta` + `result` usage; context window from `modelUsage`) |
 | Reasoning trace | Yes | Yes (`thinking` blocks) |
 | Rollback turns | Yes (`thread/rollback`) | No → session reset |
-| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No side/fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
+| Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | `compact`, `fork` (respawns via `--resume <id> --fork-session`), `side` (`/btw` — the same respawn carrying a side boundary + question as the child's first prompt; lineage `fork_relationship: "side"`), the full `goal*` family (wrapper goal engine), and live `model` / `permission-mode` — all via universal `thread_actions`. No fast/review/memory-reset — see [Dashboard and Station parity](#dashboard-and-station-parity-codex-vs-claude-code) |
 | Native sub-agents | Yes — collab tools spawn real attachable threads (`SubAgentToolCall`) | Yes — the in-band `Agent`/`Task` tool; async children stream `parent_tool_use_id`-tagged envelopes, surfaced as ephemeral `task-*` child sessions on the same `SubAgentToolCall`/relationship rail |
 
 Both spawn through `crate::platform::spawn_command(&cfg.command)` with the
@@ -508,9 +508,15 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   `error_during_execution`, mapped to a completed turn rather than a
   backend error when Intendant requested the interrupt); the process stays
   usable for follow-up turns.
-- **Steer**: a user message written while a turn runs is queued by the CLI
-  and absorbed into the *running* turn (the model reads it between tool
-  calls) — Intendant's `steer_turn` is exactly that write.
+- **Steer**: the CLI **discards** a user message written while a turn runs
+  (probed on 2.1.207; the 2.1.200-era absorb was a CLI bug, since removed,
+  and `system/init.capabilities` advertises no replacement protocol yet).
+  `steer_turn` therefore returns the load-bearing "mid-turn steering not
+  supported" / "no active turn" markers and the drain queues the text onto
+  `context_injection`: it delivers as a `[User]` line when the next turn's
+  message is sent, and an idle session flushes the queue immediately as
+  its own turn. Goal notices queue as next-prompt preludes for the same
+  reason (a mid-turn write would vanish).
 - **Usage**: per-API-call usage from `message_delta` stream events plus the
   turn `result` feed `AgentEvent::Usage`; the context window comes from the
   result's `modelUsage` map (200k default until the first result).
@@ -526,7 +532,26 @@ Protocol details that are load-bearing (verified against Claude Code 2.1.200):
   announces its own session id on its first prompt, which upgrades its
   identity and emits the `fork` relationship from the persisted
   `forked_from` lineage. Until that first prompt the forked window has no
-  native identity yet — expected, not a bug.
+  native identity yet — expected, not a bug. `side` (`/btw`) rides the
+  same respawn: Claude Code's native `/btw` is interactive-only (over
+  stream-json the CLI answers with a synthetic "isn't available in this
+  environment" result — probed on 2.1.206), so the side conversation is a
+  respawned `--fork-session` child whose first prompt carries the side
+  boundary (inherited history is reference-only, no mutations) plus the
+  question, and whose lineage persists as `fork_relationship: "side"` —
+  the identity upgrade emits an ephemeral `side` relationship (same flag
+  as Codex's in-process side start), so the dashboard renders a side
+  child window, fully conversable for follow-ups. The side contract text
+  is `external_agent::SIDE_CONVERSATION_CONTRACT`, shared verbatim with
+  Codex's side-thread developer instructions; display surfaces (session
+  meta, `SessionStarted`) strip the contract and show the bare question.
+  Unlike a Codex side thread there is no `side-close` — the respawned
+  child is its own live backend, so the dashboard offers **Stop session**
+  for it (the kebab's Close side appears only when the parent advertises
+  `side-close`). With `max_budget_usd` set, forks and side children
+  inherit the parent's counted spend (see the config reference). Both
+  dispatch sites (the external drain and the presence loop's inline
+  mirror) share `respawn_resume_thread_action`.
 - **Live reconfig** (wired): `control_request` subtypes `set_model` and
   `set_permission_mode` (verified on 2.1.201) back the `model` /
   `permission-mode` thread actions; the Launch-config modal applies both
@@ -589,9 +614,9 @@ capability-gated affordances in `app.html`, and `external_wrapper_index`.
 |---|---|---|---|
 | Steer / interrupt / stop affordances | `SessionCapabilities.{follow_up,steer,interrupt}`; the UI gates on capabilities, not backend type | emits all three | **Parity** (emits all three) |
 | Usage / context meter | `AgentEvent::Usage` → `UsageSnapshot` / `ContextSnapshot` | `token_count` notifications | **Parity** (`message_delta` + `result` usage) |
-| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices reach the model as mid-turn steers (absorbed) or as a prelude on the next prompt (idle updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
-| Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt). No Claude analog planned: side / fast / review / memory-reset |
-| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `subagent` emitted.** Fork on the forked child's first identity announcement (persisted `forked_from` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
+| Goal chip in the agent-window header (`/goal`) | `SessionGoal` type; `AgentEvent::GoalUpdated/GoalCleared`; `session_goal` outbound + log replay; the window chip renderer is backend-neutral; op semantics + wire conventions (statuses, budget shape, objective limit, notice texts) live in the shared `external_agent::GoalEngine`, which the Claude Code adapter and the native presence loop both run | native `thread/goal/*` RPCs | **Live — wrapper goal engine in the adapter.** The full `goal*` op family is advertised and dispatched; goal state lives in `CcShared`, notices always queue as a prelude on the next prompt (2.1.2xx discards mid-turn stdin writes; consecutive notices coalesce in order, and updates never buy a turn), and budget spend is measured in FRESH tokens (uncached input + cache creation + output — cache reads excluded), flipping `active` → `budgetLimited` at exhaustion. Engine state is per-process: after a resume the chip rehydrates from the log but the engine starts empty (re-set the goal) |
+| Per-window action menu (fork / compact / goals / …) | **Universal (landed):** `SessionCapabilities.thread_actions` op vocabulary + the `thread_action` control message (`codex_thread_action` stays a wire alias); the kebab and Station session actions render from the advertised op list, with the codex heuristic as legacy-replay fallback | full op set | **`compact` + `fork` + `side` live.** `compact` sends the native `/compact` user message (status → `compact_boundary` → free result); `fork` respawns via `ForkHandling::RespawnResume` → `ResumeSession { fork: true }` → `--resume <parent> --fork-session` (the child binds its own native id + the `fork` relationship on its first prompt); `side` (`/btw`) is the same respawn with `relationship_kind: "side"` and the boundary + question as the child's first prompt. No Claude analog planned: fast / review / memory-reset |
+| Relationship wiring (parent/sub/fork header chips + SVG wires; Station edges) | `session_relationship` event + lineage ledger + `/api` serving + both renderers — all backend-neutral | side / subagent / fork / fission / rewind emitters | **`fork` + `side` + `subagent` emitted.** Fork/side on the forked child's first identity announcement (persisted `forked_from` + `fork_relationship` lineage); in-band Task sub-agents ride `SubAgentToolCall` → ephemeral `task-*` child sessions with `subagent` relationships (fission observations stay Codex-only by design) |
 | Per-session persisted launch overlay | `SessionAgentConfig` + `ConfigureSessionAgent` / `Restart` (universal `agent_command` + backend fields, bundled as `LaunchOverrides`) | all `codex_*` fields | **Live.** `claude_model` / `claude_permission_mode` / `claude_allowed_tools` / `claude_effort` pins with inherit-vs-pin sentinels ("default" stays a pinnable permission mode; `all` pins explicitly-unrestricted tools), Launch-config modal rows, and LIVE apply of model + permission on save via the `model` / `permission-mode` thread actions (`set_model` / `set_permission_mode` control requests, verified on 2.1.201) |
 | Global runtime config pane | `Set*` ControlMsgs + `*ConfigChanged` broadcast + Settings/Control panes | 12 knobs | **3 knobs** (model / permission mode / allowed tools) — by design; grows only when CC grows equivalent concepts |
 | Station controls-panel runtime block | the controls panel renders per-backend blocks | approval policy / managed-context / fork-binary warning | **Live.** Model pills (default + the CLI's latest-version aliases fable/opus/sonnet/haiku, with a truthful `custom:` row for out-of-alias pins) and permission pills (default/edits/plan/bypass), gated `backend == "claude-code" \|\| launch_agent == "claude-code"` exactly like the Codex block, dispatching `set_claude_model` / `set_claude_permission_mode` (persisted to `intendant.toml` + broadcast, same as the dashboard Control pane) |
@@ -689,24 +714,25 @@ somebody asked a question; policy can't answer it.
 Frontends answer with `{"action": "answer_question", "id", "answers":
 {question → chosen label(s) or free text}}` (multi-select answers join with
 ", "). The adapter replies `allow` + `updatedInput.answers`, exactly what the
-CLI's own interactive picker returns, so the tool result reads "Your questions
-have been answered: …". The web dashboard renders a dedicated question panel
-(option buttons + free-text input + Skip); the TUI gets a `Question` mode
-(number keys pick, typing gives a custom answer, Esc dismisses); presence
-narrates the question text with its option labels. Dismissals (deny/skip) send
-a plain `deny` — never `interrupt` — so the model continues gracefully without
-an answer, and the bare approval verbs (`approve`/`approve_all` from clients
-that only speak approvals) let the question through with a "proceed on your
-best judgment" note instead of fabricating a choice. Headless runs without any
-frontend answer the same way instead of blocking forever, mirroring the CLI's
-own away-from-keyboard fallback.
+external CLI's own interactive picker returns, so the tool result reads "Your
+questions have been answered: …". The web dashboard renders a dedicated
+question panel (option buttons + free-text input + Skip), and presence narrates
+the question text with its option labels. Dismissals (deny/skip) send a plain
+`deny` — never `interrupt` — so the model continues gracefully without an
+answer, and the bare approval verbs (`approve`/`approve_all` from clients that
+only speak approvals) let the question through with a "proceed on your best
+judgment" note instead of fabricating a choice. Headless runs without any
+frontend answer the same way instead of blocking forever, mirroring the
+external CLI's own away-from-keyboard fallback.
 
 ## Configuration
 
 External-agent settings live under `[agent]` in `intendant.toml`
-(`ExternalAgentConfig` in `project.rs`). `default_backend` selects the mode; the
-per-backend subtables tune each tool. All keys have defaults, so a bare `[agent]`
-with just `default_backend` works.
+(`ExternalAgentConfig` in `project.rs`). An attached project uses its own file;
+a projectless daemon uses `<state-root>/intendant.toml` (normally
+`~/.intendant/intendant.toml`) for daemon-wide defaults. `default_backend`
+selects the mode; the per-backend subtables tune each tool. All keys have
+defaults, so a bare `[agent]` with just `default_backend` works.
 
 ```toml
 [agent]
@@ -716,10 +742,10 @@ default_backend = "codex"
 
 [agent.codex]
 command          = "codex"            # binary on PATH or absolute path
-model            = "gpt-5-codex"      # optional; omit to use Codex's default
+model            = "gpt-5.6-sol"      # optional; omit to use Codex's default
 approval_policy  = "on-request"       # untrusted | on-request | never
 sandbox          = "workspace-write"  # read-only | workspace-write | danger-full-access
-reasoning_effort = "medium"           # ""(default) | minimal | low | medium | high | xhigh
+reasoning_effort = "medium"           # ""(default) | none | minimal | low | medium | high | xhigh | max | ultra
 service_tier     = ""                 # ""(inherit Codex default) | priority (Fast) | flex | standard (explicit opt-out sentinel)
 web_search       = false              # enable the Responses web_search tool
 network_access   = false              # outbound net inside workspace-write only
@@ -730,7 +756,7 @@ context_archive = "summary"          # summary | exact | off — context snapsho
 [agent.claude_code]
 command         = "claude"
 model           = "claude-sonnet-4-6"  # optional; any claude CLI --model value (e.g. "haiku")
-permission_mode = "default"           # default | acceptEdits | plan | bypassPermissions (legacy "auto" = default)
+permission_mode = "default"           # default (alias manual) | acceptEdits | plan | auto | dontAsk | bypassPermissions
 allowed_tools   = []                  # e.g. ["Read", "Edit", "Bash"]; empty = all
 ```
 
@@ -775,8 +801,10 @@ shared state (when driven over MCP) → config default → native.
   root, and logs later `thread/settings/updated` cwd notifications so harness
   runs do not silently display a requested root as if Codex had accepted it.
 - **Per-session launch config beats global defaults.** Dashboard-created and
-  dashboard-configured external sessions persist their binary command and, for
-  Codex, `managed_context` mode. Both resume paths — daemon resume/attach and
+  dashboard-configured external sessions persist their binary command and
+  backend-specific launch fields, including launch-time Codex model and
+  reasoning-effort pins. Both
+  resume paths — daemon resume/attach and
   CLI `--resume` — rehydrate that persisted per-session config with the same
   precedence: explicit overrides (dashboard launch options or CLI flags), then
   the persisted per-session config, then the global Settings pane /

@@ -190,7 +190,9 @@ pub(crate) fn load_or_create_vapid_keypair(
     .map_err(|_| "stored VAPID key is invalid".to_string())
 }
 
-pub(crate) async fn push_vapid_public_key(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+pub(crate) async fn push_vapid_public_key(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
     use ring::signature::KeyPair as _;
     Json(json!({
         "ok": true,
@@ -388,11 +390,12 @@ pub(crate) fn notify_signing_payload(
 }
 
 /// Request kinds a nudge may name. A closed vocabulary — extending it is a
-/// deliberate act on both binaries (planned: display requests), never free
-/// text from the wire. `notify` is an urgent `notify_user` agent
-/// notification escalated by the daemon's attention monitor
-/// (`src/bin/caller/attention_nudge.rs`).
-const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify"];
+/// deliberate act on both binaries, never free text from the wire.
+/// `notify` is an urgent `notify_user` agent notification escalated by the
+/// daemon's attention monitor (`src/bin/caller/attention_nudge.rs`);
+/// `display_request` is the user-display doorbell
+/// (`request_user_display`) waiting on the owner's click.
+const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify", "display_request"];
 
 /// Compose the Web Push payload for a pending-request nudge.
 ///
@@ -421,6 +424,12 @@ pub(crate) fn attention_push_payload(
             format!("{daemon_label}: urgent agent notification"),
             format!("Session \u{201c}{session_label}\u{201d} needs your attention."),
         ),
+        "display_request" => (
+            format!("{daemon_label}: agent asks to view your screen"),
+            format!(
+                "Session \u{201c}{session_label}\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
+            ),
+        ),
         _ => (
             format!("{daemon_label}: approval needed"),
             format!("Session \u{201c}{session_label}\u{201d} is waiting for your approval."),
@@ -429,10 +438,9 @@ pub(crate) fn attention_push_payload(
     json!({
         "title": title,
         "body": body,
-        "url": format!(
-            "/app?connect=1&daemon_id={}",
-            form_urlencoded::byte_serialize(daemon_id.as_bytes()).collect::<String>()
-        ),
+        // Connect cannot open the daemon at role:none. Land on the route
+        // directory, whose cards explain which trusted client to use.
+        "url": "/connect",
         // One stacked notification per daemon: later nudges replace
         // earlier ones instead of piling up.
         "tag": format!("attention-{daemon_id}"),
@@ -517,7 +525,8 @@ pub(crate) async fn daemon_notify(
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| daemon.daemon_id.clone());
     let session_label = clean_fleet_text(&body.session_label, FLEET_LABEL_MAX);
-    let push_payload = attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
+    let push_payload =
+        attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
     let mut sent = 0;
     let mut dead = Vec::new();
     for subscription in &subscriptions {
@@ -664,7 +673,7 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
             continue;
         }
         let mut dead = Vec::new();
-        for (daemon_id, label, owner, online, offline_for) in transitions {
+        for (_daemon_id, label, owner, online, offline_for) in transitions {
             let payload = json!({
                 "title": if online { format!("{label} is back online") } else { format!("{label} went offline") },
                 "body": if online {
@@ -672,7 +681,7 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
                 } else {
                     "It stopped polling the rendezvous. The machine may be off, asleep, or disconnected.".to_string()
                 },
-                "url": format!("/app?connect=1&daemon_id={daemon_id}"),
+                "url": "/connect",
             });
             for subscription in subscriptions
                 .iter()
@@ -889,7 +898,7 @@ mod tests {
             payload["body"],
             "Session \u{201c}deploy review\u{201d} is waiting for your approval."
         );
-        assert_eq!(payload["url"], "/app?connect=1&daemon_id=daemon-1");
+        assert_eq!(payload["url"], "/connect");
         assert_eq!(payload["tag"], "attention-daemon-1");
 
         let question = attention_push_payload("question", "workshop", "s-1", "daemon-1");
@@ -908,6 +917,26 @@ mod tests {
             notify["body"],
             "Session \u{201c}s-1\u{201d} needs your attention."
         );
+
+        // Display requests keep the same discipline: kind + labels only —
+        // the agent's reason text never rides the push.
+        let display = attention_push_payload("display_request", "workshop", "s-1", "daemon-1");
+        let display_keys: Vec<&str> = {
+            let mut keys: Vec<&str> = display
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(display_keys, vec!["body", "tag", "title", "url"]);
+        assert_eq!(display["title"], "workshop: agent asks to view your screen");
+        assert_eq!(
+            display["body"],
+            "Session \u{201c}s-1\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
+        );
     }
 
     /// The nudge request wire shape has no content-bearing fields: an old
@@ -917,7 +946,10 @@ mod tests {
     #[test]
     fn notify_request_kinds_are_a_closed_vocabulary() {
         for kind in NOTIFY_KINDS {
-            assert!(matches!(*kind, "approval" | "question" | "notify"));
+            assert!(matches!(
+                *kind,
+                "approval" | "question" | "notify" | "display_request"
+            ));
         }
         let parsed: DaemonNotifyRequest = serde_json::from_value(json!({
             "protocol": "intendant-connect-daemon-notify-v1",

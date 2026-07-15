@@ -813,7 +813,7 @@ pub(crate) fn parse_gemini_cu_action(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::tests::{tool_msg_with_images};
+    use crate::provider::tests::tool_msg_with_images;
 
     // --- Gemini tests ---
 

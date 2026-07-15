@@ -167,7 +167,9 @@ pub(crate) fn persisted_namespace_schema(namespace: &str) -> u32 {
         // v1: summaries persist `first_usage_event` instead of the full
         // `usage_events` history; pre-v1 entries would deserialize with a
         // defaulted first event and mis-baseline forked sessions.
-        "codex" => 1,
+        // v2: usage includes GPT-5.6 cache writes; v1 would deserialize the
+        // new bucket as zero and preserve an understated historical cost.
+        "codex" => 2,
         _ => 0,
     }
 }
@@ -219,9 +221,21 @@ pub(crate) fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
     entry.key.matches(key).then_some(entry.value)
 }
 
+/// The persisted (on-disk) tier of the session index is DISABLED in
+/// unit-test builds, at these ambient wrappers: the index is the daemon's
+/// own derived cache under its state root, so every row a test's catalog
+/// scan parses would otherwise write a JSON blob into the machine's real
+/// `~/.intendant/cache/session_index` — the write-through leak the
+/// empty-HOME acceptance run catches (tests-are-hermetic). Same shape as
+/// listener.rs's `#[cfg(not(test))]` warm-scan gate; the in-memory tiers
+/// stay fully exercised and the `_in`-suffixed fns remain the persisted
+/// tier's testable seam (see this file's round-trip tests).
 pub(crate) fn load_persisted_session_entry<T: serde::de::DeserializeOwned>(
     key: &SessionListCacheKey,
 ) -> Option<T> {
+    if cfg!(test) {
+        return None;
+    }
     load_persisted_session_entry_in(&session_index_dir(), key)
 }
 
@@ -243,12 +257,20 @@ pub(crate) fn store_persisted_session_entry_in<T: Serialize>(
 }
 
 pub(crate) fn store_persisted_session_entry<T: Serialize>(key: &SessionListCacheKey, value: &T) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     store_persisted_session_entry_in(&session_index_dir(), key, value);
 }
 
 pub(crate) fn load_persisted_intendant_row(
     fingerprint: &SessionDirFingerprint,
 ) -> Option<serde_json::Value> {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return None;
+    }
     let path = session_index_entry_path("intendant-row", &fingerprint.path);
     let bytes = std::fs::read(path).ok()?;
     let entry: PersistedIntendantSessionEntry = serde_json::from_slice(&bytes).ok()?;
@@ -259,6 +281,10 @@ pub(crate) fn store_persisted_intendant_row(
     fingerprint: &SessionDirFingerprint,
     row: &serde_json::Value,
 ) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     let entry = PersistedIntendantSessionEntry {
         fingerprint: fingerprint.clone(),
         row: row.clone(),
@@ -271,6 +297,10 @@ pub(crate) fn store_persisted_intendant_row(
 }
 
 pub(crate) fn remove_persisted_intendant_row(dir: &Path) {
+    // Disk tier off under test — see load_persisted_session_entry.
+    if cfg!(test) {
+        return;
+    }
     let path = session_index_entry_path("intendant-row", &session_list_path_key(dir));
     let _ = std::fs::remove_file(path);
 }
@@ -892,9 +922,8 @@ mod tests {
     }
 
     /// Pre-schema "codex" entries carried the full usage_events history and
-    /// no schema stamp; they must read as misses (a defaulted
-    /// first_usage_event would mis-baseline forked sessions), while
-    /// current-schema entries round-trip.
+    /// no schema stamp; schema-v1 entries predate cache-write accounting.
+    /// Both must read as misses, while current-schema entries round-trip.
     #[test]
     fn persisted_codex_entry_schema_mismatch_is_a_miss() {
         let dir = tempfile::tempdir().unwrap();
@@ -934,6 +963,13 @@ mod tests {
             session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(
+            load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
+        );
+
+        let mut previous_schema = legacy.clone();
+        previous_schema["schema"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&previous_schema).unwrap()).unwrap();
         assert!(
             load_persisted_session_entry_in::<CodexSessionListSummary>(dir.path(), &key).is_none()
         );

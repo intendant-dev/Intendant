@@ -18,41 +18,57 @@ pub(crate) fn spawn_control_request(
     let cancel = CancellationToken::new();
     pending_requests.insert(id.clone(), cancel.clone());
     tokio::spawn(async move {
-        let response = match method.as_str() {
-            "api_session_report" => {
-                api_session_report_task_response(id.clone(), params.as_ref(), &runtime).await
-            }
-            "api_session_current_upload_raw" => {
-                api_session_current_upload_raw_task_response(id.clone(), params.as_ref(), &runtime)
-                    .await
-            }
-            "api_recording_asset" => {
-                api_recording_asset_task_response(id.clone(), params.as_ref(), &runtime).await
-            }
-            "api_session_recording_asset" => {
-                api_session_recording_asset_task_response(id.clone(), params.as_ref()).await
-            }
-            "api_session_frame_asset" => {
-                api_session_frame_asset_task_response(id.clone(), params.as_ref()).await
-            }
-            "api_fs_read" => api_fs_read_task_response(id.clone(), params.as_ref()).await,
-            "api_transfer_download_read" => {
-                api_transfer_download_read_task_response(id.clone(), params.as_ref(), &runtime)
-                    .await
-            }
-            _ => {
-                let frame =
-                    control_request_response(id.clone(), method, params, runtime, cancel).await;
-                ControlTaskResponse {
-                    id,
-                    frame,
-                    byte_stream: None,
-                    done: true,
-                }
-            }
-        };
+        let response = control_request_response(id, method, params, runtime, cancel).await;
         let _ = task_tx.send(response).await;
     });
+}
+
+/// The spawned request lane's one method→handler binding
+/// (transport-unification S11): byte-capable methods answer as complete
+/// task responses (`byte_stream_*` sequences, with their JSON error
+/// shapes riding the same task envelope); every other declared method
+/// produces its single JSON response frame through
+/// [`control_request_frame`], wrapped into the task envelope once at
+/// this seam. Each arm's body is the tunnel's transport edge — param
+/// decode, ambient resolution, the lane adapter — around the shared
+/// neutral core.
+pub(crate) async fn control_request_response(
+    id: String,
+    method: String,
+    params: Option<serde_json::Value>,
+    runtime: ControlRuntime,
+    cancel: CancellationToken,
+) -> ControlTaskResponse {
+    match method.as_str() {
+        "api_session_report" => {
+            api_session_report_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_session_current_upload_raw" => {
+            api_session_current_upload_raw_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_recording_asset" => {
+            api_recording_asset_task_response(id, params.as_ref(), &runtime).await
+        }
+        "api_session_recording_asset" => {
+            api_session_recording_asset_task_response(id, params.as_ref()).await
+        }
+        "api_session_frame_asset" => {
+            api_session_frame_asset_task_response(id, params.as_ref()).await
+        }
+        "api_fs_read" => api_fs_read_task_response(id, params.as_ref()).await,
+        "api_transfer_download_read" => {
+            api_transfer_download_read_task_response(id, params.as_ref(), &runtime).await
+        }
+        _ => {
+            let frame = control_request_frame(id.clone(), method, params, runtime, cancel).await;
+            ControlTaskResponse {
+                id,
+                frame,
+                byte_stream: None,
+                done: true,
+            }
+        }
+    }
 }
 
 pub(crate) fn spawn_control_stream(
@@ -146,7 +162,26 @@ pub(crate) async fn api_credential_egress_probe_response(
     }
 }
 
-pub(crate) async fn control_request_response(
+/// The tunnel's `api_access_connect_unclaim` twin: the S6 neutral core
+/// under the family's historical ok/error envelope (the transport edge
+/// hands over this daemon's project root).
+pub(crate) async fn api_access_connect_unclaim_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_ok_error_response(
+        id,
+        crate::web_gateway::access_connect_unclaim_api_response(runtime.project_root.clone()).await,
+        "connect unclaim",
+    )
+}
+
+/// The JSON half of the spawned lane's binding: one arm per method,
+/// each producing the single `response` frame its wire shape has always
+/// been. Split from [`control_request_response`] so the byte-capable
+/// arms above can keep the task-response envelope without re-wrapping
+/// every JSON arm.
+pub(crate) async fn control_request_frame(
     id: String,
     method: String,
     params: Option<serde_json::Value>,
@@ -160,26 +195,7 @@ pub(crate) async fn control_request_response(
         "api_credential_egress_probe" => {
             api_credential_egress_probe_response(id, params.as_ref()).await
         }
-        "api_access_connect_unclaim" => {
-            match crate::web_gateway::access_connect_unclaim_response_value(
-                runtime.project_root.clone(),
-            )
-            .await
-            {
-                Ok(result) => serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": result,
-                }),
-                Err(error) => serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": error,
-                }),
-            }
-        }
+        "api_access_connect_unclaim" => api_access_connect_unclaim_response(id, &runtime).await,
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
         "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
@@ -203,7 +219,7 @@ pub(crate) async fn control_request_response(
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         }
-        "api_transfer_jobs" => api_transfer_jobs_response(id, &runtime).await,
+        "api_transfer_jobs" => api_transfer_jobs_response(id, params.as_ref(), &runtime).await,
         "api_transfer_job_create" => {
             api_transfer_job_create_response(id, params.as_ref(), &runtime).await
         }
@@ -226,6 +242,9 @@ pub(crate) async fn control_request_response(
         "api_fs_rename" => api_fs_rename_response(id, params.as_ref()).await,
         "api_fs_delete" => api_fs_delete_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
+        "api_sessions_message_search" => {
+            api_sessions_message_search_response(id, params.as_ref()).await
+        }
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
         "api_control_msg" => api_control_msg_response(id, params.as_ref(), &runtime).await,
@@ -236,23 +255,35 @@ pub(crate) async fn control_request_response(
             api_dashboard_action_msg_response(id, params.as_ref(), &runtime).await
         }
         "api_diagnostics_visual_freshness" => {
-            api_diagnostics_visual_freshness_response(id, params.as_ref()).await
+            // The transport edge resolves the ambient state dir; the
+            // handler below it is path-parameterized (hermeticity
+            // convention).
+            api_diagnostics_visual_freshness_response(
+                id,
+                params.as_ref(),
+                crate::platform::intendant_home(),
+            )
+            .await
         }
-        "api_key_status" => json_body_response(
+        "api_key_status" => frame_api_json_body_response(
             id,
-            crate::web_gateway::api_key_status_response_body(),
+            crate::web_gateway::api_key_status_api_response(),
             "api key status",
         ),
-        "api_external_agents" => json_body_response(
+        "api_external_agents" => frame_api_json_body_response(
             id,
-            crate::web_gateway::external_agents_response_body(runtime.project_root.as_deref()),
+            crate::web_gateway::external_agents_api_response(
+                runtime.project_root.as_deref(),
+                // Same seam: the edge resolves home.
+                &crate::platform::home_dir(),
+            ),
             "external agents",
         ),
         "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
         "api_voice_session" => api_voice_session_response(id, &runtime).await,
-        "api_project_root" => json_body_response(
+        "api_project_root" => frame_api_json_body_response(
             id,
-            crate::web_gateway::project_root_response_body(runtime.project_root.as_deref()),
+            crate::web_gateway::project_root_api_response(runtime.project_root.as_deref()),
             "project root",
         ),
         "api_displays" => api_displays_response(id, &runtime).await,
@@ -342,22 +373,41 @@ pub(crate) async fn control_request_response(
     }
 }
 
+/// The tunnel's `api_sessions_stream` twin (S10): the transport edge
+/// parses its own limit vocabulary, the S10 neutral core spawns the ONE
+/// line source both lanes share, and the `stream_*` framer below is
+/// this lane's writer.
 pub(crate) async fn stream_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
     task_tx: mpsc::Sender<ControlTaskResponse>,
     cancel: CancellationToken,
 ) {
-    let request_line = sessions_stream_request_line(params);
-    let (line_tx, line_rx) = mpsc::channel::<String>(64);
-    let stream_task = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::stream_sessions_from_request(&request_line, line_tx);
-    });
+    let requested_limit = sessions_stream_requested_limit(params);
+    let crate::web_gateway::ApiResponse::Stream { stream, .. } =
+        crate::web_gateway::sessions_stream_api_response(requested_limit)
+    else {
+        // The sessions-stream core always answers on the Stream lane; a
+        // buffered response reaching this framer is a wiring bug.
+        let _ = task_tx
+            .send(ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "stream_end",
+                    "id": id,
+                    "ok": false,
+                    "error": "session stream returned a buffered response",
+                }),
+                byte_stream: None,
+                done: true,
+            })
+            .await;
+        return;
+    };
     stream_json_lines_response(
         id,
         "api_sessions_stream".to_string(),
-        line_rx,
-        stream_task,
+        stream,
         task_tx,
         cancel,
     )
@@ -367,11 +417,14 @@ pub(crate) async fn stream_sessions_response(
 pub(crate) async fn stream_json_lines_response(
     id: String,
     method: String,
-    mut line_rx: mpsc::Receiver<String>,
-    stream_task: tokio::task::JoinHandle<()>,
+    stream: crate::web_gateway::LineStream,
     task_tx: mpsc::Sender<ControlTaskResponse>,
     cancel: CancellationToken,
 ) {
+    let crate::web_gateway::LineStream {
+        lines: mut line_rx,
+        source: stream_task,
+    } = stream;
     if cancel.is_cancelled() {
         return;
     }
@@ -473,36 +526,39 @@ pub(crate) async fn stream_json_lines_response(
     }
 }
 
-pub(crate) fn sessions_stream_request_line(params: Option<&serde_json::Value>) -> String {
-    let Some(params) = params else {
-        return "GET /api/sessions/stream HTTP/1.1".to_string();
-    };
-    let Some(limit_value) = params.get("limit") else {
-        return "GET /api/sessions/stream HTTP/1.1".to_string();
-    };
+/// The tunnel's sessions-stream limit vocabulary, parsed at this
+/// transport's edge into the neutral core's `Option<usize>` (`None` =
+/// unlimited). Byte-for-byte the semantics of the retired
+/// params→request-line synthesis composed with the HTTP lane's
+/// `session_list_limit_from_request` (the equivalence pins live in the
+/// tests): absent `limit` and the "all"/"full" escapes are unlimited;
+/// invalid shapes (zero, negatives, floats, non-numeric strings, other
+/// JSON types — including the historical `"unlimited"` quirk, which
+/// only the HTTP query vocabulary accepts) collapse to
+/// `CONTROL_DEFAULT_SESSION_LIMIT`; everything is capped at the HTTP
+/// lane's `SESSION_LIST_LIMIT`.
+pub(crate) fn sessions_stream_requested_limit(params: Option<&serde_json::Value>) -> Option<usize> {
+    let limit_value = params?.get("limit")?;
     let limit = match limit_value {
         serde_json::Value::String(value) => {
             let value = value.trim();
             if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("full") {
-                "all".to_string()
-            } else {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|limit| *limit > 0)
-                    .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
-                    .to_string()
+                return None;
             }
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
         }
         serde_json::Value::Number(value) => value
             .as_u64()
             .and_then(|limit| usize::try_from(limit).ok())
             .filter(|limit| *limit > 0)
-            .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
-            .to_string(),
-        _ => CONTROL_DEFAULT_SESSION_LIMIT.to_string(),
+            .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT),
+        _ => CONTROL_DEFAULT_SESSION_LIMIT,
     };
-    format!("GET /api/sessions/stream?limit={limit} HTTP/1.1")
+    Some(limit.min(crate::web_gateway::SESSION_LIST_LIMIT))
 }
 
 pub(crate) fn cancelled_control_response(id: String, existed: bool) -> serde_json::Value {
@@ -522,6 +578,16 @@ pub(crate) fn cancelled_control_response(id: String, existed: bool) -> serde_jso
 pub(crate) async fn api_session_detail_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_detail_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_detail_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
@@ -544,8 +610,27 @@ pub(crate) async fn api_session_detail_response(
     let session_id = session_id.trim().to_string();
     let limit = control_session_detail_limit(&params);
     let before = control_session_detail_before(&params);
+    // Anchored-read parameter (message-search C2): the tunnel's params
+    // are structured, so `locate` may arrive as the locator JSON object
+    // itself — stringify it into the same wire form the HTTP lane's
+    // query parameter carries (raw JSON or base64url). Non-string
+    // non-object values stringify too and fail parsing as 400, like any
+    // malformed locate.
+    let locate = params.get("locate").and_then(|value| match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(raw) => Some(raw.clone()),
+        other => Some(other.to_string()),
+    });
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_detail_api_response(&session_id, &source, limit, before)
+        crate::web_gateway::session_detail_api_response(
+            &home,
+            &session_id,
+            &source,
+            limit,
+            before,
+            locate.as_deref(),
+        )
     })
     .await;
     match result {
@@ -564,6 +649,18 @@ pub(crate) async fn api_session_report_task_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_report_task_response_from_home(id, params, runtime, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_session_report_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    home: &std::path::Path,
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = optional_string_param(&params, &["session_id", "sessionId", "id"])
         .unwrap_or_else(|| "current".to_string());
@@ -571,8 +668,10 @@ pub(crate) async fn api_session_report_task_response(
         let session = runtime.shared_session.read().await;
         (session.session_log.clone(), session.query_ctx.clone())
     };
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::session_report_zip_for_request(
+            &home,
             &session_id,
             session_log.as_ref(),
             query_ctx.as_ref(),
@@ -624,27 +723,12 @@ pub(crate) async fn api_session_report_task_response(
             };
         }
     };
-    let size = report.bytes.len();
-    let filename = report.filename;
-    let content_type = "application/zip".to_string();
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: serde_json::Value::Null,
-        byte_stream: Some(ControlByteStream {
-            id: id.clone(),
-            stream_id: format!("{id}:session-report"),
-            content_type: content_type.clone(),
-            filename: Some(filename.clone()),
-            bytes: report.bytes,
-            result: serde_json::json!({
-                "ok": true,
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-            }),
-        }),
-        done: true,
-    }
+    frame_api_task_response(
+        id,
+        crate::web_gateway::session_report_api_response(report),
+        "session-report",
+        "session report",
+    )
 }
 
 pub(crate) async fn api_session_current_upload_raw_task_response(
@@ -698,7 +782,10 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             };
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(runtime.project_root.as_deref());
+    let scope = crate::global_store::StoreScope::resolve_in(
+        runtime.project_root.as_deref(),
+        &runtime.state_root,
+    );
     let session_log = {
         let session = runtime.shared_session.read().await;
         session.session_log.clone()
@@ -728,101 +815,25 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
     };
     let upload_id_for_stream = upload_id.clone();
     let read_result = tokio::task::spawn_blocking(move || {
-        let Some(descriptor) = crate::upload_store::find_upload(&upload_id, &session_dir, &scope)
-        else {
-            return Err((
-                404,
-                serde_json::json!({ "ok": false, "error": "upload not found" }),
-            ));
-        };
-        let metadata = std::fs::metadata(&descriptor.path).map_err(|e| {
-            (
-                500,
-                serde_json::json!({ "ok": false, "error": format!("stat upload: {e}") }),
-            )
-        })?;
-        let total_size = metadata.len();
-        if offset > total_size {
-            return Err((
-                416,
-                serde_json::json!({
-                    "ok": false,
-                    "error": "range start beyond upload size",
-                    "total_size": total_size,
-                }),
-            ));
-        }
-        let available = total_size.saturating_sub(offset);
-        let requested = length.unwrap_or(available).min(available);
-        if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
-            return Err((
-                413,
-                serde_json::json!({
-                    "ok": false,
-                    "error": format!(
-                        "range too large: {} bytes (cap is {})",
-                        requested,
-                        crate::web_gateway::UPLOAD_MAX_BYTES
-                    ),
-                }),
-            ));
-        }
-        let transfer_len = usize::try_from(requested).map_err(|_| {
-            (
-                413,
-                serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-            )
-        })?;
-        let mut file = std::fs::File::open(&descriptor.path).map_err(|e| {
-            (
-                500,
-                serde_json::json!({ "ok": false, "error": format!("open upload: {e}") }),
-            )
-        })?;
-        file.seek(std::io::SeekFrom::Start(offset)).map_err(|e| {
-            (
-                500,
-                serde_json::json!({ "ok": false, "error": format!("seek upload: {e}") }),
-            )
-        })?;
-        let mut bytes = vec![0u8; transfer_len];
-        file.read_exact(&mut bytes).map_err(|e| {
-            (
-                500,
-                serde_json::json!({ "ok": false, "error": format!("read upload: {e}") }),
-            )
-        })?;
-        let end = offset.saturating_add(requested);
-        let descriptor_id = descriptor.id.clone();
-        let descriptor_name = descriptor.name.clone();
-        let descriptor_mime = descriptor.mime.clone();
-        Ok((
-            descriptor_name.clone(),
-            descriptor_mime.clone(),
-            bytes,
-            serde_json::json!({
-                "ok": true,
-                "id": descriptor_id,
-                "name": descriptor_name,
-                "filename": descriptor_name,
-                "mime": descriptor_mime,
-                "content_type": descriptor_mime,
-                "size": requested,
-                "total_size": total_size,
-                "offset": offset,
-                "range_start": offset,
-                "range_end": end,
-                "resumable": true,
-            }),
-        ))
+        crate::web_gateway::current_upload_raw_api_response(
+            &upload_id,
+            Some((offset, length)),
+            &session_dir,
+            &scope,
+        )
     })
     .await;
-    let (filename, content_type, bytes, result) = match read_result {
-        Ok(Ok(value)) => value,
-        Ok(Err((status, body))) => {
+    let response = match read_result {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => {
             return ControlTaskResponse {
                 id: id.clone(),
-                frame: http_body_response(id, status, body.to_string(), "upload raw"),
+                frame: http_body_response(
+                    id,
+                    err.status(),
+                    upload_raw_tunnel_error_body(&err).to_string(),
+                    "upload raw",
+                ),
                 byte_stream: None,
                 done: true,
             };
@@ -841,19 +852,27 @@ pub(crate) async fn api_session_current_upload_raw_task_response(
             };
         }
     };
-    ControlTaskResponse {
-        id: id.clone(),
-        frame: serde_json::Value::Null,
-        byte_stream: Some(ControlByteStream {
-            id: id.clone(),
-            stream_id: format!("{id}:upload:{upload_id_for_stream}"),
-            content_type,
-            filename: Some(filename),
-            bytes,
-            result,
-        }),
-        done: true,
+    frame_api_task_response(
+        id,
+        response,
+        &format!("upload:{upload_id_for_stream}"),
+        "upload raw",
+    )
+}
+
+/// The tunnel's historical error bodies for the upload-raw content core:
+/// `{"ok":false,"error":…}` objects, the 416 additionally carrying
+/// `total_size` — versus HTTP's wildcard `{"error":…}` framing of the
+/// same [`crate::web_gateway::CurrentUploadRawError`] (the enumerated
+/// per-lane difference).
+fn upload_raw_tunnel_error_body(
+    err: &crate::web_gateway::CurrentUploadRawError,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({ "ok": false, "error": err.message() });
+    if let crate::web_gateway::CurrentUploadRawError::RangeBeyondSize { total_size } = err {
+        body["total_size"] = serde_json::json!(total_size);
     }
+    body
 }
 
 pub(crate) async fn api_session_current_uploads_response(
@@ -871,16 +890,19 @@ pub(crate) async fn api_session_current_uploads_response(
             );
         }
     };
-    let scope = crate::global_store::StoreScope::resolve(project_root.as_deref());
+    let scope =
+        crate::global_store::StoreScope::resolve_in(project_root.as_deref(), &runtime.state_root);
     let session_dir =
         session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&scope));
     let result = tokio::task::spawn_blocking(move || {
-        serde_json::to_string(&crate::upload_store::list_uploads(&session_dir, &scope))
-            .unwrap_or_else(|_| "[]".to_string())
+        crate::web_gateway::current_uploads_list_api_response(&session_dir, &scope)
     })
     .await;
     match result {
-        Ok(body) => json_body_response(id, body, "current uploads"),
+        // The injected-status envelope only decorates OBJECT bodies —
+        // the uploads list array passes through untouched, as it always
+        // did under its historical body-only framing.
+        Ok(response) => frame_api_response(id, response, "current uploads"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -895,7 +917,10 @@ pub(crate) async fn api_session_current_upload_task_response(
     upload: InboundUploadState,
     runtime: ControlRuntime,
 ) -> ControlTaskResponse {
-    let params = upload.params.clone();
+    // The tunnel edge of the Streaming lane (S8): frame params parsed
+    // here in their wire form, the spool handed to the same neutral
+    // commit the HTTP staged-upload POST feeds its socket spool.
+    let (params, body) = upload.into_spooled_body();
     let name = optional_string_param(&params, &["name", "filename", "file_name"])
         .unwrap_or_else(|| "upload.bin".to_string());
     let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
@@ -912,25 +937,24 @@ pub(crate) async fn api_session_current_upload_task_response(
         )
     };
     let project_root = runtime.project_root.clone();
+    let state_root = runtime.state_root.clone();
     let bus = runtime.bus.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::current_upload_commit_response_body(
+        crate::web_gateway::current_upload_commit_api_response(
+            &state_root,
             project_root.as_deref(),
             session_log.as_ref(),
             daemon_session_id.as_deref(),
             &name,
             &mime,
             requested_destination,
-            upload.tmp,
-            upload.received_bytes,
+            body,
             &bus,
         )
     })
     .await;
     let frame = match result {
-        Ok((status, body)) => {
-            http_body_response(id.clone(), status_line_code(status), body, "current upload")
-        }
+        Ok(response) => frame_api_response(id.clone(), response, "current upload"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id.clone(),
@@ -950,16 +974,27 @@ pub(crate) async fn api_session_delete_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_delete_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_delete_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     let target =
         optional_string_param(&params, &["target"]).unwrap_or_else(|| "session".to_string());
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::delete_session_data(&session_id, &target)
+        crate::web_gateway::session_delete_api_response(&home, &session_id, &target)
     })
     .await;
     match result {
-        Ok(body) => json_body_response(id, body, "session delete"),
+        Ok(response) => frame_api_json_body_response(id, response, "session delete"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -976,9 +1011,13 @@ pub(crate) async fn api_session_current_agent_output_response(
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
     match active_session_log_dir(runtime).await {
-        Ok(Some(log_dir)) => http_wire_response(
+        Ok(Some(log_dir)) => frame_api_response(
             id,
-            crate::web_gateway::current_agent_output_post_response(&body_text, &log_dir),
+            crate::web_gateway::current_agent_output_api_response(
+                &crate::platform::home_dir(),
+                &body_text,
+                &log_dir,
+            ),
             "agent output",
         ),
         Ok(None) => http_body_response(
@@ -1000,6 +1039,16 @@ pub(crate) async fn api_session_agent_output_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_agent_output_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_agent_output_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
     if session_id.is_empty() {
@@ -1017,8 +1066,14 @@ pub(crate) async fn api_session_agent_output_response(
         source
     };
     let body_text = params_body_text(Some(&params));
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_agent_output_api_response(&body_text, &session_id, &source)
+        crate::web_gateway::session_agent_output_api_response(
+            &home,
+            &body_text,
+            &session_id,
+            &source,
+        )
     })
     .await;
     match result {
@@ -1037,8 +1092,11 @@ pub(crate) async fn api_session_current_history_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let (file_watcher, _) = active_history_handles(runtime).await;
-    let (status_line, body) = crate::web_gateway::handle_history_get(file_watcher.as_ref()).await;
-    http_body_response(id, status_line_code(status_line), body, "session history")
+    frame_api_response(
+        id,
+        crate::web_gateway::current_history_api_response(file_watcher.as_ref()).await,
+        "session history",
+    )
 }
 
 pub(crate) async fn api_session_current_rollback_response(
@@ -1048,14 +1106,17 @@ pub(crate) async fn api_session_current_rollback_response(
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
     let (file_watcher, agent_state) = active_history_handles(runtime).await;
-    let (status_line, body) = crate::web_gateway::handle_history_rollback(
-        &body_text,
-        file_watcher.as_ref(),
-        agent_state.as_ref(),
-        &runtime.bus,
+    frame_api_response(
+        id,
+        crate::web_gateway::current_rollback_api_response(
+            &body_text,
+            file_watcher.as_ref(),
+            agent_state.as_ref(),
+            &runtime.bus,
+        )
+        .await,
+        "session rollback",
     )
-    .await;
-    http_body_response(id, status_line_code(status_line), body, "session rollback")
 }
 
 pub(crate) async fn api_session_current_redo_response(
@@ -1063,9 +1124,12 @@ pub(crate) async fn api_session_current_redo_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let (file_watcher, agent_state) = active_history_handles(runtime).await;
-    let (status_line, body) =
-        crate::web_gateway::handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
-    http_body_response(id, status_line_code(status_line), body, "session redo")
+    frame_api_response(
+        id,
+        crate::web_gateway::current_redo_api_response(file_watcher.as_ref(), agent_state.as_ref())
+            .await,
+        "session redo",
+    )
 }
 
 pub(crate) async fn api_session_current_prune_response(
@@ -1073,8 +1137,11 @@ pub(crate) async fn api_session_current_prune_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let (file_watcher, _) = active_history_handles(runtime).await;
-    let (status_line, body) = crate::web_gateway::handle_history_prune(file_watcher.as_ref()).await;
-    http_body_response(id, status_line_code(status_line), body, "session prune")
+    frame_api_response(
+        id,
+        crate::web_gateway::current_prune_api_response(file_watcher.as_ref()).await,
+        "session prune",
+    )
 }
 
 pub(crate) async fn api_session_current_changes_response(
@@ -1086,7 +1153,7 @@ pub(crate) async fn api_session_current_changes_response(
     let (snapshot_dir, project_root) = active_changes_handles(runtime).await;
     let home = crate::platform::home_dir();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::handle_changes_request_for_home(
+        crate::web_gateway::session_current_changes_api_response(
             &request_line,
             snapshot_dir.as_deref(),
             project_root.as_deref(),
@@ -1095,9 +1162,7 @@ pub(crate) async fn api_session_current_changes_response(
     })
     .await;
     match result {
-        Ok((status_line, body)) => {
-            http_body_response(id, status_line_code(status_line), body, "session changes")
-        }
+        Ok(response) => frame_api_response(id, response, "session changes"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -1131,8 +1196,10 @@ pub(crate) async fn api_session_context_snapshot_response(
         }
     };
     let ts = optional_string_param(&params, &["ts"]);
+    let home = crate::platform::home_dir();
     let result = tokio::task::spawn_blocking(move || {
         crate::web_gateway::session_context_snapshot_api_response(
+            &home,
             &session_id,
             &source,
             file,
@@ -1171,23 +1238,18 @@ pub(crate) async fn api_session_current_upload_delete_response(
             );
         }
     };
+    let bus = runtime.bus.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::current_upload_delete_response_body(
+        crate::web_gateway::current_upload_delete_api_response(
             project_root.as_deref(),
             session_dir.as_deref(),
             &upload_id,
+            &bus,
         )
     })
     .await;
     match result {
-        Ok((status_line, body, deleted_id)) => {
-            if let Some(id) = deleted_id {
-                runtime
-                    .bus
-                    .send(crate::event::AppEvent::UploadDeleted { id });
-            }
-            http_body_response(id, status_line_code(status_line), body, "upload delete")
-        }
+        Ok(response) => frame_api_response(id, response, "upload delete"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -1195,6 +1257,50 @@ pub(crate) async fn api_session_current_upload_delete_response(
             "error": format!("upload delete task failed: {e}"),
         }),
     }
+}
+
+/// Tunnel twin of `GET /api/sessions/message-search` — same
+/// transport-neutral core, params in the frame payload.
+pub(crate) async fn api_sessions_message_search_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let flag = |names: &[&str], default: bool| {
+        names
+            .iter()
+            .find_map(|name| params.get(name))
+            .map(|value| match value {
+                serde_json::Value::Bool(flag) => *flag,
+                serde_json::Value::String(raw) => !matches!(raw.as_str(), "false" | "0"),
+                _ => default,
+            })
+            .unwrap_or(default)
+    };
+    let search = crate::message_search::MessageSearchParams {
+        q: string_param(&params, &["q", "query"]),
+        sources: crate::message_search::parse_sources(&string_param(
+            &params,
+            &["source", "sources"],
+        )),
+        include_superseded: flag(&["include_superseded", "includeSuperseded"], true),
+        include_subagents: flag(&["subagents", "include_subagents"], true),
+        cursor: {
+            let cursor = string_param(&params, &["cursor"]);
+            if cursor.is_empty() {
+                None
+            } else {
+                Some(cursor)
+            }
+        },
+        limit: params
+            .get("limit")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(20),
+    };
+    let response = crate::web_gateway::sessions_message_search_api_response(search).await;
+    frame_api_json_body_response(id, response, "message search")
 }
 
 pub(crate) async fn api_sessions_search_response(
@@ -1388,14 +1494,17 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
             "listed.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -1422,14 +1531,17 @@ mod tests {
         std::fs::write(tmp.path(), bytes).unwrap();
 
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             Some(project.path()),
             None,
             Some(rt.session_id.as_str()),
             "raw.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -1493,22 +1605,15 @@ mod tests {
     /// Route-level proof for projectless daemons (task "Wave 1F"): with no
     /// project root anywhere, a staged upload POST commits into the
     /// daemon-global store and the raw read streams the same bytes back.
-    /// Fixture writes go through the process state root (the live
-    /// `~/.intendant` in bin unit tests — same convention as the
-    /// session-frame transfer test), so the session id is unique per run
-    /// and the store dir is removed afterwards.
+    /// Both legs resolve the store under the test runtime's scratch
+    /// state root, so the fixture never touches the machine's real
+    /// `~/.intendant/global-store` and needs no unique ids or cleanup.
     #[tokio::test]
     async fn projectless_staged_upload_posts_and_reads_raw_from_global_store() {
         let mut rt = runtime();
         assert!(rt.project_root.is_none());
-        rt.session_id = format!(
-            "projectless-upload-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let session_store_dir = crate::global_store::global_store_root()
+        rt.session_id = "projectless-upload-test".to_string();
+        let session_store_dir = crate::global_store::global_store_root_in(&rt.state_root)
             .join("uploads")
             .join(&rt.session_id);
 
@@ -1518,14 +1623,17 @@ mod tests {
 
         // POST: commit with no project root resolves the global store.
         let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            &rt.state_root,
             None,
             None,
             Some(rt.session_id.as_str()),
             "projectless.txt",
             "text/plain",
             crate::upload_store::UploadDestination::Task,
-            tmp,
-            bytes.len(),
+            crate::web_gateway::SpooledBody {
+                tmp,
+                len: bytes.len(),
+            },
             &rt.bus,
         );
         assert_eq!(status, "200 OK");
@@ -1544,13 +1652,11 @@ mod tests {
             &rt,
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&session_store_dir);
         assert!(response.done);
         let stream = response.byte_stream.expect("raw read must stream bytes");
         assert_eq!(stream.bytes, bytes);
         assert_eq!(stream.result["ok"], true);
         assert_eq!(stream.result["id"], descriptor.id);
-        cleanup.expect("global-store session dir cleanup");
     }
 
     #[tokio::test]
@@ -1570,8 +1676,10 @@ mod tests {
         stream_json_lines_response(
             "stream1".to_string(),
             "api_sessions_stream".to_string(),
-            line_rx,
-            stream_task,
+            crate::web_gateway::LineStream {
+                lines: line_rx,
+                source: stream_task,
+            },
             task_tx,
             CancellationToken::new(),
         )
@@ -1598,6 +1706,27 @@ mod tests {
         assert_eq!(frames[4].frame["ok"], true);
         assert_eq!(frames[4].frame["result"]["events"], 3);
         assert!(frames[4].done);
+
+        // S10 goldens: the exact frame objects (serde_json's sorted-key
+        // serialization), so the framer's wire shapes — method echo,
+        // seq/chunk_id pairing, the events tally — are pinned byte for
+        // byte across the Stream-lane unification.
+        assert_eq!(
+            frames[0].frame.to_string(),
+            r#"{"id":"stream1","method":"api_sessions_stream","t":"stream_start"}"#
+        );
+        assert_eq!(
+            frames[1].frame.to_string(),
+            r#"{"chunk_id":"stream1:0","event":{"limit":1,"quick_limit":1,"type":"start"},"id":"stream1","seq":0,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[2].frame.to_string(),
+            r#"{"chunk_id":"stream1:1","event":{"partial":true,"session":{"session_id":"s1"},"type":"session"},"id":"stream1","seq":1,"t":"stream_event"}"#
+        );
+        assert_eq!(
+            frames[4].frame.to_string(),
+            r#"{"id":"stream1","ok":true,"result":{"events":3},"t":"stream_end"}"#
+        );
     }
 
     #[test]
@@ -1644,18 +1773,6 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({}))),
-            "GET /api/sessions/stream HTTP/1.1"
-        );
-        assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({"limit": "all"}))),
-            "GET /api/sessions/stream?limit=all HTTP/1.1"
-        );
-        assert_eq!(
-            sessions_stream_request_line(Some(&serde_json::json!({"limit": 25}))),
-            "GET /api/sessions/stream?limit=25 HTTP/1.1"
-        );
-        assert_eq!(
             control_project_filter(&serde_json::json!({"projects": ["a", " b "]})),
             vec!["a".to_string(), "b".to_string()]
         );
@@ -1672,6 +1789,70 @@ mod tests {
                 &serde_json::json!({"capabilities": ["display", "custom:gpu"]})
             ),
             "capability=display&capability=custom:gpu"
+        );
+    }
+
+    /// S10 equivalence pins: `sessions_stream_requested_limit` must
+    /// reproduce, input for input, the retired composition of the
+    /// params→request-line synthesizer with the HTTP lane's
+    /// `session_list_limit_from_request` — including the historical
+    /// asymmetries ("unlimited" is an HTTP-query escape only; zero,
+    /// negatives, floats, and non-numeric shapes collapse to the
+    /// control default; the HTTP list cap applies last).
+    #[test]
+    fn sessions_stream_limit_vocabulary_is_pinned() {
+        let parse = |params: serde_json::Value| sessions_stream_requested_limit(Some(&params));
+        assert_eq!(sessions_stream_requested_limit(None), None);
+        assert_eq!(parse(serde_json::json!({})), None);
+        assert_eq!(parse(serde_json::json!({ "limit": "all" })), None);
+        assert_eq!(parse(serde_json::json!({ "limit": "full" })), None);
+        assert_eq!(parse(serde_json::json!({ "limit": " ALL " })), None);
+        // The HTTP query vocabulary's third escape does NOT exist on the
+        // tunnel — it has always collapsed to the control default.
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "unlimited" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(parse(serde_json::json!({ "limit": "25" })), Some(25));
+        assert_eq!(parse(serde_json::json!({ "limit": " 42 " })), Some(42));
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "0" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "nope" })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(parse(serde_json::json!({ "limit": 25 })), Some(25));
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 0 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": -3 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 2.5 })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": null })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": true })),
+            Some(CONTROL_DEFAULT_SESSION_LIMIT)
+        );
+        // Oversized asks clamp to the HTTP lane's list cap, exactly as
+        // the synthesized query did.
+        assert_eq!(
+            parse(serde_json::json!({ "limit": 9_999_999 })),
+            Some(crate::web_gateway::SESSION_LIST_LIMIT)
+        );
+        assert_eq!(
+            parse(serde_json::json!({ "limit": "9999999" })),
+            Some(crate::web_gateway::SESSION_LIST_LIMIT)
         );
     }
 
@@ -1777,84 +1958,83 @@ mod tests {
         frame["result"].clone()
     }
 
-    /// Unique-per-run fixture session in the live logs store (the
-    /// bin-test convention; removed by the caller).
-    fn parity_session_fixture(prefix: &str) -> (String, std::path::PathBuf) {
-        let session_id = format!(
-            "{prefix}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let log_dir = crate::platform::intendant_home()
+    /// Fixture session under an injected tempdir home's
+    /// `.intendant/logs` store. Both parity lanes take the same temp home
+    /// (`_from_home` adapters / home-threaded neutral fns), so no fixture
+    /// ever reads or writes the machine's real `~/.intendant` — and the
+    /// isolated store makes exact row-set assertions possible. The id can
+    /// be fixed: each test owns its whole store.
+    fn parity_session_fixture(prefix: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let home = tempfile::tempdir().expect("temp home");
+        let session_id = prefix.to_string();
+        let log_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
             .join(&session_id);
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.agent_output_with_id("parity stdout", "", Some("Codex"), Some("parity-out-1"));
         drop(log);
-        (session_id, log_dir)
+        (home, session_id, log_dir)
     }
 
     #[tokio::test]
     async fn parity_sessions_list_serves_the_same_rows_on_both_transports() {
-        let (session_id, log_dir) = parity_session_fixture("parity-list");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-list");
 
         // ids filter, plain view.
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::sessions_list_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::sessions_list_api_response(
+                home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 false,
-            ),
-        );
+            ));
         assert_eq!(status, 200);
-        let frame = api_sessions_response(
+        let frame = api_sessions_response_from_home(
             "parity-list".to_string(),
             Some(&serde_json::json!({ "ids": [session_id] })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         let tunnel_body = tunnel_plain_body(&frame);
         assert!(tunnel_body.is_array(), "{frame}");
         assert_eq!(tunnel_body, http_body);
-        assert!(
-            tunnel_body
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["session_id"] == session_id),
-            "fixture session must be listed: {tunnel_body}"
+        // The injected store holds exactly the fixture session — assert
+        // the whole row set, not mere membership.
+        let rows = tunnel_body.as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "temp store must list only the fixture: {tunnel_body}"
         );
-        cleanup.expect("parity list fixture cleanup");
+        assert_eq!(rows[0]["session_id"], session_id);
     }
 
     #[tokio::test]
     async fn parity_sessions_list_usage_view_serves_the_same_projection() {
-        let (session_id, log_dir) = parity_session_fixture("parity-usage");
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::sessions_list_api_response(
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-usage");
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::sessions_list_api_response(
+                home.path(),
                 Some(vec![session_id.clone()]),
                 None,
                 true,
-            ),
-        );
-        let frame = api_sessions_response(
+            ));
+        let frame = api_sessions_response_from_home(
             "parity-usage".to_string(),
             Some(&serde_json::json!({ "ids": [session_id], "view": "usage" })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         let tunnel_body = tunnel_plain_body(&frame);
         assert_eq!(tunnel_body, http_body);
+        assert_eq!(tunnel_body.as_array().unwrap().len(), 1);
         let row = &tunnel_body.as_array().unwrap()[0];
         assert!(row.get("session_id").is_some());
         assert!(
             row.get("entries").is_none() && row.get("goal").is_none(),
             "usage view must project rows down: {row}"
         );
-        cleanup.expect("parity usage fixture cleanup");
     }
 
     #[tokio::test]
@@ -1885,28 +2065,43 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_detail_serves_the_same_body_on_both_transports() {
-        let (session_id, log_dir) = parity_session_fixture("parity-detail");
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response(&session_id, "intendant", Some(5), None),
-        );
-        let frame = api_session_detail_response(
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-detail");
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_detail_api_response(
+                home.path(),
+                &session_id,
+                "intendant",
+                Some(5),
+                None,
+                None,
+            ));
+        let frame = api_session_detail_response_from_home(
             "parity-detail".to_string(),
             Some(&serde_json::json!({ "session_id": session_id, "limit": 5 })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         assert_eq!(tunnel_plain_body(&frame), http_body);
-        cleanup.expect("parity detail fixture cleanup");
     }
 
     #[tokio::test]
     async fn parity_session_detail_errors_share_bodies_under_the_plain_envelope() {
         // Difference #1 pinned from both sides: the HTTP 400 does not
         // surface on the tunnel — only the identical error body does.
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_detail_api_response("..", "intendant", None, None),
-        );
+        // (The bare-id check answers before any store access, so the
+        // tunnel lane exercises the full public adapter here; the temp
+        // home on the HTTP lane is never read.)
+        let home = tempfile::tempdir().unwrap();
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_detail_api_response(
+                home.path(),
+                "..",
+                "intendant",
+                None,
+                None,
+                None,
+            ));
         assert_eq!(status, 400);
         let frame = api_session_detail_response(
             "parity-detail-invalid".to_string(),
@@ -1918,34 +2113,38 @@ mod tests {
 
     #[tokio::test]
     async fn parity_session_agent_output_serves_the_same_body_with_status_metadata() {
-        let (session_id, log_dir) = parity_session_fixture("parity-output");
+        let (home, session_id, _log_dir) = parity_session_fixture("parity-output");
         let ids_body = r#"{"ids":["parity-out-1","parity-missing"]}"#;
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_agent_output_api_response(
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_agent_output_api_response(
+                home.path(),
                 ids_body,
                 &session_id,
                 "intendant",
-            ),
-        );
+            ));
         // The tunnel serializes its whole params object as the body; the
         // chunk fetch only reads `ids`.
-        let frame = api_session_agent_output_response(
+        let frame = api_session_agent_output_response_from_home(
             "parity-output".to_string(),
             Some(&serde_json::json!({
                 "session_id": session_id,
                 "ids": ["parity-out-1", "parity-missing"],
             })),
+            home.path(),
         )
         .await;
-        let cleanup = std::fs::remove_dir_all(&log_dir);
         assert_eq!(status, 200);
         assert_eq!(tunnel_result_body(&frame, 200), http_body);
-        cleanup.expect("parity output fixture cleanup");
 
-        // Missing-ids: same 400 body under each envelope.
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_agent_output_api_response("{}", "abc123", "intendant"),
-        );
+        // Missing-ids: same 400 body under each envelope (decode error
+        // before any store access — the public adapter stays under test).
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_agent_output_api_response(
+                home.path(),
+                "{}",
+                "abc123",
+                "intendant",
+            ));
         assert_eq!(status, 400);
         let frame = api_session_agent_output_response(
             "parity-output-missing-ids".to_string(),
@@ -1955,14 +2154,125 @@ mod tests {
         assert_eq!(tunnel_result_body(&frame, 400), http_body);
     }
 
+    // ── S4b parity: deletes + report (see the S4a enumeration above; the
+    // S4b-specific envelope differences are enumerated on the worktrees
+    // fixture set in api_control.rs) ──
+
+    #[tokio::test]
+    async fn parity_session_delete_serves_the_same_body_on_both_transports() {
+        // Invalid id: deterministic, store-free; the delete trio rides the
+        // pre-_httpStatus envelope (difference #1). The bare-id check
+        // answers before any store access, so the tunnel lane exercises
+        // the full public adapter.
+        let home = tempfile::tempdir().unwrap();
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::session_delete_api_response(home.path(), "..", "session"),
+        );
+        assert_eq!(status, 200);
+        let frame = api_session_delete_response(
+            "parity-delete".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+        )
+        .await;
+        assert_eq!(tunnel_plain_body(&frame), http_body);
+
+        // A real deletion under identical pre-state on each lane.
+        let (home, session_id, log_dir) = parity_session_fixture("parity-delete-http");
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::session_delete_api_response(home.path(), &session_id, "session"),
+        );
+        assert_eq!(status, 200);
+        assert!(!log_dir.exists(), "http-lane delete must remove the dir");
+        assert_eq!(http_body["ok"], true);
+        assert_eq!(http_body["deleted"], "session");
+
+        let (home, session_id, log_dir) = parity_session_fixture("parity-delete-rpc");
+        let frame = api_session_delete_response_from_home(
+            "parity-delete-2".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+            home.path(),
+        )
+        .await;
+        assert!(!log_dir.exists(), "tunnel delete must remove the dir");
+        let tunnel_body = tunnel_plain_body(&frame);
+        assert_eq!(tunnel_body["ok"], true);
+        assert_eq!(tunnel_body["deleted"], "session");
+        // bytes_freed varies with the fixture inode sizes; the shape keys
+        // are the parity claim.
+        assert_eq!(
+            tunnel_body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            http_body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_session_report_serves_the_same_zip_and_meta_on_both_transports() {
+        let (home, session_id, log_dir) = parity_session_fixture("parity-report");
+        std::fs::write(log_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+
+        let report = crate::web_gateway::session_report_zip_for_request(
+            home.path(),
+            &session_id,
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("fixture report must build"));
+        let response = crate::web_gateway::session_report_api_response(report);
+        let (http_bytes, http_meta) = match &response {
+            crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
+                let crate::web_gateway::BytesPayload::InMemory(payload) = bytes;
+                (payload.clone(), meta.clone())
+            }
+            _ => panic!("report must ride the bytes lane"),
+        };
+
+        let task = api_session_report_task_response_from_home(
+            "parity-report".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+            &runtime(),
+            home.path(),
+        )
+        .await;
+        let stream = task.byte_stream.expect("tunnel byte stream");
+        assert_eq!(stream.stream_id, "parity-report:session-report");
+        assert_eq!(stream.content_type, "application/zip");
+        assert_eq!(stream.bytes.len(), http_bytes.len());
+        assert_eq!(stream.result, http_meta);
+        assert_eq!(
+            stream.filename.as_deref(),
+            http_meta["filename"].as_str(),
+            "byte-stream filename lifts from the shared meta"
+        );
+
+        // Invalid id: per-lane error framing — the tunnel answers the
+        // injected-status envelope; HTTP answers wildcard json (pinned by
+        // the goldens). The id-policy check answers before any store
+        // access, so the public adapter stays under test.
+        let invalid = api_session_report_task_response(
+            "parity-report-invalid".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+            &runtime(),
+        )
+        .await;
+        assert!(invalid.byte_stream.is_none());
+        assert_eq!(invalid.frame["result"]["_httpStatus"], 400);
+    }
+
     #[tokio::test]
     async fn parity_session_context_snapshot_shares_bodies_with_status_metadata() {
-        // Missing selector: 400 on both lanes.
-        let (status, http_body) = http_status_and_body(
-            crate::web_gateway::session_context_snapshot_api_response(
-                "abc123", "intendant", None, None, None, None,
-            ),
-        );
+        // Missing selector: 400 on both lanes (before any store access,
+        // so the tunnel lane exercises the full public adapter).
+        let home = tempfile::tempdir().unwrap();
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_context_snapshot_api_response(
+                home.path(),
+                "abc123",
+                "intendant",
+                None,
+                None,
+                None,
+                None,
+            ));
         assert_eq!(status, 400);
         let frame = api_session_context_snapshot_response(
             "parity-snapshot".to_string(),
@@ -1971,5 +2281,515 @@ mod tests {
         .await;
         assert_eq!(tunnel_result_body(&frame, 400), http_body);
         assert_eq!(http_body["error"], "missing snapshot selector");
+    }
+
+    // ── S4c parity: current-session + managed-context (design §8) ──
+    //
+    // Extends the S4a (above) and S4b (api_control.rs) enumerations.
+    // The S4c-specific envelope differences, deliberate and pinned
+    // across this slice's fixtures (current-session family here;
+    // managed-context in api_control.rs):
+    //
+    //  1. All thirteen twins ride the injected-status envelope
+    //     (frame_api_response → http_body_response): result OBJECTS
+    //     gain _httpStatus/_httpOk matching the HTTP status; the
+    //     uploads list (array body) passes through undecorated —
+    //     byte-identical to its historical json_body_response framing.
+    //  2. Header tails stay HTTP-lane decoration: the current/* family
+    //     and upload POST/list/raw ride the wildcard-CORS tail,
+    //     managed-context and the upload delete the canonical tail,
+    //     raw fetches an attachment Content-Disposition plus nosniff; the tunnel
+    //     renders none of them.
+    //  3. Transport-owned upload carriage: HTTP streams the raw POST
+    //     body (100-continue, spool, its own 413/400 wordings); the
+    //     tunnel spools upload_start/chunk/end frames with its own
+    //     wire-integrity errors (sequence/size mismatch, base64). The
+    //     commit leg is the one shared neutral fn. The raw read is one
+    //     unbounded full body on HTTP but ranged +
+    //     UPLOAD_MAX_BYTES-capped on the tunnel (the 416/413 shapes are
+    //     tunnel-only), over the same content core.
+    //  4. Content-core error framing stays per-lane on the raw read:
+    //     wildcard `{"error":…}` (HTTP) vs `{"ok":false,"error":…}`
+    //     with the 416 total_size sidecar (tunnel), both built from the
+    //     one CurrentUploadRawError.
+    //  5. Transport-owned param decode: tunnel id/offset/length aliases
+    //     and defaults, changes path/query synthesis
+    //     (changes_request_line), managed-context query synthesis
+    //     (managed_context_request_line, whose missing-query shape is
+    //     tunnel-only); HTTP takes raw path segments and query strings.
+    //  6. Task-failure and resolution shapes stay per-lane: ok:false
+    //     frames vs in-band HTTP errors; both lanes build their
+    //     lock-poisoned 500s and the agent-output no-active-log 404
+    //     with the same wording but their own framing.
+
+    #[tokio::test]
+    async fn parity_current_history_family_shares_bodies_with_status_metadata() {
+        // No file watcher: the 503 shape on both lanes, store-free.
+        let rt = runtime();
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_history_api_response(None).await);
+        assert_eq!(status, 503);
+        let frame = api_session_current_history_response("parity-hist".to_string(), &rt).await;
+        assert_eq!(tunnel_result_body(&frame, 503), http_body);
+        assert_eq!(http_body["error"], "file watcher not active");
+
+        let frame = api_session_current_rollback_response(
+            "parity-rollback".to_string(),
+            Some(&serde_json::json!({ "round_id": 1 })),
+            &rt,
+        )
+        .await;
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::current_rollback_api_response(
+                r#"{"round_id":1}"#,
+                None,
+                None,
+                &rt.bus,
+            )
+            .await,
+        );
+        assert_eq!(status, 503);
+        assert_eq!(tunnel_result_body(&frame, 503), http_body);
+
+        let frame = api_session_current_redo_response("parity-redo".to_string(), &rt).await;
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_redo_api_response(None, None).await);
+        assert_eq!(status, 503);
+        assert_eq!(tunnel_result_body(&frame, 503), http_body);
+
+        let frame = api_session_current_prune_response("parity-prune".to_string(), &rt).await;
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_prune_api_response(None).await);
+        assert_eq!(status, 503);
+        assert_eq!(tunnel_result_body(&frame, 503), http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_current_changes_shares_bodies_with_status_metadata() {
+        // No snapshot dir / project root: the 503 watcher-absent shape.
+        // The tunnel synthesizes the request line from params
+        // (difference #5); both lanes then run the one neutral fn.
+        let rt = runtime();
+        let home = tempfile::tempdir().unwrap();
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::session_current_changes_api_response(
+                "GET /api/session/current/changes HTTP/1.1",
+                None,
+                None,
+                home.path(),
+            ));
+        assert_eq!(status, 503);
+        let frame =
+            api_session_current_changes_response("parity-changes".to_string(), None, &rt).await;
+        assert_eq!(tunnel_result_body(&frame, 503), http_body);
+        assert_eq!(http_body["error"], "file watcher not active");
+    }
+
+    #[tokio::test]
+    async fn parity_current_agent_output_shares_bodies_with_status_metadata() {
+        let (home, _session_id, log_dir) = parity_session_fixture("parity-current-output");
+        let rt = runtime();
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
+        }
+
+        // Success: one persisted id — found in the primary dir, so
+        // neither lane runs the fallback sweep (the tunnel adapter's
+        // edge-resolved home is never read; the HTTP lane's temp home
+        // pins the same).
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_agent_output_api_response(
+                home.path(),
+                r#"{"ids":["parity-out-1"]}"#,
+                &log_dir,
+            ));
+        assert_eq!(status, 200);
+        assert_eq!(http_body["outputs"][0]["output_id"], "parity-out-1");
+        let frame = api_session_current_agent_output_response(
+            "parity-current-output".to_string(),
+            Some(&serde_json::json!({ "ids": ["parity-out-1"] })),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 200), http_body);
+
+        // Decode error: 400 missing-ids on both lanes.
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::current_agent_output_api_response(home.path(), "{}", &log_dir),
+        );
+        assert_eq!(status, 400);
+        let frame = api_session_current_agent_output_response(
+            "parity-current-output-400".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 400), http_body);
+        assert_eq!(http_body["error"], "missing output ids");
+    }
+
+    #[tokio::test]
+    async fn parity_current_uploads_list_and_delete_share_bodies() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        {
+            let mut session = rt.shared_session.write().await;
+            session.project_root_for_changes = Some(project.path().to_path_buf());
+        }
+        let scope = crate::global_store::StoreScope::resolve(Some(project.path()));
+        let pending = crate::web_gateway::pending_upload_session_dir(&scope);
+
+        // Empty list: the array body passes both envelopes undecorated
+        // (difference #1).
+        let (status, http_body) = http_status_and_body(
+            crate::web_gateway::current_uploads_list_api_response(&pending, &scope),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!([]));
+        let frame =
+            api_session_current_uploads_response("parity-uploads-list".to_string(), &rt).await;
+        assert_eq!(tunnel_plain_body(&frame), http_body);
+
+        // Idempotent delete of a missing id: 200 {"ok":true} on both
+        // lanes (canonical tail on HTTP — difference #2).
+        let (status, http_body) =
+            http_status_and_body(crate::web_gateway::current_upload_delete_api_response(
+                Some(project.path()),
+                None,
+                "parity-nope",
+                &rt.bus,
+            ));
+        assert_eq!(status, 200);
+        let frame = api_session_current_upload_delete_response(
+            "parity-upload-delete".to_string(),
+            Some(&serde_json::json!({ "upload_id": "parity-nope" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(tunnel_result_body(&frame, 200), http_body);
+        assert_eq!(http_body, serde_json::json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn parity_current_upload_commit_and_raw_share_content() {
+        use std::io::Write as _;
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        {
+            let mut session = rt.shared_session.write().await;
+            session.project_root_for_changes = Some(project.path().to_path_buf());
+        }
+        let payload = b"parity staged upload bytes".to_vec();
+
+        // Tunnel commit: the upload lane's spooled frames end in the
+        // same shared neutral fn the HTTP POST runs (difference #3 —
+        // only the carriage differs).
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&payload).unwrap();
+        let upload = InboundUploadState {
+            method: "api_session_current_upload".to_string(),
+            params: serde_json::json!({ "name": "parity.txt", "mime": "text/plain" }),
+            tmp,
+            total_bytes: payload.len(),
+            expected_chunks: 1,
+            next_seq: 1,
+            received_bytes: payload.len(),
+        };
+        let commit = api_session_current_upload_task_response(
+            "parity-upload-commit".to_string(),
+            upload,
+            rt.clone(),
+        )
+        .await;
+        let tunnel_descriptor = tunnel_result_body(&commit.frame, 200);
+        assert_eq!(tunnel_descriptor["name"], "parity.txt");
+        let upload_id = tunnel_descriptor["id"].as_str().expect("id").to_string();
+
+        // HTTP commit through the same neutral fn: same descriptor
+        // shape (ids/paths are store-generated per commit).
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&payload).unwrap();
+        let (status, http_descriptor) =
+            http_status_and_body(crate::web_gateway::current_upload_commit_api_response(
+                &rt.state_root,
+                Some(project.path()),
+                None,
+                Some("parity-session"),
+                "parity.txt",
+                "text/plain",
+                crate::upload_store::UploadDestination::Task,
+                crate::web_gateway::SpooledBody {
+                    tmp,
+                    len: payload.len(),
+                },
+                &rt.bus,
+            ));
+        assert_eq!(status, 200);
+        assert_eq!(
+            tunnel_descriptor
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            http_descriptor
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+        );
+
+        // Raw read of the tunnel-committed upload: identical bytes on
+        // both lanes over the one content core; the tunnel's
+        // byte_stream_end.result meta and HTTP's header tail are the
+        // per-lane decorations (differences #2/#3).
+        let scope = crate::global_store::StoreScope::resolve(Some(project.path()));
+        let pending = crate::web_gateway::pending_upload_session_dir(&scope);
+        let http_raw =
+            crate::web_gateway::current_upload_raw_api_response(&upload_id, None, &pending, &scope)
+                .unwrap_or_else(|_| panic!("http raw read"));
+        let (http_bytes, http_meta) = match &http_raw {
+            crate::web_gateway::ApiResponse::Bytes { bytes, meta, .. } => {
+                let crate::web_gateway::BytesPayload::InMemory(payload) = bytes;
+                (payload.clone(), meta.clone())
+            }
+            crate::web_gateway::ApiResponse::Json { .. }
+            | crate::web_gateway::ApiResponse::Stream { .. } => panic!("raw read must be bytes"),
+        };
+        assert_eq!(http_bytes, payload);
+        let raw = api_session_current_upload_raw_task_response(
+            "parity-upload-raw".to_string(),
+            Some(&serde_json::json!({ "id": upload_id })),
+            &rt,
+        )
+        .await;
+        let stream = raw.byte_stream.expect("tunnel raw byte stream");
+        assert_eq!(stream.bytes, payload);
+        assert_eq!(stream.result, http_meta);
+        assert_eq!(stream.result["range_end"], payload.len());
+        assert_eq!(stream.result["resumable"], true);
+
+        // Missing id: the shared content core's NotFound framed
+        // per-lane (difference #4).
+        let missing = crate::web_gateway::current_upload_raw_api_response(
+            "parity-missing",
+            None,
+            &pending,
+            &scope,
+        );
+        let err = match missing {
+            Err(err) => err,
+            Ok(_) => panic!("missing upload must err"),
+        };
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.message(), "upload not found");
+        let raw = api_session_current_upload_raw_task_response(
+            "parity-upload-raw-404".to_string(),
+            Some(&serde_json::json!({ "id": "parity-missing" })),
+            &rt,
+        )
+        .await;
+        assert!(raw.byte_stream.is_none());
+        assert_eq!(raw.frame["result"]["_httpStatus"], 404);
+        assert_eq!(raw.frame["result"]["ok"], false);
+        assert_eq!(raw.frame["result"]["error"], "upload not found");
+    }
+
+    // ── S10 parity fixture: the sessions-stream Stream lane ──
+
+    /// Seed a minimal on-disk session the catalog scanners list. The
+    /// recency key is the transcript's mtime at second resolution
+    /// (`session_activity_mtime_secs`), so each seed gets a distinct,
+    /// idx-ordered mtime for a deterministic newest-first order.
+    fn seed_stream_session(logs_dir: &std::path::Path, idx: usize) {
+        let session_id = format!("stream-parity-{idx}");
+        let log_dir = logs_dir.join(&session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "created_at": format!("2026-07-01T10:0{idx}:00Z"),
+                "task": format!("stream parity task {idx}"),
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transcript = log_dir.join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            serde_json::json!({
+                "ts": format!("2026-07-01T10:0{idx}:00Z"),
+                "event": "session_start"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mtime =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000 + idx as u64 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&transcript)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+    }
+
+    /// A [`crate::web_gateway::LineStream`] replaying a captured line
+    /// sequence — the writers-only half of the parity fixture.
+    fn replay_line_stream(lines: Vec<String>) -> crate::web_gateway::LineStream {
+        let (tx, rx) = mpsc::channel::<String>(64);
+        let source = tokio::spawn(async move {
+            for line in lines {
+                if tx.send(line).await.is_err() {
+                    return;
+                }
+            }
+        });
+        crate::web_gateway::LineStream { lines: rx, source }
+    }
+
+    /// Same params ⇒ same event-line sequence on both lanes (design §8,
+    /// S10). The line SOURCE is shared by construction — both transports
+    /// spawn `stream_sessions_lines` through the one neutral core — so
+    /// the fixture runs it once, hermetically (injected temp store +
+    /// direct hydration scan), pins the NDJSON line shapes, then proves
+    /// each lane's WRITER carries the identical sequence: the HTTP body
+    /// under the pinned head is the lines verbatim, and the tunnel's
+    /// `stream_event` frames wrap the same events in the same order.
+    #[tokio::test]
+    async fn parity_sessions_stream_event_lines_match_across_lanes() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        for idx in 0..3 {
+            seed_stream_session(&logs_dir, idx);
+        }
+        let requested_limit = Some(2usize);
+
+        // One hermetic run of the shared source.
+        let lines = {
+            let (tx, mut rx) = mpsc::channel::<String>(64);
+            let source_home = home.path().to_path_buf();
+            let hydrate_home = source_home.clone();
+            let source = tokio::task::spawn_blocking(move || {
+                crate::web_gateway::stream_sessions_lines_from_home(
+                    &source_home,
+                    requested_limit,
+                    move || {
+                        crate::web_gateway::list_sessions_from_home_with_limit(
+                            &hydrate_home,
+                            requested_limit,
+                        )
+                    },
+                    tx,
+                );
+            });
+            let mut lines = Vec::new();
+            while let Some(line) = rx.recv().await {
+                lines.push(line);
+            }
+            source.await.unwrap();
+            lines
+        };
+
+        // The line shapes: start → 2 newest-first partial session rows →
+        // hydrating marker → replace (hydrated pair) → done, each a
+        // complete `\n`-terminated NDJSON line.
+        assert!(lines.iter().all(|line| line.ends_with('\n')), "{lines:?}");
+        let events: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|line| serde_json::from_str(line.trim()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 6, "{events:?}");
+        assert_eq!(
+            events[0].to_string(),
+            r#"{"limit":2,"quick_limit":2,"type":"start"}"#
+        );
+        assert_eq!(events[1]["type"], "session");
+        assert_eq!(events[1]["partial"], true);
+        assert_eq!(events[1]["session"]["session_id"], "stream-parity-2");
+        assert_eq!(events[2]["session"]["session_id"], "stream-parity-1");
+        assert_eq!(
+            events[3].to_string(),
+            r#"{"phase":"hydrating","type":"phase"}"#
+        );
+        assert_eq!(events[4]["type"], "replace");
+        let replaced = events[4]["sessions"].as_array().unwrap();
+        assert_eq!(replaced.len(), 2, "{events:?}");
+        assert_eq!(replaced[0]["session_id"], "stream-parity-2");
+        assert_eq!(events[5].to_string(), r#"{"type":"done"}"#);
+
+        // HTTP lane: the real writer over an in-memory stream — the
+        // pinned head, then the captured lines byte for byte.
+        let response = crate::web_gateway::sessions_stream_api_response_from(replay_line_stream(
+            lines.clone(),
+        ));
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        crate::web_gateway::write_api_response(
+            crate::web_gateway::DemuxStream::new(Box::pin(server)),
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
+        let mut raw = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            client.read_to_end(&mut raw).await.unwrap();
+        }
+        let text = String::from_utf8(raw).unwrap();
+        let head_end = text.find("\r\n\r\n").expect("head/body split") + 4;
+        assert_eq!(
+            &text[..head_end],
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/x-ndjson\r\n\
+             Cache-Control: no-cache\r\n\
+             Access-Control-Allow-Origin: *\r\n\
+             Connection: close\r\n\
+             \r\n"
+        );
+        assert_eq!(&text[head_end..], lines.concat());
+
+        // Tunnel lane: the framer over the same sequence — one
+        // stream_event per line, events byte-identical to the HTTP
+        // lane's parsed lines, under the lifecycle frames.
+        let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
+        stream_json_lines_response(
+            "stream-parity".to_string(),
+            "api_sessions_stream".to_string(),
+            replay_line_stream(lines.clone()),
+            task_tx,
+            CancellationToken::new(),
+        )
+        .await;
+        let mut frames = Vec::new();
+        while let Some(task) = task_rx.recv().await {
+            let done = task.done;
+            frames.push(task);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(frames.len(), lines.len() + 2, "start + events + end");
+        assert_eq!(frames[0].frame["t"], "stream_start");
+        for (idx, line) in lines.iter().enumerate() {
+            let frame = &frames[idx + 1].frame;
+            assert_eq!(frame["t"], "stream_event");
+            assert_eq!(frame["seq"], idx as u64);
+            let http_event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(
+                frame["event"].to_string(),
+                http_event.to_string(),
+                "lane divergence at event {idx}"
+            );
+        }
+        let end = &frames[lines.len() + 1].frame;
+        assert_eq!(end["t"], "stream_end");
+        assert_eq!(end["ok"], true);
+        assert_eq!(end["result"]["events"], lines.len() as u64);
     }
 }

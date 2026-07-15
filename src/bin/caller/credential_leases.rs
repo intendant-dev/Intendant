@@ -126,12 +126,13 @@ fn env_kind(env_name: &str) -> Option<&'static str> {
 }
 
 fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
+    let staging = crate::lease_transcript_staging::default_paths();
     let active_oauth: HashSet<String> = leases
         .iter()
         .filter(|(_, lease)| lease.expires_at_unix_ms() > now)
         .map(|(kind, _)| kind.clone())
         .collect();
-    retry_pending_materialization_cleanup(&materialization_root(), &active_oauth);
+    retry_pending_materialization_cleanup(&materialization_root(), &staging, &active_oauth);
 
     let expired: Vec<String> = leases
         .iter()
@@ -159,7 +160,7 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
                 ),
             );
         }
-        if let Err(err) = drop_materialization(&materialization_root(), &kind) {
+        if let Err(err) = drop_materialization(&materialization_root(), &staging, &kind) {
             eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
             queue_materialization_cleanup(&kind);
         }
@@ -237,7 +238,10 @@ recovery sweep covering crashes where neither ran. Non-secret
 configuration (config.toml / settings.json) is copied in so behavior
 is preserved; the user's own auth files never are. The directory
 lives under ~/.intendant, outside any project worktree, so the
-rewind/snapshot machinery never sees it. */
+rewind/snapshot machinery never sees it. Deletion stages the home's
+transcript subdirectories out first (rename-only, best-effort — see
+`lease_transcript_staging`) so leased sessions stay searchable after
+the secret dies; staging failure never delays the deletion. */
 
 fn materialization_root() -> PathBuf {
     crate::platform::intendant_home().join("leased-auth")
@@ -287,6 +291,13 @@ struct MaterializationPlan {
     /// Non-secret config carried over from the agent's real home
     /// (source home, file name) so behavior is preserved.
     carry_over: Option<(PathBuf, &'static str)>,
+    /// Message-search source label for staged transcripts.
+    source: &'static str,
+    /// Transcript subdirectories the agent writes under this home —
+    /// staged out (renamed) before the home is deleted, so leased
+    /// sessions stay searchable after the secret dies
+    /// (`lease_transcript_staging`).
+    transcript_dirs: &'static [&'static str],
 }
 
 fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
@@ -296,17 +307,50 @@ fn materialization_plan(kind: &str) -> Option<MaterializationPlan> {
             auth_name: "auth.json",
             carry_over: crate::session_config::effective_codex_home()
                 .map(|home| (PathBuf::from(home), "config.toml")),
+            source: "codex",
+            transcript_dirs: &["sessions", "archived_sessions"],
         }),
         "oauth:claude-code" => Some(MaterializationPlan {
             dir_name: "claude-home",
             auth_name: ".credentials.json",
             carry_over: Some((crate::platform::home_dir().join(".claude"), "settings.json")),
+            source: "claude-code",
+            transcript_dirs: &["projects"],
         }),
         _ => None,
     }
 }
 
-fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), String> {
+/// Stage a materialized home's transcripts and drop its active-registry
+/// entry — the mandatory prelude to deleting the home. Best-effort by
+/// design: staging failure never blocks the deletion that follows
+/// (custody outranks search completeness). `paths` is injected all the
+/// way down (tests pass tempdirs; production edges resolve
+/// `default_paths()`) — resolving globals here made the test
+/// environment-dependent, which CI's threaded `cargo test` punished.
+fn stage_before_removal(
+    plan: &MaterializationPlan,
+    home: &Path,
+    paths: &crate::lease_transcript_staging::StagingPaths,
+) {
+    if home.is_dir() {
+        crate::lease_transcript_staging::stage_transcripts(
+            home,
+            plan.dir_name,
+            plan.source,
+            plan.transcript_dirs,
+            &paths.staging,
+        );
+    }
+    crate::lease_transcript_staging::clear_active(&paths.active, plan.dir_name);
+}
+
+fn materialize_kind(
+    root: &Path,
+    staging: &crate::lease_transcript_staging::StagingPaths,
+    kind: &str,
+    material: &str,
+) -> Result<(), String> {
     let Some(plan) = materialization_plan(kind) else {
         return Ok(());
     };
@@ -318,6 +362,10 @@ fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), Strin
     std::fs::write(&auth_path, material.as_bytes())
         .map_err(|e| format!("write {}: {e}", auth_path.display()))?;
     if let Err(err) = restrict_file(&auth_path) {
+        // A re-grant materializes over the existing home, which may already
+        // hold transcripts — stage them before the failure cleanup deletes
+        // the directory.
+        stage_before_removal(&plan, &dir, staging);
         if let Err(cleanup_err) = std::fs::remove_dir_all(&dir) {
             eprintln!(
                 "[credential-leases] cleanup after failed materialization of {} failed: {}",
@@ -337,9 +385,14 @@ fn materialize_kind(root: &Path, kind: &str, material: &str) -> Result<(), Strin
     Ok(())
 }
 
-fn drop_materialization(root: &Path, kind: &str) -> Result<(), String> {
+fn drop_materialization(
+    root: &Path,
+    staging: &crate::lease_transcript_staging::StagingPaths,
+    kind: &str,
+) -> Result<(), String> {
     if let Some(plan) = materialization_plan(kind) {
         let path = root.join(plan.dir_name);
+        stage_before_removal(&plan, &path, staging);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -365,7 +418,11 @@ fn clear_materialization_cleanup(kind: &str) {
         .remove(kind);
 }
 
-fn retry_pending_materialization_cleanup(root: &Path, active_kinds: &HashSet<String>) {
+fn retry_pending_materialization_cleanup(
+    root: &Path,
+    staging: &crate::lease_transcript_staging::StagingPaths,
+    active_kinds: &HashSet<String>,
+) {
     let pending: Vec<String> = pending_materialization_cleanup()
         .read()
         .expect("pending materialization cleanup poisoned")
@@ -376,7 +433,7 @@ fn retry_pending_materialization_cleanup(root: &Path, active_kinds: &HashSet<Str
         if active_kinds.contains(&kind) {
             continue;
         }
-        match drop_materialization(root, &kind) {
+        match drop_materialization(root, staging, &kind) {
             Ok(()) => {
                 clear_materialization_cleanup(&kind);
             }
@@ -431,7 +488,16 @@ pub fn sweep_now() {
 /// may either. Call once at daemon startup.
 pub fn startup_materialization_sweep() {
     let root = materialization_root();
+    let staging = crate::lease_transcript_staging::default_paths();
     if root.exists() {
+        // Crash leftovers can hold transcripts from the previous process's
+        // leased sessions — stage them before the sweep deletes the root
+        // (works with no indexer running; the drainer picks them up later).
+        for kind in ["oauth:codex", "oauth:claude-code"] {
+            if let Some(plan) = materialization_plan(kind) {
+                stage_before_removal(&plan, &root.join(plan.dir_name), &staging);
+            }
+        }
         if let Err(err) = std::fs::remove_dir_all(&root) {
             eprintln!(
                 "[credential-leases] startup sweep of {} failed: {err}",
@@ -442,6 +508,9 @@ pub fn startup_materialization_sweep() {
             }
         }
     }
+    // Staged transcripts nobody drained within the retention window die
+    // here rather than accumulating forever.
+    crate::lease_transcript_staging::gc_staging(&staging.staging, now_unix_ms() as i64);
     // A restart is a custody epoch: whatever the trail shows as live
     // before this point died with the old process.
     crate::credential_audit::record_reset();
@@ -559,10 +628,21 @@ pub fn grant(
     sweep_locked(&mut leases, now);
     // An oauth lease without its materialized auth file is useless to the
     // child process — refuse the grant rather than hold a dead lease.
-    if let Err(error) = materialize_kind(&materialization_root(), kind, material) {
+    let staging = crate::lease_transcript_staging::default_paths();
+    if let Err(error) = materialize_kind(&materialization_root(), &staging, kind, material) {
         return Err(format!("credential materialization failed: {error}"));
     }
     clear_materialization_cleanup(kind);
+    // Register the live home so the message-search indexer can watch it
+    // during the lease (not only recover it at cleanup).
+    if let Some(plan) = materialization_plan(kind) {
+        crate::lease_transcript_staging::record_active(
+            &staging.active,
+            plan.dir_name,
+            plan.source,
+            &materialization_root().join(plan.dir_name),
+        );
+    }
     let replaced = leases.insert(kind.to_string(), lease).is_some();
     tombstones()
         .write()
@@ -657,8 +737,9 @@ pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
             });
         }
     }
+    let staging = crate::lease_transcript_staging::default_paths();
     for (kind, label) in dropped {
-        if let Err(err) = drop_materialization(&materialization_root(), &kind) {
+        if let Err(err) = drop_materialization(&materialization_root(), &staging, &kind) {
             eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
             queue_materialization_cleanup(&kind);
         }
@@ -779,6 +860,44 @@ mod tests {
     }
 
     #[test]
+    fn drop_materialization_stages_transcripts_before_deleting() {
+        // Fully injected roots: no env, no globals — the first version of
+        // this test reached the LIVE intendant home through default_paths()
+        // (intendant-core's cfg(test) scratch does not cross the crate
+        // boundary) and flaked under CI's threaded `cargo test`.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(home.join("auth.json"), "SECRET").unwrap();
+        std::fs::write(sessions.join("rollout-probe.jsonl"), "{}\n").unwrap();
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: tmp.path().join("staging"),
+            active: tmp.path().join("active"),
+        };
+        std::fs::create_dir_all(&staging.active).unwrap();
+        std::fs::write(staging.active.join("codex-home.json"), "{}").unwrap();
+
+        drop_materialization(tmp.path(), &staging, "oauth:codex").unwrap();
+
+        // The home (and the secret) are gone…
+        assert!(!home.exists(), "materialized home deleted");
+        // …the active-registry entry was cleared…
+        assert!(!staging.active.join("codex-home.json").exists());
+        // …and the transcript survived into staging.
+        let entries: Vec<_> = std::fs::read_dir(&staging.staging)
+            .expect("staging dir created")
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let entry = entries[0].path();
+        assert!(entry.join("sessions/rollout-probe.jsonl").exists());
+        assert!(!entry.join("auth.json").exists(), "secret never staged");
+        let raw = std::fs::read_to_string(entry.join("manifest.json")).unwrap();
+        assert!(raw.contains("\"codex\""));
+    }
+
+    #[test]
     fn grant_renew_status_revoke_round_trip() {
         let _guard = lock();
         reset();
@@ -820,12 +939,42 @@ mod tests {
     fn regrant_replaces_and_unknown_kinds_are_refused() {
         let _guard = lock();
         reset();
-        grant("api_key:openai", "a", "first", None, "root", "local", None, None).unwrap();
-        let outcome = grant("api_key:openai", "b", "second", None, "root", "local", None, None).unwrap();
+        grant(
+            "api_key:openai",
+            "a",
+            "first",
+            None,
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
+        let outcome = grant(
+            "api_key:openai",
+            "b",
+            "second",
+            None,
+            "root",
+            "local",
+            None,
+            None,
+        )
+        .unwrap();
         assert!(outcome.replaced);
         assert_eq!(leased_secret("api_key:openai").as_deref(), Some("second"));
 
-        assert!(grant("api_key:mystery", "x", "y", None, "root", "local", None, None).is_err());
+        assert!(grant(
+            "api_key:mystery",
+            "x",
+            "y",
+            None,
+            "root",
+            "local",
+            None,
+            None
+        )
+        .is_err());
         assert!(grant("api_key:gemini", "x", "", None, "root", "local", None, None).is_err());
         reset();
     }
@@ -875,7 +1024,11 @@ mod tests {
     #[test]
     fn oauth_materialization_writes_restricted_auth_and_cleans_up() {
         let root = tempfile::TempDir::new().unwrap();
-        materialize_kind(root.path(), "oauth:codex", r#"{"tokens":{}}"#).unwrap();
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: root.path().join("test-staging"),
+            active: root.path().join("test-active"),
+        };
+        materialize_kind(root.path(), &staging, "oauth:codex", r#"{"tokens":{}}"#).unwrap();
         let auth = root.path().join("codex-home").join("auth.json");
         assert!(auth.is_file());
         assert_eq!(std::fs::read_to_string(&auth).unwrap(), r#"{"tokens":{}}"#);
@@ -892,25 +1045,35 @@ mod tests {
             assert_eq!(dir_mode, 0o700, "materialization dir must be private");
         }
 
-        materialize_kind(root.path(), "oauth:claude-code", r#"{"claudeAiOauth":{}}"#).unwrap();
+        materialize_kind(
+            root.path(),
+            &staging,
+            "oauth:claude-code",
+            r#"{"claudeAiOauth":{}}"#,
+        )
+        .unwrap();
         let creds = root.path().join("claude-home").join(".credentials.json");
         assert!(creds.is_file());
 
         // API-key kinds are memory-only — nothing materializes.
-        materialize_kind(root.path(), "api_key:anthropic", "sk-ant").unwrap();
-        let dirs: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+        materialize_kind(root.path(), &staging, "api_key:anthropic", "sk-ant").unwrap();
+        let dirs: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with("test-"))
+            .collect();
         assert_eq!(dirs.len(), 2, "only the two oauth kinds may materialize");
 
-        drop_materialization(root.path(), "oauth:codex").unwrap();
+        drop_materialization(root.path(), &staging, "oauth:codex").unwrap();
         assert!(!root.path().join("codex-home").exists());
         assert!(
             creds.is_file(),
             "dropping one kind must not touch the other"
         );
-        drop_materialization(root.path(), "oauth:claude-code").unwrap();
+        drop_materialization(root.path(), &staging, "oauth:claude-code").unwrap();
         assert!(!root.path().join("claude-home").exists());
         // Dropping an already-gone kind is a quiet no-op.
-        drop_materialization(root.path(), "oauth:claude-code").unwrap();
+        drop_materialization(root.path(), &staging, "oauth:claude-code").unwrap();
     }
 
     #[test]

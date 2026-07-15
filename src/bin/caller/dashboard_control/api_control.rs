@@ -6,14 +6,17 @@
 
 use super::*;
 
-pub(crate) async fn api_settings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_settings_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let runtime_settings = {
         let session = runtime.shared_session.read().await;
         session.runtime_settings.clone()
     };
-    json_body_response(
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::settings_get_response_body(
+        crate::web_gateway::settings_get_api_response(
             runtime.project_root.as_deref(),
             &runtime_settings,
         )
@@ -22,19 +25,29 @@ pub(crate) async fn api_settings_response(id: String, runtime: &ControlRuntime) 
     )
 }
 
-pub(crate) async fn api_displays_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_displays_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let session_registry = {
         let session = runtime.shared_session.read().await;
         session.session_registry.clone()
     };
-    json_body_response(
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::displays_response_body(&session_registry).await,
+        crate::web_gateway::displays_api_response(
+            &session_registry,
+            runtime.grant.has_owner_dashboard_authority(),
+        )
+        .await,
         "displays",
     )
 }
 
-pub(crate) async fn api_voice_session_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_voice_session_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let provider = runtime
         .config
         .get("provider")
@@ -69,7 +82,10 @@ pub(crate) async fn api_browser_workspace_snapshot_response(id: String) -> serde
     })
 }
 
-pub(crate) async fn api_state_snapshot_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_state_snapshot_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let (daemon_session_id, query_ctx, session_log) = {
         let session = runtime.shared_session.read().await;
         (
@@ -115,11 +131,22 @@ pub(crate) async fn api_session_log_replay_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let replay_log_dir = active_replay_log_dir(runtime).await;
-    let mut replay = replay_log_dir
-        .as_ref()
-        .and_then(|log_dir| {
-            crate::web_gateway::session_log_replay_payload_for_websocket_bootstrap(log_dir)
+    // The replay conversion reads and converts the whole tail-limited
+    // session log — blocking work, so it runs on the blocking pool
+    // instead of stalling a runtime worker (the request lane spawns these
+    // handlers as plain async tasks).
+    let converted = match replay_log_dir {
+        Some(log_dir) => tokio::task::spawn_blocking(move || {
+            crate::web_gateway::session_log_replay_payload_for_websocket_bootstrap(&log_dir)
         })
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[dashboard-control] session log replay task failed: {e}");
+            None
+        }),
+        None => None,
+    };
+    let mut replay = converted
         .and_then(|(payload, external_session_id)| {
             let mut value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
             if let (Some(external_session_id), Some(map)) =
@@ -139,6 +166,7 @@ pub(crate) async fn api_session_log_replay_response(
                 "available": false,
             })
         });
+    runtime.grant.filter_dashboard_replay_payload(&mut replay);
     if let Some(map) = replay.as_object_mut() {
         map.entry("available".to_string())
             .or_insert(serde_json::Value::Bool(true));
@@ -165,9 +193,16 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     if let Some(result) = response_result(cached_bootstrap_events_response_frame(
         "bootstrap-cached".into(),
         &runtime.bootstrap_caches,
+        &runtime.grant,
     )) {
         if let Some(events) = result.get("events").and_then(|value| value.as_array()) {
-            frames.extend(events.iter().cloned());
+            frames.extend(events.iter().filter_map(|event| {
+                let line = serde_json::to_string(event).ok()?;
+                runtime
+                    .grant
+                    .allows_dashboard_event_line(&line)
+                    .then(|| event.clone())
+            }));
         }
     }
     if let Some(frame) =
@@ -188,10 +223,9 @@ pub(crate) async fn api_dashboard_bootstrap_response(
         }
         frames.push(frame);
     }
-    frames.extend(external_session_activity_replay_frames(
-        runtime,
-        &replayed_external_session_ids,
-    ));
+    frames.extend(
+        external_session_activity_replay_frames(runtime, &replayed_external_session_ids).await,
+    );
     frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
     let omitted = dashboard_bootstrap_omitted(runtime);
@@ -208,7 +242,10 @@ pub(crate) async fn api_dashboard_bootstrap_response(
     })
 }
 
-pub(crate) async fn api_display_bootstrap_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_display_bootstrap_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let mut frames = display_ready_bootstrap_frames(runtime).await;
     frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
@@ -251,7 +288,9 @@ pub(crate) async fn api_display_webrtc_offer_response(
     params: &serde_json::Value,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let display_id = display_id_param(Some(params));
+    let Some(display_id) = display_id_param(Some(params)) else {
+        return invalid_display_id_response(id);
+    };
     let sdp = string_param(params, &["sdp", "offer", "offer_sdp"]);
     if sdp.is_empty() {
         return missing_param_response(id, "sdp");
@@ -259,6 +298,21 @@ pub(crate) async fn api_display_webrtc_offer_response(
     let Some(display_session) = active_display_session(runtime, display_id).await else {
         return display_signal_error_response(id, 404, display_id, "display session not found");
     };
+    let Some(display_authority) = runtime.display_authority.as_ref() else {
+        return display_signal_error_response(
+            id,
+            503,
+            display_id,
+            "display input authority unavailable",
+        );
+    };
+
+    // The media WebRTC peer outlives this RPC and is distinct from the
+    // dashboard-control peer. Register the owning session before awaiting the
+    // offer so teardown can close the media peer even when revocation races
+    // offer construction. The post-offer authority check below covers the
+    // inverse race, where teardown drains this list before the peer is inserted.
+    track_dashboard_display_session(runtime, Arc::clone(&display_session)).await;
 
     let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
     if let Some(control_frames_tx) = runtime.control_frames_tx.clone() {
@@ -282,11 +336,7 @@ pub(crate) async fn api_display_webrtc_offer_response(
         });
     }
 
-    let input_authorized = dashboard_display_input_authorizer(
-        runtime.display_authority.clone(),
-        runtime.session_id.clone(),
-        display_id,
-    );
+    let input_authorized = dashboard_display_interactive_authorizer(runtime, display_id);
     let authority_handler = crate::display::webrtc::noop_authority_handler();
     match display_session
         .handle_offer(
@@ -296,21 +346,36 @@ pub(crate) async fn api_display_webrtc_offer_response(
             Some(Arc::clone(&runtime.tcp_peer_registry)),
             runtime.tcp_advertised,
             ice_tx,
-            input_authorized,
+            crate::display::BrowserInputAuthorization::versioned(
+                input_authorized,
+                display_authority.input_revision(display_id),
+            ),
             authority_handler,
         )
         .await
     {
-        Ok(answer_sdp) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": true,
-            "result": {
-                "t": "display_answer",
-                "display_id": display_id,
-                "sdp": answer_sdp,
-            },
-        }),
+        Ok(answer_sdp) => {
+            if runtime.shutdown.is_cancelled() || !runtime.grant.opening_authority_is_current() {
+                display_session.remove_peer(runtime.display_peer_id).await;
+                display_signal_error_response(
+                    id,
+                    403,
+                    display_id,
+                    "dashboard control authority expired during display offer",
+                )
+            } else {
+                serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": {
+                        "t": "display_answer",
+                        "display_id": display_id,
+                        "sdp": answer_sdp,
+                    },
+                })
+            }
+        }
         Err(e) => display_signal_error_response(
             id,
             502,
@@ -320,12 +385,41 @@ pub(crate) async fn api_display_webrtc_offer_response(
     }
 }
 
+pub(crate) async fn track_dashboard_display_session(
+    runtime: &ControlRuntime,
+    display_session: Arc<crate::display::DisplaySession>,
+) {
+    let mut sessions = runtime.display_peer_sessions.lock().await;
+    sessions.retain(|tracked| tracked.strong_count() > 0);
+    let display_session = Arc::downgrade(&display_session);
+    if !sessions
+        .iter()
+        .any(|tracked| std::sync::Weak::ptr_eq(tracked, &display_session))
+    {
+        sessions.push(display_session);
+    }
+}
+
+pub(crate) async fn remove_dashboard_display_peers(runtime: &ControlRuntime) {
+    let sessions = {
+        let mut sessions = runtime.display_peer_sessions.lock().await;
+        std::mem::take(&mut *sessions)
+    };
+    for display_session in sessions {
+        if let Some(display_session) = display_session.upgrade() {
+            display_session.remove_peer(runtime.display_peer_id).await;
+        }
+    }
+}
+
 pub(crate) async fn api_display_webrtc_ice_response(
     id: String,
     params: &serde_json::Value,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let display_id = display_id_param(Some(params));
+    let Some(display_id) = display_id_param(Some(params)) else {
+        return invalid_display_id_response(id);
+    };
     let Some(candidate) = params.get("candidate").cloned() else {
         return missing_param_response(id, "candidate");
     };
@@ -364,17 +458,34 @@ pub(crate) async fn active_display_session(
         session.session_registry.clone()
     }?;
     let registry = session_registry.read().await;
-    registry.get(display_id)
+    runtime.grant.display_session(&registry, display_id)
 }
 
-pub(crate) fn dashboard_display_input_authorizer(
-    display_authority: Option<DashboardDisplayAuthorityBridge>,
-    session_id: String,
+pub(crate) fn dashboard_display_interactive_authorizer(
+    runtime: &ControlRuntime,
     display_id: u32,
 ) -> Arc<dyn Fn() -> bool + Send + Sync> {
-    Arc::new(move || match display_authority.as_ref() {
-        Some(bridge) => bridge.input_authorized(&session_id, display_id),
-        None => true,
+    // The signaling method itself has a DisplayView floor. Freeze the
+    // separate interactive decision into the peer so an observer cannot use
+    // `control`, `pointer`, or `clipboard` data channels as a side door. A
+    // later authority upgrade requires reconnecting; exact-grant checks make
+    // every downgrade/revocation fail closed immediately.
+    let interactive_at_open = runtime
+        .grant
+        .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+        .allowed;
+    let display_authority = runtime.display_authority.clone();
+    let session_id = runtime.session_id.clone();
+    let grant = runtime.grant.clone();
+    let shutdown = runtime.shutdown.clone();
+    Arc::new(move || {
+        interactive_at_open
+            && !shutdown.is_cancelled()
+            && grant.opening_authority_is_current()
+            && match display_authority.as_ref() {
+                Some(bridge) => bridge.input_authorized(&session_id, display_id),
+                None => true,
+            }
     })
 }
 
@@ -420,8 +531,27 @@ pub(crate) async fn api_display_input_authority_request_response(
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return display_authority_unavailable_response(id);
     };
-    let display_id = display_id_param(params);
-    let frames = bridge.request(&runtime.session_id, display_id);
+    let Some(display_id) = display_id_param(params) else {
+        return invalid_display_id_response(id);
+    };
+    let frames = bridge.request(
+        &runtime.session_id,
+        display_id,
+        runtime.grant.has_owner_dashboard_authority(),
+    );
+    if frames.is_empty() {
+        // A valid grant always emits the resulting authority-state frame.
+        // The bridge uses an empty result to fail closed when the display no
+        // longer exists (or the registry is contended); preserve that refusal
+        // at the RPC boundary instead of reporting a grant the daemon did not
+        // install and leaving the browser to time out.
+        return display_signal_error_response(
+            id,
+            404,
+            display_id,
+            "display input authority request was rejected",
+        );
+    }
     let frame_count = frames.len();
     serde_json::json!({
         "t": "response",
@@ -444,7 +574,9 @@ pub(crate) async fn api_display_input_authority_release_response(
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return display_authority_unavailable_response(id);
     };
-    let display_id = display_id_param(params);
+    let Some(display_id) = display_id_param(params) else {
+        return invalid_display_id_response(id);
+    };
     let frames = bridge.release(&runtime.session_id, display_id);
     let frame_count = frames.len();
     serde_json::json!({
@@ -475,7 +607,7 @@ pub(crate) fn display_authority_unavailable_response(id: String) -> serde_json::
     })
 }
 
-pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
+pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> Option<u32> {
     params
         .and_then(|params| {
             params
@@ -485,10 +617,21 @@ pub(crate) fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
         })
         .and_then(|value| value.as_u64())
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or(0)
 }
 
-pub(crate) async fn display_authority_snapshot_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+pub(crate) fn invalid_display_id_response(id: String) -> serde_json::Value {
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": false,
+        "status": 400,
+        "error": "missing or invalid display_id",
+    })
+}
+
+pub(crate) async fn display_authority_snapshot_frames(
+    runtime: &ControlRuntime,
+) -> Vec<serde_json::Value> {
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return Vec::new();
     };
@@ -512,7 +655,9 @@ pub(crate) fn display_bootstrap_omitted(runtime: &ControlRuntime) -> Vec<&'stati
     }
 }
 
-pub(crate) async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+pub(crate) async fn display_ready_bootstrap_frames(
+    runtime: &ControlRuntime,
+) -> Vec<serde_json::Value> {
     let display_ids = active_display_ids(runtime).await;
     let session_registry = {
         let session = runtime.shared_session.read().await;
@@ -526,15 +671,19 @@ pub(crate) async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> 
     display_ids
         .into_iter()
         .filter_map(|display_id| {
-            registry.get(display_id).map(|session| {
-                let (width, height) = session.resolution();
-                serde_json::json!({
-                    "event": "display_ready",
-                    "display_id": display_id,
-                    "width": width,
-                    "height": height,
+            runtime
+                .grant
+                .display_session(&registry, display_id)
+                .map(|session| {
+                    let (width, height) = session.resolution();
+                    serde_json::json!({
+                        "event": "display_ready",
+                        "display_id": display_id,
+                        "width": width,
+                        "height": height,
+                        "agent_visible": session.agent_visible(),
+                    })
                 })
-            })
         })
         .collect()
 }
@@ -549,7 +698,7 @@ pub(crate) async fn active_display_ids(runtime: &ControlRuntime) -> Vec<u32> {
     };
 
     let registry = session_registry.read().await;
-    let mut display_ids = registry.display_ids();
+    let mut display_ids = runtime.grant.display_ids(&registry);
     display_ids.sort_unstable();
     display_ids
 }
@@ -558,7 +707,7 @@ pub(crate) async fn api_external_session_activity_replay_response(
     id: String,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let frames = external_session_activity_replay_frames(runtime, &HashSet::new());
+    let frames = external_session_activity_replay_frames(runtime, &HashSet::new()).await;
     let frame_count = frames.len();
     serde_json::json!({
         "t": "response",
@@ -571,7 +720,7 @@ pub(crate) async fn api_external_session_activity_replay_response(
     })
 }
 
-pub(crate) fn external_session_activity_replay_frames(
+pub(crate) async fn external_session_activity_replay_frames(
     runtime: &ControlRuntime,
     skip_session_ids: &HashSet<String>,
 ) -> Vec<serde_json::Value> {
@@ -588,14 +737,30 @@ pub(crate) fn external_session_activity_replay_frames(
         })
         .unwrap_or_default();
     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
-    active_external_sessions
+    let to_convert: Vec<(String, String)> = active_external_sessions
         .into_iter()
         .filter(|(session_id, _)| !skip_session_ids.contains(session_id))
-        .filter_map(|(session_id, source)| {
-            crate::web_gateway::external_session_activity_replay_for_websocket(&source, &session_id)
+        .collect();
+    // Each conversion reads and converts a backend-native session file —
+    // blocking disk work, off the runtime workers (see
+    // api_session_log_replay_response).
+    tokio::task::spawn_blocking(move || {
+        to_convert
+            .into_iter()
+            .filter_map(|(session_id, source)| {
+                crate::web_gateway::external_session_activity_replay_for_websocket(
+                    &source,
+                    &session_id,
+                )
                 .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
-        })
-        .collect()
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        eprintln!("[dashboard-control] external session replay task failed: {e}");
+        Vec::new()
+    })
 }
 
 pub(crate) fn response_result(response: serde_json::Value) -> Option<serde_json::Value> {
@@ -641,14 +806,15 @@ pub(crate) async fn active_replay_log_dir(runtime: &ControlRuntime) -> Option<Pa
         })
 }
 
-pub(crate) async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let body = runtime
-        .worktree_inventory_cache
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .unwrap_or_else(crate::web_gateway::empty_worktree_inventory_response);
-    json_body_response(id, body, "worktrees")
+pub(crate) async fn api_worktrees_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_json_body_response(
+        id,
+        crate::web_gateway::worktrees_list_api_response(&runtime.worktree_inventory_cache),
+        "worktrees",
+    )
 }
 
 pub(crate) async fn api_worktrees_inspect_response(
@@ -659,13 +825,11 @@ pub(crate) async fn api_worktrees_inspect_response(
     let body_text = params_body_text(params);
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::inspect_worktree_inventory_response(&home, &body_text)
+        crate::web_gateway::worktrees_inspect_api_response(&home, &body_text)
     })
     .await;
     match result {
-        Ok((status_line, body)) => {
-            http_body_response(id, status_line_code(status_line), body, "worktree inspect")
-        }
+        Ok(response) => frame_api_response(id, response, "worktree inspect"),
         Err(e) => http_body_response(
             id,
             500,
@@ -679,21 +843,19 @@ pub(crate) async fn api_worktrees_inspect_response(
     }
 }
 
-pub(crate) async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+pub(crate) async fn api_worktrees_scan_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
     let project_root = runtime.project_root.clone();
     let cache = runtime.worktree_inventory_cache.clone();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        let body =
-            crate::web_gateway::scan_worktree_inventory_response(&home, project_root.as_deref());
-        if let Ok(mut guard) = cache.lock() {
-            *guard = Some(body.clone());
-        }
-        body
+        crate::web_gateway::worktrees_scan_api_response(&home, project_root.as_deref(), &cache)
     })
     .await;
     match result {
-        Ok(body) => json_body_response(id, body, "worktree scan"),
+        Ok(response) => frame_api_json_body_response(id, response, "worktree scan"),
         Err(e) => http_body_response(
             id,
             500,
@@ -712,22 +874,14 @@ pub(crate) async fn api_worktrees_remove_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let cache = runtime.worktree_inventory_cache.clone();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let result = tokio::task::spawn_blocking(move || {
-        let result = crate::web_gateway::remove_worktree_inventory_response(&home, &body_text);
-        if result.0 == "200 OK" {
-            if let Ok(mut guard) = cache.lock() {
-                *guard = None;
-            }
-        }
-        result
+        crate::web_gateway::worktrees_remove_api_response(&home, &body_text, &cache)
     })
     .await;
     match result {
-        Ok((status_line, body)) => {
-            http_body_response(id, status_line_code(status_line), body, "worktree remove")
-        }
+        Ok(response) => frame_api_response(id, response, "worktree remove"),
         Err(e) => http_body_response(
             id,
             500,
@@ -782,6 +936,19 @@ pub(crate) async fn api_managed_context_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixture
+    // drives the `_from_home` variant with an injected temp home.
+    api_managed_context_response_from_home(id, kind, params, runtime, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_managed_context_response_from_home(
+    id: String,
+    kind: &'static str,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let Some(request_line) = managed_context_request_line(kind, &params) else {
         return missing_param_response(id, "query");
@@ -797,7 +964,7 @@ pub(crate) async fn api_managed_context_response(
             );
         }
     };
-    let home = crate::platform::home_dir();
+    let home = home.to_path_buf();
     let response = tokio::task::spawn_blocking(move || match kind {
         "records" => crate::web_gateway::managed_context_records_response_from_home(
             &request_line,
@@ -832,7 +999,7 @@ pub(crate) async fn api_managed_context_response(
             });
         }
     };
-    http_wire_response(id, response, "managed context")
+    frame_api_response(id, response, "managed context")
 }
 
 pub(crate) async fn api_mcp_tool_call_response(
@@ -977,12 +1144,20 @@ pub(crate) async fn api_settings_save_response(
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status_line, body) = crate::web_gateway::settings_post_result(
-        &body_text,
-        runtime.project_root.as_deref(),
-        &runtime.bus,
-    );
-    http_body_response(id, status_line_code(status_line), body, "settings save")
+    let settings_root = {
+        let session = runtime.shared_session.read().await;
+        session.runtime_settings.settings_root.clone()
+    }
+    .or_else(|| runtime.project_root.clone());
+    frame_api_response(
+        id,
+        crate::web_gateway::settings_post_api_response(
+            &body_text,
+            settings_root.as_deref(),
+            &runtime.bus,
+        ),
+        "settings save",
+    )
 }
 
 pub(crate) async fn api_control_msg_response(
@@ -1008,6 +1183,10 @@ pub(crate) async fn api_control_msg_response(
             .to_string(),
             "control message",
         );
+    }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "control message");
     }
     let action = dashboard_control_msg_action(&ctrl);
     runtime.bus.send(AppEvent::PresenceLog {
@@ -1051,6 +1230,10 @@ pub(crate) async fn api_session_control_msg_response(
             "session control message",
         );
     }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "session control message");
+    }
     let action = dashboard_control_msg_action(&ctrl);
     dispatch_dashboard_control_msg(&runtime.bus, ctrl, "session-control");
     serde_json::json!({
@@ -1087,6 +1270,10 @@ pub(crate) async fn api_dashboard_action_msg_response(
             .to_string(),
             "dashboard action message",
         );
+    }
+    let decision = runtime.grant.control_msg_access_decision(&ctrl);
+    if !decision.allowed {
+        return control_msg_denied_response(id, decision, "dashboard action message");
     }
     let action = dashboard_control_msg_action(&ctrl);
     let marker_apply = match &ctrl {
@@ -1128,9 +1315,32 @@ pub(crate) async fn api_dashboard_action_msg_response(
     })
 }
 
+fn control_msg_denied_response(
+    id: String,
+    decision: crate::access::iam::AccessDecision,
+    label: &str,
+) -> serde_json::Value {
+    http_body_response(
+        id,
+        403,
+        serde_json::json!({
+            "ok": false,
+            "permission": decision.permission,
+            "error": format!("not allowed: {}", decision.reason),
+        })
+        .to_string(),
+        label,
+    )
+}
+
+/// `state_dir` arrives from the dispatch arm — the transport edge
+/// resolves `platform::intendant_home()`, so tests inject a tempdir
+/// instead of appending to the live diagnostics store (the CLAUDE.md
+/// tests-are-hermetic convention).
 pub(crate) async fn api_diagnostics_visual_freshness_response(
     id: String,
     params: Option<&serde_json::Value>,
+    state_dir: PathBuf,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
@@ -1148,25 +1358,23 @@ pub(crate) async fn api_diagnostics_visual_freshness_response(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        crate::diagnostics::append_visual_freshness_record(&session_id, body.as_bytes())
+        crate::web_gateway::diagnostics_visual_freshness_api_response(
+            &state_dir,
+            &session_id,
+            body.as_bytes(),
+        )
     })
     .await;
-    let (status, body) = match result {
-        Ok(Ok(written)) => (
-            200,
-            serde_json::json!({"ok": true, "written": written}).to_string(),
-        ),
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            (400, serde_json::json!({"error": e.to_string()}).to_string())
-        }
-        Ok(Err(e)) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
-        Err(e) => (
+    match result {
+        Ok(response) => frame_api_response(id, response, "diagnostics visual freshness"),
+        Err(e) => http_body_response(
+            id,
             500,
             serde_json::json!({"error": format!("diagnostics append task failed: {e}")})
                 .to_string(),
+            "diagnostics visual freshness",
         ),
-    };
-    http_body_response(id, status, body, "diagnostics visual freshness")
+    }
 }
 
 pub(crate) fn dashboard_control_msg_from_params(
@@ -1196,7 +1404,11 @@ pub(crate) fn dashboard_control_msg_from_params(
     })
 }
 
-pub(crate) fn dispatch_dashboard_control_msg(bus: &crate::event::EventBus, ctrl: ControlMsg, scope: &str) {
+pub(crate) fn dispatch_dashboard_control_msg(
+    bus: &crate::event::EventBus,
+    ctrl: ControlMsg,
+    scope: &str,
+) {
     let action = dashboard_control_msg_action(&ctrl);
     bus.send(AppEvent::PresenceLog {
         message: format!("[dashboard-control:{scope}] ControlMsg: {action}"),
@@ -1312,6 +1524,7 @@ pub(crate) const DASHBOARD_ACTION_MSG_ACTIONS: &[&str] = &[
     "release_display",
     "grant_user_display",
     "revoke_user_display",
+    "resolve_display_request",
     "create_virtual_display",
     "create_browser_workspace",
     "close_browser_workspace",
@@ -1386,6 +1599,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::ReleaseDisplay { .. } => "release_display",
         ControlMsg::GrantUserDisplay { .. } => "grant_user_display",
         ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
+        ControlMsg::ResolveDisplayRequest { .. } => "resolve_display_request",
         ControlMsg::CreateVirtualDisplay { .. } => "create_virtual_display",
         ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
         ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
@@ -1418,10 +1632,14 @@ pub(crate) async fn api_api_keys_save_response(
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
-    http_body_response(
+    // The transport edge resolves the ambient env path; the persist
+    // core below it is path-parameterized (hermeticity convention).
+    frame_api_response(
         id,
-        200,
-        crate::web_gateway::handle_set_api_keys(&body_text),
+        crate::web_gateway::api_keys_save_api_response(
+            crate::web_gateway::api_keys_env_path().as_deref(),
+            &body_text,
+        ),
         "api keys save",
     )
 }
@@ -1618,12 +1836,27 @@ pub(crate) async fn api_peer_pairing_join_response(
     http_body_response(id, status, body, "peer pairing join")
 }
 
+// The pairing arms below split transport edge from core (hermeticity
+// convention, the sessions family's `_from_home` shape): the ambient
+// wrapper resolves the daemon's cert store once, the `_from_cert_dir`
+// core is what the parity fixtures drive over injected tempdirs.
+
 pub(crate) async fn api_peer_pairing_request_access_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_request_access(&body_text).await;
+    let (status, body) =
+        crate::web_gateway::peers_pairing_request_access(cert_dir, &body_text).await;
     http_body_response(id, status, body, "peer access request")
 }
 
@@ -1632,10 +1865,22 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_access_poll_response_from_cert_dir(id, params, runtime, &cert_dir)
+        .await
+}
+
+pub(crate) async fn api_peer_pairing_request_access_poll_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
     let (status, body) = crate::web_gateway::peers_pairing_request_access_poll(
         runtime.peer_registry.as_ref(),
         runtime.project_root.as_deref(),
+        cert_dir,
         &body_text,
     )
     .await;
@@ -1643,13 +1888,30 @@ pub(crate) async fn api_peer_pairing_request_access_poll_response(
 }
 
 pub(crate) async fn api_peer_pairing_requests_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_requests_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_requests_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_requests_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_requests_list(cert_dir);
     http_body_response(id, status, body, "peer access requests")
 }
 
 pub(crate) async fn api_peer_pairing_request_decision_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_request_decision_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_request_decision_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
 ) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let request_id = string_param(&params, &["request_id", "requestId", "code", "id"]);
@@ -1664,12 +1926,20 @@ pub(crate) async fn api_peer_pairing_request_decision_response(
     };
     let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
     let (status, body) =
-        crate::web_gateway::peers_pairing_request_decision(&request_id, &op, &body_text);
+        crate::web_gateway::peers_pairing_request_decision(cert_dir, &request_id, &op, &body_text);
     http_body_response(id, status, body, "peer access request decision")
 }
 
 pub(crate) async fn api_peer_pairing_identities_response(id: String) -> serde_json::Value {
-    let (status, body) = crate::web_gateway::peers_pairing_identities_list();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identities_response_from_cert_dir(id, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identities_response_from_cert_dir(
+    id: String,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
+    let (status, body) = crate::web_gateway::peers_pairing_identities_list_from_cert_dir(cert_dir);
     http_body_response(id, status, body, "peer identities")
 }
 
@@ -1677,8 +1947,18 @@ pub(crate) async fn api_peer_pairing_identity_revoke_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    api_peer_pairing_identity_revoke_response_from_cert_dir(id, params, &cert_dir).await
+}
+
+pub(crate) async fn api_peer_pairing_identity_revoke_response_from_cert_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    cert_dir: &std::path::Path,
+) -> serde_json::Value {
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::peers_pairing_identity_revoke(&body_text);
+    let (status, body) =
+        crate::web_gateway::peers_pairing_identity_revoke_from_cert_dir(cert_dir, &body_text);
     http_body_response(id, status, body, "peer identity revoke")
 }
 
@@ -1691,15 +1971,1454 @@ pub(crate) async fn api_coordinator_route_response(
         return peer_registry_unavailable_response(id);
     };
     let body_text = params_body_text(params);
-    let (status, body) = crate::web_gateway::coordinator_route(registry, &body_text).await;
-    http_body_response(id, status, body, "coordinator route")
+    // The datachannel twin runs the S7 neutral core (POST-shaped by
+    // construction); the registry check above keeps the tunnel's
+    // historical frame-level error instead of the core's 503 body
+    // (divergence #20 in the S7 parity enumeration).
+    frame_api_response(
+        id,
+        crate::web_gateway::coordinator_route_api_response("POST", &body_text, Some(registry))
+            .await,
+        "coordinator route",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── S4b tunnel/HTTP parity: worktrees (design §8) ──
+    //
+    // Extends the S4a enumeration (api_sessions.rs). The S4b-specific
+    // envelope differences, deliberate and pinned across this slice's
+    // fixtures (worktrees here; delete/report in api_sessions.rs;
+    // recordings in api_media.rs):
+    //
+    //  1. Body-only envelopes again: api_session_delete, api_worktrees
+    //     (list), and api_worktrees_scan predate the injected-status
+    //     envelope — plain `{t,id,ok:true,result}` frames; worktrees
+    //     inspect/remove and api_session_recordings ride the
+    //     injected-status envelope, whose keys only decorate OBJECT
+    //     bodies (the recordings array passes through untouched).
+    //  2. BYTES lane: the report zip and the recording listing assets
+    //     serve identical bytes on both lanes; HTTP renders meta as its
+    //     attachment/no-cache header tails, the tunnel emits the meta
+    //     object verbatim as byte_stream_end.result. The delete tail
+    //     orders the wildcard CORS header first (HTTP-lane decoration
+    //     only).
+    //  3. Transport-owned asset carriage: segment/frame FILES stream
+    //     ranged and capped on the tunnel (offset/length params,
+    //     UPLOAD_MAX_BYTES cap, 413/416 shapes) but serve as one
+    //     unbounded body on HTTP; tunnel asset validators are stricter
+    //     (trim, backslash) than the HTTP leaves' historical inline
+    //     checks, and each lane keeps its historical error wording
+    //     (json `{"ok":false,…}` vs text/plain).
+    //  4. Transport-owned params: the tunnel's report id defaults to
+    //     "current" and delete's target to "session"; HTTP addresses
+    //     both by path segment (five delete wire shapes).
+    //  5. Task-failure shapes stay per-lane (scan answers 200 with an
+    //     error body on HTTP, an ok:false frame on the tunnel).
+
+    fn parity_http_status_and_body(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, serde_json::Value) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        (
+            status,
+            serde_json::from_slice(&bytes[split + 4..]).expect("json body"),
+        )
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_list_serves_the_same_body_on_both_transports() {
+        let rt = crate::dashboard_control::tests::runtime();
+        {
+            let mut guard = rt.worktree_inventory_cache.lock().unwrap();
+            *guard = Some(r#"{"worktrees":[],"cached":true}"#.to_string());
+        }
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::worktrees_list_api_response(&rt.worktree_inventory_cache),
+        );
+        assert_eq!(status, 200);
+        let frame = api_worktrees_response("parity-wt-list".to_string(), &rt).await;
+        assert_eq!(frame["ok"], true);
+        // Body-only envelope: no injected status metadata.
+        assert!(frame["result"]
+            .as_object()
+            .is_none_or(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_inspect_shares_bodies_with_status_metadata() {
+        let rt = crate::dashboard_control::tests::runtime();
+        // Invalid request body: deterministic serde wording on both lanes.
+        // The injected temp home is never reached on this path, but the
+        // fixture still must not hand the core a real home dir.
+        let tmp_home = tempfile::tempdir().expect("temp home");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::worktrees_inspect_api_response(tmp_home.path(), "not json"),
+        );
+        assert_eq!(status, 400);
+        let frame = api_worktrees_inspect_response(
+            "parity-wt-inspect".to_string(),
+            Some(&serde_json::json!("not json")),
+            &rt,
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        // The tunnel serializes its params value as the request body —
+        // "not json" arrives quoted, so the serde wording differs in the
+        // offending token but both are the invalid-request shape.
+        assert_eq!(result["ok"], http_body["ok"]);
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid worktree inspect request:"));
+        assert!(http_body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid worktree inspect request:"));
+    }
+
+    #[tokio::test]
+    async fn parity_worktrees_scan_rides_the_shared_core_and_plain_envelope() {
+        // Both lanes render the ONE neutral scan (worktrees_scan_api_response)
+        // over an injected temp home. A fixture must never run the real
+        // scan: on a fleet runner that walks the runner account's
+        // ~/projects and agent-worktree roots and reads its session
+        // metadata — machine-dependent, git-subprocess-per-worktree slow,
+        // and a hermeticity violation. The temp home is also what makes
+        // the cross-lane equality assertable at all (live worktree state
+        // moves between scans on a multi-agent box; only `scanned_at`
+        // varies here).
+        let tmp_home = tempfile::tempdir().expect("temp home");
+        let strip_scanned_at = |mut body: serde_json::Value| {
+            body.as_object_mut()
+                .expect("inventory object")
+                .remove("scanned_at")
+                .expect("scan stamps scanned_at");
+            body
+        };
+
+        let http_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &http_cache),
+        );
+        assert_eq!(status, 200);
+
+        let tunnel_cache = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let frame = frame_api_json_body_response(
+            "parity-wt-scan".to_string(),
+            crate::web_gateway::worktrees_scan_api_response(tmp_home.path(), None, &tunnel_cache),
+            "worktree scan",
+        );
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // Body-only envelope: no injected status metadata.
+        let result = frame["result"].as_object().expect("inventory object");
+        assert!(!result.contains_key("_httpStatus"), "{frame}");
+        assert!(result.contains_key("worktrees"), "{frame}");
+        assert_eq!(
+            strip_scanned_at(frame["result"].clone()),
+            strip_scanned_at(http_body.clone()),
+            "the two lanes serve the same scan body"
+        );
+        // The shared cache side-effect holds each lane's served body,
+        // byte-exact (same scan produced both).
+        for (cache, served) in [(&http_cache, &http_body), (&tunnel_cache, &frame["result"])] {
+            let cached = cache
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("scan must warm the shared cache");
+            let cached: serde_json::Value = serde_json::from_str(&cached).unwrap();
+            assert_eq!(&cached, served, "the cache holds the served body");
+        }
+    }
+
+    // ── S4c parity: managed context (the S4c envelope differences are
+    // enumerated on the current-session fixture set in api_sessions.rs;
+    // the tunnel's query synthesis is difference #5, the injected-status
+    // envelope difference #1) ──
+
+    #[tokio::test]
+    async fn parity_managed_context_shares_bodies_with_status_metadata() {
+        // An injected temp home keeps the home-scoped candidate scan
+        // empty and deterministic — a fixture must never walk the
+        // machine's real ~/.intendant/logs; both lanes then serve the
+        // scoped empty bodies from the ONE neutral fn per kind.
+        let rt = runtime();
+        let session_id = "parity-mc-session";
+        let tmp_home = tempfile::tempdir().expect("temp home");
+        let home = tmp_home.path().to_path_buf();
+        for (kind, empty_key) in [
+            ("anchors", "anchors"),
+            ("records", "records"),
+            ("fission", "groups"),
+        ] {
+            let request_line =
+                format!("GET /api/managed-context/{kind}?session_id={session_id} HTTP/1.1");
+            let response = match kind {
+                "anchors" => crate::web_gateway::managed_context_anchors_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+                "records" => crate::web_gateway::managed_context_records_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+                _ => crate::web_gateway::managed_context_fission_response_from_home(
+                    &request_line,
+                    None,
+                    &home,
+                ),
+            };
+            let (status, http_body) = parity_http_status_and_body(response);
+            assert_eq!(status, 200, "{kind}");
+            assert_eq!(http_body[empty_key], serde_json::json!([]), "{kind}");
+
+            let frame = api_managed_context_response_from_home(
+                format!("parity-mc-{kind}"),
+                kind,
+                Some(&serde_json::json!({ "session_id": session_id })),
+                &rt,
+                &home,
+            )
+            .await;
+            let mut result = frame["result"].clone();
+            let map = result.as_object_mut().expect("result object");
+            assert_eq!(
+                map.remove("_httpStatus"),
+                Some(serde_json::json!(200)),
+                "{kind}: {frame}"
+            );
+            assert_eq!(
+                map.remove("_httpOk"),
+                Some(serde_json::json!(true)),
+                "{kind}"
+            );
+            assert_eq!(result, http_body, "{kind}");
+        }
+
+        // The tunnel-only missing-selector shape (difference #5): no
+        // session selector at all cannot be synthesized into a request
+        // line, so the tunnel answers its own decode error.
+        let frame =
+            api_managed_context_response("parity-mc-missing".to_string(), "records", None, &rt)
+                .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing query", "{frame}");
+    }
+
+    // ── S5 tunnel/HTTP parity: settings/keys family (design §8) ──
+    //
+    // Extends the S4a (api_sessions.rs), S4b (above), and S4c
+    // enumerations. The S5-specific envelope differences, deliberate
+    // and pinned across this set:
+    //
+    //  1. Envelope split: api_settings, api_key_status, and
+    //     api_project_root ride the body-only envelope
+    //     (frame_api_json_body_response — no injected status), so the
+    //     settings GET's historical always-200 error body
+    //     ({"error":"No project root"}) arrives under ok:true with no
+    //     status metadata; api_settings_save and api_api_keys_save
+    //     ride the injected-status envelope (frame_api_response).
+    //  2. Transport-owned request carriage: HTTP hands the raw request
+    //     body to the shared cores; the tunnel serializes its params
+    //     object (params_body_text) — the same JSON object fed to both
+    //     lanes reaches the one parse as the same bytes, but absent
+    //     tunnel params arrive as "{}", never as an empty body.
+    //  3. api_api_keys_save answers 200 on both lanes with failures in
+    //     the body (historical always-200 lane) — tunnel failure
+    //     bodies therefore still carry _httpStatus 200/_httpOk true.
+    //  4. Header tails are HTTP-lane decoration only: settings
+    //     GET/POST, key-status, and project-root the canonical tail;
+    //     api-keys the bare wildcard tail (no Cache-Control).
+    //  5. The api-keys env path resolves at each transport edge
+    //     (api_keys_env_path); the persist core is path-parameterized.
+    //     These fixtures drive only its pre-persist rejection paths —
+    //     the hermetic success pin (tempdir env path, empty keys map)
+    //     lives with the core's unit tests in web_gateway/settings.rs.
+
+    /// The minimal valid settings payload (exactly the fields without
+    /// a serde default), as the Settings tab has always POSTed it.
+    fn parity_settings_payload() -> serde_json::Value {
+        serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": null
+        })
+    }
+
+    #[tokio::test]
+    async fn parity_settings_get_serves_the_same_body_on_both_transports() {
+        // Rootless: the historical always-200 error body, identical
+        // across lanes, body-only envelope on the tunnel.
+        let rt = runtime();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_get_api_response(
+                None,
+                &crate::web_gateway::RuntimeSettingsState::default(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"error": "No project root"}));
+        let frame = api_settings_response("parity-settings-get".to_string(), &rt).await;
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_none_or(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+
+        // Tempdir root: both lanes serve the same default-config payload.
+        let dir = tempfile::tempdir().expect("temp project root");
+        let mut rt = runtime();
+        rt.project_root = Some(dir.path().to_path_buf());
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_get_api_response(
+                Some(dir.path()),
+                &crate::web_gateway::RuntimeSettingsState::default(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert!(http_body.get("cu_backend").is_some(), "{http_body}");
+        let frame = api_settings_response("parity-settings-get-root".to_string(), &rt).await;
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_settings_save_shares_bodies_with_status_metadata() {
+        // No project root: 400 body from the one core; the tunnel adds
+        // the injected-status metadata.
+        let rt = runtime();
+        let payload = parity_settings_payload();
+        let body_text = params_body_text(Some(&payload));
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::settings_post_api_response(&body_text, None, &rt.bus),
+        );
+        assert_eq!(status, 400);
+        let frame =
+            api_settings_save_response("parity-settings-save".to_string(), Some(&payload), &rt)
+                .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Tempdir roots: the success body rides both lanes and each
+        // lane's save lands in its own injected root.
+        let http_dir = tempfile::tempdir().expect("temp http root");
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::settings_post_api_response(
+                &body_text,
+                Some(http_dir.path()),
+                &rt.bus,
+            ));
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"ok": true}));
+        assert!(http_dir.path().join("intendant.toml").exists());
+
+        let tunnel_dir = tempfile::tempdir().expect("temp tunnel root");
+        let mut rt = runtime();
+        rt.project_root = Some(tunnel_dir.path().to_path_buf());
+        let frame = api_settings_save_response(
+            "parity-settings-save-root".to_string(),
+            Some(&payload),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["result"]["ok"], true, "{frame}");
+        assert_eq!(frame["result"]["_httpStatus"], 200);
+        assert!(tunnel_dir.path().join("intendant.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn parity_api_keys_save_rejections_share_bodies_always_200() {
+        // Unknown key: rejected before any env-path use on both lanes —
+        // and still 200 (difference #3), so the tunnel's failure body
+        // carries _httpOk true.
+        let payload = serde_json::json!({"keys": {"NOT_A_KNOWN_KEY": "x"}});
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::api_keys_save_api_response(None, &params_body_text(Some(&payload))),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "Unknown key: NOT_A_KNOWN_KEY"})
+        );
+        let frame = api_api_keys_save_response("parity-api-keys".to_string(), Some(&payload)).await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_key_status_and_project_root_ride_the_plain_envelope() {
+        // Key status: both lanes render the ONE neutral fn; the tunnel
+        // frames it body-only.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::api_key_status_api_response());
+        assert_eq!(status, 200);
+        let frame = frame_api_json_body_response(
+            "parity-key-status".to_string(),
+            crate::web_gateway::api_key_status_api_response(),
+            "api key status",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+
+        // Project root: Some and None bodies, identical across lanes.
+        let dir = tempfile::tempdir().expect("temp project root");
+        for root in [None, Some(dir.path())] {
+            let (status, http_body) =
+                parity_http_status_and_body(crate::web_gateway::project_root_api_response(root));
+            assert_eq!(status, 200);
+            let frame = frame_api_json_body_response(
+                "parity-project-root".to_string(),
+                crate::web_gateway::project_root_api_response(root),
+                "project root",
+            );
+            assert_eq!(frame["result"], http_body);
+            assert_eq!(frame["result"]["project_root"].is_null(), root.is_none());
+        }
+    }
+
+    // ── S5 second slice: info/displays/diagnostics (design §8) ──
+    //
+    // Extends the S5 enumeration above:
+    //
+    //  6. api_displays and api_external_agents ride the body-only
+    //     envelope; api_diagnostics_visual_freshness the
+    //     injected-status envelope — all over one neutral core each.
+    //  7. Transport-owned diagnostics decode: the tunnel pre-rejects a
+    //     missing/empty session_id and a missing body (missing-param
+    //     frames) and runs the sink on a blocking task whose failure
+    //     is its own 500 shape; HTTP hands an empty session id to the
+    //     sanitizer (400 "sanitizes to empty") and accepts an empty
+    //     body as a zero-byte append (200 written:0).
+    //  8. Header tails stay HTTP-lane decoration: displays the
+    //     wildcard-CORS-with-Cache-Control tail, the sink the bare
+    //     wildcard tail, external-agents the canonical tail.
+    //  9. The sink's state dir and external-agents' home resolve at
+    //     each transport edge; the cores are path-parameterized.
+
+    #[tokio::test]
+    async fn parity_displays_serves_the_same_body_on_both_transports() {
+        // Injected display set on both lanes (a fixture must never
+        // enumerate the machine's real displays — on a session-less CI
+        // account the macOS enumeration never completes); no session
+        // registry on either lane, so both render the ONE neutral body
+        // through the `_from` core the production edges delegate to.
+        let displays = vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }];
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response_from(displays.clone(), &None, true).await,
+        );
+        assert_eq!(status, 200);
+        assert!(http_body["displays"].is_array(), "{http_body}");
+        let frame = frame_api_json_body_response(
+            "parity-displays".to_string(),
+            crate::web_gateway::displays_api_response_from(displays, &None, true).await,
+            "displays",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn displays_api_hides_private_capture_state_from_non_owners() {
+        let displays = vec![crate::display::DisplayInfo {
+            id: 1,
+            platform_id: 7,
+            name: "Fixture Display".to_string(),
+            width: 1280,
+            height: 720,
+            is_primary: true,
+            kind: crate::display::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
+        }];
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let private = Arc::new(crate::display::DisplaySession::new(
+            1,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private.set_agent_visible(false);
+        registry.write().await.insert(1, private);
+        let registry = Some(registry);
+
+        let (_, scoped) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response_from(displays.clone(), &registry, false)
+                .await,
+        );
+        assert!(scoped["displays"][0].get("capture_active").is_none());
+        assert!(scoped["displays"][0].get("agent_visible").is_none());
+
+        let (_, owner) = parity_http_status_and_body(
+            crate::web_gateway::displays_api_response_from(displays, &registry, true).await,
+        );
+        assert_eq!(owner["displays"][0]["capture_active"], true);
+        assert_eq!(owner["displays"][0]["agent_visible"], false);
+    }
+
+    #[tokio::test]
+    async fn parity_external_agents_shares_the_availability_body() {
+        // Injected temp home on both lanes (a fixture must never scan
+        // the live account's last-run state); the tunnel frames the
+        // one neutral fn body-only.
+        let home = tempfile::tempdir().expect("temp home");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::external_agents_api_response(None, home.path()),
+        );
+        assert_eq!(status, 200);
+        assert!(http_body["external_agents"].is_array(), "{http_body}");
+        let frame = frame_api_json_body_response(
+            "parity-external-agents".to_string(),
+            crate::web_gateway::external_agents_api_response(None, home.path()),
+            "external agents",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_diagnostics_sink_shares_bodies_with_status_metadata() {
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let ndjson = "{\"t\":\"session_start\"}\n";
+
+        // Success: same written count from the one sink core; the
+        // tunnel adds the injected-status metadata.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::diagnostics_visual_freshness_api_response(
+                state_dir.path(),
+                "vf-parity-http",
+                ndjson.as_bytes(),
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"ok": true, "written": ndjson.len()})
+        );
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "vf-parity-tunnel",
+                "body": ndjson,
+            })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+
+        // Unusable (but present) session id: the shared sanitizer 400,
+        // identical bodies (difference #7 — the empty id never reaches
+        // the tunnel core; this one does on both lanes).
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::diagnostics_visual_freshness_api_response(
+                state_dir.path(),
+                "///",
+                ndjson.as_bytes(),
+            ),
+        );
+        assert_eq!(status, 400);
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-bad".to_string(),
+            Some(&serde_json::json!({ "session_id": "///", "body": ndjson })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Tunnel-only pre-rejections (difference #7): missing params
+        // never reach the sink core.
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-missing".to_string(),
+            None,
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing session_id");
+        let frame = api_diagnostics_visual_freshness_response(
+            "parity-vf-nobody".to_string(),
+            Some(&serde_json::json!({ "session_id": "vf-parity-tunnel" })),
+            state_dir.path().to_path_buf(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing body");
+    }
+
+    // ── S6 tunnel/HTTP parity: access inspect/connect/tier family ──
+    //
+    // Extends the S4/S5 enumerations. The S6-specific envelope
+    // differences, deliberate and pinned across this set (the org and
+    // grant-mutation slices extend it):
+    //
+    //  10. The ok/error envelope: this family predates `_httpStatus` —
+    //      2xx bodies ride the body-only `{t,id,ok:true,result}` frame,
+    //      and error statuses surface the shared cores' `{"error": …}`
+    //      body as the frame-level `{ok:false, error}` shape
+    //      (frame_api_ok_error_response). No status metadata on either
+    //      shape.
+    //  11. Fleet-CORS decoration is HTTP-lane-only: the fleet-allowlist
+    //      origin echo + `Vary: Origin` — and the historical
+    //      undecorated shapes underneath it (the belt-and-suspenders
+    //      manage-recheck 403, the tier pair's parse-error 400) — never
+    //      appear on the tunnel (the golden transcripts in
+    //      routes_access.rs pin the HTTP side).
+    //  12. The manage re-check is an HTTP-edge belt: the tunnel's
+    //      equivalent gate is the pre-dispatch method authorizer (the
+    //      row-derived operation), whose denial is the authorizer's own
+    //      `{ok:false, error:"…is not allowed…"}` frame, not a 403
+    //      body.
+    //  13. Transport-owned request carriage: the tunnel's params object
+    //      is the canonical shape (§2.1) and absent params read as
+    //      `{}`; HTTP parses its body text at the edge with the
+    //      historical wordings ("invalid request body: …"), so
+    //      parse-failure shapes are HTTP-only.
+    //  14. Store resolution at the edges: both lanes resolve the
+    //      ambient cert dir / project root at their dispatch arms and
+    //      hand paths to the shared cores (hermeticity convention) —
+    //      these fixtures inject tempdirs and never touch the live
+    //      account's stores.
+
+    #[tokio::test]
+    async fn parity_dashboard_targets_rides_the_ok_error_envelope() {
+        // Both lanes render the ONE neutral fn over the same inputs (an
+        // empty agent card, no registry — the deterministic local-only
+        // list).
+        let card = serde_json::json!({});
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity-test", "local");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None, Some(&principal)),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-targets".to_string(),
+            crate::web_gateway::dashboard_targets_api_response(&card, None, None, Some(&principal)),
+            "dashboard targets",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_access_inspect_reads_share_bodies_over_an_injected_cert_dir() {
+        // iam/state and enrollment-requests: deterministic empty-store
+        // bodies from the one core each, body-only envelope on the
+        // tunnel.
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_iam_state_api_response(tmp.path()),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-iam-state".to_string(),
+            crate::web_gateway::access_iam_state_api_response(tmp.path()),
+            "access iam state",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+        assert_eq!(frame["result"]["schema_version"], 1);
+
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_enrollment_requests_api_response(tmp.path()),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-enrollment".to_string(),
+            crate::web_gateway::access_enrollment_requests_api_response(tmp.path()),
+            "access enrollment requests",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+
+        // Overview: same principal, same card, same store on both lanes.
+        let card = serde_json::json!({});
+        let principal =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_overview_api_response(tmp.path(), &card, None, &principal),
+        );
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-overview".to_string(),
+            crate::web_gateway::access_overview_api_response(tmp.path(), &card, None, &principal),
+            "access overview",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_access_tier_settings_shares_the_core_across_lanes() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+
+        // Validation error: the shared core's wording surfaces as the
+        // HTTP `{"error"}` body and the tunnel's frame-level error
+        // (difference #10) — no store touched.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                serde_json::json!({"tier": 123}),
+                &actor,
+            ));
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "tier must be a string or null"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-tier-bad".to_string(),
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                serde_json::json!({"tier": 123}),
+                &actor,
+            ),
+            "trust tier settings",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "tier must be a string or null");
+
+        // Success over the injected store: both lanes set the tier
+        // through the one core (the `iam` overview metadata carries
+        // store fingerprints, so equality is asserted on the mutation's
+        // own fields).
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                serde_json::json!({"tier": "disposable"}),
+                &actor,
+            ));
+        assert_eq!(status, 200);
+        assert_eq!(http_body["tier"], "disposable");
+        let frame = frame_api_ok_error_response(
+            "parity-tier".to_string(),
+            crate::web_gateway::access_tier_settings_api_response(
+                tmp.path(),
+                serde_json::json!({"tier": "disposable"}),
+                &actor,
+            ),
+            "trust tier settings",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"]["tier"], "disposable");
+        assert_eq!(
+            frame["result"]["schema_version"],
+            http_body["schema_version"]
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_connect_config_and_unclaim_deterministic_errors() {
+        // Connect config, missing `enabled`: the shared validation
+        // error before any store access, on both lanes.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_connect_config_api_response(serde_json::json!({}), None),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "enabled must be true or false"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-connect-config".to_string(),
+            crate::web_gateway::access_connect_config_api_response(serde_json::json!({}), None),
+            "connect config",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "enabled must be true or false");
+
+        // Unclaim over a tempdir project root: the deterministic
+        // no-rendezvous error through the tunnel twin fn (the live
+        // release path stays smoke-covered). The tempdir root keeps the
+        // store off the daemon-scoped connect.toml.
+        let dir = tempfile::tempdir().expect("temp project root");
+        let mut rt = runtime();
+        rt.project_root = Some(dir.path().to_path_buf());
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_connect_unclaim_api_response(Some(dir.path().to_path_buf()))
+                .await,
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "no rendezvous_url configured"})
+        );
+        let frame = api_access_connect_unclaim_response("parity-unclaim".to_string(), &rt).await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "no rendezvous_url configured");
+    }
+
+    // ── S6 tunnel/HTTP parity (second slice): IAM grants / enrollment
+    // decide / org manage ──
+    //
+    // Extends the S6 enumeration above (#10–#14 all apply). The
+    // slice-specific differences, deliberate and pinned:
+    //
+    //  15. Org-manage leaf addressing is transport-owned: HTTP maps the
+    //      request path (issue is the historical default arm), the
+    //      tunnel maps the method name — both land on the ONE
+    //      OrgManageLeaf fan-out over the shared cores.
+    //  16. The HTTP org-manage handler renders EVERY leaf through the
+    //      fleet decorator (the own-origin leaves' inert `Vary: Origin`
+    //      tail, golden-pinned in routes_access.rs) — pure HTTP-lane
+    //      decoration; the tunnel's ok/error envelope carries none of
+    //      it.
+
+    #[tokio::test]
+    async fn parity_iam_grant_mutations_share_cores_over_an_injected_cert_dir() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("parity", "https");
+
+        // Upsert success: same body from the one core on both lanes
+        // (fresh store per lane call is NOT possible — the second call
+        // updates rather than creates — so the pin compares the
+        // mutation's own fields).
+        let upsert = || {
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Parity browser",
+                "fingerprint": "PA:R1",
+                "role_id": "role:observer"
+            })
+        };
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                tmp.path(),
+                upsert(),
+                &actor,
+            ),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body["created_grant"], serde_json::json!(true));
+        let frame = frame_api_ok_error_response(
+            "parity-iam-upsert".to_string(),
+            crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                tmp.path(),
+                upsert(),
+                &actor,
+            ),
+            "iam grant upsert",
+        );
+        assert_eq!(frame["ok"], true);
+        assert!(frame["result"]
+            .as_object()
+            .is_some_and(|map| !map.contains_key("_httpStatus")));
+        // Second upsert of the same fingerprint updates in place.
+        assert_eq!(frame["result"]["created_grant"], serde_json::json!(false));
+        assert_eq!(
+            frame["result"]["schema_version"],
+            http_body["schema_version"]
+        );
+
+        // Update decode error: deterministic serde wording as the HTTP
+        // {"error"} body and the tunnel frame-level error.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_iam_update_grant_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &actor,
+            ));
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-iam-update".to_string(),
+            crate::web_gateway::access_iam_update_grant_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &actor,
+            ),
+            "iam grant update",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Enrollment decide, unknown fingerprint: deterministic error on
+        // both lanes before any store access.
+        let decide = || serde_json::json!({ "fingerprint": "PA:R1:EN", "approve": true });
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_enrollment_decide_api_response(tmp.path(), decide(), &actor),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(
+            http_body,
+            serde_json::json!({"error": "no pending enrollment for fingerprint PA:R1:EN"})
+        );
+        let frame = frame_api_ok_error_response(
+            "parity-enroll-decide".to_string(),
+            crate::web_gateway::access_enrollment_decide_api_response(tmp.path(), decide(), &actor),
+            "enrollment decide",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(
+            frame["error"],
+            "no pending enrollment for fingerprint PA:R1:EN"
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_org_manage_leaves_share_the_one_fan_out() {
+        use crate::web_gateway::OrgManageLeaf;
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+
+        // Leaf addressing agrees across transports (difference #15).
+        for (method, path) in [
+            ("api_access_org_trust", "/api/access/orgs/trust"),
+            ("api_access_org_revoke", "/api/access/orgs/revoke"),
+            ("api_access_org_issue", "/api/access/org-grants/issue"),
+            (
+                "api_access_org_revoke_member",
+                "/api/access/org-grants/revoke-member",
+            ),
+            (
+                "api_access_org_issuer_init",
+                "/api/access/org-grants/issuers/init",
+            ),
+            (
+                "api_access_org_issuer_delegate",
+                "/api/access/org-grants/issuers/delegate",
+            ),
+            (
+                "api_access_org_issuer_install",
+                "/api/access/org-grants/issuers/install",
+            ),
+        ] {
+            assert_eq!(
+                OrgManageLeaf::from_control_method(method),
+                Some(OrgManageLeaf::from_req_path(path)),
+                "{method} vs {path}"
+            );
+        }
+        assert_eq!(
+            OrgManageLeaf::from_control_method("api_access_org_present"),
+            None
+        );
+
+        // Issue without keys: the deterministic error body on both lanes
+        // from the one fan-out (the signing successes need real org keys
+        // and stay smoke-covered — validate-org-grants).
+        let params = || serde_json::json!({ "handle": "parity-org" });
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::Issue,
+                params(),
+            ));
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-issue".to_string(),
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::Issue,
+                params(),
+            ),
+            "org manage",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Issuer init: both lanes create/read the deputy key under the
+        // injected store — the SAME key once created, so the bodies are
+        // equal across the two calls.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::IssuerInit,
+                params(),
+            ));
+        assert_eq!(status, 200);
+        let frame = frame_api_ok_error_response(
+            "parity-org-issuer-init".to_string(),
+            crate::web_gateway::access_org_manage_api_response(
+                tmp.path(),
+                OrgManageLeaf::IssuerInit,
+                params(),
+            ),
+            "org manage",
+        );
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"], http_body);
+    }
+
+    // ── S6 tunnel/HTTP parity (third slice): the signed-org doorbell
+    // quartet ──
+    //
+    // Extends the S6 enumeration (#10–#16 apply). The slice-specific
+    // differences, deliberate and pinned:
+    //
+    //  17. Authority is the documented op-override pair (design §2.7):
+    //      the HTTP rows are Public (the signed document/list IS the
+    //      authorization, rate-limited and size-capped), while the
+    //      tunnel methods gate on a bound session's operation —
+    //      AccessInspect for present/orl/renew, PresenceRead for the
+    //      orl-apply courier — declared as `op_override`s on the rows
+    //      and pinned closed by
+    //      `tunnel_op_overrides_are_a_closed_documented_enumeration`.
+    //  18. ORL addressing is transport-owned: HTTP captures the org
+    //      handle from the path, the tunnel reads `params.handle`.
+    //  19. The ORL error is the historical 404 on HTTP; the tunnel
+    //      frame carries the same error string with no status.
+
+    #[tokio::test]
+    async fn parity_org_doorbell_shares_cores_over_an_injected_cert_dir() {
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+
+        // Present, undecodable document: same core error on both lanes
+        // (the verify successes need real signed documents — smoke-
+        // covered by validate-org-grants).
+        let card = serde_json::json!({});
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_present_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &card,
+            ));
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-present".to_string(),
+            crate::web_gateway::access_org_present_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+                &card,
+            ),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // ORL for an unheld org: 404 on HTTP, the same error string as
+        // the tunnel's ok:false frame (differences #18/#19).
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_orl_api_response(tmp.path(), "parity-org"),
+        );
+        assert_eq!(status, 404);
+        let frame = frame_api_ok_error_response(
+            "parity-org-orl".to_string(),
+            crate::web_gateway::access_org_orl_api_response(tmp.path(), "parity-org"),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        // Apply + renew decode errors: one core wording per leaf.
+        let (status, http_body) =
+            parity_http_status_and_body(crate::web_gateway::access_org_orl_apply_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+            ));
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-orl-apply".to_string(),
+            crate::web_gateway::access_org_orl_apply_api_response(
+                tmp.path(),
+                serde_json::json!({}),
+            ),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::access_org_renew_api_response(tmp.path(), serde_json::json!({})),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-org-renew".to_string(),
+            crate::web_gateway::access_org_renew_api_response(tmp.path(), serde_json::json!({})),
+            "org doorbell",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+    }
+
+    #[tokio::test]
+    async fn parity_fleet_cert_request_shares_the_no_name_error() {
+        // The S6 ROW-NEW: both lanes run the one neutral fn. The test
+        // process holds no fleet name, so the deterministic error is
+        // the shared shape (explicit addresses keep the fixture off the
+        // NIC-enumeration default; the no-name path never spawns the
+        // ACME flow).
+        let params = || serde_json::json!({ "addresses": ["192.0.2.10"] });
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::fleet_cert_request_api_response(params()),
+        );
+        assert_eq!(status, 400);
+        let frame = frame_api_ok_error_response(
+            "parity-fleet-cert".to_string(),
+            crate::web_gateway::fleet_cert_request_api_response(params()),
+            "fleet cert request",
+        );
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], http_body["error"]);
+        assert_eq!(
+            frame["error"],
+            "this daemon has no fleet name — enable Connect against a \
+             rendezvous with fleet DNS and let it register first"
+        );
+    }
+
+    // ── S7 tunnel/HTTP parity: the peers/coordinator federation
+    // family ──
+    //
+    // Extends the enumeration (#10–#19 in the S6 blocks above). Both
+    // lanes have long shared the peers leaves (`peers_*` in
+    // routes_peers.rs); S7 makes the HTTP side one neutral sub-router
+    // unit and pins the addressing equivalence. The slice-specific
+    // differences, deliberate and pinned:
+    //
+    //  20. Registry-gate shapes are per-lane: the HTTP sub-router and
+    //      coordinator answer 503 {"error":"peer registry not
+    //      configured"}; the tunnel arms pre-check and answer the
+    //      frame-level {ok:false, error:"peer registry unavailable"}
+    //      — a different string AND envelope, both historical.
+    //  21. Addressing is transport-owned: HTTP captures the peer id
+    //      (url-decoded) and the request code/decision from path
+    //      segments and reads eligible capabilities from the query
+    //      string; the tunnel reads params — peer_id under five
+    //      aliases, request_id under four, the decision op defaulting
+    //      to "approve", capabilities as array/CSV
+    //      (control_capability_query) — and answers its own
+    //      missing-param frame when the id is absent.
+    //  22. Envelope split: api_peers (the list) rides the body-only
+    //      envelope (inline dispatch arm — no injected status); every
+    //      other peer method rides the `_httpStatus` injection. The
+    //      family's wildcard-CORS tail and its reason ladder (502 Bad
+    //      Gateway on relay failures) are HTTP-lane decoration only.
+    //  23. Store resolution at the edges: both lanes resolve the
+    //      ambient cert store at their transport edges and share the
+    //      cert-dir-parameterized pairing leaves; fixtures inject
+    //      tempdirs (hermeticity convention).
+
+    fn empty_peer_registry() -> crate::peer::PeerRegistry {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        crate::peer::PeerRegistry::new(log_tx)
+    }
+
+    #[tokio::test]
+    async fn parity_coordinator_route_shares_the_neutral_core() {
+        // Decode failure: deterministic serde wording through the one
+        // core on both lanes (routing successes need a connected peer
+        // and stay smoke-covered by the peer validators).
+        let registry = empty_peer_registry();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::coordinator_route_api_response("POST", "{}", Some(&registry)).await,
+        );
+        assert_eq!(status, 400);
+
+        let mut rt = runtime();
+        rt.peer_registry = Some(empty_peer_registry());
+        let frame = api_coordinator_route_response(
+            "parity-coordinator".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_registry_unavailable_shapes_stay_per_lane() {
+        // Divergence #20, pinned from both sides.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 503);
+        assert_eq!(http_body["error"], "peer registry not configured");
+
+        let rt = runtime();
+        let frame = api_peer_add_response("parity-no-registry".to_string(), None, &rt).await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "peer registry unavailable");
+    }
+
+    #[tokio::test]
+    async fn parity_pairing_decision_addresses_by_params_on_the_tunnel() {
+        // Divergence #21: HTTP takes the code and decision from path
+        // segments, the tunnel from params; the unknown-decision 404
+        // rises from the one shared leaf over the same injected store.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "POST",
+                "/api/peers/pairing/requests/zzz/badop",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 404);
+
+        let frame = api_peer_pairing_request_decision_response_from_cert_dir(
+            "parity-decision".to_string(),
+            Some(&serde_json::json!({"request_id": "zzz", "op": "badop"})),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(404)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // The tunnel's own missing-param frame (no HTTP equivalent —
+        // the path shape cannot omit the code).
+        let frame = api_peer_pairing_request_decision_response_from_cert_dir(
+            "parity-decision-missing".to_string(),
+            Some(&serde_json::json!({})),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], false);
+        assert_eq!(frame["error"], "missing request_id");
+    }
+
+    #[tokio::test]
+    async fn parity_pairing_requests_list_shares_the_leaf_store() {
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/pairing/requests",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(http_body, serde_json::json!({"requests": []}));
+
+        let frame = api_peer_pairing_requests_response_from_cert_dir(
+            "parity-requests".to_string(),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_eligible_addresses_by_params_on_the_tunnel() {
+        // Divergence #21 on the read side: HTTP's ?capability= query vs
+        // the tunnel's capabilities param (array/CSV), one leaf behind
+        // both. The no-capability 400 is the deterministic shape.
+        let bus = crate::event::EventBus::new();
+        let tmp = tempfile::tempdir().expect("temp cert dir");
+        let registry = empty_peer_registry();
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/eligible",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                Some(&registry),
+            )
+            .await,
+        );
+        assert_eq!(status, 400);
+
+        let mut rt = runtime();
+        rt.peer_registry = Some(empty_peer_registry());
+        let frame = api_peer_eligible_response(
+            "parity-eligible".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+
+        // Same params, capability satisfied on both lanes: the empty
+        // registry serves the empty snapshot list.
+        let (status, http_body) = parity_http_status_and_body(
+            crate::web_gateway::peers_sub_router_api_response(
+                "GET",
+                "/api/peers/eligible?capability=display",
+                "",
+                tmp.path(),
+                &bus,
+                None,
+                Some(&registry),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        let frame = api_peer_eligible_response(
+            "parity-eligible-display".to_string(),
+            Some(&serde_json::json!({"capabilities": ["display"]})),
+            &rt,
+        )
+        .await;
+        assert_eq!(frame["ok"], true);
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(200)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(true)));
+        assert_eq!(result, http_body);
+    }
+
+    use crate::dashboard_control::tests::runtime;
     use crate::*;
-    use crate::dashboard_control::tests::{runtime};
+
+    fn observer_display_grant() -> DashboardControlGrant {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:TUNNEL-OBSERVER".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:TUNNEL-OBSERVER",
+            "https",
+        )
+        .unwrap();
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+            iam_cert_dir: None,
+        }
+    }
+
+    fn non_owner_grant_with_permissions(permissions: &[&str]) -> DashboardControlGrant {
+        let mut grant = observer_display_grant();
+        let DashboardControlGrant::UserClient { iam_state, .. } = &mut grant else {
+            unreachable!("observer fixture is a user client")
+        };
+        let role = iam_state
+            .roles
+            .iter_mut()
+            .find(|role| role.id == "role:observer")
+            .expect("observer role");
+        role.permissions = permissions
+            .iter()
+            .map(|permission| permission.to_string())
+            .collect();
+        grant
+    }
 
     /// The SPA mirrors the action-message allowlist as
     /// `DASHBOARD_ACTION_MSG_RPC_ACTIONS` (static/app/31-init-identity-fleet.js)
@@ -1763,6 +3482,10 @@ mod tests {
         (
             "take_display",
             || serde_json::json!({"action": "take_display", "display_id": 1}),
+        ),
+        (
+            "resolve_display_request",
+            || serde_json::json!({"action": "resolve_display_request", "session_id": "s", "id": 1, "decision": "approve", "duration": "this_session"}),
         ),
         (
             "release_display",
@@ -2084,18 +3807,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
-        let session_id = format!("dashboard-control-test-vf-{}", std::process::id());
-        if let Some(path) = crate::diagnostics::visual_freshness_path(&session_id) {
-            let _ = std::fs::remove_file(&path);
+    async fn dashboard_action_rpc_authorizes_the_inner_control_message() {
+        let mut rt = runtime();
+        rt.grant = non_owner_grant_with_permissions(&["message.send"]);
+        assert!(
+            rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::Message)
+                .allowed
+        );
+
+        let denied = api_dashboard_action_msg_response(
+            "inner-auth-grant".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "grant_user_display",
+                    "display_id": 7,
+                    "agent_visible": false,
+                }
+            })),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(denied["result"]["ok"], false);
+        assert_eq!(denied["result"]["_httpStatus"], 403);
+        assert_eq!(denied["result"]["permission"], "display.input");
+    }
+
+    #[tokio::test]
+    async fn every_multiplexed_rpc_rechecks_its_inner_operation() {
+        let mut rt = runtime();
+        rt.grant = non_owner_grant_with_permissions(&["message.send"]);
+
+        let settings = api_control_msg_response(
+            "inner-auth-settings".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_codex_sandbox",
+                    "mode": "workspace-write",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(settings["result"]["_httpStatus"], 403);
+        assert_eq!(settings["result"]["permission"], "settings.manage");
+
+        let task = api_session_control_msg_response(
+            "inner-auth-task".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "create_session",
+                    "task": "do something",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(task["result"]["_httpStatus"], 403);
+        assert_eq!(task["result"]["permission"], "task.run");
+    }
+
+    #[tokio::test]
+    async fn owner_only_actions_stay_closed_while_revoke_and_stop_deescalate() {
+        let mut rt = runtime();
+        rt.grant =
+            non_owner_grant_with_permissions(&["message.send", "display.input", "runtime.control"]);
+
+        for (id, message) in [
+            (
+                "owner-only-grant",
+                serde_json::json!({
+                    "action": "grant_user_display",
+                    "display_id": 7,
+                    "agent_visible": false,
+                }),
+            ),
+            (
+                "owner-only-resolve",
+                serde_json::json!({
+                    "action": "resolve_display_request",
+                    "session_id": "session-a",
+                    "id": 1,
+                    "decision": "approve",
+                    "duration": "this_session",
+                }),
+            ),
+            (
+                "owner-only-record",
+                serde_json::json!({
+                    "action": "start_recording",
+                    "stream_name": "display-7",
+                }),
+            ),
+            (
+                "owner-only-debug-screen",
+                serde_json::json!({"action": "setup_debug_screen"}),
+            ),
+            (
+                "owner-only-debug-recording",
+                serde_json::json!({"action": "start_debug_recording"}),
+            ),
+            (
+                "owner-only-diagnostics-marker",
+                serde_json::json!({
+                    "action": "set_diagnostics_visual_marker",
+                    "display_id": 7,
+                    "enabled": true,
+                }),
+            ),
+        ] {
+            let denied = api_dashboard_action_msg_response(
+                id.to_string(),
+                Some(&serde_json::json!({"message": message})),
+                &rt,
+            )
+            .await;
+            assert_eq!(denied["result"]["ok"], false, "{id}: {denied}");
+            assert_eq!(denied["result"]["_httpStatus"], 403, "{id}: {denied}");
+            assert!(denied["result"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("owner dashboard authority"));
         }
+
+        for (id, message, action) in [
+            (
+                "deescalate-revoke",
+                serde_json::json!({"action": "revoke_user_display", "display_id": 7}),
+                "revoke_user_display",
+            ),
+            (
+                "deescalate-stop",
+                serde_json::json!({"action": "stop_recording", "stream_name": "display-7"}),
+                "stop_recording",
+            ),
+        ] {
+            let accepted = api_dashboard_action_msg_response(
+                id.to_string(),
+                Some(&serde_json::json!({"message": message})),
+                &rt,
+            )
+            .await;
+            assert_eq!(accepted["result"]["ok"], true, "{id}: {accepted}");
+            assert_eq!(accepted["result"]["action"], action);
+        }
+    }
+
+    #[tokio::test]
+    async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
+        // Injected state dir: the append lands in the fixture's tempdir,
+        // never the live diagnostics store (hermeticity convention; the
+        // dispatch arm resolves the real dir in production).
+        let state_dir = tempfile::tempdir().expect("temp state dir");
+        let session_id = "dashboard-control-test-vf";
         let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
         let response = api_diagnostics_visual_freshness_response(
             "diag-vf".to_string(),
             Some(&serde_json::json!({
-                "session_id": session_id.clone(),
+                "session_id": session_id,
                 "body": ndjson,
             })),
+            state_dir.path().to_path_buf(),
         )
         .await;
         assert_eq!(response["t"], "response");
@@ -2104,11 +3977,10 @@ mod tests {
         assert_eq!(response["result"]["_httpStatus"], 200);
         assert_eq!(response["result"]["written"], ndjson.len());
 
-        let path =
-            crate::diagnostics::visual_freshness_path(&session_id).expect("diagnostics path");
+        let path = crate::diagnostics::visual_freshness_path_in(state_dir.path(), session_id)
+            .expect("diagnostics path");
         let written = std::fs::read_to_string(&path).expect("diagnostics transcript");
         assert_eq!(written, ndjson);
-        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -2223,6 +4095,37 @@ mod tests {
             .any(|value| value.as_str() == Some("display_input_authority_state")));
     }
 
+    #[test]
+    fn display_signal_viewer_cannot_gain_interactive_data_channels() {
+        let mut rt = runtime();
+        rt.grant = observer_display_grant();
+        assert!(
+            rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
+        );
+        assert!(
+            !rt.grant
+                .access_decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        let guard = dashboard_display_interactive_authorizer(&rt, 0);
+        assert!(
+            !guard(),
+            "DisplayView-only signaling must not authorize input or clipboard channels"
+        );
+    }
+
+    #[test]
+    fn interactive_display_guard_dies_with_control_session() {
+        let rt = runtime();
+        let guard = dashboard_display_interactive_authorizer(&rt, 0);
+        assert!(guard());
+        rt.shutdown.cancel();
+        assert!(!guard());
+    }
+
     #[tokio::test]
     async fn display_webrtc_signal_rpc_reports_missing_display() {
         let rt = runtime();
@@ -2239,6 +4142,258 @@ mod tests {
         assert_eq!(response["status"], 404);
         assert_eq!(response["display_id"], 99);
         assert_eq!(response["error"], "display session not found");
+    }
+
+    #[tokio::test]
+    async fn display_offer_without_authority_bridge_returns_error_instead_of_panicking() {
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(
+            7,
+            Arc::new(crate::display::DisplaySession::new(
+                7,
+                Arc::new(DashboardControlStubDisplayBackend),
+            )),
+        );
+        rt.shared_session.write().await.session_registry = Some(registry);
+
+        let response = api_display_webrtc_offer_response(
+            "sig-no-authority".to_string(),
+            &serde_json::json!({
+                "display_id": 7,
+                "sdp": "browser-controlled-offer",
+            }),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 503);
+        assert_eq!(response["display_id"], 7);
+        assert_eq!(response["error"], "display input authority unavailable");
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dashboard_display_helpers_include_private_user_views() {
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let private_session = Arc::new(crate::display::DisplaySession::new(
+            12,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private_session.set_agent_visible(false);
+        registry
+            .write()
+            .await
+            .insert(12, Arc::clone(&private_session));
+        rt.shared_session.write().await.session_registry = Some(registry);
+
+        let resolved = active_display_session(&rt, 12)
+            .await
+            .expect("owner dashboard must resolve its private user view");
+        assert!(Arc::ptr_eq(&resolved, &private_session));
+        assert_eq!(active_display_ids(&rt).await, vec![12]);
+        let ready = display_ready_bootstrap_frames(&rt).await;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["display_id"], 12);
+        assert_eq!(ready[0]["agent_visible"], false);
+    }
+
+    #[tokio::test]
+    async fn non_owner_display_helpers_exclude_private_user_views() {
+        let mut rt = runtime();
+        rt.grant = observer_display_grant();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let public_session = Arc::new(crate::display::DisplaySession::new(
+            11,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let private_session = Arc::new(crate::display::DisplaySession::new(
+            12,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        private_session.set_agent_visible(false);
+        {
+            let mut registry = registry.write().await;
+            registry.insert(11, Arc::clone(&public_session));
+            registry.insert(12, Arc::clone(&private_session));
+        }
+        rt.shared_session.write().await.session_registry = Some(Arc::clone(&registry));
+
+        let registry_guard = registry.read().await;
+        assert!(rt.grant.dashboard_event_targets_hidden_display(
+            r#"{"event":"display_resize","display_id":12,"width":80,"height":80}"#,
+            &registry_guard,
+        ));
+        assert!(!rt.grant.dashboard_event_targets_hidden_display(
+            r#"{"event":"display_resize","display_id":11,"width":80,"height":80}"#,
+            &registry_guard,
+        ));
+        drop(registry_guard);
+
+        let resolved = active_display_session(&rt, 11)
+            .await
+            .expect("agent-visible display remains viewable");
+        assert!(Arc::ptr_eq(&resolved, &public_session));
+        assert!(active_display_session(&rt, 12).await.is_none());
+        assert_eq!(active_display_ids(&rt).await, vec![11]);
+        let ready = display_ready_bootstrap_frames(&rt).await;
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["display_id"], 11);
+        assert_eq!(ready[0]["agent_visible"], true);
+    }
+
+    #[test]
+    fn display_id_parameters_are_strict_but_zero_remains_valid() {
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": 0}))),
+            Some(0)
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"displayId": 7}))),
+            Some(7)
+        );
+        assert_eq!(display_id_param(Some(&serde_json::json!({}))), None);
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": "7"}))),
+            None
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({"display_id": -1}))),
+            None
+        );
+        assert_eq!(
+            display_id_param(Some(&serde_json::json!({
+                "display_id": u64::from(u32::MAX) + 1,
+            }))),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn display_signaling_rejects_missing_id_instead_of_targeting_zero() {
+        let rt = runtime();
+        let response = api_display_webrtc_offer_response(
+            "missing-display-id".to_string(),
+            &serde_json::json!({"sdp": "synthetic-offer"}),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 400);
+        assert_eq!(response["error"], "missing or invalid display_id");
+    }
+
+    #[tokio::test]
+    async fn display_authority_request_reports_bridge_rejection() {
+        let mut rt = runtime();
+        let (authority_change_tx, _) = tokio::sync::broadcast::channel(1);
+        rt.display_authority = Some(DashboardDisplayAuthorityBridge::new(
+            |_, _| Vec::new(),
+            |_, _| None,
+            |_, _, _| Vec::new(),
+            |_, _| Vec::new(),
+            |_, _| false,
+            |_| Arc::new(AtomicU64::new(0)),
+            |_| {},
+            move || authority_change_tx.subscribe(),
+        ));
+
+        let response = api_display_input_authority_request_response(
+            "authority-missing-display".to_string(),
+            Some(&serde_json::json!({ "display_id": 99 })),
+            &rt,
+        )
+        .await;
+
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["id"], "authority-missing-display");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 404);
+        assert_eq!(response["display_id"], 99);
+        assert_eq!(
+            response["error"],
+            "display input authority request was rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_teardown_closes_every_tracked_display_media_peer() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            11,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        display_session
+            .register_test_peer_for_cleanup(rt.display_peer_id)
+            .await;
+        assert_eq!(display_session.metrics().await.peer_count, 1);
+
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        assert_eq!(
+            rt.display_peer_sessions.lock().await.len(),
+            1,
+            "repeated offers on one display session must not grow teardown state"
+        );
+
+        rt.shutdown.cancel();
+        remove_dashboard_display_peers(&rt).await;
+        assert_eq!(display_session.metrics().await.peer_count, 0);
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn display_peer_namespaces_coexist_and_teardown_independently() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            13,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let ws = crate::display_peer_ids::allocate_legacy_ws_display_peer_id().unwrap();
+        let control = rt.display_peer_id;
+        let federated =
+            crate::display_peer_ids::peer_id_for_federated_session("connection", "coexistence");
+
+        for peer_id in [ws, control, federated] {
+            display_session
+                .register_test_peer_for_cleanup(peer_id)
+                .await;
+        }
+        assert_eq!(display_session.metrics().await.peer_count, 3);
+
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        remove_dashboard_display_peers(&rt).await;
+        assert_eq!(display_session.metrics().await.peer_count, 2);
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
+
+        display_session.remove_peer(ws).await;
+        assert_eq!(display_session.metrics().await.peer_count, 1);
+        display_session.remove_peer(federated).await;
+        assert_eq!(display_session.metrics().await.peer_count, 0);
+    }
+
+    #[tokio::test]
+    async fn display_peer_tracking_does_not_retain_finished_sessions() {
+        let rt = runtime();
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            14,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        let weak = Arc::downgrade(&display_session);
+        track_dashboard_display_session(&rt, Arc::clone(&display_session)).await;
+        drop(display_session);
+
+        assert!(weak.upgrade().is_none());
+        remove_dashboard_display_peers(&rt).await;
+        assert!(rt.display_peer_sessions.lock().await.is_empty());
     }
 
     #[tokio::test]

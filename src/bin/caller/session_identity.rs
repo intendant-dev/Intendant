@@ -39,6 +39,10 @@ pub(crate) struct PersistedExternalIdentity {
 /// Everything one pass over a `session.jsonl` yields about identity.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityScan {
+    /// Every parseable structured identity fact, in log order. Callers that
+    /// scan multiple candidate directories must match these exact facts
+    /// rather than applying the single-directory fallback policy below.
+    pub identities: Vec<PersistedExternalIdentity>,
     /// Latest parseable event whose wrapper id matches the requested
     /// session under [`wrapper_matches`]. Later events supersede earlier
     /// ones — identity upgrades (placeholder → native id) append, never
@@ -102,8 +106,9 @@ pub(crate) fn scan_session_log(
                     scan.latest_matching = Some(identity.clone());
                 }
                 if scan.first.is_none() {
-                    scan.first = Some(identity);
+                    scan.first = Some(identity.clone());
                 }
+                scan.identities.push(identity);
             }
             continue;
         }
@@ -268,7 +273,9 @@ mod tests {
         let sole = scan_session_log(&identity_line("other", "codex", "id-a"), "sess-1", None);
         assert!(sole.latest_matching.is_none());
         assert_eq!(
-            sole.matching_or_unique().expect("unique").backend_session_id,
+            sole.matching_or_unique()
+                .expect("unique")
+                .backend_session_id,
             "id-a"
         );
 
@@ -286,7 +293,11 @@ mod tests {
     fn wrapper_matching_covers_prefix_and_canonical_forms() {
         assert!(wrapper_matches(Some("sess-1"), "sess-1", None));
         assert!(wrapper_matches(Some("sess-1-full-name"), "sess-1", None));
-        assert!(wrapper_matches(Some("canonical"), "sess-1", Some("canonical")));
+        assert!(wrapper_matches(
+            Some("canonical"),
+            "sess-1",
+            Some("canonical")
+        ));
         assert!(wrapper_matches(
             Some("anything"),
             "sess-1",

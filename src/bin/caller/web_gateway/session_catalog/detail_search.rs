@@ -20,6 +20,7 @@ pub(crate) fn get_session_detail_from_home(home: &Path, session_id: &str) -> Str
 }
 
 pub(crate) fn session_detail_response_body_with_page(
+    home: &Path,
     session_id: &str,
     source: &str,
     limit: Option<usize>,
@@ -35,11 +36,10 @@ pub(crate) fn session_detail_response_body_with_page(
     } else {
         source
     };
-    let home = crate::platform::home_dir();
     if source == "intendant" {
-        get_session_detail_from_home_with_page(&home, session_id, limit, before)
+        get_session_detail_from_home_with_page(home, session_id, limit, before)
     } else {
-        external_session_detail_from_home_with_page(&home, source, session_id, limit, before)
+        external_session_detail_from_home_with_page(home, source, session_id, limit, before)
             .unwrap_or_else(|| serde_json::json!({"error": "session not found"}).to_string())
     }
 }
@@ -64,13 +64,26 @@ pub(crate) fn get_session_detail_from_home_with_page(
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
-    let mut entries = session_log_replay_entries_from_dir(&session_dir)
+    // Cached full conversion (fingerprint-keyed, already compacted):
+    // paging back through a session detail re-used to re-convert the
+    // whole log per page; now page N is a slice of the cached entries.
+    let entries = cached_session_log_replay_entries(&session_dir)
         .map(|(entries, _)| entries)
         .unwrap_or_default();
-    compact_context_snapshot_entries_for_replay(&mut entries);
-    let page = session_detail_page_entries(entries, limit, before);
-    let entries = page.entries;
+    // Entries come out of the cache already compacted (replay_cache
+    // compacts before admission), so no per-request compaction pass.
+    let page = session_detail_page_entries_ref(&entries, limit, before);
+    native_session_detail_body(&session_dir, page, None)
+}
 
+/// Shared assembly of the native session-detail body (the historical
+/// field set) plus the optional additive `locate` object the anchored
+/// read (`locate.rs`) attaches.
+pub(crate) fn native_session_detail_body(
+    session_dir: &Path,
+    page: SessionDetailPageEntries,
+    locate: Option<serde_json::Value>,
+) -> String {
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
     let mut frames: Vec<String> = Vec::new();
@@ -86,16 +99,20 @@ pub(crate) fn get_session_detail_from_home_with_page(
         frames.sort();
     }
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-        "entries": entries,
+        "entries": page.entries,
         "total_entries": page.total_entries,
         "page_start": page.page_start,
         "page_end": page.page_end,
         "has_older": page.page_start > 0,
         "frames": frames,
-        "relationships": session_relationships_from_log_dir(&session_dir),
-    }).to_string()
+        "relationships": session_relationships_from_log_dir(session_dir),
+    });
+    if let Some(locate) = locate {
+        body["locate"] = locate;
+    }
+    body.to_string()
 }
 
 #[derive(Default)]
@@ -445,6 +462,40 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
     project_filter: &[String],
     cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
+    session_log_search_from_home_with_progress(
+        home,
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        cancel,
+        &mut |_progress| {},
+    )
+}
+
+/// Deep-search scan progress: how far through the candidate list the
+/// scan is. `scanned` counts candidate sessions the loop has passed
+/// (filtered-out ones included, so it reaches `total`), `matched` counts
+/// result rows so far.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeepSearchProgress {
+    pub(crate) scanned: usize,
+    pub(crate) total: usize,
+    pub(crate) matched: usize,
+}
+
+/// How often the scan reports progress, in candidate sessions.
+pub(crate) const DEEP_SEARCH_PROGRESS_EVERY: usize = 250;
+
+pub(crate) fn session_log_search_from_home_with_progress(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+    project_filter: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
+    progress: &mut dyn FnMut(DeepSearchProgress),
+) -> String {
     let mode = SessionLogSearchMode::from_query(mode);
     let terms = session_log_search_terms(query);
     if !mode.has_search_input(query, &terms) {
@@ -467,10 +518,11 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
     let deleted_external_sessions = read_deleted_external_sessions(home);
     let source_filter = normalize_session_source_filter(source_filter);
     let project_filter = normalize_session_project_filter(project_filter);
+    let total = sessions.len();
     let mut results = Vec::new();
     let mut searched = 0usize;
 
-    for session in sessions {
+    for (index, session) in sessions.into_iter().enumerate() {
         if cancel.is_cancelled() {
             return serde_json::json!({
                 "query": query,
@@ -484,6 +536,13 @@ pub(crate) fn session_log_search_from_home_with_projects_cancel(
                 "results": results,
             })
             .to_string();
+        }
+        if index > 0 && index % DEEP_SEARCH_PROGRESS_EVERY == 0 {
+            progress(DeepSearchProgress {
+                scanned: index,
+                total,
+                matched: results.len(),
+            });
         }
         let source = session
             .get("source")
@@ -671,7 +730,7 @@ pub(crate) fn search_session_log_file(
     let reader = std::io::BufReader::new(file);
     let candidates = reader
         .lines()
-        .filter_map(Result::ok)
+        .map_while(Result::ok)
         .filter_map(|line| session_log_search_candidate_from_line(&line));
     Some(search_session_log_candidates(
         candidates,
@@ -1644,6 +1703,7 @@ mod tests {
             log.model_response_for_session(
                 Some("backend-session"),
                 &format!("response {idx}"),
+                0,
                 0,
                 0,
                 0,

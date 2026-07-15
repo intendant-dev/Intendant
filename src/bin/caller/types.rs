@@ -187,7 +187,9 @@ pub struct UserQuestion {
 /// also the designed attach point for future audible/voice escalation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum NotificationUrgency {
+    #[default]
     Info,
     Attention,
     Urgent,
@@ -217,12 +219,6 @@ impl NotificationUrgency {
     }
 }
 
-impl Default for NotificationUrgency {
-    fn default() -> Self {
-        NotificationUrgency::Info
-    }
-}
-
 /// Serde default for fields whose wire absence means `true` (lines
 /// written before the field existed keep their historical meaning).
 fn default_true() -> bool {
@@ -233,7 +229,8 @@ fn default_true() -> bool {
 /// blob committed into the session's upload store — never inline bytes:
 /// the WebSocket broadcast and the session log both stay small, and the
 /// browser fetches the pixels lazily from `url` (the upload store's
-/// existing `/raw` route, which serves the stored MIME inline).
+/// existing `/raw` route, which preserves the stored MIME but forces an
+/// attachment disposition and disables MIME sniffing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionNoteAttachment {
     /// Upload-store descriptor id the blob was committed under.
@@ -276,6 +273,10 @@ pub enum OutboundEvent {
         source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_id: Option<String>,
+        /// Originating tool call (`agent_started.item_id`) when known —
+        /// groups output under its command in the Activity log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
     },
     ApprovalRequired {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -320,6 +321,20 @@ pub enum OutboundEvent {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
+    },
+    /// Peer-delegation delivery receipt. Emitted when a daemon
+    /// supervisor *dispatches* (not merely reads) a `StartTask` frame
+    /// that carried a `delegation_id`: `session_id` is the receiver's
+    /// real local session identity for the accepted task. The
+    /// delegating daemon's federation transport correlates it back to
+    /// the in-flight `PeerOp::DelegateTask` by `delegation_id` (see
+    /// `peer::transport::intendant` for the wire contract and the
+    /// old-peer compatibility matrix). Re-emitted with the original
+    /// `session_id` when a duplicate `delegation_id` is deduped.
+    /// Informational only — carries no authority.
+    TaskReceived {
+        delegation_id: String,
+        session_id: String,
     },
     SessionIdentity {
         session_id: String,
@@ -375,11 +390,39 @@ pub enum OutboundEvent {
         width: u32,
         height: u32,
         /// `false` marks a private user view ("View this machine"):
-        /// dashboards render the tile with a "private view" chip; peer
-        /// upcasters skip it. Absent on wires older than the split —
-        /// those daemons never hid displays, so default `true`.
+        /// authority-checked owner/root dashboards render the tile with a
+        /// "private view" chip; scoped dashboards and peer upcasters skip it.
+        /// Absent on wires older than the split — those daemons never hid
+        /// displays, so default `true`.
         #[serde(default = "default_true")]
         agent_visible: bool,
+    },
+    /// One executed computer-use action on a display — the dashboard's live
+    /// action-visualization lane (stage overlays + per-display feed).
+    /// Ephemeral: never session-logged, never replayed; `event_id` is the
+    /// browser's dual-lane dedupe key.
+    CuAction {
+        event_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        display_id: u32,
+        /// `left_click` | `type` | `screenshot` | … (see
+        /// `computer_use::cu_action_kind`).
+        kind: String,
+        /// Action point in display pixel space, when the action has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        y: Option<i32>,
+        /// Resolution the coordinates are relative to (0 = unknown).
+        #[serde(default)]
+        ref_w: u32,
+        #[serde(default)]
+        ref_h: u32,
+        /// Short raw call string for the feed (`left_click(612, 233)`).
+        raw: String,
+        /// Unix milliseconds at execution.
+        ts: u64,
     },
     DisplayResize {
         display_id: u32,
@@ -400,8 +443,8 @@ pub enum OutboundEvent {
         /// 0 = primary, matching the historical single-display meaning.
         #[serde(default)]
         display_id: u32,
-        /// `false` = private user view (dashboard-only); `true` = shared
-        /// with the agent for computer use. Absent-means-true keeps old
+        /// `false` = private user view (owner/root-dashboard-only); `true` =
+        /// shared with the agent for computer use. Absent-means-true keeps old
         /// wire lines meaning what they always meant.
         #[serde(default = "default_true")]
         agent_visible: bool,
@@ -410,6 +453,35 @@ pub enum OutboundEvent {
         display_id: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    /// A scoped agent asked to access the user's display
+    /// (`request_user_display`): dashboards raise the dedicated
+    /// display-request popup. Resolution is only ever the owner clicking
+    /// it (`{"action":"resolve_display_request", …}`) — never an approval
+    /// action, never autonomy.
+    DisplayRequestRaised {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        /// "view" | "view_and_control".
+        access: String,
+        /// Short agent-provided justification (display verbatim as text).
+        reason: String,
+        /// Unix ms when the request stops waiting; the popup auto-expires.
+        #[serde(default)]
+        expires_unix_ms: u64,
+    },
+    /// A display request left the pending set: outcome is "approved",
+    /// "denied", "denied_for_session", "timeout", or "cancelled".
+    DisplayRequestResolved {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: u64,
+        outcome: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        access: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration: Option<String>,
     },
     DisplayCaptureLost {
         display_id: u32,
@@ -700,6 +772,8 @@ pub enum OutboundEvent {
         completion_tokens: u64,
         #[serde(default)]
         cached_tokens: u64,
+        #[serde(default)]
+        cache_creation_tokens: u64,
     },
     LiveUsageUpdate {
         provider: String,
@@ -835,6 +909,8 @@ pub enum OutboundEvent {
     /// (native / Codex `thread/rollback`) or "session-reset"
     /// (CC / Gemini re-init).
     ConversationRolledBack {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         round_id: u64,
         turns_removed: u32,
         backend: String,
@@ -885,6 +961,15 @@ pub enum OutboundEvent {
     /// Steer was explicitly cleared/cancelled before Intendant could prove
     /// delivery. This is terminal UI state, not an agent-observed message.
     SteerCancelled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
+    /// A cancel found nothing left to cancel — the steer already delivered
+    /// or converted to a follow-up. Terminal UI state that must NOT read as
+    /// a successful clear: the text reached (or will reach) the agent.
+    SteerCancelFailed {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         id: String,

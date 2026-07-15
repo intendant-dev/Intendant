@@ -2,9 +2,15 @@
 //! files under `$CODEX_HOME` and reconstructing per-user-turn revision
 //! state from recorded events.
 
-use crate::json_string_field;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+// Consolidated (message-search F3 phase 2): the rollout-file shapes this
+// module used to duplicate live in `external_agent`; the local copies had
+// already drifted (whole-file reads vs streaming, a stale injection list).
+// `codex_message_content_text` died outright — its one caller now goes
+// through the shared `codex_payload_text` shape.
+pub(crate) use crate::external_agent::codex::rollout::codex_session_file_id;
 
 pub(crate) fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -25,74 +31,67 @@ pub(crate) fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-pub(crate) fn codex_session_file_id(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
-            return obj
-                .get("payload")
-                .and_then(|payload| json_string_field(payload, "id"));
-        }
-    }
-    None
-}
-
 pub(crate) fn find_codex_session_file_for_main(home: &Path, session_id: &str) -> Option<PathBuf> {
     let codex = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".codex"));
+    find_codex_session_file_in(&codex, home, session_id)
+}
+
+/// Locate the rollout whose `session_meta.payload.id` is `session_id`
+/// under `codex_root`, consulting the wrapper index's stored rollout path
+/// before paying for the recursive scan (the scan opens EVERY rollout
+/// under `sessions/` + `archived_sessions/` to match the id). The stored
+/// path is trusted only after re-verifying the session id — rollouts
+/// migrate `sessions/` → `archived_sessions/` — and a successful rescan
+/// re-records the fresh location. `codex_root` is resolved by the caller
+/// (the `CODEX_HOME` env edge above); `home` scopes the wrapper index.
+pub(crate) fn find_codex_session_file_in(
+    codex_root: &Path,
+    home: &Path,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if let Some(stored) =
+        crate::external_wrapper_index::resolved_rollout_path(home, "codex", session_id, |path| {
+            codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+    {
+        return Some(stored);
+    }
     let mut files = Vec::new();
-    collect_jsonl_files(&codex.join("sessions"), &mut files);
-    collect_jsonl_files(&codex.join("archived_sessions"), &mut files);
-    files
-        .into_iter()
-        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+    collect_jsonl_files(&codex_root.join("sessions"), &mut files);
+    collect_jsonl_files(&codex_root.join("archived_sessions"), &mut files);
+    // Codex embeds the session id in rollout filenames — try the cheap
+    // name match before opening every file (ported from the catalog's
+    // finder during consolidation; the id check stays authoritative).
+    let found = files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+                && codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+        .cloned()
+        .or_else(|| {
+            files
+                .into_iter()
+                .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+        })?;
+    let _ = crate::external_wrapper_index::record_rollout_path(home, "codex", session_id, &found);
+    Some(found)
 }
 
-pub(crate) fn codex_message_content_text(content: &serde_json::Value) -> Option<String> {
-    match content {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|item| {
-                    item.get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
-                        .map(str::to_string)
-                })
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
+/// A genuine user message from a `response_item` payload: the shared
+/// `message` shape, filtered to `role == "user"` and stripped of
+/// harness-injected text no human typed.
 pub(crate) fn codex_payload_user_text(payload: &serde_json::Value) -> Option<String> {
-    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+    let (role, text) = crate::external_agent::codex::rollout::codex_payload_text(payload)?;
+    if role != "user" || is_codex_injected_user_text_for_main(&text) {
         return None;
     }
-    if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
-        return None;
-    }
-    let text = codex_message_content_text(payload.get("content")?)?;
-    if is_codex_injected_user_text_for_main(&text) {
-        None
-    } else {
-        Some(text)
-    }
+    Some(text)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,18 +185,22 @@ impl UserTurnRevisionState {
 }
 
 pub(crate) fn is_codex_injected_user_text_for_main(text: &str) -> bool {
-    // Delegates to the canonical predicate — this was a byte-for-byte copy
-    // that had already drifted from the session-catalog vocabulary.
-    crate::web_gateway::is_injected_external_user_text(text)
+    // Delegates to the canonical predicate at its post-F3 home (this was a
+    // byte-for-byte copy that had already drifted once before).
+    crate::external_agent::transcript_text::is_injected_external_user_text(text)
 }
 
-pub(crate) fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
+pub(crate) fn codex_user_turn_state_from_history(
+    session_id: &str,
+) -> Option<UserTurnRevisionState> {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
     let path = find_codex_session_file_for_main(&home, session_id)?;
     codex_user_turn_state_from_history_file(&path)
 }
 
-pub(crate) fn codex_user_turn_state_from_history_file(path: &Path) -> Option<UserTurnRevisionState> {
+pub(crate) fn codex_user_turn_state_from_history_file(
+    path: &Path,
+) -> Option<UserTurnRevisionState> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut saw_user_message_event = false;
     let mut event_state = UserTurnRevisionState::default();
@@ -228,14 +231,13 @@ pub(crate) fn codex_user_turn_state_from_history_file(path: &Path) -> Option<Use
                     _ => {}
                 }
             }
-            "response_item" => {
+            "response_item"
                 if obj
                     .get("payload")
                     .and_then(codex_payload_user_text)
-                    .is_some()
-                {
-                    fallback_state.record_next_turn();
-                }
+                    .is_some() =>
+            {
+                fallback_state.record_next_turn();
             }
             _ => {}
         }
@@ -353,5 +355,92 @@ mod tests {
         assert!(!is_codex_injected_user_text_for_main(
             "please inspect <bash-input> handling"
         ));
+    }
+
+    #[test]
+    fn find_codex_session_file_in_reuses_stored_rollout_path_and_survives_migration() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "019ea8b9-0000-7000-8000-00000000dd01";
+        let wrapper_id = "9a411507-4a41-4a37-95a2-6a8f4f9edc01";
+        let log_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            session_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+
+        let codex_root = home.path().join("codex-root");
+        let sessions_dir = codex_root.join("sessions").join("2026").join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let meta = serde_json::json!({
+            "timestamp": "2026-07-11T10:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        });
+        let decoy = serde_json::json!({
+            "timestamp": "2026-07-11T10:00:00Z",
+            "type": "session_meta",
+            "payload": { "id": "019ea8b9-9999-7000-8000-00000000dd99" }
+        });
+        std::fs::write(sessions_dir.join("decoy.jsonl"), decoy.to_string()).unwrap();
+        let live = sessions_dir.join("rollout.jsonl");
+        std::fs::write(&live, meta.to_string()).unwrap();
+
+        // First resolution scans and records the location.
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(live.clone())
+        );
+        assert_eq!(
+            crate::external_wrapper_index::resolved_rollout_path(
+                home.path(),
+                "codex",
+                session_id,
+                |_| true
+            ),
+            Some(live.clone())
+        );
+
+        // Migration sessions/ -> archived_sessions/: the stored path goes
+        // stale, the scan fallback finds the new home and re-records it.
+        let archived_dir = codex_root.join("archived_sessions");
+        std::fs::create_dir_all(&archived_dir).unwrap();
+        let archived = archived_dir.join("rollout.jsonl");
+        std::fs::rename(&live, &archived).unwrap();
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(archived.clone())
+        );
+        assert_eq!(
+            crate::external_wrapper_index::resolved_rollout_path(
+                home.path(),
+                "codex",
+                session_id,
+                |_| true
+            ),
+            Some(archived.clone())
+        );
+
+        // The stored path short-circuits the scan: a recorded location
+        // outside the scanned roots still resolves, as long as the file
+        // exists and its session id verifies.
+        let outside = codex_root.join("kept.jsonl");
+        std::fs::rename(&archived, &outside).unwrap();
+        crate::external_wrapper_index::record_rollout_path(
+            home.path(),
+            "codex",
+            session_id,
+            &outside,
+        )
+        .unwrap();
+        assert_eq!(
+            find_codex_session_file_in(&codex_root, home.path(), session_id),
+            Some(outside)
+        );
     }
 }

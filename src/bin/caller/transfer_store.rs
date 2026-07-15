@@ -101,6 +101,11 @@ pub struct TransferJob {
     pub mime: Option<String>,
     #[serde(default)]
     pub total_size: Option<u64>,
+    /// Expected content hash for upload jobs (lowercase hex), declared
+    /// at create and verified at commit. Absent from serialized jobs
+    /// when unset, so pre-sha256 wire shapes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     #[serde(default)]
     pub completed_bytes: u64,
     #[serde(default)]
@@ -223,6 +228,71 @@ fn cleanup_created_file_after_save_failure(path: &Path, label: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Active-job cache
+// ---------------------------------------------------------------------------
+
+/// In-memory handle for jobs with a transfer in flight, keyed by the job's
+/// on-disk JSON path (unique per scope+id, so hermetic tests in one process
+/// never collide). While an upload/download streams, the freshest
+/// `TransferJob` lives HERE; the JSON file is a durability checkpoint
+/// written on state transitions and every [`PERSIST_INTERVAL_BYTES`] of
+/// progress instead of a tempfile+rename per chunk. Readers (`find_job`,
+/// `list_jobs`) overlay this cache over the disk copy so progress and
+/// offset checks always see the newest state.
+struct ActiveJob {
+    job: TransferJob,
+    /// `completed_bytes` at the last durable persist — drives the
+    /// every-N-bytes checkpoint policy.
+    persisted_bytes: u64,
+    /// An append is copying into the partial right now. Concurrent appends
+    /// used to interleave `std::io::copy` calls into the same file; now the
+    /// second caller gets a 409 instead of silent corruption.
+    appending: bool,
+    /// Unix seconds of last touch, for pruning abandoned entries.
+    touched_at: u64,
+}
+
+/// Persist progress metadata at least once per this many appended bytes.
+const PERSIST_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Drop cache entries idle longer than this; the disk copy (persisted at
+/// most `PERSIST_INTERVAL_BYTES` behind) remains the source for resume.
+const ACTIVE_JOB_IDLE_SECS: u64 = 15 * 60;
+
+fn active_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, ActiveJob>> {
+    static ACTIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, ActiveJob>>,
+    > = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn prune_active_jobs_locked(map: &mut std::collections::HashMap<PathBuf, ActiveJob>, now: u64) {
+    map.retain(|_, entry| {
+        entry.appending || now.saturating_sub(entry.touched_at) < ACTIVE_JOB_IDLE_SECS
+    });
+}
+
+/// Freshest view of the job at `path`: the active-cache copy when a
+/// transfer is open, else `None` (caller falls back to disk).
+fn cached_job(path: &Path) -> Option<TransferJob> {
+    let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_unix();
+    prune_active_jobs_locked(&mut map, now);
+    map.get(path).map(|entry| entry.job.clone())
+}
+
+/// Remove the cache entry (terminal state or deletion).
+fn evict_job(path: &Path) {
+    let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+    map.remove(path);
+}
+
+#[cfg(test)]
+fn reset_active_jobs_for_path(path: &Path) {
+    evict_job(path);
+}
+
 fn save_job(scope: &StoreScope, job: &TransferJob) -> Result<(), TransferStoreError> {
     // Only project stores live inside a checkout; the global store needs
     // no ignore rule (it is daemon state, not project content).
@@ -240,19 +310,34 @@ fn save_job(scope: &StoreScope, job: &TransferJob) -> Result<(), TransferStoreEr
 
 pub fn list_jobs(scope: &StoreScope) -> Vec<TransferJob> {
     let mut jobs = Vec::new();
-    let Ok(entries) = fs::read_dir(jobs_dir(scope)) else {
-        return jobs;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
+    let dir = jobs_dir(scope);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
+            if let Ok(job) = serde_json::from_str::<TransferJob>(&content) {
+                jobs.push(job);
+            }
         }
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        if let Ok(job) = serde_json::from_str::<TransferJob>(&content) {
-            jobs.push(job);
+    }
+    // Overlay the active-job cache: while a transfer streams, the durable
+    // JSON trails the real progress by up to a checkpoint interval.
+    {
+        let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        prune_active_jobs_locked(&mut map, now_unix());
+        for (path, entry) in map.iter() {
+            if path.parent() != Some(dir.as_path()) {
+                continue;
+            }
+            match jobs.iter_mut().find(|job| job.id == entry.job.id) {
+                Some(slot) => *slot = entry.job.clone(),
+                None => jobs.push(entry.job.clone()),
+            }
         }
     }
     jobs.sort_by(|a, b| {
@@ -271,13 +356,21 @@ pub fn find_job(scope: &StoreScope, id_or_token: &str) -> Option<TransferJob> {
     if !is_generated_transfer_key(needle) {
         return None;
     }
-    if let Some(direct) = lookup_job_path(scope, needle).filter(|path| path.is_file()) {
-        if let Ok(content) = fs::read_to_string(direct) {
-            if let Ok(job) = serde_json::from_str::<TransferJob>(&content) {
-                return Some(job);
+    if let Some(direct) = lookup_job_path(scope, needle) {
+        // Freshest first: an in-flight transfer's newest state lives in the
+        // active-job cache; the JSON checkpoint may trail it.
+        if let Some(job) = cached_job(&direct) {
+            return Some(job);
+        }
+        if direct.is_file() {
+            if let Ok(content) = fs::read_to_string(direct) {
+                if let Ok(job) = serde_json::from_str::<TransferJob>(&content) {
+                    return Some(job);
+                }
             }
         }
     }
+    // Resume-token (or missed-id) fallback: full scan, cache-overlaid.
     list_jobs(scope)
         .into_iter()
         .find(|job| job.id == needle || job.resume_token == needle)
@@ -349,6 +442,7 @@ pub fn create_download_job_from_path(
         filename,
         mime: Some(mime.unwrap_or_else(|| content_type_for_path(&display_path))),
         total_size: Some(metadata.len()),
+        sha256: None,
         completed_bytes: 0,
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
@@ -412,6 +506,7 @@ pub fn create_download_job_from_bytes(
         filename: Some(safe_name),
         mime: Some(mime),
         total_size: Some(bytes.len() as u64),
+        sha256: None,
         completed_bytes: 0,
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
@@ -512,14 +607,53 @@ fn resolve_upload_destination(
     Ok((final_path, parent))
 }
 
+/// Normalize a declared upload checksum: lowercase hex, 64 chars.
+fn normalize_expected_sha256(raw: Option<String>) -> Result<Option<String>, TransferStoreError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(TransferStoreError::new(
+            400,
+            "sha256 must be 64 hex characters",
+        ));
+    }
+    Ok(Some(normalized))
+}
+
+/// Streaming content hash of a file (lowercase hex) — commit-time
+/// verification must not buffer a multi-gigabyte partial in memory.
+fn sha256_file_hex(path: &Path) -> Result<String, std::io::Error> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok(crate::file_watcher::hex_encode(&digest))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn create_upload_job(
     scope: &StoreScope,
     raw_destination: &str,
     original_name: &str,
     mime: &str,
     total_size: Option<u64>,
+    sha256: Option<String>,
     conflict_policy: TransferConflictPolicy,
 ) -> Result<TransferJob, TransferStoreError> {
+    let sha256 = normalize_expected_sha256(sha256)?;
     let (final_path, parent) =
         resolve_upload_destination(raw_destination, original_name, conflict_policy)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -558,6 +692,7 @@ pub fn create_upload_job(
             mime.trim().to_string()
         }),
         total_size,
+        sha256,
         completed_bytes: 0,
         error: None,
         conflict_policy,
@@ -569,6 +704,22 @@ pub fn create_upload_job(
     Ok(job)
 }
 
+/// Releases an upload's in-flight append claim on scope exit, so every
+/// early-return error path frees the slot for the next chunk.
+struct AppendSlot {
+    path: PathBuf,
+}
+
+impl Drop for AppendSlot {
+    fn drop(&mut self) {
+        let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&self.path) {
+            entry.appending = false;
+            entry.touched_at = now_unix();
+        }
+    }
+}
+
 pub fn append_upload_tempfile(
     scope: &StoreScope,
     id_or_token: &str,
@@ -576,13 +727,44 @@ pub fn append_upload_tempfile(
     mut chunk: tempfile::NamedTempFile,
     chunk_len: u64,
 ) -> Result<TransferJob, TransferStoreError> {
-    let mut job = required_job(scope, id_or_token)?;
-    if job.kind != TransferKind::Upload {
+    let located = required_job(scope, id_or_token)?;
+    if located.kind != TransferKind::Upload {
         return Err(TransferStoreError::new(
             400,
             "transfer job is not an upload",
         ));
     }
+    let job_file = job_path(scope, &located.id)?;
+
+    // Claim the append slot and take the freshest job snapshot under the
+    // cache lock. Two chunks copying into the same partial concurrently
+    // used to interleave silently; the second caller now gets a 409 and
+    // retries against the advanced offset.
+    let (mut job, freshly_admitted) = {
+        let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_unix();
+        prune_active_jobs_locked(&mut map, now);
+        let freshly_admitted = !map.contains_key(&job_file);
+        let entry = map.entry(job_file.clone()).or_insert_with(|| ActiveJob {
+            job: located.clone(),
+            persisted_bytes: located.completed_bytes,
+            appending: false,
+            touched_at: now,
+        });
+        if entry.appending {
+            return Err(TransferStoreError::new(
+                409,
+                "another chunk is being appended to this upload",
+            ));
+        }
+        entry.appending = true;
+        entry.touched_at = now;
+        (entry.job.clone(), freshly_admitted)
+    };
+    let _slot = AppendSlot {
+        path: job_file.clone(),
+    };
+
     if matches!(
         job.status,
         TransferStatus::Completed | TransferStatus::Cancelled | TransferStatus::Failed
@@ -592,6 +774,56 @@ pub fn append_upload_tempfile(
             "upload job is not writable in its current state",
         ));
     }
+    let temp_path = job
+        .temp_path
+        .clone()
+        .ok_or_else(|| TransferStoreError::new(500, "upload job has no partial path"))?;
+
+    // Crash reconciliation, once per cache admission: metadata checkpoints
+    // trail the partial by up to PERSIST_INTERVAL_BYTES, so after a daemon
+    // restart the two can disagree in either direction.
+    // - partial LONGER than the checkpoint: the tail was appended but never
+    //   acknowledged durably — truncate back to the checkpoint so the
+    //   resume offset protocol stays exact (at most one interval re-sent).
+    // - partial SHORTER than the checkpoint: the checkpoint outlived data
+    //   the filesystem dropped — roll the job back to the partial's length
+    //   and persist that immediately.
+    let on_disk = fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
+    if on_disk != job.completed_bytes {
+        if !freshly_admitted {
+            // Live entry disagreeing with its own partial: a foreign writer
+            // touched the file — refuse, as before.
+            return Err(TransferStoreError::new(
+                409,
+                "upload partial size does not match job metadata",
+            ));
+        }
+        if on_disk > job.completed_bytes {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(&temp_path)
+                .map_err(|e| TransferStoreError::new(500, format!("open upload partial: {e}")))?;
+            file.set_len(job.completed_bytes).map_err(|e| {
+                TransferStoreError::new(500, format!("truncate upload partial: {e}"))
+            })?;
+        } else {
+            job.completed_bytes = on_disk;
+            job.status = TransferStatus::Running;
+            job.updated_at = now_unix();
+            save_job(scope, &job)?;
+        }
+        // Publish the reconciled state (slot stays claimed — update the
+        // entry in place rather than reinserting it).
+        {
+            let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = map.get_mut(&job_file) {
+                entry.job = job.clone();
+                entry.persisted_bytes = job.completed_bytes;
+                entry.touched_at = now_unix();
+            }
+        }
+    }
+
     if let Some(total) = job.total_size {
         if offset.saturating_add(chunk_len) > total {
             return Err(TransferStoreError::new(
@@ -615,17 +847,7 @@ pub fn append_upload_tempfile(
             "upload chunk offset does not match persisted size",
         ));
     }
-    let temp_path = job
-        .temp_path
-        .clone()
-        .ok_or_else(|| TransferStoreError::new(500, "upload job has no partial path"))?;
-    let on_disk = fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
-    if on_disk != job.completed_bytes {
-        return Err(TransferStoreError::new(
-            409,
-            "upload partial size does not match job metadata",
-        ));
-    }
+
     let mut output = fs::OpenOptions::new()
         .append(true)
         .open(&temp_path)
@@ -645,13 +867,42 @@ pub fn append_upload_tempfile(
     output
         .flush()
         .map_err(|e| TransferStoreError::new(500, format!("flush upload partial: {e}")))?;
+
+    let previous_status = job.status;
     job.completed_bytes = job.completed_bytes.saturating_add(copied);
     job.updated_at = now_unix();
     job.status = match job.total_size {
         Some(total) if job.completed_bytes >= total => TransferStatus::Ready,
         _ => TransferStatus::Running,
     };
-    save_job(scope, &job)?;
+
+    // Durable-checkpoint policy: the JSON rewrite (tempfile+rename) no
+    // longer runs per chunk — persist on state transitions, every
+    // PERSIST_INTERVAL_BYTES of progress, and when the upload becomes
+    // Ready; the in-memory handle carries the exact state in between and
+    // the admission reconciliation above covers a crash inside the gap.
+    let should_persist = {
+        let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_unix();
+        let entry = map.entry(job_file.clone()).or_insert_with(|| ActiveJob {
+            job: job.clone(),
+            persisted_bytes: 0,
+            appending: true,
+            touched_at: now,
+        });
+        entry.job = job.clone();
+        entry.touched_at = now;
+        let should_persist = job.status != previous_status
+            || job.status == TransferStatus::Ready
+            || job.completed_bytes.saturating_sub(entry.persisted_bytes) >= PERSIST_INTERVAL_BYTES;
+        if should_persist {
+            entry.persisted_bytes = job.completed_bytes;
+        }
+        should_persist
+    };
+    if should_persist {
+        save_job(scope, &job)?;
+    }
     Ok(job)
 }
 
@@ -665,6 +916,17 @@ pub fn commit_upload_job(
             400,
             "transfer job is not an upload",
         ));
+    }
+    // Refuse to rename the partial out from under an in-flight append.
+    {
+        let job_file = job_path(scope, &job.id)?;
+        let map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&job_file).is_some_and(|entry| entry.appending) {
+            return Err(TransferStoreError::new(
+                409,
+                "upload has a chunk append in flight",
+            ));
+        }
     }
     let temp_path = job
         .temp_path
@@ -683,6 +945,16 @@ pub fn commit_upload_job(
                 409,
                 "upload is not complete enough to commit",
             ));
+        }
+    }
+    // Verify the declared checksum before the partial is placed — a
+    // mismatch leaves the job resumable-from-scratch (delete + retry)
+    // rather than a corrupt file at the destination.
+    if let Some(expected) = &job.sha256 {
+        let actual = sha256_file_hex(&temp_path)
+            .map_err(|e| TransferStoreError::new(500, format!("hash upload partial: {e}")))?;
+        if &actual != expected {
+            return Err(TransferStoreError::new(409, "upload sha256 mismatch"));
         }
     }
     if destination.exists() {
@@ -720,17 +992,23 @@ pub fn commit_upload_job(
     job.updated_at = now_unix();
     job.error = None;
     save_job(scope, &job)?;
+    // Terminal state: final persist above is authoritative — drop the
+    // in-memory handle.
+    if let Ok(job_file) = job_path(scope, &job.id) {
+        evict_job(&job_file);
+    }
     Ok(job)
 }
 
-pub fn read_download_range(
+/// Resolve a download job's source: the job, its source path, and the
+/// on-disk size — the shared preamble of [`read_download_range`] and the
+/// HTTP lane's `Range`-header normalization (which must know the total
+/// before an end-inclusive header can become an offset/length read).
+pub fn download_source(
     scope: &StoreScope,
     id_or_token: &str,
-    offset: u64,
-    length: Option<u64>,
-    max_bytes: u64,
-) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
-    let mut job = required_job(scope, id_or_token)?;
+) -> Result<(TransferJob, PathBuf, u64), TransferStoreError> {
+    let job = required_job(scope, id_or_token)?;
     if job.kind != TransferKind::Download {
         return Err(TransferStoreError::new(
             400,
@@ -747,6 +1025,17 @@ pub fn read_download_range(
         return Err(TransferStoreError::new(400, "path is not a regular file"));
     }
     let total_size = metadata.len();
+    Ok((job, path, total_size))
+}
+
+pub fn read_download_range(
+    scope: &StoreScope,
+    id_or_token: &str,
+    offset: u64,
+    length: Option<u64>,
+    max_bytes: u64,
+) -> Result<(TransferJob, Vec<u8>, u64), TransferStoreError> {
+    let (mut job, path, total_size) = download_source(scope, id_or_token)?;
     if offset > total_size {
         return Err(TransferStoreError::new(416, "range start beyond file size"));
     }
@@ -768,6 +1057,8 @@ pub fn read_download_range(
     file.read_exact(&mut bytes)
         .map_err(|e| TransferStoreError::new(500, format!("read file: {e}")))?;
     let end = offset.saturating_add(requested);
+    let previous_status = job.status;
+    let previous_completed = job.completed_bytes;
     job.total_size = Some(total_size);
     job.completed_bytes = job.completed_bytes.max(end);
     job.status = if end >= total_size {
@@ -776,7 +1067,36 @@ pub fn read_download_range(
         TransferStatus::Running
     };
     job.updated_at = now_unix();
-    save_job(scope, &job)?;
+    // Same checkpoint policy as uploads: the progress watermark is a UI
+    // hint, so persist on state transitions and every
+    // PERSIST_INTERVAL_BYTES instead of a JSON rewrite per range read;
+    // the active-job cache serves the exact watermark in between.
+    let job_file = job_path(scope, &job.id)?;
+    let should_persist = {
+        let mut map = active_jobs().lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_unix();
+        prune_active_jobs_locked(&mut map, now);
+        let entry = map.entry(job_file.clone()).or_insert_with(|| ActiveJob {
+            job: job.clone(),
+            persisted_bytes: previous_completed,
+            appending: false,
+            touched_at: now,
+        });
+        entry.job = job.clone();
+        entry.touched_at = now;
+        let should_persist = job.status != previous_status
+            || job.completed_bytes.saturating_sub(entry.persisted_bytes) >= PERSIST_INTERVAL_BYTES;
+        if should_persist {
+            entry.persisted_bytes = job.completed_bytes;
+        }
+        should_persist
+    };
+    if should_persist {
+        save_job(scope, &job)?;
+    }
+    if job.status == TransferStatus::Completed {
+        evict_job(&job_file);
+    }
     Ok((job, bytes, end))
 }
 
@@ -784,6 +1104,11 @@ pub fn delete_job(scope: &StoreScope, id_or_token: &str) -> Result<bool, Transfe
     let Some(mut job) = find_job(scope, id_or_token) else {
         return Ok(false);
     };
+    // Drop the in-memory handle first so nothing can resurrect the job
+    // from cache (or checkpoint it back to disk) after the file removal.
+    if let Ok(job_file) = job_path(scope, &job.id) {
+        evict_job(&job_file);
+    }
     if let Some(temp_path) = job.temp_path.take() {
         let _ = fs::remove_file(temp_path);
     }
@@ -990,6 +1315,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(11),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap();
@@ -1022,6 +1348,175 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    /// Raw on-disk job JSON, bypassing the active-job cache overlay.
+    fn disk_job(project: &Path, id: &str) -> TransferJob {
+        let path = job_path(&scope(project), id).unwrap();
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// The per-chunk JSON rewrite is gone: mid-stream appends update the
+    /// in-memory handle (served by `find_job`) while the durable JSON
+    /// checkpoints only on state transitions / the byte interval, with a
+    /// final persist at Ready.
+    #[test]
+    fn upload_appends_checkpoint_metadata_instead_of_rewriting_per_chunk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("out.bin");
+
+        let job = create_upload_job(
+            &scope(&project),
+            dest.to_str().unwrap(),
+            "out.bin",
+            "application/octet-stream",
+            Some(9),
+            None,
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let id = job.id.clone();
+
+        // Chunk 1: Queued -> Running is a state transition — checkpointed.
+        append_upload_tempfile(&scope(&project), &id, 0, write_chunk(b"aaa"), 3).unwrap();
+        assert_eq!(disk_job(&project, &id).completed_bytes, 3);
+
+        // Chunk 2: no transition, far below the byte interval — the disk
+        // copy stays at the checkpoint while find_job serves the fresh
+        // in-memory state.
+        append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"bbb"), 3).unwrap();
+        assert_eq!(
+            disk_job(&project, &id).completed_bytes,
+            3,
+            "no mid-stream rewrite"
+        );
+        assert_eq!(
+            find_job(&scope(&project), &id).unwrap().completed_bytes,
+            6,
+            "find_job must serve the freshest (cached) progress"
+        );
+        assert_eq!(
+            list_jobs(&scope(&project))
+                .into_iter()
+                .find(|job| job.id == id)
+                .unwrap()
+                .completed_bytes,
+            6,
+            "list_jobs must overlay the cached progress"
+        );
+
+        // Chunk 3 completes the upload: Ready is always persisted.
+        append_upload_tempfile(&scope(&project), &id, 6, write_chunk(b"ccc"), 3).unwrap();
+        let on_disk = disk_job(&project, &id);
+        assert_eq!(on_disk.status, TransferStatus::Ready);
+        assert_eq!(on_disk.completed_bytes, 9);
+    }
+
+    /// Crash inside the checkpoint gap: the partial is LONGER than the
+    /// persisted metadata. On the next append (fresh cache admission) the
+    /// partial truncates back to the durable watermark so the resume
+    /// offset protocol stays exact, and the upload completes.
+    #[test]
+    fn upload_recovers_when_partial_outruns_checkpoint_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("out.bin");
+
+        let job = create_upload_job(
+            &scope(&project),
+            dest.to_str().unwrap(),
+            "out.bin",
+            "application/octet-stream",
+            Some(6),
+            None,
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let id = job.id.clone();
+        let temp_path = job.temp_path.clone().unwrap();
+
+        append_upload_tempfile(&scope(&project), &id, 0, write_chunk(b"abc"), 3).unwrap();
+        // Simulate the crash: unacknowledged tail bytes in the partial,
+        // then a daemon restart (cache emptied).
+        {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&temp_path)
+                .unwrap();
+            file.write_all(b"XY").unwrap();
+        }
+        reset_active_jobs_for_path(&job_path(&scope(&project), &id).unwrap());
+
+        // Resume from the durable watermark (what a client learns from
+        // find_job after restart) — admission truncates the orphan tail.
+        let resumed =
+            append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"def"), 3).unwrap();
+        assert_eq!(resumed.completed_bytes, 6);
+        assert_eq!(resumed.status, TransferStatus::Ready);
+        let committed = commit_upload_job(&scope(&project), &id).unwrap();
+        assert_eq!(
+            fs::read(committed.final_path.unwrap()).unwrap(),
+            b"abcdef",
+            "orphan tail must not corrupt the committed bytes"
+        );
+    }
+
+    /// Crash the other way: the checkpoint outlived partial bytes the
+    /// filesystem dropped. Admission rolls the job back to the partial's
+    /// real length and persists that, so resume proceeds from truth.
+    #[test]
+    fn upload_rolls_back_when_checkpoint_outruns_partial_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("out.bin");
+
+        let job = create_upload_job(
+            &scope(&project),
+            dest.to_str().unwrap(),
+            "out.bin",
+            "application/octet-stream",
+            Some(6),
+            None,
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let id = job.id.clone();
+        let temp_path = job.temp_path.clone().unwrap();
+
+        append_upload_tempfile(&scope(&project), &id, 0, write_chunk(b"abc"), 3).unwrap();
+        // Simulate lost partial bytes + restart.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        reset_active_jobs_for_path(&job_path(&scope(&project), &id).unwrap());
+
+        // A resume at the stale watermark reports the mismatch class the
+        // client already handles (409 -> re-query -> retry)...
+        let err =
+            append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"def"), 3).unwrap_err();
+        assert_eq!(err.status, 409);
+        // ...and the admission already rolled the durable job back to the
+        // partial's real length, so the re-queried offset works.
+        assert_eq!(find_job(&scope(&project), &id).unwrap().completed_bytes, 1);
+        assert_eq!(disk_job(&project, &id).completed_bytes, 1);
+        let resumed =
+            append_upload_tempfile(&scope(&project), &id, 1, write_chunk(b"bcdef"), 5).unwrap();
+        assert_eq!(resumed.completed_bytes, 6);
+        assert_eq!(resumed.status, TransferStatus::Ready);
+    }
+
     #[test]
     fn upload_job_rejects_conflict_by_default_and_can_rename() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1038,6 +1533,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap_err();
@@ -1049,6 +1545,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Rename,
         )
         .unwrap();
@@ -1075,6 +1572,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap_err();
@@ -1093,6 +1591,71 @@ mod tests {
     }
 
     #[test]
+    fn upload_commit_verifies_declared_sha256() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let payload = b"hello world";
+        let good_hash = crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(payload));
+
+        // Malformed declarations refuse at create.
+        let err = create_upload_job(
+            &scope(&project),
+            dest_dir.join("bad-decl.bin").to_str().unwrap(),
+            "bad-decl.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some("not-a-hash".to_string()),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+        assert_eq!(err.message, "sha256 must be 64 hex characters");
+
+        // A wrong declared hash refuses at commit; the partial and job
+        // survive (delete + retry, never a corrupt destination).
+        let wrong = create_upload_job(
+            &scope(&project),
+            dest_dir.join("wrong.bin").to_str().unwrap(),
+            "wrong.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some("0".repeat(64)),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let wrong =
+            append_upload_tempfile(&scope(&project), &wrong.id, 0, write_chunk(payload), 11)
+                .unwrap();
+        let err = commit_upload_job(&scope(&project), &wrong.id).unwrap_err();
+        assert_eq!(err.status, 409);
+        assert_eq!(err.message, "upload sha256 mismatch");
+        assert!(!dest_dir.join("wrong.bin").exists());
+        assert!(wrong.temp_path.unwrap().exists());
+
+        // The correct hash (declared uppercase — normalized at create)
+        // commits, and the job carries the normalized value.
+        let good = create_upload_job(
+            &scope(&project),
+            dest_dir.join("good.bin").to_str().unwrap(),
+            "good.bin",
+            "application/octet-stream",
+            Some(payload.len() as u64),
+            Some(good_hash.to_ascii_uppercase()),
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        assert_eq!(good.sha256.as_deref(), Some(good_hash.as_str()));
+        let good = append_upload_tempfile(&scope(&project), &good.id, 0, write_chunk(payload), 11)
+            .unwrap();
+        let committed = commit_upload_job(&scope(&project), &good.id).unwrap();
+        assert_eq!(committed.status, TransferStatus::Completed);
+        assert_eq!(fs::read(dest_dir.join("good.bin")).unwrap(), payload);
+    }
+
+    #[test]
     fn duplicate_already_persisted_upload_chunk_is_idempotent() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -1106,6 +1669,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(6),
+            None,
             TransferConflictPolicy::Fail,
         )
         .unwrap();
@@ -1134,6 +1698,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Overwrite,
         )
         .unwrap();
@@ -1166,6 +1731,7 @@ mod tests {
             "out.txt",
             "text/plain",
             Some(3),
+            None,
             TransferConflictPolicy::Overwrite,
         )
         .unwrap_err();

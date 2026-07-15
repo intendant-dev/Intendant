@@ -1509,7 +1509,7 @@ function stationHandleControlsAction(action) {
   }
   if (op.startsWith('claude-permission:')) {
     const mode = op.slice('claude-permission:'.length).trim();
-    if (!['default', 'acceptEdits', 'plan', 'bypassPermissions'].includes(mode)) return;
+    if (!['default', 'acceptEdits', 'plan', 'auto', 'dontAsk', 'bypassPermissions'].includes(mode)) return;
     dispatchControlMsg({ action: 'set_claude_permission_mode', mode });
     showControlToast?.('success', `Claude permissions: ${mode}`);
     return;

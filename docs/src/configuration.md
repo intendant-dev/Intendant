@@ -2,8 +2,11 @@
 
 Intendant is configured through three layers, in increasing specificity:
 
-1. **`intendant.toml`** in the project root — the durable, per-project config
-   (structure in `src/bin/caller/project.rs`).
+1. **`intendant.toml`** — in the project root for a rooted daemon, or under
+   the daemon state root (`~/.intendant/intendant.toml` by default) for a
+   projectless daemon such as the bundled app. The latter stores daemon-wide
+   defaults without making the state directory a session project or sandbox
+   root (structure in `src/bin/caller/project.rs`).
 2. **Environment variables** (often via `.env`) — keys, provider/model
    overrides, and a few runtime toggles.
 3. **CLI flags** — per-invocation overrides (see
@@ -50,7 +53,7 @@ for the headless `tests/e2e/` suite and demos) and requires
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations that are deliberately *not* under the state root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the platform-data-dir daemon identity key. |
+| `INTENDANT_HOME` | `~/.intendant` | Overrides the daemon state root — the one directory holding session logs, the session-index cache, recordings, quarantine, leased credentials, access certs, the service pidfile, the projectless daemon's general settings (`intendant.toml`) and Connect config (`connect.toml`), the projectless upload/transfer global store (`global-store/`, pruned after 14 idle days at daemon startup), and the rest of the machine-local daemon state. The value is used verbatim as the root (no `.intendant` component is appended); a relative path resolves against the startup directory. Read once at first use and fixed for the process lifetime. Useful for scratch daemons and hermetic harnesses. Locations deliberately outside this root are unaffected: project-local `.intendant/` directories, external-agent homes (`~/.codex`, `~/.claude`), and the durable Ed25519 daemon identity private key at the OS data directory's `intendant/daemon-identity/ed25519.pk8` (0600 on Unix; the temp-directory fallback is only for platforms where no data directory resolves). |
 
 ### Model and behavior tuning
 
@@ -128,9 +131,12 @@ sessions spawned in-process via the `spawn_sub_agent` tool (see
 
 ## `intendant.toml`
 
-Create `intendant.toml` in your project root (the git top-level). Every section
-is optional; an absent section uses its defaults. The structure and defaults
-below are taken directly from `src/bin/caller/project.rs`.
+Create `intendant.toml` in your project root (the git top-level). A daemon
+started without a project marker reads and writes the same schema at
+`<INTENDANT_HOME>/intendant.toml`; the dashboard's Settings page uses that
+daemon-wide file while `/api/project-root` remains null. Every section is
+optional; an absent section uses its defaults. The structure and defaults below
+are taken directly from `src/bin/caller/project.rs`.
 
 ### `[memory]`
 
@@ -262,7 +268,7 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `model` | string | unset | Model override |
 | `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
 | `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
-| `reasoning_effort` | string | unset (model default) | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `reasoning_effort` | string | unset (model default) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra` (model-dependent; `ultra` enables automatic task delegation on supporting Codex models) |
 | `service_tier` | string | unset (inherit Codex default) | `priority` enables Fast, `flex` requests Flex, `standard` is a sentinel that sends an explicit `serviceTier: null` to opt managed sessions out of Fast |
 | `web_search` | bool | `false` | Enable the Responses-API `web_search` tool (`codex --search`) |
 | `network_access` | bool | `false` | Allow outbound network in `workspace-write` sandbox (ignored for `read-only` / `danger-full-access`) |
@@ -286,9 +292,10 @@ preserve Codex's normal user configuration inheritance.
 |-----|------|---------|-------------|
 | `command` | string | `claude` | Path or command name |
 | `model` | string | unset | Model override — an alias (`fable`, `opus`, `sonnet`, `haiku`; the CLI resolves it to the latest model) or a full model id |
-| `permission_mode` | string | `default` | `default`, `acceptEdits`, `plan`, `bypassPermissions` (legacy `auto` = `default`) |
-| `effort` | string | unset | Reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max` (unset omits the flag) |
+| `permission_mode` | string | `default` | `default` (alias `manual`), `acceptEdits`, `plan`, `auto` (classifier-based approvals), `dontAsk` (auto-deny anything that would prompt), `bypassPermissions`. **Semantics change:** before Claude Code 2.1.206 Intendant coerced `auto` to `default`; it now selects the CLI's real auto-approval mode, and the config load warns when it finds `auto` so an old config doesn't escalate silently |
+| `effort` | string | unset | Reasoning effort passed as `--effort`: `low`, `medium`, `high`, `xhigh`, `max`, `ultracode` (unset omits the flag) |
 | `allowed_tools` | array | `[]` (all) | Restrict the tool set |
+| `max_budget_usd` | float | unset | CLI-enforced dollar backstop passed as `--max-budget-usd`; cumulative for the session, its resumes, AND its forks — a forked or `/btw` side child inherits the parent's counted spend (probed 2.1.206), so children of an exhausted parent fail immediately with the same hint. On exceed every further turn fails with `error_max_budget_usd` (surfaced as a backend error with a recovery hint). Must be positive: a zero/negative/non-finite value refuses the spawn instead of silently disarming (the CLI itself rejects `--max-budget-usd 0`) |
 
 Unknown or empty values for `approval_policy`, `sandbox`, `reasoning_effort`,
 are normalized to the safe default so a config typo cannot silently escalate
@@ -336,11 +343,12 @@ optional `credential`.
 
 ### `[connect]`
 
-Experimental Intendant Connect client for public-origin dashboard access. This
-is disabled by default and does **not** replace local/offline dashboard mTLS.
-When enabled, the daemon opens outbound requests to a Connect/rendezvous service
-that brokers WebRTC dashboard-control signaling; the browser still verifies the
-daemon-signed DataChannel binding before sending dashboard RPC.
+Intendant Connect client for public-origin account/route discovery. This is
+disabled by default and does **not** replace local/offline dashboard mTLS.
+When enabled, the daemon registers signed presence and route-code metadata and
+polls the rendezvous mailbox. The default binary refuses every hosted-origin
+control event before touching dashboard-control, IAM, or enrollment state. The
+current service also returns `403` for browser offer/ICE/close before mutation.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -353,16 +361,17 @@ daemon-signed DataChannel binding before sending dashboard RPC.
 
 No file editing is required for the common case: the dashboard's
 **Access → Intendant Connect** card toggles `enabled` (persisting it
-here), shows registration/claim state, reveals the twelve-word claim
-phrase to manage-grade sessions, and can release the claim binding. The
+here), shows registration/link state, reveals the single-use twelve-word
+locally minted claim code to trusted manage-grade sessions, and can release the
+account/route link. The
 `INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable still force-enables
 the client and overrides the file (the card reports when it does).
 
 **Projectless daemons** (the bundled macOS app's normal shape — no
-`.git`/`intendant.toml` at the launch directory) have no project file to
-persist into; for them the same `[connect]` table lives in the
-daemon-scoped `connect.toml` under the state root (`~/.intendant/`), and
-the toggle and daemon boot both use it. Rooted daemons are unaffected.
+`.git`/`intendant.toml` at the launch directory) keep general defaults in the
+daemon-scoped `intendant.toml`, but Connect's credential-bearing table remains
+in its dedicated owner-only `connect.toml` beside it. The toggle and daemon boot
+both use that dedicated file. Rooted daemons are unaffected.
 
 Hosted Connect uses the same daemon-side settings:
 
@@ -382,23 +391,33 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
     --listen 127.0.0.1:9876 \
     --origin https://connect.intendant.dev \
     --rp-id intendant.dev \
-    --static-root static \
     --data-file <state-file>
 ```
 
+`--static-root PATH` and `INTENDANT_CONNECT_STATIC_ROOT` are deprecated
+compatibility inputs. They are accepted (a missing flag value still errors)
+but ignored. The default Connect binary serves only explicit, compile-time
+embedded routes and assets; it never mounts a filesystem fallback. In
+particular, a supplied directory cannot expose `app.html`, WASM, or
+`vault-kernel.js` from the hosted origin.
+
 `intendant-connect` is intended to sit behind public TLS for the configured
-origin. It handles passkey-only account sessions, claim-phrase ownership proof,
-daemon list/open/revoke/label UI, account-backed fleet target metadata,
-rendezvous routing grants, WebRTC signaling, active-session close on revoke, and
-a capped audit log. The target daemon still requires a daemon-local IAM grant
-for the routed Connect account before it answers hosted dashboard control. The
-state file durably stores users/passkeys, daemon ownership, labels, hashed claim
-phrases, account-scoped fleet navigation records, and audit events. Plain claim
-phrases, WebAuthn challenge state, pending offers, issued routing grants, rate
-limits, web sessions, and active dashboard session tracking are memory-only. The
-claim API field remains named
-`claim_code` for compatibility, but newly generated claims are standard 12-word
-BIP39 English mnemonic phrases rather than short PIN-style codes.
+origin. It handles passkey-only account sessions, single-use account/route linking,
+daemon list/release/label UI, account-backed fleet target metadata, and a capped
+audit log. A live claim-linked daemon exposes no control URL or Open action;
+`/app` always redirects to `/connect`. A separately remembered, client-signed
+and passkey-decrypted direct route may show **Open direct route**, which merely
+navigates away from Connect to that daemon's mTLS origin and grants nothing by
+itself. A Connect account assertion never authenticates to the
+daemon, and no grant or configuration edit can enable hosted control. The state file durably stores users/passkeys, daemon account
+links, labels, hashed claim codes, account-scoped fleet navigation records, and
+audit events. The daemon locally generates each single-use 12-word BIP39 code
+and signs a fresh registration containing only its SHA-256 hash. Its printed
+URL carries the phrase in `/connect#claim_code=...`; the browser scrubs the
+fragment, hashes locally, and sends only the digest. Connect never receives or
+returns plaintext, and its claim API rejects plaintext/query compatibility.
+WebAuthn challenge state, rate limits, web sessions, and short-lived
+daemon-session credentials are memory-only.
 
 For new `*.intendant.dev` deployments, the default RP ID is `intendant.dev`, so
 passkeys can be scoped to the owned parent domain. The current
@@ -415,8 +434,8 @@ Use `/healthz` for liveness and `/readyz` for readiness. Back up the state file
 and store `INTENDANT_CONNECT_TOKEN` in the deployment secret store.
 
 Cookie-backed user mutations require a same-origin request and the per-session
-CSRF token returned by `/api/me`. The bundled Connect UI and dashboard
-`connect=1` mode set that header automatically, including hosted fleet sync
+CSRF token returned by `/api/me`. The bundled Connect UI sets that header
+automatically, including hosted fleet sync
 through `/api/fleet/targets/sync` and fleet-record deletion through
 `/api/fleet/targets/{target_id}/forget`.
 
@@ -447,10 +466,10 @@ copy or print the daemon bearer token; the token remains in the remote systemd
 environment.
 
 Backups should be encrypted because the state file is the authoritative account
-and device registry. It stores account handles, passkey public-key records,
-daemon ownership and labels, hashed claim phrases, and audit entries. It does
-not store plaintext claim phrases, WebAuthn challenges, active browser sessions,
-pending offers, routing grants, or rate-limit buckets. Create an encrypted
+and route registry. It stores account handles, passkey public-key records,
+daemon account links and labels, hashed claim codes, and audit entries. It does
+not store plaintext claim codes, WebAuthn challenges, active browser sessions,
+pending offers, routing tokens, or rate-limit buckets. Create an encrypted
 backup with:
 
 ```bash
@@ -474,9 +493,11 @@ scripts/connect-state-restore.sh --yes \
   ~/.local/share/intendant/connect-backups/intendant-connect-state-YYYYMMDDTHHMMSSZ.json.enc
 ```
 
-After a restore, existing browser sessions are gone because sessions are
-memory-only. Claimed daemons continue to be owned by the restored account state,
-but currently connected dashboards must reconnect.
+After a restore, existing Connect account sessions are gone because those web
+sessions are memory-only. Linked daemon routes remain associated with the
+restored account state. Direct daemon dashboards are separate and are not
+Connect sessions. The restored association is not daemon ownership or IAM
+authority.
 
 The service accepts these deployment flags and equivalent environment variables:
 
@@ -485,11 +506,11 @@ The service accepts these deployment flags and equivalent environment variables:
 | `INTENDANT_CONNECT_LISTEN` | `--listen` | `127.0.0.1:9876` | HTTP listen address |
 | `INTENDANT_CONNECT_ORIGIN` | `--origin` | `http://localhost:<port>` | Public browser origin for redirects, install snippets, and WebAuthn origin checks |
 | `INTENDANT_CONNECT_RP_ID` | `--rp-id` | origin host, or `intendant.dev` for `*.intendant.dev` | WebAuthn relying-party id |
-| `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` | `static` | Static asset root |
+| `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` | ignored | Deprecated compatibility input. Accepted but never read or mounted; Connect serves only its explicit embedded allowlist |
 | `INTENDANT_CONNECT_DATA_FILE` | `--data-file` | platform data dir `intendant/connect/state.json` | JSON state file |
-| `INTENDANT_CONNECT_TOKEN` | `--daemon-token` | unset | Bearer token for daemon registration/polling unless open registration is enabled; still guards admin surfaces |
+| `INTENDANT_CONNECT_TOKEN` | `--daemon-token` | unset | Shared deployment bearer for registration unless open registration is enabled; still guards admin surfaces. It does not replace the daemon's signed registration proof or rotating daemon-session credential |
 | `INTENDANT_CONNECT_INVITE_REQUIRED` | `--invite-required` | `false` | Require a valid invite code for new account registration |
-| `INTENDANT_CONNECT_OPEN_REGISTRATION` | `--open-registration` | `false` | Let daemons register and poll without the bearer token; claim-time account authorization remains enforced |
+| `INTENDANT_CONNECT_OPEN_REGISTRATION` | `--open-registration` | `false` | Skip only the shared deployment bearer on registration. Daemons still sign a fresh key-possession proof, and successful registration rotates a short-lived daemon-session credential required by poll/answer/error/dry/claim-proof endpoints |
 
 The service also accepts environment-only operational overrides for
 self-hosting and tests:
@@ -498,9 +519,9 @@ self-hosting and tests:
 |-----|---------|-------------|
 | `INTENDANT_CONNECT_DOH_URL` | `https://cloudflare-dns.com/dns-query` | DNS-over-HTTPS endpoint used for `_intendant.<domain>` TXT attestation |
 | `INTENDANT_CONNECT_GIST_BASE` | `https://gist.githubusercontent.com/` | Allowed raw gist URL prefix for GitHub handle attestation |
-| `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS` | `180000` | Claimed daemon polling gap that counts as offline for presence alerts |
+| `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS` | `180000` | Linked daemon polling gap that counts as offline for presence alerts |
 | `INTENDANT_CONNECT_PRESENCE_POLL_MS` | `30000` | Presence-alert monitor poll interval |
-| `INTENDANT_CONNECT_RECLAIM_AFTER_MS` | `0` (off) | Dormant-handle reclamation threshold for accounts with no claimed daemons and no recent sign-in |
+| `INTENDANT_CONNECT_RECLAIM_AFTER_MS` | `0` (off) | Dormant-handle reclamation threshold for accounts with no linked daemon routes and no recent sign-in |
 | `INTENDANT_CONNECT_RECLAIM_POLL_MS` | `21600000` | Dormant-handle reclamation poll interval |
 
 For local E2E without editing `intendant.toml`, the daemon also accepts
@@ -527,18 +548,19 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
   node scripts/validate-connect-rendezvous.cjs
 ```
 
-The emulator intentionally has no account signup, passkey ceremony, claim
-phrase, durable device registry, or authorization policy of its own. The
-validator seeds a temporary daemon-local IAM grant for the emulator's fixed test
-Connect account, then proves the browser-public-origin -> rendezvous ->
-daemon-outbound-signaling -> direct WebRTC DataChannel path while keeping the
-normal dashboard mTLS default in place. The hosted MVP validator covers the real
-account/passkey flow, claim proof, local grant binding, revoke, and audit.
+The emulator intentionally has no account signup, passkey ceremony, claim code,
+durable device registry, or authorization policy of its own. Its hosted-origin
+pass is now negative-only: it injects legacy control events and expects the
+daemon to refuse them before mutation. Direct/local validators cover
+authenticated dashboard-control transport separately. The hosted MVP validator
+covers account/passkey flow, authority-free route linking, service-side `403`
+with no enqueue, release, and audit.
 
 The transport validator drives the fresh-box ceremony end to end — passkey
-signup, daemon-minted first-owner bootstrap phrase, hosted `/app` dashboard —
-and asserts the control DataChannel actually opens, including over the
-ICE-TCP path a NAT'd cloud daemon depends on (see
+signup, fragment-only one-time discovery link, retired `/app` redirect, and
+service/daemon refusal — and asserts that even a local browser-key grant cannot
+create a hosted control session. Lower-level direct/local harnesses cover the ICE/DataChannel paths
+(see
 [Self-Hosted Rendezvous → End-to-end transport validation](./self-hosted-rendezvous.md#end-to-end-transport-validation)):
 
 ```bash
@@ -559,12 +581,14 @@ deployments only ever touch `[server.tls]`.
 
 `[server.tls]` — native TLS-only HTTPS/WSS for the dashboard (pure-Rust
 `rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard
-defaults to mTLS; enable this section when you intentionally want HTTPS/WSS
-without browser client-certificate authentication:
+defaults to mTLS. This section supplies HTTPS/WSS and a browser secure context,
+but it does not give a certless remote browser daemon authority: only loopback
+certless requests receive the local-root posture, and protected remote
+HTTP/WebSocket/control requests still require mTLS:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Serve the dashboard over HTTPS/WSS without requiring browser client certificates |
+| `enabled` | bool | `false` | Enable HTTPS/WSS; certless access is local-root only on loopback, while remote protected routes still require mTLS |
 | `cert` | string | installed access certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
@@ -583,19 +607,27 @@ certificate.
 | `enabled` | bool | `false` | Explicitly require browser/client certificates during the TLS handshake; default behavior already does this unless `--tls` / `[server.tls]` or `--no-tls` is used |
 | `ca` | string | installed access CA | PEM CA bundle used to verify client certificates |
 
-Use `[server.tls]` only when the dashboard should be HTTPS/WSS without client
-certificate access control. Default mTLS and `[server.mtls]` require a valid
-client identity.
+Use `[server.tls]` for a secure context on loopback or for public/bootstrap
+content, not as a remote authentication bypass. Use default mTLS or
+`[server.mtls]` for a remote dashboard with daemon authority.
 
-Use default mTLS, `[server.tls]`, `--tls`, the macOS app wrapper, or another
-trusted HTTPS reverse proxy when a remote browser needs secure-context-gated
-features: Station WebGPU, microphone/camera, browser screen capture, or stricter
-clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs, and
+Use default mTLS, `[server.tls]`, or `--tls` when a remote browser needs
+secure-context-gated features: Station WebGPU,
+microphone/camera, browser screen capture, or stricter clipboard APIs. An HTTPS
+reverse proxy can provide a secure context for public bytes, but ordinary TLS
+termination does **not** authenticate a controller. A proxy that forwards to
+daemon loopback becomes a root trust boundary: remote control is safe only when
+the proxy enforces an approved client identity and its upstream is protected
+from other local callers. A local development build of the packaged macOS app
+also supplies a secure context for its bundled daemon, but the current unsigned
+artifact is not a distribution anchor. Plain `http://<host-ip>` is not enough for those APIs, and
 `--no-tls` on a wildcard listener refuses startup when the host has a public
 interface unless `--allow-public-plaintext` is passed. The macOS
 app wrapper starts its bundled backend with native mTLS by default and fails
 closed with setup guidance when access certs are missing; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
+Neither `--tls` nor `--allow-public-plaintext` synthesizes `TrustedLocal` for a
+remote caller. A custom `Origin` is routing metadata, not authentication.
 
 Peer access requests use the unauthenticated
 `/api/peer-pairing/requests` doorbell endpoint so one daemon can ask another for
@@ -654,9 +686,10 @@ or Connect user access by themselves. Peer profiles use names such as
 
 In the Access UI and `/api/access/overview`, a `[[peer]]` entry appears as a
 peer-daemon principal with a peer-profile grant to a daemon target. Browser mTLS
-and hosted/passkey dashboard access are user/client grants instead. The same
-page shows both kinds of access, but the config entry only persists the peer
-route and its daemon-to-daemon credentials. Peer profiles are not human IAM:
+access is a user/client grant instead; browser-key rows are record-only in this
+alpha, and a Connect passkey authenticates only the hosted account and route UI.
+The same page shows both kinds of records, but the config entry only persists the
+peer route and its daemon-to-daemon credentials. Peer profiles are not human IAM:
 `peer-root` maps to peer inspection/management and access inspection, while
 human/account access management remains owner/root user-client authority.
 
@@ -667,82 +700,96 @@ normally `~/.intendant/access-certs/iam.json` on Unix-like platforms. It is not
 part of `intendant.toml` because it belongs to the local daemon identity and may
 later contain per-device/user audit metadata rather than project configuration.
 
-Schema version 1 contains:
+Schema version 2 contains:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | State schema version; currently `1` |
+| `schema_version` | State schema version; currently `2` |
 | `principals` | Local managed human/device principal records |
 | `roles` | Built-in or local role templates |
 | `grants` | Local IAM grant records targeting daemon IDs (optional `expires_at_unix_ms` stops enforcement after that instant; shown as `expired`) |
 | `audit_events` | Local IAM audit metadata |
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
-| `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (phase 6; see [Trust Architecture](./trust-architecture.md)) |
+| `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (implemented; see [Trust Architecture](./trust-architecture.md)) |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
 sessions, peer daemon profiles, and active scoped user/client grants pass
-through the IAM operation evaluator. The daemon can currently bind scoped
-user/client grants to browser identity keys (`client_key`, the WebCrypto key
-each browser signs into its dashboard-control offers; see
-[Trust Architecture](./trust-architecture.md)), browser mTLS certificate
-fingerprints, hosted Connect account metadata, or a combined `human_user`
-principal that carries any of those bindings plus optional account/provider
-and organization metadata. Matching active records are enforced by role.
-Unbound owner browser mTLS dashboard sessions keep the existing
+through the IAM operation evaluator. Shipped alpha browser authentication is
+loopback/local presence or a browser mTLS certificate presented over an
+independently verified direct daemon route.
+`client_key` WebCrypto records remain in the schema for fleet signatures,
+attribution, migration, and future identity work, but direct `/ws`, direct
+dashboard-control offers, and the reserved future native-bridge code do not
+authenticate them. A
+combined `human_user` principal may carry those records plus optional
+account/provider and organization metadata. `connect_account` records are
+also inert compatibility/audit metadata and never authenticate.
+Loopback sessions and the verified owner browser mTLS certificate keep the
 root-compatible fallback so direct/self-hosted access remains first-class.
-Connect dashboard sessions do not have an implicit root fallback: the routed
-identity — a verified client key first, else the Connect account — must match
-local IAM, and a record in `draft` or `revoked` status denies instead of
-falling back to root. Root users can create these records through the Access
-UI, `POST /api/access/iam/user-client-grants`, or dashboard-control
+Certless remote TLS/plaintext requests do not. Connect has no dashboard-session
+path at all: the service rejects browser signaling and the daemon drops legacy
+events before key/grant resolution. A key record in `draft` or `revoked`
+status denies instead of falling back to anything else. Root users can create
+these records through the Access UI,
+`POST /api/access/iam/user-client-grants`, or dashboard-control
 `api_access_iam_upsert_user_client_grant`; existing records can be activated,
 drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`
 or dashboard-control `api_access_iam_update_grant`.
 
 The user-client grant upsert request accepts `kind = "client_key"`,
-`"browser_certificate"`, `"connect_account"`, or `"human_user"`. `human_user`
-is the local IAM shape for a real person who may authenticate through a
-browser key or mTLS now and through a hosted account later. `client_key`
-grants take `client_key_fingerprint` (base64url, case-sensitive), an optional
-`client_key` public key for audit, and an optional `client_key_origin`
-recorded by the trusted session that creates the grant. The optional
-`account_provider`, `verified_provider`, `handle`, `organization_id`, and
+`"browser_certificate"`, `"human_user"`, `"agent_session"`, or
+`"local_process"`. `human_user` is the local IAM shape for a real person. In the
+alpha only its mTLS binding is an active browser authenticator; a browser-key
+binding is record-only. `connect_account` remains readable in the IAM vocabulary
+for compatibility and audit, but grant upsert rejects it without mutating IAM
+state: Connect account links are metadata only and cannot receive a role.
+`client_key` grant records take `client_key_fingerprint` (base64url, case-sensitive),
+an optional `client_key` public key for audit, and an optional
+`client_key_origin` recorded by the trusted session that creates the grant. The
+optional `account_provider`, `verified_provider`, `handle`, `organization_id`, and
 `organization_name` fields are local metadata today; the hosted Connect
 service does not yet verify OAuth providers or organization membership.
 
-**Role ceilings.** `role_ceilings` maps an authenticating binding kind to a
-ceiling role, and defaults to
+**Hosted-provenance compatibility state.** `role_ceilings` retains the two
+historical binding categories and serializes as
 
 ```json
-{ "connect_account": "role:operator", "client_key": "role:operator" }
+{ "connect_account": "role:none", "client_key": "role:none" }
 ```
 
-A session authenticated by a capped binding never exceeds the ceiling role's
-permissions in that session, no matter what its grant says — the grant record
-itself is untouched. `connect_account` sessions are always subject to their
-ceiling; `client_key` sessions only when the key's recorded enrollment origin
-is listed in `hosted_origins` (default `["https://connect.intendant.dev"]`) —
-keys enrolled from any other origin are uncapped by default. Uncapped is a
-routing statement, not a blessing: a typed direct address is trustless first
-contact, while a fleet-certificate name is daemon-served *code* on a
-rendezvous-named *route* ([first-contact rung
-two](./trust-tiers.md#first-contact-three-rungs)); owners who want
-fleet-name sessions capped like hosted ones add the daemon's own fleet
-origin to `hosted_origins` (exact-origin match — the daemon's fleet URL,
-not the bare zone). This is the honest degraded-trust tier from the trust
-architecture: hosted-route sessions can operate but cannot administer.
-Owners who accept hosted-root risk can raise a ceiling or disable them all
-with an explicit empty map (`"role_ceilings": {}`).
+A hosted-origin key may have a grant record, but Connect cannot present or
+exercise it in the default build. Legacy events are rejected before grant
+resolution, and the compatibility map remains fail-closed. Client
+keys whose recorded enrollment origin is in `hosted_origins` (default
+`["https://connect.intendant.dev"]`) are also hosted, as is the retired
+`connect-bootstrap` origin. Every load normalizes both entries to `role:none`;
+missing, empty, or hand-edited entries cannot enable hosted control.
 
-The common moves have a one-knob UI: the **hosted-control cap** on
-Access → Overview's Trust tier card writes both hosted bindings at once
-(`role:operator` / `role:observer` / `role:none` — the last refuses
-hosted-origin control entirely; `POST /api/access/hosted-ceiling`).
-Per-binding divergence, raising above operator, and clearing the map
-remain deliberate `iam.json` edits. `role:none` is a zero-permission,
-ceiling-only builtin — it can never be granted to a principal.
+A typed direct address is trustless first contact, while a fleet-certificate
+name is daemon-served *code* on a
+rendezvous-named *route* ([first-contact rung
+two](./trust-tiers.md#first-contact-three-rungs)). Adding an exact origin to
+`hosted_origins` now refuses it at `role:none`; it is not a lower-authority
+control mode.
+
+The former hosted-control cap UI and mutation route are retired. `role:none` is
+a zero-permission, ceiling-only builtin — it can never be granted to a
+principal — and compiled policy is the authority for hosted provenance rather
+than the persisted map.
+
+IAM schema v2 migrates earlier alpha state fail-closed. It revokes every
+active grant on a principal whose client-key origin is `connect-bootstrap`,
+records a `revoke_legacy_connect_bootstrap` audit event, and restores both
+hosted ceilings to `role:none`. Direct root grants survive, and the Connect
+account/route link remains discovery metadata, but the legacy browser key
+requires trusted re-enrollment.
+
+During an alpha upgrade, restarting only the service cannot tear down an
+already-established legacy P2P DataChannel. Upgrade/restart the daemon, close
+old Connect tabs, and let the schema-v2 migration revoke legacy bootstrap
+grants. New mixed-version attempts are blocked at both service and daemon.
 
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,

@@ -968,8 +968,13 @@ function stationBuildControlsSummary() {
   const sessionCanSteer = externalLive
     ? externalLive.steer
     : (sessionId ? sessionSupportsSteer(sessionId) : true);
+  // External sessions: a live stop id alone only proves the window is
+  // ATTACHED — an idle attached backend kept `sessionCanInterrupt` true
+  // forever, which held the Station header's "Agent turn active"
+  // attention item long after DONE. Require an actually-active turn on
+  // both arms; the internal arm already did.
   const sessionCanInterrupt = externalLive
-    ? !!sessionStopId
+    ? (!!sessionStopId && (sessionActive || isAgentActivePhase(externalLive.phase)))
     : (sessionId
       ? sessionActive && sessionSupportsInterrupt(sessionId) && !sessionDetached
       : isAgentActivePhase(currentPhase));
@@ -2346,7 +2351,7 @@ let stripMinimized = false;
 let stripHeight = 280;
 
 // Recording replay
-const recordingStreams = new Map(); // stream_name -> {segments, totalDuration, manifest}
+const recordingStreams = new Map(); // stream_name -> {active} (writes live in 46; liveness registry only)
 let activeRecordingStream = null;
 let recPlayer = null;
 

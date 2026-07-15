@@ -4,7 +4,24 @@
 
 use super::*;
 
-pub(crate) fn media_http_response(id: String, status: u16, body: serde_json::Value) -> serde_json::Value {
+// The recording/frame asset content core — the RecordingAsset vocabulary,
+// its resolvers (including the live-registry resolution the legacy
+// /recordings* chain shares since S8), safety predicates, and range
+// readers — moved verbatim to web_gateway::session_catalog
+// (transport-unification S4b/S8): both lanes resolve assets through one
+// core; this module keeps the tunnel's ranged byte-stream carriage.
+pub(crate) use crate::web_gateway::{
+    read_frame_asset_file_range, read_recording_asset_bytes_range, read_recording_asset_file_range,
+    recording_asset_name_is_safe, recording_stream_name_is_safe,
+    resolve_live_recording_asset_in_daemon_dir, resolve_session_recording_asset,
+    session_frame_filename_is_safe, RecordingAsset,
+};
+
+pub(crate) fn media_http_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> serde_json::Value {
     http_body_response(id, status, body.to_string(), "dashboard media")
 }
 
@@ -28,7 +45,11 @@ pub(crate) fn media_error_task_response(
     }
 }
 
-pub(crate) fn media_task_response(id: String, status: u16, body: serde_json::Value) -> ControlTaskResponse {
+pub(crate) fn media_task_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> ControlTaskResponse {
     ControlTaskResponse {
         id: id.clone(),
         frame: media_http_response(id, status, body),
@@ -37,7 +58,9 @@ pub(crate) fn media_task_response(id: String, status: u16, body: serde_json::Val
     }
 }
 
-pub(crate) fn read_inbound_upload_bytes(upload: &mut InboundUploadState) -> Result<Vec<u8>, String> {
+pub(crate) fn read_inbound_upload_bytes(
+    upload: &mut InboundUploadState,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::with_capacity(upload.received_bytes);
     upload
         .tmp
@@ -69,35 +92,15 @@ pub(crate) async fn dashboard_media_session_handles(
     (session.frame_registry.clone(), session.query_ctx.clone())
 }
 
-pub(crate) async fn register_dashboard_media_frame(
-    registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
-    frame_id: &str,
-    stream: &str,
-    note: Option<String>,
-    bytes: &[u8],
-    log_label: &str,
-) -> (String, bool) {
-    let Some(registry) = registry else {
-        return (String::new(), false);
-    };
-    let meta = presence_core::FrameMeta {
-        frame_id: frame_id.to_string(),
-        stream: stream.to_string(),
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        sent_to_live: false,
-        live_resolution: None,
-        hq_resolution: None,
-        note,
-    };
-    let mut reg = registry.write().await;
-    match reg.register(meta, bytes) {
-        Ok(path) => (path.display().to_string(), true),
-        Err(e) => {
-            eprintln!("{log_label} frame registry write failed: {e}");
-            (String::new(), false)
-        }
-    }
-}
+// The media store core — frame registration, presence-video
+// register+record, annotation/clip context injection, and the clip
+// operation type — moved verbatim to web_gateway::media_store
+// (transport-unification S8): the /ws media twins commit through the
+// same fns; this module keeps the tunnel's upload-frame carriage and
+// response shapes.
+pub(crate) use crate::web_gateway::{
+    inject_annotation_context, inject_clip_context, register_dashboard_media_frame,
+};
 
 pub(crate) async fn api_presence_video_frame_upload_task_response(
     id: String,
@@ -132,6 +135,9 @@ pub(crate) async fn api_presence_video_frame_upload_task_response(
     )
 }
 
+/// Tunnel edge of the presence-video store op: read the registries off
+/// the shared session, then commit through the neutral store fn the
+/// `/ws` `video_frame` twin shares.
 pub(crate) async fn register_dashboard_presence_video_frame(
     runtime: &ControlRuntime,
     frame_id: &str,
@@ -142,124 +148,15 @@ pub(crate) async fn register_dashboard_presence_video_frame(
     let frame_registry = session.frame_registry.clone();
     let recording_registry = session.recording_registry.clone();
     drop(session);
-
-    let mut registered = false;
-    if let Some(registry) = frame_registry {
-        let meta = presence_core::FrameMeta {
-            frame_id: frame_id.to_string(),
-            stream: stream.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            sent_to_live: true,
-            live_resolution: Some("768x768".to_string()),
-            hq_resolution: None,
-            note: None,
-        };
-        let mut reg = registry.write().await;
-        match reg.register(meta, jpeg_bytes) {
-            Ok(_) => registered = true,
-            Err(e) => eprintln!("presence video frame registry write failed: {e}"),
-        }
-    }
-
-    let mut recorded = false;
-    if let Some(registry) = recording_registry {
-        let mut rec = registry.write().await;
-        if rec.is_enabled() {
-            if !rec.is_recording(stream) && crate::recording::is_ffmpeg_available() {
-                match rec.start_stream(stream).await {
-                    Ok(()) => {
-                        runtime.bus.send(AppEvent::RecordingStarted {
-                            stream_name: stream.to_string(),
-                        });
-                    }
-                    Err(e) => eprintln!("presence video recording start failed: {e}"),
-                }
-            }
-            if let Err(e) = rec.feed_frame(stream, jpeg_bytes).await {
-                eprintln!("presence video recording frame failed: {e}");
-            } else {
-                recorded = true;
-            }
-        }
-    }
-
-    (registered, recorded)
-}
-
-pub(crate) fn inject_annotation_context(
-    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
-    note: &str,
-    data_b64: String,
-) -> bool {
-    let Some(ctx) = query_ctx else {
-        return false;
-    };
-    let Some(ciq) = ctx.context_injection.as_ref() else {
-        return false;
-    };
-    let Ok(mut queue) = ciq.lock() else {
-        return false;
-    };
-    let label = if note.is_empty() {
-        "[User Annotation] User highlighted something on the screen.".to_string()
-    } else {
-        format!("[User Annotation] {note}")
-    };
-    queue.push(crate::event::ContextInjection {
-        text: label,
-        images: vec![crate::conversation::ImageData {
-            media_type: "image/jpeg".to_string(),
-            data: data_b64,
-        }],
-        source: crate::event::InjectionSource::User,
-        target_session_id: None,
-        steer_id: None,
-    });
-    true
-}
-
-pub(crate) fn inject_clip_context(
-    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
-    _clip_id: &str,
-    clip: &DashboardMediaClipOperation,
-) -> bool {
-    let Some(ctx) = query_ctx else {
-        return false;
-    };
-    let Some(ciq) = ctx.context_injection.as_ref() else {
-        return false;
-    };
-    let Ok(mut queue) = ciq.lock() else {
-        return false;
-    };
-    let frames_registered = clip.frames.len();
-    let label = if clip.note.is_empty() {
-        format!(
-            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps)",
-            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps,
-        )
-    } else {
-        format!(
-            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps). {}",
-            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps, clip.note,
-        )
-    };
-    let images = clip
-        .frames
-        .iter()
-        .map(|(_, data)| crate::conversation::ImageData {
-            media_type: "image/jpeg".to_string(),
-            data: data.clone(),
-        })
-        .collect();
-    queue.push(crate::event::ContextInjection {
-        text: label,
-        images,
-        source: crate::event::InjectionSource::User,
-        target_session_id: None,
-        steer_id: None,
-    });
-    true
+    crate::web_gateway::register_presence_video_frame(
+        frame_registry,
+        recording_registry,
+        &runtime.bus,
+        frame_id,
+        stream,
+        jpeg_bytes,
+    )
+    .await
 }
 
 pub(crate) async fn api_media_annotation_upload_task_response(
@@ -624,11 +521,31 @@ pub(crate) async fn api_media_clip_cancel_response(
     )
 }
 
-pub(crate) async fn api_recordings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+pub(crate) async fn api_recordings_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    // Transport edge: resolve the real daemon recordings dir once; the
+    // parity fixture drives the `_in_daemon_dir` variant with an
+    // injected tempdir.
+    api_recordings_response_in_daemon_dir(id, runtime, &crate::debug::daemon_recordings_dir()).await
+}
+
+pub(crate) async fn api_recordings_response_in_daemon_dir(
+    id: String,
+    runtime: &ControlRuntime,
+    daemon_dir: &std::path::Path,
+) -> serde_json::Value {
     let recording_registry = active_recording_registry(runtime).await;
-    json_body_response(
+    // Body-only framing (this method predates the injected-status
+    // envelope); the neutral fn always answers 200 with the listing.
+    frame_api_json_body_response(
         id,
-        crate::web_gateway::recordings_list_response_body(recording_registry).await,
+        crate::web_gateway::recordings_list_api_response_in_daemon_dir(
+            recording_registry,
+            daemon_dir,
+        )
+        .await,
         "recordings",
     )
 }
@@ -637,14 +554,21 @@ pub(crate) async fn api_session_recordings_response(
     id: String,
     params: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    // Transport edge: resolve the real home once; the parity fixtures
+    // drive the `_from_home` variant with an injected temp home.
+    api_session_recordings_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_recordings_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
-    let (status_line, body) =
-        crate::web_gateway::session_recordings_list_response_body(&session_id);
-    http_body_response(
+    frame_api_response(
         id,
-        status_line_code(status_line),
-        body,
+        crate::web_gateway::session_recordings_api_response(home, &session_id),
         "session recordings",
     )
 }
@@ -653,6 +577,24 @@ pub(crate) async fn api_recording_asset_task_response(
     id: String,
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
+) -> ControlTaskResponse {
+    // Transport edge: resolve the real daemon recordings dir once; the
+    // parity fixture drives the `_in_daemon_dir` variant with an
+    // injected tempdir.
+    api_recording_asset_task_response_in_daemon_dir(
+        id,
+        params,
+        runtime,
+        &crate::debug::daemon_recordings_dir(),
+    )
+    .await
+}
+
+pub(crate) async fn api_recording_asset_task_response_in_daemon_dir(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+    daemon_dir: &std::path::Path,
 ) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let (stream_name, asset, offset, length) = match recording_asset_request_params(&params) {
@@ -668,13 +610,26 @@ pub(crate) async fn api_recording_asset_task_response(
             serde_json::json!({ "ok": false, "error": "recording registry unavailable" }),
         );
     };
-    let resolved = resolve_live_recording_asset(registry, &stream_name, &asset).await;
+    let resolved =
+        resolve_live_recording_asset_in_daemon_dir(registry, daemon_dir, &stream_name, &asset)
+            .await;
     recording_asset_task_response(id, stream_name, asset, offset, length, resolved).await
 }
 
 pub(crate) async fn api_session_recording_asset_task_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the parity fixture
+    // drives the `_from_home` variant with an injected temp home.
+    api_session_recording_asset_task_response_from_home(id, params, &crate::platform::home_dir())
+        .await
+}
+
+pub(crate) async fn api_session_recording_asset_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
 ) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
@@ -691,14 +646,17 @@ pub(crate) async fn api_session_recording_asset_task_response(
             return recording_asset_error_task_response(id, status, error);
         }
     };
-    let session_dir = crate::web_gateway::resolve_session_dir(&session_id);
+    let session_dir = crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id);
     let resolved = resolve_session_recording_asset(session_dir, &stream_name, &asset);
     recording_asset_task_response(id, stream_name, asset, offset, length, resolved).await
 }
 
+/// Parsed recording-asset request: `(stream_name, asset, offset, length)`.
+type RecordingAssetParams = (String, String, u64, Option<u64>);
+
 pub(crate) fn recording_asset_request_params(
     params: &serde_json::Value,
-) -> Result<(String, String, u64, Option<u64>), (u16, serde_json::Value)> {
+) -> Result<RecordingAssetParams, (u16, serde_json::Value)> {
     let Some(stream_name) = optional_string_param(params, &["stream_name", "streamName", "stream"])
     else {
         return Err((
@@ -730,145 +688,6 @@ pub(crate) fn recording_asset_request_params(
     let length = optional_u64_param(params, &["length", "limit"])
         .map_err(|error| (400, serde_json::json!({ "ok": false, "error": error })))?;
     Ok((stream_name, asset, offset, length))
-}
-
-pub(crate) fn recording_stream_name_is_safe(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() < 128
-        && name.trim() == name
-        && name != "."
-        && name != ".."
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-}
-
-pub(crate) fn recording_asset_name_is_safe(asset: &str) -> bool {
-    asset == "segments" || asset == "playlist.m3u8" || (recording_segment_filename_is_safe(asset))
-}
-
-pub(crate) fn recording_segment_filename_is_safe(filename: &str) -> bool {
-    filename.starts_with("seg_")
-        && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-        && filename.len() < 30
-        && !filename.contains("..")
-        && !filename.contains('/')
-        && !filename.contains('\\')
-}
-
-pub(crate) enum RecordingAsset {
-    Bytes {
-        bytes: Vec<u8>,
-        content_type: &'static str,
-        filename: String,
-    },
-    File {
-        path: PathBuf,
-        content_type: &'static str,
-        filename: String,
-    },
-}
-
-pub(crate) async fn resolve_live_recording_asset(
-    registry: Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
-    stream_name: &str,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    let (session_dir, mut segments) = {
-        let reg = registry.read().await;
-        (reg.session_dir().to_path_buf(), reg.segments(stream_name))
-    };
-    if segments.is_empty() {
-        let stream_dir = crate::debug::daemon_recordings_dir().join(stream_name);
-        segments =
-            crate::recording::parse_segment_csv_pub(&stream_dir.join("segments.csv"), &stream_dir);
-    }
-    resolve_recording_asset_from_dir_pair(
-        Some(session_dir.join("recordings").join(stream_name)),
-        Some(crate::debug::daemon_recordings_dir().join(stream_name)),
-        segments,
-        asset,
-    )
-}
-
-pub(crate) fn resolve_session_recording_asset(
-    session_dir: Option<PathBuf>,
-    stream_name: &str,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    let stream_dir = session_dir
-        .as_ref()
-        .map(|dir| dir.join("recordings").join(stream_name));
-    let segments = stream_dir
-        .as_ref()
-        .map(|dir| crate::recording::parse_segment_csv_pub(&dir.join("segments.csv"), dir))
-        .unwrap_or_default();
-    resolve_recording_asset_from_dir_pair(stream_dir, None, segments, asset)
-}
-
-pub(crate) fn resolve_recording_asset_from_dir_pair(
-    primary_dir: Option<PathBuf>,
-    fallback_dir: Option<PathBuf>,
-    segments: Vec<crate::recording::SegmentInfo>,
-    asset: &str,
-) -> Result<RecordingAsset, (u16, serde_json::Value)> {
-    if asset == "segments" {
-        let seg_json: Vec<serde_json::Value> = segments
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "filename": s.filename,
-                    "start_secs": s.start_secs,
-                    "end_secs": s.end_secs,
-                })
-            })
-            .collect();
-        let bytes = serde_json::to_vec(&seg_json).unwrap_or_else(|_| b"[]".to_vec());
-        return Ok(RecordingAsset::Bytes {
-            bytes,
-            content_type: "application/json",
-            filename: "segments.json".to_string(),
-        });
-    }
-    if asset == "playlist.m3u8" {
-        return Ok(RecordingAsset::Bytes {
-            bytes: crate::web_gateway::recording_playlist_m3u8(&segments).into_bytes(),
-            content_type: "application/vnd.apple.mpegurl",
-            filename: "playlist.m3u8".to_string(),
-        });
-    }
-    if !recording_segment_filename_is_safe(asset) {
-        return Err((
-            400,
-            serde_json::json!({ "ok": false, "error": "invalid recording asset" }),
-        ));
-    }
-    let path = primary_dir
-        .as_ref()
-        .map(|dir| dir.join(asset))
-        .filter(|path| path.exists())
-        .or_else(|| {
-            fallback_dir
-                .as_ref()
-                .map(|dir| dir.join(asset))
-                .filter(|path| path.exists())
-        });
-    let Some(path) = path else {
-        return Err((
-            404,
-            serde_json::json!({ "ok": false, "error": "recording asset not found" }),
-        ));
-    };
-    let content_type = if asset.ends_with(".ts") {
-        "video/mp2t"
-    } else {
-        "video/mp4"
-    };
-    Ok(RecordingAsset::File {
-        path,
-        content_type,
-        filename: asset.to_string(),
-    })
 }
 
 pub(crate) async fn recording_asset_task_response(
@@ -954,96 +773,6 @@ pub(crate) async fn recording_asset_task_response(
     }
 }
 
-pub(crate) fn read_recording_asset_bytes_range(
-    bytes: Vec<u8>,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let total_size = bytes.len() as u64;
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let start = usize::try_from(start).map_err(|_| {
-        (
-            413,
-            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-        )
-    })?;
-    Ok((bytes[start..start + transfer_len].to_vec(), total_size, end))
-}
-
-pub(crate) fn read_recording_asset_file_range(
-    path: &std::path::Path,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("stat recording asset: {e}") }),
-        )
-    })?;
-    let total_size = metadata.len();
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("open recording asset: {e}") }),
-        )
-    })?;
-    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("seek recording asset: {e}") }),
-        )
-    })?;
-    let mut bytes = vec![0u8; transfer_len];
-    file.read_exact(&mut bytes).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("read recording asset: {e}") }),
-        )
-    })?;
-    Ok((bytes, total_size, end))
-}
-
-pub(crate) fn recording_asset_range(
-    total_size: u64,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
-    if offset > total_size {
-        return Err((
-            416,
-            serde_json::json!({
-                "ok": false,
-                "error": "range start beyond recording asset size",
-                "total_size": total_size,
-            }),
-        ));
-    }
-    let available = total_size.saturating_sub(offset);
-    let requested = length.unwrap_or(available).min(available);
-    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
-        return Err((
-            413,
-            serde_json::json!({
-                "ok": false,
-                "error": format!(
-                    "range too large: {} bytes (cap is {})",
-                    requested,
-                    crate::web_gateway::UPLOAD_MAX_BYTES
-                ),
-            }),
-        ));
-    }
-    let transfer_len = usize::try_from(requested).map_err(|_| {
-        (
-            413,
-            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
-        )
-    })?;
-    Ok((offset, transfer_len, offset.saturating_add(requested)))
-}
-
 pub(crate) fn recording_asset_error_task_response(
     id: String,
     status: u16,
@@ -1060,6 +789,16 @@ pub(crate) fn recording_asset_error_task_response(
 pub(crate) async fn api_session_frame_asset_task_response(
     id: String,
     params: Option<&serde_json::Value>,
+) -> ControlTaskResponse {
+    // Transport edge: resolve the real home once; the RPC fixture drives
+    // the `_from_home` variant with an injected temp home.
+    api_session_frame_asset_task_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_frame_asset_task_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
 ) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
@@ -1106,7 +845,9 @@ pub(crate) async fn api_session_frame_asset_task_response(
         }
     };
 
-    let Some(session_dir) = crate::web_gateway::resolve_session_dir(&session_id) else {
+    let Some(session_dir) =
+        crate::web_gateway::resolve_bare_session_dir_from_home(home, &session_id)
+    else {
         return session_frame_asset_error_task_response(
             id,
             404,
@@ -1175,51 +916,6 @@ pub(crate) async fn api_session_frame_asset_task_response(
     }
 }
 
-pub(crate) fn session_frame_filename_is_safe(filename: &str) -> bool {
-    (filename.ends_with(".jpg") || filename.ends_with(".png"))
-        && filename.len() < 80
-        && !filename.is_empty()
-        && filename.trim() == filename
-        && !filename.contains("..")
-        && !filename.contains('/')
-        && !filename.contains('\\')
-}
-
-pub(crate) fn read_frame_asset_file_range(
-    path: &std::path::Path,
-    offset: u64,
-    length: Option<u64>,
-) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("stat session frame: {e}") }),
-        )
-    })?;
-    let total_size = metadata.len();
-    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("open session frame: {e}") }),
-        )
-    })?;
-    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("seek session frame: {e}") }),
-        )
-    })?;
-    let mut bytes = vec![0u8; transfer_len];
-    file.read_exact(&mut bytes).map_err(|e| {
-        (
-            500,
-            serde_json::json!({ "ok": false, "error": format!("read session frame: {e}") }),
-        )
-    })?;
-    Ok((bytes, total_size, end))
-}
-
 pub(crate) fn session_frame_asset_error_task_response(
     id: String,
     status: u16,
@@ -1236,6 +932,261 @@ pub(crate) fn session_frame_asset_error_task_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recordings fixture under an injected tempdir home's
+    /// `.intendant/logs` store (both parity lanes take the same temp
+    /// home, so the fixture never touches the machine's real
+    /// `~/.intendant`; a fixed id is fine — each test owns its store).
+    fn parity_recordings_fixture(prefix: &str) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        let home = tempfile::tempdir().expect("temp home");
+        let session_id = prefix.to_string();
+        let log_dir = crate::platform::intendant_home_in(home.path())
+            .join("logs")
+            .join(&session_id);
+        let stream_dir = log_dir.join("recordings").join("screen");
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        std::fs::write(stream_dir.join("seg_00001.mp4"), b"parity segment bytes").unwrap();
+        std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        (home, session_id, log_dir)
+    }
+
+    fn parity_http_json_body(
+        response: crate::web_gateway::ApiResponse,
+    ) -> (u16, serde_json::Value) {
+        let bytes = crate::web_gateway::api_response_http_bytes(
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        );
+        let split = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("header/body split");
+        let head = String::from_utf8(bytes[..split].to_vec()).expect("ascii head");
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status line");
+        (
+            status,
+            serde_json::from_slice(&bytes[split + 4..]).expect("json body"),
+        )
+    }
+
+    // ── S4b parity: recordings list + the listing-asset vocabulary ──
+
+    #[tokio::test]
+    async fn parity_session_recordings_list_shares_bodies_with_status_metadata() {
+        let (home, session_id, _log_dir) = parity_recordings_fixture("parity-rec-list");
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(home.path(), &session_id),
+        );
+        assert_eq!(status, 200);
+        let frame = api_session_recordings_response_from_home(
+            "parity-rec-list".to_string(),
+            Some(&serde_json::json!({ "session_id": session_id })),
+            home.path(),
+        )
+        .await;
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // The list body is a json ARRAY: the injected-status envelope
+        // only decorates objects, so the array passes through untouched.
+        assert!(frame["result"].is_array(), "{frame}");
+        assert_eq!(frame["result"], http_body);
+
+        // Invalid id: an object body — the injection appears and matches
+        // the HTTP status. (Bare-id check before any store access; the
+        // tunnel lane exercises the full public adapter.)
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::session_recordings_api_response(home.path(), ".."),
+        );
+        assert_eq!(status, 400);
+        let frame = api_session_recordings_response(
+            "parity-rec-list-invalid".to_string(),
+            Some(&serde_json::json!({ "session_id": ".." })),
+        )
+        .await;
+        let mut result = frame["result"].clone();
+        let map = result.as_object_mut().expect("result object");
+        assert_eq!(map.remove("_httpStatus"), Some(serde_json::json!(400)));
+        assert_eq!(map.remove("_httpOk"), Some(serde_json::json!(false)));
+        assert_eq!(result, http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_recording_listing_assets_share_bytes_on_both_transports() {
+        let (home, session_id, _log_dir) = parity_recordings_fixture("parity-rec-assets");
+        for asset in ["segments", "playlist.m3u8"] {
+            // HTTP: the shared resolver under the canonical tail.
+            let response = crate::web_gateway::session_recording_listing_asset_api_response(
+                home.path(),
+                &session_id,
+                "screen",
+                asset,
+            );
+            let (http_bytes, http_ct) = match response {
+                crate::web_gateway::ApiResponse::Bytes {
+                    bytes: crate::web_gateway::BytesPayload::InMemory(payload),
+                    content_type,
+                    ..
+                } => (payload, content_type),
+                _ => panic!("listing asset must ride the bytes lane"),
+            };
+            // Tunnel: the same asset vocabulary through the ranged
+            // byte-stream carriage (offset 0, unbounded).
+            let task = api_session_recording_asset_task_response_from_home(
+                format!("parity-asset-{asset}"),
+                Some(&serde_json::json!({
+                    "session_id": session_id,
+                    "stream_name": "screen",
+                    "asset": asset,
+                })),
+                home.path(),
+            )
+            .await;
+            let stream = task.byte_stream.expect("tunnel byte stream");
+            assert_eq!(stream.bytes, http_bytes, "{asset}");
+            assert_eq!(stream.content_type, http_ct, "{asset}");
+            assert_eq!(stream.result["ok"], true);
+            assert_eq!(stream.result["total_size"], http_bytes.len());
+        }
+    }
+
+    // ── S8 parity: the LIVE (daemon-scoped) recordings lanes — the
+    // legacy /recordings* chain shapes and the tunnel residue resolve
+    // through one core over the same injected dirs (no ambient
+    // daemon_recordings_dir read on either lane).
+
+    /// A registry over a temp session dir holding one recorded stream
+    /// ("screen"), plus an injected daemon recordings dir holding
+    /// another ("daemon0") — segments csv + playable bytes each.
+    fn parity_live_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>,
+    ) {
+        let session_dir = tempfile::tempdir().expect("temp session dir");
+        let daemon_dir = tempfile::tempdir().expect("temp daemon dir");
+        for (root, stream, bytes) in [
+            (
+                session_dir.path().join("recordings"),
+                "screen",
+                &b"live session segment bytes"[..],
+            ),
+            (
+                daemon_dir.path().to_path_buf(),
+                "daemon0",
+                &b"daemon-scoped segment bytes"[..],
+            ),
+        ] {
+            let stream_dir = root.join(stream);
+            std::fs::create_dir_all(&stream_dir).unwrap();
+            std::fs::write(stream_dir.join("seg_00001.mp4"), bytes).unwrap();
+            std::fs::write(stream_dir.join("segments.csv"), "seg_00001.mp4,0.0,2.0\n").unwrap();
+        }
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::recording::RecordingRegistry::new(
+                session_dir.path(),
+                crate::project::RecordingConfig::default(),
+            ),
+        ));
+        (session_dir, daemon_dir, registry)
+    }
+
+    #[tokio::test]
+    async fn parity_live_recordings_list_shares_bodies_across_lanes() {
+        let (_session_dir, daemon_dir, registry) = parity_live_fixture();
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.recording_registry = Some(registry.clone());
+        }
+
+        let (status, http_body) = parity_http_json_body(
+            crate::web_gateway::recordings_list_api_response_in_daemon_dir(
+                Some(registry),
+                daemon_dir.path(),
+            )
+            .await,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            http_body.as_array().map(|entries| entries.len()),
+            Some(2),
+            "{http_body}"
+        );
+
+        let frame = api_recordings_response_in_daemon_dir(
+            "parity-live-list".to_string(),
+            &rt,
+            daemon_dir.path(),
+        )
+        .await;
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        // Body-only framing over a json ARRAY — no status injection.
+        assert_eq!(frame["result"], http_body);
+    }
+
+    #[tokio::test]
+    async fn parity_live_recording_assets_share_bytes_across_lanes() {
+        let (_session_dir, daemon_dir, registry) = parity_live_fixture();
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.recording_registry = Some(registry.clone());
+        }
+
+        // "screen" resolves through the registry's session dir; "daemon0"
+        // exercises the daemon-dir csv fallback — on both lanes.
+        for stream_name in ["screen", "daemon0"] {
+            for asset in ["segments", "playlist.m3u8", "seg_00001.mp4"] {
+                let response = crate::web_gateway::live_recordings_path_api_response(
+                    Some(registry.clone()),
+                    daemon_dir.path(),
+                    &format!("{stream_name}/{asset}"),
+                )
+                .await;
+                let (http_bytes, http_ct) = match response {
+                    crate::web_gateway::ApiResponse::Bytes {
+                        status: 200,
+                        bytes: crate::web_gateway::BytesPayload::InMemory(payload),
+                        content_type,
+                        ..
+                    } => (payload, content_type),
+                    other => panic!(
+                        "{stream_name}/{asset} must ride the bytes lane 200: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                };
+
+                let task = api_recording_asset_task_response_in_daemon_dir(
+                    format!("parity-live-{stream_name}-{asset}"),
+                    Some(&serde_json::json!({
+                        "stream_name": stream_name,
+                        "asset": asset,
+                    })),
+                    &rt,
+                    daemon_dir.path(),
+                )
+                .await;
+                let stream = task.byte_stream.expect("tunnel byte stream");
+                assert_eq!(stream.bytes, http_bytes, "{stream_name}/{asset}");
+                assert_eq!(stream.content_type, http_ct, "{stream_name}/{asset}");
+                assert_eq!(stream.result["ok"], true, "{stream_name}/{asset}");
+                assert_eq!(
+                    stream.result["total_size"],
+                    http_bytes.len(),
+                    "{stream_name}/{asset}"
+                );
+            }
+        }
+    }
+
     use crate::dashboard_control::tests::{runtime, test_upload_state};
 
     #[tokio::test]
@@ -1346,7 +1297,11 @@ mod tests {
     async fn recording_rpcs_preserve_shapes_and_status() {
         let rt = runtime();
 
-        let recordings = api_recordings_response("rec1".to_string(), &rt).await;
+        // Injected daemon dir (hermetic — the ambient variant would scan
+        // the machine's real ~/.intendant/recordings).
+        let daemon_dir = tempfile::tempdir().unwrap();
+        let recordings =
+            api_recordings_response_in_daemon_dir("rec1".to_string(), &rt, daemon_dir.path()).await;
         assert_eq!(recordings["t"], "response");
         assert_eq!(recordings["ok"], true);
         assert!(recordings["result"].as_array().is_some());
@@ -1504,35 +1459,30 @@ mod tests {
 
     #[tokio::test]
     async fn session_frame_asset_rpc_streams_validated_frame_ranges() {
-        let session_id = format!(
-            "dashboard-frame-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        // The RPC resolves sessions from the process state root
-        // (`platform::intendant_home()` — a per-process scratch in
-        // unit-test builds, so this never touches the live ~/.intendant).
-        let session_dir = crate::platform::intendant_home()
+        // The RPC resolves sessions from an injected temp home's
+        // `.intendant/logs` store (the `_from_home` variant; the public
+        // adapter resolves the real home at the transport edge).
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "dashboard-frame-test";
+        let session_dir = crate::platform::intendant_home_in(home.path())
             .join("logs")
-            .join(&session_id);
+            .join(session_id);
         let frames_dir = session_dir.join("frames");
         std::fs::create_dir_all(&frames_dir).unwrap();
         let frame_bytes = b"dashboard frame bytes";
         std::fs::write(frames_dir.join("ann-test.png"), frame_bytes).unwrap();
 
-        let response = api_session_frame_asset_task_response(
+        let response = api_session_frame_asset_task_response_from_home(
             "frame-asset1".to_string(),
             Some(&serde_json::json!({
-                "session_id": &session_id,
+                "session_id": session_id,
                 "filename": "ann-test.png",
                 "offset": 10,
                 "length": 5,
             })),
+            home.path(),
         )
         .await;
-        let _ = std::fs::remove_dir_all(&session_dir);
 
         assert!(response.done);
         assert!(response.byte_stream.is_some());

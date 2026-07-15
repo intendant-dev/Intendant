@@ -14,12 +14,32 @@
 ///
 /// Deliberately not carried yet: the acting [`RequestAuthority`] (the
 /// pre-dispatch gates stay the enforcement point until a converted
-/// family consumes actor identity in-handler) and the raw-body spool
-/// for `Streaming` routes (the S8 upload lane).
+/// family consumes actor identity in-handler). The `Streaming`-lane
+/// raw-body spool flows as a [`SpooledBody`] argument to its neutral
+/// fns (the staged-upload commit) rather than a field here — each
+/// transport parses its own wire form (query pairs + Content-Type vs
+/// upload-frame params) at the edge; a `raw_body` field lands when the
+/// S9 transfer-chunk rows move body consumption into dispatch.
 pub(crate) struct ApiRequest {
     pub(crate) params: serde_json::Value,
     /// Byte-range request (fs read; transfer download from S9).
     pub(crate) range: Option<ByteRange>,
+}
+
+/// The `Streaming`-lane raw-body spool (design §2.1/§2.5): however the
+/// bytes arrived — HTTP spooling the socket
+/// ([`crate::web_gateway::stream_body_to_tempfile`]), the tunnel
+/// spooling `upload_start/chunk/end` frames (`InboundUploadState`) —
+/// both end in this one tempfile handle, which the neutral handler
+/// commits (atomic rename into the store). Today's consumer is the
+/// staged-upload commit; the S9 transfer-chunk rows reuse this lane
+/// for their offset-addressed appends.
+pub(crate) struct SpooledBody {
+    pub(crate) tmp: tempfile::NamedTempFile,
+    /// Spooled byte count, as counted by the transport's spooler (HTTP
+    /// asserts it equals `Content-Length`; the tunnel counts received
+    /// chunk bytes).
+    pub(crate) len: usize,
 }
 
 impl ApiRequest {
@@ -32,6 +52,63 @@ impl ApiRequest {
             .and_then(|value| value.as_str())
             .unwrap_or_default()
     }
+}
+
+// ── The lenient alias-param readers (moved verbatim from
+//    dashboard_control, which re-exports them): the tunnel's historical
+//    params vocabulary, now shared by every neutral fn that parses the
+//    canonical params shape. ──
+
+pub(crate) fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
+    for name in names {
+        if let Some(value) = params.get(*name) {
+            if let Some(text) = value.as_str() {
+                return text.trim().to_string();
+            }
+            if !value.is_null() {
+                return value.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+pub(crate) fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
+    let value = string_param(params, names);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+pub(crate) fn optional_u64_param(
+    params: &serde_json::Value,
+    names: &[&str],
+) -> Result<Option<u64>, String> {
+    for name in names {
+        let Some(value) = params.get(*name) else {
+            continue;
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        if let Some(number) = value.as_u64() {
+            return Ok(Some(number));
+        }
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            return text
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| format!("invalid {name}"));
+        }
+        return Err(format!("invalid {name}"));
+    }
+    Ok(None)
 }
 
 /// A byte-range request as it arrived on its transport. Satisfiability
@@ -73,6 +150,20 @@ pub(crate) enum BytesPayload {
     InMemory(Vec<u8>),
 }
 
+/// The Stream lane's one line source (design §2.5, S10): the neutral
+/// handler spawns the producer and hands both transports this handle —
+/// the HTTP adapter writes the received lines verbatim under the
+/// response head; the tunnel framer wraps each in a `stream_event`
+/// frame between `stream_start`/`stream_end`. Items are complete
+/// NDJSON lines (trailing `\n` included). `source` is the producer
+/// task: writers drop `lines` first (hanging up unblocks a producer
+/// still sending after an early exit), then await it, so a panicked
+/// source is observable as the lane's error tail.
+pub(crate) struct LineStream {
+    pub(crate) lines: tokio::sync::mpsc::Receiver<String>,
+    pub(crate) source: tokio::task::JoinHandle<()>,
+}
+
 /// One API response, however it will leave the daemon. The HTTP adapter
 /// renders it byte-identically to the historical handler output (the
 /// golden transcripts prove it); the tunnel adapter (S2) frames `Json`
@@ -102,6 +193,19 @@ pub(crate) enum ApiResponse {
         /// the transfer rows (S9) define meta's HTTP rendering. `Null`
         /// when the response has no sidecar.
         meta: serde_json::Value,
+    },
+    /// NDJSON line stream (`GET /api/sessions/stream`, tunnel twin
+    /// `api_sessions_stream`): an unbounded-length response fed line by
+    /// line from one source task. The HTTP adapter writes the head
+    /// (EOF-delimited — no Content-Length) then each line verbatim; the
+    /// tunnel framer emits `stream_start`/`stream_event`/`stream_end`
+    /// and consumes only the lines.
+    Stream {
+        status: u16,
+        content_type: String,
+        /// Same contract as `Json::headers` (HTTP-lane decoration).
+        headers: Vec<(&'static str, String)>,
+        stream: LineStream,
     },
 }
 
@@ -139,7 +243,7 @@ impl ApiResponse {
 /// constructor when its families delegate (S2+). Filesystem scope and
 /// custody attribution stay with the per-lane gates until the unified
 /// `authorize_filesystem` stage.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RequestAuthority {
     pub(crate) principal: crate::access::iam::AccessPrincipal,
     pub(crate) iam_state: Option<crate::access::iam::LocalIamState>,
@@ -187,7 +291,8 @@ mod tests {
     fn request_authority_root_principal_allows_filesystem_read() {
         let authority = RequestAuthority {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
-                "unit-test", "https",
+                "unit-test",
+                "https",
             ),
             iam_state: None,
         };

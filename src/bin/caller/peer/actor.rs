@@ -23,16 +23,24 @@
 //! own retry policy.
 
 use crate::peer::card::AgentCard;
-use crate::peer::event::{PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent};
+use crate::peer::event::{
+    PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
+};
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
 use crate::peer::traits::PeerTransport;
 use crate::peer::upcast::{MAX_TRACKED_PEER_DISPLAYS, MAX_TRACKED_PEER_SESSIONS};
 use crate::peer::PeerError;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, watch};
+
+/// Bound on the delegation-receipt ledger (see [`PeerActor::receipts`]).
+/// Receipts are only needed while a `PeerHandle::delegate_task` call is
+/// awaiting one (seconds), so a small FIFO window is generous; the bound
+/// exists so a chatty or hostile peer can't grow the map without limit.
+pub(crate) const MAX_TRACKED_TASK_RECEIPTS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Backoff
@@ -109,6 +117,21 @@ pub(crate) struct PeerActor {
     pub displays_tx: watch::Sender<Arc<Vec<PeerDisplayInfo>>>,
     /// Fold backing `displays_tx`, keyed by display id.
     pub displays: BTreeMap<u32, PeerDisplayInfo>,
+    /// Published delegation-receipt ledger, folded from
+    /// [`PeerEvent::TaskReceipt`]: delegation id → the peer's local
+    /// identity for the accepted task. `PeerHandle::delegate_task`
+    /// awaits an entry here (via `watch::Receiver::wait_for`) to
+    /// resolve at-least-once delivery. Deliberately NOT cleared on
+    /// disconnect, unlike `sessions_tx`/`displays_tx`: a receipt is a
+    /// one-shot correlation fact, not connection-scoped live state —
+    /// clearing would lose an ack that raced the disconnect and force
+    /// a redundant (though harmless, deduped) re-send. Bounded by
+    /// [`MAX_TRACKED_TASK_RECEIPTS`], oldest-inserted evicted.
+    pub receipts_tx: watch::Sender<Arc<HashMap<String, TaskId>>>,
+    /// Fold backing `receipts_tx`, keyed by delegation id.
+    pub receipts: HashMap<String, TaskId>,
+    /// Insertion order for `receipts` eviction.
+    pub receipt_order: VecDeque<String>,
     pub seq: u64,
     /// Operator's via-URL override, preserved across card refreshes.
     ///
@@ -302,7 +325,7 @@ impl PeerActor {
                 maybe_cmd = self.commands_rx.recv() => {
                     match maybe_cmd {
                         Some(PeerCommand::Send { op, responder }) => {
-                            let result = self.transport.send(op).await;
+                            let result = self.transport.send(*op).await;
                             let _ = responder.send(result);
                         }
                         Some(PeerCommand::Disconnect) => {
@@ -375,6 +398,28 @@ impl PeerActor {
                 if self.displays.remove(display_id).is_some() {
                     self.publish_displays();
                 }
+            }
+            PeerEvent::TaskReceipt {
+                delegation_id,
+                task,
+            } => {
+                // Re-acks for an already-recorded id (receiver-side
+                // dedup answering a re-send) update in place without
+                // burning an eviction slot.
+                if self.receipts.contains_key(delegation_id) {
+                    self.receipts.insert(delegation_id.clone(), task.clone());
+                } else {
+                    while self.receipt_order.len() >= MAX_TRACKED_TASK_RECEIPTS {
+                        if let Some(evicted) = self.receipt_order.pop_front() {
+                            self.receipts.remove(&evicted);
+                        } else {
+                            break;
+                        }
+                    }
+                    self.receipt_order.push_back(delegation_id.clone());
+                    self.receipts.insert(delegation_id.clone(), task.clone());
+                }
+                let _ = self.receipts_tx.send(Arc::new(self.receipts.clone()));
             }
             PeerEvent::Disconnected { .. } => {
                 if !self.sessions.is_empty() {

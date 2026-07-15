@@ -1,6 +1,9 @@
 /* ── Credential vault (credential custody v1) ──
    The user's provider credentials, end-to-end encrypted client-side and
-   synced blind through the hosted rendezvous (/api/vault). A random
+   stored as an opaque blob on the daemon used by this trusted dashboard.
+   Connect retains an account-vault storage API for compatibility, but the
+   default hosted directory serves no vault client and has no bridge to a
+   daemon. A random
    256-bit master key encrypts the vault body; that key is stored only
    wrapped, one envelope per enrolled unlocker: each account passkey (via
    the vault's OWN WebAuthn PRF salt 'intendant-vault-v1', evaluated as
@@ -12,7 +15,11 @@
    blob authentication" below), so the store cannot tamper, splice, or
    relabel. What remains to the store: withholding, or serving a stale
    revision — detectable via the local high-water mark. Unsealing happens
-   only here, in memory, behind a passkey gesture or the phrase. */
+   only client-side, in memory, behind a passkey gesture or the phrase —
+   and the key-touching crypto itself runs inside the pinned crypto
+   kernel (static/vault-kernel.js, a hash-verified dedicated Worker; see
+   "Vault crypto: the pinned kernel" below), so the master key never
+   exists in this page's memory. */
 
 const VAULT_LOCAL_KEY = 'intendant_vault_local_v1';
 const VAULT_HKDF_SALT = 'intendant-vault-v1';
@@ -40,7 +47,8 @@ const vaultState = {
   blob: null,          // the full encrypted vault blob
   entries: [],         // decrypted entries while unlocked
   settings: {},        // decrypted vault-wide settings while unlocked
-  kBytes: null,        // raw master key while unlocked (zeroed on lock)
+  // The master key itself lives in the crypto kernel worker while
+  // unlocked; the page holds only vaultKernelToken (below).
   matchedEnvelopeId: null, // which prf envelope this session's passkey opened
   macSeen: false,      // downgrade ratchet: an authenticated blob has been seen
   rollbackWarning: '',
@@ -52,29 +60,46 @@ let vaultPublishChain = Promise.resolve(true);
 const vaultRevealedEntries = new Set();
 
 /* ── Vault storage backends ──
-   The blob has two possible homes, both blind to its contents:
-   - 'account': the Connect service stores one blob per account (hosted
-     tabs — the original path; follows the person across daemons).
-   - 'daemon': this daemon stores the blob itself (~/.intendant/
-     vault-blob.json via api_daemon_vault_fetch/publish) — the local
-     vault for direct dashboards, no Connect service in the loop.
-   The stores are independent (each keeps its own revision ratchet);
-   copying between them is an explicit user action, never implicit. */
+   The shipped dashboard uses the daemon store (~/.intendant/vault-blob.json
+   via api_daemon_vault_fetch/publish), with no Connect service in the loop.
+   The dormant 'account' branch is wire-compatibility scaffolding for a
+   future, separately trusted client; Connect does not serve this bundle.
+   The stores are independent (each keeps its own revision ratchet), and a
+   future copy between them must remain an explicit user action. */
 function vaultDaemonStoreReady() {
-  if (DASHBOARD_CONNECT_MODE) return false; // hosted tabs use the account store
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // An empty feature list means the hello_ack hasn't landed yet: fall
-    // through and let the RPCs answer (mirrors vaultLeaseTransportReady).
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_daemon_vault_fetch');
-    }
-    return true;
-  } catch {
-    return false;
+  if (DASHBOARD_CONNECT_MODE) return false; // retired hosted-dashboard mode
+  // daemonApi availability (transport F6): the tunnel status boolean when
+  // it has landed (false = this session's role is refused the custody
+  // gate), the hello_ack features list before that (absent = the daemon
+  // predates local vault storage), optimistic only while the handshake is
+  // still in flight — the pre-facade "let the RPCs answer" semantics.
+  return daemonApi.availability('api_daemon_vault_fetch').ok;
+}
+
+/* Why the daemon store is out of reach, for the 'unavailable' status line
+   — the honest split the conflated pre-facade copy could not make. */
+function vaultDaemonStoreUnavailableText() {
+  const reason = daemonApi.availability('api_daemon_vault_fetch').reason;
+  if (reason === 'denied') {
+    return "This session's role lacks credentials.manage, so this daemon's local vault store is out of reach. Reopen it through an authorized loopback/direct-mTLS session or grant that permission from a trusted root surface.";
   }
+  if (reason === 'unsupported') {
+    return 'This daemon predates local vault storage — upgrade it to keep a sealed vault here. Hosted Connect is discovery-only and cannot supply a vault client.';
+  }
+  // 'transport-down': the store rides the secure control channel (a
+  // tunnel-only method). Whether that channel is even coming decides the
+  // honest copy — "retries automatically" was a lie on dashboards that
+  // never open one.
+  if (!dashboardControlTransportEnabled()) {
+    return 'The local vault store needs the secure dashboard control channel, and this dashboard has not enabled one. Enable it under Access → Diagnostics or use a trusted loopback/direct-mTLS dashboard.';
+  }
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: true, connected: false };
+  if (dashboardTransportStatusSummary(status).kind === 'err') {
+    return 'The control channel to this daemon failed, so its local vault store is out of reach — see Access → Diagnostics. Hosted Connect cannot bridge an account vault to this daemon.';
+  }
+  return 'No vault store reachable yet: the trusted control channel is still connecting (retries automatically).';
 }
 
 function vaultBackendKind() {
@@ -86,78 +111,159 @@ function vaultAvailable() {
   return Boolean(crypto?.subtle) && vaultBackendKind() !== null;
 }
 
-/* ── Vault crypto ── */
+/* ── Vault crypto: the pinned kernel ──
+   All key-touching crypto lives in static/vault-kernel.js — a small,
+   separately served, dedicated Worker that holds the master key, every
+   KEK, and the MAC key for its lifetime (the kernel's header carries the
+   full design and its honest limits). The page refuses to run vault
+   crypto through unverified code: it fetches /vault-kernel.js, hashes
+   the bytes, and compares against VAULT_KERNEL_SHA256 — the sha256 the
+   app.html assembler computed from the kernel file at build time. On a
+   mismatch the vault fails closed with a loud error; there is
+   deliberately no inline-crypto fallback. What remains in this fragment
+   is policy and state: which envelope to try, when to trust a MAC, what
+   to render, storage and sync. */
 
-async function vaultHkdfAesKey(secretBytes, info) {
-  const hkdf = await crypto.subtle.importKey('raw', secretBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode(info),
-    },
-    hkdf,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
+/* Substituted by crates/app-html-assembler at assembly time (the
+   fragment source carries the placeholder; the assembled app.html
+   carries the real lowercase-hex sha256 of static/vault-kernel.js). */
+const VAULT_KERNEL_SHA256 = '__VAULT_KERNEL_SHA256__';
+
+let vaultKernel = null;        // { worker, pending, seq } once verified + running
+let vaultKernelPromise = null; // in-flight spawn: concurrent callers share one fetch
+let vaultKernelToken = '';     // the kernel's unlock token (page-held session nonce)
+
+async function vaultKernelSpawn() {
+  const resp = await fetch('/vault-kernel.js', { cache: 'no-cache' });
+  if (!resp.ok) throw new Error(`vault kernel fetch failed: HTTP ${resp.status}`);
+  const bytes = await resp.arrayBuffer();
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const hex = Array.from(digest, b => b.toString(16).padStart(2, '0')).join('');
+  if (hex !== VAULT_KERNEL_SHA256) {
+    // Fail closed and loudly: a mismatch means the served kernel is not
+    // the one this bundle was built against — tampering, or a skewed
+    // deploy (e.g. an edited kernel without `cargo run -p
+    // app-html-assembler`).
+    const err = new Error(
+      `VAULT KERNEL INTEGRITY FAILURE: /vault-kernel.js hashes to ${hex} but this dashboard pins ${VAULT_KERNEL_SHA256}. Refusing to unseal the vault through unverified code.`
+    );
+    err.vaultKernelIntegrity = true;
+    throw err;
+  }
+  // Instantiate from the VERIFIED bytes (a blob: URL), never from the
+  // network path — re-fetching could race a swap after verification.
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }));
+  let worker;
+  try {
+    worker = new Worker(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  const kernel = { worker, pending: new Map(), seq: 0 };
+  const fail = message => {
+    for (const request of kernel.pending.values()) request.reject(new Error(message));
+    kernel.pending.clear();
+    if (vaultKernel === kernel) {
+      vaultKernel = null;
+      vaultKernelPromise = null;
+    }
+    try { worker.terminate(); } catch (_) {}
+  };
+  worker.onmessage = event => {
+    const msg = event.data || {};
+    const request = kernel.pending.get(msg.id);
+    if (!request) return;
+    kernel.pending.delete(msg.id);
+    if (msg.ok) request.resolve(msg.result || {});
+    else request.reject(new Error(msg.error || 'vault kernel error'));
+  };
+  worker.onerror = event => fail(`vault kernel crashed: ${event?.message || 'worker error'}`);
+  worker.onmessageerror = () => fail('vault kernel message deserialization failed');
+  return kernel;
 }
 
-/* KEK from the dedicated vault PRF domain — what new envelopes use. */
-async function vaultPrfKekDedicated() {
+function vaultKernelEnsure() {
+  if (vaultKernel) return Promise.resolve(vaultKernel);
+  if (!vaultKernelPromise) {
+    vaultKernelPromise = vaultKernelSpawn().then(
+      kernel => {
+        vaultKernel = kernel;
+        return kernel;
+      },
+      err => {
+        vaultKernelPromise = null;
+        if (err?.vaultKernelIntegrity) {
+          // Tamper evidence must surface even on silent auto-unlock paths.
+          console.error('[vault]', err.message);
+          vaultState.lastError = err.message;
+          renderAccessVaultSection();
+        }
+        throw err;
+      }
+    );
+  }
+  return vaultKernelPromise;
+}
+
+/* One kernel RPC. `transfer` optionally moves ArrayBuffers into the
+   worker, detaching the page-side copy. */
+async function vaultKernelCall(op, params = {}, transfer = []) {
+  const kernel = await vaultKernelEnsure();
+  return new Promise((resolve, reject) => {
+    const id = ++kernel.seq;
+    kernel.pending.set(id, { resolve, reject });
+    try {
+      kernel.worker.postMessage({ id, op, params }, transfer);
+    } catch (err) {
+      kernel.pending.delete(id);
+      reject(err);
+    }
+  });
+}
+
+/* Drop the kernel's master key; best-effort and non-blocking so lock
+   paths stay synchronous. Clears the page-held token either way, and
+   never spawns a kernel just to lock it. */
+function vaultKernelLock() {
+  if (vaultKernel) vaultKernelCall('lock').catch(() => {});
+  vaultKernelToken = '';
+}
+
+/* The dedicated vault PRF secret for this session, as bytes (null when
+   the login gesture did not evaluate the second salt). sessionStorage
+   keeps the base64url copy so a reload can re-unlock without a fresh
+   gesture — a pre-kernel design the kernel does not change; what the
+   kernel removes from the page is every key DERIVED from it. */
+function vaultPrfSecretDedicated() {
   const prfB64u = sessionStorage.getItem(VAULT_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] vault-PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK from the fleet PRF secret — legacy: pre-two-salt envelopes were
-   wrapped under this. Kept for unlocking them (and as the wrap fallback
-   for authenticators that only evaluate one PRF salt). */
-async function vaultPrfKekLegacy() {
+/* The fleet PRF secret — legacy: pre-two-salt envelopes were wrapped
+   under a KEK derived from it. Kept for unlocking them (and as the wrap
+   fallback for authenticators that only evaluate one PRF salt). */
+function vaultPrfSecretLegacy() {
   const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
   if (!prfB64u) return null;
   try {
-    return await vaultHkdfAesKey(dashboardBase64UrlToBytes(prfB64u), 'vault-kek');
-  } catch (err) {
-    console.warn('[vault] PRF key derivation failed:', err?.message || err);
+    return dashboardBase64UrlToBytes(prfB64u);
+  } catch {
     return null;
   }
 }
 
-/* KEK for wrapping a NEW envelope: [kek, marker]. Dedicated domain when
-   the authenticator evaluated both salts, legacy (markerless) otherwise. */
-async function vaultPrfKekForWrap() {
-  const dedicated = await vaultPrfKekDedicated();
+/* The PRF secret + envelope marker for wrapping a NEW envelope:
+   dedicated domain when the authenticator evaluated both salts, legacy
+   (markerless) otherwise. */
+function vaultPrfWrapSource() {
+  const dedicated = vaultPrfSecretDedicated();
   if (dedicated) return [dedicated, VAULT_PRF_ENVELOPE_MARK];
-  return [await vaultPrfKekLegacy(), null];
-}
-
-/* KEK for OPENING an existing envelope, chosen by its marker. */
-async function vaultPrfKekForEnvelope(envelope) {
-  return envelope?.prf === VAULT_PRF_ENVELOPE_MARK
-    ? vaultPrfKekDedicated()
-    : vaultPrfKekLegacy();
-}
-
-/* Standard BIP39 seed stretch (PBKDF2-HMAC-SHA512, salt 'mnemonic',
-   2048 iterations — the 128-bit entropy does the security work), then
-   our own HKDF domain down to an AES-GCM key. */
-async function vaultPhraseKek(phrase) {
-  const password = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(phrase.normalize('NFKD')), 'PBKDF2', false, ['deriveBits']
-  );
-  const seed = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-512', salt: new TextEncoder().encode('mnemonic'), iterations: 2048 },
-    password,
-    512
-  );
-  return vaultHkdfAesKey(new Uint8Array(seed), 'vault-kek-phrase');
+  return [vaultPrfSecretLegacy(), null];
 }
 
 async function vaultGeneratePhrase() {
@@ -191,79 +297,6 @@ async function vaultNormalizePhrase(input) {
   return words.join(' ');
 }
 
-function vaultEnvelopeAad() {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|kek`);
-}
-
-/* The body AAD binds the revision into the ciphertext, so the store
-   cannot re-label an old body with a new revision number; replaying a
-   complete old blob (rollback) remains and is what highWater detects. */
-function vaultBodyAad(revision) {
-  return new TextEncoder().encode(`${VAULT_HKDF_SALT}|body|rev:${revision}`);
-}
-
-async function vaultWrapMasterKey(kek, kBytes) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const wrapped = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultEnvelopeAad() },
-    kek,
-    kBytes
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    wrapped: dashboardBytesToBase64Url(new Uint8Array(wrapped)),
-  };
-}
-
-async function vaultUnwrapMasterKey(kek, envelope) {
-  try {
-    const kBytes = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(String(envelope.iv || '')), additionalData: vaultEnvelopeAad() },
-      kek,
-      dashboardBase64UrlToBytes(String(envelope.wrapped || ''))
-    );
-    return new Uint8Array(kBytes);
-  } catch {
-    return null;
-  }
-}
-
-async function vaultMasterAesKey(kBytes) {
-  return crypto.subtle.importKey('raw', kBytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
-}
-
-async function vaultEncryptBody(kBytes, bodyObj, revision) {
-  const key = await vaultMasterAesKey(kBytes);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: vaultBodyAad(revision) },
-    key,
-    new TextEncoder().encode(JSON.stringify(bodyObj))
-  );
-  return {
-    iv: dashboardBytesToBase64Url(iv),
-    ct: dashboardBytesToBase64Url(new Uint8Array(ct)),
-  };
-}
-
-async function vaultDecryptBody(kBytes, blob) {
-  try {
-    const key = await vaultMasterAesKey(kBytes);
-    const plaintext = await crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: dashboardBase64UrlToBytes(String(blob?.body?.iv || '')),
-        additionalData: vaultBodyAad(Number(blob?.revision) || 0),
-      },
-      key,
-      dashboardBase64UrlToBytes(String(blob?.body?.ct || ''))
-    );
-    return JSON.parse(new TextDecoder().decode(plaintext));
-  } catch {
-    return null;
-  }
-}
-
 function vaultRandomId(prefix) {
   return `${prefix}_${dashboardBytesToBase64Url(crypto.getRandomValues(new Uint8Array(9)))}`;
 }
@@ -275,60 +308,9 @@ function vaultRandomId(prefix) {
    closes that: HMAC-SHA-256 under a key derived from the vault master
    key over the whole blob. The store never holds the master key, so it
    can neither mint nor relabel a MAC'd blob; every unlocker can verify.
-   Canonical JSON (sorted keys) because the store's serializer is free to
-   reorder object keys in transit. */
-
-function vaultCanonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(vaultCanonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map(k => `${JSON.stringify(k)}:${vaultCanonicalJson(value[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
-async function vaultMacKey(kBytes) {
-  const hkdf = await crypto.subtle.importKey('raw', kBytes, 'HKDF', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    {
-      name: 'HKDF',
-      hash: 'SHA-256',
-      salt: new TextEncoder().encode(VAULT_HKDF_SALT),
-      info: new TextEncoder().encode('vault-mac-v1'),
-    },
-    hkdf,
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign', 'verify']
-  );
-}
-
-function vaultMacPayload(blob) {
-  return new TextEncoder().encode(
-    `intendant-vault-mac-v1\n${Number(blob.v) || 0}\n${String(blob.kind || '')}\n` +
-    `${Number(blob.revision) || 0}\n${vaultCanonicalJson(blob.envelopes || [])}\n` +
-    `${vaultCanonicalJson(blob.body || {})}`
-  );
-}
-
-async function vaultComputeMac(kBytes, blob) {
-  const key = await vaultMacKey(kBytes);
-  const mac = await crypto.subtle.sign('HMAC', key, vaultMacPayload(blob));
-  return dashboardBytesToBase64Url(new Uint8Array(mac));
-}
-
-async function vaultVerifyMac(kBytes, blob) {
-  const mac = String(blob?.mac || '');
-  if (!mac) return false;
-  try {
-    const key = await vaultMacKey(kBytes);
-    return await crypto.subtle.verify(
-      'HMAC', key, dashboardBase64UrlToBytes(mac), vaultMacPayload(blob)
-    );
-  } catch {
-    return false;
-  }
-}
+   The kernel computes and verifies MACs (compute-mac / verify-mac); this
+   page decides the POLICY — when a missing MAC is legacy-acceptable and
+   when it is a downgrade attack (the macSeen ratchet below). */
 
 /* Once this device has seen an authenticated blob, an unauthenticated one
    is a downgrade attack, not a legacy vault. Ratchet state rides in
@@ -340,7 +322,7 @@ function vaultMarkMacSeen() {
   }
 }
 
-/* ── Local cache + hosted sync ── */
+/* ── Local cache + backing-store sync ── */
 
 function vaultReadLocal() {
   try {
@@ -374,6 +356,9 @@ async function vaultServerFetch() {
       vault: result?.vault || null,
     };
   }
+  // The account store lives on the Connect service, not on any daemon —
+  // deliberately raw fetch, outside the daemonApi facade (the facade
+  // speaks to daemons only; rendezvous calls stay on their own lane).
   const resp = await fetch(accessFleetHostedUrl('/api/vault'));
   if (resp.status === 401) return { authenticated: false };
   const body = await resp.json().catch(() => ({}));
@@ -397,13 +382,11 @@ async function vaultServerPublish(blob) {
       throw err;
     }
   }
-  const headers = await accessFleetHostedHeaders();
-  if (!headers) throw new Error('sign in to the hosted account first');
-  const resp = await fetch(accessFleetHostedUrl('/api/vault'), {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ revision: blob.revision, vault: blob }),
-  });
+  // Rides the shared hosted-POST helper (42-usage-terminal.js): one
+  // CSRF-expiry retry, so a rotated session token cannot strand publishes.
+  const resp = await accessFleetHostedPost('/api/vault',
+    JSON.stringify({ revision: blob.revision, vault: blob }));
+  if (!resp) throw new Error('sign in to the hosted account first');
   const body = await resp.json().catch(() => ({}));
   if (resp.status === 409) {
     const err = new Error(body.error || 'vault revision conflict');
@@ -421,7 +404,7 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   if (!blob || !revision) return;
   if (fromServer) {
     vaultState.rollbackWarning = vaultState.highWater > revision
-      ? `The hosted store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
+      ? `The backing store returned vault revision ${revision}, but this device has already seen revision ${vaultState.highWater}. The store cannot read or forge the vault, but it can withhold updates — treat its copy as stale.`
       : '';
   }
   if (revision < vaultState.revision) return;
@@ -429,8 +412,9 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   // Locked with a MAC: adopt provisionally — unlock verifies before any
   // use. Either way the downgrade ratchet refuses an unauthenticated
   // blob once this device has seen an authenticated one.
-  if (blob.mac && vaultState.kBytes) {
-    if (!(await vaultVerifyMac(vaultState.kBytes, blob))) {
+  if (blob.mac && vaultKernelToken) {
+    const { valid } = await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob });
+    if (!valid) {
       vaultState.lastError = 'The store returned a vault blob that failed its integrity check — ignoring it.';
       renderAccessVaultSection();
       return;
@@ -444,8 +428,8 @@ async function vaultAdoptBlob(blob, { fromServer = false } = {}) {
   vaultState.blob = blob;
   vaultState.revision = revision;
   vaultState.highWater = Math.max(vaultState.highWater, revision);
-  if (vaultState.kBytes) {
-    const body = await vaultDecryptBody(vaultState.kBytes, blob);
+  if (vaultKernelToken) {
+    const { body } = await vaultKernelCall('decrypt-body', { token: vaultKernelToken, blob });
     if (body) {
       vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
       vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
@@ -501,8 +485,7 @@ async function vaultInitInner() {
 /* ── Lock / unlock / create / enroll ── */
 
 function vaultLock(notice) {
-  if (vaultState.kBytes) vaultState.kBytes.fill(0);
-  vaultState.kBytes = null;
+  vaultKernelLock();
   vaultState.entries = [];
   vaultState.settings = {};
   vaultState.matchedEnvelopeId = null;
@@ -519,29 +502,44 @@ function vaultLock(notice) {
   renderAccessVaultSection();
 }
 
-async function vaultFinishUnlock(kBytes, envelopeId) {
-  // Every unlock funnels through here: authenticate the whole blob before
-  // trusting any of it. A blob without a MAC is legacy — allowed only
-  // until this device has seen an authenticated one, and upgraded in
-  // place right after unlock.
-  if (vaultState.blob?.mac) {
-    if (!(await vaultVerifyMac(kBytes, vaultState.blob))) {
-      vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+async function vaultFinishUnlock(token, envelopeId) {
+  // Every unlock funnels through here: the kernel already holds the
+  // master key behind `token`; authenticate the whole blob before
+  // trusting any of it (and re-lock the kernel on every refusal so the
+  // worker never outlives the page's decision). A blob without a MAC is
+  // legacy — allowed only until this device has seen an authenticated
+  // one, and upgraded in place right after unlock.
+  vaultKernelToken = token;
+  let body;
+  try {
+    if (vaultState.blob?.mac) {
+      const { valid } = await vaultKernelCall('verify-mac', { token, blob: vaultState.blob });
+      if (!valid) {
+        vaultKernelLock();
+        vaultState.lastError = 'Vault integrity check failed — the stored blob was tampered with or spliced. Refusing to unlock it.';
+        renderAccessVaultSection();
+        return false;
+      }
+      vaultMarkMacSeen();
+    } else if (vaultState.macSeen) {
+      vaultKernelLock();
+      vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
       renderAccessVaultSection();
       return false;
     }
-    vaultMarkMacSeen();
-  } else if (vaultState.macSeen) {
-    vaultState.lastError = 'The store served an unauthenticated vault although this device has seen an authenticated one — refusing the downgrade.';
+    body = (await vaultKernelCall('decrypt-body', { token, blob: vaultState.blob })).body;
+  } catch (err) {
+    // Kernel died mid-unlock: keep the historical never-throws contract.
+    vaultKernelLock();
+    vaultState.lastError = `Vault unlock failed: ${err?.message || err}`;
     renderAccessVaultSection();
     return false;
   }
-  const body = await vaultDecryptBody(kBytes, vaultState.blob);
   if (!body) {
+    vaultKernelLock();
     vaultState.lastError = 'The key envelope opened but the vault body did not decrypt — the blob may be corrupted.';
     return false;
   }
-  vaultState.kBytes = kBytes;
   vaultState.entries = Array.isArray(body.entries) ? body.entries : [];
   vaultState.settings = body.settings && typeof body.settings === 'object' ? body.settings : {};
   vaultState.matchedEnvelopeId = envelopeId || null;
@@ -565,30 +563,50 @@ async function vaultFinishUnlock(kBytes, envelopeId) {
       });
   }
   renderAccessVaultSection();
+  vaultDepositLaneSync().catch(() => {});
   return true;
 }
 
 async function vaultTryPrfUnlock({ silent = false } = {}) {
   if (!vaultState.blob) return false;
-  let sawKek = false;
-  for (const envelope of vaultState.blob.envelopes || []) {
-    if (envelope.kind !== 'prf') continue;
-    // Each envelope names its PRF domain: marked = dedicated vault salt,
-    // markerless = legacy fleet-secret derivation.
-    const kek = await vaultPrfKekForEnvelope(envelope);
-    if (!kek) continue;
-    sawKek = true;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    if (kBytes) {
-      const unlocked = await vaultFinishUnlock(kBytes, envelope.id);
-      if (unlocked && envelope.prf !== VAULT_PRF_ENVELOPE_MARK) {
-        vaultMigratePrfEnvelope(envelope.id);
-      }
-      return unlocked;
+  // Each envelope names its PRF domain: marked = dedicated vault salt,
+  // markerless = legacy fleet-secret derivation. The kernel picks the
+  // matching secret per envelope; this page only decides which secrets
+  // exist this session. No secret at all skips the kernel entirely.
+  const secretDedicated = vaultPrfSecretDedicated();
+  const secretLegacy = vaultPrfSecretLegacy();
+  if (!secretDedicated && !secretLegacy) {
+    if (!silent) {
+      vaultState.lastError = 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
     }
+    return false;
+  }
+  let result;
+  try {
+    // Transfer the secret buffers into the worker (detaches the page-side
+    // copies; the sessionStorage strings remain for reload-unlock).
+    const transfer = [secretDedicated?.buffer, secretLegacy?.buffer].filter(Boolean);
+    result = await vaultKernelCall('unlock-prf', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: secretDedicated,
+      secret_legacy: secretLegacy,
+    }, transfer);
+  } catch (err) {
+    console.warn('[vault] kernel unlock-prf failed:', err?.message || err);
+    if (!silent && !err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Passkey unlock failed: ${err?.message || err}`;
+    }
+    return false;
+  }
+  if (result.unlocked) {
+    const unlocked = await vaultFinishUnlock(result.token, result.envelope_id);
+    if (unlocked && result.envelope_prf !== VAULT_PRF_ENVELOPE_MARK) {
+      vaultMigratePrfEnvelope(result.envelope_id);
+    }
+    return unlocked;
   }
   if (!silent) {
-    vaultState.lastError = sawKek
+    vaultState.lastError = result.saw_kek
       ? 'This passkey is not enrolled in the vault yet — unlock with the recovery phrase, then enroll it.'
       : 'No passkey secret in this session — sign in with the account passkey, or use the recovery phrase.';
   }
@@ -602,9 +620,9 @@ async function vaultTryPrfUnlock({ silent = false } = {}) {
 function vaultMigratePrfEnvelope(envelopeId) {
   vaultPublishChain = vaultPublishChain
     .then(async () => {
-      if (!vaultState.kBytes || !vaultState.blob) return false;
-      const [kek, mark] = await vaultPrfKekForWrap();
-      if (!kek || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
+      if (!vaultKernelToken || !vaultState.blob) return false;
+      const [secret, mark] = vaultPrfWrapSource();
+      if (!secret || mark !== VAULT_PRF_ENVELOPE_MARK) return false;
       const envelopes = [];
       let migrated = false;
       for (const envelope of vaultState.blob.envelopes || []) {
@@ -612,7 +630,10 @@ function vaultMigratePrfEnvelope(envelopeId) {
           envelopes.push({
             ...envelope,
             prf: VAULT_PRF_ENVELOPE_MARK,
-            ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+            ...(await vaultKernelCall('wrap-new-envelope', {
+              token: vaultKernelToken,
+              prf_secret: secret,
+            })),
           });
           migrated = true;
         } else {
@@ -689,64 +710,69 @@ async function vaultUnlockWithPhrase(input) {
     renderAccessVaultSection();
     return false;
   }
-  const kek = await vaultPhraseKek(phrase);
-  for (const envelope of vaultState.blob?.envelopes || []) {
-    if (envelope.kind !== 'phrase') continue;
-    const kBytes = await vaultUnwrapMasterKey(kek, envelope);
-    // matchedEnvelopeId means "the prf envelope this session's passkey
-    // opened" — a phrase unlock matches none, which is exactly what
-    // makes the enroll-this-passkey offer appear.
-    if (kBytes) return vaultFinishUnlock(kBytes, null);
+  let result;
+  try {
+    result = await vaultKernelCall('unlock-phrase', {
+      phrase,
+      envelopes: vaultState.blob?.envelopes || [],
+    });
+  } catch (err) {
+    if (!err?.vaultKernelIntegrity) {
+      vaultState.lastError = `Phrase unlock failed: ${err?.message || err}`;
+    }
+    renderAccessVaultSection();
+    return false;
   }
+  // matchedEnvelopeId means "the prf envelope this session's passkey
+  // opened" — a phrase unlock matches none, which is exactly what
+  // makes the enroll-this-passkey offer appear.
+  if (result.unlocked) return vaultFinishUnlock(result.token, null);
   vaultState.lastError = 'The phrase is well-formed but does not open this vault.';
   renderAccessVaultSection();
   return false;
 }
 
 async function vaultCreate(phrase) {
-  if (!vaultAvailable()) throw new Error('the vault needs a hosted session');
-  const kBytes = crypto.getRandomValues(new Uint8Array(32));
+  if (!vaultAvailable()) throw new Error('the vault needs an authorized trusted dashboard session');
   const now = Date.now();
-  const envelopes = [];
-  envelopes.push({
-    kind: 'phrase',
-    id: vaultRandomId('env'),
-    label: 'Recovery phrase',
-    created_unix_ms: now,
-    ...(await vaultWrapMasterKey(await vaultPhraseKek(phrase), kBytes)),
-  });
-  let matched = null;
-  const [prfKek, prfMark] = await vaultPrfKekForWrap();
-  if (prfKek) {
-    const envelope = {
-      kind: 'prf',
+  // The page owns the metadata (ids, labels, timestamps); the kernel
+  // generates the master key, wraps the envelopes, encrypts the empty
+  // body, and MACs the assembled blob — the key never exists here.
+  const [prfSecret, prfMark] = vaultPrfWrapSource();
+  const { token, blob, matched_envelope_id: matched } = await vaultKernelCall('create', {
+    phrase,
+    phrase_envelope: {
+      kind: 'phrase',
       id: vaultRandomId('env'),
-      label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+      label: 'Recovery phrase',
       created_unix_ms: now,
-      ...(prfMark ? { prf: prfMark } : {}),
-      ...(await vaultWrapMasterKey(prfKek, kBytes)),
-    };
-    envelopes.push(envelope);
-    matched = envelope.id;
+    },
+    prf_secret: prfSecret,
+    prf_mark: prfMark,
+    prf_envelope: prfSecret
+      ? {
+          kind: 'prf',
+          id: vaultRandomId('env'),
+          label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
+          created_unix_ms: now,
+        }
+      : null,
+    revision: Math.max(1, vaultState.highWater + 1),
+    now,
+  });
+  try {
+    await vaultServerPublish(blob);
+  } catch (err) {
+    // Nothing was committed: drop the kernel's key with the ceremony.
+    vaultKernelLock();
+    throw err;
   }
-  const revision = Math.max(1, vaultState.highWater + 1);
-  const blob = {
-    v: 1,
-    kind: 'intendant-vault',
-    revision,
-    created_unix_ms: now,
-    updated_unix_ms: now,
-    envelopes,
-    body: await vaultEncryptBody(kBytes, { entries: [], settings: {} }, revision),
-  };
-  blob.mac = await vaultComputeMac(kBytes, blob);
-  await vaultServerPublish(blob);
   vaultState.blob = blob;
-  vaultState.revision = revision;
-  vaultState.highWater = Math.max(vaultState.highWater, revision);
+  vaultState.revision = blob.revision;
+  vaultState.highWater = Math.max(vaultState.highWater, blob.revision);
   vaultState.macSeen = true;
   vaultWriteLocal();
-  await vaultFinishUnlock(kBytes, matched);
+  await vaultFinishUnlock(token, matched);
 }
 
 /* Re-encrypt and publish the unlocked state as the next revision. On a
@@ -754,21 +780,21 @@ async function vaultCreate(phrase) {
    a concurrent update wins over a concurrent delete, never silently
    dropping a credential — and retry once. */
 async function vaultPersist() {
-  if (!vaultState.kBytes || !vaultState.blob) throw new Error('vault is locked');
+  if (!vaultKernelToken || !vaultState.blob) throw new Error('vault is locked');
   const attempt = async () => {
     const revision = Math.max(vaultState.revision, vaultState.highWater) + 1;
     const blob = {
       ...vaultState.blob,
       revision,
       updated_unix_ms: Date.now(),
-      body: await vaultEncryptBody(
-        vaultState.kBytes,
-        { entries: vaultState.entries, settings: vaultState.settings },
-        revision
-      ),
+      body: await vaultKernelCall('encrypt-body', {
+        token: vaultKernelToken,
+        body: { entries: vaultState.entries, settings: vaultState.settings },
+        revision,
+      }),
     };
     // Recompute — the spread carries the previous revision's MAC.
-    blob.mac = await vaultComputeMac(vaultState.kBytes, blob);
+    blob.mac = (await vaultKernelCall('compute-mac', { token: vaultKernelToken, blob })).mac;
     await vaultServerPublish(blob);
     vaultState.blob = blob;
     vaultState.revision = revision;
@@ -786,7 +812,7 @@ async function vaultPersist() {
       // envelope set here and re-signing it in the retry would launder the
       // splice into a valid MAC.
       const remoteAuthentic = server.vault.mac
-        ? await vaultVerifyMac(vaultState.kBytes, server.vault)
+        ? (await vaultKernelCall('verify-mac', { token: vaultKernelToken, blob: server.vault })).valid
         : !vaultState.macSeen;
       if (!remoteAuthentic) {
         vaultState.lastError = 'The conflict refetch returned a vault blob that failed its integrity check — keeping local state.';
@@ -794,7 +820,10 @@ async function vaultPersist() {
         throw err;
       }
       if (server.vault.mac) vaultMarkMacSeen();
-      const remoteBody = await vaultDecryptBody(vaultState.kBytes, server.vault);
+      const { body: remoteBody } = await vaultKernelCall('decrypt-body', {
+        token: vaultKernelToken,
+        blob: server.vault,
+      });
       if (!remoteBody) {
         vaultLock('The vault was re-keyed on another device — unlock it again.');
         throw err;
@@ -845,12 +874,11 @@ function vaultQueuePersist() {
 
 /* Per-entry unseal policy (docs/src/trust-tiers.md, hook 3). 'any' (or
    absent — every pre-policy entry) uses the entry everywhere the vault
-   opens; 'trusted' refuses use from hosted tabs. Client-side self-
-   enforcement: it defends against mistakes and casual exfiltration, not
-   against a malicious page — and since today the vault only opens
-   through a Connect service, a trusted-only entry stays sealed until
-   the direct/app vault path lands. It still syncs, and the policy
-   rides inside the encrypted body like every other entry field. */
+   opens; 'trusted' refuses use from a future hosted client. The shipped
+   vault UI is already daemon-origin and uses the daemon store. This remains
+   client-side self-enforcement: useful against mistakes, not malicious code
+   on whatever origin is allowed to unseal. The policy rides inside the
+   encrypted body like every other entry field. */
 function vaultEntryUnsealPolicy(entry) {
   return entry?.unseal_policy === 'trusted' ? 'trusted' : 'any';
 }
@@ -883,24 +911,114 @@ function vaultRemoveEntry(id) {
   return vaultQueuePersist();
 }
 
+/* ── Write-only deposits (the CLI lane) ──
+   `intendant vault deposit <label>` seals a secret to the vault's deposit
+   public key and queues it on the DAEMON (vault_deposits.rs) — the daemon
+   holds ciphertext only, and the plaintext never rides a web UI. After
+   every unlock we (1) ensure the deposit keypair exists inside the sealed
+   body's settings and publish its public half to this daemon, then
+   (2) fold queued deposits into the vault as ordinary entries, consuming
+   them only AFTER the re-wrapped blob has published. The crypto (P-256
+   ECDH → HKDF-SHA256 → AES-256-GCM, label-bound) lives in the kernel
+   (open-deposit / generate-deposit-keypair) and mirrors vault_deposits.rs
+   (v1) exactly. Cross-implementation parity harness:
+   scripts/vault-deposit-parity.cjs. */
+
+async function vaultDepositLaneSync() {
+  if (vaultState.status !== 'unlocked' || !vaultKernelToken) return;
+  try {
+    // 1. Keypair lives inside the sealed body (extractable so it rides
+    //    the blob to every unlocking device; it exists only as ciphertext
+    //    at rest). The kernel generates it; the private JWK is body
+    //    material by design — it must reach every unlocking device.
+    let lane = vaultState.settings.deposit_lane;
+    if (!lane || !lane.priv_jwk || !lane.pub_raw_b64u) {
+      const pair = await vaultKernelCall('generate-deposit-keypair', { token: vaultKernelToken });
+      lane = {
+        alg: 'ECDH-P256',
+        priv_jwk: pair.priv_jwk,
+        pub_raw_b64u: pair.pub_raw_b64u,
+        created_unix_ms: Date.now(),
+      };
+      vaultState.settings.deposit_lane = lane;
+      await vaultQueuePersist();
+    }
+
+    // 2. Publish the public half to this daemon (idempotent; a daemon can
+    //    hold at most one deposit key — last unlocked vault wins, and the
+    //    mismatch check keeps this a no-op in the steady state).
+    const current = await vaultLeaseRpc('api_daemon_vault_deposit_key_fetch').catch(() => null);
+    if (!current?.present || current.pub_raw_b64u !== lane.pub_raw_b64u) {
+      await vaultLeaseRpc('api_daemon_vault_deposit_key_publish', {
+        alg: 'ECDH-P256',
+        pub_raw_b64u: lane.pub_raw_b64u,
+      });
+    }
+
+    // 3. Fold queued deposits, then consume. Consume strictly after the
+    //    folded blob PUBLISHED — a failed publish leaves them queued.
+    const fetched = await vaultLeaseRpc('api_daemon_vault_deposits_fetch').catch(() => null);
+    const deposits = Array.isArray(fetched?.deposits) ? fetched.deposits : [];
+    if (!deposits.length) return;
+    const consumed = [];
+    for (const dep of deposits) {
+      try {
+        const { secret } = await vaultKernelCall('open-deposit', {
+          token: vaultKernelToken,
+          deposit: dep,
+          lane_priv_jwk: lane.priv_jwk,
+          lane_pub_raw_b64u: lane.pub_raw_b64u,
+        });
+        vaultState.entries.push({
+          id: vaultRandomId('cred'),
+          kind: 'api_key',
+          provider: '',
+          label: String(dep.label || 'CLI deposit'),
+          secret,
+          origin: 'cli-deposit',
+          created_unix_ms: Number(dep.created_unix_ms) || Date.now(),
+          updated_unix_ms: Date.now(),
+        });
+        consumed.push(String(dep.id));
+      } catch (err) {
+        // Sealed to a superseded deposit key, or corrupt: leave it queued
+        // (visible via `intendant vault status`); never consume blind.
+        console.warn('[vault] deposit', dep?.id, 'did not open — leaving it queued:', err?.message || err);
+      }
+    }
+    if (!consumed.length) return;
+    await vaultQueuePersist();
+    await vaultLeaseRpc('api_daemon_vault_deposits_consume', { ids: consumed });
+    vaultSyncVoiceMirror();
+    renderAccessVaultSection();
+    console.info(`[vault] folded ${consumed.length} CLI deposit(s) into the vault`);
+  } catch (err) {
+    // Advisory lane: never let it break an unlock.
+    console.warn('[vault] deposit-lane sync failed:', err?.message || err);
+  }
+}
+
 async function vaultEnrollThisPasskey() {
-  if (!vaultState.kBytes) return;
+  if (!vaultKernelToken) return;
   vaultState.lastError = '';
   try {
-    let [kek, mark] = await vaultPrfKekForWrap();
-    if (!kek) {
+    let [secret, mark] = vaultPrfWrapSource();
+    if (!secret) {
       if (!(await vaultRequestPrfSecret())) throw new Error('this authenticator did not return a PRF secret');
-      [kek, mark] = await vaultPrfKekForWrap();
+      [secret, mark] = vaultPrfWrapSource();
     }
-    if (!kek) throw new Error('no PRF secret available');
-    for (const envelope of vaultState.blob.envelopes || []) {
-      if (envelope.kind !== 'prf') continue;
-      const envelopeKek = await vaultPrfKekForEnvelope(envelope);
-      if (envelopeKek && (await vaultUnwrapMasterKey(envelopeKek, envelope))) {
-        vaultState.matchedEnvelopeId = envelope.id;
-        renderAccessVaultSection();
-        return;
-      }
+    if (!secret) throw new Error('no PRF secret available');
+    // Already enrolled? The kernel probes which envelope (if any) this
+    // session's secrets open, without touching the held key.
+    const { envelope_id: matched } = await vaultKernelCall('match-prf-envelope', {
+      envelopes: vaultState.blob.envelopes || [],
+      secret_dedicated: vaultPrfSecretDedicated(),
+      secret_legacy: vaultPrfSecretLegacy(),
+    });
+    if (matched) {
+      vaultState.matchedEnvelopeId = matched;
+      renderAccessVaultSection();
+      return;
     }
     const now = Date.now();
     const envelope = {
@@ -909,7 +1027,10 @@ async function vaultEnrollThisPasskey() {
       label: `Passkey enrolled ${new Date(now).toISOString().slice(0, 10)}`,
       created_unix_ms: now,
       ...(mark ? { prf: mark } : {}),
-      ...(await vaultWrapMasterKey(kek, vaultState.kBytes)),
+      ...(await vaultKernelCall('wrap-new-envelope', {
+        token: vaultKernelToken,
+        prf_secret: secret,
+      })),
     };
     vaultState.blob = { ...vaultState.blob, envelopes: [...(vaultState.blob.envelopes || []), envelope] };
     vaultState.matchedEnvelopeId = envelope.id;
@@ -929,7 +1050,7 @@ let vaultVoiceMirror = {};
    synchronous voice paths keep working without an unlock await. */
 function vaultSyncVoiceMirror() {
   const mirror = {};
-  if (vaultState.status === 'unlocked' || vaultState.kBytes) {
+  if (vaultState.status === 'unlocked' || vaultKernelToken) {
     const usable = vaultState.entries.filter(vaultEntryUsableHere);
     for (const [storageKey, provider] of Object.entries(VAULT_VOICE_STORAGE_PROVIDERS)) {
       const entry =
@@ -1026,7 +1147,8 @@ const VAULT_OFFLINE_CHOICES = [
 const VAULT_OFFLINE_DEFAULT_MS = 24 * 60 * 60 * 1000;
 
 const vaultLeaseState = {
-  supported: null,   // null until first probe; false when the daemon lacks the RPCs / gate
+  supported: null,   // null until first verdict; false only on the daemon's own refusal
+  availability: '',  // honest cause: 'denied' | 'unsupported' | 'connected' (transport F6)
   leases: [],
   egress: [],        // active client-egress relays (the path indicator)
   expiredNote: '',
@@ -1200,40 +1322,47 @@ async function vaultOauthAccessTokenMaterial(entry, kind) {
   return vaultOauthAccessMaterial(kind, secretJson);
 }
 
+/* Availability of the lease RPC family here (transport F6, design §3.4):
+   the daemon's own word, before any RPC fires. Reasons the render paths
+   branch on — 'denied' (the status boolean says this session's role is
+   refused credentials.manage; custody methods have no runtime-ready
+   ladder, so false means exactly that), 'unsupported' (the hello_ack
+   features list omits the family — the daemon predates it),
+   'transport-down' (no verified tunnel; custody has no HTTP twin by
+   design, so no other lane can answer), 'connected' (go — optimistically
+   so while the handshake is still digesting, letting the RPCs answer
+   exactly as the pre-facade probes did). */
+function vaultLeaseAvailability() {
+  return daemonApi.availability('api_credential_lease_status');
+}
+
 function vaultLeaseTransportReady() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    // Leases need the credential RPC family. A daemon that advertises its
-    // control surface but not these methods is too old — report
-    // unsupported instead of firing calls that fail one by one. An empty
-    // list means the hello_ack hasn't landed yet: fall through and let
-    // the RPCs answer.
-    const features = status.controlFeatures;
-    if (Array.isArray(features) && features.length) {
-      return features.includes('api_credential_lease_status');
-    }
-    return true;
-  } catch {
-    return false;
-  }
+  return vaultLeaseAvailability().ok;
 }
 
-function vaultLeaseRpc(method, params = {}) {
-  return window.intendantDashboardControl.request(method, params, { timeoutMs: 15000 });
+/* One custody RPC. Tunnel-only by design (docs/src/credential-custody.md;
+   the transport design keeps the family off HTTP rows), which the facade
+   enforces: no fallback lane exists, so a custody mutation can never
+   replay elsewhere after an ambiguous failure, and a down tunnel rejects
+   immediately. Resolves with the result payload (the pre-facade contract
+   every call site and window.intendantVault.probeEgress keeps);
+   rejections are DaemonApiError, whose `kind` the refreshers classify
+   into availability verdicts. Per-method timeouts live in
+   dashboardControlRequestTimeoutMs — the `{ timeoutMs: 15000 }` option
+   the pre-facade call passed here was silently ignored by the request
+   verb; the custody rows of that table now carry the intent. */
+async function vaultLeaseRpc(method, params = {}) {
+  const { body } = await daemonApi.request(method, params);
+  return body;
 }
 
-/* Whether the tunneled daemon advertises local vault storage — strict
-   (feature must be listed) because this only gates an optional action. */
+/* Whether the tunneled daemon offers local vault storage to THIS session —
+   'connected' only: the daemon must have confirmed the method (status
+   boolean or features list), because this gates an optional action (the
+   sealed-copy button) that a credentials.manage-denied session or an
+   older daemon could only bounce. */
 function vaultTunnelDaemonVaultAvailable() {
-  try {
-    const status = window.intendantDashboardControl?.status?.();
-    if (!status?.connected || !status?.verifiedBinding?.ok) return false;
-    const features = status.controlFeatures;
-    return Array.isArray(features) && features.includes('api_daemon_vault_publish');
-  } catch {
-    return false;
-  }
+  return daemonApi.availability('api_daemon_vault_publish').reason === 'connected';
 }
 
 /* The lease kind a vault entry fuels, or null when it cannot fuel.
@@ -1252,11 +1381,22 @@ function vaultEntryLeaseKind(entry) {
 }
 
 async function vaultRefreshLeases({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = vaultLeaseAvailability();
+  if (!avail.ok) {
+    // The daemon already answered through features/status — record the
+    // verdict without firing RPCs that can only bounce (the render paths
+    // read the same availability live, so no re-render is needed here).
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = avail.reason;
+    }
+    return;
+  }
   if (!force && Date.now() - vaultLeaseState.fetchedAt < 30_000) return;
   try {
     const result = await vaultLeaseRpc('api_credential_lease_status');
     vaultLeaseState.supported = true;
+    vaultLeaseState.availability = 'connected';
     vaultLeaseState.leases = Array.isArray(result?.leases) ? result.leases : [];
     vaultLeaseState.egress = Array.isArray(result?.egress) ? result.egress : [];
     vaultLeaseState.expiredNote = String(result?.expired_note || '');
@@ -1267,12 +1407,20 @@ async function vaultRefreshLeases({ force = false } = {}) {
     }
     vaultEgressEnsure().catch(() => {});
   } catch (err) {
-    const message = String(err?.message || err);
-    // A daemon predating the lease RPCs, or a session without the
-    // credentials.manage gate, reads as unsupported rather than broken.
-    vaultLeaseState.supported = false;
-    vaultLeaseState.lastError = message;
+    vaultLeaseState.lastError = String(err?.message || err);
     vaultLeaseState.fetchedAt = Date.now();
+    // Availability honesty (transport F6): only the daemon's own refusals
+    // are verdicts about this session or this daemon. 'denied' is the
+    // authorizer refusing the gate, 'unavailable' is a daemon without the
+    // method (races where the pre-flight was still optimistic). A timeout
+    // or a dropped channel says nothing about support — keep the last
+    // known verdict and surface the error text instead of the old
+    // conflated "cannot manage leases" reading.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      vaultLeaseState.supported = false;
+      vaultLeaseState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessVaultSection();
   refreshUnfueledEmptyState().catch(() => {});
@@ -1280,20 +1428,41 @@ async function vaultRefreshLeases({ force = false } = {}) {
 }
 
 /* Custody trail: the daemon's own record of lease/relay lifecycle events,
-   fetched over the same credentials.manage-gated channel as the leases. */
-const custodyTrailState = { events: [], supported: null, fetchedAt: 0 };
+   fetched over the same credentials.manage-gated channel as the leases.
+   `availability` carries the honest cause when supported goes false:
+   'denied' (role refused the gate) vs 'unsupported' (daemon predates the
+   trail) — transient lane failures flip neither. */
+const custodyTrailState = { events: [], supported: null, availability: '', fetchedAt: 0 };
 
 async function vaultRefreshCustody({ force = false } = {}) {
-  if (!vaultLeaseTransportReady()) return;
+  const avail = daemonApi.availability('api_credential_custody_trail');
+  if (!avail.ok) {
+    if (avail.reason === 'denied' || avail.reason === 'unsupported') {
+      const changed = custodyTrailState.supported !== false
+        || custodyTrailState.availability !== avail.reason;
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = avail.reason;
+      custodyTrailState.fetchedAt = Date.now();
+      if (changed) renderAccessCustodySection();
+    }
+    return;
+  }
   if (!force && Date.now() - custodyTrailState.fetchedAt < 30_000) return;
   custodyTrailState.fetchedAt = Date.now();
   try {
     const result = await vaultLeaseRpc('api_credential_custody_trail');
     custodyTrailState.events = Array.isArray(result?.events) ? result.events : [];
     custodyTrailState.supported = true;
-  } catch {
-    // Older daemon or a session without credentials.manage.
-    custodyTrailState.supported = false;
+    custodyTrailState.availability = 'connected';
+  } catch (err) {
+    // Verdicts only from the daemon's own refusals (see
+    // vaultRefreshLeases); a timeout or dropped channel keeps whatever
+    // the last connected read established.
+    const kind = err?.kind || '';
+    if (kind === 'denied' || kind === 'unavailable') {
+      custodyTrailState.supported = false;
+      custodyTrailState.availability = kind === 'denied' ? 'denied' : 'unsupported';
+    }
   }
   renderAccessCustodySection();
 }
@@ -1318,7 +1487,10 @@ function renderAccessCustodySection() {
     mount.appendChild(el);
   };
   if (custodyTrailState.supported === false) {
-    note('This session cannot read the custody trail — it needs credentials.manage, or the daemon predates it.');
+    // The honest split (transport F6): the daemon said which it is.
+    note(custodyTrailState.availability === 'unsupported'
+      ? 'This daemon predates the custody trail — upgrade it to see lease and relay lifecycle events.'
+      : "This session can't read the custody trail — its role needs credentials.manage.");
     return;
   }
   if (!custodyTrailState.events.length) {
@@ -1971,7 +2143,7 @@ function vaultRenderAddForm(card) {
   const policySelect = document.createElement('select');
   for (const [value, label, title] of [
     ['any', 'Anywhere this vault opens', 'The default: usable from every dashboard that can open your vault.'],
-    ['trusted', 'Trusted origins only (direct / app)', 'Sealed against hosted tabs: no reveal, fueling, or relay from them. Client-side policy — a guard against mistakes, not a malicious page. Today the vault itself opens through Connect, so a trusted-only entry stays stored-but-sealed until the direct/app vault path lands.'],
+    ['trusted', 'Trusted origins only (direct / app)', 'Usable from this daemon-origin/native vault. Any future hosted vault client must keep it sealed: no reveal, fueling, or relay. Client-side policy guards against mistakes, not malicious served code.'],
   ]) {
     const option = document.createElement('option');
     option.value = value;
@@ -2021,8 +2193,8 @@ function vaultRenderAddForm(card) {
 }
 
 /* Fueling panel: this daemon's active leases + a fuel button per
-   fuelable vault entry. Renders wherever a vault store is reachable —
-   hosted tabs (account vault) and direct dashboards (local vault). */
+   fuelable vault entry. The shipped path is the trusted loopback/direct-mTLS
+   dashboard backed by this daemon's local vault. */
 function vaultRenderFueling(card) {
   if (!vaultAvailable()) return;
   const head = document.createElement('div');
@@ -2034,21 +2206,32 @@ function vaultRenderFueling(card) {
   head.appendChild(title);
   card.appendChild(head);
 
-  if (!vaultLeaseTransportReady()) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = 'Connect to the daemon to fuel it — leases travel only over the verified tunnel.';
-    card.appendChild(note);
+  const fuelingNote = text => {
+    const el = document.createElement('div');
+    el.className = 'vault-note';
+    el.textContent = text;
+    card.appendChild(el);
+  };
+  // Availability honesty (transport F6): the daemon's features/status
+  // answer BEFORE any RPC fires, so the panel names the actual cause —
+  // a session whose role is refused the gate, a daemon predating the
+  // family, or simply no tunnel yet — instead of the old conflated
+  // "cannot manage leases" catch-all. The stored verdict covers the
+  // race where a still-optimistic pre-flight let an RPC bounce.
+  const avail = vaultLeaseAvailability();
+  if (avail.reason === 'denied' || vaultLeaseState.availability === 'denied') {
+    fuelingNote("This session's role can't manage credential leases — fueling needs credentials.manage.");
+    return;
+  }
+  if (avail.reason === 'unsupported' || vaultLeaseState.availability === 'unsupported') {
+    fuelingNote('This daemon predates credential leases — upgrade it to fuel from the vault.');
+    return;
+  }
+  if (!avail.ok) {
+    fuelingNote('Connect to the daemon to fuel it — leases travel only over the verified tunnel.');
     return;
   }
   vaultRefreshLeases().catch(() => {});
-  if (vaultLeaseState.supported === false) {
-    const note = document.createElement('div');
-    note.className = 'vault-note';
-    note.textContent = `This session cannot manage credential leases: ${vaultLeaseState.lastError || 'the daemon predates leases or this role lacks credentials.manage.'}`;
-    card.appendChild(note);
-    return;
-  }
 
   if (vaultLeaseState.expiredNote) {
     const warning = document.createElement('div');
@@ -2056,7 +2239,9 @@ function vaultRenderFueling(card) {
     warning.textContent = vaultLeaseState.expiredNote;
     card.appendChild(warning);
   }
-  if (vaultLeaseState.lastError && vaultLeaseState.supported) {
+  // Transient lane failures (timeouts, channel drops) are errors, not
+  // support verdicts — show them even before the first successful probe.
+  if (vaultLeaseState.lastError && vaultLeaseState.supported !== false) {
     const error = document.createElement('div');
     error.className = 'vault-error';
     error.textContent = vaultLeaseState.lastError;
@@ -2335,7 +2520,7 @@ function renderAccessVaultSection() {
         ? 'This browser lacks the WebCrypto features the vault needs.'
         : DASHBOARD_CONNECT_MODE
           ? 'The hosted vault store is unreachable right now.'
-          : 'No vault store reachable yet: this daemon predates local vault storage, this session lacks credentials.manage, or the control channel is still connecting (retries automatically). Hosted Connect dashboards use the account vault instead.';
+          : vaultDaemonStoreUnavailableText();
       break;
     case 'signed-out':
       chip.textContent = 'signed out';
@@ -2517,6 +2702,7 @@ window.intendantVault = {
   voiceApiKeyGet: storageKey => voiceApiKeyGet(storageKey),
   leases: () => ({
     supported: vaultLeaseState.supported,
+    availability: vaultLeaseState.availability,
     leases: vaultLeaseState.leases.map(lease => ({ ...lease })),
     expiredNote: vaultLeaseState.expiredNote,
     lastError: vaultLeaseState.lastError,
@@ -2555,6 +2741,7 @@ window.intendantVault = {
   probeEgress: kind => vaultLeaseRpc('api_credential_egress_probe', { kind }),
   custody: () => ({
     supported: custodyTrailState.supported,
+    availability: custodyTrailState.availability,
     events: custodyTrailState.events.map(event => ({ ...event })),
   }),
   refreshCustody: () => vaultRefreshCustody({ force: true }),
@@ -2747,7 +2934,7 @@ async function orgRevocationCourier() {
       if (!resp.ok) continue;
       const body = await resp.json().catch(() => ({}));
       if (!body?.orl) continue;
-      const applied = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', body.orl);
+      const applied = await accessOrgCall('api_access_org_orl_apply', body.orl);
       if (applied?.applied?.changed) {
         console.info(`[org] carried @${handle} revocations seq ${applied.applied.seq} to this daemon (${applied.applied.revoked_grants} grants, ${applied.applied.revoked_peer_identities} peer identities revoked)`);
       }
@@ -2770,7 +2957,14 @@ function dashboardConnectMutationUnavailable(action, label = 'Dashboard control 
   return false;
 }
 
+// F8a warn-logging shim: zero in-repo callers after the flip — every
+// product call site rides the daemonApi facade. The legacy body stays
+// verbatim for the soak week (delegation double-records under
+// 'dashboardJsonFetch' and 'jsonFetch' by design — the label names the
+// missed method either way); window.qa.transportShimHits() is the soak
+// verdict, and F8b deletes this with the DashboardTransport shims.
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
+  dashboardTransportShimRecord('dashboardJsonFetch', label);
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
     return dashboardTransport.jsonFetch(method, params, fallback, label, options);
   }
@@ -2784,21 +2978,46 @@ function dispatchSessionControlMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Session control request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // send_server_action reports whether the frame reached an OPEN
+      // legacy /ws socket (only an explicit false refuses — QA stubs
+      // return undefined). A refused intent must not die silently: kick
+      // the event-lane fallback so the tunnel comes up, and tell the
+      // caller the send never left the browser.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'session control'} intent found no open event lane`);
+      }
+      console.warn('session control: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('session control: no app connection, dropped', payload);
     return false;
   };
   if (!DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_session_control_msg_available === true
-  ) {
-    dashboardTransport.request('api_session_control_msg', { message: payload }, {
+  // Transport F7: the RPC leg rides the daemonApi facade. WS-twin residue
+  // method (no HTTP row by design — the /ws intent stream below is the
+  // twin), so no HTTP lane exists for it; the availability derivation
+  // replaces the hand-rolled canUseRpc + status-boolean probe, and denied
+  // or too-old daemons fall through to /ws exactly as the strict boolean
+  // did. A tunnel attempt is final: never replayed over /ws.
+  if (daemonApi.availability('api_session_control_msg').ok) {
+    daemonApi.request('api_session_control_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      // Delivered refusals (allowlist drift the parity pins make
+      // near-impossible) surface instead of silently resolving; still no
+      // /ws replay — the response was delivered.
+      const err = new Error(resp.body?.error || 'Dashboard control request failed');
+      console.warn(`[dashboard-control] ${action} session ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} session ControlMsg RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {
@@ -2819,21 +3038,36 @@ function dispatchDashboardActionMsg(payload, options = {}) {
       return dashboardConnectMutationUnavailable(action, 'Dashboard action request', options);
     }
     if (app && app.send_server_action) {
-      app.send_server_action(payload);
-      return true;
+      // Same refused-send contract as dispatchSessionControlMsg above.
+      if (app.send_server_action(payload) !== false) return true;
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'dashboard action'} intent found no open event lane`);
+      }
+      console.warn('dashboard action: no open event lane, refused', action || payload);
+      const err = new Error('Dashboard control connection is down — reconnecting. Retry in a moment.');
+      if (typeof options.onError === 'function') options.onError(err);
+      else if (typeof showControlToast === 'function') showControlToast('error', err.message);
+      return false;
     }
     console.warn('dashboard action: no app connection, dropped', payload);
     return false;
   };
   if (!DASHBOARD_ACTION_MSG_RPC_ACTIONS.has(action)) return fallback();
-  if (
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_dashboard_action_msg_available === true
-  ) {
-    dashboardTransport.request('api_dashboard_action_msg', { message: payload }, {
+  // Transport F7: same facade + WS-twin residue shape as
+  // dispatchSessionControlMsg above — no HTTP lane, availability-derived
+  // routing, tunnel attempts never replayed over /ws.
+  if (daemonApi.availability('api_dashboard_action_msg').ok) {
+    daemonApi.request('api_dashboard_action_msg', { message: payload }, {
       timeoutMs: options.timeoutMs || 15000,
+    }).then(resp => {
+      if (resp.ok) return;
+      const err = new Error(resp.body?.error || 'Dashboard action failed');
+      console.warn(`[dashboard-control] ${action} dashboard action RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err.message);
+      }
     }).catch(err => {
       console.warn(`[dashboard-control] ${action} dashboard action RPC failed; not replaying over /ws`, err);
       if (typeof options.onError === 'function') {
@@ -2994,6 +3228,10 @@ function applyGatewayConfig(config) {
   if (currentExternalAgent === null) {
     currentExternalAgent = normalizeAgentId(cfg.external_agent);
   }
+  // Every lane's config lands here (boot fetch, tunnel config RPC,
+  // reconnect hydration, /ws-reconnect refetch) — the one chokepoint where
+  // a stale tab learns the daemon now serves a newer bundle.
+  if (typeof maybeNudgeStaleBuild === 'function') maybeNudgeStaleBuild(cfg.app_build);
   applyMainBackendStatus();
 }
 
@@ -3141,4 +3379,3 @@ function stationStatus(text) {
   }
   el.textContent = value;
 }
-

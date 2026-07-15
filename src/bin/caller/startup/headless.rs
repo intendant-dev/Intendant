@@ -242,8 +242,7 @@ pub(crate) async fn run_headless_mode(
                                 // approval slot in JSON mode.
                                 let mut guard = approval_slot.lock().unwrap();
                                 if let Some((_id, tx)) = guard.take() {
-                                    let _ =
-                                        tx.send(event::ApprovalResponse::Answer { answers });
+                                    let _ = tx.send(event::ApprovalResponse::Answer { answers });
                                 }
                             }
                             event::ControlMsg::Input { text } => {
@@ -297,10 +296,20 @@ pub(crate) async fn run_headless_mode(
         // Backend task dispatcher: listens on the bus for
         // ControlCommand(StartTask | FollowUp) from the dashboard and
         // routes to the presence layer or the follow-up channel.
+        //
+        // `follow_up_tx` only when something will read the other end:
+        // `follow_up_rx` is consumed by `run_external_agent_mode` /
+        // `run_direct_mode` — the `!use_presence` branches below.
+        // `run_with_presence` never reads it, so handing the dispatcher a
+        // sender in the presence shape made `try_send` "succeed" into a
+        // never-drained channel and emit phantom `SteerQueued` receipts
+        // (and silently ate task/follow-up fallbacks) for messages nothing
+        // would ever deliver. With `None`, those fallbacks reach the
+        // explicit warn+drop instead.
         task_dispatch::Dispatcher {
             presence_tx: presence_tx_for_dispatch,
             task_tx: task_tx.clone(),
-            follow_up_tx: Some(follow_up_tx.clone()),
+            follow_up_tx: (!use_presence).then(|| follow_up_tx.clone()),
             primary_session_id: session_log_id(&session_log),
         }
         .spawn(bus.clone());
@@ -349,9 +358,7 @@ pub(crate) async fn run_headless_mode(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
                 let (id, response) = match ctrl {
-                    event::ControlMsg::Approve { id, .. } => {
-                        (id, event::ApprovalResponse::Approve)
-                    }
+                    event::ControlMsg::Approve { id, .. } => (id, event::ApprovalResponse::Approve),
                     event::ControlMsg::ApproveAll { id, .. } => {
                         (id, event::ApprovalResponse::ApproveAll)
                     }
@@ -454,17 +461,30 @@ pub(crate) async fn run_headless_mode(
     let agent_backend = initial_agent_backend.clone();
     let shared_codex_config = shared_codex_config_from_project(&project);
     let shared_claude_config = shared_claude_config_from_project(&project);
-    let _control_plane_handle = control_plane::spawn(
-        bus.subscribe(),
-        control_plane::ControlPlaneState {
-            autonomy: autonomy.clone(),
-            external_agent: shared_external_agent.clone(),
-            codex_config: shared_codex_config.clone(),
-            claude_config: shared_claude_config.clone(),
-            bus: bus.clone(),
-            project_root: Some(project.root.clone()),
-        },
-    );
+    let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
+        autonomy: autonomy.clone(),
+        external_agent: shared_external_agent.clone(),
+        codex_config: shared_codex_config.clone(),
+        claude_config: shared_claude_config.clone(),
+        bus: bus.clone(),
+        project_root: Some(project.root.clone()),
+    });
+
+    // Session vitals: cache/limits are usage-driven and always produced;
+    // the git segment probes the live target registry (primary session
+    // seed + supervisor-registered sessions).
+    let vitals = if use_web {
+        let seed = session_log_id(&session_log)
+            .map(|session_id| vec![(session_id, project.root.clone())])
+            .unwrap_or_default();
+        Some(session_vitals::spawn_session_vitals_producer(
+            bus.clone(),
+            seed,
+        ))
+    } else {
+        None
+    };
+    let vitals_git_targets = vitals.as_ref().map(|(targets, _)| targets.clone());
 
     // Dashboard-driven CreateSession / ResumeSession while the foreground
     // session runs: parallel sessions are owned by the session supervisor
@@ -487,6 +507,7 @@ pub(crate) async fn run_headless_mode(
                     shared_session: headless_shared_session.clone(),
                     provider_factory: None,
                     logs_home_override: None,
+                    git_vitals_targets: vitals_git_targets.clone(),
                 },
             )
             .spawn_resume_listener(),
@@ -495,18 +516,6 @@ pub(crate) async fn run_headless_mode(
         None
     };
 
-    // Vitals chips for the primary session: git state of the project
-    // root (statusline port).
-    let _vitals_producer = if use_web {
-        session_log_id(&session_log).map(|session_id| {
-            session_vitals::spawn_session_vitals_producer(
-                bus.clone(),
-                vec![(session_id, project.root.clone())],
-            )
-        })
-    } else {
-        None
-    };
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     let _usage_rail = if use_web {
@@ -705,6 +714,7 @@ pub(crate) async fn run_headless_mode(
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: headless_shared_session.clone(),
+            git_vitals_targets: vitals_git_targets.clone(),
         })
         .await;
     } else {

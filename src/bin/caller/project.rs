@@ -169,7 +169,8 @@ pub struct CodexConfig {
     pub sandbox: String,
     /// Reasoning effort passed to Codex for reasoning-capable models.
     /// Codex's `-c model_reasoning_effort=...` — accepted values:
-    /// `"minimal" | "low" | "medium" | "high" | "xhigh"`. Empty = Codex default.
+    /// `"none" | "minimal" | "low" | "medium" | "high" | "xhigh" |
+    /// "max" | "ultra"`. Empty = Codex default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Optional Codex service-tier default for Intendant-managed Codex
@@ -267,7 +268,91 @@ pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never
 /// "default" as a menu choice without introducing a separate Option<String>
 /// juggling layer. All other values map straight to
 /// `-c model_reasoning_effort=...`.
-pub const CODEX_REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_REASONING_EFFORTS: &[&str] = &[
+    "", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// One entry in the Codex model picker catalog exposed to dashboard clients.
+///
+/// Codex itself remains the final authority (and the custom-id escape keeps
+/// staged/account-specific models usable), but keeping this compatibility
+/// snapshot on the daemon means every frontend derives the same model and
+/// effort vocabulary instead of carrying its own copy.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexModelCatalogEntry {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub default_reasoning_effort: &'static str,
+    pub reasoning_efforts: &'static [&'static str],
+}
+
+const CODEX_EFFORTS_THROUGH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
+const CODEX_EFFORTS_THROUGH_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS_THROUGH_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// Conservative offline Codex picker fallback. The dashboard replaces this
+/// with Codex's signed-in-account catalog whenever `models_cache.json` is
+/// available. Keep only actual Codex CLI model ids here; account/API aliases
+/// belong in the live catalog (or the picker's custom-id escape), not this
+/// fallback.
+pub const CODEX_MODEL_CATALOG: &[CodexModelCatalogEntry] = &[
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-sol",
+        display_name: "GPT-5.6-Sol",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-terra",
+        display_name: "GPT-5.6-Terra",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_ULTRA,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_MAX,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.5",
+        display_name: "GPT-5.5",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.3-codex-spark",
+        display_name: "GPT-5.3-Codex-Spark",
+        default_reasoning_effort: "high",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.4",
+        display_name: "GPT-5.4",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+    CodexModelCatalogEntry {
+        id: "gpt-5.4-mini",
+        display_name: "GPT-5.4-Mini",
+        default_reasoning_effort: "medium",
+        reasoning_efforts: CODEX_EFFORTS_THROUGH_XHIGH,
+    },
+];
+
+/// Resolve exact or version-suffixed Codex model ids to the most specific
+/// catalog entry (`gpt-5.6-luna-preview` must beat the shorter `gpt-5.6`
+/// alias prefix).
+pub fn codex_model_catalog_entry(model: &str) -> Option<&'static CodexModelCatalogEntry> {
+    CODEX_MODEL_CATALOG
+        .iter()
+        .filter(|entry| {
+            model
+                .strip_prefix(entry.id)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        })
+        .max_by_key(|entry| entry.id.len())
+}
 pub const CODEX_STANDARD_SERVICE_TIER: &str = "standard";
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
@@ -428,18 +513,31 @@ pub struct ClaudeCodeConfig {
     /// Model to use.
     #[serde(default)]
     pub model: Option<String>,
-    /// Permission mode: "default", "acceptEdits", "plan", "bypassPermissions".
-    /// The legacy value "auto" (never a real Claude Code mode) is accepted
-    /// and treated as "default".
+    /// Permission mode: "default", "acceptEdits", "plan", "auto",
+    /// "dontAsk", or "bypassPermissions" ("manual" is the CLI's alias for
+    /// "default"). "auto" (classifier-based approvals) became a real CLI
+    /// mode in 2.1.x — configs that predate Intendant 2026-07-04 and still
+    /// carry the old shipped default "auto" now get that documented mode
+    /// instead of the historical coercion to "default".
     #[serde(default = "default_claude_code_permission_mode")]
     pub permission_mode: String,
     /// Allowed tools list (empty = all).
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     /// Reasoning-effort level passed as `--effort`: "low", "medium",
-    /// "high", "xhigh", or "max". `None` omits the flag (CLI default).
+    /// "high", "xhigh", "max", or "ultracode" (2.1.203+: xhigh with the
+    /// ultracode meta-mode on). `None` omits the flag (CLI default).
     #[serde(default)]
     pub effort: Option<String>,
+    /// Hard per-session dollar backstop passed as `--max-budget-usd`
+    /// (print mode; CLI-enforced, cumulative across the process AND its
+    /// resumes). On exceed the CLI ends every further turn with a
+    /// `result` of subtype `error_max_budget_usd` (probed on 2.1.206),
+    /// surfaced as a backend error with a recovery hint. `None` omits the
+    /// flag. Complements goal budgets: goals measure fresh tokens and
+    /// steer the model; this is the CLI's own hard stop.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 fn default_claude_code_command() -> String {
@@ -451,30 +549,51 @@ fn default_claude_code_permission_mode() -> String {
 }
 
 /// Canonicalize a Claude Code reasoning-effort level. The CLI accepts
-/// low / medium / high / xhigh / max; empty and "default" mean "don't pass
-/// the flag". Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// low / medium / high / xhigh / max / ultracode (2.1.203+); empty and
+/// "default" mean "don't pass the flag". Unknown values pass through
+/// trimmed for forward compatibility with newer CLIs.
 pub fn normalize_claude_effort(effort: Option<&str>) -> Option<String> {
     let trimmed = effort.map(str::trim).filter(|s| !s.is_empty())?;
     let lowered = trimmed.to_ascii_lowercase();
     match lowered.as_str() {
         "default" | "inherit" => None,
-        "low" | "medium" | "high" | "xhigh" | "max" => Some(lowered),
+        "low" | "medium" | "high" | "xhigh" | "max" | "ultracode" => Some(lowered),
         _ => Some(trimmed.to_string()),
     }
 }
 
-/// Canonicalize a Claude Code permission mode. The CLI's real modes are
-/// `default`, `acceptEdits`, `plan`, and `bypassPermissions`; the legacy
-/// Intendant default "auto" (never a real mode — the CLI silently coerces
-/// it) maps to `default`. Unknown values pass through trimmed for forward
-/// compatibility with newer CLIs.
+/// Canonicalize a Claude Code permission mode. The CLI's modes on 2.1.206
+/// are `default` (alias `manual`), `acceptEdits`, `plan`, `auto`
+/// (classifier-based approvals), `dontAsk` (auto-deny anything that would
+/// prompt), and `bypassPermissions` — all probed accepted. `auto` was once
+/// coerced to `default` here (pre-2.1.83 CLIs silently coerced it); now
+/// that it is a documented mode it passes through. Unknown values pass
+/// through trimmed for forward compatibility with newer CLIs.
+/// Canonical Claude Code permission-mode vocabulary — the normalizer's
+/// output set, in display order. The frontend mirrors (the dashboard
+/// selects in `static/app/20-shell.html` and `static/app/21-access-dialogs.html`,
+/// the Station pane mode gate in `static/app/34-station-panes.js`, and the
+/// station-web pill row in `crates/station-web/src/hud/panels.rs`) are
+/// pinned to this list by
+/// `claude_permission_mode_mirrors_carry_the_canonical_vocabulary` — extend
+/// the list and every mirror in the same change.
+pub const CLAUDE_PERMISSION_MODES: [&str; 6] = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
+
 pub fn normalize_claude_permission_mode(mode: &str) -> String {
     let trimmed = mode.trim();
     match trimmed.to_ascii_lowercase().as_str() {
-        "" | "default" | "auto" => "default".to_string(),
+        "" | "default" | "manual" => "default".to_string(),
         "acceptedits" | "accept-edits" | "accept_edits" => "acceptEdits".to_string(),
         "plan" => "plan".to_string(),
+        "auto" => "auto".to_string(),
+        "dontask" | "dont-ask" | "dont_ask" => "dontAsk".to_string(),
         "bypasspermissions" | "bypass-permissions" | "bypass_permissions" => {
             "bypassPermissions".to_string()
         }
@@ -490,6 +609,7 @@ impl Default for ClaudeCodeConfig {
             permission_mode: default_claude_code_permission_mode(),
             effort: None,
             allowed_tools: Vec::new(),
+            max_budget_usd: None,
         }
     }
 }
@@ -668,13 +788,23 @@ struct DaemonConnectFile {
     connect: ConnectConfig,
 }
 
+/// Root carrying durable, daemon-wide settings when no project is attached.
+///
+/// A projectless daemon must not pretend this is a session project (doing so
+/// would widen sandbox and file-watcher scope), but it still needs a durable
+/// place for dashboard defaults. Its `intendant.toml` lives directly under
+/// this state root.
+pub fn daemon_settings_config_root() -> PathBuf {
+    crate::platform::intendant_home()
+}
+
 /// Where a projectless daemon persists its Connect client config. Rooted
 /// daemons keep `[connect]` in the project's `intendant.toml`; a daemon
-/// with no project (the bundled app's normal shape) has no intendant.toml
-/// to write, so the config lives with the rest of the machine-local daemon
-/// state under the state root.
+/// with no project (the bundled app's normal shape) keeps Connect's
+/// credential-bearing table in its existing owner-only file beside the
+/// general daemon settings file.
 pub fn daemon_connect_config_path() -> PathBuf {
-    crate::platform::intendant_home().join("connect.toml")
+    daemon_settings_config_root().join("connect.toml")
 }
 
 /// Load the daemon-scoped Connect config. An absent file is the normal
@@ -682,9 +812,7 @@ pub fn daemon_connect_config_path() -> PathBuf {
 pub fn load_daemon_connect_config_in(path: &Path) -> Result<ConnectConfig, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConnectConfig::default())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ConnectConfig::default()),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     let file: DaemonConnectFile =
@@ -707,8 +835,7 @@ pub fn save_daemon_connect_config_in(path: &Path, config: &ConnectConfig) -> Res
     let text =
         toml::to_string_pretty(&file).map_err(|e| format!("serialize connect config: {e}"))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -1345,6 +1472,28 @@ impl Project {
                     config.agent.codex.context_archive
                 );
             }
+            // "auto" changed meaning when Claude Code 2.1.206 made it a real
+            // CLI mode: older Intendant coerced it to "default" (prompt for
+            // everything), so a pre-existing config now silently escalates
+            // to classifier auto-approval without this notice.
+            if config
+                .agent
+                .claude_code
+                .permission_mode
+                .trim()
+                .eq_ignore_ascii_case("auto")
+            {
+                eprintln!(
+                    "[project] intendant.toml [agent.claude_code] permission_mode = \"auto\" now selects the claude CLI's auto-approval mode (2.1.206+); older Intendant treated it as \"default\" (prompt for everything) — set \"default\" explicitly if you want prompting"
+                );
+            }
+            if let Some(budget) = config.agent.claude_code.max_budget_usd {
+                if !(budget.is_finite() && budget > 0.0) {
+                    eprintln!(
+                        "[project] intendant.toml [agent.claude_code] max_budget_usd = {budget} is not a positive dollar amount; Claude Code sessions will refuse to spawn until it is fixed or unset"
+                    );
+                }
+            }
             config
         } else {
             ProjectConfig::default()
@@ -1423,6 +1572,59 @@ mod tests {
         // Whitespace-only entries behave like unset.
         cfg.managed_command = Some("   ".to_string());
         assert_eq!(cfg.effective_command(true), "codex");
+    }
+
+    #[test]
+    fn claude_permission_mode_mirrors_carry_the_canonical_vocabulary() {
+        // The canonical list is the normalizer's own output set…
+        for mode in CLAUDE_PERMISSION_MODES {
+            assert_eq!(
+                normalize_claude_permission_mode(mode),
+                mode,
+                "canonical mode {mode} must survive normalization"
+            );
+        }
+        // …and every static frontend mirror must carry all of it, so a mode
+        // added to the vocabulary without extending a mirror fails here
+        // instead of shipping as silent frontend drift.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
+        };
+        let shell = read("static/app/20-shell.html");
+        let dialogs = read("static/app/21-access-dialogs.html");
+        let panes = read("static/app/34-station-panes.js");
+        let pills = read("crates/station-web/src/hud/panels.rs");
+        for mode in CLAUDE_PERMISSION_MODES {
+            for (name, hay, needle) in [
+                (
+                    "static/app/20-shell.html",
+                    &shell,
+                    format!("value=\"{mode}\""),
+                ),
+                (
+                    "static/app/21-access-dialogs.html",
+                    &dialogs,
+                    format!("value=\"{mode}\""),
+                ),
+                (
+                    "static/app/34-station-panes.js",
+                    &panes,
+                    format!("'{mode}'"),
+                ),
+                (
+                    "crates/station-web/src/hud/panels.rs",
+                    &pills,
+                    format!("\"{mode}\""),
+                ),
+            ] {
+                assert!(
+                    hay.contains(&needle),
+                    "{name} is missing permission mode {mode} (looked for {needle}); \
+                     extend the mirror alongside CLAUDE_PERMISSION_MODES"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2061,6 +2263,64 @@ default_backend = "codex"
         }
         // Typos still normalize to the safe default.
         assert_eq!(normalize_codex_context_archive("summry"), "summary");
+    }
+
+    #[test]
+    fn codex_reasoning_effort_accepts_current_full_vocabulary() {
+        for effort in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            assert_eq!(
+                normalize_reasoning_effort(Some(effort)).as_deref(),
+                Some(effort)
+            );
+        }
+        assert_eq!(
+            normalize_reasoning_effort(Some(" ultra ")).as_deref(),
+            Some("ultra")
+        );
+        assert!(normalize_reasoning_effort(Some("extreme")).is_none());
+        assert!(normalize_reasoning_effort(None).is_none());
+    }
+
+    #[test]
+    fn codex_catalog_prefers_the_most_specific_version_prefix() {
+        assert_eq!(
+            codex_model_catalog_entry("gpt-5.6-luna-preview").map(|entry| entry.id),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            codex_model_catalog_entry("gpt-5.6-sol").map(|entry| entry.id),
+            Some("gpt-5.6-sol")
+        );
+        assert!(codex_model_catalog_entry("account-private-model").is_none());
+    }
+
+    #[test]
+    fn codex_catalog_ids_defaults_and_efforts_are_consistent() {
+        let ids: std::collections::BTreeSet<_> =
+            CODEX_MODEL_CATALOG.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids.len(), CODEX_MODEL_CATALOG.len(), "duplicate model id");
+        assert!(
+            !ids.contains("gpt-5.6"),
+            "the bare alias Codex does not advertise must not be in the offline fallback"
+        );
+        for entry in CODEX_MODEL_CATALOG {
+            assert!(
+                entry
+                    .reasoning_efforts
+                    .contains(&entry.default_reasoning_effort),
+                "{} default is not supported",
+                entry.id
+            );
+            for effort in entry.reasoning_efforts {
+                assert!(
+                    CODEX_REASONING_EFFORTS.contains(effort),
+                    "{} advertises unknown effort {effort}",
+                    entry.id
+                );
+            }
+        }
     }
 
     /// `managed_context` defaults to "vanilla" when absent and is also

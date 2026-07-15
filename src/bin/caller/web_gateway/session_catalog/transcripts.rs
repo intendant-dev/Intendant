@@ -305,6 +305,7 @@ pub(crate) fn codex_removed_turn_ids_for_user_turns(
     removed.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
     user_turn_revisions: &mut ReplayUserTurnRevisionState,
@@ -745,10 +746,24 @@ pub(crate) fn codex_session_has_assistant_response_items(path: &Path) -> bool {
     false
 }
 
+/// Rebuild Activity entries from Claude Code's native `~/.claude` session
+/// JSONL, STRUCTURALLY — mirroring the live event shapes (level / source /
+/// kind / item_id) so hydration renders what the live feed rendered and the
+/// transcript-sync dedupe (`sessionWindowTranscriptSignatures*`) collapses
+/// the two instead of duplicating rows.
+///
+/// The flat predecessor extracted every block's text with
+/// `message_content_text` and stamped user-role envelopes as source
+/// `"user"` — which put tool_result payloads (command output!) in the log
+/// as USER speech, dropped tool-call rows entirely, and used a source
+/// label ("claude") the live rows never carry ("Claude Code").
 pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut entries = Vec::new();
+    // The live rows' source label (AgentBackend::Display) — dedupe
+    // signatures include the source, so this must match byte-for-byte.
+    let agent_source = crate::external_agent::AgentBackend::ClaudeCode.to_string();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -768,26 +783,157 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        let text = obj
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(message_content_text)
-            .unwrap_or_default();
-        if text.is_empty() {
+        // Machine-generated records: `isMeta` synthetic turns and
+        // `isCompactSummary` context summaries are not conversation prose.
+        // The live feed never rendered them, and the message-search ground
+        // truth (`message_search::extract_claude::record_from_line`) skips
+        // both — rendering them here painted harness plumbing as User rows.
+        if obj.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+            || obj.get("isCompactSummary").and_then(|v| v.as_bool()) == Some(true)
+        {
             continue;
         }
-        // Claude Code writes its local-command plumbing (/login, /compact …)
-        // as ordinary user lines; the Codex surfaces already filter this
-        // vocabulary and the Activity log must not render it either.
-        if typ == "user" && is_injected_external_user_text(&text) {
+        let ts = value_str(&obj, "timestamp").unwrap_or_default();
+        let ts_ms = chrono::DateTime::parse_from_rfc3339(&ts)
+            .ok()
+            .map(|dt| dt.timestamp_millis());
+        let mut push = |mut entry: serde_json::Value| {
+            entry["ts"] = serde_json::Value::String(ts.clone());
+            if let Some(ms) = ts_ms {
+                entry["ts_ms"] = serde_json::Value::from(ms);
+            }
+            entries.push(entry);
+        };
+        let content = obj.get("message").and_then(|m| m.get("content"));
+        // The wrapper appends its supervision addendum to the first prompt;
+        // the live UserMessageLog row shows the user's own text. Trim it so
+        // hydrated rows read (and dedupe) like the live ones.
+        let user_prose = |text: &str| -> String {
+            text.split(crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER)
+                .next()
+                .unwrap_or(text)
+                .trim()
+                .to_string()
+        };
+
+        // Plain-string content: only user prompts use this shape.
+        if let Some(text) = content.and_then(|c| c.as_str()) {
+            let text = user_prose(text);
+            if typ == "user" && !text.is_empty() && !is_injected_external_user_text(&text) {
+                push(serde_json::json!({
+                    "level": "info",
+                    "source": "User",
+                    "content": text,
+                }));
+            }
             continue;
         }
-        entries.push(serde_json::json!({
-            "ts": value_str(&obj, "timestamp").unwrap_or_default(),
-            "level": if typ == "assistant" { "model" } else { "info" },
-            "source": external_transcript_source("claude", typ),
-            "content": text,
-        }));
+        let Some(blocks) = content.and_then(|c| c.as_array()) else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    let text = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if typ == "assistant" {
+                        // Live shape: ModelResponse summary (plain text
+                        // passes through format_model_summary unchanged).
+                        push(serde_json::json!({
+                            "level": "model",
+                            "source": agent_source,
+                            "content": text,
+                        }));
+                    } else if !is_injected_external_user_text(text) {
+                        let text = user_prose(text);
+                        if !text.is_empty() {
+                            // Live shape: UserMessageLog → LogEntry.
+                            push(serde_json::json!({
+                                "level": "info",
+                                "source": "User",
+                                "content": text,
+                            }));
+                        }
+                    }
+                }
+                "thinking" if typ == "assistant" => {
+                    let text = block
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if !text.is_empty() {
+                        // Live shape: reasoning-only ModelResponse, which
+                        // the dashboard renders as a detail-level
+                        // "Reasoning: …" row.
+                        push(serde_json::json!({
+                            "level": "detail",
+                            "source": agent_source,
+                            "content": format!("Reasoning: {text}"),
+                        }));
+                    }
+                }
+                "tool_use" if typ == "assistant" => {
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let input = block
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let preview = crate::external_agent::claude_code::tool_input_preview(&input);
+                    let Some(content) =
+                        crate::external_output::external_tool_preview_text(name, &preview)
+                    else {
+                        continue;
+                    };
+                    let mut entry = serde_json::json!({
+                        "level": "agent",
+                        "source": agent_source,
+                        // Command announcement, never command output — the
+                        // frontend's level-'agent' fallback groups untagged
+                        // rows into output groups.
+                        "kind": "tool_call",
+                        "content": content,
+                    });
+                    if let Some(id) = block.get("id").and_then(|i| i.as_str()) {
+                        entry["item_id"] = serde_json::Value::String(id.to_string());
+                    }
+                    push(entry);
+                }
+                "tool_result" => {
+                    let text = block
+                        .get("content")
+                        .and_then(message_content_text)
+                        .unwrap_or_default();
+                    let text = text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    // Live shape: AgentOutput (kind agent_output), grouped
+                    // under its tool call via item_id — NEVER user speech.
+                    let mut entry = serde_json::json!({
+                        "level": if is_error { "warn" } else { "agent" },
+                        "source": agent_source,
+                        "kind": "agent_output",
+                        "content": text,
+                    });
+                    if let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) {
+                        entry["item_id"] = serde_json::Value::String(id.to_string());
+                    }
+                    push(entry);
+                }
+                _ => {}
+            }
+        }
     }
 
     Some(entries)
@@ -1215,7 +1361,7 @@ pub(crate) fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBu
             Some((mtime, path))
         })
         .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
     dirs.truncate(limit);
     dirs.into_iter().map(|(_, path)| path).collect()
 }
@@ -2395,5 +2541,122 @@ mod tests {
                 .get("preview")
                 .and_then(|v| v.as_str())
                 .is_some_and(|preview| preview.contains("from raw trace")))));
+    }
+
+    /// The Claude transcript reconstruction mirrors the LIVE event shapes:
+    /// tool_results are agent output under their tool call (never "user"
+    /// speech), tool calls render as command rows with item ids, thinking
+    /// becomes a detail Reasoning row, and the source label is the live
+    /// "Claude Code" so hydration dedupes against streamed rows.
+    #[test]
+    fn claude_transcript_parse_is_structural() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"type":"user","timestamp":"2026-07-13T03:22:56.000Z","message":{"role":"user","content":[{"type":"text","text":"Read README.md"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-13T03:23:13.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"planning the read"},{"type":"text","text":"I'll read it."},{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"cat README.md"}}]}}"#,
+            r##"{"type":"user","timestamp":"2026-07-13T03:23:14.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"# QA sandbox"}]}}"##,
+            r#"{"type":"user","timestamp":"2026-07-13T03:23:15.000Z","message":{"role":"user","content":[{"type":"text","text":"<local-command-stdout>noise</local-command-stdout>"}]}}"#,
+            r#"{"type":"user","timestamp":"2026-07-13T03:23:16.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_02","is_error":true,"content":[{"type":"text","text":"boom"}]}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let entries = parse_claude_session_entries(&path).expect("parse");
+        let rows: Vec<(String, String, String, String, String)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["level"].as_str().unwrap_or("").to_string(),
+                    e["source"].as_str().unwrap_or("").to_string(),
+                    e["kind"].as_str().unwrap_or("").to_string(),
+                    e["item_id"].as_str().unwrap_or("").to_string(),
+                    e["content"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "info".into(),
+                    "User".into(),
+                    "".into(),
+                    "".into(),
+                    "Read README.md".into()
+                ),
+                (
+                    "detail".into(),
+                    "Claude Code".into(),
+                    "".into(),
+                    "".into(),
+                    "Reasoning: planning the read".into()
+                ),
+                (
+                    "model".into(),
+                    "Claude Code".into(),
+                    "".into(),
+                    "".into(),
+                    "I'll read it.".into()
+                ),
+                (
+                    "agent".into(),
+                    "Claude Code".into(),
+                    "tool_call".into(),
+                    "toolu_01".into(),
+                    "Bash: cat README.md".into()
+                ),
+                (
+                    "agent".into(),
+                    "Claude Code".into(),
+                    "agent_output".into(),
+                    "toolu_01".into(),
+                    "# QA sandbox".into()
+                ),
+                (
+                    "warn".into(),
+                    "Claude Code".into(),
+                    "agent_output".into(),
+                    "toolu_02".into(),
+                    "boom".into()
+                ),
+            ]
+        );
+        // Timestamps ride both string and millisecond forms for ordered
+        // merging on the frontend.
+        assert_eq!(entries[0]["ts"], "2026-07-13T03:22:56.000Z");
+        assert_eq!(entries[0]["ts_ms"], 1_783_912_976_000_i64);
+    }
+
+    /// `isMeta` synthetic turns and `isCompactSummary` context summaries are
+    /// machine-generated — the ground truth
+    /// (`message_search::extract_claude::record_from_line`) skips both, and
+    /// the structural parser must too instead of rendering them as User rows.
+    #[test]
+    fn claude_transcript_parse_skips_meta_and_compact_summary_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-07-13T03:22:50.000Z","message":{"role":"user","content":"Caveat: the messages below were generated by the harness"}}"#,
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-07-13T03:22:51.000Z","message":{"role":"user","content":[{"type":"text","text":"<system-notice>synthetic turn</system-notice>"}]}}"#,
+            r#"{"type":"user","isCompactSummary":true,"timestamp":"2026-07-13T03:22:52.000Z","message":{"role":"user","content":[{"type":"text","text":"This session is being continued from a previous conversation..."}]}}"#,
+            r#"{"type":"user","timestamp":"2026-07-13T03:22:56.000Z","message":{"role":"user","content":[{"type":"text","text":"real user prompt"}]}}"#,
+            r#"{"type":"assistant","isMeta":false,"timestamp":"2026-07-13T03:23:13.000Z","message":{"role":"assistant","content":[{"type":"text","text":"real reply"}]}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let entries = parse_claude_session_entries(&path).expect("parse");
+        let contents: Vec<&str> = entries
+            .iter()
+            .map(|e| e["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["real user prompt", "real reply"],
+            "machine-generated records must not render as conversation rows"
+        );
+        assert!(entries
+            .iter()
+            .all(|e| e["source"] != "User" || e["content"] == "real user prompt"));
     }
 }

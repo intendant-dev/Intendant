@@ -1,25 +1,25 @@
 # CLAUDE.md
 
-> **Living document — last verified 2026-07-04 against `main` @ `3fb8eb30`.**
+> **Living document — reviewed 2026-07-13 for the alpha trust refactor, based on `main` @ `714f24af`.**
 > This is a *tight orientation* for working in the repo. The deep reference lives in
 > the mdBook under `docs/src/` (mapped below). **Both this file and those docs lag the
 > code** — Intendant moves fast (~500 commits/month) and the docs are *not* updated on
 > every change. When this file, the docs, and the source disagree, **trust the source**,
 > then fix the doc. See what changed since this was written with
-> `git log --oneline 3fb8eb30..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
+> `git log --oneline 714f24af..HEAD`. (`AGENTS.md` is a tracked, byte-for-byte copy of this
 > file — when you edit CLAUDE.md, run `cp CLAUDE.md AGENTS.md` in the same commit; CI enforces they match.)
 
 ## What Intendant Is
 
-Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. Provider-agnostic (OpenAI, Anthropic, Gemini); cross-platform (macOS, Linux, Windows — all first-class); every capability reachable from any interface (CLI, web dashboard, MCP, voice).
+Intendant is an autonomous AI agent operating environment written in Rust. It gives an AI agent a full desktop — shell, file editing, a graphical display it can see and control, voice, and phone calls — under layered human oversight. Beyond running its own agent loop, it **supervises external coding agents** (Codex, Claude Code) as managed backends and **federates with peer machines**. It is provider-agnostic (OpenAI, Anthropic, Gemini) and cross-platform (macOS, Linux, Windows — all first-class). Its shipped trust anchors are local presence and an independently reached direct-mTLS dashboard; CLI and MCP provide automation, and the dashboard provides visual, voice, and phone control. The packaged macOS app contains a local mTLS bridge, but no Developer ID-signed/notarized release has been published for this alpha. An `-unsigned-dev` app artifact is not a distribution trust anchor.
 
-Past the single box, the ambition is a **network of agentic networks** — fleets of daemons owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; browser identity keys protected by passkeys; org root keys sign grant documents and revocation lists; the hosted rendezvous is zero-authority and self-hostable), **credential custody** (daemons borrow time-boxed leases from a passkey-sealed vault or relay calls through the owner's browser — a disposable box's disk holds no durable secrets), and the **zero-install client** (the entire client is a browser tab: claim a fresh daemon with a twelve-word phrase, watch every fleet display live, phone included). The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
+Past the single box, daemons federate into a **network of agentic networks** — fleets owned by people and organizations, where owners grant other people and other daemons scoped access to their machines, infrastructure, and resources. Three pillars carry it: the **trust architecture** (authority is only ever minted by the target daemon's local IAM; a hosted claim is discovery/route metadata and creates no principal or grant; the default binary fixes hosted provenance at the zero-permission `role:none` and treats rendezvous-controlled fleet WebPKI names as discovery-only, so shipped daemon control requires a trusted local or independently reached daemon-served direct/mTLS surface; org root keys sign grant documents and revocation lists), **credential custody** (sealed vault stores, time-boxed leases, and client egress exist, but the default build has no bridge from a Connect-origin account vault to a trusted daemon session; `.env` remains supported, and active full-credential OAuth leases temporarily materialize private auth files), and the **zero-install discovery client** (a browser tab can link a daemon with a single-use twelve-word claim code and find the fleet, but cannot control it). Connect remains self-hostable and is not an authority mint, but it is trusted for availability, account/route metadata, and the browser code and installers it serves. The name is the thesis: agents perform, orchestrators conduct, the Intendant runs the house — and answers to the owner.
 
 ## The Three Binaries (security boundary)
 
 - **intendant-runtime** (`src/main.rs`, `src/agent.rs`) — sandboxed executor. Reads one JSON `AgentInput` from stdin, runs commands sequentially, writes JSONL results. Landlock-restricted on Linux, Seatbelt-wrapped on macOS, restricted-token re-exec on Windows (`src/win_sandbox.rs`). **Never holds API keys.**
 - **intendant** (`src/bin/caller/main.rs`) — controller. Drives the LLM loop, calls model APIs, dispatches tool calls to the runtime subprocess, supervises external agents, and runs every frontend.
-- **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores only what daemons and browsers publish; fleet records are browser-signed and re-verified client-side so the service cannot invent or alter them. Holds no daemon secrets and no API keys.
+- **intendant-connect** (`src/bin/connect/main.rs`) — hosted rendezvous + account/metadata service (deployed to intendant.dev; self-hostable, see `docs/src/self-hosted-rendezvous.md`). Stores what daemons and browsers publish. Fleet records are self-signed: the current browser detects same-key alteration, but there is not yet an owner/device trust set, so a malicious store can substitute a newly self-signed record on another device. That metadata never grants daemon authority. Connect also serves browser code and installers, so malicious served code can alter or exfiltrate what the Connect page sees and a malicious installer can compromise what it installs. It holds no daemon API keys, cannot mint daemon-local IAM, and the default daemon refuses hosted-provenance control at immutable `role:none`.
 
 The runtime/controller split is the load-bearing security decision: a compromised model conversation can't reach API keys; the runtime can't exfiltrate through model APIs. Preserve it.
 
@@ -65,9 +65,17 @@ cargo nextest run --bins  # same tests, much faster: one process per test
 cargo clippy              # lint
 ```
 
-**WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails (use the pinned version):
-`cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web` or
-`cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web`.
+Never clear `RUSTC_WRAPPER` or set `RUSTC` for builds in this repo: the
+box-wide compile governor (scripts/ci/README.md, "Governor") rides those
+settings, and overriding them opts your build out of the machine's
+RAM-protecting compile ceiling (the 2026-07-10 OOM-spiral class).
+Permitted only when deliberately diagnosing the wrapper chain itself.
+
+**WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails: `bash scripts/build-wasm.sh`
+(the canonical builder — it carries the registry-path remap that makes
+artifact bytes account-independent; the CI drift gate rebuilds through the
+same script, and build.rs mirrors its flags). **Regenerate wasm artifacts on
+macOS only** — output is not byte-deterministic across host triples.
 
 Common invocations (full flag reference in `docs/src/getting-started.md`):
 
@@ -88,7 +96,7 @@ displays, screenshots, computer use, federated peers — use `intendant ctl`
 (self-describing: `ctl --help`; agent guide in `skills/intendant-cli/SKILL.md`).
 Read the source to change Intendant, not to operate it.
 
-**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test --test e2e`. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
+**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/` is the headless end-to-end suite (in CI on all three platforms): it spawns the real binaries against the scripted mock provider (`PROVIDER=mock` + `INTENDANT_MOCK_SCRIPT`, `src/bin/caller/provider_mock.rs`) — keyless, no network, no display; run it with `cargo test --test e2e`. "No display" is enforced by `INTENDANT_MOCK_DISPLAY=synthetic` (honored only alongside `PROVIDER=mock`; fail-closed otherwise), which serves display enumeration/capture from a deterministic 1280×720 synthetic backend (`crates/intendant-display/src/synthetic.rs`) so no native capture API (SCK, GDI/DXGI, X11, Wayland) is ever touched. Real-LLM scenarios live as SKILL.md files under `tests/skills/` and are **not** in CI (real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
 
 ## Repository Layout
 
@@ -141,6 +149,15 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - tokio (full features), `Arc<RwLock/Mutex<T>>` for shared state, `mpsc` for channels
 - TLS/cert code is **pure-Rust `ring`/`rcgen`/`rustls`** (`web_tls.rs`, `access/certs.rs`) — no OpenSSL; prefer that path when touching crypto/cert code
 - Tests live in inline `#[cfg(test)]` modules only
+- **Tests are hermetic.** A test must never read or mutate machine state
+  outside the repo checkout and its own temp dirs — CI runs on the fleet's
+  real accounts, so a fixture that resolves `dirs::home_dir()` scans a
+  live box (worktree roots, `~/.intendant` session stores) and its outcome
+  and duration become machine state. Functions under test take their roots
+  as parameters (`home: &Path`, store dirs); the transport edge resolves
+  the real environment, tests inject `tempfile` dirs. A nextest lane or
+  widened timeout around an environment-dependent test is a smell, not a
+  fix.
 - **File size budget:** keep a source file under ~3k lines of non-test code
   (4k absolute ceiling; inline `#[cfg(test)]` modules don't count against it;
   the remaining god-files are legacy being carved down, not precedents). When a
@@ -155,7 +172,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - **Derive, don't mirror.** Daemon truth a frontend needs — permission
   catalogs, feature lists, availability booleans, option vocabularies — is
   declared once and derived everywhere else (exemplar: the tunnel method
-  table — `gateway_routes::ROUTES` tunnel columns ∪ the `CONTROL_METHODS`
+  table — `gateway_routes::ROUTES` tunnel columns ∪ the `CONTROL_ONLY_METHODS`
   residue in `dashboard_control/mod.rs` — drives the authorizer, the
   `features` list, and the per-method availability booleans). When a static
   frontend fallback copy is unavoidable (app.html's IAM catalog, the
@@ -172,7 +189,7 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   request-body policy (dispatch reads and caps the body before the handler
   runs). A route's dashboard-control (datachannel) twin is declared on the
   same row: tunnel-twinned methods get the row's `tunnel:` column
-  (`TunnelSpec`) — never a `CONTROL_METHODS` entry; that table is the residue
+  (`TunnelSpec`) — never a `CONTROL_ONLY_METHODS` entry; that table is the residue
   for tunnel-only methods, and the tunnel derives each twinned method's IAM
   operation from its row. Unit tests enforce the table invariants, pin the
   docs chapter, pin every route-specific body cap, and freeze the tunnel
@@ -306,10 +323,14 @@ collisions cheap:
   --draft --fill`, then `gh pr ready` once green). Drafts are the fleet's
   files-in-flight signal — before touching hot files, check what's already
   in motion: `gh pr list --state open --json number,title,headRefName,isDraft,files`.
-- **Auto-merge silently disarms** whenever the PR stops being mergeable (main
-  conflict) or a check fails — after every conflict-resolution push or flake
-  rerun, re-run `gh pr merge <n> --merge --auto` and confirm
-  `autoMergeRequest` is set again. While the PR sits IN the queue,
+- **Auto-merge can silently disarm** (check failure, queue ejection) — after
+  every conflict-resolution push or flake rerun, re-run
+  `gh pr merge <n> --merge --auto` and confirm `autoMergeRequest` is set
+  again. But **disarm is NOT a reliable conflict signal**: a pre-queue PR
+  that goes `CONFLICTING`/`DIRTY` under a moving main can keep auto-merge
+  ARMED and park forever (observed live, PR #293 2026-07-13) — any
+  landing watcher must query `mergeable` + `mergeStateStatus` directly and
+  treat `CONFLICTING`/`DIRTY` as terminal. While the PR sits IN the queue,
   `autoMergeRequest` nulling and `mergeStateStatus: UNKNOWN` are normal;
   only `state` (`MERGED`/`CLOSED`) is terminal. A queued branch is frozen —
   pushes are rejected until the entry merges or is dequeued.
@@ -341,30 +362,39 @@ move on; never force it and never resolve the root checkout's state yourself.
 
 ## CI/CD
 
-GitHub Actions on push / PR to `main`, and — for the required checks — on every
+GitHub Actions on PR to `main` and — for the required checks — on every
 `merge_group`. The required-check workflows run **unfiltered on `pull_request`
 and `merge_group`**: GitHub only lets a PR enter the merge queue after its own
 required checks pass, so a paths-skipped required check blocks queue entry
-(and on the group side wedges the entry at "Expected"). Only the push-to-main
-triggers keep paths filters — push runs are check-only warm passes, not gates
-(`smokes.yml` has no push trigger at all).
+(and on the group side wedges the entry at "Expected"). The heavy workflow
+(`windows.yml`) has **no push trigger at all** — a push-to-main run would
+revalidate the identical tree the merge group just validated, and the
+external per-listener build caches stay warm from the constant PR + group
+flow. The remaining push triggers (repo-integrity, app.html, audit, docs
+deploy) are cheap and paths-filtered.
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
 **self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
-`intendant-macos`, `samsung-win` = `intendant-windows`) with persistent
-incremental `target/` dirs — warm gate runs are minutes, not half-hours.
+`intendant-macos`, `samsung-win` = `intendant-windows`) with build state
+in **external per-listener cargo target caches** (`CARGO_TARGET_DIR`
+under the runner account's `~/.cache/intendant-ci/`, keyed by `rustc -V`
+— checkout's `git clean -ffdx` wipes an in-workspace `target/` every
+job, so warmth can only live outside it) — warm gate runs are minutes,
+not half-hours.
 **Fork PRs route to GitHub-hosted runners instead** (dynamic `runs-on`;
 `matrix.os` doubles as the hosted label): external code never executes on
 our hardware, yet its required checks really run. Fork-PR workflows also
 need maintainer approval before anything runs (all outside collaborators,
 not just first-timers). The Dell and Windows runners run as dedicated
-non-admin `ci` users, and the check *names* stay pinned to the
+non-admin `ci` users — the Mac joins them as the `scripts/ci` service-account
+kit (`_intendant-ci`: hidden role account, LaunchDaemon listeners, job hooks)
+is cut over — and the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
-- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); everything else — non-Linux PR legs, every push-to-main warm run — is `cargo check` only. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Headless-safe: needs no display or API keys. **Required check.**
-- **`smokes.yml`** — the keyless smokes (session-vitals, native-goal, peer-sessions) against real binaries on Linux only (debug profile with debuginfo off, sharing the runner's warm tree with the test job; the drivers are platform-agnostic protocol probes, so a second platform mostly duplicated coverage while doubling flake surface). PR + merge group only — no push trigger. **Required check.**
+- **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Linux leg is the **whole Linux gate**: after unit tests + e2e it runs the keyless smokes (session-vitals, native-goal, peer-sessions — real binaries under the mock provider) and the dashboard-boot probe (SPA booted in headless Chromium over CDP; promoted from advisory on its 40/40 soak) as tail steps reusing the same checkout and warm tree — these were smokes.yml's jobs until 2026-07-11. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Jobs are bounded by `timeout-minutes: 60` (no per-test timeout exists under plain `cargo test`, so a single hung test otherwise holds a queue slot indefinitely). Headless-safe: needs no display or API keys. **Required check.**
 - **`app-html.yml`** — the `static/app/` fragments ↔ generated `static/app.html` regen gate. **Required check.**
-- **`agents-md-sync.yml`** — CLAUDE.md ↔ AGENTS.md byte-parity. **Required check.**
+- **`wasm-drift.yml`** — the committed `static/wasm-*` artifacts ↔ their crates: rebuilds both WASM crates with the pinned wasm-pack + pinned toolchain and fails on any byte difference (build.rs's mtime staleness check is blind in a fresh checkout, so drift otherwise ships silently). Runs on the **Mac fleet leg**: wasm output is not byte-deterministic across host triples (proven live 2026-07-11), and aarch64-darwin is the canonical artifact host — regenerate wasm artifacts on macOS only. In-job relevance skip: only wasm inputs (the two crates, `presence-core`, the artifacts, `Cargo.lock`, the pins) trigger the rebuild — everything else green-skips. **Required check.**
+- **`agents-md-sync.yml`** — repo integrity: CLAUDE.md ↔ AGENTS.md byte-parity + actionlint over the workflow files (fleet runner labels are declared in `.github/actionlint.yaml`; shellcheck/pyflakes passes await their own baseline pass). **Required check.**
 - **`audit.yml`** — `cargo audit` on push/PR plus a weekly cron (Mondays 08:00 UTC). Advisory only — new upstream advisories must not block unrelated landings.
 - **`docs.yml`** — mdBook (`docs/`) deploy to GitHub Pages on push to `main`.
 

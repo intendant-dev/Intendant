@@ -1,0 +1,196 @@
+/* ── composer conversation peek ─────────────────────────────────────────
+   The container floats ABOVE the dock card: the bar is position:fixed, so
+   this absolute child anchors to the card and never contributes to the
+   bar's measured height — the #app bottom reservation follows
+   --ui2-composer-h (the bar box alone), and the peek overlays content
+   like a transient sheet instead of reflowing it. It rides the keyboard
+   lift for free (the bar's bottom carries --ui2-kb-inset).
+   Solid surface, no backdrop-filter: fixed chrome can overlap the Station
+   canvases (same rule as the dock card). */
+html.ui-v2 .ui2-composer-peek {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  max-height: min(42vh, 380px);
+  max-height: min(42dvh, 380px);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+/* the display:flex above outweighs the UA [hidden] rule — restate it */
+html.ui-v2 .ui2-composer-peek[hidden] { display: none; }
+@keyframes ui2-peek-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+html.ui-v2 .ui2-composer-peek:not([hidden]) {
+  animation: ui2-peek-in var(--t-slow) ease;
+}
+
+/* — header: target identity, live phase, jump-to-Activity, close — */
+html.ui-v2 .ui2-peek-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 8px 9px 7px 13px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-header:hover { background: var(--hover-wash); }
+html.ui-v2 .ui2-peek-target {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 220px;
+  font-size: 11px;
+  font-weight: 650;
+}
+html.ui-v2 .ui2-peek-phase {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+html.ui-v2 .ui2-peek-phase-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--neutral-dot);
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="thinking"],
+html.ui-v2 .ui2-peek-phase-dot[data-cat="running"] {
+  background: var(--iris);
+  animation: ui2-pulse 1.3s infinite;
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="waiting"] {
+  background: var(--amber);
+  animation: ui2-pulse 2s infinite;
+}
+html.ui-v2 .ui2-peek-phase-dot[data-cat="done"] { background: var(--green); }
+html.ui-v2 .ui2-peek-phase-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-peek-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-open:hover { color: var(--text); background: var(--surface-2); }
+html.ui-v2 .ui2-peek-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--sans);
+  cursor: pointer;
+}
+html.ui-v2 .ui2-peek-close:hover { color: var(--text); background: var(--surface-2); }
+
+/* — transcript tail — */
+html.ui-v2 .ui2-peek-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* scroll pinning is managed manually, like the other log scrollers */
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  padding: 6px 12px 9px;
+}
+html.ui-v2 .ui2-peek-empty {
+  padding: 20px 12px 22px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+/* — compact entry density —
+   Clones keep the Activity timeline grammar (ui2-activity.css styles
+   .log-entry globally); the peek drops the ts gutter and the host/session
+   badges (identity lives in the peek header) and tightens type. Track
+   list mirrors the base 7-column template with the hidden columns zeroed
+   so the explicit grid-column placements keep landing. */
+html.ui-v2 .ui2-composer-peek .log-entry {
+  grid-template-columns: 0 16px 0 0 max-content 0 minmax(0, 1fr);
+  padding: 3px 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+/* 12.5px × 1.5 line box ≈ 19px; the 6px dot centers at (19−6)/2 ≈ 6px */
+html.ui-v2 .ui2-composer-peek .log-entry .log-icon { margin-top: 6px; }
+html.ui-v2 .ui2-composer-peek .log-entry .log-ts,
+html.ui-v2 .ui2-composer-peek .log-entry .log-host,
+html.ui-v2 .ui2-composer-peek .log-entry .log-session,
+html.ui-v2 .ui2-composer-peek .log-entry .log-anchor-btn,
+html.ui-v2 .ui2-composer-peek .log-entry .log-copy-entry,
+html.ui-v2 .ui2-composer-peek .log-entry .log-edit-message,
+html.ui-v2 .ui2-composer-peek .log-entry .collapse-toggle {
+  display: none;
+}
+html.ui-v2 .ui2-composer-peek .log-entry pre {
+  font-size: 11.5px;
+  padding: 8px 10px;
+}
+
+/* long payloads clamp; the fade appears only on entries that really clip
+   (JS tags .ui2-peek-clamped — CSS cannot see overflow). The blanket
+   content:none also retires v1's side fade on collapsible entries, whose
+   1.5em clamp the max-height below supersedes inside the peek. */
+html.ui-v2 .ui2-composer-peek .log-entry .log-content {
+  position: relative;
+  max-height: 8.5em;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-composer-peek .log-entry:not(.ui2-peek-clamped) .log-content::after { content: none; }
+html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: auto;
+  width: auto;
+  height: 1.8em;
+  background: linear-gradient(to bottom, transparent, var(--surface));
+  pointer-events: none;
+}
+html.ui-v2 .ui2-composer-peek .diff-log-entry .diff-log-body {
+  max-height: 8.5em;
+  overflow: hidden;
+}
+
+/* — phones: keep the header one quiet row — */
+@media (max-width: 500px) {
+  html.ui-v2 .ui2-peek-open .ui2-peek-open-label { display: none; }
+  html.ui-v2 .ui2-peek-open { padding: 4px 8px; }
+  html.ui-v2 .ui2-peek-header { padding: 7px 8px 6px 11px; }
+}

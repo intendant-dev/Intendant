@@ -85,6 +85,12 @@ impl WaylandBackend {
     }
 }
 
+impl Default for WaylandBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl DisplayBackend for WaylandBackend {
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -421,7 +427,7 @@ impl DisplayBackend for WaylandBackend {
         Ok(())
     }
 
-    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+    async fn paste_text(&self, text: &str) -> Result<super::PasteOutcome, CallerError> {
         // Paste gesture emulation, matching the Windows backend: (1) make
         // exactly `text` the session's current paste payload, (2) press
         // ctrl+v in the already-approved RemoteDesktop session. The payload
@@ -499,7 +505,17 @@ impl DisplayBackend for WaylandBackend {
             ));
         }
 
-        Ok(())
+        // Portal selections are pull-based and the portal offers no way to
+        // read (and thus restore) the previous owner's content — this
+        // session simply stays the selection owner. Report that honestly
+        // instead of pretending the clipboard is untouched.
+        Ok(super::PasteOutcome {
+            clipboard_note: Some(
+                "clipboard: previous content not restored (the Wayland portal clipboard \
+                 is pull-based); the pasted text remains the active selection"
+                    .to_string(),
+            ),
+        })
     }
 
     fn resolution(&self) -> (u32, u32) {
@@ -585,11 +601,11 @@ async fn verify_remote_interaction(
     remote_desktop
         .notify_pointer_motion(session, 1.0, 0.0)
         .await
-        .map_err(|e| wayland_remote_interaction_error(e))?;
+        .map_err(wayland_remote_interaction_error)?;
     remote_desktop
         .notify_pointer_motion(session, -1.0, 0.0)
         .await
-        .map_err(|e| wayland_remote_interaction_error(e))?;
+        .map_err(wayland_remote_interaction_error)?;
     Ok(())
 }
 
@@ -670,6 +686,7 @@ fn mmap_fd_and_read(
 /// This function blocks until the `shutdown` flag is set or the PipeWire
 /// connection is lost. Frames are sent to `tx` via `try_send()` -- if the
 /// channel is full the frame is dropped (backpressure).
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn run_pipewire_capture(
     pw_fd: std::os::fd::OwnedFd,
     node_id: u32,

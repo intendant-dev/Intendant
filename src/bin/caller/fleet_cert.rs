@@ -1,5 +1,5 @@
 //! Fleet certificates: a real, browser-trusted certificate for this
-//! daemon's fleet name (docs/src/trust-tiers.md; the convenient direct
+//! daemon's fleet name (docs/src/trust-tiers.md; the warning-free discovery
 //! path). The rendezvous serves a delegated DNS subzone and this daemon
 //! owns exactly one name under it — `d-<hash>.<zone>`, derived from its
 //! Connect daemon id. Flow, all daemon-side:
@@ -17,17 +17,166 @@
 //!    beside the access certs; a background loop renews it.
 //!
 //! Honest limits: certificate names appear in public CT logs (the label
-//! is an opaque hash for exactly that reason), and a hostile zone
-//! operator could mint certificates for fleet names — enrolled browsers
-//! stay safe via key verification, and CT makes mis-issuance public
-//! evidence.
+//! is an opaque hash for exactly that reason), and a hostile zone operator
+//! can redirect a fleet name and mint a certificate for it. CT makes that
+//! issuance public evidence, but evidence is not an authority anchor: the
+//! gateway serves only public shell/discovery bytes on fleet-SNI connections
+//! and rejects protected HTTP, MCP, signaling, and WebSocket access before it
+//! resolves browser mTLS or daemon IAM authority.
 
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+const FLEET_ORIGIN_PROVENANCE_FILE: &str = "fleet-origin-provenance.json";
+const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+
+/// Durable service-controlled-name provenance. Certificates and Connect
+/// registration are both replaceable/optional at startup, but a name once
+/// assigned by a rendezvous must never later be mistaken for an independent
+/// direct origin merely because the daemon is offline or Connect is disabled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct FleetOriginProvenance {
+    #[serde(default = "fleet_origin_provenance_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    zone: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    known_names: Vec<String>,
+    /// Recovery could not prove the complete historical name set. While this
+    /// is true, IAM treats DNS-origin browser keys conservatively instead of
+    /// allowing an unknown former fleet name to decay into a direct anchor.
+    #[serde(default)]
+    provenance_incomplete: bool,
+}
+
+fn fleet_origin_provenance_schema_version() -> u32 {
+    FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION
+}
+
+impl Default for FleetOriginProvenance {
+    fn default() -> Self {
+        Self {
+            schema_version: FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION,
+            zone: None,
+            name: None,
+            known_names: Vec::new(),
+            provenance_incomplete: false,
+        }
+    }
+}
+
+fn normalized_dns_name(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn fleet_origin_provenance_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(FLEET_ORIGIN_PROVENANCE_FILE)
+}
+
+fn write_fleet_origin_provenance_locked(
+    cert_dir: &Path,
+    provenance: &FleetOriginProvenance,
+) -> crate::access::AccessResult<()> {
+    let mut bytes = serde_json::to_vec_pretty(provenance).map_err(|error| {
+        crate::access::AccessError(format!("serialize fleet origin provenance: {error}"))
+    })?;
+    bytes.push(b'\n');
+    crate::access::authority_store::atomic_write_private_locked(
+        &fleet_origin_provenance_path_in(cert_dir),
+        &bytes,
+    )
+}
+
+fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvenance, String> {
+    let path = fleet_origin_provenance_path_in(cert_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FleetOriginProvenance::default());
+        }
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let mut provenance: FleetOriginProvenance = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if provenance.schema_version > FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION {
+        return Err(format!(
+            "{} uses unsupported schema version {}",
+            path.display(),
+            provenance.schema_version
+        ));
+    }
+    provenance.schema_version = FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION;
+    provenance.zone = provenance.zone.as_deref().and_then(normalized_dns_name);
+    provenance.name = provenance.name.as_deref().and_then(normalized_dns_name);
+    provenance.known_names = provenance
+        .known_names
+        .iter()
+        .filter_map(|name| normalized_dns_name(name))
+        .collect();
+    if let Some(name) = provenance.name.clone() {
+        provenance.known_names.push(name);
+    }
+    provenance.known_names.sort();
+    provenance.known_names.dedup();
+    Ok(provenance)
+}
+
+fn remember_fleet_origin_in(
+    cert_dir: &Path,
+    zone: Option<&str>,
+    name: &str,
+) -> Result<FleetOriginProvenance, String> {
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "rendezvous returned an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut provenance =
+            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+        let before = provenance.clone();
+        provenance.zone = zone.and_then(normalized_dns_name);
+        provenance.name = Some(name.clone());
+        provenance.known_names.push(name);
+        provenance.known_names.sort();
+        provenance.known_names.dedup();
+        if provenance == before {
+            return Ok(provenance);
+        }
+        write_fleet_origin_provenance_locked(cert_dir, &provenance)?;
+        Ok(provenance)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn fleet_origin_provenance_incomplete_flag() -> &'static AtomicBool {
+    static INCOMPLETE: AtomicBool = AtomicBool::new(false);
+    &INCOMPLETE
+}
+
+/// Whether startup found fleet-origin state whose full historical exact-name
+/// set could not be recovered. This is process-sticky: learning one current
+/// name cannot prove that a corrupted file held no older service-controlled
+/// names. IAM uses it only as a conservative browser-key binding guard.
+pub(crate) fn fleet_origin_provenance_is_incomplete() -> bool {
+    fleet_origin_provenance_incomplete_flag().load(Ordering::SeqCst)
+}
+
+fn mark_fleet_origin_provenance_incomplete() {
+    fleet_origin_provenance_incomplete_flag().store(true, Ordering::SeqCst);
+}
+
+fn fleet_dns_observed_this_process() -> &'static AtomicBool {
+    static OBSERVED: AtomicBool = AtomicBool::new(false);
+    &OBSERVED
+}
 
 /// The daemon's fleet label: `d-<hex(sha256(daemon_id))[..20]>` —
 /// REPLICATES `bin/connect/dns.rs::daemon_label` (the two binaries never
 /// link each other); the golden test below twins the service's.
+#[cfg(test)]
 pub fn daemon_fleet_label(daemon_id: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     let id = daemon_id.trim();
@@ -56,8 +205,8 @@ pub struct FleetCertStatus {
     pub last_error: Option<String>,
     /// Addresses last published for the name (what the A/AAAA records say).
     pub addresses: Vec<String>,
-    /// Certificate Transparency tripwire (docs/src/trust-tiers.md, first
-    /// contact rung two): `unchecked` | `ok` | `alert`. An `alert` means
+    /// Certificate Transparency tripwire (docs/src/trust-tiers.md, fleet
+    /// discovery route): `unchecked` | `ok` | `alert`. An `alert` means
     /// the public CT logs hold a certificate for this daemon's name that
     /// this daemon never requested — the fleet-zone operator (or a CA)
     /// minted one, which is exactly the betrayal the rung's security
@@ -83,7 +232,10 @@ fn registry() -> &'static Mutex<FleetCertStatus> {
 }
 
 pub fn status_snapshot() -> FleetCertStatus {
-    registry().lock().expect("fleet cert status poisoned").clone()
+    registry()
+        .lock()
+        .expect("fleet cert status poisoned")
+        .clone()
 }
 
 fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
@@ -95,6 +247,28 @@ fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
 /// fleet_dns hint. Also loads any existing on-disk certificate state the
 /// first time the name is learned.
 pub fn note_fleet_dns(zone: Option<String>, name: Option<String>) {
+    fleet_dns_observed_this_process().store(true, Ordering::SeqCst);
+    if let Some(name) = name.as_deref() {
+        // The rendezvous-assigned public name is never an authority anchor,
+        // regardless of whether its WebPKI certificate has been issued or
+        // installed yet. Register provenance before updating live state so
+        // gateway requests fail closed during name/certificate transitions.
+        crate::web_tls::register_fleet_server_name(name);
+        match remember_fleet_origin_in(&cert_dir(), zone.as_deref(), name) {
+            Ok(provenance) if provenance.provenance_incomplete => {
+                mark_fleet_origin_provenance_incomplete();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // In-memory exact-name classification still fails closed for
+                // this process, but persistence failure means older names may
+                // be unrecoverable after restart. Keep the conservative IAM
+                // guard sticky and surface the durability failure loudly.
+                mark_fleet_origin_provenance_incomplete();
+                eprintln!("[fleet-cert] persist fleet-origin provenance failed: {error}");
+            }
+        }
+    }
     let newly_named = {
         let mut status = registry().lock().expect("fleet cert status poisoned");
         let newly_named = name.is_some() && status.name != name;
@@ -111,12 +285,20 @@ fn cert_dir() -> PathBuf {
     crate::access::backend::select_backend().cert_dir()
 }
 
+fn cert_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join("fleet-cert.pem")
+}
+
 pub(crate) fn cert_path() -> PathBuf {
-    cert_dir().join("fleet-cert.pem")
+    cert_path_in(&cert_dir())
+}
+
+fn key_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join("fleet-key.pem")
 }
 
 pub(crate) fn key_path() -> PathBuf {
-    cert_dir().join("fleet-key.pem")
+    key_path_in(&cert_dir())
 }
 
 fn acme_account_path() -> PathBuf {
@@ -139,13 +321,196 @@ fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn fleet_certificate_dns_names(cert_pem: &str) -> Result<Vec<String>, String> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::*;
+
+    let leaf = pem_certificates(cert_pem)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "fleet certificate PEM holds no certificates".to_string())?;
+    let (_, certificate) = X509Certificate::from_der(&leaf)
+        .map_err(|error| format!("parse fleet certificate: {error}"))?;
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|error| format!("parse fleet certificate SAN: {error}"))?
+        .ok_or_else(|| "fleet certificate has no subjectAltName extension".to_string())?;
+    let mut names = Vec::new();
+    for name in &san.value.general_names {
+        let GeneralName::DNSName(name) = name else {
+            continue;
+        };
+        if name.contains('*') {
+            return Err(format!(
+                "fleet certificate carries wildcard DNS SAN {name}; exact provenance is unrecoverable"
+            ));
+        }
+        if let Some(name) = normalized_dns_name(name) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Err("fleet certificate has no exact DNS SAN names".to_string());
+    }
+    Ok(names)
+}
+
+fn fleet_certificate_dns_names_in(cert_dir: &Path) -> Result<Option<Vec<String>>, String> {
+    let path = cert_path_in(cert_dir);
+    let pem = match std::fs::read_to_string(&path) {
+        Ok(pem) => pem,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    fleet_certificate_dns_names(&pem).map(Some)
+}
+
+fn merge_recovered_fleet_names(
+    provenance: &mut FleetOriginProvenance,
+    recovered_names: Vec<String>,
+) {
+    if provenance.name.is_none() {
+        provenance.name = recovered_names.first().cloned();
+    }
+    provenance.known_names.extend(recovered_names);
+    provenance.known_names.sort();
+    provenance.known_names.dedup();
+}
+
+#[derive(Debug)]
+struct RestoredFleetOriginProvenance {
+    provenance: FleetOriginProvenance,
+    warning: Option<String>,
+}
+
+/// Restore the durable exact-name set, migrating pre-provenance installs from
+/// the DNS SANs in `fleet-cert.pem`. The authority-store lock serializes this
+/// read/merge/write with a concurrent Connect register response.
+///
+/// A malformed provenance file is never overwritten automatically: it may be
+/// the only surviving record of older names. We recover the current
+/// certificate's exact names for this process, mark the result incomplete,
+/// and leave the malformed file in place so every later startup also fails
+/// closed. An existing certificate whose exact DNS SANs cannot be recovered
+/// persists `provenance_incomplete: true` in an otherwise valid state file.
+fn restore_fleet_origin_provenance_in(cert_dir: &Path) -> RestoredFleetOriginProvenance {
+    let restored = crate::access::authority_store::with_lock(cert_dir, || {
+        let loaded = load_fleet_origin_provenance_in(cert_dir);
+        let mut provenance = match loaded {
+            Ok(provenance) => provenance,
+            Err(load_error) => {
+                let mut provenance = FleetOriginProvenance {
+                    provenance_incomplete: true,
+                    ..Default::default()
+                };
+                let certificate_error = match fleet_certificate_dns_names_in(cert_dir) {
+                    Ok(Some(names)) => {
+                        merge_recovered_fleet_names(&mut provenance, names);
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(error) => Some(error),
+                };
+                let warning = match certificate_error {
+                    Some(certificate_error) => format!(
+                        "{load_error}; certificate provenance recovery also failed: {certificate_error}"
+                    ),
+                    None => load_error,
+                };
+                // Preserve the malformed/unsupported source file. Its
+                // continued parse failure is itself a durable fail-closed
+                // marker for the historical names we could not recover.
+                return Ok(RestoredFleetOriginProvenance {
+                    provenance,
+                    warning: Some(warning),
+                });
+            }
+        };
+
+        let before = provenance.clone();
+        let mut warning = None;
+        match fleet_certificate_dns_names_in(cert_dir) {
+            Ok(Some(names)) => merge_recovered_fleet_names(&mut provenance, names),
+            Ok(None) => {}
+            Err(error) => {
+                provenance.provenance_incomplete = true;
+                warning = Some(format!(
+                    "existing fleet certificate provenance could not be recovered: {error}"
+                ));
+            }
+        }
+        if provenance != before {
+            write_fleet_origin_provenance_locked(cert_dir, &provenance)?;
+        }
+        Ok(RestoredFleetOriginProvenance {
+            provenance,
+            warning,
+        })
+    });
+
+    match restored {
+        Ok(restored) => restored,
+        Err(error) => {
+            // A lock or durable-write failure must not turn an old fleet name
+            // into a direct origin. Recover any readable exact names for this
+            // process, but keep the broad conservative marker set.
+            let mut provenance = load_fleet_origin_provenance_in(cert_dir).unwrap_or_else(|_| {
+                FleetOriginProvenance {
+                    provenance_incomplete: true,
+                    ..Default::default()
+                }
+            });
+            provenance.provenance_incomplete = true;
+            if let Ok(Some(names)) = fleet_certificate_dns_names_in(cert_dir) {
+                merge_recovered_fleet_names(&mut provenance, names);
+            }
+            RestoredFleetOriginProvenance {
+                provenance,
+                warning: Some(format!(
+                    "restore fleet-origin provenance under authority lock: {error}"
+                )),
+            }
+        }
+    }
+}
+
+fn register_restored_fleet_origins(provenance: &FleetOriginProvenance) {
+    for name in &provenance.known_names {
+        crate::web_tls::register_fleet_server_name(name);
+    }
+}
+
 /// Load on-disk certificate state into the registry and the live TLS
 /// resolver (startup + after learning the name). Quietly does nothing
 /// when no certificate exists yet.
 pub fn refresh_installed_state() {
+    refresh_installed_state_in(&cert_dir());
+}
+
+pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
+    let restored = restore_fleet_origin_provenance_in(cert_dir);
+    register_restored_fleet_origins(&restored.provenance);
+    if restored.provenance.provenance_incomplete {
+        mark_fleet_origin_provenance_incomplete();
+    }
+    if let Some(error) = restored.warning {
+        eprintln!("[fleet-cert] restore fleet-origin provenance: {error}");
+    }
+    // Offline/Connect-disabled startup restores the last current name so an
+    // installed certificate remains usable. A register response observed in
+    // this process wins, including an explicit null hint; remembered names
+    // remain discovery-only either way.
+    if !fleet_dns_observed_this_process().load(Ordering::SeqCst) {
+        with_status(|status| {
+            status.zone = restored.provenance.zone;
+            status.name = restored.provenance.name;
+        });
+    }
     let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(cert_path()),
-        std::fs::read_to_string(key_path()),
+        std::fs::read_to_string(cert_path_in(cert_dir)),
+        std::fs::read_to_string(key_path_in(cert_dir)),
     ) else {
         return;
     };
@@ -185,8 +550,7 @@ fn acme_directory() -> String {
 async fn acme_account() -> Result<instant_acme::Account, String> {
     let path = acme_account_path();
     if let Ok(stored) = std::fs::read_to_string(&path) {
-        if let Ok(credentials) = serde_json::from_str::<instant_acme::AccountCredentials>(&stored)
-        {
+        if let Ok(credentials) = serde_json::from_str::<instant_acme::AccountCredentials>(&stored) {
             return instant_acme::Account::builder()
                 .map_err(|e| format!("acme http client: {e}"))?
                 .from_credentials(credentials)
@@ -309,7 +673,6 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             .await
             .map_err(|e| format!("acme challenge ready: {e}"))?;
     }
-    drop(authorizations);
 
     let status = order
         .poll_ready(&instant_acme::RetryPolicy::default())
@@ -346,13 +709,13 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
 }
 
 /* ── Certificate Transparency tripwire ──
-The fleet rung's security argument is "the zone operator can only betray
-loudly": a hijack needs a mis-issued certificate, and browsers only
-accept CT-logged certificates. This monitor turns that in-principle
-evidence into an actual alarm — the daemon records the serials of every
-certificate IT obtained and periodically asks the public CT indexes
-whether its name carries any it didn't. Advisory by nature (crt.sh is a
-best-effort public service); failures are reported, never alarmed. */
+A fleet-name hijack needs a certificate browsers accept, and public CAs log
+those certificates to CT. This monitor turns that evidence into an alarm —
+the daemon records the serials of every certificate IT obtained and
+periodically asks the public CT indexes whether its name carries any it
+didn't. It is diagnostic, not an authorization control: fleet-SNI traffic is
+discovery-only even when this check is healthy. Advisory by nature (crt.sh is
+a best-effort public service); failures are reported, never alarmed. */
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OwnCertRecord {
@@ -464,7 +827,7 @@ fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
 fn foreign_entries(logged: Vec<CtEntry>, own_serials: &[String]) -> Vec<CtEntry> {
     logged
         .into_iter()
-        .filter(|entry| !own_serials.iter().any(|own| *own == entry.serial_hex))
+        .filter(|entry| !own_serials.contains(&entry.serial_hex))
         .collect()
 }
 
@@ -579,6 +942,17 @@ pub fn spawn_renewal_loop() {
 mod tests {
     use super::*;
 
+    fn write_legacy_fleet_certificate(cert_dir: &Path, names: &[&str]) {
+        let certificate = rcgen::generate_simple_self_signed(
+            names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        std::fs::write(cert_path_in(cert_dir), certificate.cert.pem()).unwrap();
+    }
+
     #[test]
     fn fleet_label_twins_the_service_derivation() {
         // Golden value pinned in bin/connect/dns.rs — change together.
@@ -587,6 +961,107 @@ mod tests {
             Some("d-30a08371a38c1b447038")
         );
         assert!(daemon_fleet_label(" ").is_none());
+    }
+
+    #[test]
+    fn fleet_origin_provenance_persists_current_and_replaced_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = remember_fleet_origin_in(
+            temp.path(),
+            Some("Fleet.Example.Test."),
+            "Old.Fleet.Example.Test.",
+        )
+        .unwrap();
+        assert_eq!(first.zone.as_deref(), Some("fleet.example.test"));
+        assert_eq!(first.name.as_deref(), Some("old.fleet.example.test"));
+
+        remember_fleet_origin_in(
+            temp.path(),
+            Some("fleet.example.test"),
+            "new.fleet.example.test",
+        )
+        .unwrap();
+        let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert_eq!(restored.name.as_deref(), Some("new.fleet.example.test"));
+        assert_eq!(
+            restored.known_names,
+            vec![
+                "new.fleet.example.test".to_string(),
+                "old.fleet.example.test".to_string(),
+            ]
+        );
+
+        let metadata = std::fs::metadata(fleet_origin_provenance_path_in(temp.path())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let _ = metadata;
+    }
+
+    #[test]
+    fn existing_fleet_certificate_backfills_missing_provenance_before_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let fleet_name = "legacy-backfill.fleet.example.test";
+        write_legacy_fleet_certificate(temp.path(), &[fleet_name]);
+        assert!(!fleet_origin_provenance_path_in(temp.path()).exists());
+
+        let restored = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restored.warning.is_none(), "{:?}", restored.warning);
+        assert!(!restored.provenance.provenance_incomplete);
+        assert_eq!(restored.provenance.name.as_deref(), Some(fleet_name));
+        assert_eq!(restored.provenance.known_names, vec![fleet_name]);
+
+        let persisted = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert_eq!(persisted, restored.provenance);
+        register_restored_fleet_origins(&restored.provenance);
+        assert!(crate::web_tls::is_fleet_server_name(Some(fleet_name)));
+    }
+
+    #[test]
+    fn unbackfillable_existing_certificate_persists_incomplete_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(cert_path_in(temp.path()), b"not a certificate").unwrap();
+
+        let restored = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restored.provenance.provenance_incomplete);
+        assert!(restored.provenance.known_names.is_empty());
+        assert!(restored
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("could not be recovered")));
+
+        let persisted = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert!(persisted.provenance_incomplete);
+        assert!(persisted.known_names.is_empty());
+    }
+
+    #[test]
+    fn malformed_provenance_recovers_current_cert_name_but_stays_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let fleet_name = "malformed-recovery.fleet.example.test";
+        write_legacy_fleet_certificate(temp.path(), &[fleet_name]);
+        std::fs::write(
+            fleet_origin_provenance_path_in(temp.path()),
+            b"{ definitely not valid json",
+        )
+        .unwrap();
+
+        let restored = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restored.provenance.provenance_incomplete);
+        assert_eq!(restored.provenance.name.as_deref(), Some(fleet_name));
+        assert_eq!(restored.provenance.known_names, vec![fleet_name]);
+        assert!(restored
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("parse")));
+
+        // Never overwrite the only possible record of older exact names.
+        assert!(load_fleet_origin_provenance_in(temp.path()).is_err());
+        let restarted = restore_fleet_origin_provenance_in(temp.path());
+        assert!(restarted.provenance.provenance_incomplete);
+        assert_eq!(restarted.provenance.known_names, vec![fleet_name]);
     }
 
     /// Operator-battery E2E (never in CI: live network + a registered

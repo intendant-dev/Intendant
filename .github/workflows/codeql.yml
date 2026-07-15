@@ -1,0 +1,57 @@
+name: CodeQL
+
+# Advisory security scanning: Rust (GA build-free analysis) plus the
+# Actions workflow files. Deliberately NOT a required check and NOT
+# per-PR — findings surface on pushes to main and a weekly cron, while
+# landing latency stays owned by the deterministic suites. GitHub-hosted
+# runners on purpose: the analysis needs no fleet warmth, and advisory
+# scans should never occupy fleet slots the required gates are waiting
+# for.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/**"
+  schedule:
+    # Mondays 09:00 UTC — an hour after the cargo-audit cron, so the two
+    # advisory reports land as one Monday-morning batch, not two pings.
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - uses: github/codeql-action/analyze@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
+        with:
+          category: "/language:${{ matrix.language }}"

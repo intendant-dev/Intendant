@@ -20,28 +20,195 @@ use super::*;
 pub(crate) trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
-/// Boxed demuxed connection (plain TCP or TLS), used for all post-demux
-/// HTTP/WebSocket handling.
-pub(crate) type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
-
-/// Finalize a one-shot HTTP response on a demuxed stream before it drops.
+/// Demuxed connection (plain TCP or TLS) used for all post-demux
+/// HTTP/WebSocket handling, plus the per-exchange keep-alive state the
+/// request loop and the write edges share (see the `keep_alive` module
+/// docs for the decision table).
 ///
-/// Every dashboard HTTP reply is a single buffered response sent with
-/// `Connection: close`, after which the connection task returns and the
-/// boxed [`DemuxStream`] is dropped. For a plain `TcpStream` that's fine —
-/// the kernel keeps queued bytes and flushes them on close. But the TLS
-/// path's stream is a `tokio_rustls::server::TlsStream`, which buffers
-/// *ciphertext* inside the rustls session: `write_all` only guarantees the
-/// plaintext was accepted into that buffer, not that the encrypted records
-/// reached the socket. Dropping the `TlsStream` without flushing discards
-/// the unwritten tail records, truncating large bodies (e.g. the ~871 KB
+/// Reads serve the `replay` buffer first — the request loop pushes each
+/// follow-up request's already-captured segment there so dispatch (and a
+/// WebSocket upgrade arriving on a kept-alive connection) see the request
+/// from byte zero, exactly as the first request is delivered (kernel
+/// buffer on the plain path, `PrefixedStream` on TLS). Writes delegate
+/// straight to the inner stream.
+pub(crate) struct DemuxStream {
+    inner: std::pin::Pin<Box<dyn AsyncReadWrite>>,
+    replay: Vec<u8>,
+    replay_pos: usize,
+    /// Request leg of the keep-alive verdict (client headers + loop
+    /// budget + segment framing); set by the request loop per request.
+    client_allows_reuse: bool,
+    /// Body leg: the request body was provably consumed in full; set by
+    /// dispatch, reset by [`Self::begin_request`]. Fail-closed default.
+    request_consumed: bool,
+    /// Give-back channel to the request loop: a write edge that finished
+    /// a self-framing response on a reusable exchange parks the stream
+    /// here instead of closing it. `Weak` — only the connection task
+    /// holds the slot strongly, so unarmed streams (handler test
+    /// fixtures, one-shot tools) fail closed to the historical
+    /// write-then-finalize behavior.
+    parked: std::sync::Weak<Mutex<Option<DemuxStream>>>,
+}
+
+/// The request loop's strong handle to the keep-alive give-back slot.
+pub(crate) type ParkedStreamSlot = Arc<Mutex<Option<DemuxStream>>>;
+
+impl DemuxStream {
+    /// Wrap a demuxed transport. Keep-alive starts disarmed: every write
+    /// edge behaves exactly like the historical close-per-request server
+    /// until the request loop arms the slot and begins a request.
+    pub(crate) fn new(inner: std::pin::Pin<Box<dyn AsyncReadWrite>>) -> Self {
+        Self {
+            inner,
+            replay: Vec::new(),
+            replay_pos: 0,
+            client_allows_reuse: false,
+            request_consumed: false,
+            parked: std::sync::Weak::new(),
+        }
+    }
+
+    pub(crate) fn new_parked_slot() -> ParkedStreamSlot {
+        Arc::new(Mutex::new(None))
+    }
+
+    pub(crate) fn arm_keep_alive(&mut self, slot: &ParkedStreamSlot) {
+        self.parked = Arc::downgrade(slot);
+    }
+
+    /// Begin one request/response exchange: record the request leg's
+    /// verdict and reset the body leg (fail-closed until dispatch proves
+    /// the body was consumed).
+    pub(crate) fn begin_request(&mut self, client_allows_reuse: bool) {
+        self.client_allows_reuse = client_allows_reuse;
+        self.request_consumed = false;
+    }
+
+    /// Body leg: dispatch proved this request's body is fully consumed
+    /// (or that there was none to consume).
+    pub(crate) fn mark_request_body_consumed(&mut self) {
+        self.request_consumed = true;
+    }
+
+    /// The verdict a write edge consults before opting in: park (and
+    /// emit `Connection: keep-alive`) only when the request leg, the
+    /// body leg, and a live loop slot all agree. Anything else — and
+    /// every write edge that never asks — closes.
+    pub(crate) fn exchange_reusable(&self) -> bool {
+        self.client_allows_reuse && self.request_consumed && self.parked.strong_count() > 0
+    }
+
+    /// Serve `segment` to readers before the socket (the request loop's
+    /// captured next-request head + any body prefix read with it).
+    pub(crate) fn push_replay(&mut self, segment: &[u8]) {
+        // The previous request drained its replay in full (dispatch
+        // consumes exactly the segment it was handed), so this replaces
+        // rather than appends.
+        debug_assert!(self.replay_pos >= self.replay.len());
+        self.replay = segment.to_vec();
+        self.replay_pos = 0;
+    }
+
+    /// Response-leg opt-in: flush this exchange's response through to
+    /// the socket — rustls buffers ciphertext, so this is the flush half
+    /// of the [`finalize_http_stream`] contract applied per response —
+    /// then hand the stream back to the request loop for the next
+    /// request. Falls back to a clean close when the flush fails or the
+    /// loop is gone (unarmed slot / dead task).
+    pub(crate) async fn park(mut self) {
+        use tokio::io::AsyncWriteExt;
+        if self.flush().await.is_err() {
+            let _ = self.shutdown().await;
+            return;
+        }
+        let Some(slot) = self.parked.upgrade() else {
+            let _ = self.shutdown().await;
+            return;
+        };
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(self);
+    }
+}
+
+impl AsyncRead for DemuxStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.replay_pos < this.replay.len() {
+            let remaining = &this.replay[this.replay_pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            this.replay_pos += n;
+            // Serve only replay bytes on this poll (same shape as
+            // web_tls::PrefixedStream); the next read drains the inner
+            // stream.
+            return std::task::Poll::Ready(Ok(()));
+        }
+        this.inner.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for DemuxStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.get_mut().inner.as_mut().poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.get_mut().inner.as_mut().poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// Finalize an HTTP connection before its stream drops: flush, then shut
+/// down cleanly.
+///
+/// The flush matters because the TLS path's stream is a
+/// `tokio_rustls::server::TlsStream`, which buffers *ciphertext* inside
+/// the rustls session: `write_all` only guarantees the plaintext was
+/// accepted into that buffer, not that the encrypted records reached the
+/// socket. Dropping the `TlsStream` without flushing discards the
+/// unwritten tail records, truncating large bodies (e.g. the ~871 KB
 /// `app.html` arrived ~19.5 KB short over HTTPS).
 ///
 /// Calling `flush` drives rustls to emit all buffered ciphertext to the
 /// TCP socket; `shutdown` then writes the TLS `close_notify` and the TCP
 /// FIN, closing the session cleanly. On the plain path both delegate
 /// straight through to the `TcpStream` (flush is a no-op, shutdown sends
-/// the FIN we'd send on drop anyway), so behavior there is unchanged.
+/// the FIN we'd send on drop anyway).
+///
+/// With HTTP/1.1 keep-alive this runs at CONNECTION end — after the last
+/// exchange of a kept-alive connection, or immediately after a
+/// `Connection: close` exchange (the historical one-shot shape). Between
+/// kept-alive exchanges the flush half runs per response inside
+/// [`DemuxStream::park`], so a parked response always reaches the client
+/// before the loop waits for the next request.
 pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
     use tokio::io::AsyncWriteExt;
     let _ = stream.flush().await;
@@ -49,10 +216,16 @@ pub(crate) async fn finalize_http_stream(stream: &mut DemuxStream) {
 }
 
 /// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
+///
+/// `Compression::best()`: every caller compresses once and caches the
+/// result (embedded static assets once per process, app.html once per
+/// gateway spawn — the `INTENDANT_APP_HTML_PATH` dev override serves
+/// uncompressed), so the one-time CPU cost buys smaller transfers on
+/// every subsequent request.
 pub(crate) fn gzip_compress(data: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
-    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::default());
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::best());
     // Writing to a Vec cannot fail.
     let _ = encoder.write_all(data);
     encoder.finish().unwrap_or_default()
@@ -283,10 +456,11 @@ mod host_header_tests {
 /// Stream the body of an HTTP request into a fresh tempfile, honouring
 /// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
 ///
-/// Returns `(tempfile, size)` on success. Designed so the caller can then
-/// commit the tempfile into the upload store via
-/// [`crate::upload_store::commit_upload`], which atomically renames it
-/// into place.
+/// Returns the [`SpooledBody`] handle on success — the HTTP side of the
+/// Streaming lane (transport-unification S8): the tunnel's upload-frame
+/// spool ends in the same handle, and the shared neutral fns commit it
+/// into the store via [`crate::upload_store::commit_upload`], which
+/// atomically renames it into place.
 ///
 /// This is the binary counterpart to `read_request_body_capped` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
@@ -295,7 +469,7 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     initial_request_bytes: &[u8],
     stream: &mut S,
     max_bytes: usize,
-) -> Result<(tempfile::NamedTempFile, usize), String> {
+) -> Result<SpooledBody, String> {
     use std::io::Write;
     use tokio::io::AsyncReadExt;
 
@@ -352,7 +526,7 @@ pub(crate) async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     tmp.as_file_mut()
         .flush()
         .map_err(|e| format!("flush tempfile: {e}"))?;
-    Ok((tmp, written))
+    Ok(SpooledBody { tmp, len: written })
 }
 
 pub(crate) fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
@@ -417,6 +591,7 @@ impl HttpResponse {
         Self::with_content(status, "text/html; charset=utf-8", body)
             .header("Cache-Control", "no-cache")
             .header("Access-Control-Allow-Origin", "*")
+            .deny_framing()
             .header("Connection", "close")
     }
 
@@ -448,9 +623,45 @@ impl HttpResponse {
         self.header("Access-Control-Allow-Origin", "*")
     }
 
+    /// Root-capable dashboard pages must never be embedded by a foreign page.
+    /// Origin checks protect requests made by the foreign page; frame denial
+    /// also protects genuine same-origin requests induced through clickjacking
+    /// inside an embedded Intendant page.
+    pub(crate) fn deny_framing(self) -> Self {
+        self.header("Content-Security-Policy", "frame-ancestors 'none'")
+            .header("X-Frame-Options", "DENY")
+    }
+
+    /// Set this response's connection tail from the exchange's keep-alive
+    /// verdict. A close verdict keeps the historical bytes exactly: an
+    /// existing `Connection` header (every legacy shape bakes `close`) is
+    /// left untouched, and `Connection: close` is appended only when
+    /// absent. A keep-alive verdict replaces any baked tail with
+    /// `Connection: keep-alive` + `Keep-Alive: timeout=N` — emitted only
+    /// by write edges that will actually park the connection (see the
+    /// `keep_alive` module docs).
+    pub(crate) fn connection_reuse(mut self, keep_alive: bool) -> Self {
+        if keep_alive {
+            self.headers.retain(|(name, _)| {
+                !name.eq_ignore_ascii_case("connection") && !name.eq_ignore_ascii_case("keep-alive")
+            });
+            self.header("Connection", "keep-alive")
+                .header("Keep-Alive", keep_alive_header_value())
+        } else if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        {
+            self
+        } else {
+            self.header("Connection", "close")
+        }
+    }
+
     /// Fleet-allowlist CORS posture: strip any wildcard, echo the origin
-    /// only when it passed the allowlist, and mark `Vary: Origin` — the
-    /// builder form of `with_fleet_cors`.
+    /// only when it passed the allowlist, and mark `Vary: Origin`. The
+    /// one fleet renderer (its string-form ancestor retired with the S6
+    /// access-family conversion).
     pub(crate) fn fleet_cors(mut self, allowed_origin: Option<&str>) -> Self {
         self.headers
             .retain(|(name, _)| !name.eq_ignore_ascii_case("access-control-allow-origin"));
@@ -522,7 +733,10 @@ pub(crate) fn query_param(request_line: &str, key: &str) -> Option<String> {
         let mut it = pair.splitn(2, '=');
         let k = it.next()?;
         let v = it.next().unwrap_or("");
-        if k == key {
+        // Browsers' URLSearchParams decodes both names and values. Match
+        // that behavior so security decisions cannot be bypassed with an
+        // encoded parameter name such as `%63onnect`.
+        if url_decode(k) == key {
             return Some(url_decode(v));
         }
     }
@@ -623,6 +837,18 @@ pub(crate) fn extract_host_header(header_text: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Conservative fallback for fleet-origin provenance on HTTP keep-alive.
+/// The listener's accepted SNI is authoritative; this also treats a request
+/// whose Host names any fleet certificate installed during this process as
+/// fleet-origin. A forged Host can therefore only remove authority, never
+/// gain it.
+pub(crate) fn request_names_known_fleet_origin(header_text: &str) -> bool {
+    extract_host_header(header_text)
+        .and_then(|authority| url::Url::parse(&format!("https://{authority}")).ok())
+        .and_then(|url| url.host_str().map(str::to_string))
+        .is_some_and(|host| crate::web_tls::is_fleet_server_name(Some(&host)))
+}
+
 /// Decide whether a cross-origin caller may use the fleet Access APIs.
 /// Allowed origins are: this daemon itself (same-origin requests also send
 /// an Origin header on POST), the macOS app bundle's custom scheme, this
@@ -632,7 +858,11 @@ pub(crate) fn extract_host_header(header_text: &str) -> Option<String> {
 /// True for the request's own origin (Origin matches the Host header under
 /// the connection's scheme) and for the macOS app bundle's custom scheme —
 /// web content can never carry a custom-scheme origin, and the app's native
-/// proxy is not subject to CORS anyway.
+/// proxy is not subject to CORS anyway. Cleartext browser authority is local
+/// only: accepting an arbitrary matching hostname would let an attacker DNS-
+/// rebind its HTTP origin to the loopback listener while preserving matching
+/// Origin and Host values. Non-loopback browser access must use HTTPS (and,
+/// for trusted-root authority, mTLS).
 pub(crate) fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str) -> bool {
     let origin = origin.trim();
     if origin.eq_ignore_ascii_case("null") || origin.is_empty() {
@@ -647,17 +877,35 @@ pub(crate) fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str
     if let Some(host) = extract_host_header(header_text) {
         let scheme = if is_tls { "https" } else { "http" };
         if normalized_origin(&format!("{scheme}://{host}")).as_deref() == Some(&normalized) {
-            return true;
+            return is_tls || is_cleartext_loopback_origin(origin);
         }
     }
     false
 }
 
-/// The bootstrap surfaces that are *designed* for foreign-origin browsers:
-/// local Connect signaling (a page from a rendezvous origin negotiates a
-/// tunnel whose real authentication is the daemon-signed binding plus IAM)
-/// and the public peer-access doorbell. Their responses stay
-/// wildcard-readable; everything else is same-origin or fleet-echoed.
+fn is_cleartext_loopback_origin(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "ws") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(client_ip_is_loopback)
+}
+
+/// Public doorbell responses stay wildcard-readable. Authority-bearing
+/// daemon signaling deliberately does not use this helper: those responses
+/// are same-origin (or signed-app-origin) only.
 pub(crate) fn with_public_cors(response: String) -> String {
     let Some(split) = response.find("\r\n\r\n") else {
         return response;
@@ -666,36 +914,22 @@ pub(crate) fn with_public_cors(response: String) -> String {
     format!("{head}\r\nAccess-Control-Allow-Origin: *{rest}")
 }
 
-/// Rewrite a JSON response's CORS posture for the fleet Access APIs: echo
-/// the specific origin only when it passed the fleet allowlist (stripping
-/// any pre-existing ACAO — duplicates are invalid to browsers). These six
-/// routes must never be wildcard-readable — a cert-installed browser would
-/// happily authenticate reads for any website.
-pub(crate) fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
+/// Echo one already-validated browser origin on a hand-written response.
+/// Callers must run `is_own_or_app_origin` before passing an origin here.
+pub(crate) fn with_allowed_origin_cors(response: String, origin: Option<&str>) -> String {
+    let Some(origin) = origin else {
+        return response;
+    };
     let Some(split) = response.find("\r\n\r\n") else {
         return response;
     };
     let (head, rest) = response.split_at(split);
-    let mut lines: Vec<&str> = head
-        .split("\r\n")
-        .filter(|line| {
-            !line
-                .to_ascii_lowercase()
-                .starts_with("access-control-allow-origin:")
-        })
-        .collect();
-    let echo;
-    if let Some(origin) = allowed_origin {
-        echo = format!("Access-Control-Allow-Origin: {origin}");
-        lines.push(&echo);
-    }
-    lines.push("Vary: Origin");
-    format!("{}{rest}", lines.join("\r\n"))
+    format!("{head}\r\nAccess-Control-Allow-Origin: {origin}\r\nVary: Origin{rest}")
 }
 
-/// Body cap for the public /connect/dashboard signaling arms (SDP offers
-/// and ICE batches stay far below this; the lane is reachable before any
-/// authentication, so it must never buffer unbounded input).
+/// Body cap for the direct /connect/dashboard signaling arms. SDP offers
+/// and ICE batches stay far below this; authentication must not turn a
+/// malformed request into an unbounded allocation.
 pub(crate) const CONNECT_SIGNALING_BODY_CAP_BYTES: usize = 256 * 1024;
 
 pub(crate) async fn read_request_body_capped<S: AsyncRead + Unpin>(
@@ -758,6 +992,11 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
         416 => "416 Range Not Satisfiable",
         429 => "429 Too Many Requests",
         500 => "500 Internal Server Error",
+        // The peers family's relay-failure class (peer_error_response,
+        // coordinator delegation): NotConnected/Transport/Auth/Rejected
+        // answer 502 through the shared renderer since the S7
+        // conversion.
+        502 => "502 Bad Gateway",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
@@ -772,16 +1011,41 @@ pub(crate) fn status_reason(status: u16) -> &'static str {
 /// `"GET /ws?token=abc HTTP/1.1"`. Returns the extracted token if
 /// present, `None` if there's no `?token=` parameter.
 pub(crate) fn extract_token_query_param(request_line: &str) -> Option<String> {
+    // No URL-decoding: bearer tokens are typically URL-safe
+    // (hex / base64-url). If a token contains characters that
+    // require encoding, the operator can either pick a
+    // different token or send via Authorization header (which
+    // doesn't have the URL-encoding constraint).
+    extract_query_param(request_line, "token")
+}
+
+/// Extract a named query parameter from an HTTP request line (same
+/// no-URL-decoding contract as the token extractor above — callers pass
+/// URL-safe values).
+pub(crate) fn extract_query_param(request_line: &str, name: &str) -> Option<String> {
     let path_and_query = request_line.split_whitespace().nth(1)?;
     let query = path_and_query.split_once('?')?.1;
     for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("token=") {
-            // No URL-decoding: bearer tokens are typically URL-safe
-            // (hex / base64-url). If a token contains characters that
-            // require encoding, the operator can either pick a
-            // different token or send via Authorization header (which
-            // doesn't have the URL-encoding constraint).
+        if let Some(value) = pair
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
             return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Case-insensitive lookup of one header's value in a raw HTTP header
+/// block (request line + `Name: value` lines).
+pub(crate) fn extract_header_value(header_text: &str, name: &str) -> Option<String> {
+    for line in header_text.lines().skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case(name) {
+            let value = value.trim();
+            return (!value.is_empty()).then(|| value.to_string());
         }
     }
     None
@@ -812,11 +1076,16 @@ mod tests {
              Content-Length: 13\r\n\
              Cache-Control: no-cache\r\n\
              Access-Control-Allow-Origin: *\r\n\
+             Content-Security-Policy: frame-ancestors 'none'\r\n\
+             X-Frame-Options: DENY\r\n\
              Connection: close\r\n\
              \r\n\
              <h1>gone</h1>"
         );
-        // The builder's CORS postures match the string post-processors.
+        // The builder's CORS postures match the historical
+        // post-processor bytes (the string-form fleet helper is gone —
+        // the builder is the one fleet renderer, so its shapes are
+        // pinned literally).
         assert_eq!(
             HttpResponse::json("200 OK", "{}")
                 .public_cors()
@@ -827,17 +1096,105 @@ mod tests {
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(Some("https://fleet.example"))
                 .into_string(),
-            with_fleet_cors(
-                json_response("200 OK", "{}".to_string()),
-                Some("https://fleet.example")
-            )
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             Access-Control-Allow-Origin: https://fleet.example\r\n\
+             Vary: Origin\r\n\
+             \r\n\
+             {}"
         );
         assert_eq!(
             HttpResponse::json("200 OK", "{}")
                 .fleet_cors(None)
                 .into_string(),
-            with_fleet_cors(json_response("200 OK", "{}".to_string()), None)
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             Cache-Control: no-cache\r\n\
+             Connection: close\r\n\
+             Vary: Origin\r\n\
+             \r\n\
+             {}"
         );
+    }
+
+    #[test]
+    fn connection_reuse_close_is_byte_identical_to_legacy_shapes() {
+        // Close verdict on a shape that bakes `Connection: close`
+        // (every legacy helper): a strict no-op.
+        assert_eq!(
+            HttpResponse::json("200 OK", "{}")
+                .connection_reuse(false)
+                .into_string(),
+            json_response("200 OK", "{}".to_string())
+        );
+        // Close verdict on a shape with no Connection header: one is
+        // appended so the client knows not to reuse.
+        let bare = HttpResponse::with_content("200 OK", "text/plain", "x")
+            .connection_reuse(false)
+            .into_string();
+        assert!(bare.contains("Connection: close\r\n"), "{bare}");
+    }
+
+    #[test]
+    fn connection_reuse_keep_alive_replaces_baked_close() {
+        let text = HttpResponse::json("200 OK", "{}")
+            .connection_reuse(true)
+            .into_string();
+        assert!(!text.contains("Connection: close"), "{text}");
+        assert!(text.contains("Connection: keep-alive\r\n"), "{text}");
+        assert!(
+            text.contains(&format!("Keep-Alive: timeout={KEEP_ALIVE_IDLE_SECS}\r\n")),
+            "{text}"
+        );
+        assert_eq!(text.matches("Connection").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn demux_stream_defaults_fail_closed_and_replay_serves_first() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut stream = DemuxStream::new(Box::pin(server));
+        // Fail-closed defaults: no verdict, no armed slot.
+        assert!(!stream.exchange_reusable());
+        stream.begin_request(true);
+        stream.mark_request_body_consumed();
+        // Still not reusable: the parked slot was never armed (the
+        // fixture / one-shot shape), so a park would just close.
+        assert!(!stream.exchange_reusable());
+        let slot = DemuxStream::new_parked_slot();
+        stream.arm_keep_alive(&slot);
+        assert!(stream.exchange_reusable());
+        // begin_request resets the body leg (fail-closed per request).
+        stream.begin_request(true);
+        assert!(!stream.exchange_reusable());
+
+        // Replay bytes are served before the transport's own bytes.
+        client.write_all(b"tail").await.unwrap();
+        stream.push_replay(b"head ");
+        let mut got = [0u8; 9];
+        stream.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"head tail");
+    }
+
+    #[tokio::test]
+    async fn demux_stream_park_hands_the_stream_back_through_the_slot() {
+        let (_client, server) = tokio::io::duplex(64);
+        let mut stream = DemuxStream::new(Box::pin(server));
+        let slot = DemuxStream::new_parked_slot();
+        stream.arm_keep_alive(&slot);
+        stream.begin_request(true);
+        stream.mark_request_body_consumed();
+        stream.park().await;
+        let parked = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("park() must hand the stream back through the slot");
+        drop(parked);
     }
 
     #[tokio::test]
@@ -934,6 +1291,11 @@ mod tests {
 
     #[test]
     fn fleet_cors_paths_cover_exactly_the_access_apis() {
+        // is_fleet_cors_access_path derives from the route table (S6):
+        // every FleetAllowlist row's path answers true — a new fleet
+        // row (the fleet-cert ROW-NEW is the first) joins the write-side
+        // origin gate by declaration instead of by remembering to edit
+        // a hand-kept list.
         for path in [
             "/api/access/overview",
             "/api/access/iam/state",
@@ -941,29 +1303,36 @@ mod tests {
             "/api/access/enrollment-requests/decide",
             "/api/access/iam/user-client-grants",
             "/api/access/iam/grants/update",
+            "/api/access/orgs/trust",
+            "/api/access/orgs/revoke",
             "/api/access/connect/status",
             "/api/access/connect/claim-code",
             "/api/access/connect/config",
             "/api/access/connect/unclaim",
+            "/api/access/tier",
+            "/api/access/fleet-cert/request",
         ] {
             assert!(is_fleet_cors_access_path(path), "{path}");
         }
         assert!(!is_fleet_cors_access_path("/api/peers"));
         assert!(!is_fleet_cors_access_path("/config"));
+        // Public and own-origin access rows stay out of the fleet set.
+        assert!(!is_fleet_cors_access_path("/api/access/org-grants"));
+        assert!(!is_fleet_cors_access_path("/api/access/org-grants/issue"));
 
-        // The generic helper's wildcard must be REPLACED, never duplicated.
-        let with = with_fleet_cors(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
-            Some("https://daemon.local:8765"),
-        );
+        // A pre-existing wildcard must be REPLACED, never duplicated.
+        let with = HttpResponse::with_content("200 OK", "application/json", "{}")
+            .header("Access-Control-Allow-Origin", "*")
+            .fleet_cors(Some("https://daemon.local:8765"))
+            .into_string();
         assert_eq!(with.matches("Access-Control-Allow-Origin").count(), 1);
         assert!(with.contains("Access-Control-Allow-Origin: https://daemon.local:8765"));
         assert!(with.contains("Vary: Origin"));
         assert!(with.ends_with("\r\n\r\n{}"));
-        let without = with_fleet_cors(
-            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
-            None,
-        );
+        let without = HttpResponse::with_content("200 OK", "application/json", "{}")
+            .header("Access-Control-Allow-Origin", "*")
+            .fleet_cors(None)
+            .into_string();
         assert!(!without.contains("Access-Control-Allow-Origin"));
         assert!(without.contains("Vary: Origin"));
     }
@@ -979,6 +1348,42 @@ mod tests {
             true,
             "GET / HTTP/1.1\r\nHost: daemon.local:8765\r\n",
         ));
+        assert!(is_own_or_app_origin(
+            "http://localhost:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: localhost:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://127.0.0.1:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://[::1]:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: [::1]:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin(
+            "http://[::ffff:127.0.0.1]:8765",
+            false,
+            "GET / HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n",
+        ));
+        assert!(
+            !is_own_or_app_origin(
+                "http://attacker.example:8765",
+                false,
+                "GET / HTTP/1.1\r\nHost: attacker.example:8765\r\n",
+            ),
+            "matching Origin and Host are not enough on cleartext: DNS rebinding"
+        );
+        assert!(
+            !is_own_or_app_origin(
+                "http://192.0.2.10:8765",
+                false,
+                "GET / HTTP/1.1\r\nHost: 192.0.2.10:8765\r\n",
+            ),
+            "non-loopback browser authority requires HTTPS"
+        );
         assert!(is_own_or_app_origin("intendant://backend", true, ""));
         assert!(!is_own_or_app_origin("null", true, ""));
         assert!(!is_own_or_app_origin(

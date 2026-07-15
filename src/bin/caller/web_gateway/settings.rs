@@ -3,6 +3,167 @@
 //! set/status, and the thin per-route stream handlers.
 
 use super::*;
+use std::io::Read;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CodexModelChoice {
+    pub id: String,
+    pub display_name: String,
+    pub default_reasoning_effort: String,
+    pub reasoning_efforts: Vec<String>,
+}
+
+const MAX_CODEX_MODELS_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CODEX_AUTH_METADATA_BYTES: usize = 64 * 1024;
+
+#[derive(serde::Deserialize)]
+struct CodexModelsCache {
+    #[serde(default)]
+    models: Vec<CachedCodexModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct CachedCodexModel {
+    slug: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<CachedCodexReasoningLevel>,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    supported_in_api: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+struct CachedCodexReasoningLevel {
+    effort: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CodexAuthMetadata {
+    #[serde(default)]
+    auth_mode: Option<String>,
+}
+
+fn read_bounded_file(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() <= max_bytes).then_some(bytes)
+}
+
+/// Match Codex's picker filter: ChatGPT and agent-identity auth use the
+/// Codex backend and can expose subscription-only models; API-key (or
+/// unknown) auth only gets entries marked `supported_in_api`.
+fn codex_auth_uses_codex_backend(codex_home: &Path) -> bool {
+    let bytes =
+        match read_bounded_file(&codex_home.join("auth.json"), MAX_CODEX_AUTH_METADATA_BYTES) {
+            Some(bytes) => bytes,
+            None => return false,
+        };
+    let auth: CodexAuthMetadata = match serde_json::from_slice(&bytes) {
+        Ok(auth) => auth,
+        Err(_) => return false,
+    };
+    matches!(
+        auth.auth_mode
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("chatgpt" | "chatgptauthtokens" | "agentidentity")
+    )
+}
+
+/// Read the model vocabulary Codex cached for its currently signed-in
+/// account. The cache is advisory UI data only: Codex remains the launch-time
+/// authority, malformed/oversized files fall back to the conservative daemon
+/// catalog, and custom ids remain available in the picker.
+fn codex_model_choices_from_cache(codex_home: &Path) -> Option<Vec<CodexModelChoice>> {
+    let bytes = read_bounded_file(
+        &codex_home.join("models_cache.json"),
+        MAX_CODEX_MODELS_CACHE_BYTES,
+    )?;
+    let cache: CodexModelsCache = serde_json::from_slice(&bytes).ok()?;
+    let uses_codex_backend = codex_auth_uses_codex_backend(codex_home);
+    let mut seen = std::collections::HashSet::new();
+    let mut choices = Vec::new();
+    for cached in cache.models {
+        if cached
+            .visibility
+            .as_deref()
+            .is_some_and(|visibility| !visibility.eq_ignore_ascii_case("list"))
+            || (!uses_codex_backend && cached.supported_in_api == Some(false))
+        {
+            continue;
+        }
+        let id = cached.slug.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let static_entry = crate::project::codex_model_catalog_entry(id);
+        let mut reasoning_efforts = Vec::new();
+        for level in cached.supported_reasoning_levels {
+            let effort = level.effort.trim();
+            if !effort.is_empty()
+                && !reasoning_efforts
+                    .iter()
+                    .any(|existing: &String| existing == effort)
+            {
+                reasoning_efforts.push(effort.to_string());
+            }
+        }
+        if reasoning_efforts.is_empty() {
+            if let Some(entry) = static_entry {
+                reasoning_efforts = entry
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| (*effort).to_string())
+                    .collect();
+            }
+        }
+        let mut default_reasoning_effort = cached
+            .default_reasoning_level
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_string)
+            .or_else(|| static_entry.map(|entry| entry.default_reasoning_effort.to_string()))
+            .or_else(|| {
+                reasoning_efforts
+                    .iter()
+                    .find(|effort| effort.as_str() == "medium")
+                    .cloned()
+            })
+            .or_else(|| reasoning_efforts.first().cloned())
+            .unwrap_or_default();
+        if !default_reasoning_effort.is_empty()
+            && !reasoning_efforts.contains(&default_reasoning_effort)
+        {
+            reasoning_efforts.push(default_reasoning_effort.clone());
+        }
+        if default_reasoning_effort.is_empty() && !reasoning_efforts.is_empty() {
+            default_reasoning_effort = reasoning_efforts[0].clone();
+        }
+        let display_name = cached.display_name.trim();
+        choices.push(CodexModelChoice {
+            id: id.to_string(),
+            display_name: if display_name.is_empty() {
+                id.to_string()
+            } else {
+                display_name.to_string()
+            },
+            default_reasoning_effort,
+            reasoning_efforts,
+        });
+    }
+    (!choices.is_empty()).then_some(choices)
+}
 
 /// Settings payload for GET/POST /api/settings.
 /// Flattened view of intendant.toml sections relevant to the web dashboard.
@@ -56,16 +217,23 @@ pub struct SettingsPayload {
     pub codex_model: Option<String>,
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    /// Read-only picker catalog. POST callers may omit it; GET derives it
+    /// from the daemon's canonical Codex model snapshot.
+    #[serde(default)]
+    pub codex_models: Vec<CodexModelChoice>,
+    /// Read-only union accepted by the daemon, used for custom model ids.
+    #[serde(default)]
+    pub codex_reasoning_efforts: Vec<String>,
     // Empty / omitted = inherit Codex config; "standard" sends an explicit
     // normal/clear override for Intendant-managed Codex sessions.
     #[serde(default)]
     pub codex_service_tier: Option<String>,
     #[serde(default)]
-    pub codex_web_search: bool,
+    pub codex_web_search: Option<bool>,
     #[serde(default)]
-    pub codex_network_access: bool,
+    pub codex_network_access: Option<bool>,
     #[serde(default)]
-    pub codex_writable_roots: Vec<String>,
+    pub codex_writable_roots: Option<Vec<String>>,
     #[serde(default, alias = "codex_context_recovery")]
     pub codex_managed_context: Option<String>,
     #[serde(default)]
@@ -130,7 +298,9 @@ pub(crate) fn normalize_settings_agent_command(input: Option<&str>, fallback: &s
     }
 }
 
-pub(crate) fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> SettingsPayload {
+pub(crate) fn settings_payload_from_config(
+    config: &crate::project::ProjectConfig,
+) -> SettingsPayload {
     let mut env_overrides = std::collections::HashMap::new();
     for (key, var) in [
         ("CU_PROVIDER", "CU_PROVIDER"),
@@ -177,12 +347,30 @@ pub(crate) fn settings_payload_from_config(config: &crate::project::ProjectConfi
         codex_reasoning_effort: crate::project::normalize_reasoning_effort(
             config.agent.codex.reasoning_effort.as_deref(),
         ),
+        codex_models: crate::project::CODEX_MODEL_CATALOG
+            .iter()
+            .map(|entry| CodexModelChoice {
+                id: entry.id.to_string(),
+                display_name: entry.display_name.to_string(),
+                default_reasoning_effort: entry.default_reasoning_effort.to_string(),
+                reasoning_efforts: entry
+                    .reasoning_efforts
+                    .iter()
+                    .map(|effort| (*effort).to_string())
+                    .collect(),
+            })
+            .collect(),
+        codex_reasoning_efforts: crate::project::CODEX_REASONING_EFFORTS
+            .iter()
+            .filter(|effort| !effort.is_empty())
+            .map(|effort| (*effort).to_string())
+            .collect(),
         codex_service_tier: crate::project::normalize_codex_service_tier(
             config.agent.codex.service_tier.as_deref(),
         ),
-        codex_web_search: config.agent.codex.web_search,
-        codex_network_access: config.agent.codex.network_access,
-        codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        codex_web_search: Some(config.agent.codex.web_search),
+        codex_network_access: Some(config.agent.codex.network_access),
+        codex_writable_roots: Some(config.agent.codex.writable_roots.clone()),
         codex_managed_context: Some(crate::project::normalize_codex_managed_context(
             &config.agent.codex.managed_context,
         )),
@@ -222,6 +410,22 @@ pub(crate) async fn settings_payload_with_runtime_overrides(
             .as_ref()
             .map(|backend| backend.as_short_str().to_string());
     }
+    if let Some(codex_home) = runtime.codex_home.as_deref() {
+        if let Some(models) = codex_model_choices_from_cache(codex_home) {
+            // Preserve the daemon's canonical custom-id vocabulary, then
+            // append any account-advertised effort that is newer than this
+            // build so the picker remains forward-compatible.
+            for effort in models
+                .iter()
+                .flat_map(|model| model.reasoning_efforts.iter())
+            {
+                if !payload.codex_reasoning_efforts.contains(effort) {
+                    payload.codex_reasoning_efforts.push(effort.clone());
+                }
+            }
+            payload.codex_models = models;
+        }
+    }
     payload
 }
 
@@ -229,7 +433,8 @@ pub(crate) async fn settings_get_response_body(
     project_root: Option<&Path>,
     runtime_settings: &RuntimeSettingsState,
 ) -> String {
-    match project_root {
+    let settings_root = runtime_settings.settings_root.as_deref().or(project_root);
+    match settings_root {
         Some(root) => match crate::project::Project::from_root(root.to_path_buf()) {
             Ok(proj) => {
                 let payload =
@@ -242,7 +447,10 @@ pub(crate) async fn settings_get_response_body(
     }
 }
 
-pub(crate) fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
+pub(crate) fn apply_settings_payload(
+    config: &mut crate::project::ProjectConfig,
+    payload: &SettingsPayload,
+) {
     config.computer_use.provider = payload.cu_provider.clone();
     config.computer_use.model = payload.cu_model.clone();
     config.computer_use.backend = payload.cu_backend.clone();
@@ -289,9 +497,37 @@ pub(crate) fn apply_settings_payload(config: &mut crate::project::ProjectConfig,
     if let Some(policy) = payload.codex_approval_policy.as_deref() {
         config.agent.codex.approval_policy = crate::project::normalize_approval_policy(policy);
     }
+    if payload.codex_model.is_some() {
+        // Empty clears the override (Codex chooses its account/config
+        // default). Omission leaves the existing value untouched for older
+        // partial API clients.
+        config.agent.codex.model = payload
+            .codex_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
+    }
+    if payload.codex_reasoning_effort.is_some() {
+        config.agent.codex.reasoning_effort =
+            crate::project::normalize_reasoning_effort(payload.codex_reasoning_effort.as_deref());
+    }
     if payload.codex_service_tier.is_some() {
         config.agent.codex.service_tier =
             crate::project::normalize_codex_service_tier(payload.codex_service_tier.as_deref());
+    }
+    if let Some(enabled) = payload.codex_web_search {
+        config.agent.codex.web_search = enabled;
+    }
+    if let Some(enabled) = payload.codex_network_access {
+        config.agent.codex.network_access = enabled;
+    }
+    if let Some(roots) = payload.codex_writable_roots.as_ref() {
+        config.agent.codex.writable_roots = roots
+            .iter()
+            .map(|root| root.trim().to_string())
+            .filter(|root| !root.is_empty())
+            .collect();
     }
     if let Some(mode) = payload.codex_managed_context.as_deref() {
         config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
@@ -329,10 +565,10 @@ pub(crate) fn settings_post_result(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
-) -> (&'static str, String) {
+) -> (u16, String) {
     let Some(root) = project_root else {
         return (
-            "400 Bad Request",
+            400,
             serde_json::json!({"error": "No project root"}).to_string(),
         );
     };
@@ -340,7 +576,7 @@ pub(crate) fn settings_post_result(
         Ok(payload) => payload,
         Err(e) => {
             return (
-                "400 Bad Request",
+                400,
                 serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
             );
         }
@@ -348,26 +584,20 @@ pub(crate) fn settings_post_result(
     let mut proj = match crate::project::Project::from_root(root.to_path_buf()) {
         Ok(proj) => proj,
         Err(e) => {
-            return (
-                "500 Internal Server Error",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            );
+            return (500, serde_json::json!({"error": e.to_string()}).to_string());
         }
     };
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
         Ok(()) => {
-            dispatch_codex_settings_control_msgs(bus, &payload);
-            ("200 OK", serde_json::json!({"ok": true}).to_string())
+            dispatch_agent_settings_control_msgs(bus, &payload);
+            (200, serde_json::json!({"ok": true}).to_string())
         }
-        Err(e) => (
-            "500 Internal Server Error",
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
-/// Mirror just-persisted `[agent.codex]` settings into the live control plane.
+/// Mirror just-persisted external-agent settings into the live control plane.
 ///
 /// `apply_settings_payload` + `save_config` update the TOML, but session
 /// launches read the live `CodexRuntimeConfig`, which OVERLAYS the TOML
@@ -382,10 +612,14 @@ pub(crate) fn settings_post_result(
 /// own synchronous TOML write (kept above) is what makes an immediate
 /// GET /api/settings read back the saved values.
 ///
-/// Only fields actually present in the payload are dispatched, mirroring
-/// `apply_settings_payload`'s conditional writes; only codex fields with a
-/// live control-plane setter are covered.
-pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
+/// Optional fields dispatch only when present, mirroring
+/// `apply_settings_payload`'s partial-client compatibility. The dashboard's
+/// full payload includes the bool and list fields, while older partial API
+/// clients can omit them without clearing live state.
+pub(crate) fn dispatch_agent_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
+    bus.send(AppEvent::ControlCommand(ControlMsg::SetExternalAgent {
+        agent: payload.external_agent.clone(),
+    }));
     if payload.codex_command.is_some() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
             command: payload.codex_command.clone(),
@@ -408,10 +642,37 @@ pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &Set
             ControlMsg::SetCodexApprovalPolicy { policy },
         ));
     }
+    if payload.codex_model.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexModel {
+            model: payload.codex_model.clone(),
+        }));
+    }
+    if payload.codex_reasoning_effort.is_some() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: payload.codex_reasoning_effort.clone(),
+            },
+        ));
+    }
     if payload.codex_service_tier.is_some() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
             service_tier: payload.codex_service_tier.clone(),
         }));
+    }
+    if let Some(enabled) = payload.codex_web_search {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled,
+        }));
+    }
+    if let Some(enabled) = payload.codex_network_access {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexNetworkAccess { enabled },
+        ));
+    }
+    if let Some(roots) = payload.codex_writable_roots.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexWritableRoots { roots },
+        ));
     }
     if let Some(mode) = payload.codex_managed_context.clone() {
         bus.send(AppEvent::ControlCommand(
@@ -421,6 +682,21 @@ pub(crate) fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &Set
     if let Some(mode) = payload.codex_context_archive.clone() {
         bus.send(AppEvent::ControlCommand(
             ControlMsg::SetCodexContextArchive { mode },
+        ));
+    }
+    if payload.claude_model.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetClaudeModel {
+            model: payload.claude_model.clone(),
+        }));
+    }
+    if let Some(mode) = payload.claude_permission_mode.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetClaudePermissionMode { mode },
+        ));
+    }
+    if let Some(tools) = payload.claude_allowed_tools.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetClaudeAllowedTools { tools },
         ));
     }
 }
@@ -465,16 +741,18 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
 /// when this daemon last ran a session with it. Deliberately independent
 /// of provider fueling — external agents bring their own credentials, so
 /// the dashboard pairs this with the `fueled` flag instead of letting the
-/// first-run nudge claim an unfueled daemon can't do anything.
-pub(crate) fn external_agents_response_body(project_root: Option<&Path>) -> String {
+/// first-run nudge claim an unfueled daemon can't do anything. `home`
+/// arrives from the transport edge (last-run recency and local-login
+/// probes read under it), so tests inject a tempdir instead of reading
+/// the live account (the CLAUDE.md tests-are-hermetic convention).
+pub(crate) fn external_agents_response_body(project_root: Option<&Path>, home: &Path) -> String {
     let agent_config = project_root
         .and_then(|root| crate::project::Project::from_root(root.to_path_buf()).ok())
         .map(|project| project.config.agent)
         .unwrap_or_default();
-    let home = crate::platform::home_dir();
     serde_json::json!({
         "external_agents":
-            crate::external_agent::backend_availability_json(&agent_config, &home),
+            crate::external_agent::backend_availability_json(&agent_config, home),
     })
     .to_string()
 }
@@ -485,9 +763,22 @@ pub(crate) struct SetApiKeysPayload {
     keys: std::collections::HashMap<String, String>,
 }
 
-/// Handle POST /api/api-keys: persist keys to ~/.config/intendant/.env and
-/// set them in the current process.
-pub(crate) fn handle_set_api_keys(body: &str) -> String {
+/// The `.env` file POST /api/api-keys persists provider keys to
+/// (`<config_dir>/intendant/.env`). Resolved here — at the transport
+/// edges — so the persist core takes the path as a parameter and stays
+/// hermetically testable (tests inject a tempdir path; the CLAUDE.md
+/// tests-are-hermetic convention). `None` when the platform reports no
+/// config directory.
+pub(crate) fn api_keys_env_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("intendant").join(".env"))
+}
+
+/// POST /api/api-keys persist core: validate the payload against the
+/// authoritative provider key list, persist to `env_path`, and set the
+/// keys in the current process so future provider instantiations pick
+/// them up without a restart. Failures report in the body — the
+/// endpoint's historical contract answers 200 either way.
+pub(crate) fn set_api_keys_result(env_path: Option<&Path>, body: &str) -> String {
     let payload: SetApiKeysPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => {
@@ -502,24 +793,20 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
         }
     }
 
-    // Resolve config dir.
-    let config_dir = match dirs::config_dir() {
-        Some(d) => d.join("intendant"),
-        None => {
-            return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
-        }
+    let Some(env_path) = env_path else {
+        return serde_json::json!({"error": "Cannot determine config directory"}).to_string();
     };
 
     // Ensure the directory exists.
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
-        return serde_json::json!({"error": format!("Cannot create config dir: {}", e)})
-            .to_string();
+    if let Some(config_dir) = env_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(config_dir) {
+            return serde_json::json!({"error": format!("Cannot create config dir: {}", e)})
+                .to_string();
+        }
     }
 
-    let env_path = config_dir.join(".env");
-
     // Read existing content (may not exist yet).
-    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+    let existing = std::fs::read_to_string(env_path).unwrap_or_default();
 
     // Build updated content: replace existing lines, append new ones.
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
@@ -548,7 +835,7 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
 
     let new_content = lines.join("\n") + "\n";
 
-    if let Err(e) = crate::file_watcher::atomic_write(&env_path, new_content.as_bytes()) {
+    if let Err(e) = crate::file_watcher::atomic_write(env_path, new_content.as_bytes()) {
         return serde_json::json!({"error": format!("Write failed: {}", e)}).to_string();
     }
 
@@ -559,6 +846,81 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
     }
 
     serde_json::json!({"ok": true}).to_string()
+}
+
+// ── Transport-neutral cores (transport-unification design §2.1, S5):
+//    the settings/keys family. Each fn is the single response builder
+//    both lanes render — the HTTP shims below hand them to
+//    `write_api_response`; the tunnel twins frame them through the
+//    dispatch adapters.
+
+/// JSON under the bare wildcard-CORS tail (`Access-Control-Allow-Origin:
+/// *` + `Connection: close`, NO `Cache-Control`) — the historical
+/// framing of the api-keys POST and the diagnostics sink.
+pub(crate) fn bare_wildcard_json_response(status: u16, body: String) -> ApiResponse {
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        headers: vec![
+            ("Access-Control-Allow-Origin", "*".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
+/// GET /api/settings + the tunnel's `api_settings`: the flattened
+/// settings payload — or the historical error body, still under 200.
+pub(crate) async fn settings_get_api_response(
+    project_root: Option<&Path>,
+    runtime_settings: &RuntimeSettingsState,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(settings_get_response_body(project_root, runtime_settings).await),
+    )
+}
+
+/// POST /api/settings + the tunnel's `api_settings_save`.
+pub(crate) fn settings_post_api_response(
+    body_text: &str,
+    project_root: Option<&Path>,
+    bus: &EventBus,
+) -> ApiResponse {
+    let (status, body) = settings_post_result(body_text, project_root, bus);
+    ApiResponse::json(status, JsonBody::PreSerialized(body))
+}
+
+/// POST /api/api-keys + the tunnel's `api_api_keys_save`: always 200 —
+/// the historical lane reports failures in the body — under the bare
+/// wildcard tail. `env_path` arrives from the transport edge
+/// ([`api_keys_env_path`]).
+pub(crate) fn api_keys_save_api_response(env_path: Option<&Path>, body_text: &str) -> ApiResponse {
+    bare_wildcard_json_response(200, set_api_keys_result(env_path, body_text))
+}
+
+/// GET /api/api-key-status + the tunnel's `api_key_status`.
+pub(crate) fn api_key_status_api_response() -> ApiResponse {
+    ApiResponse::json(200, JsonBody::PreSerialized(api_key_status_response_body()))
+}
+
+/// GET /api/project-root + the tunnel's `api_project_root`.
+pub(crate) fn project_root_api_response(project_root: Option<&Path>) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(project_root_response_body(project_root)),
+    )
+}
+
+/// GET /api/external-agents + the tunnel's `api_external_agents`.
+/// `home` arrives from the transport edge (hermeticity convention).
+pub(crate) fn external_agents_api_response(
+    project_root: Option<&Path>,
+    home: &Path,
+) -> ApiResponse {
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(external_agents_response_body(project_root, home)),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -572,85 +934,191 @@ pub(crate) fn handle_set_api_keys(body: &str) -> String {
 // Returning 200+JSON for notifications causes rmcp to try deserializing the
 // body as ServerJsonRpcMessage, which fails because there's no valid `id`.
 
-
-pub(crate) async fn handle_project_root(mut stream: DemuxStream, project_root: Option<PathBuf>) {
-    use tokio::io::AsyncWriteExt;
-    let body = project_root_response_body(project_root.as_deref());
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_project_root(
+    stream: DemuxStream,
+    project_root: Option<PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = project_root_api_response(project_root.as_deref());
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_settings_post(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     bus: EventBus,
     project_root: Option<PathBuf>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let (status, result) =
-        settings_post_result(&body_text, project_root.as_deref(), &bus);
-    let response = json_response(status, result);
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = settings_post_api_response(&body_text, project_root.as_deref(), &bus);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_settings_get(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     project_root: Option<PathBuf>,
     runtime_settings: RuntimeSettingsState,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    use tokio::io::AsyncWriteExt;
-    let body =
-        settings_get_response_body(project_root.as_deref(), &runtime_settings)
-            .await;
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = settings_get_api_response(project_root.as_deref(), &runtime_settings).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_api_keys_post(mut stream: DemuxStream, body_text: String) {
-    use tokio::io::AsyncWriteExt;
-    let result = handle_set_api_keys(&body_text);
-    let response = HttpResponse::with_content("200 OK", "application/json", result)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_api_keys_post(
+    stream: DemuxStream,
+    body_text: String,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    // The transport edge resolves the ambient env path; the neutral core
+    // below it is path-parameterized (hermeticity convention).
+    let response = api_keys_save_api_response(api_keys_env_path().as_deref(), &body_text);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_api_key_status(mut stream: DemuxStream) {
-    use tokio::io::AsyncWriteExt;
-    let body = api_key_status_response_body();
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_api_key_status(
+    stream: DemuxStream,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    write_api_response(stream, api_key_status_api_response(), cors, fleet_origin).await;
 }
 
-pub(crate) async fn handle_external_agents(mut stream: DemuxStream, project_root: Option<PathBuf>) {
-    use tokio::io::AsyncWriteExt;
-    let body = external_agents_response_body(project_root.as_deref());
-    let response = HttpResponse::with_content("200 OK", "application/json", body)
-        .header("Cache-Control", "no-cache")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+pub(crate) async fn handle_external_agents(
+    stream: DemuxStream,
+    project_root: Option<PathBuf>,
+    home: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = external_agents_api_response(project_root.as_deref(), &home);
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn settings_catalog_uses_the_signed_in_codex_account_cache() {
+        let codex_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_home.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.path().join("models_cache.json"),
+            serde_json::json!({
+                "models": [
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6-Sol",
+                        "default_reasoning_level": "low",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"},
+                            {"effort": "medium"},
+                            {"effort": "ultra"}
+                        ],
+                        "visibility": "list",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "gpt-5.3-codex-spark",
+                        "display_name": "GPT-5.3-Codex-Spark",
+                        "default_reasoning_level": "high",
+                        "supported_reasoning_levels": [{"effort": "high"}],
+                        "visibility": "list",
+                        "supported_in_api": false
+                    },
+                    {
+                        "slug": "gpt-5.6",
+                        "display_name": "GPT-5.6 API alias",
+                        "default_reasoning_level": "medium",
+                        "supported_reasoning_levels": [{"effort": "medium"}],
+                        "visibility": "hide",
+                        "supported_in_api": true
+                    },
+                    {
+                        "slug": "codex-auto-review",
+                        "display_name": "Codex Auto Review",
+                        "visibility": "hide",
+                        "supported_in_api": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = RuntimeSettingsState {
+            codex_home: Some(codex_home.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let payload = settings_payload_with_runtime_overrides(
+            &crate::project::ProjectConfig::default(),
+            &runtime,
+        )
+        .await;
+
+        assert_eq!(
+            payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-5.3-codex-spark"]
+        );
+        assert_eq!(payload.codex_models[0].default_reasoning_effort, "low");
+        assert_eq!(
+            payload.codex_models[0].reasoning_efforts,
+            vec!["low", "medium", "ultra"]
+        );
+
+        // Codex filters the same cache by auth mode: API-key auth must not
+        // offer subscription-only entries.
+        std::fs::write(
+            codex_home.path().join("auth.json"),
+            r#"{"auth_mode":"apikey"}"#,
+        )
+        .unwrap();
+        let api_payload = settings_payload_with_runtime_overrides(
+            &crate::project::ProjectConfig::default(),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            api_payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol"]
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_get_uses_daemon_settings_root_without_a_project_root() {
+        let settings_root = tempfile::tempdir().unwrap();
+        let mut project =
+            crate::project::Project::from_root(settings_root.path().to_path_buf()).unwrap();
+        project.config.agent.codex.model = Some("gpt-5.6-sol".to_string());
+        project.config.agent.claude_code.model = Some("fable".to_string());
+        project.save_config().unwrap();
+        let runtime = RuntimeSettingsState {
+            settings_root: Some(settings_root.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let body = settings_get_response_body(None, &runtime).await;
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(value["codex_model"], "gpt-5.6-sol");
+        assert_eq!(value["claude_model"], "fable");
+    }
 
     #[test]
     fn settings_payload_accepts_settings_tab_save_without_agent_runtime_fields() {
@@ -717,6 +1185,24 @@ mod tests {
         assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(payload.codex_service_tier.as_deref(), Some("priority"));
         assert_eq!(
+            payload
+                .codex_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            crate::project::CODEX_MODEL_CATALOG
+                .iter()
+                .map(|model| model.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(payload
+            .codex_reasoning_efforts
+            .contains(&"none".to_string()));
+        assert!(payload.codex_reasoning_efforts.contains(&"max".to_string()));
+        assert!(payload
+            .codex_reasoning_efforts
+            .contains(&"ultra".to_string()));
+        assert_eq!(
             payload.claude_command.as_deref(),
             Some("/usr/local/bin/claude")
         );
@@ -769,7 +1255,7 @@ mod tests {
             &EventBus::new(),
         );
 
-        assert_eq!(status, "400 Bad Request");
+        assert_eq!(status, 400);
         assert!(body.contains("Invalid settings"));
     }
 
@@ -777,7 +1263,7 @@ mod tests {
     fn settings_post_result_rejects_missing_project_root_with_bad_request() {
         let (status, body) = settings_post_result("{}", None, &EventBus::new());
 
-        assert_eq!(status, "400 Bad Request");
+        assert_eq!(status, 400);
         assert!(body.contains("No project root"));
     }
 
@@ -786,7 +1272,7 @@ mod tests {
     /// which overrides the file. The gateway does that by re-dispatching
     /// the codex fields as control-plane intents after a successful save.
     #[test]
-    fn settings_post_dispatches_codex_control_msgs_for_live_state() {
+    fn settings_post_dispatches_external_agent_control_msgs_for_live_state() {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
@@ -813,21 +1299,32 @@ mod tests {
             "codex_command": "/opt/codex/bin/codex",
             "codex_sandbox": "danger-full-access",
             "codex_approval_policy": "never",
+            "codex_model": "gpt-5.6-sol",
+            "codex_reasoning_effort": "high",
             "codex_service_tier": "priority",
+            "codex_web_search": true,
+            "codex_network_access": true,
+            "codex_writable_roots": ["/tmp/work"],
             "codex_managed_context": "managed",
-            "codex_context_archive": "exact"
+            "codex_context_archive": "exact",
+            "claude_model": "fable",
+            "claude_permission_mode": "plan",
+            "claude_allowed_tools": ["Read"]
         })
         .to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
-        assert_eq!(status, "200 OK");
+        assert_eq!(status, 200);
 
         let mut saw_command = false;
         let mut saw_sandbox = false;
         let mut saw_approval = false;
+        let mut saw_codex_model = false;
         let mut saw_service_tier = false;
         let mut saw_managed = false;
         let mut saw_archive = false;
+        let mut saw_claude_model = false;
+        let mut saw_claude_permission = false;
         while let Ok(event) = rx.try_recv() {
             let AppEvent::ControlCommand(msg) = event else {
                 continue;
@@ -845,6 +1342,10 @@ mod tests {
                     assert_eq!(policy, "never");
                     saw_approval = true;
                 }
+                ControlMsg::SetCodexModel { model } => {
+                    assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                    saw_codex_model = true;
+                }
                 ControlMsg::SetCodexServiceTier { service_tier } => {
                     assert_eq!(service_tier.as_deref(), Some("priority"));
                     saw_service_tier = true;
@@ -857,20 +1358,390 @@ mod tests {
                     assert_eq!(mode, "exact");
                     saw_archive = true;
                 }
+                ControlMsg::SetClaudeModel { model } => {
+                    assert_eq!(model.as_deref(), Some("fable"));
+                    saw_claude_model = true;
+                }
+                ControlMsg::SetClaudePermissionMode { mode } => {
+                    assert_eq!(mode, "plan");
+                    saw_claude_permission = true;
+                }
                 _ => {}
             }
         }
         assert!(saw_command, "SetCodexCommand was not dispatched");
         assert!(saw_sandbox, "SetCodexSandbox was not dispatched");
         assert!(saw_approval, "SetCodexApprovalPolicy was not dispatched");
+        assert!(saw_codex_model, "SetCodexModel was not dispatched");
         assert!(saw_service_tier, "SetCodexServiceTier was not dispatched");
         assert!(saw_managed, "SetCodexManagedContext was not dispatched");
         assert!(saw_archive, "SetCodexContextArchive was not dispatched");
+        assert!(saw_claude_model, "SetClaudeModel was not dispatched");
+        assert!(
+            saw_claude_permission,
+            "SetClaudePermissionMode was not dispatched"
+        );
 
         // The synchronous TOML write still happened (read-after-write
         // consistency for an immediate GET /api/settings).
         let saved = std::fs::read_to_string(dir.path().join("intendant.toml")).unwrap();
         assert!(saved.contains("managed_context = \"managed\""));
+        assert!(saved.contains("model = \"gpt-5.6-sol\""));
+        assert!(saved.contains("model = \"fable\""));
+    }
+
+    // ── S5 golden transcripts: settings / keys family ──
+    //
+    // Byte-exact pins of the settings GET/POST, api-keys POST,
+    // api-key-status, and project-root HTTP responses, captured before
+    // the transport-neutral conversion (transport-unification design
+    // §6 S5, risk R1) and kept as the conversion's proof. The expected
+    // framing is hand-written below — never built through the response
+    // helpers under conversion. Environment-dependent bodies (the
+    // key-status booleans read process env / leases; the settings
+    // payload mirrors env overrides) are computed through the body
+    // builders the conversion does not touch and spliced into the
+    // hand-written framing — the framing is the pin, and the fixtures
+    // never write outside their tempdirs (the api-keys pins use the
+    // pre-persist rejection paths, which return before any config-dir
+    // resolution).
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_settings_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(DemuxStream::new(Box::pin(server))).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The canonical JSON framing (`Cache-Control` + `Connection` tail):
+    /// settings GET/POST, key-status, and project-root, spelled out
+    /// literally.
+    fn golden_settings_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The bare wildcard-CORS JSON framing (`Access-Control-Allow-Origin:
+    /// *` + `Connection` tail, NO `Cache-Control`): the api-keys POST
+    /// shape, spelled out literally.
+    fn golden_settings_bare_wildcard_json_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn golden_settings_transcript(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// The CORS posture dispatch hands the shim — read from the route
+    /// table so a row-posture change fails these byte pins instead of
+    /// silently changing the wire.
+    fn settings_route_cors(method: &str, path: &str) -> crate::gateway_routes::CorsPosture {
+        crate::gateway_routes::match_route(method, path)
+            .expect("settings route declared")
+            .0
+            .cors
+    }
+
+    #[tokio::test]
+    async fn golden_project_root_transcripts() {
+        let cors = settings_route_cors("GET", "/api/project-root");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let root_json = serde_json::json!(root.to_string_lossy()).to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_project_root(stream, Some(root.clone()), cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript(
+                "200 OK",
+                &format!(r#"{{"project_root":{root_json}}}"#)
+            )
+        );
+
+        let response = collect_settings_handler_response(|stream| {
+            handle_project_root(stream, None, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"project_root":null}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_get_no_root_transcript() {
+        // Historical shape: the missing-project-root ERROR body still
+        // answers 200 OK on the GET lane.
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_get(
+                stream,
+                None,
+                RuntimeSettingsState::default(),
+                settings_route_cors("GET", "/api/settings"),
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"error":"No project root"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_get_temp_root_transcript() {
+        // A tempdir project root loads the default config; the payload
+        // body mirrors process env (env_overrides), so it is computed
+        // through the payload builder and spliced — the 200 framing is
+        // the byte-exact pin.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let runtime_settings = RuntimeSettingsState::default();
+        let body = settings_get_response_body(Some(&root), &runtime_settings).await;
+        assert!(
+            body.contains("cu_backend"),
+            "default-config payload expected: {body}"
+        );
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_get(
+                stream,
+                Some(root.clone()),
+                runtime_settings.clone(),
+                settings_route_cors("GET", "/api/settings"),
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_settings_post_transcripts() {
+        let cors = settings_route_cors("POST", "/api/settings");
+        // Missing project root: 400 under the canonical tail.
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(stream, "{}".to_string(), EventBus::new(), None, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("400 Bad Request", r#"{"error":"No project root"}"#)
+        );
+
+        // Invalid payload: 400 with serde's wording for this exact input
+        // (derived through the same parse, framing hand-written). The
+        // parse rejects before the project root is ever read.
+        let parse_dir = tempfile::tempdir().unwrap();
+        let invalid = "{\"external_agent\":";
+        let serde_error = serde_json::from_str::<SettingsPayload>(invalid).unwrap_err();
+        let expected_body =
+            serde_json::json!({"error": format!("Invalid settings: {}", serde_error)}).to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(
+                stream,
+                invalid.to_string(),
+                EventBus::new(),
+                Some(parse_dir.path().to_path_buf()),
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("400 Bad Request", &expected_body)
+        );
+
+        // Success on a tempdir root: 200 {"ok":true} and the TOML written.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": null
+        })
+        .to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_settings_post(
+                stream,
+                body,
+                EventBus::new(),
+                Some(root.clone()),
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", r#"{"ok":true}"#)
+        );
+        assert!(root.join("intendant.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn golden_api_keys_post_transcripts() {
+        let cors = settings_route_cors("POST", "/api/api-keys");
+        // Unknown key: rejected before any config-dir resolution — and
+        // still 200 OK (the historical always-200 POST lane) under the
+        // bare wildcard tail.
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_keys_post(
+                stream,
+                r#"{"keys":{"NOT_A_KNOWN_KEY":"x"}}"#.to_string(),
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_bare_wildcard_json_transcript(
+                "200 OK",
+                r#"{"error":"Unknown key: NOT_A_KNOWN_KEY"}"#
+            )
+        );
+
+        // Invalid payload: serde wording derived through the same parse
+        // (match instead of unwrap_err — the payload type has no Debug).
+        let invalid = "not json";
+        let serde_error = match serde_json::from_str::<SetApiKeysPayload>(invalid) {
+            Err(error) => error,
+            Ok(_) => panic!("fixture input must not parse"),
+        };
+        let expected_body =
+            serde_json::json!({"error": format!("Invalid payload: {}", serde_error)}).to_string();
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_keys_post(stream, invalid.to_string(), cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_bare_wildcard_json_transcript("200 OK", &expected_body)
+        );
+    }
+
+    /// The persist core writes the injected env path — the hermetic
+    /// success pin (an empty keys map exercises the full write path
+    /// without touching process env; the transport edges resolve the
+    /// real path via api_keys_env_path).
+    #[test]
+    fn set_api_keys_persists_to_injected_env_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("intendant").join(".env");
+        let body = serde_json::json!({"keys": {}}).to_string();
+        let result = set_api_keys_result(Some(&env_path), &body);
+        assert_eq!(result, r#"{"ok":true}"#);
+        assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "\n");
+    }
+
+    /// No config directory: the persist core reports the historical
+    /// error body (still a 200 lane).
+    #[test]
+    fn set_api_keys_without_config_dir_reports_error_body() {
+        let body = serde_json::json!({"keys": {}}).to_string();
+        assert_eq!(
+            set_api_keys_result(None, &body),
+            r#"{"error":"Cannot determine config directory"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_external_agents_transcripts() {
+        // S5 second slice (info/displays/diagnostics). The availability
+        // body probes the configured commands on PATH, so it is
+        // computed through the untouched builder over an injected temp
+        // home (no live-account reads) and spliced — the canonical 200
+        // framing is the byte-exact pin.
+        let home = tempfile::tempdir().unwrap();
+        let body = external_agents_response_body(None, home.path());
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed["external_agents"].is_array(),
+            "availability array expected: {body}"
+        );
+        let cors = settings_route_cors("GET", "/api/external-agents");
+        let home_path = home.path().to_path_buf();
+        let response = collect_settings_handler_response(|stream| {
+            handle_external_agents(stream, None, home_path, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+
+        // A tempdir project root loads the default agent config — same
+        // framing, same builder.
+        let root = tempfile::tempdir().unwrap();
+        let body = external_agents_response_body(Some(root.path()), home.path());
+        let root_path = root.path().to_path_buf();
+        let home_path = home.path().to_path_buf();
+        let response = collect_settings_handler_response(|stream| {
+            handle_external_agents(stream, Some(root_path), home_path, cors, None)
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_api_key_status_transcript() {
+        // The per-provider booleans read process env + lease state; the
+        // body is computed through the status builder and spliced — the
+        // 200 canonical framing is the byte-exact pin.
+        let body = api_key_status_response_body();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(parsed.is_object(), "status body is an object: {body}");
+        let response = collect_settings_handler_response(|stream| {
+            handle_api_key_status(
+                stream,
+                settings_route_cors("GET", "/api/api-key-status"),
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            golden_settings_transcript(&response),
+            golden_settings_json_transcript("200 OK", &body)
+        );
     }
 
     /// Codex fields absent from the payload must not be re-dispatched —
@@ -904,7 +1775,7 @@ mod tests {
         .to_string();
 
         let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
-        assert_eq!(status, "200 OK");
+        assert_eq!(status, 200);
 
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::ControlCommand(msg) = event {
@@ -914,9 +1785,17 @@ mod tests {
                         ControlMsg::SetCodexCommand { .. }
                             | ControlMsg::SetCodexSandbox { .. }
                             | ControlMsg::SetCodexApprovalPolicy { .. }
+                            | ControlMsg::SetCodexModel { .. }
+                            | ControlMsg::SetCodexReasoningEffort { .. }
                             | ControlMsg::SetCodexServiceTier { .. }
+                            | ControlMsg::SetCodexWebSearch { .. }
+                            | ControlMsg::SetCodexNetworkAccess { .. }
+                            | ControlMsg::SetCodexWritableRoots { .. }
                             | ControlMsg::SetCodexManagedContext { .. }
                             | ControlMsg::SetCodexContextArchive { .. }
+                            | ControlMsg::SetClaudeModel { .. }
+                            | ControlMsg::SetClaudePermissionMode { .. }
+                            | ControlMsg::SetClaudeAllowedTools { .. }
                     ),
                     "unexpected codex control msg for absent payload field: {msg:?}"
                 );

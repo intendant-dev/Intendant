@@ -819,6 +819,8 @@ impl StationInner {
                     ("default", "default"),
                     ("edits", "acceptEdits"),
                     ("plan", "plan"),
+                    ("auto", "auto"),
+                    ("dontAsk", "dontAsk"),
                     ("bypass", "bypassPermissions"),
                 ]
                 .into_iter()

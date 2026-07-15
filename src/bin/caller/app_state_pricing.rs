@@ -11,6 +11,42 @@ struct Pricing {
 
 const TABLE: &[(&str, Pricing)] = &[
     (
+        "gpt-5.6",
+        Pricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-sol",
+        Pricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-terra",
+        Pricing {
+            input: 2.5e-6,
+            cache_write: 3.125e-6,
+            cached: 0.25e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-luna",
+        Pricing {
+            input: 1.0e-6,
+            cache_write: 1.25e-6,
+            cached: 0.1e-6,
+            output: 6.0e-6,
+        },
+    ),
+    (
         "gpt-5.5",
         Pricing {
             input: 5.0e-6,
@@ -493,6 +529,27 @@ pub fn estimate_live_usage_cost(model: &str, usage: LiveUsageTokens) -> Option<f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpt_5_6_variants_use_official_pricing_and_longest_prefix_match() {
+        let cases = [
+            ("gpt-5.6", 41.75),
+            ("openai/gpt-5.6-sol-20260711", 41.75),
+            ("gpt-5.6-terra-preview", 20.875),
+            ("gpt-5.6-luna-20260711", 8.35),
+        ];
+
+        for (model, expected) in cases {
+            // One million tokens in each billing bucket: uncached input,
+            // cache write, cached read, and output.
+            let cost =
+                estimate_session_cost(model, 3_000_000, 1_000_000, 1_000_000, 1_000_000).unwrap();
+            assert!(
+                (cost - expected).abs() < 1e-12,
+                "unexpected {model} cost: {cost}"
+            );
+        }
+    }
 
     #[test]
     fn opus_4_8_session_cost_uses_anthropic_pricing() {

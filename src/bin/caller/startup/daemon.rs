@@ -26,6 +26,9 @@ pub(crate) struct DaemonConfig {
     pub(crate) flags_direct: bool,
     /// Optional shared session state for headless mode (cleared between tasks).
     pub(crate) shared_session: Option<web_gateway::SharedActiveSession>,
+    /// Git-vitals target registry handed to the supervisor (see
+    /// `SessionSupervisorConfig::git_vitals_targets`).
+    pub(crate) git_vitals_targets: Option<session_vitals::GitVitalsTargets>,
 }
 
 /// Daemon loop the headless web-gateway path falls through to after its task ends.
@@ -53,6 +56,7 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
         shared_session: config.shared_session,
         provider_factory: None,
         logs_home_override: None,
+        git_vitals_targets: config.git_vitals_targets,
     })
     .run()
     .await;
@@ -91,7 +95,11 @@ pub(crate) async fn run_daemon(
     // retention window so the store cannot grow unbounded across restarts.
     tokio::task::spawn_blocking(global_store::prune_at_daemon_startup);
     let bus = EventBus::new();
-    let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+    // No tick timer here: `AppEvent::Tick` is consumed only by the stdio
+    // MCP event listener (stuck-phase warnings), which daemon mode never
+    // runs — the daemon's `/mcp` gateway surface observes state through
+    // `spawn_http_observation_listener`, which ignores Tick. A 1 Hz tick
+    // would only wake every bus subscriber for nothing.
     let _session_listeners = startup::wiring::spawn_session_listeners(
         &bus,
         &recording_registry,
@@ -156,33 +164,34 @@ pub(crate) async fn run_daemon(
 
     let shared_codex_config = shared_codex_config_from_project(project);
     let shared_claude_config = shared_claude_config_from_project(project);
-    let _control_plane_handle = control_plane::spawn(
-        bus.subscribe(),
-        control_plane::ControlPlaneState {
-            autonomy: autonomy.clone(),
-            external_agent: shared_external_agent.clone(),
-            codex_config: shared_codex_config.clone(),
-            claude_config: shared_claude_config.clone(),
-            bus: bus.clone(),
-            project_root: project_root.clone(),
-        },
-    );
+    let settings_root = project_root
+        .clone()
+        .unwrap_or_else(project::daemon_settings_config_root);
+    let _control_plane_handle = control_plane::spawn(control_plane::ControlPlaneState {
+        autonomy: autonomy.clone(),
+        external_agent: shared_external_agent.clone(),
+        codex_config: shared_codex_config.clone(),
+        claude_config: shared_claude_config.clone(),
+        bus: bus.clone(),
+        project_root: Some(settings_root),
+    });
 
-    // Vitals chips for the daemon's primary session: git state of the
-    // project root (statusline port). A projectless daemon has no repo to
-    // report on — no producer.
-    let _vitals_producer = match (session_log_id(&session_log), project_root.clone()) {
-        (Some(session_id), Some(root)) => Some(session_vitals::spawn_session_vitals_producer(
-            bus.clone(),
-            vec![(session_id, root)],
-        )),
-        _ => None,
+    // Session vitals: cache/limits are usage-driven and cover every
+    // session on any backend, so the producer always runs. The git segment
+    // probes the live target registry: seeded with the daemon's primary
+    // session when a project root exists, and fed per-session by the
+    // supervisor at launch — dashboard-spawned sessions get their dirty /
+    // merge-parity / unpushed rows even on a projectless daemon.
+    let vitals_git_seed = match (session_log_id(&session_log), project_root.clone()) {
+        (Some(session_id), Some(root)) => vec![(session_id, root)],
+        _ => Vec::new(),
     };
+    let (vitals_git_targets, _vitals_producer) =
+        session_vitals::spawn_session_vitals_producer(bus.clone(), vitals_git_seed);
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     // Covers supervisor-spawned native children too.
-    let _usage_rail =
-        crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
+    let _usage_rail = crate::usage_rail::spawn_native_usage_rail(bus.clone(), provider_identity);
 
     let startup_bus = bus.clone();
     let supervisor_handle =
@@ -201,6 +210,7 @@ pub(crate) async fn run_daemon(
             shared_session: Some(shared_session),
             provider_factory: None,
             logs_home_override: None,
+            git_vitals_targets: Some(vitals_git_targets.clone()),
         })
         .spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed
@@ -224,6 +234,7 @@ pub(crate) async fn run_daemon(
             direct: None,
             attachments: Vec::new(),
             fork: false,
+            relationship_kind: None,
             agent_command: None,
             codex_sandbox: None,
             codex_approval_policy: None,

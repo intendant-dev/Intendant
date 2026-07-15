@@ -55,8 +55,14 @@ function markSessionWindowPendingActive(sessionId) {
   }, SESSION_PENDING_ACTIVE_MS + 50);
 }
 
+// Last target the chip rendered — lets updateTaskTargetChip tell an
+// automatic resolver rebind (pulse it) apart from a repeat render.
+let taskTargetChipRenderedTarget = null;
+
 function updateTaskTargetChip() {
   const sid = resolvePromptTargetSessionId();
+  const previousTarget = taskTargetChipRenderedTarget;
+  taskTargetChipRenderedTarget = sid;
   updatePromptTargetSessionHighlight(sid);
   schedulePromptTargetLogSessionBadgeRefresh(sid);
   updateControlFastButtonState();
@@ -84,6 +90,24 @@ function updateTaskTargetChip() {
   const title = `Prompt target: ${sid}`;
   chip.title = title;
   chip.setAttribute('aria-label', title);
+  // An explicit pick lands in foreground/current before this runs; a
+  // target that differs from those came from the resolver's fallbacks
+  // (latest supervised external / single usable window) — pulse the chip
+  // so the silent rebind is visible. element.animate keeps this out of
+  // the stylesheets; skip the initial render (previousTarget === null).
+  if (
+    previousTarget !== null &&
+    previousTarget !== sid &&
+    sid !== explicitForegroundSessionId()
+  ) {
+    try {
+      chip.animate([
+        { transform: 'scale(1)', filter: 'brightness(1)' },
+        { transform: 'scale(1.12)', filter: 'brightness(1.6)', offset: 0.35 },
+        { transform: 'scale(1)', filter: 'brightness(1)' },
+      ], { duration: 600, easing: 'ease-in-out' });
+    } catch (_) { /* Web Animations unavailable — rebind stays silent */ }
+  }
 }
 
 function updatePromptTargetSessionHighlight(target = resolvePromptTargetSessionId()) {
@@ -182,6 +206,14 @@ function isPromptTargetMetadataUsable(sessionId) {
     meta.intendant_session_id ||
     ''
   ).trim();
+  // Supervision gate: the composer may only auto-target sessions this
+  // daemon supervises. Evidence is a session window on this dashboard
+  // (daemon lifecycle events or an explicit restore created it) or the
+  // wrapper linkage — intendant_session_id is only minted when an
+  // intendant session wraps the backend thread (session_catalog's
+  // wrapper merge / wrapper index). Catalog-only foreign CLI sessions
+  // carry neither and must never steal the prompt target.
+  if (!intendantSessionId && !sessionWindows.has(sid)) return false;
   return !intendantSessionId || !daemonSessionFullId || intendantSessionId === daemonSessionFullId;
 }
 
@@ -190,6 +222,14 @@ function discardPromptTargetReference(sessionId) {
   if (!sid) return;
   if (foregroundSessionFullId === sid) foregroundSessionFullId = '';
   if (currentSessionFullId === sid) currentSessionFullId = '';
+}
+
+// Explicit focus only — none of resolvePromptTargetSessionId's routing
+// fallbacks: the status-bar gate must never let a "best guess" session
+// drive the header chips while the user is looking at a different window.
+// Empty when no session window is explicitly focused.
+function explicitForegroundSessionId() {
+  return String(foregroundSessionFullId || currentSessionFullId || '').trim();
 }
 
 function resolvePromptTargetSessionId() {
@@ -690,49 +730,163 @@ function applySessionGoalsFromReplayEntries(entries) {
   }
 }
 
-// ── Session vitals (git / cache / limits chips — the statusline port) ──
+// ── Session vitals (git / cache / limits / worktree — the statusline port)
+//
+// VITALS_SYMBOLS is THE catalog: every vitals surface — session-window
+// header chips, the Focus rail tooltips, the tap-to-explain popovers, the
+// glossary sheet — derives its glyph, label, plain-language explanation,
+// severity, and action from this one map ("derive, don't mirror"). Never
+// hand-write a vitals sentence anywhere else. Explanations are written
+// for the least technical reader first: say what the symbol MEANS for
+// them, never how it is computed. Chips are real <button>s — the header's
+// collapse-on-click guard exempts buttons, and they get keyboard and
+// screen-reader semantics for free. The wire fields consumed between the
+// markers are pinned by
+// session_vitals.rs::vitals_symbol_catalog_covers_wire_fields.
+// VITALS_SYMBOLS_BEGIN
+const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 
-function sessionVitalsGitSegment(git) {
-  if (!git || typeof git !== 'object') return null;
-  const parts = [];
-  const titleLines = [];
-  const branch = String(git.branch || '').trim();
-  if (branch) {
-    parts.push(`⎇ ${branch}`);
-    titleLines.push(`Branch: ${branch}`);
-  }
-  const dirty = Number(git.dirtyFiles) || 0;
-  if (dirty > 0) {
-    parts.push(`●${dirty}`);
-    titleLines.push(`Dirty files: ${dirty}`);
-  }
-  const primaryRef = String(git.primaryRef || '').trim();
-  if (primaryRef) {
-    const ahead = Number(git.ahead) || 0;
-    const behind = Number(git.behind) || 0;
-    parts.push(`+${ahead}/−${behind}`);
-    titleLines.push(`vs ${primaryRef}: ${ahead} ahead, ${behind} behind`);
-  }
-  const parity = String(git.mergeParity || '').trim();
-  if (parity === 'clean') {
-    parts.push('✓');
-    titleLines.push(`Merge with ${primaryRef || 'primary'}: clean`);
-  } else if (parity === 'conflict') {
-    parts.push('⚠');
-    titleLines.push(`Merge with ${primaryRef || 'primary'}: WOULD CONFLICT`);
-  }
-  if (git.unpushed !== null && git.unpushed !== undefined) {
-    parts.push(`⇡${git.unpushed}`);
-    titleLines.push(`Unpushed on ${branch || 'branch'}: ${git.unpushed}`);
-  }
-  if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
-    const primaryName = primaryRef.replace(/^origin\//, '');
-    parts.push(`${primaryName}⇡${git.primaryUnpushed}`);
-    titleLines.push(`Unpushed on ${primaryName}: ${git.primaryUnpushed}`);
-  }
-  if (!parts.length) return null;
-  return { text: parts.join(' '), titleLines, conflict: parity === 'conflict' };
+function vitalsLimitLabelLong(label) {
+  if (label === '5h') return '5-hour';
+  if (label === '7d') return '7-day';
+  return label;
 }
+
+const VITALS_SYMBOLS = {
+  health: {
+    label: 'Session health',
+    priority: 100,
+    chip: () => '',
+    explain: (v) => (v.severity === 'crit'
+      ? ['Something needs your attention — the highlighted symbols say what.']
+      : v.severity === 'warn'
+        ? ['Worth a look soon — the highlighted symbols say why.']
+        : ['Everything looks good.', 'Tap any symbol to learn what it tracks.']),
+  },
+  worktree: {
+    label: 'Worktree',
+    priority: 20,
+    unavailable: 'Not in a worktree — this agent works directly in the project folder.',
+    chip: () => '⧉',
+    explain: (v) => {
+      const lines = [
+        'This agent works in its own copy of the project (a git worktree), so agents working in parallel never disturb each other.',
+        `Branch: ${v.branch}`,
+      ];
+      if (v.path) lines.push(`Folder: ${v.path}`);
+      if (v.baseBranch) lines.push(`Started from ${v.baseBranch}${v.baseSha ? ` @ ${v.baseSha.slice(0, 12)}` : ''}`);
+      return lines;
+    },
+    action: (v) => (v.path ? { label: 'Copy folder path', run: () => vitalsCopyText(v.path) } : null),
+  },
+  branch: {
+    label: 'Branch',
+    priority: 30,
+    chip: (v) => `⎇ ${v.branch}`,
+    explain: (v) => [`“${v.branch}” is the git branch this agent is working on.`],
+    action: (v) => ({ label: 'Copy branch name', run: () => vitalsCopyText(v.branch) }),
+  },
+  dirty: {
+    label: 'Uncommitted changes',
+    priority: 60,
+    quiet: 'Nothing uncommitted — the working folder is clean.',
+    chip: (v) => `●${v.count}`,
+    explain: (v) => [
+      `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
+      'Normal while the agent works — they become permanent history once committed.',
+    ],
+    action: () => ({ label: 'View the changes', run: () => vitalsOpenChangesTab() }),
+  },
+  divergence: {
+    label: 'Ahead / behind',
+    priority: 40,
+    quiet: 'No primary branch to compare with.',
+    chip: (v) => `+${v.ahead}/−${v.behind}`,
+    explain: (v) => [
+      `Compared with ${v.primaryRef}: this branch has ${v.ahead} commit${v.ahead === 1 ? '' : 's'} of its own and is missing ${v.behind} from there.`,
+    ],
+  },
+  parity: {
+    label: 'Merge readiness',
+    priority: 90,
+    quiet: 'No merge check needed — this branch is not diverged from the primary.',
+    chip: (v) => (v.conflict ? '⚠' : '✓'),
+    explain: (v) => (v.conflict
+      ? [`Merging this work into ${v.primaryRef} would CONFLICT — overlapping edits need a decision before it can land.`]
+      : [`Merging this work into ${v.primaryRef} would apply cleanly right now.`]),
+    action: (v, sessionId) => (v.conflict
+      ? { label: 'Open the merge card', run: () => openSessionWorktreeMergeCard(sessionId) }
+      : null),
+  },
+  unpushed: {
+    label: 'Unpushed commits',
+    priority: 35,
+    quiet: 'Nothing waiting to be pushed (or no upstream is configured).',
+    chip: (v) => `⇡${v.count}`,
+    explain: (v) => [
+      `${v.count} commit${v.count === 1 ? '' : 's'} on this branch exist${v.count === 1 ? 's' : ''} only on this machine — not pushed to the shared repository yet.`,
+    ],
+  },
+  'primary-unpushed': {
+    label: 'Unpushed on primary',
+    priority: 25,
+    quiet: 'Nothing unpushed on the primary branch.',
+    chip: (v) => `${v.primaryName}⇡${v.count}`,
+    explain: (v) => [
+      `The primary branch ${v.primaryName} has ${v.count} commit${v.count === 1 ? '' : 's'} that ${v.count === 1 ? 'hasn’t' : 'haven’t'} been pushed yet.`,
+    ],
+  },
+  'cache-hit': {
+    label: 'Prompt cache',
+    priority: 15,
+    quiet: 'No cache reading on the last request.',
+    chip: (v) => `⚡${v.hitPct}%`,
+    explain: (v) => [
+      `${v.hitPct}% of the last request was answered from the provider's prompt cache.`,
+      'Cached input is far cheaper and faster than fresh input.',
+    ],
+  },
+  'cache-ttl': {
+    label: 'Cache freshness',
+    priority: 45,
+    quiet: "This provider doesn't report how long its cache stays warm.",
+    chip: (v) => (v.cold ? '✗' : `⏳${v.countdown}`),
+    explain: (v) => (v.cold
+      ? [
+        'The prompt cache went cold — the next request rebuilds it.',
+        'Nothing is broken; the next turn just costs a little more once.',
+      ]
+      : [
+        `The prompt cache stays warm for another ${v.countdown}.`,
+        'If the session idles past that, the next request rebuilds it — slower and pricier.',
+      ]),
+  },
+  limit: {
+    label: 'Rate limit',
+    priority: 80,
+    chip: (v) => (v.usedPct !== null
+      ? `▮${v.usedPct}% ${v.label}`
+      : `${v.label} ${v.statusWord}${v.reset ? ` ↻${v.reset}` : ''}`),
+    explain: (v) => {
+      const lines = [];
+      if (v.usedPct !== null) {
+        lines.push(`${v.usedPct}% of the provider's ${vitalsLimitLabelLong(v.label)} usage allowance is used.`);
+      } else {
+        lines.push(`The provider reports its ${vitalsLimitLabelLong(v.label)} allowance as “${v.statusWord}” — it doesn't share an exact percentage.`);
+      }
+      if (v.reset) lines.push(`The window resets in ~${v.reset}.`);
+      if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
+      return lines;
+    },
+  },
+};
+
+// Fixed display order for chips and the glossary (semantic, not priority:
+// priority only governs which chips stay visible when space is scarce).
+const VITALS_SYMBOL_ORDER = [
+  'health', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
+  'unpushed', 'primary-unpushed', 'cache-hit', 'cache-ttl', 'limit',
+];
 
 // Seconds until the prompt cache goes cold, from the server-stamped
 // activity anchor; null when the provider's TTL is unknown (receipt-only).
@@ -748,37 +902,6 @@ function formatCacheCountdown(seconds) {
   return `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 }
 
-function sessionVitalsCacheSegment(cache) {
-  if (!cache || typeof cache !== 'object') return null;
-  const parts = [];
-  const titleLines = [];
-  let cls = 'vit-cache';
-  const hit = Number.isFinite(Number(cache.hitPct)) && cache.hitPct !== null && cache.hitPct !== undefined
-    ? Math.max(0, Math.min(100, Number(cache.hitPct)))
-    : null;
-  if (hit !== null) {
-    parts.push(`⚡${hit}%`);
-    titleLines.push(`Prompt-cache hit (latest request): ${hit}%`);
-    cls += hit >= 90 ? ' cache-ok' : hit >= 50 ? ' cache-warn' : ' cache-crit';
-  }
-  const remaining = sessionCacheCountdownSeconds(cache);
-  let ticking = false;
-  if (remaining !== null) {
-    if (remaining > 0) {
-      parts.push(`⏳${formatCacheCountdown(remaining)}`);
-      titleLines.push(`Cache expires in ${formatCacheCountdown(remaining)} (TTL ${formatCacheCountdown(cache.ttlSeconds)})`);
-      if (remaining <= 60) cls += ' cache-expiring';
-      ticking = true;
-    } else {
-      parts.push('✗');
-      titleLines.push('Prompt cache is cold — the next request rebuilds it');
-      cls += ' cache-cold';
-    }
-  }
-  if (!parts.length) return null;
-  return { text: parts.join(' '), titleLines, cls, ticking };
-}
-
 function formatLimitReset(resetsAtEpoch) {
   const remaining = Number(resetsAtEpoch) - Date.now() / 1000;
   if (!Number.isFinite(remaining) || remaining <= 0) return '';
@@ -787,68 +910,576 @@ function formatLimitReset(resetsAtEpoch) {
   return `${Math.max(1, Math.round(remaining / 60))}m`;
 }
 
-// The gauge shows the most-used window; the tooltip lists them all.
-function sessionVitalsLimitsSegment(limits) {
-  if (!Array.isArray(limits) || !limits.length) return null;
-  const windows = limits
-    .map((w) => ({
-      label: String(w?.label || '').trim() || 'window',
-      usedPct: Math.max(0, Math.min(100, Number(w?.usedPct) || 0)),
-      resetsAtEpoch: Number(w?.resetsAtEpoch) || null,
-    }));
-  const top = windows.reduce((a, b) => (b.usedPct > a.usedPct ? b : a));
-  let text = `▮${top.usedPct}% ${top.label}`;
-  let cls = 'vit-limits';
-  let severity = '';
-  if (top.usedPct >= 90) {
-    severity = 'crit';
-    cls += ' limits-crit';
-    const reset = top.resetsAtEpoch ? formatLimitReset(top.resetsAtEpoch) : '';
-    if (reset) text += ` ↻${reset}`;
-  } else if (top.usedPct >= 70) {
-    severity = 'warn';
-    cls += ' limits-warn';
-  }
-  const titleLines = windows.map((w) => {
-    const reset = w.resetsAtEpoch ? ` — resets in ${formatLimitReset(w.resetsAtEpoch) || 'moments'}` : '';
-    return `Rate limit ${w.label}: ${w.usedPct}% used${reset}`;
-  });
-  return { text, titleLines, cls, severity };
+function limitStatusSeverity(status) {
+  const s = String(status || '').trim().toLowerCase();
+  if (!s || s === 'allowed') return '';
+  if (s === 'allowed_warning') return 'warn';
+  return 'crit'; // rejected / limited / queueing / anything non-allowed
 }
 
-// Renders the chip; returns true while a cache countdown is live (the
+function limitStatusWord(status, severity) {
+  if (severity === 'crit') return 'limited';
+  if (severity === 'warn') return 'getting high';
+  return 'ok';
+}
+
+// Chip models for one session: [{ id, key, label, text, severity,
+// elevated, priority, explainLines, action, ticking }]. `vitals` may be
+// null (a worktree session with no vitals yet still gets health +
+// worktree). The health model is synthesized last and leads the list.
+function vitalsChipModels(vitals, meta, sessionId) {
+  const models = [];
+  const push = (key, id, value, extra = {}) => {
+    const def = VITALS_SYMBOLS[key];
+    if (!def) return;
+    // severity = attention (elevates the chip, feeds the health dot);
+    // tone = cosmetic tint only. A fresh session's 0% cache hit is
+    // expensive (red TEXT) but not wrong (never a red health dot).
+    const severity = extra.severity || '';
+    const tone = extra.tone !== undefined ? extra.tone : severity;
+    models.push({
+      id: id || key,
+      key,
+      label: def.label,
+      priority: def.priority,
+      text: def.chip(value),
+      severity,
+      tone,
+      elevated: severity === 'warn' || severity === 'crit',
+      explainLines: def.explain({ ...value, severity }),
+      action: def.action ? (def.action(value, sessionId) || null) : null,
+      ticking: !!extra.ticking,
+    });
+  };
+
+  const worktree = meta?.worktree && typeof meta.worktree === 'object' ? meta.worktree : null;
+  if (worktree?.branch) {
+    push('worktree', 'worktree', {
+      branch: worktree.branch,
+      path: worktree.path || '',
+      baseBranch: worktree.baseBranch || '',
+      baseSha: worktree.baseSha || '',
+    });
+  }
+
+  const git = vitals?.git && typeof vitals.git === 'object' ? vitals.git : null;
+  if (git) {
+    const branch = String(git.branch || '').trim();
+    if (branch) push('branch', 'branch', { branch });
+    const dirty = Number(git.dirtyFiles) || 0;
+    if (dirty > 0) push('dirty', 'dirty', { count: dirty });
+    const primaryRef = String(git.primaryRef || '').trim();
+    if (primaryRef) {
+      push('divergence', 'divergence', {
+        ahead: Number(git.ahead) || 0,
+        behind: Number(git.behind) || 0,
+        primaryRef,
+      });
+    }
+    const parity = String(git.mergeParity || '').trim();
+    if (parity === 'clean' || parity === 'conflict') {
+      const conflict = parity === 'conflict';
+      push('parity', 'parity', { conflict, primaryRef: primaryRef || 'the primary branch' },
+        { severity: conflict ? 'crit' : 'ok' });
+    }
+    if (git.unpushed !== null && git.unpushed !== undefined) {
+      push('unpushed', 'unpushed', { count: Number(git.unpushed) || 0 });
+    }
+    if (git.primaryUnpushed !== null && git.primaryUnpushed !== undefined && primaryRef) {
+      push('primary-unpushed', 'primary-unpushed', {
+        primaryName: primaryRef.replace(/^origin\//, ''),
+        count: Number(git.primaryUnpushed) || 0,
+      });
+    }
+  }
+
+  const cache = vitals?.cache && typeof vitals.cache === 'object' ? vitals.cache : null;
+  if (cache) {
+    const hitRaw = Number(cache.hitPct);
+    if (Number.isFinite(hitRaw) && cache.hitPct !== null && cache.hitPct !== undefined) {
+      const hitPct = Math.max(0, Math.min(100, hitRaw));
+      push('cache-hit', 'cache-hit', { hitPct }, {
+        severity: hitPct >= 90 ? 'ok' : '',
+        tone: hitPct >= 90 ? 'ok' : hitPct >= 50 ? 'warn' : 'crit',
+      });
+    }
+    const remaining = sessionCacheCountdownSeconds(cache);
+    if (remaining !== null) {
+      if (remaining > 0) {
+        push('cache-ttl', 'cache-ttl', { cold: false, countdown: formatCacheCountdown(remaining) },
+          { severity: '', tone: remaining <= 60 ? 'crit' : '', ticking: true });
+      } else {
+        push('cache-ttl', 'cache-ttl', { cold: true, countdown: '' });
+      }
+    }
+  }
+
+  const limits = Array.isArray(vitals?.limits) ? vitals.limits : [];
+  for (const w of limits) {
+    const label = String(w?.label || '').trim() || 'window';
+    const pctRaw = Number(w?.usedPct);
+    const usedPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined
+      ? Math.max(0, Math.min(100, pctRaw))
+      : null;
+    const statusSeverity = limitStatusSeverity(w?.status);
+    let severity = statusSeverity;
+    if (usedPct !== null) {
+      if (usedPct >= 90) severity = 'crit';
+      else if (usedPct >= 70 && severity !== 'crit') severity = 'warn';
+    }
+    push('limit', `limit:${label}`, {
+      label,
+      usedPct,
+      statusWord: limitStatusWord(w?.status, statusSeverity),
+      reset: w?.resetsAtEpoch ? formatLimitReset(w.resetsAtEpoch) : '',
+      severity,
+    }, { severity });
+  }
+
+  const order = new Map(VITALS_SYMBOL_ORDER.map((key, index) => [key, index]));
+  models.sort((a, b) => (order.get(a.key) ?? 99) - (order.get(b.key) ?? 99));
+
+  const worst = models.reduce(
+    (acc, m) => (VITALS_SEVERITY_RANK[m.severity] > VITALS_SEVERITY_RANK[acc] ? m.severity : acc),
+    ''
+  );
+  const healthDef = VITALS_SYMBOLS.health;
+  models.unshift({
+    id: 'health',
+    key: 'health',
+    label: healthDef.label,
+    priority: healthDef.priority,
+    text: '',
+    severity: worst === 'ok' ? '' : worst,
+    tone: worst === 'ok' ? '' : worst,
+    elevated: true,
+    explainLines: healthDef.explain({ severity: worst }),
+    action: null,
+    ticking: false,
+  });
+  return models;
+}
+// VITALS_SYMBOLS_END
+
+const VITALS_GIT_KEYS = new Set([
+  'branch', 'dirty', 'divergence', 'parity', 'unpushed', 'primary-unpushed',
+]);
+
+// Legacy family segments — the Focus rail (ui2RailTick) and Station rows
+// consume these. Thin catalog derivations: same glyph strings, same
+// sentences as the chip popovers, so no surface can drift.
+function sessionVitalsGitSegment(git) {
+  if (!git || typeof git !== 'object') return null;
+  const models = vitalsChipModels({ git }, null, '')
+    .filter((m) => VITALS_GIT_KEYS.has(m.key));
+  if (!models.length) return null;
+  return {
+    text: models.map((m) => m.text).join(' '),
+    titleLines: models.flatMap((m) => m.explainLines),
+    conflict: models.some((m) => m.key === 'parity' && m.severity === 'crit'),
+  };
+}
+
+function sessionVitalsCacheSegment(cache) {
+  if (!cache || typeof cache !== 'object') return null;
+  const models = vitalsChipModels({ cache }, null, '')
+    .filter((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
+  if (!models.length) return null;
+  let cls = 'vit-cache';
+  const hit = models.find((m) => m.key === 'cache-hit');
+  if (hit) cls += hit.tone === 'ok' ? ' cache-ok' : hit.tone === 'warn' ? ' cache-warn' : ' cache-crit';
+  const ttl = models.find((m) => m.key === 'cache-ttl');
+  if (ttl) cls += ttl.tone === 'crit' ? ' cache-expiring' : ttl.text === '✗' ? ' cache-cold' : '';
+  return {
+    text: models.map((m) => m.text).join(' '),
+    titleLines: models.flatMap((m) => m.explainLines),
+    cls,
+    ticking: models.some((m) => m.ticking),
+  };
+}
+
+// The rail gauge shows the most-used window; the tooltip lists them all.
+function sessionVitalsLimitsSegment(limits) {
+  if (!Array.isArray(limits) || !limits.length) return null;
+  const models = vitalsChipModels({ limits }, null, '')
+    .filter((m) => m.key === 'limit');
+  if (!models.length) return null;
+  const severity = models.reduce(
+    (acc, m) => (VITALS_SEVERITY_RANK[m.severity] > VITALS_SEVERITY_RANK[acc] ? m.severity : acc),
+    ''
+  );
+  const top = models.reduce((a, b) =>
+    (VITALS_SEVERITY_RANK[b.severity] > VITALS_SEVERITY_RANK[a.severity] ? b : a));
+  let cls = 'vit-limits';
+  if (severity === 'crit') cls += ' limits-crit';
+  else if (severity === 'warn') cls += ' limits-warn';
+  return {
+    text: top.text,
+    titleLines: models.flatMap((m) => m.explainLines),
+    cls,
+    severity: severity === 'ok' ? '' : severity,
+  };
+}
+
+// Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
+//
+// Truncation policy: NEVER mid-string ellipsis. Expanded headers wrap the
+// chips onto extra lines so nothing is ever cut; collapsed headers show
+// the health dot + severity-elevated chips + a "+N" overflow chip that
+// opens the glossary (CSS keys off data-elevated / .header-collapsed).
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
-  const git = sessionVitalsGitSegment(vitals && typeof vitals === 'object' ? vitals.git : null);
-  const cache = sessionVitalsCacheSegment(vitals && typeof vitals === 'object' ? vitals.cache : null);
-  const limits = sessionVitalsLimitsSegment(vitals && typeof vitals === 'object' ? vitals.limits : null);
-  if (!git && !cache && !limits) {
+  const meta = sessionMetadataById.get(win.sessionId) || {};
+  const models = vitalsChipModels(vitals ?? meta.vitals ?? null, meta, win.sessionId);
+  // health alone means no tracked symbols at all — a verdict about
+  // nothing is noise, hide the row entirely.
+  if (models.length <= 1) {
     win.vitals.className = 'session-window-vitals hidden';
     win.vitals.replaceChildren();
-    win.vitals.title = '';
+    win.vitals.removeAttribute('title');
+    delete win.vitals.dataset.vitSig;
     return false;
   }
-  const segments = [];
-  for (const seg of [
-    git && { cls: 'vit-git', text: git.text },
-    cache && { cls: cache.cls, text: cache.text },
-    limits && { cls: limits.cls, text: limits.text },
-  ]) {
-    if (!seg) continue;
-    const span = document.createElement('span');
-    span.className = seg.cls;
-    span.textContent = seg.text;
-    segments.push(span);
+  wireVitalsChipRow(win);
+  // Stable-DOM fast path: the 1s countdown ticker must not rebuild the
+  // row (replaced buttons detach mid-tap). When only the cache countdown
+  // moved, update that chip's text in place.
+  const signature = models
+    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : m.text}${m.tone}${m.elevated ? 1 : 0}`)
+    .join('|');
+  if (win.vitals.dataset.vitSig === signature) {
+    const ttl = models.find((m) => m.key === 'cache-ttl');
+    const ttlChip = win.vitals.querySelector('[data-chip="cache-ttl"]');
+    if (ttl && ttlChip) {
+      ttlChip.textContent = ttl.text;
+      ttlChip.title = ttl.explainLines[0] || ttl.label;
+    }
+    return models.some((m) => m.ticking);
   }
-  win.vitals.className = `session-window-vitals${git?.conflict ? ' conflict' : ''}`;
-  win.vitals.replaceChildren(...segments);
-  win.vitals.title = [
-    ...(git?.titleLines || []),
-    ...(cache?.titleLines || []),
-    ...(limits?.titleLines || []),
-  ].join('\n');
-  return !!cache?.ticking;
+  win.vitals.dataset.vitSig = signature;
+  win.vitals.className = 'session-window-vitals';
+  win.vitals.setAttribute('role', 'group');
+  win.vitals.setAttribute('aria-label', 'Session vitals — select a symbol for its meaning');
+  win.vitals.removeAttribute('title');
+  const nodes = [];
+  let foldedWhenCollapsed = 0;
+  for (const m of models) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'vit-chip' + (m.key === 'health' ? ' vit-health' : '');
+    chip.dataset.chip = m.id;
+    if (m.tone) chip.dataset.severity = m.tone;
+    const elevated = m.key === 'health' || m.elevated;
+    if (elevated) chip.dataset.elevated = '1';
+    else foldedWhenCollapsed++;
+    chip.textContent = m.text;
+    chip.title = m.explainLines[0] || m.label;
+    chip.setAttribute('aria-label', m.text ? `${m.label}: ${m.text}` : m.label);
+    nodes.push(chip);
+  }
+  if (foldedWhenCollapsed > 0) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'vit-chip vit-overflow';
+    more.dataset.chip = 'overflow';
+    more.dataset.elevated = '1';
+    more.textContent = `+${foldedWhenCollapsed}`;
+    more.title = 'Show all vitals';
+    more.setAttribute('aria-label', `${foldedWhenCollapsed} more vitals — show all`);
+    nodes.push(more);
+  }
+  win.vitals.replaceChildren(...nodes);
+  return models.some((m) => m.ticking);
+}
+
+// One delegated listener per window (chips are rebuilt every render).
+// Chips are buttons, so the header's collapse-on-click guard already
+// ignores them — stopPropagation only spares the focus/menu side effects.
+function wireVitalsChipRow(win) {
+  if (!win?.vitals || win.vitals.dataset.vitWired) return;
+  win.vitals.dataset.vitWired = '1';
+  win.vitals.addEventListener('click', (event) => {
+    const chip = event.target.closest?.('.vit-chip');
+    if (!chip) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const id = chip.dataset.chip || '';
+    if (id === 'health' || id === 'overflow') openVitalsGlossary(win.sessionId, chip);
+    else openVitalsExplainer(win.sessionId, id, chip);
+  });
+}
+
+// ── Tap-to-explain: popover on fine pointers, bottom sheet on coarse /
+// narrow — tooltips are mobile-hostile, so every symbol answers a tap.
+function vitalsModelsForSession(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sessionMetadataById.get(sid) || {};
+  return vitalsChipModels(meta.vitals || null, meta, sid);
+}
+
+function vitalsExplainerUsesSheet() {
+  return window.matchMedia('(max-width: 720px)').matches
+    || window.matchMedia('(pointer: coarse)').matches;
+}
+
+function ensureVitalsExplainerHost() {
+  let host = document.getElementById('vitals-explainer');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'vitals-explainer';
+  host.hidden = true;
+  const backdrop = document.createElement('div');
+  backdrop.className = 'vx-backdrop';
+  backdrop.addEventListener('click', closeVitalsExplainer);
+  const panel = document.createElement('div');
+  panel.className = 'vx-panel';
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Vitals explanation');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) closeVitalsExplainer();
+  });
+  // Capture phase: dismiss on any outside press without racing the
+  // chip handlers (a chip tap re-opens with fresh content instead).
+  document.addEventListener('pointerdown', (event) => {
+    if (host.hidden) return;
+    if (event.target.closest?.('#vitals-explainer .vx-panel, .vit-chip')) return;
+    closeVitalsExplainer();
+  }, true);
+  return host;
+}
+
+function closeVitalsExplainer() {
+  const host = document.getElementById('vitals-explainer');
+  if (!host) return;
+  host.hidden = true;
+  host.classList.remove('sheet', 'popover');
+}
+
+function vxEl(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function vxHeader(label, valueText) {
+  const head = vxEl('div', 'vx-head');
+  head.appendChild(vxEl('span', 'vx-title', label));
+  if (valueText) head.appendChild(vxEl('span', 'vx-value', valueText));
+  return head;
+}
+
+function vxActionButton(action) {
+  const btn = vxEl('button', 'vx-action', action.label);
+  btn.type = 'button';
+  btn.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    closeVitalsExplainer();
+    try { action.run(); } catch (_) { /* action surfaces its own errors */ }
+  });
+  return btn;
+}
+
+function presentVitalsPanel(host, panel, anchor) {
+  const sheet = vitalsExplainerUsesSheet();
+  host.hidden = false;
+  host.classList.toggle('sheet', sheet);
+  host.classList.toggle('popover', !sheet);
+  panel.style.left = '';
+  panel.style.top = '';
+  if (sheet || !anchor?.getBoundingClientRect) return;
+  const rect = anchor.getBoundingClientRect();
+  // Measure after content mount, then clamp inside the viewport;
+  // prefer below the chip, flip above when there's no room.
+  const pw = Math.min(panel.offsetWidth || 320, window.innerWidth - 16);
+  const ph = panel.offsetHeight || 160;
+  let left = Math.max(8, Math.min(rect.left, window.innerWidth - pw - 8));
+  let top = rect.bottom + 6;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, rect.top - ph - 6);
+  panel.style.left = `${Math.round(left)}px`;
+  panel.style.top = `${Math.round(top)}px`;
+}
+
+function openVitalsExplainer(sessionId, chipId, anchor) {
+  const models = vitalsModelsForSession(sessionId);
+  const model = models.find((m) => m.id === chipId);
+  if (!model) {
+    openVitalsGlossary(sessionId, anchor);
+    return;
+  }
+  const host = ensureVitalsExplainerHost();
+  const panel = host.querySelector('.vx-panel');
+  panel.replaceChildren(
+    vxHeader(model.label, model.text),
+    ...model.explainLines.map((line) => vxEl('p', 'vx-line', line)),
+    ...(model.action ? [vxActionButton(model.action)] : [])
+  );
+  presentVitalsPanel(host, panel, anchor);
+}
+
+// The glossary is the parity surface: EVERY catalog symbol is listed —
+// present ones with their live value and sentence (tap to drill in),
+// absent ones dimmed with "not reported", so what an agent lacks is
+// visible instead of silently missing. The health dot opens this.
+function openVitalsGlossary(sessionId, anchor) {
+  const models = vitalsModelsForSession(sessionId);
+  const health = models.find((m) => m.key === 'health');
+  const host = ensureVitalsExplainerHost();
+  const panel = host.querySelector('.vx-panel');
+  const rows = [];
+  // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
+  // the symbol's family has data but this symbol is at rest, say so in
+  // its own words; only families the agent never reported read as such.
+  const hasGit = models.some((m) => VITALS_GIT_KEYS.has(m.key));
+  const hasCache = models.some((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
+  const familyPresent = (key) => (VITALS_GIT_KEYS.has(key) ? hasGit
+    : key === 'cache-hit' || key === 'cache-ttl' ? hasCache
+    : false);
+  const addRow = (model, def, label, key) => {
+    const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
+    row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
+    const body = vxEl('div', 'vx-body');
+    body.appendChild(vxEl('div', 'vx-label', label || def.label));
+    const absentText = familyPresent(key) && def.quiet
+      ? def.quiet
+      : (def.unavailable || 'Not reported by this agent yet.');
+    body.appendChild(vxEl('div', 'vx-desc',
+      model ? (model.explainLines[0] || '') : absentText));
+    row.appendChild(body);
+    if (model) {
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      const open = () => openVitalsExplainer(sessionId, model.id, anchor);
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
+      });
+    }
+    rows.push(row);
+  };
+  for (const key of VITALS_SYMBOL_ORDER) {
+    if (key === 'health') continue;
+    if (key === 'limit') {
+      const limitModels = models.filter((m) => m.key === 'limit');
+      if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
+      for (const m of limitModels) addRow(m, VITALS_SYMBOLS.limit, `Rate limit ${m.id.slice('limit:'.length)}`, key);
+      continue;
+    }
+    addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
+  }
+  panel.replaceChildren(
+    vxHeader('Session vitals',
+      health?.severity === 'crit' ? 'needs attention' : health?.severity === 'warn' ? 'worth a look' : 'all good'),
+    vxEl('p', 'vx-line', health?.explainLines[0] || ''),
+    ...rows
+  );
+  presentVitalsPanel(host, panel, anchor);
+}
+
+function vitalsCopyText(text) {
+  const value = String(text || '');
+  const done = () => {
+    if (typeof showControlToast === 'function') showControlToast('info', 'Copied');
+  };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(value).then(done).catch(() => {});
+    return;
+  }
+  const scratch = document.createElement('textarea');
+  scratch.value = value;
+  document.body.appendChild(scratch);
+  scratch.select();
+  try { document.execCommand('copy'); done(); } catch (_) {}
+  scratch.remove();
+}
+
+function vitalsOpenChangesTab() {
+  const btn = document.querySelector('#activity-subtabs [data-activity-tab="changes"]');
+  if (btn) btn.click();
+}
+
+// Vitals arrive keyed to the wrapper/log id and fan out through the
+// identity group AS CACHED AT ARRIVAL (applySessionVitals). A window
+// keyed by the backend-native id from birth missed every emission sent
+// before the SessionIdentity linkage landed — and the change-only hub
+// sends nothing again until something changes. Called from
+// applySessionIdentity the moment the linkage is recorded.
+function refanSessionVitalsForIdentityGroup(sessionId) {
+  const ids = sessionGoalUpdateIds(sessionId);
+  let vitals = null;
+  for (const id of ids) {
+    const cached = sessionMetadataById.get(id)?.vitals;
+    if (cached) { vitals = cached; break; }
+  }
+  if (!vitals) return;
+  for (const id of ids) {
+    const meta = sessionMetadataById.get(id) || {};
+    if (!meta.vitals) sessionMetadataById.set(id, { ...meta, vitals });
+    if (sessionWindows.has(id)) {
+      renderSessionWindowVitals(sessionWindows.get(id), sessionMetadataById.get(id).vitals);
+    }
+  }
+  refreshSessionVitalsTicker();
+}
+
+// QA readback (window.qa convention): the chip models a session renders,
+// serializable — e2e probes assert backend parity on this.
+window.qa = Object.assign(window.qa || {}, {
+  vitalsChips: (sessionId) => vitalsModelsForSession(sessionId).map((m) => ({
+    id: m.id,
+    key: m.key,
+    text: m.text,
+    severity: m.severity,
+    tone: m.tone,
+    elevated: m.key === 'health' || m.elevated,
+    ticking: m.ticking,
+  })),
+});
+
+// The vitals conflict chip opens the same worktree finish/merge card the
+// session-lifecycle flow renders (54-session-lifecycle.js — called by
+// name at event time, never edited here). The card is normally gated by
+// worktreeFinishCardDismissed; an explicit click re-requests it, so drop
+// the dismissal first. When no worktree linkage resolves, fall back to
+// routing to Sessions → Worktrees.
+function openSessionWorktreeMergeCard(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const fallbackToWorktreesTab = () => {
+    const branch = (sessionMetadataById.get(sid) || {}).worktree?.branch || '';
+    if (typeof routeTo === 'function') routeTo('sessions', 'worktrees');
+    if (typeof showControlToast === 'function') {
+      showControlToast('info', branch
+        ? `Worktree card unavailable — find branch ${branch} under Sessions → Worktrees`
+        : 'Worktree card unavailable — see Sessions → Worktrees');
+    }
+  };
+  const open = () => {
+    const win = sessionWindows.get(sid);
+    if (!win) {
+      fallbackToWorktreesTab();
+      return;
+    }
+    if (win.minimized && typeof setSessionWindowMinimized === 'function') {
+      setSessionWindowMinimized(sid, false);
+    }
+    try { worktreeFinishCardDismissed.delete(sid); } catch (_) {}
+    maybeShowWorktreeFinishCard(sid);
+    sessionWindows.get(sid)?.worktreeCard?.scrollIntoView?.({ block: 'nearest' });
+  };
+  if (typeof maybeShowWorktreeFinishCard !== 'function' ||
+      typeof hydrateSessionWorktreeFinishInfo !== 'function') {
+    fallbackToWorktreesTab();
+    return;
+  }
+  Promise.resolve(hydrateSessionWorktreeFinishInfo(sid))
+    .then(info => { if (info) open(); else fallbackToWorktreesTab(); })
+    .catch(() => fallbackToWorktreesTab());
 }
 
 // One toast (plus a browser notification when permission is already
@@ -869,10 +1500,63 @@ function maybeAlertCacheExpiry(sid, win, vitals) {
   const identity = sessionIdentityParts(sid);
   const label = identity.name || identity.shortId || 'session';
   const text = `Prompt cache for ${label} expires in ${formatCacheCountdown(remaining)} — a follow-up now reuses it`;
-  if (typeof showControlToast === 'function') showControlToast('info', text);
+  showCacheExpiryToast(sid, text);
   if (typeof Notification !== 'undefined' && Notification.permission === 'granted' && document.hidden) {
     try { new Notification('Intendant', { body: text }); } catch (_) { /* notification blocked */ }
   }
+}
+
+// Minimal keep-warm follow-up to a specific session, mirroring
+// dispatchTaskText's start_task path (follow-up bookkeeping included) but
+// pinned to the alerted session instead of the resolved prompt target.
+// Deliberately spends one small model call — only ever sent on an
+// explicit user click.
+function sendCacheKeepWarmPing(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid)) return false;
+  const text = 'ack (cache keep-warm)';
+  const id = nextFollowUpId();
+  const msg = { action: 'start_task', task: text, session_id: sid, follow_up_id: id };
+  rememberPendingFollowUp(id, { sessionId: sid, text, direct: false, attachments: [] });
+  onSteerStatusUpdate(id, text, 'pending', null, { sessionId: sid });
+  if (!dispatchSessionControlMsg(msg)) return false;
+  markSessionWindowPendingActive(sid);
+  return true;
+}
+
+// Cache-expiry toast with an inline action. Mirrors showControlToast's
+// DOM contract (single .control-toast, same host selection) because the
+// shared helper is text-only; longer lifetime than the default 4.5s since
+// this toast carries a button and references a sub-minute window.
+function showCacheExpiryToast(sid, text) {
+  const controlBody = document.querySelector('#activity-control-pane .control-pane-body');
+  const host = controlBody && controlBody.offsetParent !== null ? controlBody : document.body;
+  if (!host) return;
+  host.querySelector('.control-toast')?.remove();
+  const toast = document.createElement('div');
+  toast.className = 'control-toast info';
+  if (host === document.body) toast.classList.add('global-command-toast');
+  const label = document.createElement('span');
+  label.textContent = text;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ui-btn';
+  btn.textContent = 'Send keep-warm ping';
+  btn.style.marginLeft = '0.6em';
+  btn.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    toast.remove();
+    if (sendCacheKeepWarmPing(sid)) {
+      showControlToast('info', `Keep-warm ping sent to ${shortSessionId(sid)}`);
+    } else {
+      showControlToast('error', 'Keep-warm ping could not be sent');
+    }
+  });
+  toast.appendChild(label);
+  toast.appendChild(btn);
+  host.appendChild(toast);
+  setTimeout(() => { if (toast.parentNode) toast.remove(); }, 12000);
 }
 
 function refreshSessionVitalsTicker() {
@@ -1220,6 +1904,10 @@ function persistSessionWindowState() {
     const record = persistedSessionWindowRecord(sid, win);
     if (record) windows.push(record);
   }
+  // The cap drops records at PERSIST time, so the count of what was cut
+  // rides the payload — restore has no other way to know it should tell
+  // the user some windows will not come back.
+  let dropped = 0;
   if (windows.length > SESSION_WINDOW_RESTORE_LIMIT) {
     const preferredIds = new Set([
       resolvePromptTargetSessionId(),
@@ -1228,15 +1916,29 @@ function persistSessionWindowState() {
     ].filter(Boolean));
     const preferred = windows.filter(record => preferredIds.has(record.session_id));
     const rest = windows.filter(record => !preferredIds.has(record.session_id));
+    dropped = windows.length - SESSION_WINDOW_RESTORE_LIMIT;
     windows = [...preferred, ...rest].slice(0, SESSION_WINDOW_RESTORE_LIMIT);
   }
   try {
     if (windows.length) {
-      localStorage.setItem(SESSION_WINDOW_STATE_KEY, JSON.stringify({ windows }));
+      localStorage.setItem(
+        SESSION_WINDOW_STATE_KEY,
+        JSON.stringify(dropped > 0 ? { windows, dropped } : { windows })
+      );
     } else {
       localStorage.removeItem(SESSION_WINDOW_STATE_KEY);
     }
   } catch (_) {}
+}
+
+function readPersistedSessionWindowDroppedCount() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_WINDOW_STATE_KEY) || 'null');
+    const n = Number(parsed?.dropped);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  } catch (_) {
+    return 0;
+  }
 }
 
 function normalizePersistedSessionWindowRecord(record = {}) {
@@ -1257,10 +1959,18 @@ function restorePersistedSessionWindowsSoon(delay = 1200) {
 }
 
 async function restorePersistedSessionWindows() {
-  const records = readPersistedSessionWindowState()
+  const normalized = readPersistedSessionWindowState()
     .map(normalizePersistedSessionWindowRecord)
-    .filter(Boolean)
-    .slice(0, SESSION_WINDOW_RESTORE_LIMIT);
+    .filter(Boolean);
+  const records = normalized.slice(0, SESSION_WINDOW_RESTORE_LIMIT);
+  const dropped = readPersistedSessionWindowDroppedCount() +
+    Math.max(0, normalized.length - records.length);
+  if (dropped > 0 && typeof showControlToast === 'function') {
+    showControlToast(
+      'info',
+      `${dropped} session window${dropped === 1 ? '' : 's'} not restored — reopen them from Sessions`
+    );
+  }
   if (!records.length) return;
   restoringPersistedSessionWindows = true;
   try {
@@ -1287,6 +1997,124 @@ async function restorePersistedSessionWindows() {
     stationScheduleUpdate();
   }
 }
+
+// ── Named session-window layouts ───────────────────────────────────────────
+// Contract: window.intendantLayouts = { save, apply, list, remove } — the
+// command palette binds these verbs; keep the shape exact. Snapshots reuse
+// the persisted session-window record shape, and apply() restores through
+// the same code path as page-load restore (replace semantics: windows not
+// in the layout are hidden first; open windows in the layout keep their
+// streamed history).
+const SESSION_WINDOW_LAYOUT_KEY_PREFIX = 'intendant.ui2.layout.';
+
+function sessionWindowLayoutKey(name) {
+  const trimmed = String(name || '').trim();
+  return trimmed ? SESSION_WINDOW_LAYOUT_KEY_PREFIX + trimmed : '';
+}
+
+function saveSessionWindowLayout(name) {
+  const key = sessionWindowLayoutKey(name);
+  if (!key) return null;
+  const windows = [];
+  for (const [sid, win] of sessionWindows) {
+    const record = persistedSessionWindowRecord(sid, win);
+    if (record) windows.push(record);
+  }
+  try {
+    localStorage.setItem(key, JSON.stringify({ windows, saved_at: new Date().toISOString() }));
+  } catch (_) {
+    return null;
+  }
+  return windows.length;
+}
+
+function readSessionWindowLayout(name) {
+  const key = sessionWindowLayoutKey(name);
+  if (!key) return null;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(key) || 'null');
+    return Array.isArray(parsed?.windows) ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function applySessionWindowLayout(name) {
+  const layout = readSessionWindowLayout(name);
+  if (!layout) return null;
+  const records = layout.windows
+    .map(normalizePersistedSessionWindowRecord)
+    .filter(Boolean);
+  const keep = new Set(records.map(record => record.sessionId));
+  for (const sid of Array.from(sessionWindows.keys())) {
+    if (!keep.has(sid)) removeSessionWindow(sid);
+  }
+  if (!records.length) return 0;
+  restoringPersistedSessionWindows = true;
+  try {
+    for (const record of records) {
+      sessionMetadataById.set(record.sessionId, {
+        ...(sessionMetadataById.get(record.sessionId) || {}),
+        ...record.meta,
+      });
+    }
+    for (const record of records) {
+      if (record.meta.parentId && record.meta.relationshipKind) {
+        applySessionRelationship({
+          parent_session_id: record.meta.parentId,
+          child_session_id: record.sessionId,
+          relationship: record.meta.relationshipKind,
+          ephemeral: !!record.meta.relationshipEphemeral,
+        });
+      }
+    }
+    await Promise.all(records.map(record => restorePersistedSessionWindow(record)));
+  } finally {
+    restoringPersistedSessionWindows = false;
+    persistSessionWindowState();
+    stationScheduleUpdate();
+  }
+  return records.length;
+}
+
+function listSessionWindowLayouts() {
+  const layouts = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !key.startsWith(SESSION_WINDOW_LAYOUT_KEY_PREFIX)) continue;
+      const name = key.slice(SESSION_WINDOW_LAYOUT_KEY_PREFIX.length);
+      if (!name) continue;
+      const layout = readSessionWindowLayout(name);
+      layouts.push({
+        name,
+        windows: Array.isArray(layout?.windows) ? layout.windows.length : 0,
+        saved_at: layout?.saved_at || '',
+      });
+    }
+  } catch (_) {}
+  layouts.sort((a, b) => a.name.localeCompare(b.name));
+  return layouts;
+}
+
+function removeSessionWindowLayout(name) {
+  const key = sessionWindowLayoutKey(name);
+  if (!key) return false;
+  try {
+    if (localStorage.getItem(key) === null) return false;
+    localStorage.removeItem(key);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+window.intendantLayouts = {
+  save: (name) => saveSessionWindowLayout(name),
+  apply: (name) => applySessionWindowLayout(name),
+  list: () => listSessionWindowLayouts(),
+  remove: (name) => removeSessionWindowLayout(name),
+};
 
 function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') {
   const event = String(entry.event || '').trim();
@@ -1361,14 +2189,16 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'agent_started') {
     content = String(entry.commands_preview || entry.commandsPreview || '').trim();
     if (!content) return null;
-    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind };
+    // kind tool_call = command announcement (parity with the live WASM
+    // path) — keeps replayed calls out of isCommandOutputLog's grouping.
+    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind: kind || 'tool_call' };
   }
   if (event === 'agent_output') {
     const stdout = String(entry.stdout || '').trim();
     const stderr = String(entry.stderr || '').trim();
     content = stdout || stderr;
     if (!content) return null;
-    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '' };
+    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '', item_id: entry.item_id || entry.itemId || '' };
   }
   if (event === 'presence_log') {
     if (!content) return null;
@@ -1429,6 +2259,13 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
     .map(entry => sessionWindowRecordFromReplayEntry(entry, fallbackSessionId))
     .filter(Boolean);
   if (!records.length) return 0;
+  // The emptiness the caller checked can be stale by now: the fetch
+  // awaited while the live replay/stream filled the window. Resetting
+  // here wiped the streamed rows and re-rendered the fetched copy NEXT
+  // TO their clones — merge into the streamed timeline instead.
+  if (sessionWindowHasStreamedHistory(win)) {
+    return appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId);
+  }
   resetSessionWindowLog(win);
   appendSessionWindowHistoryBatch(win, records, true);
   return records.length;
@@ -1527,7 +2364,10 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.eventId) signatures.push(['event', parts.sessionId, parts.eventId].join('\u001f'));
   if (parts.commandItemId) signatures.push(['command-item', parts.sessionId, parts.commandItemId].join('\u001f'));
-  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
+  // kind joins the item identity: a tool CALL row and its OUTPUT rows now
+  // share the tool_use id (output attribution), and an id-only signature
+  // would dedupe one against the other.
+  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.kind, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
   if (parts.turnId && parts.itemType && parts.itemId) {
     signatures.push(['thread-item', parts.sessionId, parts.turnId, parts.itemType, parts.itemId].join('\u001f'));
@@ -1626,11 +2466,43 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
   return sessionWindowTranscriptSignaturesFromParts(parts);
 }
 
+// Per-item signature cache (log-append hot path). Computing a node item's
+// signatures clones the node and walks it (sessionWindowTranscriptContentForElement),
+// which made every streamed line O(retained history × cloneNode) through
+// the full-history signature scans. Signatures are stable for an item's
+// lifetime except for its session id, which retargets rewrite in place —
+// so entries are keyed by the effective session id and recomputed when it
+// changes. Node signatures ignore options (as before); record signatures
+// cache per options variant ('near' = includeUserNearTime dedup passes).
+// Item content mutations (live command-output summaries) intentionally do
+// not invalidate: their identity signatures (event/output/item ids) are
+// immutable and their summary-text signatures never matched replayed
+// records in the first place.
+const _sessionWindowItemSignatureCache = new WeakMap();
+
 function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId = '', options = {}) {
+  if (!item || typeof item !== 'object') return [];
   const node = sessionWindowHistoryNode(item);
-  if (node) return sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId);
-  const record = sessionWindowHistoryRecord(item);
-  return record ? sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options) : [];
+  const record = node ? null : sessionWindowHistoryRecord(item);
+  if (!node && !record) return [];
+  const ownSid = node
+    ? String(node.dataset?.sessionId || '').trim()
+    : String(record.session_id || record.sessionId || '').trim();
+  const sid = ownSid || String(fallbackSessionId || '').trim();
+  const variant = node
+    ? 'node'
+    : (options.includeUserNearTime ? 'near' : (options.includeText === false ? 'noText' : 'def'));
+  let cached = _sessionWindowItemSignatureCache.get(item);
+  if (cached && cached.sid === sid && cached[variant]) return cached[variant];
+  if (!cached || cached.sid !== sid) {
+    cached = { sid };
+    _sessionWindowItemSignatureCache.set(item, cached);
+  }
+  const signatures = node
+    ? sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId)
+    : sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options);
+  cached[variant] = signatures;
+  return signatures;
 }
 
 function findSessionWindowHistoryIndexBySignatures(history, signatures, fallbackSessionId = '') {
@@ -1658,10 +2530,14 @@ function sessionWindowTranscriptTimestampMs(value) {
   }
   const direct = Date.parse(raw);
   if (Number.isFinite(direct)) return direct;
-  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  // Fractional seconds ride the session log's HH:MM:SS.mmm stamps — an
+  // unmatched fraction made every replayed row timestamp-less, which
+  // broke ordered merges (hydration landed as a tail block).
+  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/);
   if (match) {
     const date = new Date();
-    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), 0);
+    const fraction = match[4] ? Number(('0.' + match[4])) * 1000 : 0;
+    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), Math.round(fraction));
     return date.getTime();
   }
   match = raw.match(/^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
@@ -1691,6 +2567,19 @@ function sessionWindowTranscriptTimeBucket(value) {
   return String(Math.floor(ms / 5000));
 }
 
+// Timestamp lookups for the insert-position scan cost a querySelector +
+// parse per node item; an item's timestamp never changes once built, so
+// cache it for the item's lifetime.
+const _sessionWindowItemTimestampCache = new WeakMap();
+
+function sessionWindowTranscriptTimestampForHistoryItemCached(item) {
+  if (!item || typeof item !== 'object') return sessionWindowTranscriptTimestampForHistoryItem(item);
+  if (_sessionWindowItemTimestampCache.has(item)) return _sessionWindowItemTimestampCache.get(item);
+  const ts = sessionWindowTranscriptTimestampForHistoryItem(item);
+  _sessionWindowItemTimestampCache.set(item, ts);
+  return ts;
+}
+
 function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
   if (!win || !Array.isArray(records) || records.length === 0) return;
   deduplicateSessionWindowHistory(win, shouldFollow);
@@ -1698,6 +2587,13 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
   let inserted = 0;
+  // Monotonic scan boundary: every item before the previous insertion
+  // point has a timestamp <= the previous record's (that is why the
+  // previous scan passed it), so an ascending record can resume there —
+  // placement is identical to the full scan. A descending record (or one
+  // following a timestamp-less insert) restarts from 0.
+  let scanFrom = 0;
+  let lastInsertedTs = null;
   for (const record of records) {
     const item = retargetSessionWindowHistoryItem(
       prepareSessionWindowHistoryItem(record),
@@ -1708,8 +2604,9 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     const recordTs = sessionWindowTranscriptTimestampMs(record.ts_ms ?? record.tsMs ?? record.ts ?? record.timestamp ?? '');
     let index = history.length;
     if (recordTs !== null) {
-      for (let i = 0; i < history.length; i++) {
-        const itemTs = sessionWindowTranscriptTimestampForHistoryItem(history[i]);
+      const from = lastInsertedTs !== null && recordTs >= lastInsertedTs ? scanFrom : 0;
+      for (let i = from; i < history.length; i++) {
+        const itemTs = sessionWindowTranscriptTimestampForHistoryItemCached(history[i]);
         if (itemTs !== null && itemTs > recordTs) {
           index = i;
           break;
@@ -1718,9 +2615,14 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     }
     history.splice(index, 0, item);
     addSessionWindowHistorySignatures(signatures, item, win.sessionId);
+    if (recordTs !== null) {
+      scanFrom = index + 1;
+      lastInsertedTs = recordTs;
+    }
     inserted += 1;
   }
   if (inserted === 0) return;
+  commitSessionWindowHistorySignatureAppend(win, signatures);
   deduplicateSessionWindowHistory(win, shouldFollow);
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
@@ -1857,6 +2759,27 @@ function sessionWindowHasStreamedHistory(win) {
   });
 }
 
+// Hydration outcome flag (contract with the session-window placeholder
+// renderer): win.hydrateError distinguishes "hydration failed" from
+// "genuinely empty". Set on failure, cleared on any successful hydration
+// pass; the signature reset forces updateSessionWindow past its
+// no-metadata-change early return so renderers can react immediately.
+function setSessionWindowHydrateError(win, err) {
+  if (!win) return;
+  const message = String(err?.message || err || 'hydration failed');
+  if (win.hydrateError === message) return;
+  win.hydrateError = message;
+  win.metadataSignature = '';
+  updateSessionWindow(win.sessionId, {});
+}
+
+function clearSessionWindowHydrateError(win) {
+  if (!win || !win.hydrateError) return;
+  win.hydrateError = '';
+  win.metadataSignature = '';
+  updateSessionWindow(win.sessionId, {});
+}
+
 async function hydrateRestoredSessionWindow(win, record) {
   const sid = String(record?.sessionId || win?.sessionId || '').trim();
   const source = normalizeAgentId(record?.source || win?.source || '');
@@ -1890,12 +2813,17 @@ async function hydrateRestoredSessionWindow(win, record) {
     const targetWin = sessionWindows.get(targetSid) || (win.el?.isConnected ? win : null);
     updateSessionWindowRemotePageState(targetWin, data, source, sid);
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
+    clearSessionWindowHydrateError(targetWin || win);
     if (rendered > 0) {
       updateSessionWindow(targetSid, { phase: 'idle', ended: false });
       stationScheduleUpdate();
     }
   } catch (err) {
     console.warn('Failed to hydrate restored session window', sid, err);
+    setSessionWindowHydrateError(
+      sessionWindows.get(sessionWindowTargetForLogSession(sid) || sid) || win,
+      err
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -1929,16 +2857,21 @@ async function hydrateSessionWindowIfEmpty(sessionId) {
   try {
     let record = sessionWindowHydrationRecord(sid);
     if (!record) {
-      const resp = await dashboardJsonFetch('api_sessions', { ids: [sid] }, () => fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' }), 'api_sessions_ids');
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (cache posture preserved).
+      const resp = await daemonApi.request('api_sessions', { ids: [sid] }, { cache: 'no-store' });
       if (resp.ok) {
-        const sessions = await resp.json();
-        cacheSessionWindowMetadata(sessions);
+        cacheSessionWindowMetadata(resp.body);
       }
       record = sessionWindowHydrationRecord(sid);
     }
+    // No hydration record is NOT an error: internal sessions (source
+    // 'intendant' normalizes to '') are filled by the live stream, never
+    // by this path — only real fetch failures set the flag.
     if (record) await hydrateRestoredSessionWindow(win, record);
   } catch (err) {
     console.warn('Failed to hydrate session window', sid, err);
+    setSessionWindowHydrateError(sessionWindows.get(sid) || win, err);
   } finally {
     sessionWindowRestoreInFlight.delete(sid);
   }
@@ -1976,6 +2909,34 @@ async function restorePersistedSessionWindow(record) {
   }
 }
 
+// Forever-failing polls must not be silent, but they must stay quiet
+// (no toast spam): warn once per cause on the console and flag the
+// affected windows (win.metaStale) so placeholder logic can distinguish
+// "no data yet" from "polling is failing". Recovery clears the flags and
+// re-arms the warn for the next failure streak.
+const _sessionPollFailureWarned = new Set();
+
+function noteSessionMetadataPollFailure(cause, err, sessionIds = null) {
+  if (!_sessionPollFailureWarned.has(cause)) {
+    _sessionPollFailureWarned.add(cause);
+    console.warn(`[dashboard] ${cause} failing; retrying quietly (warned once per streak)`, err);
+  }
+  const ids = Array.isArray(sessionIds) ? sessionIds : Array.from(sessionWindows.keys());
+  for (const id of ids) {
+    const win = sessionWindows.get(String(id || '').trim());
+    if (win) win.metaStale = true;
+  }
+}
+
+function noteSessionMetadataPollRecovery(cause, sessionIds = null) {
+  _sessionPollFailureWarned.delete(cause);
+  const ids = Array.isArray(sessionIds) ? sessionIds : Array.from(sessionWindows.keys());
+  for (const id of ids) {
+    const win = sessionWindows.get(String(id || '').trim());
+    if (win && win.metaStale) win.metaStale = false;
+  }
+}
+
 function shouldPollSessionWindowMetadata() {
   return sessionWindows.size > 0 && activeTab === 'activity' && !document.hidden;
 }
@@ -1987,20 +2948,18 @@ function refreshSessionWindowMetadata(delay = 0, options = {}) {
     const ids = sessionWindowMetadataRequestIds();
     const url = sessionWindowMetadataUrl();
     const loadMetadata = async () => {
-      if (dashboardTransport?.canUseRpc()) {
-        try {
-          return await dashboardTransport.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
-        } catch (err) {
-          console.warn('[dashboard-control] api_sessions metadata RPC failed, falling back to HTTP', err);
-        }
-      }
-      const r = await authedFetch(url);
-      if (!r.ok) throw new Error(`${url} returned ${r.status}`);
-      return r.json();
+      // daemonApi (transport F2): tunnel first, direct HTTP per the
+      // GET-twin fallback policy (`url` survives as the error label).
+      const resp = await daemonApi.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
+      if (!resp.ok) throw new Error(`${url} returned ${resp.status}`);
+      return resp.body;
     };
     sessionMetadataRefreshInFlight = loadMetadata()
-      .then(sessions => cacheSessionWindowMetadata(sessions))
-      .catch(() => {})
+      .then(sessions => {
+        cacheSessionWindowMetadata(sessions);
+        noteSessionMetadataPollRecovery('session metadata poll');
+      })
+      .catch(err => noteSessionMetadataPollFailure('session metadata poll', err))
       .finally(() => {
         sessionMetadataRefreshInFlight = null;
       });

@@ -1,5 +1,5 @@
 use crate::types::truncate_str;
-use chrono::Local;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +20,11 @@ mod bus_events;
 #[derive(Serialize)]
 struct LogEvent {
     ts: String,
+    /// Epoch milliseconds (UTC) captured alongside `ts`. `ts` is local
+    /// time-of-day only — without this field an event's calendar date must
+    /// be reconstructed from `session_meta.json` plus midnight-wrap
+    /// inference, which breaks across DST folds and multi-day sessions.
+    ts_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn: Option<usize>,
     event: String,
@@ -38,10 +43,23 @@ struct LogEvent {
 }
 
 #[derive(Debug, Clone)]
-struct TurnFileSpan {
+pub(crate) struct TurnFileSpan {
     relative: String,
     offset: u64,
     len: u64,
+}
+
+/// First 16 hex chars of the SHA-256 of `text` — the content fingerprint the
+/// `conversation_message_epoch` mapping carries so historical extractors can
+/// correlate legacy-extracted messages with resume-time seq assignments.
+pub(crate) fn content_hash_hex16(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +76,13 @@ pub struct AgentOutputChunk {
 pub struct SessionMeta {
     pub session_id: String,
     pub created_at: String,
+    /// Epoch milliseconds (UTC) captured with `created_at` — the
+    /// machine-readable timestamp (`created_at` is local and offset-less).
+    /// Additive: metas written before 2026-07 lack it. Mirrors
+    /// `created_at`'s existing rewrite semantics (re-stamped on every meta
+    /// write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +127,104 @@ static OPEN_SESSION_LOG_DIRS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::n
 
 fn open_session_log_dirs() -> &'static StdMutex<HashSet<PathBuf>> {
     OPEN_SESSION_LOG_DIRS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+/// How a memoized id→dir resolution is re-validated on a cache hit.
+#[derive(Clone, Debug)]
+enum SessionDirLookupValidation {
+    /// The dir name itself answered to the id — revalidation is a free
+    /// string check plus one `is_dir` stat.
+    NamePrefix,
+    /// The id came from `session_meta.json` — revalidate by the meta
+    /// file's (len, mtime): unchanged meta means unchanged session_id.
+    MetaFingerprint((u64, u128)),
+}
+
+#[derive(Clone, Debug)]
+struct SessionDirLookupEntry {
+    dir: PathBuf,
+    validation: SessionDirLookupValidation,
+}
+
+fn session_dir_lookup_cache(
+) -> &'static StdMutex<std::collections::HashMap<(PathBuf, String), SessionDirLookupEntry>> {
+    static CACHE: OnceLock<
+        StdMutex<std::collections::HashMap<(PathBuf, String), SessionDirLookupEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+}
+
+const SESSION_DIR_LOOKUP_CACHE_LIMIT: usize = 4096;
+
+fn meta_fingerprint(meta_path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(meta_path).ok()?;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some((metadata.len(), mtime_nanos))
+}
+
+/// Memo hit for `find_session_by_id_in_home`, validated against the live
+/// filesystem before being trusted (a deleted dir or rewritten meta drops
+/// the entry and the caller re-scans).
+fn cached_session_dir_for_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let key = (home.to_path_buf(), session_id.to_string());
+    let entry = {
+        let cache = session_dir_lookup_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.get(&key).cloned()
+    }?;
+    let valid = entry.dir.is_dir()
+        && match &entry.validation {
+            SessionDirLookupValidation::NamePrefix => entry
+                .dir
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with(session_id))
+                .unwrap_or(false),
+            SessionDirLookupValidation::MetaFingerprint(fingerprint) => {
+                meta_fingerprint(&entry.dir.join("session_meta.json")).as_ref() == Some(fingerprint)
+            }
+        };
+    if valid {
+        return Some(entry.dir);
+    }
+    let mut cache = session_dir_lookup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.remove(&key);
+    None
+}
+
+fn store_cached_session_dir_for_id(
+    home: &Path,
+    session_id: &str,
+    dir: &Path,
+    validation: SessionDirLookupValidation,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    let mut cache = session_dir_lookup_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = (home.to_path_buf(), session_id.to_string());
+    if cache.len() >= SESSION_DIR_LOOKUP_CACHE_LIMIT && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        SessionDirLookupEntry {
+            dir: dir.to_path_buf(),
+            validation,
+        },
+    );
 }
 
 fn lock_open_session_log_dirs() -> StdMutexGuard<'static, HashSet<PathBuf>> {
@@ -319,6 +442,7 @@ impl SessionLog {
         };
         log.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_start".to_string(),
             level: Some("info".to_string()),
@@ -380,6 +504,7 @@ impl SessionLog {
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            created_at_ms: Some(Self::ts_ms()),
             project_root: project_root.map(|p| p.to_string_lossy().to_string()),
             name: name.map(|n| n.to_string()).or(existing_name),
             task: task.map(|t| t.to_string()),
@@ -435,6 +560,21 @@ impl SessionLog {
         // A fresh UUID-named directory for each top-level caller invocation.
         let session_id = Uuid::new_v4().to_string();
         crate::platform::intendant_home()
+            .join("logs")
+            .join(&session_id)
+    }
+
+    /// [`SessionLog::resolve_path`] against an explicit home: mints the
+    /// fresh UUID dir under `<home>/.intendant/logs`. The supervisor mints
+    /// through its `logs_home()` so tests' spawned sessions land in the
+    /// injected scratch home instead of the machine's real store; the
+    /// ambient variant stays the CLI/startup edge.
+    pub fn resolve_path_in_home(home: &Path, override_path: Option<&str>) -> PathBuf {
+        if let Some(path) = override_path {
+            return PathBuf::from(path);
+        }
+        let session_id = Uuid::new_v4().to_string();
+        crate::platform::intendant_home_in(home)
             .join("logs")
             .join(&session_id)
     }
@@ -510,24 +650,59 @@ impl SessionLog {
             return Some(direct);
         }
 
-        // Scan for prefix match or meta match
         if !logs_dir.is_dir() {
             return None;
         }
-        if let Ok(entries) = fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
+
+        // Memoized resolution: this lookup used to scan every session dir
+        // AND read every session_meta.json per call — repeated resolutions
+        // of the same id (MCP event routing, launch paths) paid a full
+        // store scan each time. A hit is re-validated against the live
+        // filesystem before it is trusted; misses fall through to the
+        // scan. Negative results are never cached (the session may be
+        // created a moment later).
+        if let Some(dir) = cached_session_dir_for_id(home, session_id) {
+            return Some(dir);
+        }
+
+        // Pass 1 — directory names only (no file reads): prefix match.
+        // The legacy single pass interleaved meta reads with the name
+        // scan, so an id resolvable by name could still pay meta reads
+        // for every dir readdir happened to yield first.
+        let mut entries: Vec<PathBuf> = Vec::new();
+        if let Ok(dir_entries) = fs::read_dir(&logs_dir) {
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(session_id) && entry.path().is_dir() {
-                    return Some(entry.path());
+                if name.starts_with(session_id) && path.is_dir() {
+                    store_cached_session_dir_for_id(
+                        home,
+                        session_id,
+                        &path,
+                        SessionDirLookupValidation::NamePrefix,
+                    );
+                    return Some(path);
                 }
-                // Also check inside session_meta.json for session_id match
-                let meta_path = entry.path().join("session_meta.json");
-                if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                        if meta.session_id == session_id || meta.session_id.starts_with(session_id)
-                        {
-                            return Some(entry.path());
-                        }
+                entries.push(path);
+            }
+        }
+
+        // Pass 2 — the expensive primitive: read each session_meta.json
+        // for an exact or prefix session_id match.
+        for path in entries {
+            let meta_path = path.join("session_meta.json");
+            if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+                    if meta.session_id == session_id || meta.session_id.starts_with(session_id) {
+                        store_cached_session_dir_for_id(
+                            home,
+                            session_id,
+                            &path,
+                            meta_fingerprint(&meta_path)
+                                .map(SessionDirLookupValidation::MetaFingerprint)
+                                .unwrap_or(SessionDirLookupValidation::NamePrefix),
+                        );
+                        return Some(path);
                     }
                 }
             }
@@ -546,6 +721,10 @@ impl SessionLog {
 
     fn ts() -> String {
         Local::now().format("%H:%M:%S%.3f").to_string()
+    }
+
+    fn ts_ms() -> i64 {
+        Utc::now().timestamp_millis()
     }
 
     fn emit(&mut self, event: LogEvent) {
@@ -582,6 +761,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_start".to_string(),
             level: Some("info".to_string()),
@@ -600,6 +780,7 @@ impl SessionLog {
     }
 
     /// Log a CU turn with structured data.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn cu_turn(
         &mut self,
         turn: usize,
@@ -613,6 +794,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = turn;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_turn".to_string(),
             level: Some("info".to_string()),
@@ -648,6 +830,7 @@ impl SessionLog {
         self.summary_builder.current_cu_turns = 0;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_complete".to_string(),
             level: Some("info".to_string()),
@@ -671,6 +854,7 @@ impl SessionLog {
         });
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "cu_task_error".to_string(),
             level: Some("warn".to_string()),
@@ -702,6 +886,7 @@ impl SessionLog {
         });
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -879,6 +1064,7 @@ impl SessionLog {
     pub fn info(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -896,6 +1082,7 @@ impl SessionLog {
     pub fn warn(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -914,6 +1101,7 @@ impl SessionLog {
     pub fn voice_log(&mut self, text: &str, seq: u64, tool_context: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "voice_log".to_string(),
             level: Some("info".to_string()),
@@ -938,6 +1126,7 @@ impl SessionLog {
         self.flush_voice_utterance();
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "user_transcript".to_string(),
             level: Some("info".to_string()),
@@ -959,6 +1148,7 @@ impl SessionLog {
     pub fn presence_checkpoint(&mut self, summary: &str, last_event_seq: u64) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_checkpoint".to_string(),
             level: Some("info".to_string()),
@@ -982,6 +1172,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_connected".to_string(),
             level: Some("info".to_string()),
@@ -1003,6 +1194,7 @@ impl SessionLog {
     pub fn presence_disconnected(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_disconnected".to_string(),
             level: Some("info".to_string()),
@@ -1222,6 +1414,7 @@ impl SessionLog {
     fn emit_voice(&mut self, event: &str, level: &str, kind: &str, detail: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: event.to_string(),
             level: Some(level.to_string()),
@@ -1306,6 +1499,7 @@ mod tests {
         let meta = SessionMeta {
             session_id: "test-session-123".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: None,
             name: None,
             task: None,
@@ -1414,6 +1608,7 @@ mod tests {
         let meta1 = SessionMeta {
             session_id: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp/project".to_string()),
             name: None,
             task: Some("task 1".to_string()),
@@ -1434,6 +1629,7 @@ mod tests {
         let meta2 = SessionMeta {
             session_id: "session-2".to_string(),
             created_at: "2026-01-02T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp/project".to_string()),
             name: None,
             task: Some("task 2".to_string()),
@@ -1480,7 +1676,10 @@ mod tests {
 
     #[test]
     fn find_session_by_id_nonexistent() {
-        let result = SessionLog::find_session_by_id("nonexistent-uuid-12345");
+        // An injected empty home: the lookup must miss without scanning
+        // the machine's real logs store.
+        let home = tempfile::tempdir().unwrap();
+        let result = SessionLog::find_session_by_id_in_home(home.path(), "nonexistent-uuid-12345");
         assert!(result.is_none());
     }
 
@@ -1492,6 +1691,7 @@ mod tests {
         let meta = SessionMeta {
             session_id: "session".to_string(),
             created_at: "2026-05-29T00:00:00".to_string(),
+            created_at_ms: None,
             project_root: Some("/tmp".to_string()),
             name: None,
             task: Some("task".to_string()),
@@ -1607,7 +1807,10 @@ mod tests {
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
-    pub(crate) fn read_events(log_dir: &std::path::Path, event_type: &str) -> Vec<serde_json::Value> {
+    pub(crate) fn read_events(
+        log_dir: &std::path::Path,
+        event_type: &str,
+    ) -> Vec<serde_json::Value> {
         let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         content
             .lines()
@@ -1616,10 +1819,209 @@ mod tests {
             .collect()
     }
 
-    pub(crate) fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
+    pub(crate) fn read_last_event(
+        log_dir: &std::path::Path,
+        event_type: &str,
+    ) -> serde_json::Value {
         read_events(log_dir, event_type)
             .into_iter()
             .last()
             .unwrap_or_else(|| panic!("no {} event found", event_type))
+    }
+
+    #[test]
+    fn events_carry_epoch_ms_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.info("hello");
+        drop(log);
+
+        let before = Utc::now().timestamp_millis();
+        let event = read_last_event(dir.path(), "session_start");
+        let ts_ms = event["ts_ms"].as_i64().expect("ts_ms is an i64");
+        assert!(
+            ts_ms > before - 60_000 && ts_ms <= before,
+            "ts_ms {} not within a minute before {}",
+            ts_ms,
+            before
+        );
+        assert!(
+            event["ts"].as_str().is_some(),
+            "time-of-day ts still present"
+        );
+    }
+
+    #[test]
+    fn meta_carries_epoch_ms_and_reads_legacy_metas() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.write_meta(None, Some("task"));
+        let raw = fs::read_to_string(dir.path().join("session_meta.json")).unwrap();
+        let meta: SessionMeta = serde_json::from_str(&raw).unwrap();
+        let ms = meta.created_at_ms.expect("created_at_ms stamped");
+        assert!(ms > 0);
+
+        // Metas written before the field existed must still parse.
+        let legacy = r#"{"session_id":"old","created_at":"2026-01-01T00:00:00"}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(meta.created_at_ms, None);
+    }
+
+    #[test]
+    fn conversation_message_user_event_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        let id = log.conversation_message_user(
+            7,
+            crate::conversation::MessageProvenance::AskHumanAnswer,
+            "the raw answer",
+            Some(6),
+        );
+        drop(log);
+        let event = read_last_event(dir.path(), "conversation_message");
+        assert_eq!(event["data"]["message_id"].as_str(), Some(id.as_str()));
+        assert_eq!(event["data"]["message_seq"].as_u64(), Some(7));
+        assert_eq!(event["data"]["role"].as_str(), Some("user"));
+        assert_eq!(
+            event["data"]["provenance"].as_str(),
+            Some("ask_human_answer")
+        );
+        assert_eq!(event["data"]["text"].as_str(), Some("the raw answer"));
+        assert_eq!(event["data"]["ref_seq"].as_u64(), Some(6));
+        assert!(event["ts_ms"].as_i64().is_some());
+    }
+
+    #[test]
+    fn model_response_with_message_shares_one_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.model_response_with_message(3, "the full assistant text", 10, 5, 15, 0, 0);
+        drop(log);
+
+        let diag = read_last_event(dir.path(), "model_response");
+        let canon = read_last_event(dir.path(), "conversation_message");
+        assert_eq!(canon["data"]["role"].as_str(), Some("assistant"));
+        assert_eq!(canon["data"]["provenance"].as_str(), Some("assistant"));
+        assert_eq!(canon["data"]["message_seq"].as_u64(), Some(3));
+        // Both events reference the SAME sidecar bytes — one write.
+        assert_eq!(canon["file"], diag["file"]);
+        assert_eq!(canon["data"]["model_offset"], diag["data"]["model_offset"]);
+        assert_eq!(canon["data"]["model_bytes"], diag["data"]["model_bytes"]);
+        // And the span resolves to the full text.
+        let relative = canon["file"].as_str().expect("sidecar file recorded");
+        let bytes = fs::read(dir.path().join(relative)).unwrap();
+        let offset = canon["data"]["model_offset"].as_u64().unwrap() as usize;
+        let len = canon["data"]["model_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(&bytes[offset..offset + len], b"the full assistant text");
+    }
+
+    #[test]
+    fn conversation_rewound_and_epoch_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open(dir.path().to_path_buf()).unwrap();
+        log.conversation_rewound(5, "tail_rollback");
+        log.conversation_message_epoch(&[
+            (1, "system".to_string(), "aaaa".to_string()),
+            (2, "user".to_string(), "bbbb".to_string()),
+        ]);
+        drop(log);
+
+        let rewound = read_last_event(dir.path(), "conversation_rewound");
+        assert_eq!(rewound["data"]["cut_after_seq"].as_u64(), Some(5));
+        assert_eq!(rewound["data"]["kind"].as_str(), Some("tail_rollback"));
+        assert!(rewound["data"]["superseded_at_ms"].as_i64().is_some());
+
+        let epoch = read_last_event(dir.path(), "conversation_message_epoch");
+        let mapping = epoch["data"]["mapping"].as_array().unwrap();
+        assert_eq!(mapping.len(), 2);
+        assert_eq!(mapping[1][0].as_u64(), Some(2));
+        assert_eq!(mapping[1][1].as_str(), Some("user"));
+        assert_eq!(mapping[1][2].as_str(), Some("bbbb"));
+    }
+
+    #[test]
+    fn content_hash_hex16_is_stable() {
+        assert_eq!(content_hash_hex16("hello"), content_hash_hex16("hello"));
+        assert_ne!(content_hash_hex16("hello"), content_hash_hex16("hello!"));
+        assert_eq!(content_hash_hex16("x").len(), 16);
+    }
+
+    #[test]
+    fn find_session_by_id_resolves_names_metas_and_survives_deletion() {
+        let home = tempfile::tempdir().unwrap();
+        let logs = home.path().join(".intendant").join("logs");
+
+        // Dir whose NAME is the session id.
+        let named = logs.join("aaaa-1111-2222");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::write(
+            named.join("session_meta.json"),
+            serde_json::json!({"session_id": "aaaa-1111-2222", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+        // Dir whose name differs from its META session id (--log-file
+        // style custom dir).
+        let custom = logs.join("custom-dir");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "bbbb-3333-4444", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+
+        // Exact + prefix name matches; meta-only match; miss.
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "aaaa-1111-2222"),
+            Some(named.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "aaaa-1111"),
+            Some(named.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333"),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "zzzz-none"),
+            None
+        );
+
+        // Memoized hits are revalidated: a deleted dir must not be served
+        // from the cache (both lookups above primed it).
+        std::fs::remove_dir_all(&custom).unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            None
+        );
+        // A meta rewrite that changes the session id drops the memo too.
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "bbbb-3333-4444", "created_at": "t"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            Some(custom.clone())
+        );
+        std::fs::write(
+            custom.join("session_meta.json"),
+            serde_json::json!({"session_id": "cccc-5555-6666", "created_at": "later than t"})
+                .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "bbbb-3333-4444"),
+            None
+        );
+        assert_eq!(
+            SessionLog::find_session_by_id_in_home(home.path(), "cccc-5555-6666"),
+            Some(custom)
+        );
     }
 }

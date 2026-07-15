@@ -18,7 +18,12 @@ pub(crate) struct TlsFailureLogEntry {
 
 pub(crate) type TlsFailureLogState = Arc<Mutex<HashMap<String, TlsFailureLogEntry>>>;
 
-pub(crate) fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &str, kind: &str, detail: &str) {
+pub(crate) fn log_tls_failure_rate_limited(
+    state: &TlsFailureLogState,
+    peer: &str,
+    kind: &str,
+    detail: &str,
+) {
     let now = std::time::Instant::now();
     let key = format!("{kind}|{peer}|{detail}");
     let mut map = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -57,6 +62,138 @@ pub(crate) fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &st
     }
 }
 
+/// Apply a dashboard-control authority request only while its display is
+/// present in the live registry. The active-session and registry read guards
+/// stay held through the synchronous authority mutation, so a concurrent
+/// session replacement or display removal cannot clear the display and then
+/// lose a race to a stale grant. `try_read` keeps this synchronous bridge
+/// non-blocking; contention rejects the request closed and the user can retry.
+fn apply_dashboard_grant_for_existing_display(
+    shared_session: &SharedActiveSession,
+    display_id: u32,
+    include_private: bool,
+    session_id: &str,
+    authority: &Arc<DisplayInputAuthority>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let Ok(session) = shared_session.try_read() else {
+        return false;
+    };
+    let Some(session_registry) = session.session_registry.as_ref() else {
+        return false;
+    };
+    let Ok(registry) = session_registry.try_read() else {
+        return false;
+    };
+    let display_exists = if include_private {
+        registry.get_any(display_id).is_some()
+    } else {
+        registry.get(display_id).is_some()
+    };
+    if !display_exists {
+        return false;
+    }
+    apply_grant_input_authority_dashboard_control(
+        display_id,
+        session_id.to_string(),
+        authority,
+        authority_change_tx,
+    );
+    true
+}
+
+#[cfg(test)]
+mod authority_grant_validation_tests {
+    use super::*;
+
+    struct AuthorityTestDisplayBackend;
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for AuthorityTestDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, crate::error::CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn kind(&self) -> &'static str {
+            "authority-test"
+        }
+    }
+
+    #[test]
+    fn nonexistent_dashboard_authority_requests_do_not_grow_global_maps() {
+        let session_registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let shared_session = ActiveSessionState::empty();
+        shared_session
+            .try_write()
+            .expect("fresh active session is uncontended")
+            .session_registry = Some(Arc::clone(&session_registry));
+        let authority = Arc::new(DisplayInputAuthority::default());
+        let (change_tx, mut change_rx) = broadcast::channel(8);
+
+        for display_id in 1..=2_048 {
+            assert!(!apply_dashboard_grant_for_existing_display(
+                &shared_session,
+                display_id,
+                false,
+                "dashboard-session",
+                &authority,
+                &change_tx,
+            ));
+        }
+
+        assert_eq!(authority.tracked_entry_counts(), (0, 0));
+        assert!(
+            change_rx.try_recv().is_err(),
+            "rejected requests must not publish authority changes"
+        );
+
+        let private = Arc::new(crate::display::DisplaySession::new(
+            9,
+            Arc::new(AuthorityTestDisplayBackend),
+        ));
+        private.set_agent_visible(false);
+        session_registry
+            .try_write()
+            .expect("registry is uncontended")
+            .insert(9, private);
+        assert!(!apply_dashboard_grant_for_existing_display(
+            &shared_session,
+            9,
+            false,
+            "non-owner-session",
+            &authority,
+            &change_tx,
+        ));
+        assert!(apply_dashboard_grant_for_existing_display(
+            &shared_session,
+            9,
+            true,
+            "owner-session",
+            &authority,
+            &change_tx,
+        ));
+    }
+}
+
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
 // below parses compact Codex token lines without materializing full JSON values.
 // Exact fork baselines come from scanning the parent's log (results
@@ -69,7 +206,74 @@ pub(crate) use intendant_core::net::{
     rebind_dead_tcp_listener, should_continue_after_accept_error, FATAL_ACCEPT_REBIND_THRESHOLD,
 };
 
+#[cfg(not(test))]
+fn default_access_cert_dir() -> std::path::PathBuf {
+    crate::access::backend::select_backend().cert_dir()
+}
+
+/// Unit-test callers historically reached the production wrapper and thereby
+/// read the runner's live access store. Keep those transport tests isolated by
+/// giving every gateway its own process-lifetime temp store. Tests that need a
+/// populated store use `spawn_web_gateway_from_cert_dir` explicitly.
+#[cfg(test)]
+fn default_access_cert_dir() -> std::path::PathBuf {
+    static TEST_STORES: std::sync::OnceLock<std::sync::Mutex<Vec<tempfile::TempDir>>> =
+        std::sync::OnceLock::new();
+    let store = tempfile::tempdir().expect("create isolated gateway access store");
+    let path = store.path().to_path_buf();
+    TEST_STORES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(store);
+    path
+}
+
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub fn spawn_web_gateway(
+    listener: TcpListener,
+    bus: EventBus,
+    broadcast_tx: broadcast::Sender<String>,
+    config: WebGatewayConfig,
+    shared_session: SharedActiveSession,
+    transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
+    task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
+    project_root: Option<std::path::PathBuf>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+    advertise_urls: Vec<String>,
+    inbound_bearer_token: Option<String>,
+    local_card_auth: crate::peer::AuthRequirements,
+    tls_client_cert_required: bool,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_web_gateway_from_cert_dir(
+        listener,
+        bus,
+        broadcast_tx,
+        config,
+        shared_session,
+        transcriber,
+        task_tx,
+        project_root,
+        mcp_server,
+        peer_registry,
+        advertise_urls,
+        inbound_bearer_token,
+        local_card_auth,
+        tls_client_cert_required,
+        tls_acceptor,
+        default_access_cert_dir(),
+    )
+}
+
+/// Spawn a gateway against an explicit access-certificate store.
+///
+/// Production resolves the installed platform store in [`spawn_web_gateway`].
+/// Keeping the path explicit below that transport edge makes request IAM and
+/// peer-identity resolution testable without reading the runner's real home.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_web_gateway_from_cert_dir(
     listener: TcpListener,
     bus: EventBus,
     broadcast_tx: broadcast::Sender<String>,
@@ -89,11 +293,10 @@ pub fn spawn_web_gateway(
     // rely on transport security (mTLS proxy, tailnet, loopback).
     // Sourced from `[server.auth] bearer_token` in intendant.toml.
     //
-    // /ws, /.well-known/agent-card.json, /config, the dashboard HTML,
-    // and static assets are intentionally exempt in this slice — /ws
-    // enforcement requires a parallel dashboard auth flow (browser
-    // can't easily set headers on `WebSocket` opens) which lands in
-    // slice 2d.
+    // /.well-known/agent-card.json, /config, the dashboard HTML, and static
+    // assets are intentionally exempt. /ws is enforced separately below:
+    // daemons use Authorization, browsers use a ?token= query parameter, and
+    // every browser Origin must be the daemon's own or the signed app scheme.
     inbound_bearer_token: Option<String>,
     // What to advertise in the local Agent Card's `auth` field —
     // tells connecting peers what wire-layer (transport) and
@@ -111,8 +314,9 @@ pub fn spawn_web_gateway(
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
     // When true, the TLS layer may complete without a client certificate so
-    // public peer-access requests can reach the doorbell endpoint, but every
-    // other HTTP/WS path is rejected unless rustls verified a client cert.
+    // authority-free shell/discovery bytes and public access-request doors
+    // remain reachable. Protected HTTP and every WS path still require a
+    // rustls-verified client certificate (or authenticated peer identity).
     tls_client_cert_required: bool,
     // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
     // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
@@ -123,6 +327,7 @@ pub fn spawn_web_gateway(
     // `0x16` handshake-record first byte, which is disjoint from both the
     // STUN length-prefix and HTTP method bytes.
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    access_cert_dir: std::path::PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
@@ -281,15 +486,19 @@ pub fn spawn_web_gateway(
     // can.  The map is small, write-rare (grant/release/WS-close only),
     // read-frequent on the hot input path; std::sync::RwLock is the
     // correct lock here.
-    let display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>> =
-        Arc::new(StdRwLock::new(HashMap::new()));
+    let display_input_authority = Arc::new(DisplayInputAuthority::default());
+
+    // Tab presence (Access pane): live connections on both event lanes,
+    // with voice/input ownership joined from the two handles above at
+    // query time. The /ws lane registers below at accept; the control
+    // tunnel registers inside DashboardControlRegistry's answer/close.
+    let dashboard_tabs =
+        DashboardTabsRegistry::new(active_presence.clone(), display_input_authority.clone());
 
     // Phase 5a.1 authority transition channel.  Each per-connection
     // outbound task subscribes; emit sites are the Request/Release
-    // ControlMsg handlers, the WS-close cleanup, and the DisplayReady
-    // listener that fires `holder: None` for freshly
-    // created display sessions so already-connected browsers move
-    // from `unknown` to `unclaimed`.
+    // ControlMsg handlers, transport cleanup, and the synchronous display
+    // registry lifecycle observer installed before the accept loop starts.
     let (authority_change_tx, _authority_change_rx0) =
         broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
 
@@ -298,14 +507,90 @@ pub fn spawn_web_gateway(
     {
         let mut authority_change_rx = authority_change_tx.subscribe();
         let dashboard_authority_change_tx = dashboard_authority_change_tx.clone();
+        let authority_shared_session = shared_session.clone();
+        let observer_authority = Arc::clone(&display_input_authority);
         tokio::spawn(async move {
+            let mut last_holders: HashMap<u32, DisplayInputHolder> = HashMap::new();
             loop {
                 match authority_change_rx.recv().await {
                     Ok(change) => {
+                        // Mutation and broadcast are intentionally separated so
+                        // no channel send happens under the hot holder lock.
+                        // A concurrent newer mutation can therefore broadcast
+                        // first; never regress derived state to its stale event.
+                        if !change.is_current(&observer_authority) {
+                            continue;
+                        }
+                        let identity_changed =
+                            match (last_holders.get(&change.display_id), change.holder.as_ref()) {
+                                (Some(previous), Some(current)) => !previous.same_identity(current),
+                                (None, None) => false,
+                                _ => true,
+                            };
+                        match change.holder.as_ref() {
+                            Some(holder) => {
+                                last_holders.insert(change.display_id, holder.clone());
+                            }
+                            None => {
+                                last_holders.remove(&change.display_id);
+                            }
+                        }
+                        // Every holder transition advances the display input
+                        // epoch and clears its backlog, even when no native
+                        // edge is held yet. Otherwise a queued A event could
+                        // survive a fast A -> B -> A sequence and become true
+                        // under A's identity-only guard again.
+                        if identity_changed {
+                            let session_registry = authority_shared_session
+                                .read()
+                                .await
+                                .session_registry
+                                .clone();
+                            if let Some(session_registry) = session_registry {
+                                if let Some(session) =
+                                    session_registry.read().await.get_any(change.display_id)
+                                {
+                                    session.reset_browser_input_before_authority_revision(
+                                        change.revision,
+                                        "display input authority changed",
+                                    );
+                                }
+                            }
+                        }
                         let _ = dashboard_authority_change_tx.send(change.display_id);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        last_holders.clear();
+                        let session_registry = authority_shared_session
+                            .read()
+                            .await
+                            .session_registry
+                            .clone();
+                        if let Some(session_registry) = session_registry {
+                            let sessions = {
+                                let registry = session_registry.read().await;
+                                registry
+                                    .all_display_ids()
+                                    .into_iter()
+                                    .filter_map(|display_id| {
+                                        registry
+                                            .get_any(display_id)
+                                            .map(|session| (display_id, session))
+                                    })
+                                    .collect::<Vec<_>>()
+                            };
+                            for (display_id, session) in sessions {
+                                let revision = observer_authority
+                                    .revision(display_id)
+                                    .load(Ordering::SeqCst);
+                                session.reset_browser_input_before_authority_revision(
+                                    revision,
+                                    "display input authority updates were lost",
+                                );
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -316,9 +601,11 @@ pub fn spawn_web_gateway(
         let state_authority = Arc::clone(&display_input_authority);
         let request_authority = Arc::clone(&display_input_authority);
         let request_change_tx = authority_change_tx.clone();
+        let request_shared_session = shared_session.clone();
         let release_authority = Arc::clone(&display_input_authority);
         let release_change_tx = authority_change_tx.clone();
         let input_authority = Arc::clone(&display_input_authority);
+        let input_revision_authority = Arc::clone(&display_input_authority);
         let cleanup_authority = Arc::clone(&display_input_authority);
         let cleanup_change_tx = authority_change_tx.clone();
         let subscribe_tx = dashboard_authority_change_tx.clone();
@@ -337,13 +624,17 @@ pub fn spawn_web_gateway(
                     &state_authority,
                 ))
             },
-            move |session_id, display_id| {
-                apply_grant_input_authority_dashboard_control(
+            move |session_id, display_id, include_private| {
+                if !apply_dashboard_grant_for_existing_display(
+                    &request_shared_session,
                     display_id,
-                    session_id.to_string(),
+                    include_private,
+                    session_id,
                     &request_authority,
                     &request_change_tx,
-                );
+                ) {
+                    return Vec::new();
+                }
                 vec![dashboard_control_authority_state_frame(
                     session_id,
                     display_id,
@@ -366,6 +657,7 @@ pub fn spawn_web_gateway(
             move |session_id, display_id| {
                 dashboard_control_input_authorized(session_id, display_id, &input_authority)
             },
+            move |display_id| input_revision_authority.revision(display_id),
             move |session_id| {
                 apply_dashboard_control_close_input_authority(
                     session_id,
@@ -481,6 +773,7 @@ pub fn spawn_web_gateway(
         Some(dashboard_presence),
         ice_config.clone(),
         Arc::clone(&tcp_peer_registry),
+        dashboard_tabs.clone(),
     ));
     crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
@@ -490,10 +783,19 @@ pub fn spawn_web_gateway(
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.
     crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
+    // An owner surface (dashboards on this gateway) now exists in this
+    // process: display requests may block on the popup instead of failing
+    // closed with the headless no-approver refusal.
+    crate::display_requests::mark_approver_surface_available();
     // Fleet certificates: restore any stored certificate into the live
     // SNI resolver and keep it renewed (fleet_cert.rs).
-    crate::fleet_cert::refresh_installed_state();
+    crate::fleet_cert::refresh_installed_state_in(&access_cert_dir);
     crate::fleet_cert::spawn_renewal_loop();
+    // Hosted-bundle code transparency: when Connect is enabled,
+    // periodically verify what the rendezvous serves against its public
+    // transparency log (hosted_verify.rs — advisory and fail-open, the
+    // CT tripwire's sibling).
+    crate::hosted_verify::spawn_hosted_bundle_monitor();
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't
@@ -505,38 +807,6 @@ pub fn spawn_web_gateway(
     // bulk-by-connection key. See the F-1.3b3 helpers above.
     let federated_authority_subscribers: FederatedAuthoritySubscribers =
         Arc::new(StdRwLock::new(HashMap::new()));
-
-    // Spawn a listener that fires an "unclaimed" authority change for
-    // every newly-created display session so already-connected browsers'
-    // chips flip from `unknown` to `unclaimed` without waiting for the
-    // first Request/Release.  Subscribes to the broadcast_tx event
-    // stream (already serialized JSON) and pattern-matches on
-    // `display_ready` rather than the typed AppEvent — same source the
-    // existing `display_ready_cache` task uses, keeps the dependency
-    // surface small.
-    {
-        let authority_change_tx = authority_change_tx.clone();
-        let mut display_events_rx = broadcast_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match display_events_rx.recv().await {
-                    Ok(line) => {
-                        if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                let _ = authority_change_tx.send(DisplayInputAuthorityChange {
-                                    display_id: did,
-                                    holder: None,
-                                });
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
-        });
-    }
 
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
@@ -577,185 +847,26 @@ pub fn spawn_web_gateway(
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    {
-        let usage_cache = last_usage_json.clone();
-        let live_usage_cache = last_live_usage_json.clone();
-        let status_cache = last_status_json.clone();
-        let autonomy_cache = last_autonomy_json.clone();
-        let external_agent_cache = last_external_agent_json.clone();
-        let session_attached_cache = attached_external_sessions.clone();
-        let user_display_cache = last_user_display_json.clone();
-        let session_state_cache = session_state_lines.clone();
-        let display_cache = display_ready_cache.clone();
-        let mut usage_rx = broadcast_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match usage_rx.recv().await {
-                    Ok(line) => {
-                        // Cache display_ready events per display_id for
-                        // late-connecting browsers.
-                        if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                if let Ok(mut guard) = display_cache.lock() {
-                                    guard.insert(did, line.clone());
-                                }
-                            }
-                        }
-                        // Evict display_ready cache when display is revoked.
-                        if line.contains("\"event\":\"user_display_revoked\"")
-                            || line.contains("\"event\":\"display_capture_lost\"")
-                        {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                if let Ok(mut guard) = display_cache.lock() {
-                                    guard.remove(&did);
-                                }
-                            }
-                        }
-                        // Cache user_display_granted for replay on reconnect.
-                        // Clear the cache on user_display_revoked so a refreshed
-                        // browser after a revoke doesn't re-enable the badge.
-                        if line.contains("\"event\":\"user_display_granted\"") {
-                            if let Ok(mut guard) = user_display_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"user_display_revoked\"") {
-                            if let Ok(mut guard) = user_display_cache.lock() {
-                                *guard = None;
-                            }
-                        }
-                        if line.contains("\"event\":\"usage_update\"")
-                            || line.contains("\"event\":\"usage\"")
-                        {
-                            if let Ok(mut guard) = usage_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"live_usage_update\"") {
-                            if let Ok(mut guard) = live_usage_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"status\"") {
-                            if let Ok(mut guard) = status_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"autonomy_changed\"") {
-                            if let Ok(mut guard) = autonomy_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"external_agent_changed\"") {
-                            if let Ok(mut guard) = external_agent_cache.lock() {
-                                *guard = Some(line.clone());
-                            }
-                        }
-                        if line.contains("\"event\":\"session_attached\"")
-                            || line.contains("\"event\":\"session_identity\"")
-                        {
-                            if let Ok(mut guard) = session_attached_cache.lock() {
-                                update_external_attached_sessions_from_wire(&mut guard, &line);
-                            }
-                        }
-                        if line.contains("\"event\":\"session_vitals\"")
-                            || line.contains("\"event\":\"session_goal\"")
-                            || line.contains("\"event\":\"session_started\"")
-                            || line.contains("\"event\":\"approval_required\"")
-                            || line.contains("\"event\":\"user_question\"")
-                        {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let kind = match parsed["event"].as_str() {
-                                    Some("session_vitals") => Some("session_vitals"),
-                                    Some("session_goal") => Some("session_goal"),
-                                    // A live session's birth announcement:
-                                    // replayed to late joiners so their
-                                    // Activity grid rebuilds windows for
-                                    // work that predates the connection
-                                    // (session_started routinely falls off
-                                    // the tail-limited log replay).
-                                    Some("session_started") => Some("session_started"),
-                                    // Pending approvals/questions: the
-                                    // daemon-side registry survives a page
-                                    // reload but the panel state does not —
-                                    // replay the ask so a reconnecting
-                                    // operator can still answer. Cleared on
-                                    // approval_resolved below.
-                                    Some("approval_required") => Some("approval_required"),
-                                    Some("user_question") => Some("user_question"),
-                                    _ => None,
-                                };
-                                if let (Some(kind), Some(sid)) =
-                                    (kind, parsed["session_id"].as_str())
-                                {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        guard
-                                            .entry(sid.to_string())
-                                            .or_default()
-                                            .insert(kind, line.clone());
-                                        // Bound the cache against a runaway
-                                        // session-id source. session_ended is
-                                        // the normal prune; this evicts the
-                                        // lexicographically first key, which
-                                        // is arbitrary but keeps it finite.
-                                        if guard.len() > 256 {
-                                            if let Some(first) = guard.keys().next().cloned() {
-                                                guard.remove(&first);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if line.contains("\"event\":\"approval_resolved\"") {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                if let (Some(sid), Some(id)) =
-                                    (parsed["session_id"].as_str(), parsed["id"].as_u64())
-                                {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        if let Some(kinds) = guard.get_mut(sid) {
-                                            for kind in ["approval_required", "user_question"] {
-                                                let matches = kinds
-                                                    .get(kind)
-                                                    .and_then(|cached| {
-                                                        serde_json::from_str::<serde_json::Value>(
-                                                            cached,
-                                                        )
-                                                        .ok()
-                                                    })
-                                                    .is_some_and(|cached| {
-                                                        cached["id"].as_u64() == Some(id)
-                                                    });
-                                                if matches {
-                                                    kinds.remove(kind);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if line.contains("\"event\":\"session_ended\"") {
-                            if let Ok(mut guard) = session_attached_cache.lock() {
-                                update_external_attached_sessions_from_wire(&mut guard, &line);
-                            }
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                                if let Some(sid) = parsed["session_id"].as_str() {
-                                    if let Ok(mut guard) = session_state_cache.lock() {
-                                        guard.remove(sid);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+    // Bootstrap-cache maintenance rides the TYPED bus (4096-slot), not the
+    // 256-slot serialized channel it used to sniff with `line.contains`
+    // probes: a lag on the old channel silently poisoned every future
+    // tab's bootstrap (ghost approvals, ghost sessions). The typed
+    // maintainer matches AppEvent variants, serializes only the relevant
+    // ones through the same canonical converter the broadcaster uses, and
+    // on Lagged clears the affected sections so the next bootstrap omits
+    // stale lines instead of replaying ghosts (see
+    // `BootstrapCacheMaintainer::clear_on_gap` for the per-section
+    // ground-truth story). Authority is tied synchronously to the session
+    // registry; this maintainer only clears it as fail-closed gap recovery.
+    spawn_bootstrap_cache_maintainer(
+        &bus,
+        BootstrapCacheMaintainer {
+            caches: bootstrap_caches.clone(),
+            display_ready_cache: display_ready_cache.clone(),
+            display_input_authority: Arc::clone(&display_input_authority),
+            authority_change_tx: authority_change_tx.clone(),
+        },
+    );
 
     // Peer registry → dashboard push translator.
     //
@@ -831,8 +942,7 @@ pub fn spawn_web_gateway(
     // INTENDANT_APP_HTML_PATH (dev override): read once at spawn; when
     // set, every dashboard request re-reads that path instead of serving
     // the embedded `app_html` above.
-    let app_html_override: Option<Arc<std::path::Path>> =
-        app_html_override_path().map(Arc::from);
+    let app_html_override: Option<Arc<std::path::Path>> = app_html_override_path().map(Arc::from);
     if let Some(path) = &app_html_override {
         eprintln!(
             "[web_gateway] INTENDANT_APP_HTML_PATH: serving the dashboard from {} \
@@ -851,8 +961,34 @@ pub fn spawn_web_gateway(
     // behind `embedded_static_asset`), so its cache lives here.
     let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
+    let lifecycle_shared_session = shared_session.clone();
+    let lifecycle_authority = Arc::clone(&display_input_authority);
+    let lifecycle_authority_change_tx = authority_change_tx.clone();
 
     tokio::spawn(async move {
+        // Install the authority invalidator before accepting any browser.
+        // SessionRegistry invokes it synchronously under its write guard and
+        // before insert/remove publication, closing the display-ID reuse race
+        // that an asynchronous DisplayReady/CaptureLost subscriber cannot.
+        if let Some(session_registry) = lifecycle_shared_session
+            .read()
+            .await
+            .session_registry
+            .clone()
+        {
+            session_registry
+                .write()
+                .await
+                .set_lifecycle_observer(Some(Arc::new(move |display_id| {
+                    let (_, revision) = lifecycle_authority.clear_display(display_id);
+                    let _ = lifecycle_authority_change_tx.send(DisplayInputAuthorityChange {
+                        display_id,
+                        holder: None,
+                        revision,
+                    });
+                })));
+        }
+
         let mut listener = listener;
         let bind_addr = listener.local_addr().ok();
         let port = bind_addr.map(|a| a.port()).unwrap_or(0);
@@ -955,6 +1091,7 @@ pub fn spawn_web_gateway(
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
+            let dashboard_tabs = dashboard_tabs.clone();
             let authority_change_tx = authority_change_tx.clone();
             let federated_authority_subscribers = federated_authority_subscribers.clone();
             let last_usage_json = last_usage_json.clone();
@@ -966,12 +1103,14 @@ pub fn spawn_web_gateway(
             let last_user_display_json = last_user_display_json.clone();
             let session_state_lines = session_state_lines.clone();
             let display_ready_cache = display_ready_cache.clone();
+            let bootstrap_caches = bootstrap_caches.clone();
             let task_tx = task_tx.clone();
             let project_root = project_root.clone();
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
+            let access_cert_dir = access_cert_dir.clone();
             let tls_client_cert_required = tls_client_cert_required;
             let source_hint = peer_addr.ip().to_string();
             let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
@@ -1152,18 +1291,19 @@ pub fn spawn_web_gateway(
                     );
                     let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
                                 http:// / ws://.\n";
-                    let response = HttpResponse::with_content("426 Upgrade Required", "text/plain", body)
-                        .header("Upgrade", "TLS/1.2")
-                        .header("Connection", "close")
-                        .into_string();
+                    let response =
+                        HttpResponse::with_content("426 Upgrade Required", "text/plain", body)
+                            .header("Upgrade", "TLS/1.2")
+                            .header("Connection", "close")
+                            .into_string();
                     let _ = raw_stream.write_all(response.as_bytes()).await;
                     let _ = raw_stream.shutdown().await;
                     return;
                 }
 
                 let buf_owned: Vec<u8>;
-                let n: usize;
                 let mut stream: DemuxStream;
+                let tls_fleet_origin: bool;
                 let tls_client_cert_present: bool;
                 let tls_client_cert_fingerprint: Option<String>;
                 if is_tls {
@@ -1183,6 +1323,13 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
+                    // Capture certificate-selection provenance at the TLS
+                    // boundary. The public fleet/WebPKI name is a discovery
+                    // endpoint, never an authority anchor; HTTP Host alone is
+                    // mutable and cannot establish the stronger direct-mTLS
+                    // ceremony.
+                    tls_fleet_origin =
+                        crate::web_tls::is_fleet_server_name(tls_stream.get_ref().1.server_name());
                     let peer_certs = tls_stream
                         .get_ref()
                         .1
@@ -1207,79 +1354,262 @@ pub fn spawn_web_gateway(
                         }
                     };
                     decrypted.truncate(read_n);
-                    n = read_n;
                     buf_owned = decrypted.clone();
                     // Replay the decrypted request head in front of the TLS
                     // stream so the WS upgrade / HTTP body reads downstream
                     // see the request from byte zero.
-                    stream = Box::pin(crate::web_tls::PrefixedStream::new(decrypted, tls_stream));
+                    stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
+                        decrypted, tls_stream,
+                    )));
                 } else {
                     // Plain HTTP/WS: the peeked bytes are still in the
                     // kernel buffer. Box the raw stream with an empty
                     // replay prefix — a zero-overhead pass-through that
                     // reads the request straight from the socket.
-                    n = peeked;
                     buf_owned = buf[..peeked].to_vec();
+                    tls_fleet_origin = false;
                     tls_client_cert_present = false;
                     tls_client_cert_fingerprint = None;
-                    stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
+                    stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
+                        Vec::new(),
+                        raw_stream,
+                    )));
                 }
-                // Downstream code reads `buf[..n]`; point `buf` at the
-                // (decrypted, for TLS) request head we just captured.
-                let buf = buf_owned.as_slice();
-
-                let header_text = String::from_utf8_lossy(&buf[..n]);
-                let peer_connection_identity = match resolve_peer_connection_identity(
-                    &header_text,
-                    tls_client_cert_fingerprint.as_deref(),
-                ) {
-                    Ok(identity) => identity,
-                    Err((status, body)) => {
-                        use tokio::io::AsyncWriteExt;
-                        let reason = match status {
-                            401 => "Unauthorized",
-                            403 => "Forbidden",
-                            _ => "Error",
+                // ── HTTP/1.1 keep-alive request loop ─────────────────
+                // One accepted connection serves a sequence of requests:
+                // each iteration processes the request head captured in
+                // `head_segment` (request 1: the demux peek / first TLS
+                // read; request N+1: read back below after the previous
+                // response PARKED the stream instead of closing it).
+                // Identity, IAM context, and the origin gates are
+                // re-evaluated PER REQUEST inside `serve_http_request` —
+                // only transport facts (TLS-ness, the client-cert
+                // fingerprint, the peer address) are connection-scoped.
+                // The loop ends when a write edge closes instead of
+                // parking (the keep_alive module holds the decision
+                // table), when the idle timeout / request budget runs
+                // out, or when a WebSocket upgrade hands the whole
+                // connection off below.
+                let parked = DemuxStream::new_parked_slot();
+                stream.arm_keep_alive(&parked);
+                let mut served: u32 = 0;
+                let mut head_segment: Vec<u8> = buf_owned;
+                let (mut stream, header_text, peer_connection_identity, browser_host_ip) = loop {
+                    served += 1;
+                    let n = head_segment.len();
+                    let header_text = String::from_utf8_lossy(&head_segment).to_string();
+                    let peer_connection_identity =
+                        match resolve_peer_connection_identity_from_cert_dir(
+                            &access_cert_dir,
+                            &header_text,
+                            tls_client_cert_fingerprint.as_deref(),
+                        ) {
+                            Ok(identity) => identity,
+                            Err((status, body)) => {
+                                use tokio::io::AsyncWriteExt;
+                                let reason = match status {
+                                    401 => "Unauthorized",
+                                    403 => "Forbidden",
+                                    _ => "Error",
+                                };
+                                let response = HttpResponse::with_content(
+                                    format!("{} {}", status, reason),
+                                    "application/json",
+                                    body,
+                                )
+                                .header("Cache-Control", "no-cache")
+                                .header("Connection", "close")
+                                .into_string();
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
                         };
-                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-                            .header("Cache-Control", "no-cache")
-                            .header("Connection", "close")
-                            .into_string();
+                    let is_websocket = header_text
+                        .lines()
+                        .any(|l| l.to_lowercase().contains("upgrade: websocket"));
+
+                    // Parse the `Host:` header to learn what address the
+                    // browser thinks reaches us. We use this later as the IP
+                    // for ICE-TCP host candidates: Firefox refuses to pair
+                    // remote loopback candidates, so we need a non-loopback
+                    // address the browser can actually connect to. The only
+                    // one we know for sure the browser can reach is whatever
+                    // it just used to reach us for HTTP — which is exactly
+                    // what the Host header contains. If the user accessed
+                    // via a hostname (`localhost`, `myserver.local`) rather
+                    // than a literal IP, we get None here and skip the TCP
+                    // candidate entirely; those users can still use UDP if
+                    // their topology allows it.
+                    let browser_host_ip: Option<std::net::IpAddr> =
+                        extract_host_header_ip(&header_text);
+
+                    if is_websocket {
+                        // Upgrades never loop: the connection stops being
+                        // HTTP. Hand the WS path everything it needs —
+                        // whether this was request 1 or a kept-alive
+                        // follow-up, the stream delivers the upgrade head
+                        // from byte zero (kernel buffer / PrefixedStream /
+                        // replay).
+                        break (
+                            stream,
+                            header_text,
+                            peer_connection_identity,
+                            browser_host_ip,
+                        );
+                    }
+
+                    // Request leg of the keep-alive verdict; the body and
+                    // response legs are dispatch's and the write edges'.
+                    stream.begin_request(
+                        served < KEEP_ALIVE_MAX_REQUESTS
+                            && request_allows_keep_alive(&header_text)
+                            && segment_is_single_request(&head_segment),
+                    );
+                    let http_ctx = HttpRequestCtx {
+                        access_cert_dir: access_cert_dir.clone(),
+                        bus: bus.clone(),
+                        config_json: config_json.clone(),
+                        session_provider: session_provider.clone(),
+                        session_model: session_model.clone(),
+                        agent_card_json: agent_card_json.clone(),
+                        agent_card_value_for_targets: agent_card_value_for_targets.clone(),
+                        app_html: app_html.clone(),
+                        app_html_override: app_html_override.clone(),
+                        app_html_cache: app_html_cache.clone(),
+                        worktree_inventory_cache: worktree_inventory_cache.clone(),
+                        mcp_server: mcp_server.clone(),
+                        peer_registry: peer_registry.clone(),
+                        project_root: project_root.clone(),
+                        inbound_bearer_token: inbound_bearer_token.clone(),
+                        tls_client_cert_required,
+                        peer_access_request_config: peer_access_request_config.clone(),
+                        active_presence: active_presence.clone(),
+                        voice_debug: voice_debug.clone(),
+                        dashboard_control: Arc::clone(&dashboard_control),
+                        daemon_session_id: daemon_session_id.clone(),
+                        query_ctx: query_ctx.clone(),
+                        frame_registry: frame_registry.clone(),
+                        session_log: session_log.clone(),
+                        recording_registry: recording_registry.clone(),
+                        session_registry: session_registry.clone(),
+                        snapshot_dir: snapshot_dir.clone(),
+                        project_root_for_changes: project_root_for_changes.clone(),
+                        runtime_settings: runtime_settings.clone(),
+                        file_watcher: file_watcher.clone(),
+                    };
+                    serve_http_request(
+                        http_ctx,
+                        stream,
+                        n,
+                        &header_text,
+                        peer_addr,
+                        source_hint.clone(),
+                        is_tls,
+                        tls_fleet_origin,
+                        tls_client_cert_present,
+                        tls_client_cert_fingerprint.clone(),
+                        peer_connection_identity,
+                    )
+                    .await;
+
+                    // The write edge either parked the stream for reuse
+                    // or closed it (finalize); no parked stream means the
+                    // connection is done.
+                    let Some(back) = parked.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+                        return;
+                    };
+                    stream = back;
+                    let Some(next) = read_next_request_head(
+                        &mut stream,
+                        std::time::Duration::from_secs(KEEP_ALIVE_IDLE_SECS),
+                    )
+                    .await
+                    else {
+                        // Idle timeout, clean client close, or an
+                        // unparseable follow-up: flush + shutdown ends the
+                        // connection (the finalize contract's home is
+                        // connection end now — parked responses were
+                        // already flushed per response).
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    };
+                    // Serve the captured segment back to readers so
+                    // dispatch (or a WS upgrade) sees the request from
+                    // byte zero, exactly as request 1 arrives.
+                    stream.push_replay(&next);
+                    head_segment = next;
+                };
+
+                // ── WebSocket upgrade path — request 1 or any kept-alive
+                //    follow-up whose head asked to upgrade. ──
+                {
+                    if tls_fleet_origin || request_names_known_fleet_origin(&header_text) {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control",
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
-                };
-                let is_websocket = header_text
-                    .lines()
-                    .any(|l| l.to_lowercase().contains("upgrade: websocket"));
-
-                // Parse the `Host:` header to learn what address the
-                // browser thinks reaches us. We use this later as the IP
-                // for ICE-TCP host candidates: Firefox refuses to pair
-                // remote loopback candidates, so we need a non-loopback
-                // address the browser can actually connect to. The only
-                // one we know for sure the browser can reach is whatever
-                // it just used to reach us for HTTP — which is exactly
-                // what the Host header contains. If the user accessed
-                // via a hostname (`localhost`, `myserver.local`) rather
-                // than a literal IP, we get None here and skip the TCP
-                // candidate entirely; those users can still use UDP if
-                // their topology allows it.
-                let browser_host_ip: Option<std::net::IpAddr> =
-                    extract_host_header_ip(&header_text);
-
-                if is_websocket {
-                    if tls_client_cert_required && !tls_client_cert_present {
+                    // Browsers attach their page Origin to WebSocket
+                    // handshakes, but WebSocket's same-origin protection is
+                    // entirely server-enforced. Reject foreign pages before
+                    // transport identity is converted into a dashboard grant:
+                    // otherwise a hosted page can make the browser present an
+                    // already-enrolled mTLS certificate and inherit that
+                    // direct principal's daemon-local IAM grant. Native
+                    // and daemon clients may omit Origin. The local wrapper's
+                    // custom scheme is an origin allowance, not authentication
+                    // or a shipped signed-native remote anchor; transport IAM
+                    // checks below still apply.
+                    if let Some(origin) = extract_origin_header(&header_text)
+                        .filter(|origin| !is_own_or_app_origin(origin, is_tls, &header_text))
+                    {
                         use tokio::io::AsyncWriteExt;
                         let body = serde_json::json!({
-                            "error": "mTLS client certificate required"
+                            "error": "cross-origin caller is not allowed on this WebSocket",
+                            "origin": origin,
                         })
                         .to_string();
-                        let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
-                            .header("Cache-Control", "no-cache")
-                            .header("Connection", "close")
-                            .into_string();
+                        let response =
+                            HttpResponse::with_content("403 Forbidden", "application/json", body)
+                                .header("Cache-Control", "no-cache")
+                                .header("Vary", "Origin")
+                                .header("Connection", "close")
+                                .into_string();
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+                    let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+                        peer_addr,
+                        &header_text,
+                        tls_client_cert_fingerprint.as_deref(),
+                        peer_connection_identity.as_ref(),
+                    );
+                    if (tls_client_cert_required && !tls_client_cert_present)
+                        || remote_client_auth_missing
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "error": if remote_client_auth_missing {
+                                "verified client certificate or authenticated peer identity required for remote dashboard access"
+                            } else {
+                                "mTLS client certificate required"
+                            }
+                        })
+                        .to_string();
+                        let response = HttpResponse::with_content(
+                            "401 Unauthorized",
+                            "application/json",
+                            body,
+                        )
+                        .header("Cache-Control", "no-cache")
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -1297,10 +1627,14 @@ pub fn spawn_web_gateway(
                             401 => "Unauthorized",
                             _ => "Error",
                         };
-                        let response = HttpResponse::with_content(format!("{} {}", status, reason), "application/json", body)
-                            .header("WWW-Authenticate", "Bearer")
-                            .header("Connection", "close")
-                            .into_string();
+                        let response = HttpResponse::with_content(
+                            format!("{} {}", status, reason),
+                            "application/json",
+                            body,
+                        )
+                        .header("WWW-Authenticate", "Bearer")
+                        .header("Connection", "close")
+                        .into_string();
                         let _ = stream.write_all(response.as_bytes()).await;
                         // Flush + cleanly shut down before the task returns and
                         // drops the stream. On the TLS path rustls buffers the
@@ -1311,11 +1645,11 @@ pub fn spawn_web_gateway(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
-                    let cert_dir = crate::access::backend::select_backend().cert_dir();
                     let dashboard_control_grant_for_ws = match dashboard_control_grant_for_client(
-                        &cert_dir,
+                        &access_cert_dir,
                         peer_connection_identity.as_ref(),
                         tls_client_cert_fingerprint.as_deref(),
+                        tls_client_cert_present,
                     ) {
                         Ok(grant) => grant,
                         Err(message) => {
@@ -1326,10 +1660,33 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
+                    if !dashboard_control_grant_for_ws.allows_unfiltered_websocket_stream() {
+                        use tokio::io::AsyncWriteExt;
+                        let response = json_error(
+                            "403 Forbidden",
+                            "mTLS client lacks the complete observer read set required by the legacy WebSocket stream",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
                     let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,
+                    };
+
+                    // Assign a collision-free peer ID before registering any
+                    // connection state. Dashboard-control and federated
+                    // viewers share each DisplaySession's peer map, so the
+                    // central allocator reserves a distinct namespace for
+                    // this legacy WS lane. Exhaustion closes the socket
+                    // without leaving a phantom dashboard-tab registration.
+                    let Some(peer_id) =
+                        crate::display_peer_ids::allocate_legacy_ws_display_peer_id()
+                    else {
+                        eprintln!("[web_gateway] display peer-id namespace exhausted");
+                        return;
                     };
 
                     let (ws_tx, ws_rx) = ws_stream.split();
@@ -1338,9 +1695,45 @@ pub fn spawn_web_gateway(
                     // Per-connection identity for active/passive tracking
                     let connection_id = uuid::Uuid::new_v4().to_string();
 
+                    // Tab presence: register this event-lane connection.
+                    // The tab id is client-declared (`?tab=` beside the
+                    // token — browsers can't set headers on WebSocket
+                    // opens); ws_inbound_task unregisters on close.
+                    dashboard_tabs.register(
+                        &connection_id,
+                        DashboardTabConnection {
+                            lane: DashboardTabLane::LegacyWs,
+                            kind: dashboard_control_grant_for_ws.connection_kind(),
+                            label: dashboard_control_grant_for_ws.label().to_string(),
+                            tab_id: extract_query_param(
+                                header_text.lines().next().unwrap_or(""),
+                                "tab",
+                            ),
+                            remote: browser_host_ip.map(|ip| ip.to_string()),
+                            user_agent: extract_header_value(&header_text, "user-agent"),
+                            connected_at_unix_ms: now_unix_ms(),
+                        },
+                    );
+
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
+
+                    // Subscribe before reading the authority bootstrap. Any
+                    // transition racing the snapshot is then either represented
+                    // by the snapshot or retained for the outbound task. Waiting
+                    // until after log replay left a long missed-update window.
+                    let authority_change_rx = authority_change_tx.subscribe();
+
+                    // Ordering barrier for the outbound task: live broadcast
+                    // events stay gated until every bootstrap frame queued on
+                    // `direct_tx` below has drained to the socket, so a live
+                    // event can never interleave into (or precede) the
+                    // bootstrap sequence. Fired after the last bootstrap
+                    // enqueue; `ws_outbound_task`'s biased select drains
+                    // direct frames first, then opens the broadcast lane.
+                    let (bootstrap_flushed_tx, bootstrap_flushed_rx) =
+                        tokio::sync::oneshot::channel::<()>();
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
@@ -1463,7 +1856,34 @@ pub fn spawn_web_gateway(
                     // (the dashboard's HTML default is "off").
                     if let Ok(guard) = last_user_display_json.lock() {
                         if let Some(ref ud_json) = *guard {
-                            let _ = direct_tx.send(ud_json.clone());
+                            if dashboard_control_grant_for_ws.allows_dashboard_event_line(ud_json) {
+                                let _ = direct_tx.send(ud_json.clone());
+                            }
+                        }
+                    }
+
+                    // Re-raise still-pending display requests so a
+                    // late-connecting dashboard (the exact browser the
+                    // attention nudge just summoned) shows the popup.
+                    // Requests are short-lived; expired entries are
+                    // filtered by the snapshot.
+                    if dashboard_control_grant_for_ws.has_owner_dashboard_authority() {
+                        for pending in crate::display_requests::registry()
+                            .pending_snapshot(crate::display_requests::now_unix_ms())
+                        {
+                            let line = serde_json::to_string(
+                                &crate::types::OutboundEvent::DisplayRequestRaised {
+                                    session_id: Some(pending.session_key.clone())
+                                        .filter(|s| s != "main"),
+                                    id: pending.id,
+                                    access: pending.access.as_str().to_string(),
+                                    reason: pending.reason.clone(),
+                                    expires_unix_ms: pending.expires_unix_ms,
+                                },
+                            );
+                            if let Ok(line) = line {
+                                let _ = direct_tx.send(line);
+                            }
                         }
                     }
 
@@ -1507,21 +1927,20 @@ pub fn spawn_web_gateway(
                     let bootstrap_authority_snapshots: Vec<(u32, &'static str)> =
                         if let Some(ref sr) = session_registry {
                             let reg = sr.read().await;
-                            // Dashboards are the user surface: replay
-                            // private user views too (they exist FOR this
-                            // surface), tagged so the tile renders its
-                            // "private view" chip.
-                            let active_ids: Vec<u32> = reg.all_display_ids();
+                            let active_ids: Vec<u32> =
+                                dashboard_control_grant_for_ws.display_ids(&reg);
                             // Snapshot resolutions + auth states under the
                             // std lock, then drop the guard before any
                             // direct_tx.send calls.
                             let resolutions: Vec<(u32, u32, u32, bool)> = active_ids
                                 .iter()
                                 .filter_map(|&did| {
-                                    reg.get_any(did).map(|session| {
-                                        let (w, h) = session.resolution();
-                                        (did, w, h, session.agent_visible())
-                                    })
+                                    dashboard_control_grant_for_ws
+                                        .display_session(&reg, did)
+                                        .map(|session| {
+                                            let (w, h) = session.resolution();
+                                            (did, w, h, session.agent_visible())
+                                        })
                                 })
                                 .collect();
                             let auth_snapshots = {
@@ -1556,7 +1975,11 @@ pub fn spawn_web_gateway(
                             // display_ready JSON, no holder state.
                             if let Ok(guard) = display_ready_cache.lock() {
                                 for display_json in guard.values() {
-                                    let _ = direct_tx.send(display_json.clone());
+                                    if dashboard_control_grant_for_ws
+                                        .allows_dashboard_event_line(display_json)
+                                    {
+                                        let _ = direct_tx.send(display_json.clone());
+                                    }
                                 }
                             }
                             Vec::new()
@@ -1577,17 +2000,36 @@ pub fn spawn_web_gateway(
                                 })
                             });
                     let mut replayed_external_session_ids: HashSet<String> = HashSet::new();
-                    if let Some(ref log_dir) = replay_log_dir {
-                        if let Some((replay, external_session_id)) =
+                    if let Some(log_dir) = replay_log_dir.clone() {
+                        // Cache-fast after the first connect, but still file IO on a
+                        // miss — keep it off the reactor (single-flight in the cache
+                        // coalesces concurrent connects).
+                        let replay_result = tokio::task::spawn_blocking(move || {
                             session_log_replay_payload_from_dir_with_limit(
-                                log_dir,
+                                &log_dir,
                                 Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
                             )
-                        {
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                        if let Some((replay, external_session_id)) = replay_result {
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
                             }
-                            let _ = direct_tx.send(replay);
+                            if dashboard_control_grant_for_ws.has_owner_dashboard_authority() {
+                                let _ = direct_tx.send(replay);
+                            } else if let Ok(mut replay) =
+                                serde_json::from_str::<serde_json::Value>(&replay)
+                            {
+                                dashboard_control_grant_for_ws
+                                    .filter_dashboard_replay_payload(&mut replay);
+                                let _ = direct_tx.send(replay.to_string());
+                            } else {
+                                eprintln!(
+                                    "[web] refusing malformed session replay for scoped dashboard"
+                                );
+                            }
                         }
                     }
 
@@ -1605,19 +2047,20 @@ pub fn spawn_web_gateway(
                             })
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
-                    let home_dir = crate::platform::home_dir();
                     for (session_id, source) in active_external_sessions {
-                        let wrapper_replay_is_current = replayed_external_session_ids
-                            .contains(&session_id)
-                            && replay_log_dir.as_ref().is_some_and(|log_dir| {
-                                !external_session_newer_than_wrapper(
-                                    &home_dir,
-                                    log_dir,
-                                    &source,
-                                    &session_id,
-                                )
-                            });
-                        if wrapper_replay_is_current {
+                        // Wrapper-covered sessions replay from the wrapper
+                        // log ONLY. The old mtime tiebreak re-sent the whole
+                        // external transcript whenever the backend's file
+                        // was momentarily newer — which is the steady state
+                        // (Claude Code flushes after the drain logs), so
+                        // every connect triple-rendered supervised sessions
+                        // (wrapper replay + external replay + hydration).
+                        // Pre-attach history for resumed sessions still
+                        // arrives via the window-hydration fetch, which
+                        // merges instead of re-replaying. This matches the
+                        // dashboard-control bootstrap lane, which never had
+                        // the mtime override.
+                        if replayed_external_session_ids.contains(&session_id) {
                             continue;
                         }
                         if let Some(replay) =
@@ -1644,6 +2087,10 @@ pub fn spawn_web_gateway(
                         let _ = direct_tx.send(auth_msg.to_string());
                     }
 
+                    // Bootstrap fully queued — open the outbound task's
+                    // broadcast lane once these frames have drained.
+                    let _ = bootstrap_flushed_tx.send(());
+
                     // Inbound: WebSocket → EventBus
                     // Handles message types:
                     //   {"t":"presence_connect",...}     → AppEvent::PresenceConnected
@@ -1653,8 +2100,7 @@ pub fn spawn_web_gateway(
                     //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
-                    // Assign a unique peer ID for WebRTC signaling
-                    let peer_id = NEXT_PEER_ID.fetch_add(1, Ordering::Relaxed);
+                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
 
                     let inbound_ctx = WsInboundCtx {
                         bus: bus.clone(),
@@ -1669,6 +2115,7 @@ pub fn spawn_web_gateway(
                         authority_change_tx: authority_change_tx.clone(),
                         federated_authority_subscribers: federated_authority_subscribers.clone(),
                         connection_id: connection_id.clone(),
+                        dashboard_tabs: dashboard_tabs.clone(),
                         frame_registry: frame_registry.clone(),
                         recording_registry: recording_registry.clone(),
                         session_log: session_log.clone(),
@@ -1683,19 +2130,13 @@ pub fn spawn_web_gateway(
                         ice_config: ice_config.clone(),
                         tcp_advertised_port,
                         tcp_peer_registry: Arc::clone(&tcp_peer_registry),
+                        session_cancel: ws_session_cancel.clone(),
                     };
                     let inbound = tokio::spawn(ws_inbound_task(inbound_ctx, ws_rx, peer_id));
 
                     // Attention-nudge presence: a live `/ws` client is the
                     // "somebody is watching" signal that suppresses pushes.
                     crate::attention_nudge::dashboard_connected();
-
-                    // Phase 5a.1 outbound personalization plumbing: the authority
-                    // change channel carries the holder's server-internal
-                    // connection_id; ws_outbound_task converts each incoming change
-                    // into a personalized `display_input_authority_state` wire
-                    // message.
-                    let authority_change_rx = authority_change_tx.subscribe();
 
                     // Outbound: broadcast + direct responses → WebSocket
                     let outbound = tokio::spawn(ws_outbound_task(
@@ -1706,68 +2147,486 @@ pub fn spawn_web_gateway(
                         connection_id.clone(),
                         display_input_authority.clone(),
                         session_registry.clone(),
+                        bootstrap_caches.clone(),
+                        bootstrap_flushed_rx,
+                        dashboard_control_grant_for_ws.clone(),
+                        ws_session_cancel,
                     ));
 
                     let _ = tokio::join!(inbound, outbound);
                     crate::attention_nudge::dashboard_disconnected();
-                } else {
-                    let http_ctx = HttpRequestCtx {
-                        bus: bus.clone(),
-                        config_json: config_json.clone(),
-                        session_provider: session_provider.clone(),
-                        session_model: session_model.clone(),
-                        agent_card_json: agent_card_json.clone(),
-                        agent_card_value_for_targets: agent_card_value_for_targets.clone(),
-                        app_html: app_html.clone(),
-                        app_html_override: app_html_override.clone(),
-                        app_html_cache: app_html_cache.clone(),
-                        worktree_inventory_cache: worktree_inventory_cache.clone(),
-                        mcp_server: mcp_server.clone(),
-                        peer_registry: peer_registry.clone(),
-                        project_root: project_root.clone(),
-                        inbound_bearer_token: inbound_bearer_token.clone(),
-                        tls_client_cert_required,
-                        peer_access_request_config: peer_access_request_config.clone(),
-                        active_presence: active_presence.clone(),
-                        voice_debug: voice_debug.clone(),
-                        dashboard_control: Arc::clone(&dashboard_control),
-                        daemon_session_id: daemon_session_id.clone(),
-                        query_ctx: query_ctx.clone(),
-                        frame_registry: frame_registry.clone(),
-                        session_log: session_log.clone(),
-                        recording_registry: recording_registry.clone(),
-                        session_registry: session_registry.clone(),
-                        snapshot_dir: snapshot_dir.clone(),
-                        project_root_for_changes: project_root_for_changes.clone(),
-                        runtime_settings: runtime_settings.clone(),
-                        file_watcher: file_watcher.clone(),
-                    };
-                    serve_http_request(
-                        http_ctx,
-                        stream,
-                        n,
-                        &header_text,
-                        peer_addr,
-                        source_hint,
-                        is_tls,
-                        tls_client_cert_present,
-                        tls_client_cert_fingerprint,
-                        peer_connection_identity,
-                    )
-                    .await;
                 }
             });
         }
     })
 }
 
+// ---------------------------------------------------------------------------
+// Bootstrap-cache maintenance (typed bus)
+// ---------------------------------------------------------------------------
+
+/// Serialize an AppEvent to the exact wire line browsers receive — the same
+/// `app_event_to_outbound` + serde path the outbound broadcaster uses, so
+/// cached lines are byte-identical to the broadcast copies they stand in for.
+fn bootstrap_wire_line(event: &crate::event::AppEvent) -> Option<String> {
+    crate::event::app_event_to_outbound(event)
+        .and_then(|outbound| serde_json::to_string(&outbound).ok())
+}
+
+/// State fed by [`spawn_bootstrap_cache_maintainer`]: the shared bootstrap
+/// caches every new `/ws` connection (and the tunnel's
+/// `api_dashboard_bootstrap`) replays, the per-display `display_ready`
+/// fallback cache, plus authority state used only for fail-closed recovery
+/// when the typed event stream itself has a gap.
+pub(crate) struct BootstrapCacheMaintainer {
+    pub(crate) caches: crate::dashboard_control::DashboardBootstrapCaches,
+    pub(crate) display_ready_cache: Arc<Mutex<HashMap<u32, String>>>,
+    pub(crate) display_input_authority: Arc<DisplayInputAuthority>,
+    pub(crate) authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+}
+
+impl BootstrapCacheMaintainer {
+    fn set_latest(cache: &Arc<Mutex<Option<String>>>, event: &crate::event::AppEvent) {
+        if let Some(line) = bootstrap_wire_line(event) {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some(line);
+            }
+        }
+    }
+
+    /// Latest change-detected per-session state (`session_started` /
+    /// `session_vitals` / `session_goal` / pending `approval_required` /
+    /// `user_question`), replayed to late joiners. Bounded at 256 sessions
+    /// against a runaway session-id source: `session_ended` is the normal
+    /// prune; overflow evicts the lexicographically first key, which is
+    /// arbitrary but keeps it finite.
+    fn cache_session_state_line(
+        &self,
+        kind: &'static str,
+        session_id: &str,
+        event: &crate::event::AppEvent,
+    ) {
+        let Some(line) = bootstrap_wire_line(event) else {
+            return;
+        };
+        if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+            guard
+                .entry(session_id.to_string())
+                .or_default()
+                .insert(kind, line);
+            if guard.len() > 256 {
+                if let Some(first) = guard.keys().next().cloned() {
+                    guard.remove(&first);
+                }
+            }
+        }
+    }
+
+    /// Fold one typed event into the bootstrap caches. Only the variants a
+    /// bootstrap replays are serialized; the high-volume stream events
+    /// (deltas, context snapshots) fall through untouched.
+    pub(crate) fn apply(&self, event: &crate::event::AppEvent) {
+        use crate::event::AppEvent as E;
+        match event {
+            E::DisplayReady { display_id, .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.display_ready_cache.lock() {
+                        guard.insert(*display_id, line);
+                    }
+                }
+            }
+            // Evict display_ready on revoke / capture loss; a revoke also
+            // clears the cached grant so a refreshed browser after a revoke
+            // doesn't re-enable the badge.
+            E::UserDisplayRevoked { display_id, .. } => {
+                if let Ok(mut guard) = self.display_ready_cache.lock() {
+                    guard.remove(display_id);
+                }
+                if let Ok(mut guard) = self.caches.last_user_display_json.lock() {
+                    *guard = None;
+                }
+            }
+            E::DisplayCaptureLost { display_id, .. } => {
+                if let Ok(mut guard) = self.display_ready_cache.lock() {
+                    guard.remove(display_id);
+                }
+            }
+            E::UserDisplayGranted { .. } => {
+                Self::set_latest(&self.caches.last_user_display_json, event)
+            }
+            E::UsageSnapshot { .. } => Self::set_latest(&self.caches.last_usage_json, event),
+            E::LiveUsageUpdate { .. } => Self::set_latest(&self.caches.last_live_usage_json, event),
+            E::StatusUpdate { .. } => Self::set_latest(&self.caches.last_status_json, event),
+            E::AutonomyChanged { .. } => Self::set_latest(&self.caches.last_autonomy_json, event),
+            E::ExternalAgentChanged { .. } => {
+                Self::set_latest(&self.caches.last_external_agent_json, event)
+            }
+            E::SessionAttached { .. } | E::SessionIdentity { .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+                        update_external_attached_sessions_from_wire(&mut guard, &line);
+                    }
+                }
+            }
+            // A live session's birth announcement: replayed to late joiners
+            // so their Activity grid rebuilds windows for work that predates
+            // the connection (session_started routinely falls off the
+            // tail-limited log replay).
+            E::SessionStarted { session_id, .. } => {
+                self.cache_session_state_line("session_started", session_id, event)
+            }
+            E::SessionVitals { session_id, .. } => {
+                self.cache_session_state_line("session_vitals", session_id, event)
+            }
+            E::SessionGoal { session_id, .. } => {
+                self.cache_session_state_line("session_goal", session_id, event)
+            }
+            // Pending approvals/questions: the daemon-side registry survives
+            // a page reload but the panel state does not — replay the ask so
+            // a reconnecting operator can still answer. Cleared on
+            // ApprovalResolved below. Session-less asks were never cached by
+            // the wire sniffer (no `session_id` key on the line) — same here.
+            E::ApprovalRequired {
+                session_id: Some(session_id),
+                ..
+            } => self.cache_session_state_line("approval_required", session_id, event),
+            E::UserQuestionRequired {
+                session_id: Some(session_id),
+                ..
+            } => self.cache_session_state_line("user_question", session_id, event),
+            E::ApprovalResolved {
+                session_id: Some(session_id),
+                id,
+                ..
+            } => {
+                if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                    if let Some(kinds) = guard.get_mut(session_id) {
+                        for kind in ["approval_required", "user_question"] {
+                            let matches = kinds
+                                .get(kind)
+                                .and_then(|cached| {
+                                    serde_json::from_str::<serde_json::Value>(cached).ok()
+                                })
+                                .is_some_and(|cached| cached["id"].as_u64() == Some(*id));
+                            if matches {
+                                kinds.remove(kind);
+                            }
+                        }
+                    }
+                }
+            }
+            E::SessionEnded { session_id, .. } => {
+                if let Some(line) = bootstrap_wire_line(event) {
+                    if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+                        update_external_attached_sessions_from_wire(&mut guard, &line);
+                    }
+                }
+                if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+                    guard.remove(session_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The maintainer lagged the typed bus: any number of grants, revokes,
+    /// approvals, or session ends were missed, so every cached line may now
+    /// be a ghost. Clear the affected sections — the next bootstrap omits
+    /// stale lines instead of replaying them, and each cache refills on its
+    /// next live event:
+    /// - `display_ready_cache` is only the bootstrap's NO-registry fallback;
+    ///   whenever a session registry exists the bootstrap already reads that
+    ///   ground truth directly, so clearing here never blanks a live path.
+    /// - the "latest line" caches (usage/status/autonomy/agent/grant) have
+    ///   no in-scope authority to rebuild from; empty means the dashboard
+    ///   falls back to its defaults instead of trusting a stale value.
+    /// - pending approvals/questions clear rather than replay as ghosts;
+    ///   the daemon-side approval registry still holds the real pending set
+    ///   and live `approval_required` re-emissions repopulate the panel.
+    pub(crate) fn clear_on_gap(&self) {
+        for (display_id, revision) in self.display_input_authority.clear_all() {
+            let _ = self.authority_change_tx.send(DisplayInputAuthorityChange {
+                display_id,
+                holder: None,
+                revision,
+            });
+        }
+        if let Ok(mut guard) = self.display_ready_cache.lock() {
+            guard.clear();
+        }
+        for cache in [
+            &self.caches.last_usage_json,
+            &self.caches.last_live_usage_json,
+            &self.caches.last_status_json,
+            &self.caches.last_autonomy_json,
+            &self.caches.last_external_agent_json,
+            &self.caches.last_user_display_json,
+        ] {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = None;
+            }
+        }
+        if let Ok(mut guard) = self.caches.attached_external_sessions.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.caches.session_state_lines.lock() {
+            guard.clear();
+        }
+    }
+}
+
+/// Drive a [`BootstrapCacheMaintainer`] from the typed event bus.
+fn spawn_bootstrap_cache_maintainer(
+    bus: &EventBus,
+    maintainer: BootstrapCacheMaintainer,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => maintainer.apply(&event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    eprintln!(
+                        "[web_gateway] bootstrap-cache maintainer lagged the event bus \
+                         ({skipped} events skipped); clearing caches so bootstraps omit \
+                         stale state instead of replaying ghosts"
+                    );
+                    maintainer.clear_on_gap();
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod bootstrap_cache_tests {
+    use super::*;
+    use crate::event::AppEvent;
+
+    fn maintainer() -> (
+        BootstrapCacheMaintainer,
+        broadcast::Receiver<DisplayInputAuthorityChange>,
+    ) {
+        let (authority_change_tx, authority_rx) = broadcast::channel(8);
+        (
+            BootstrapCacheMaintainer {
+                caches: crate::dashboard_control::DashboardBootstrapCaches::default(),
+                display_ready_cache: Arc::new(Mutex::new(HashMap::new())),
+                display_input_authority: Arc::new(DisplayInputAuthority::default()),
+                authority_change_tx,
+            },
+            authority_rx,
+        )
+    }
+
+    fn status_event(session_id: &str, phase: &str) -> AppEvent {
+        AppEvent::StatusUpdate {
+            turn: 1,
+            phase: phase.to_string(),
+            autonomy: "medium".to_string(),
+            session_id: session_id.to_string(),
+            task: "task".to_string(),
+        }
+    }
+
+    #[test]
+    fn typed_events_fill_the_caches_with_wire_lines() {
+        let (m, _authority_rx) = maintainer();
+        let display_cache = m.display_ready_cache.clone();
+
+        m.apply(&status_event("s-1", "running"));
+        let status_line = m
+            .caches
+            .last_status_json
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("status cached");
+        let parsed: serde_json::Value = serde_json::from_str(&status_line).unwrap();
+        assert_eq!(parsed["event"], "status", "cached line is the wire shape");
+        assert_eq!(parsed["session_id"], "s-1");
+
+        m.apply(&AppEvent::AutonomyChanged {
+            autonomy: "High".to_string(),
+        });
+        assert!(m
+            .caches
+            .last_autonomy_json
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap()
+            .contains("\"autonomy_changed\""));
+
+        // display_ready caches per display. The synchronous session-registry
+        // lifecycle observer owns authority invalidation and UI notification.
+        m.apply(&AppEvent::DisplayReady {
+            display_id: 3,
+            width: 1280,
+            height: 720,
+            agent_visible: true,
+        });
+        assert!(display_cache.lock().unwrap().contains_key(&3));
+
+        // Grant cached; revoke clears it AND evicts the display entry.
+        m.apply(&AppEvent::UserDisplayGranted {
+            display_id: 3,
+            agent_visible: true,
+        });
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_some());
+        m.apply(&AppEvent::UserDisplayRevoked {
+            display_id: 3,
+            note: None,
+        });
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_none());
+        assert!(!display_cache.lock().unwrap().contains_key(&3));
+    }
+
+    #[test]
+    fn pending_ask_lines_track_their_resolution_by_id() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::ApprovalRequired {
+            session_id: Some("s-1".to_string()),
+            id: 41,
+            command_preview: "rm -rf scratch".to_string(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        assert!(
+            m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+
+        // A different id resolving must NOT clear the pending ask.
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: Some("s-1".to_string()),
+            id: 40,
+            action: "approved".to_string(),
+        });
+        assert!(
+            m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+
+        // The matching id clears it — no ghost approval on the next
+        // bootstrap.
+        m.apply(&AppEvent::ApprovalResolved {
+            session_id: Some("s-1".to_string()),
+            id: 41,
+            action: "approved".to_string(),
+        });
+        assert!(
+            !m.caches.session_state_lines.lock().unwrap()["s-1"].contains_key("approval_required")
+        );
+    }
+
+    #[test]
+    fn session_end_prunes_session_state() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-2".to_string(),
+            task: Some("t".to_string()),
+        });
+        assert!(m
+            .caches
+            .session_state_lines
+            .lock()
+            .unwrap()
+            .contains_key("s-2"));
+        m.apply(&AppEvent::SessionEnded {
+            session_id: "s-2".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(!m
+            .caches
+            .session_state_lines
+            .lock()
+            .unwrap()
+            .contains_key("s-2"));
+    }
+
+    /// Lag policy: clear every affected section so a bootstrap after the
+    /// gap omits possibly-stale lines instead of replaying ghosts.
+    #[test]
+    fn clear_on_gap_empties_every_cache_section() {
+        let (m, mut authority_rx) = maintainer();
+        let display_cache = m.display_ready_cache.clone();
+        let revision = m.display_input_authority.revision(1);
+        m.display_input_authority.write().unwrap().insert(
+            1,
+            DisplayInputHolder::LocalWs {
+                connection_id: "stale-holder".to_string(),
+                direct_tx: mpsc::unbounded_channel().0,
+            },
+        );
+        m.apply(&status_event("s-1", "running"));
+        m.apply(&AppEvent::DisplayReady {
+            display_id: 1,
+            width: 640,
+            height: 480,
+            agent_visible: true,
+        });
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-1".to_string(),
+            task: None,
+        });
+        m.apply(&AppEvent::UserDisplayGranted {
+            display_id: 1,
+            agent_visible: true,
+        });
+
+        m.clear_on_gap();
+
+        assert!(m.caches.last_status_json.lock().unwrap().is_none());
+        assert!(m.caches.last_user_display_json.lock().unwrap().is_none());
+        assert!(m.caches.session_state_lines.lock().unwrap().is_empty());
+        assert!(m
+            .caches
+            .attached_external_sessions
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(display_cache.lock().unwrap().is_empty());
+        assert!(m.display_input_authority.read().unwrap().is_empty());
+        assert_eq!(revision.load(Ordering::SeqCst), 1);
+        let cleared = authority_rx.try_recv().expect("gap publishes unclaimed");
+        assert_eq!(cleared.display_id, 1);
+        assert!(cleared.holder.is_none());
+    }
+
+    /// End to end: intents flooding past the broadcast ring can lag the
+    /// old string maintainer; the typed one keeps serving fresh state and
+    /// resync lines mirror the bootstrap subset.
+    #[test]
+    fn resync_lines_replay_cached_state_with_session_started_stamped() {
+        let (m, _rx) = maintainer();
+        m.apply(&AppEvent::SessionStarted {
+            session_id: "s-3".to_string(),
+            task: Some("hello".to_string()),
+        });
+        m.apply(&status_event("s-3", "running"));
+        let lines = crate::web_gateway::ws_session::bootstrap_cache_resync_lines(&m.caches);
+        let started = lines
+            .iter()
+            .find(|line| line.contains("\"session_started\""))
+            .expect("session_started replayed");
+        let parsed: serde_json::Value = serde_json::from_str(started).unwrap();
+        assert_eq!(
+            parsed["replayed"], true,
+            "resync must stamp session_started like the bootstrap replay"
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("\"event\":\"status\"")));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::OutboundEvent;
-    use tokio::io::AsyncWriteExt;
     use crate::test_support::TEST_ENV_LOCK;
-    use crate::web_gateway::tests::{EnvVarGuard, next_ws_json_matching};
+    use crate::types::OutboundEvent;
+    use crate::web_gateway::tests::{next_ws_json_matching, EnvVarGuard};
+    use tokio::io::AsyncWriteExt;
 
     async fn next_ws_json_type<S>(ws_rx: &mut S, ty: &str) -> serde_json::Value
     where
@@ -1953,7 +2812,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -2013,7 +2872,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -2067,7 +2926,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -2146,7 +3005,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -2862,7 +3721,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .write_all(b"POST /session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
 
@@ -2920,7 +3779,9 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .write_all(
+                b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
 
@@ -3417,6 +4278,243 @@ mod tests {
             "should not emit duplicate PresenceConnected for already-active browser"
         );
 
+        handle.abort();
+    }
+
+    // ── HTTP/1.1 keep-alive (the per-connection request loop) ──
+
+    /// Spawn a bare test gateway (no session state, no TLS) and return
+    /// its port + task handle — the common preamble of the keep-alive
+    /// tests below.
+    async fn spawn_keep_alive_test_gateway() -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            None,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    /// Read exactly ONE HTTP response off a kept-alive connection: the
+    /// head through `\r\n\r\n`, then exactly `Content-Length` body
+    /// bytes. Asserts the server sent nothing beyond the response — on
+    /// a parked connection stray bytes would be protocol corruption.
+    async fn read_one_http_response(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("response head timed out")
+                    .expect("response head read failed");
+            assert!(n > 0, "connection closed mid-head");
+            bytes.extend_from_slice(&chunk[..n]);
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+        let content_length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .map(|value| value.trim().parse().expect("Content-Length parses"))
+            .unwrap_or(0);
+        while bytes.len() < head_end + content_length {
+            let n =
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), stream.read(&mut chunk))
+                    .await
+                    .expect("response body timed out")
+                    .expect("response body read failed");
+            assert!(n > 0, "connection closed mid-body");
+            bytes.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(
+            bytes.len(),
+            head_end + content_length,
+            "server sent bytes beyond the framed response"
+        );
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_http_keep_alive_reuses_connection() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        // Request 1: HTTP/1.1 defaults to keep-alive; the framed JSON
+        // response advertises it and the connection stays open.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp1 = read_one_http_response(&mut stream).await;
+        assert!(resp1.starts_with("HTTP/1.1 200 OK\r\n"), "{resp1}");
+        assert!(resp1.contains("Connection: keep-alive\r\n"), "{resp1}");
+        assert!(
+            resp1.contains(&format!("Keep-Alive: timeout={KEEP_ALIVE_IDLE_SECS}\r\n")),
+            "{resp1}"
+        );
+
+        // Request 2 rides the SAME connection through the route-table
+        // funnel (write_api_response): the rewritten header tail must
+        // advertise keep-alive there too.
+        stream
+            .write_all(b"GET /api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp2 = read_one_http_response(&mut stream).await;
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "{resp2}");
+        assert!(resp2.contains("Connection: keep-alive\r\n"), "{resp2}");
+        assert!(!resp2.contains("Connection: close"), "{resp2}");
+
+        // Request 3: a static-asset chain arm, same connection still.
+        stream
+            .write_all(b"GET /audio-processor.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp3 = read_one_http_response(&mut stream).await;
+        assert!(resp3.starts_with("HTTP/1.1 200 OK\r\n"), "{resp3}");
+        assert!(resp3.contains("Connection: keep-alive\r\n"), "{resp3}");
+
+        // Request 4 says close: the server honors it and the connection
+        // ends cleanly right after the response.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let resp4 = read_one_http_response(&mut stream).await;
+        assert!(resp4.starts_with("HTTP/1.1 200 OK\r\n"), "{resp4}");
+        assert!(resp4.contains("Connection: close\r\n"), "{resp4}");
+        assert!(!resp4.contains("Connection: keep-alive"), "{resp4}");
+        let mut rest = Vec::new();
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest),
+        )
+        .await
+        .expect("EOF after Connection: close")
+        .expect("clean EOF read");
+        assert_eq!(n, 0, "no bytes may follow a Connection: close response");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http10_request_closes_by_default() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /config HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+        )
+        .await
+        .expect("HTTP/1.0 response must end in EOF promptly")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("Connection: close\r\n"), "{response}");
+        assert!(!response.contains("Connection: keep-alive"), "{response}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ws_upgrade_on_kept_alive_connection() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        // Plain request first; the connection parks for reuse.
+        stream
+            .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let resp = read_one_http_response(&mut stream).await;
+        assert!(resp.contains("Connection: keep-alive\r\n"), "{resp}");
+
+        // A WebSocket upgrade arrives as the SECOND request on the same
+        // connection: the loop replays the captured head to the upgrade
+        // handshake and hands the connection off — it must never keep
+        // looping past an upgrade.
+        let (ws, upgrade_response) =
+            tokio_tungstenite::client_async(format!("ws://127.0.0.1:{port}/ws"), stream)
+                .await
+                .expect("WS upgrade on a kept-alive connection");
+        assert_eq!(
+            upgrade_response.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
+        );
+        drop(ws);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_keep_alive_request_budget_closes_at_cap() {
+        use tokio::io::AsyncWriteExt;
+        let (port, handle) = spawn_keep_alive_test_gateway().await;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        for i in 1..=KEEP_ALIVE_MAX_REQUESTS {
+            stream
+                .write_all(b"GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .await
+                .unwrap();
+            let resp = read_one_http_response(&mut stream).await;
+            if i < KEEP_ALIVE_MAX_REQUESTS {
+                assert!(
+                    resp.contains("Connection: keep-alive\r\n"),
+                    "request {i}: {resp}"
+                );
+            } else {
+                // The budget-exhausting request answers close…
+                assert!(
+                    resp.contains("Connection: close\r\n"),
+                    "request {i}: {resp}"
+                );
+            }
+        }
+        // …and the connection really ends.
+        let mut rest = Vec::new();
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest),
+        )
+        .await
+        .expect("EOF after the request budget is spent")
+        .expect("clean EOF read");
+        assert_eq!(n, 0);
         handle.abort();
     }
 }

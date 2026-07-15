@@ -7,57 +7,83 @@ reference.
 ## Fresh box in one command
 
 Standing up a **new machine** end to end (clone, dependencies, build, launch,
-claimable from your browser) is one served command — see
+and a Connect discovery link) is one served command — see
 [Credential Custody](./credential-custody.md#the-bootstrap-this-unlocks) for
 the trust story behind it:
 
 ```bash
 # macOS / Linux
-curl -fsSL https://intendant.dev/install.sh | sh -s -- --owner <your-key>
+curl -fsSL https://intendant.dev/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-& ([scriptblock]::Create((irm https://intendant.dev/install.ps1))) -Owner <your-key>
+& ([scriptblock]::Create((irm https://intendant.dev/install.ps1)))
 ```
 
 Add `--service` / `-Service` on an unattended box: `intendant service install`
 registers the daemon with the platform's native supervisor (systemd where
 present, launchd on macOS, Task Scheduler on Windows, cron `@reboot` plus a
 built-in restart supervisor on systemd-less Linux — no init system is a
-dependency) and prints where the claim phrase lands. `intendant service
+dependency) and prints where the one-time claim code lands. `intendant service
 uninstall|status` manage it afterwards.
 
-What happens next is the whole story in three steps:
+What happens next is the whole story in four steps:
 
-1. **Claim.** The daemon prints a twelve-word claim phrase in its log (and
-   re-prints a fresh claim link every minute while unclaimed). Paste it at
+1. **Link.** The daemon prints a single-use twelve-word claim code in its log.
+   Enter it at
    your rendezvous — [intendant.dev/connect](https://intendant.dev/connect)
-   for the hosted service (invite-only during the pre-alpha), or your
-   [self-hosted rendezvous](./self-hosted-rendezvous.md) — and the box
-   appears under *Your computers*.
-2. **Fuel.** Open it: the dashboard greets you with *"This daemon has no fuel
-   yet"* and a **Fuel from your vault** button. Grant a time-boxed credential
-   lease (or relay provider calls through your browser) — the machine's disk
-   never holds a key. [Credential Custody](./credential-custody.md) is the
+   for the hosted service (invite-only during the alpha), or your
+   [self-hosted rendezvous](./self-hosted-rendezvous.md) — and the route
+   appears under *Your computers*. Linking is discovery metadata only: it
+   creates no IAM principal or grant and grants no daemon access.
+2. **Establish a trusted owner.** On the machine's console or SSH session, run
+   `intendant access setup`; alternatively use a direct mTLS connection. The
+   packaged macOS app contains a local mTLS bridge, but no Developer
+   ID-signed/notarized release has been published for this alpha, so its current
+   `-unsigned-dev` artifact is not an anchor. The default build cannot mint or exercise root
+   through hosted-origin code. The former `--owner <browser-key>` shortcut is
+   retired in this alpha; a bare fingerprint is not remote authentication.
+3. **Authorize on that trusted surface.** Install/use the daemon's browser mTLS
+   client certificate or stay on loopback.
+   Browser identity-key records are not an active login mechanism in this
+   alpha. The hosted Connect tab remains discovery-only; there is no opt-in
+   that turns it into a control client.
+4. **Fuel and work.** Open the trusted dashboard: it greets you with *"This daemon
+   has no fuel yet"* and a **Fuel from your vault** button. Grant a time-boxed
+   API-key lease (or relay provider calls through your browser). API-key leases
+   are memory-only, but this is not a blanket disk guarantee: `.env` is still
+   supported and a full-credential OAuth lease temporarily materializes a
+   private auth home under `~/.intendant/leased-auth` until cleanup.
+   [Credential Custody](./credential-custody.md) is the
    full story.
-3. **Work.** Send the first task from the composer, watch it in Activity, and
-   dial autonomy and approvals to taste.
+   Then send the first task from the composer, watch it in Activity, and dial
+   autonomy and approvals to taste.
+
+> **Upgrading an earlier alpha installed with `--owner`:** remove the retired
+> flag from the service command, upgrade and restart the daemon, close any old
+> Connect dashboard tabs, then run `intendant access setup` locally and install
+> the generated mTLS client credential. CLI parsing now rejects `--owner` with
+> this migration direction. IAM schema v2 revokes both `connect-bootstrap`
+> grants and legacy browser-key grants whose reason records a `--owner`
+> bootstrap; it does not silently preserve browser-key root.
 
 The rest of this chapter is the from-checkout path the installer automates —
-including the classic alternative to step 2: putting an API key in `.env` on
+including the classic alternative to fueling from the vault: putting an API key in `.env` on
 a machine you fully trust.
 
 ## Prerequisites
 
 Intendant is a Rust workspace. At minimum you need:
 
-- **Rust** toolchain (stable) — `rustup` recommended
-- **wasm-pack** — `cargo install wasm-pack` (the dashboard's browser code is a
-  WASM crate; the build auto-rebuilds it, see [WASM](#wasm-builds-automatically))
+- **Rust 1.96.1** — pinned by `rust-toolchain.toml`; `rustup` selects and
+  installs it automatically
+- **wasm-pack 0.14.0** — pinned by `.wasm-pack-version`; install it with
+  `cargo install wasm-pack --version 0.14.0 --locked` (the build
+  auto-rebuilds stale browser WASM, see [WASM](#wasm-builds-automatically))
 - **ffmpeg** — display recording and software H.264 encoding
 - Provider **credentials** — an API key in `.env` for at least one of OpenAI,
-  Anthropic, or Gemini, *or* nothing on disk at all: a claimed daemon can run
+  Anthropic, or Gemini, *or* nothing on disk at all: an authorized daemon can run
   keyless on [vault leases](./credential-custody.md)
 
 Platform-specific runtime dependencies (display capture, input injection, audio
@@ -111,7 +137,7 @@ Managed browser setup accepts `--check`, `--force`,
 `--channel stable|beta|dev|canary`, `--json`, and `--print-path`; run
 `intendant setup browsers --help` for exact usage.
 
-A release build produces two binaries:
+A release build produces three binaries:
 
 - `target/release/intendant-runtime` — the sandboxed command executor. Reads
   JSON commands on stdin, runs them, writes JSON results to stdout. Never holds
@@ -119,6 +145,8 @@ A release build produces two binaries:
 - `target/release/intendant` — the controller. Manages the LLM conversation,
   calls model APIs, dispatches tool calls to the runtime subprocess, and hosts
   every frontend (web dashboard, MCP, control socket).
+- `target/release/intendant-connect` — the self-hostable account, discovery,
+  and route-metadata rendezvous. It has no daemon authority.
 
 The two-binary split is the security boundary; see [Architecture](./architecture.md).
 
@@ -128,31 +156,35 @@ The two-binary split is the security boundary; see [Architecture](./architecture
 cargo install --path .
 ```
 
-Both binaries land in `~/.cargo/bin/`. The `intendant` binary embeds the default
+All three binaries land in `~/.cargo/bin/`. The `intendant` binary embeds the default
 system prompts and the web assets (HTML, JS, compiled WASM) at compile time, so
 it runs from any directory without the source tree.
 
 ### WASM builds automatically
 
-The dashboard's browser-side state machine and voice clients live in the
-`crates/presence-web` (and shared `crates/presence-core`) WASM crate. **A normal
-`cargo build` rebuilds the WASM for you**: `build.rs` compares the timestamps of
-`crates/presence-web/src` and `crates/presence-core/src` against the compiled
-`static/wasm-web/presence_web_bg.wasm`, and when the sources are newer it runs
-`wasm-pack` into a separate target dir and re-embeds the result.
+There are two browser WASM crates: `crates/presence-web` (fed by shared
+`crates/presence-core`) produces `static/wasm-web/`, and
+`crates/station-web` produces `static/wasm-station/`. **A normal `cargo build`
+rebuilds stale WASM for you**: `build.rs` compares each crate's source
+timestamps with its compiled `.wasm`, invokes `wasm-pack` in a separate target
+directory when needed, then re-embeds the resulting artifacts.
 
-This requires `wasm-pack` to be installed. If it is missing, `cargo build`
-prints a `cargo:warning` and skips the WASM step (the previously-compiled
-artifact in `static/wasm-web/` is used as-is).
+Artifact generation is version-gated. Only the `wasm-pack` version in
+`.wasm-pack-version` — currently **0.14.0** — may rebuild the committed output.
+If `wasm-pack` is absent or a different version is installed, `cargo build`
+warns and keeps the committed artifacts rather than creating byte churn.
 
-The manual two-step is now only a **fallback** (e.g. if the auto-detect ever
-misfires):
+The canonical manual fallback rebuilds **both** crates with the same flags as
+`build.rs`:
 
 ```bash
-cd crates/presence-web && \
-  wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web
+bash scripts/build-wasm.sh
 cargo build --release -p intendant   # re-embed
 ```
+
+Regenerate and commit WASM artifacts on macOS only. The emitted bytes are not
+deterministic across host triples; the aarch64 macOS build is the canonical
+artifact host used by the drift gate.
 
 > The earlier guidance that "`cargo build` alone does NOT rebuild WASM" is no
 > longer true — `build.rs` handles it.
@@ -162,7 +194,11 @@ cargo build --release -p intendant   # re-embed
 `scripts/bundle-macos.sh` compiles a small Swift wrapper
 (`macos-app/*.swift`) with `swiftc`, bundles it with the release `intendant`
 binary, codesigns it (a persistent self-signed identity, ad-hoc fallback), and
-installs to `/Applications/Intendant.app`.
+installs to `/Applications/Intendant.app`. The same script carries the
+[release signing seam](#macos-releases-signing-and-notarization): with
+`INTENDANT_SIGN_IDENTITY` and the notary variables set, it can produce a
+Developer ID-signed, notarized bundle. Those credentials are not provisioned
+for the current release setup, and no such artifact has been published.
 
 The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 `intendant://` URL scheme. This is deliberate: `WKWebView` does not treat
@@ -206,16 +242,94 @@ back to the placeholder automatically. Two environment variables tune this:
 INSTALL_APP=0 ./scripts/bundle-macos.sh   # build the bundle without installing
 ```
 
+### macOS releases: signing and notarization
+
+The repository contains a tag-triggered release workflow, but the current
+setup has no Developer ID/notarization credentials and no signed/notarized app
+release has been published. Pushing a `v*` tag runs
+`.github/workflows/release.yml` on the self-hosted macOS runner: it
+release-builds the binaries, runs `scripts/bundle-macos.sh`, and publishes a
+GitHub Release carrying `Intendant-<version>-macos-<arch>.zip` plus a `.sha256`
+checksum file. Without the complete signing configuration, the artifact is
+explicitly suffixed `-unsigned-dev` and is not a distribution trust anchor.
+
+**Installing a release:** download the zip and checksum from
+[GitHub releases](https://github.com/intendant-dev/Intendant/releases),
+verify with `shasum -a 256 -c <zip>.sha256`, unzip, and drag `Intendant.app`
+to `/Applications`. On first launch macOS asks for the TCC permissions
+(Screen Recording, Accessibility, Microphone) exactly as with a local build.
+The app checks GitHub for a newer release at launch (silently, release builds
+only) and via **Intendant → Check for Updates…**; updating is always manual —
+the prompt only opens the release page in your browser.
+
+**What a future signed release would mean.** With all signing and notarization
+secrets provisioned, a release bundle is signed with a `Developer ID
+Application` certificate under the hardened runtime with a secure timestamp,
+notarized by Apple, and stapled — Gatekeeper opens it without warnings, and a
+tampered bundle fails validation. Signing is
+inside-out: bundled non-system dylibs (`Contents/Frameworks`, e.g. libvpx),
+then the embedded `intendant-bin` / `intendant-runtime`, then the bundle.
+All executables carry the minimal entitlements in
+`macos-app/entitlements.plist` — microphone (`device.audio-input`, live
+voice), camera (`device.camera`, presence video input), and Apple Events
+(`automation.apple-events`, the daemon's osascript paths); the rationale for
+what is present *and absent* is commented in that file. The app bundle stamps
+its version (`CFBundleShortVersionString`) from the tag; dev builds get a
+`git describe` stamp and an artifact suffixed `-unsigned-dev` so the two can
+never be confused. Versions are visible in **Intendant → About Intendant**.
+
+**Provisioning the release secrets** (repo → Settings → Secrets and
+variables → Actions). Official tag builds fail closed without them: a `v*`
+tag must be signed, notarized, and committed to the transparency log, or the
+run goes red before anything is published. A `workflow_dispatch` dry-run
+without secrets still exercises the pipeline end to end and keeps an
+unsigned dev artifact on the workflow run. Each secret group is
+all-or-nothing and a partial group fails the run.
+
+Signing identity — `MACOS_SIGN_P12_B64`, `MACOS_SIGN_P12_PASSWORD`:
+
+1. In your Apple Developer account (Certificates → `+`), create a
+   **Developer ID Application** certificate, or use Xcode → Settings →
+   Accounts → Manage Certificates to create it in your login keychain.
+2. In **Keychain Access**, expand the certificate, select the certificate
+   *and* its private key, File → Export Items… → `.p12`, and set a strong
+   password. Export **with the certificate chain included** (select the
+   Developer ID intermediate alongside if offered) — the release job
+   validates the identity and rejects chain-less exports.
+3. `base64 -i cert.p12 | pbcopy`, paste into the `MACOS_SIGN_P12_B64`
+   secret; put the export password in `MACOS_SIGN_P12_PASSWORD`.
+
+Notarization — `NOTARY_KEY_B64`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`:
+
+1. In [App Store Connect](https://appstoreconnect.apple.com) → Users and
+   Access → Integrations → **App Store Connect API** → Team Keys, generate a
+   key with the **Developer** role. Download the `.p8` (one-time download).
+2. `base64 -i AuthKey_XXXX.p8 | pbcopy` → `NOTARY_KEY_B64`; the key's
+   **Key ID** → `NOTARY_KEY_ID`; the page's **Issuer ID** → `NOTARY_ISSUER_ID`.
+
+The workflow imports the identity into a throwaway keychain (created, used,
+and deleted with the original keychain search list restored even on failure)
+and materializes the `.p8` only for the run. To sign a build by hand instead,
+`scripts/bundle-macos.sh` takes the same seam as environment variables:
+`INTENDANT_SIGN_IDENTITY` (activates hardened-runtime distribution signing),
+`INTENDANT_SIGN_KEYCHAIN`, `INTENDANT_NOTARY_KEY_FILE` /
+`INTENDANT_NOTARY_KEY_ID` / `INTENDANT_NOTARY_ISSUER` (notarize + staple),
+`INTENDANT_ARTIFACT_DIR` (versioned zip + checksum), and
+`INTENDANT_APP_VERSION` (version override; defaults to `git describe`).
+
 ## API keys (.env)
 
 Two ways to give a daemon credentials, by trust posture:
 
 - **Keys on disk (`.env`)** — this section. Right for a machine you fully
   trust: your laptop, a workstation you sit at.
-- **No keys on disk** — a claimed daemon runs unfueled and borrows time-boxed
-  leases from your browser-side vault, or relays provider calls through the
-  browser entirely; see [Credential Custody](./credential-custody.md). Right
-  for rented, shared, or disposable boxes.
+- **No keys on disk** — a daemon remains unfueled until an authorized trusted
+  loopback/direct-mTLS session lends time-boxed leases from that daemon's
+  separate daemon-store vault, or relays supported provider calls through the
+  trusted browser. A Connect account link or account-vault blob cannot fuel a
+  daemon in this build because no delivery bridge ships; see
+  [Credential Custody](./credential-custody.md). Right for rented, shared, or
+  disposable boxes.
 
 On startup the controller loads environment variables from `.env`, searching in
 this order (later files do not override variables already set):
@@ -367,10 +481,9 @@ value is missing.
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; run headless |
 | `--bind` | `<addr>` | IP address for the web dashboard listener. Use `127.0.0.1` for local/plaintext automation |
-| `--owner` | `<fingerprint>` | Pin root authority to a browser client key at startup for the install bootstrap; authority is minted locally and no secrets go on the wire |
 | `--no-tls` | — | Serve the dashboard over plain HTTP. Explicit local/debug escape; wildcard bind refuses startup when a public interface exists |
-| `--allow-public-plaintext` | — | Override the `--no-tls` public-interface guard for intentional public plaintext exposure |
-| `--tls` | — | Serve HTTPS/WSS without requiring browser client certificates; uses installed access certs when present, otherwise falls back to an auto self-signed cert |
+| `--allow-public-plaintext` | — | Override the `--no-tls` public-interface startup guard; does not grant remote callers local/root authority |
+| `--tls` | — | Serve HTTPS/WSS and provide a secure context; certless local-root is loopback-only and remote protected routes still require mTLS |
 | `--tls-cert` | `<path>` | PEM cert (chain) overriding the default cert selection; implies `--tls` (pair with `--tls-key`) |
 | `--tls-key` | `<path>` | PEM private key matching `--tls-cert`; implies `--tls` |
 | `--mtls` | — | Require browser/client certificates signed by the Intendant access CA. This is the default dashboard transport |
@@ -380,6 +493,7 @@ value is missing.
 | `--agent` | `<backend>` | Use an external coding-agent backend: `codex` or `claude-code` |
 | `--advertise-url` | `<url>` | WebSocket URL to advertise to federation peers in this daemon's Agent Card (repeatable, preference order; overrides `[server.advertise]`) |
 | `--help`, `-h` | — | Print help and exit |
+| `--version`, `-V` | — | Print version + build provenance (package version, commit short SHA with `-dirty` marker, build timestamp, target triple) and exit. Also accepted by `intendant-runtime`; the daemon reports the same line as `daemon_version` in `intendant ctl status` |
 
 > **Correction vs. older docs:** `--web` is **on by default** and no longer
 > "implies `--mcp`". The dashboard runs unless disabled by `--no-web`, `--mcp`,
@@ -437,14 +551,16 @@ is passed.
 
 For mutual-TLS with client certificates (so only enrolled devices can connect),
 the `intendant access` subcommand creates a per-user access certificate authority,
-server cert, client identity, and strict enrollment page for installing those
-certs on browsers and mobile devices:
+server cert, client identity, and local-IAM owner grant. macOS/Linux setup can
+then start a strict enrollment page for other browsers and mobile devices;
+Windows setup instead prints exact PowerShell commands for importing the same
+material into that user's local certificate stores:
 
 ```bash
-intendant access setup            # generate CA/server/client certs + start enrollment
+intendant access setup            # generate and seed CA/server/client material
 intendant access recert           # regenerate the server cert after access addresses change
 intendant access list             # show current setup state
-intendant access serve-certs      # run strict HTTPS client-cert enrollment
+intendant access serve-certs      # macOS/Linux: strict HTTPS client enrollment
 intendant access remove           # remove the per-user access cert store
 ```
 
@@ -452,8 +568,9 @@ Useful flags: `--port <N>` (native dashboard HTTPS port to advertise, default
 8765),
 `--cert-port <N>` (HTTPS enrollment server, default 9999), repeatable
 `--ip <IP>`, repeatable `--host <DNS>`, `--name <label>`, `--force`, and
-`--no-serve-certs`. Removed LAN/proxy flags are rejected; certificate setup no
-longer configures an upstream proxy.
+`--no-serve-certs`. `--cert-port` and `--no-serve-certs` are accepted but unused
+on Windows, where setup never starts a distribution server. Removed LAN/proxy
+flags are rejected; certificate setup no longer configures an upstream proxy.
 
 `--name` is the daemon display label used by the Agent Card and dashboard
 targets. If omitted, setup now uses the system hostname when available and falls
@@ -461,7 +578,17 @@ back to the primary IP only as a last resort. Existing IP-based labels continue
 to work, but the dashboard prefers a human label or hostname over a stale IP
 when both are present.
 
-Client certificate enrollment is deliberately strict. The temporary enrollment
+On Windows, `setup` finishes after generation and prints copy/paste-ready
+`Import-Certificate` / `Import-PfxCertificate` commands targeting
+`Cert:\CurrentUser\Root` and `Cert:\CurrentUser\My`. The commands read the
+generated PKCS#12 password directly into a PowerShell `SecureString`; they do
+not echo it into shell history. Close and reopen Edge or Chrome afterwards.
+`serve-certs` returns an explicit unsupported/manual-import error on Windows.
+`remove` deletes the generated access directory, but certificates manually
+imported into Windows certificate stores remain until removed with
+`certmgr.msc`.
+
+Remote client certificate enrollment is deliberately strict. The temporary enrollment
 server is HTTPS, using the same access server certificate as the dashboard. Before
 the CLI reveals the one-time enrollment secret, the operator must copy the
 server certificate SHA-256 fingerprint observed in the browser certificate UI
@@ -475,14 +602,20 @@ the local `server.crt` can the browser redeem the secret and download enrollment
 artifacts. Apple clients get a single `intendant.mobileconfig` profile; other
 clients can download `ca.crt` plus `client.p12` (or the same identity as
 `client.pfx`). This avoids the unsafe pattern where a MITM page can serve
-active content or steal a secret from an unauthenticated download page.
+active content or steal a secret from an unauthenticated download page. A fleet
+DNS/WebPKI certificate is deliberately not an enrollment shortcut: the server
+always presents the direct access certificate and always requires the
+browser-observed fingerprint. Hosted DNS or origin control must never authorize
+release of the shared owner/root client bundle.
 
 The enrollment page uses the browser's User-Agent only to prioritize the
 instructions and download buttons for that device. The authorization decision is
 always the strict terminal-paired session cookie.
 
-Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the macOS
-app wrapper for dashboard features that require a secure browser context:
+Use this HTTPS/mTLS path or native `--tls` with a trusted certificate for
+dashboard features that require a secure browser context. A locally built
+macOS app wrapper also supplies a secure context for development, but is not a
+distribution anchor:
 Station WebGPU, microphone/camera, browser screen capture, and stricter
 clipboard APIs. Plain `http://<host-ip>:8765` is available only when launched
 with `--no-tls`; it is intended for local/programmatic debugging, is guarded on
@@ -522,11 +655,15 @@ cargo test --bins         # unit tests (fast, no API keys)
 cargo test -- --list      # list all test names
 ```
 
-Unit tests are inline `#[cfg(test)]` modules in both binaries. Integration
-tests under `tests/e2e/` spawn a real binary and make real API calls (they cost
-tokens and are non-deterministic) — they are **not** part of CI. See
-[Architecture](./architecture.md) for the tiered e2e suite and
-[Session Logging](./session-logging.md) for the test-coverage summary.
+Unit tests are inline `#[cfg(test)]` modules across the binaries and library
+crates. The `#[tokio::test]` cases in `tests/e2e/main.rs` spawn the real
+binaries against the deterministic scripted mock provider (`PROVIDER=mock` +
+`INTENDANT_MOCK_SCRIPT`). They need no API key or network, use the synthetic
+1280×720 display backend rather than native capture, and run in CI on macOS,
+Linux, and Windows; run them locally with `cargo test --test e2e`. Real-LLM or
+headed-display scenarios live under `tests/skills/` and are deliberately
+outside CI. See [Session Logging](./session-logging.md) for the logging/search
+coverage exercised through that real-binary suite.
 
 ## Runtime (standalone)
 

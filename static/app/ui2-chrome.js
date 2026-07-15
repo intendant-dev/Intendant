@@ -159,7 +159,7 @@ function ui2WireMirrors() {
     conn.dataset.state = /err|fail/.test(cls) ? 'err' : /warn|reconnect|checking|relay/i.test(cls) ? 'warn' : /ok|ready/i.test(cls) ? 'ok' : '';
   });
   const conn = document.getElementById('ui2-conn');
-  if (conn) conn.addEventListener('click', () => routeTo('access', 'diagnostics'));
+  if (conn) conn.addEventListener('click', () => openConnectionDiagnostics());
 
   // Autonomy chip: level text mirrored (+ the truthful short tag); click
   // opens Settings → Autonomy & approvals (the design's behavior —
@@ -222,8 +222,13 @@ function ui2WireMirrors() {
   const switcher = document.getElementById('ui2-session-switcher');
   const rebuildSwitcher = () => {
     if (!switcher || typeof sessionWindows === 'undefined') return;
-    const target = typeof resolvePromptTargetSessionId === 'function'
-      ? (resolvePromptTargetSessionId() || '') : '';
+    // Must be the SAME selector Focus promotes with (ui2ApplyFocusSurface),
+    // or the switcher reads "all sessions" while Focus is showing exactly one
+    // session's transcript.
+    const target = typeof ui2FocusSessionId === 'function'
+      ? (ui2FocusSessionId() || '')
+      : (typeof resolvePromptTargetSessionId === 'function'
+        ? (resolvePromptTargetSessionId() || '') : '');
     const options = [['', 'all sessions']];
     for (const [sid] of sessionWindows) {
       let label = sid.slice(0, 8);
@@ -255,7 +260,7 @@ function ui2WireMirrors() {
         if (current) discardPromptTargetReference(current);
         if (typeof updatePromptTargetSessionHighlight === 'function') updatePromptTargetSessionHighlight();
       }
-      if (typeof ui2ApplyFocusFilter === 'function') ui2ApplyFocusFilter();
+      if (typeof ui2ApplyFocusSurface === 'function') ui2ApplyFocusSurface();
     });
     ui2Mirror('task-target-chip', rebuildSwitcher);
     const grid = document.getElementById('session-window-grid');
@@ -337,12 +342,331 @@ function ui2WireMirrors() {
   updateTitle();
 }
 
-// ── ⌘K command palette (P1b) ──────────────────────────────────────────
-// Destinations only for now (the design excludes Debug from the palette;
-// it stays one click away in the rail). Sessions/actions search arrives
-// with the Sessions program phase.
+// ── ⌘K command palette (P1b + phase 2) ────────────────────────────────
+// Sections, in order: destinations (under the pane's static "Go to"
+// eyebrow), Sessions (fuzzy match over the cached session corpus, only
+// while typing), and Actions (contextual verbs + the theme toggle). All
+// cross-fragment state is read by name at event time with typeof guards —
+// the palette lives in an early fragment.
 
-function ui2PaletteEntries() {
+// Light fuzzy: exact substring first, else the query's characters in
+// order (subsequence). Returns a sort score, higher = better; -1 = miss.
+function ui2FuzzyScore(query, haystack) {
+  if (!query) return 0;
+  const q = query.toLowerCase();
+  const h = String(haystack || '').toLowerCase();
+  if (!h) return -1;
+  const at = h.indexOf(q);
+  if (at >= 0) return 1000 - at;
+  let hi = 0;
+  for (let qi = 0; qi < q.length; qi++) {
+    if (q[qi] === ' ') continue;
+    hi = h.indexOf(q[qi], hi);
+    if (hi < 0) return -1;
+    hi += 1;
+  }
+  return 1;
+}
+
+function ui2PaletteSessionEntries(q) {
+  if (!q || q.length < 2 || typeof _cachedSessions === 'undefined' || !Array.isArray(_cachedSessions)) return [];
+  // Bound the per-keystroke scan: the corpus can be tens of thousands of
+  // rows; the first slice is the recent end, which is what palette
+  // jumping is for. Deep history stays reachable via Sessions search.
+  const rows = _cachedSessions.length > 4000 ? _cachedSessions.slice(0, 4000) : _cachedSessions;
+  const scored = [];
+  for (const s of rows) {
+    if (!s || typeof s !== 'object') continue;
+    const sid = String(s.session_id || '');
+    const name = String(s.name || '').trim();
+    const task = String(s.task || '').trim();
+    const label = name || task || sid.slice(0, 8) || 'session';
+    const score = Math.max(
+      ui2FuzzyScore(q, name),
+      ui2FuzzyScore(q, task),
+      ui2FuzzyScore(q, sid),
+    );
+    if (score < 0) continue;
+    scored.push({ score, entry: {
+      section: 'Sessions',
+      icon: 'sessions',
+      label,
+      hint: sid.slice(0, 8),
+      matchless: true,
+      run: () => {
+        if (typeof sessionWindows !== 'undefined' && sid && sessionWindows.has(sid)
+            && typeof focusSessionWindow === 'function') {
+          routeTo('activity');
+          focusSessionWindow(sid);
+          return;
+        }
+        routeTo('sessions');
+        if (typeof openSessionDetail === 'function') openSessionDetail(s);
+      },
+    } });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, 6).map(x => x.entry);
+}
+
+// ── Messages section: full-text hits from the rolling message index ──
+// Async side-lane of the synchronous palette: renders re-entrantly when
+// results land. Same flag, debounce, and request vocabulary as the
+// Sessions-tab quick-search lane (57-sessions-message-search.js); scoped
+// to this daemon (no host fanout) and capped to a palette-sized page.
+const ui2PaletteMsg = {
+  sig: '',        // query the current entries/answer belong to
+  scheduled: '',  // query the armed debounce timer will run
+  entries: [],
+  loading: false,
+  unavailable: false,
+  timer: null,
+  abort: null,
+  token: 0,
+};
+
+function ui2PaletteMsgReset() {
+  if (ui2PaletteMsg.timer) { clearTimeout(ui2PaletteMsg.timer); ui2PaletteMsg.timer = null; }
+  if (ui2PaletteMsg.abort) { try { ui2PaletteMsg.abort.abort(); } catch {} ui2PaletteMsg.abort = null; }
+  ui2PaletteMsg.sig = '';
+  ui2PaletteMsg.scheduled = '';
+  ui2PaletteMsg.entries = [];
+  ui2PaletteMsg.loading = false;
+  ui2PaletteMsg.token += 1;
+}
+
+function ui2PaletteMsgEnabled() {
+  return typeof messageSearchFlagEnabled === 'function' && messageSearchFlagEnabled()
+    && typeof daemonApi !== 'undefined';
+}
+
+function ui2PaletteMsgSchedule(query) {
+  if (!ui2PaletteMsgEnabled() || ui2PaletteMsg.unavailable) return;
+  if (!query || query.length < 2) { if (ui2PaletteMsg.sig || ui2PaletteMsg.loading) ui2PaletteMsgReset(); return; }
+  if (query === ui2PaletteMsg.sig || query === ui2PaletteMsg.scheduled) return; // answered or already armed
+  if (ui2PaletteMsg.timer) clearTimeout(ui2PaletteMsg.timer);
+  ui2PaletteMsg.scheduled = query;
+  ui2PaletteMsg.loading = true;
+  ui2PaletteMsg.timer = setTimeout(() => { ui2PaletteMsg.timer = null; ui2PaletteMsgRun(query); }, 225);
+}
+
+function ui2PaletteMsgRun(query, attempt = 0) {
+  if (!ui2Palette.open) { ui2PaletteMsgReset(); return; }
+  const availability = daemonApi.availability('api_sessions_message_search', null);
+  if (!availability.ok && availability.reason === 'unsupported') {
+    // Daemon predates the index: hide the section for this page load.
+    ui2PaletteMsg.unavailable = true;
+    ui2PaletteMsgReset();
+    return;
+  }
+  if (ui2PaletteMsg.abort) { try { ui2PaletteMsg.abort.abort(); } catch {} }
+  const controller = new AbortController();
+  ui2PaletteMsg.abort = controller;
+  const token = ++ui2PaletteMsg.token;
+  daemonApi.request('api_sessions_message_search', {
+    q: query,
+    source: 'all',
+    include_superseded: false,
+    subagents: true,
+    limit: 5,
+  }, { signal: controller.signal, timeoutMs: 15000 })
+    .then(resp => {
+      if (token !== ui2PaletteMsg.token || !ui2Palette.open) return;
+      if (resp.status === 429 && attempt < 1) {
+        setTimeout(() => { if (token === ui2PaletteMsg.token) ui2PaletteMsgRun(query, attempt + 1); }, 300);
+        return;
+      }
+      const body = resp.body && typeof resp.body === 'object' ? resp.body : {};
+      if (!resp.ok || body.ok === false) {
+        // Quiet failure: the palette must never nag; the Sessions tab
+        // carries the detailed error surface.
+        ui2PaletteMsg.loading = false;
+        ui2PaletteMsg.sig = query;
+        ui2PaletteMsg.entries = [];
+        ui2PaletteRerenderIfCurrent(query);
+        return;
+      }
+      ui2PaletteMsg.entries = ui2PaletteMsgShape(query, Array.isArray(body.sessions) ? body.sessions : []);
+      ui2PaletteMsg.sig = query;
+      ui2PaletteMsg.loading = false;
+      ui2PaletteMsg.abort = null;
+      ui2PaletteRerenderIfCurrent(query);
+    })
+    .catch(err => {
+      if (token !== ui2PaletteMsg.token) return;
+      if (err?.kind === 'abort' || err?.name === 'AbortError') return;
+      ui2PaletteMsg.loading = false;
+      ui2PaletteMsg.sig = query;
+      ui2PaletteMsg.entries = [];
+      ui2PaletteRerenderIfCurrent(query);
+    });
+}
+
+function ui2PaletteRerenderIfCurrent(query) {
+  const input = ui2PaletteInput();
+  if (ui2Palette.open && input && input.value.trim().toLowerCase() === query) {
+    ui2PaletteRender(input.value);
+  }
+}
+
+function ui2PaletteMsgShape(query, sessions) {
+  const cached = (typeof _cachedSessions !== 'undefined' && Array.isArray(_cachedSessions)) ? _cachedSessions : [];
+  const entries = [];
+  for (const entry of sessions.slice(0, 5)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const sessionId = String(entry.session_id || '').trim();
+    if (!sessionId) continue;
+    const source = String(entry.source || 'intendant');
+    const hits = Array.isArray(entry.hits) ? entry.hits : [];
+    const best = hits[0] && typeof hits[0] === 'object' ? hits[0] : null;
+    const row = cached.find(s => s && s.session_id === sessionId) || null;
+    const sessionLabel = (row && (String(row.name || '').trim() || String(row.task || '').trim().slice(0, 40)))
+      || `Session ${sessionId.slice(0, 8)}`;
+    const total = Number(entry.total_hits) || hits.length;
+    entries.push({
+      section: 'Messages',
+      icon: 'search',
+      label: sessionLabel,
+      labelNode: best ? ui2PaletteMsgLabelNode(sessionLabel, best) : null,
+      hint: `${total} ${total === 1 ? 'match' : 'matches'}`,
+      matchless: true,
+      run: () => {
+        const sid = sessionId;
+        if (typeof sessionWindows !== 'undefined' && sessionWindows.has(sid)
+            && typeof focusSessionWindow === 'function') {
+          routeTo('activity');
+          focusSessionWindow(sid);
+          return;
+        }
+        routeTo('sessions');
+        if (typeof openSessionDetail === 'function') {
+          openSessionDetail(row || { session_id: sid, source });
+        }
+      },
+    });
+  }
+  return entries;
+}
+
+function ui2PaletteMsgLabelNode(sessionLabel, best) {
+  const frag = document.createDocumentFragment();
+  const name = document.createElement('span');
+  name.className = 'ui2-palette-msg-session';
+  name.textContent = sessionLabel;
+  frag.appendChild(name);
+  const snippet = document.createElement('span');
+  snippet.className = 'ui2-palette-msg-snippet';
+  if (typeof messageSnippetSegments === 'function') {
+    for (const segment of messageSnippetSegments(best.snippet, best.ranges, best.snippet_offset_bytes)) {
+      if (!segment.text) continue;
+      if (segment.hit) {
+        const mark = document.createElement('mark');
+        mark.textContent = segment.text;
+        snippet.appendChild(mark);
+      } else {
+        snippet.appendChild(document.createTextNode(segment.text));
+      }
+    }
+  } else {
+    snippet.textContent = String(best.snippet || '');
+  }
+  snippet.title = String(best.snippet || '');
+  frag.appendChild(snippet);
+  return frag;
+}
+
+function ui2PaletteMessageEntries(query) {
+  if (!ui2PaletteMsgEnabled() || ui2PaletteMsg.unavailable) return [];
+  ui2PaletteMsgSchedule(query);
+  if (!query || query.length < 2) return [];
+  if (ui2PaletteMsg.sig === query) return ui2PaletteMsg.entries;
+  if (ui2PaletteMsg.loading) {
+    return [{ section: 'Messages', icon: 'search', label: 'Searching messages…', hint: '', matchless: true, inert: true }];
+  }
+  return [];
+}
+
+function ui2PaletteActionEntries(q) {
+  const entries = [];
+  // Pending approval verbs — only while one is actually on screen.
+  if (typeof pendingApprovalId !== 'undefined' && pendingApprovalId !== null
+      && typeof window.sendApproval === 'function') {
+    entries.push({
+      section: 'Actions', icon: 'check', label: 'Approve pending approval',
+      run: () => window.sendApproval('approve'),
+    });
+    entries.push({
+      section: 'Actions', icon: 'stop', label: 'Deny pending approval',
+      run: () => window.sendApproval('deny'),
+    });
+  }
+  // Stop — mirrors the v1 button's visibility (inline display, like the
+  // oversight-bar proxy).
+  const stopSrc = document.getElementById('stop-btn');
+  if (stopSrc && stopSrc.style.display !== 'none' && !stopSrc.disabled) {
+    entries.push({
+      section: 'Actions', icon: 'stop', label: 'Stop current session',
+      run: () => stopSrc.click(),
+    });
+  }
+  entries.push({
+    section: 'Actions', icon: 'plus', label: 'New session',
+    run: () => routeTo('sessions', 'new'),
+  });
+  // Deep search with the typed text — additive: prefill + focus only, the
+  // pane itself is untouched.
+  const deepQuery = (q || '').trim();
+  if (deepQuery.length >= 2) {
+    entries.push({
+      section: 'Actions', icon: 'search', label: `Deep search: “${deepQuery}”`,
+      matchless: true,
+      run: () => {
+        routeTo('sessions', 'deep');
+        const input = document.getElementById('sessions-deep-search-query');
+        if (input) {
+          input.value = deepQuery;
+          input.focus();
+          input.select?.();
+        }
+      },
+    });
+  }
+  // Layout verbs (CONTRACT: window.intendantLayouts is another agent's
+  // module — { save(), list() -> names|{name}[], apply(name) }; hidden
+  // entirely when absent or partial).
+  const layouts = window.intendantLayouts;
+  if (layouts && typeof layouts === 'object') {
+    if (typeof layouts.save === 'function') {
+      entries.push({
+        section: 'Actions', icon: 'station', label: 'Save layout…',
+        run: () => { try { layouts.save(); } catch (e) { console.warn('[ui2] layout save failed', e); } },
+      });
+    }
+    if (typeof layouts.list === 'function' && typeof layouts.apply === 'function') {
+      let names = [];
+      try { names = layouts.list() || []; } catch (_) { names = []; }
+      for (const item of names.slice(0, 8)) {
+        const name = typeof item === 'string' ? item : String(item?.name || '');
+        if (!name) continue;
+        entries.push({
+          section: 'Actions', icon: 'station', label: `Apply layout ${name}`,
+          run: () => { try { layouts.apply(name); } catch (e) { console.warn('[ui2] layout apply failed', e); } },
+        });
+      }
+    }
+  }
+  // The theme toggle keeps its palette seat.
+  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
+  entries.push({
+    section: 'Actions', icon: 'dial',
+    label: light ? 'Switch to dark theme' : 'Switch to light theme',
+    action: 'theme',
+  });
+  return entries;
+}
+
+function ui2PaletteEntries(q) {
+  const query = (q || '').trim().toLowerCase();
   const entries = [];
   for (const group of UI2_NAV_GROUPS) {
     for (const item of group.items) {
@@ -350,15 +674,14 @@ function ui2PaletteEntries() {
       entries.push(item);
     }
   }
-  // Actions (design-system import): the theme toggle rides the palette
-  // so light/dark is one ⌘K away from anywhere.
-  const light = typeof ui2Theme === 'function' && ui2Theme() === 'light';
-  entries.push({
-    action: 'theme',
-    icon: 'dial',
-    label: light ? 'Switch to dark theme' : 'Switch to light theme',
-  });
-  return entries;
+  // Label-only matching for labeled entries: users type what they SEE
+  // (id matching surprised — "sta" surfaced Usage via its internal id).
+  // `matchless` entries carry the query themselves (sessions already
+  // matched; the deep-search verb embeds it).
+  const filtered = entries.filter((item) => !query || item.label.toLowerCase().includes(query));
+  const actions = ui2PaletteActionEntries(q)
+    .filter((item) => item.matchless || !query || item.label.toLowerCase().includes(query));
+  return [...filtered, ...ui2PaletteSessionEntries(query), ...ui2PaletteMessageEntries(query), ...actions];
 }
 
 const ui2Palette = { open: false, selected: 0, entries: [] };
@@ -366,33 +689,52 @@ const ui2Palette = { open: false, selected: 0, entries: [] };
 function ui2PaletteRender(filter) {
   const list = document.getElementById('ui2-palette-list');
   if (!list) return;
-  const q = (filter || '').trim().toLowerCase();
   const activePane = document.querySelector('.tab-pane.active');
   const activeTab = activePane ? activePane.id.replace(/^tab-/, '') : '';
-  // Label-only matching: users type what they SEE. Id matching surprised —
-  // "sta" surfaced Usage via its internal tab id `stats`.
-  ui2Palette.entries = ui2PaletteEntries().filter((item) =>
-    !q || item.label.toLowerCase().includes(q));
+  ui2Palette.entries = ui2PaletteEntries(filter);
   ui2Palette.selected = Math.min(ui2Palette.selected, Math.max(0, ui2Palette.entries.length - 1));
   list.innerHTML = '';
   if (!ui2Palette.entries.length) {
     const empty = document.createElement('div');
     empty.className = 'ui2-palette-empty';
-    empty.textContent = 'No matching screens';
+    empty.textContent = 'No matches';
     list.appendChild(empty);
     return;
   }
+  let lastSection = '';
   ui2Palette.entries.forEach((item, i) => {
+    // Small section headers (Sessions / Actions); destinations stay under
+    // the pane's static "Go to" eyebrow.
+    if (item.section && item.section !== lastSection) {
+      const eyebrow = document.createElement('div');
+      eyebrow.className = 'ui2-palette-eyebrow';
+      eyebrow.textContent = item.section;
+      list.appendChild(eyebrow);
+    }
+    lastSection = item.section || lastSection;
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'ui2-palette-row' + (i === ui2Palette.selected ? ' selected' : '');
     row.setAttribute('role', 'option');
     const isCurrent = item.tab && item.tab === activeTab;
-    row.innerHTML =
-      `<span class="ui2-nav-icon">${ui2Icon(item.icon, 17)}</span>` +
-      `<span class="ui2-palette-row-label">${item.label}</span>` +
-      `<span class="ui2-palette-row-hint">${isCurrent ? 'current' : 'go'}</span>`;
-    row.addEventListener('click', () => ui2PaletteGo(item));
+    // Session labels are user/session data — DOM text, never innerHTML.
+    const icon = document.createElement('span');
+    icon.className = 'ui2-nav-icon';
+    icon.innerHTML = ui2Icon(item.icon, 17);
+    const label = document.createElement('span');
+    label.className = 'ui2-palette-row-label';
+    // Message hits carry a prebuilt node (session name + highlighted
+    // snippet); every other entry stays plain text.
+    if (item.labelNode) label.appendChild(item.labelNode.cloneNode(true));
+    else label.textContent = item.label;
+    const hint = document.createElement('span');
+    hint.className = 'ui2-palette-row-hint';
+    hint.textContent = item.run
+      ? (item.hint || 'run')
+      : (isCurrent ? 'current' : 'go');
+    row.append(icon, label, hint);
+    if (item.inert) { row.disabled = true; row.classList.add('inert'); }
+    else row.addEventListener('click', () => ui2PaletteGo(item));
     row.addEventListener('mousemove', () => {
       if (ui2Palette.selected !== i) { ui2Palette.selected = i; ui2PaletteRender(ui2PaletteInput().value); }
     });
@@ -407,6 +749,10 @@ function ui2PaletteGo(item) {
   if (item.action === 'theme') {
     ui2SetTheme(ui2Theme() === 'light' ? 'dark' : 'light');
     if (typeof ui2SettingsRenderAppearance === 'function') ui2SettingsRenderAppearance();
+    return;
+  }
+  if (typeof item.run === 'function') {
+    try { item.run(); } catch (e) { console.warn('[ui2] palette action failed', e); }
     return;
   }
   if (item.tab) routeTo(item.tab);
@@ -431,6 +777,7 @@ function ui2PaletteClose() {
   if (!backdrop || !ui2Palette.open) return;
   ui2Palette.open = false;
   backdrop.hidden = true;
+  ui2PaletteMsgReset();
 }
 
 function ui2WirePalette() {
@@ -471,9 +818,218 @@ function ui2WirePalette() {
     } else if (e.key === 'Enter') {
       e.preventDefault(); e.stopPropagation();
       const item = ui2Palette.entries[ui2Palette.selected];
-      if (item) ui2PaletteGo(item);
+      if (item && !item.inert) ui2PaletteGo(item);
     }
   }, true);
+}
+
+// ── Fuel/lease chip (display-only) ─────────────────────────────────────
+// When the daemon's status reports the built-in agent unfueled but the
+// vault shows a live lease, the oversight bar gets a small "fueled ·
+// <time-left>" chip next to the transport control — the lease IS the fuel
+// (credential custody), and without this the chrome reads as broken while
+// the agent works fine. All state is read by name at event time
+// (dashboardControlTransport.lastStatus.fueled, vaultLeaseState.leases,
+// vaultLeaseExpiryText) with typeof guards; hidden whenever any of it is
+// missing.
+function ui2FuelChipSync() {
+  const bar = document.getElementById('ui2-oversight');
+  if (!bar) return;
+  let chip = document.getElementById('ui2-fuel-chip');
+  const status = (typeof dashboardControlTransport !== 'undefined' && dashboardControlTransport)
+    ? dashboardControlTransport.lastStatus : null;
+  const leases = (typeof vaultLeaseState !== 'undefined' && vaultLeaseState
+    && Array.isArray(vaultLeaseState.leases)) ? vaultLeaseState.leases : [];
+  const live = leases.filter(l => Number(l?.expires_at_unix_ms || 0) > Date.now());
+  const show = !!status && status.fueled === false && live.length > 0
+    && typeof vaultLeaseExpiryText === 'function';
+  if (!show) {
+    if (chip) chip.hidden = true;
+    return;
+  }
+  // The longest-lived lease is the effective fuel horizon.
+  const best = live.reduce((a, b) =>
+    Number(a.expires_at_unix_ms || 0) >= Number(b.expires_at_unix_ms || 0) ? a : b);
+  if (!chip) {
+    chip = document.createElement('span');
+    chip.id = 'ui2-fuel-chip';
+    chip.className = 'ui2-fuel-chip';
+    const conn = document.getElementById('ui2-conn');
+    if (conn && conn.parentElement === bar) bar.insertBefore(chip, conn);
+    else bar.appendChild(chip);
+  }
+  chip.hidden = false;
+  chip.textContent = `fueled · ${vaultLeaseExpiryText(best)}`;
+  chip.title = 'The daemon holds no local provider key, but a vault lease is fueling the built-in agent'
+    + (best.kind ? ` (${best.kind})` : '') + '. Display only.';
+}
+
+function ui2WireComposerMech() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const root = document.documentElement.style;
+
+  // Reservation: keep --ui2-composer-h at the bar's real border-box height.
+  // The bar wraps and grows (focus expand, the attachments row, the v1
+  // 500-600px wrap band), and the old constant reservation is exactly what
+  // let it cover the Files save row and the Live control banner on phones.
+  const measure = () => {
+    const h = Math.ceil(bar.getBoundingClientRect().height);
+    if (h > 0) root.setProperty('--ui2-composer-h', h + 'px');
+  };
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(measure).observe(bar);
+  } else {
+    bar.addEventListener('focusin', () => requestAnimationFrame(measure));
+    bar.addEventListener('focusout', () => requestAnimationFrame(measure));
+    window.addEventListener('resize', measure);
+  }
+  measure();
+
+  // Soft-keyboard lift: iOS keeps position:fixed anchored to the layout
+  // viewport, so the opened keyboard covers the bar mid-composition. Track
+  // the visual viewport and lift by the overlap — but only while focus is
+  // inside the bar: lifting for other inputs (the Files editor, a settings
+  // field) would cover the very field being edited. Android resizes the
+  // layout viewport under the keyboard instead, so the overlap computes to
+  // ~0 there and this stays inert.
+  const vv = window.visualViewport;
+  if (vv) {
+    let raf = 0;
+    const apply = () => {
+      raf = 0;
+      const composing = bar.contains(document.activeElement);
+      const overlap = window.innerHeight - vv.height - vv.offsetTop;
+      const inset = composing ? Math.max(0, Math.round(overlap)) : 0;
+      root.setProperty('--ui2-kb-inset', inset + 'px');
+    };
+    const schedule = () => { if (!raf) raf = requestAnimationFrame(apply); };
+    vv.addEventListener('resize', schedule);
+    vv.addEventListener('scroll', schedule);
+    bar.addEventListener('focusin', schedule);
+    // The keyboard retracts after focus leaves; measuring in the same frame
+    // reads the pre-retraction viewport.
+    bar.addEventListener('focusout', () => setTimeout(schedule, 80));
+  }
+}
+
+const UI2_COMPOSER_PILL_DEFAULT_TABS = new Set(['displays', 'station', 'terminal', 'files']);
+
+function ui2WireComposerState() {
+  const bar = document.querySelector('.global-task-bar');
+  if (!bar) return;
+  const rootEl = document.documentElement;
+  const input = document.getElementById('activity-task-input');
+
+  const pill = document.createElement('span');
+  pill.className = 'ui2-composer-pill';
+  const dot = document.createElement('span');
+  dot.className = 'ui2-composer-pill-dot';
+  const pillLabel = document.createElement('span');
+  pillLabel.textContent = 'Ask Intendant';
+  const draftDot = document.createElement('span');
+  draftDot.className = 'ui2-composer-pill-draft';
+  draftDot.title = 'Unsent draft';
+  pill.append(dot, pillLabel, draftDot);
+  bar.appendChild(pill);
+
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'ui2-composer-collapse';
+  collapse.title = 'Collapse composer (Esc)';
+  collapse.setAttribute('aria-label', 'Collapse composer');
+  collapse.innerHTML = ui2Icon('chev', 14);
+  bar.insertBefore(collapse, document.getElementById('phase-banner'));
+
+  const activeTabId = () => {
+    const pane = document.querySelector('.tab-pane.active');
+    return pane ? pane.id.replace(/^tab-/, '') : 'activity';
+  };
+  const stateKey = (tab) => 'intendant.ui2.composerState.' + tab;
+  const stateFor = (tab) => {
+    try {
+      const o = localStorage.getItem(stateKey(tab));
+      if (o === 'pill' || o === 'expanded') return o;
+    } catch (_) { /* private mode: defaults only */ }
+    return UI2_COMPOSER_PILL_DEFAULT_TABS.has(tab) ? 'pill' : 'expanded';
+  };
+  const syncDraft = () => {
+    pill.classList.toggle('has-draft', !!(input && input.value.trim()));
+  };
+
+  let current = '';
+  const setState = (next, remember = false) => {
+    if (next !== 'pill' && next !== 'expanded') return;
+    if (remember) {
+      try { localStorage.setItem(stateKey(activeTabId()), next); } catch (_) { /* private mode */ }
+    }
+    if (current === next) return;
+    current = next;
+    rootEl.dataset.composerState = next;
+    if (next === 'pill') {
+      // Children go display:none — never leave focus on a hidden control
+      // (it would also pin the keyboard lift).
+      if (bar.contains(document.activeElement)) document.activeElement.blur();
+      bar.setAttribute('role', 'button');
+      bar.setAttribute('tabindex', '0');
+      bar.setAttribute('aria-label', 'Expand composer');
+      syncDraft();
+    } else {
+      bar.removeAttribute('role');
+      bar.removeAttribute('tabindex');
+      bar.removeAttribute('aria-label');
+    }
+    window.dispatchEvent(new CustomEvent('ui2:composer-state', { detail: { state: next } }));
+  };
+
+  const expandAndFocus = (viaTouch) => {
+    setState('expanded', true);
+    // Touch keeps the keyboard down until the user taps the input.
+    if (!viaTouch && input) input.focus();
+  };
+
+  // Programmatic seam for palette/shortcut callers: expand before focusing
+  // (a pilled dock's children are display:none and cannot receive focus).
+  window.ui2ComposerExpand = () => setState('expanded');
+
+  bar.addEventListener('click', (e) => {
+    if (current !== 'pill') return;
+    expandAndFocus(e.pointerType === 'touch');
+  });
+  collapse.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setState('pill', true);
+  });
+  bar.addEventListener('keydown', (e) => {
+    if (current === 'pill' && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      expandAndFocus(false);
+      return;
+    }
+    // Bubble phase: the peek's capture-phase Esc (close-peek) stops
+    // propagation while the peek is open, so this fires only with no peek
+    // up. Esc is get-out-of-my-way, not a preference — no remember.
+    if (e.key === 'Escape' && current === 'expanded') setState('pill');
+  });
+  if (input) input.addEventListener('input', syncDraft);
+
+  ui2Mirror('phase-banner', (banner) => {
+    pill.dataset.phase = ui2PhaseCategory(banner.className);
+  });
+
+  const applyForTab = (tab) => setState(stateFor(String(tab || '')));
+  if (typeof switchTab === 'function') {
+    // One shared module scope: rebinding the declaration retargets every
+    // caller (nav, palette, router deep links), so the per-tab state rides
+    // every navigation path.
+    const origSwitchTab = switchTab;
+    switchTab = function (tabId) {
+      const r = origSwitchTab.apply(this, arguments);
+      if (r !== false) applyForTab(tabId);
+      return r;
+    };
+  }
+  applyForTab(activeTabId());
 }
 
 ui2BuildNav();
@@ -483,7 +1039,18 @@ ui2BuildNav();
   // everything twice — the doubled capture-phase keydown made one ⌘K
   // open-then-close the palette and arrows double-step. Same idiom as the
   // ui2-activity boot.
-  const wire = () => { ui2WireMirrors(); ui2WirePalette(); };
+  const wire = () => {
+    ui2WireMirrors();
+    ui2WirePalette();
+    ui2WireComposerMech();
+    ui2WireComposerState();
+    // Fuel chip: transport-status flips repaint it via the existing
+    // #sb-dashboard-transport mirror lane; the interval keeps the lease
+    // countdown honest between flips.
+    ui2Mirror('sb-dashboard-transport', ui2FuelChipSync);
+    setInterval(ui2FuelChipSync, 30000);
+    ui2FuelChipSync();
+  };
   if (document.readyState === 'complete') wire();
   else document.addEventListener('DOMContentLoaded', wire, { once: true });
 }

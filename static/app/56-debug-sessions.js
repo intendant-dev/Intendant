@@ -459,6 +459,9 @@ function setSessionsHost(hostId) {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
   renderSessionsHostStrip();
   loadSessions({ force: true });
+  // Message lane (flagged): the tunnel twin serves the selected peer's own
+  // index, so a host switch re-keys the search. No-op with the flag off.
+  scheduleSessionMessageSearch();
 }
 
 // Whole-card action while browsing a peer: hand off to the peer's own
@@ -667,7 +670,9 @@ function loadSessions(options = {}) {
     })
     .catch(err => {
       if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
-      if (err?.name === 'AbortError') {
+      // Facade aborts are DaemonApiError kind:'abort' (name differs from
+      // the DOM AbortError the pre-facade stream threw).
+      if (err?.name === 'AbortError' || err?.kind === 'abort') {
         if (token === _sessionsLoadToken) {
           setSessionsHydrationState({ active: false, done: false, error: '', phase: 'idle' });
         }
@@ -688,28 +693,93 @@ function loadSessions(options = {}) {
     });
 }
 
+// One-shot classification stash: eventRefreshesSessionMetadata() and the
+// scheduleSessionsMetadataRefresh() that follows it are called back to back
+// (synchronously) by the fragment-36 server-message dispatcher, which only
+// passes the event NAME — the stash carries "this trigger is session-scoped"
+// across that pair. Direct schedule callers (session launch/config paths)
+// find it false and get the historical full refresh.
+let _sessionsRefreshEventTargeted = false;
+// True while the pending coalesced tick is targeted-only; any full trigger
+// inside the window upgrades the tick (full beats targeted).
+let _sessionsMetadataRefreshTargeted = false;
+
 function scheduleSessionsMetadataRefresh(delay = 700) {
+  const targeted = _sessionsRefreshEventTargeted;
+  _sessionsRefreshEventTargeted = false;
   if (!sessionsLoaded && !shouldPollSessionWindowMetadata()) return;
-  if (sessionsMetadataRefreshTimer) clearTimeout(sessionsMetadataRefreshTimer);
+  if (sessionsMetadataRefreshTimer) {
+    clearTimeout(sessionsMetadataRefreshTimer);
+    _sessionsMetadataRefreshTargeted = _sessionsMetadataRefreshTargeted && targeted;
+  } else {
+    _sessionsMetadataRefreshTargeted = targeted;
+  }
   sessionsMetadataRefreshTimer = setTimeout(() => {
     sessionsMetadataRefreshTimer = null;
-    if (sessionsLoaded) {
-      loadSessions({ force: true });
-    } else {
+    const wasTargeted = _sessionsMetadataRefreshTargeted;
+    _sessionsMetadataRefreshTargeted = false;
+    if (!sessionsLoaded) {
+      // 39's window-metadata poll is already ids-scoped when windows exist.
       refreshSessionWindowMetadata(0, { force: true });
+    } else if (wasTargeted) {
+      refreshLiveSessionRows();
+    } else {
+      loadSessions({ force: true });
     }
   }, delay);
 }
 
+// Targeted lane for session-scoped progress events: refresh only the rows
+// of live session windows via the api_sessions ids= filter (the same lane
+// 39's hydrate and metadata poll use) instead of refetching the whole
+// corpus with limit 'all' on every turn. The id population is 39's
+// canonical one (windows + backend/wrapper twins + resolved relatives) so
+// the targeted refresh sees exactly what the metadata poll sees.
+function refreshLiveSessionRows() {
+  const ids = typeof sessionWindowMetadataRequestIds === 'function'
+    ? sessionWindowMetadataRequestIds()
+    : [];
+  // Nothing live to target: fall back to the window-metadata poll (cheap,
+  // ids-scoped or bounded) rather than a silent no-op — a session-scoped
+  // event without a window still implies row drift somewhere.
+  if (!ids.length) {
+    refreshSessionWindowMetadata(0, { force: true });
+    return;
+  }
+  daemonApi.request('api_sessions', { ids })
+    .then(resp => {
+      if (!resp.ok || !Array.isArray(resp.body) || resp.body.length === 0) return;
+      if (sessionsViewingPeer()) {
+        // Browsing a peer's list: keep self rows out of the visible corpus
+        // but still feed the window-metadata cache.
+        cacheSessionWindowMetadata(resp.body);
+        return;
+      }
+      applyLoadedSessions(
+        mergeSessionRows(_cachedSessions, resp.body),
+        document.getElementById('sessions-aggregate'),
+        selfPeerId,
+      );
+    })
+    .catch(() => { /* the next event or full refresh recovers */ });
+}
+
 function eventRefreshesSessionMetadata(eventName) {
   switch (eventName) {
+    // Session-scoped progress: a targeted (ids=) row refresh is enough.
+    // model_response is deliberately absent — it fires per model response
+    // and used to trigger a full-corpus refetch each time.
     case 'turn_started':
-    case 'model_response':
     case 'done_signal':
     case 'task_complete':
     case 'round_complete':
     case 'interrupted':
+      _sessionsRefreshEventTargeted = true;
+      return true;
+    // List-shape changes: the full refresh.
+    case 'session_started':
     case 'session_ended':
+      _sessionsRefreshEventTargeted = false;
       return true;
     default:
       return false;
@@ -1034,6 +1104,10 @@ function _refilterSessions() {
 // Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
   sessionsRenderWindow = SESSION_CARD_RENDER_PAGE;
+  // Message lane (flagged; 57-sessions-message-search.js): every
+  // search/filter change funnels through here, so the lane re-keys or
+  // clears BEFORE the re-render below. No-op with the flag off.
+  scheduleSessionMessageSearch();
   _refilterSessions();
 }
 
@@ -1229,11 +1303,13 @@ function renderSessionProjectFilterMenu(kind) {
   const validSelected = Array.from(selected).filter(value =>
     cfg.options.some(opt => opt.value === value)
   );
-  if (validSelected.length > 0) {
-    localStorage.setItem(cfg.key, JSON.stringify(validSelected));
-  } else {
-    localStorage.removeItem(cfg.key);
-  }
+  try {
+    if (validSelected.length > 0) {
+      localStorage.setItem(cfg.key, JSON.stringify(validSelected));
+    } else {
+      localStorage.removeItem(cfg.key);
+    }
+  } catch (_) { /* Safari private mode / quota — selection stays in-memory */ }
   setSessionMultiFilterValues(kind, validSelected);
 }
 
@@ -1416,7 +1492,9 @@ function setupSessionMultiFilter(kind, onChange) {
     // are selection changes.
     if (ev.target && ev.target.type !== 'checkbox') return;
     const values = sessionMultiFilterValues(kind);
-    localStorage.setItem(cfg.key, JSON.stringify(values));
+    // Guarded like the attention-center writes: Safari private mode (and
+    // storage-quota states) throw here and would kill the filter handler.
+    try { localStorage.setItem(cfg.key, JSON.stringify(values)); } catch (_) {}
     updateSessionMultiFilterSummary(kind);
     onChange?.();
   });
@@ -1439,7 +1517,8 @@ document.addEventListener('keydown', (ev) => {
 document.getElementById('sort-sessions')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
 document.getElementById('sessions-show-subagents')?.addEventListener('change', (ev) => {
-  localStorage.setItem(SESSIONS_SHOW_SUBAGENTS_KEY, String(!!ev.target.checked));
+  // Same Safari-private-mode guard as the multi-filter persistence above.
+  try { localStorage.setItem(SESSIONS_SHOW_SUBAGENTS_KEY, String(!!ev.target.checked)); } catch (_) {}
   _refreshSessionsFilters();
 });
 document.getElementById('sort-sessions-deep')?.addEventListener('change', _refreshSessionsFilters);
@@ -1480,7 +1559,18 @@ document.getElementById('new-session-project-root')?.addEventListener('input', (
   ev.currentTarget.title = ev.currentTarget.value.trim();
   scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
 });
-window.setInterval(refreshNewSessionProjectStatusOnValueDrift, 500);
+// Drift detection is event-driven, not a forever-poll (was a 500ms
+// interval): 'change' fires on datalist picks and committed edits, 'blur'
+// catches abandoned edits, 'focus' catches a programmatic write that
+// landed while the field sat idle. Every programmatic writer schedules its
+// own refresh today (setNewSessionProjectRoot, updateNewSessionProjectPrefills,
+// ensureNewSessionProjectDirectory, the fs-picker apply path), so the
+// remaining uncovered case is a silent .value write from future code while
+// the field stays unfocused.
+for (const evName of ['change', 'blur', 'focus']) {
+  document.getElementById('new-session-project-root')
+    ?.addEventListener(evName, refreshNewSessionProjectStatusOnValueDrift);
+}
 document.getElementById('new-session-create-project-dir')?.addEventListener('change', refreshNewSessionProjectStatus);
 document.getElementById('new-session-agent')?.addEventListener('change', () => {
   renderNewSessionAgentControls({ replaceCommand: true });
@@ -1893,6 +1983,49 @@ function sessionDeepSearchHit(session, source) {
   return _sessionDeepSearch.results.get(sessionLogSearchKey(source, session.session_id)) || null;
 }
 
+// ── Deep-search progress (additive) ──
+// The daemon may emit {"type":"deep_search_progress","scanned":N,"total":M,
+// "matched":K} lines on the deep-search lane (newer daemons only). This is
+// the single entry point that folds one such line into the running banner —
+// whatever transport surfaces the lines calls it by name at event time.
+// Absence of progress lines changes nothing: the banner keeps its prose.
+function applySessionDeepSearchProgress(progress) {
+  if (!progress || typeof progress !== 'object') return;
+  if (!_sessionDeepSearch || !_sessionDeepSearch.loading) return;
+  const scanned = Number(progress.scanned);
+  const total = Number(progress.total);
+  const matched = Number(progress.matched);
+  if (!Number.isFinite(scanned) || scanned < 0) return;
+  _sessionDeepSearch.progress = {
+    scanned,
+    total: Number.isFinite(total) && total > 0 ? total : 0,
+    matched: Number.isFinite(matched) && matched >= 0 ? matched : 0,
+  };
+  updateSessionsSearchStatus();
+}
+
+function appendSessionsDeepSearchProgressLine(el, progress) {
+  const line = document.createElement('div');
+  line.className = 'sessions-deep-search-progress';
+  const text = document.createElement('span');
+  text.className = 'sessions-deep-search-progress-text';
+  text.textContent = progress.total > 0
+    ? `Scanned ${progress.scanned.toLocaleString()} of ${progress.total.toLocaleString()} · ${progress.matched.toLocaleString()} matched`
+    : `Scanned ${progress.scanned.toLocaleString()} · ${progress.matched.toLocaleString()} matched`;
+  line.appendChild(text);
+  if (progress.total > 0) {
+    const track = document.createElement('div');
+    track.className = 'sessions-deep-search-progress-track';
+    const fill = document.createElement('div');
+    fill.className = 'sessions-deep-search-progress-fill';
+    const pct = Math.max(0, Math.min(100, (progress.scanned / progress.total) * 100));
+    fill.style.width = `${pct}%`;
+    track.appendChild(fill);
+    line.appendChild(track);
+  }
+  el.appendChild(line);
+}
+
 function updateSessionsSearchStatus() {
   const el = document.getElementById('sessions-deep-search-status');
   if (!el) return;
@@ -1904,6 +2037,10 @@ function updateSessionsSearchStatus() {
       ? 'Deep search waiting for the previous search to finish'
       : 'Deep search running';
     el.textContent = `${prefix}${projectScope} for "${_sessionDeepSearch.query}" (${sessionDeepSearchModeLabel(_sessionDeepSearch.mode)}). It is scanning every matching session log and can take a while on large histories.`;
+    // Progress lines are optional (old daemons never send them).
+    if (_sessionDeepSearch.progress) {
+      appendSessionsDeepSearchProgressLine(el, _sessionDeepSearch.progress);
+    }
     return;
   }
   if (_sessionDeepSearch.error) {
@@ -1932,7 +2069,7 @@ const _sessionSearchTextCache = new WeakMap();
 function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
   const cached = _sessionSearchTextCache.get(session);
   if (cached && cached.status === displayStatus && cached.current === isCurrent) {
-    return cached.text;
+    return cached;
   }
   const totalBytes = session.total_bytes || 0;
   // Server-side conversation preview (first user/assistant messages) —
@@ -1975,20 +2112,65 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     totalBytes > 0 ? `${_fmtBytes(totalBytes)} size` : '',
     session.total_tokens != null ? `${session.total_tokens} tokens` : '',
     session.estimated_cost != null ? `$${Number(session.estimated_cost).toFixed(4)}` : '',
-    previewText,
   ];
   const text = fields
     .filter(v => v !== null && v !== undefined && v !== '')
     .join(' ')
     .toLowerCase();
-  _sessionSearchTextCache.set(session, { status: displayStatus, current: isCurrent, text });
-  return text;
+  const entry = {
+    status: displayStatus,
+    current: isCurrent,
+    text,
+    // Kept OUT of the metadata haystack: preview text only participates
+    // as the old-daemon fallback (see sessionMatchesSearch).
+    preview: previewText.toLowerCase(),
+  };
+  _sessionSearchTextCache.set(session, entry);
+  return entry;
 }
 
 function sessionMatchesSearch(session, query, displayStatus, source, shortId, isCurrent) {
   if (!query) return true;
-  const haystack = sessionSearchText(session, displayStatus, source, shortId, isCurrent);
-  return query.split(/\s+/).every(term => haystack.includes(term));
+  const entry = sessionSearchText(session, displayStatus, source, shortId, isCurrent);
+  const terms = query.split(/\s+/);
+  if (terms.every(term => entry.text.includes(term))) return true;
+  // Preview fallback (plan §8 retirement): server-side conversation
+  // previews stop participating in search whenever the message-search
+  // lane can serve — the shard index is the authority on message text,
+  // and a preview-only match would contradict its (correct) no-hit
+  // answer. Old daemons / a down tunnel keep the fallback.
+  if (messageSearchSupersedesPreviews()) return false;
+  return entry.preview !== '' && terms.every(term => entry.preview.includes(term));
+}
+
+// Compact tile value + the exact figure for the hover: 144,900,123,456
+// renders as "144.9B" with the full number in the title attribute.
+function sessionsAggregateTokenTile(label, value, loading) {
+  return {
+    label,
+    value: loading ? 'Loading' : formatCompactNumber(value),
+    title: loading ? '' : `${Number(value || 0).toLocaleString()} tokens`,
+    loading,
+  };
+}
+
+// The Cost twin of sessionsAggregateTokenTile: an exact "$118,694.20"
+// ellipsizes on narrow tiles (observed "$118,69..." at 390px), so large
+// totals render compactly ($10k+ → "$118.7k", $1M+ → "$1.53M") with the
+// exact toLocaleString figure in the title attribute — same pattern as
+// the token tiles. Below $10k the exact figure fits and stays.
+function sessionsAggregateCostTile(totalCost, loading) {
+  const n = Number(totalCost || 0);
+  const exact = '$' + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  let compact = exact;
+  if (n >= 1e6) compact = '$' + (n / 1e6).toFixed(2) + 'M';
+  else if (n >= 10000) compact = '$' + (n / 1000).toFixed(1) + 'k';
+  return {
+    label: 'Cost',
+    value: loading ? 'Loading' : compact,
+    title: loading ? '' : exact,
+    loading,
+  };
 }
 
 function renderSessionsAggregate(sessions, el) {
@@ -2000,7 +2182,20 @@ function renderSessionsAggregate(sessions, el) {
   const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
   const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
   const totalCached = sessions.reduce((sum, s) => sum + (s.cached_tokens || 0), 0);
-  const activeSessions = sessions.filter(s => s.status === 'running' || s.status === 'in_progress').length;
+  // Truthful liveness: "active" means a session this dashboard supervises
+  // in a live agent phase right now. The row status alone over-counts —
+  // `in_progress` is the on-disk default any crashed/abandoned session
+  // keeps forever — so the rest of the running/in_progress rows surface as
+  // "open" (not finalized), which is all the status field actually says.
+  const statusOpenSessions = sessions.filter(s => s.status === 'running' || s.status === 'in_progress');
+  let liveActiveSessions = 0;
+  if (typeof sessionWindows !== 'undefined' && typeof isAgentActivePhase === 'function') {
+    liveActiveSessions = statusOpenSessions.filter(s => {
+      const win = sessionWindows.get(String(s.session_id || ''));
+      return win && !win.ended && isAgentActivePhase(win.phase);
+    }).length;
+  }
+  const openSessions = statusOpenSessions.length - liveActiveSessions;
 
   el.innerHTML = '';
 
@@ -2010,11 +2205,19 @@ function renderSessionsAggregate(sessions, el) {
   const sessionsSubParts = [];
   if (detailsLoading) sessionsSubParts.push('visible so far');
   if (externalSessions > 0) sessionsSubParts.push(`${externalSessions.toLocaleString()} external`);
-  if (activeSessions > 0) sessionsSubParts.push(`${activeSessions.toLocaleString()} active`);
-  const sessionsTile = { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') };
-  const inputTile = { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading };
-  const cachedTile = { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading };
-  const outputTile = { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading };
+  if (liveActiveSessions > 0) sessionsSubParts.push(`${liveActiveSessions.toLocaleString()} active`);
+  if (openSessions > 0) sessionsSubParts.push(`${openSessions.toLocaleString()} open`);
+  const sessionsTile = {
+    label: 'Sessions',
+    value: totalSessions.toLocaleString(),
+    sub: sessionsSubParts.join(' · '),
+    title: openSessions > 0
+      ? 'active = supervised here in a live agent phase · open = not marked ended on disk'
+      : '',
+  };
+  const inputTile = sessionsAggregateTokenTile('Input', totalInput, detailsLoading);
+  const cachedTile = sessionsAggregateTokenTile('Cached', totalCached, detailsLoading);
+  const outputTile = sessionsAggregateTokenTile('Output', totalOutput, detailsLoading);
   const diskTile = { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading };
 
   // The reference KPI set — Sessions · Tokens · Cost · Active days —
@@ -2035,14 +2238,8 @@ function renderSessionsAggregate(sessions, el) {
   }
   const cards = [
     sessionsTile,
-    { label: 'Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
-    {
-      label: 'Cost',
-      value: detailsLoading
-        ? loadingValue
-        : '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
-      loading: detailsLoading,
-    },
+    sessionsAggregateTokenTile('Tokens', totalTokens, detailsLoading),
+    sessionsAggregateCostTile(totalCost, detailsLoading),
     { label: 'Active days', value: activeDayKeys.size.toLocaleString(), sub: detailsLoading ? 'visible so far' : '' },
     inputTile, cachedTile, outputTile, diskTile,
   ];
@@ -2056,6 +2253,7 @@ function renderAggregateStatTiles(el, cards) {
   for (const c of cards) {
     const card = document.createElement('div');
     card.className = 'ui-stat agg-card' + (c.loading ? ' loading' : '');
+    if (c.title) card.title = c.title;
     const labelEl = document.createElement('div');
     labelEl.className = 'ui-stat-label agg-label';
     labelEl.textContent = c.label;

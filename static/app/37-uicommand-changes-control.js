@@ -404,15 +404,13 @@ function renderChangesDiffHeader(path, info, stateText = '') {
     + (resolvedMeta ? `<span class="changes-diff-meta">${escapeHtml(resolvedMeta)}</span>` : '');
 }
 
-function encodeChangePath(path) {
-  if (isAbsolutePath(path)) return encodeURIComponent(path);
-  return String(path).split('/').map(part => encodeURIComponent(part)).join('/');
-}
-
+// Unwrap a facade envelope from fetchChangesResponse: delivered errors
+// surface as data.error (the endpoint's structured shape) or the HTTP
+// status; the list shape is a bare array and passes through untouched.
 async function parseChangesResponse(resp) {
-  const data = await resp.json().catch(() => ({}));
+  const data = (resp.body && typeof resp.body === 'object') ? resp.body : {};
   if (!resp.ok || data.error) {
-    throw new Error(data.error || resp.statusText || `HTTP ${resp.status}`);
+    throw new Error(data.error || `HTTP ${resp.status}`);
   }
   return data;
 }
@@ -458,12 +456,6 @@ function currentChangesTargetQuery() {
   return params.toString();
 }
 
-function changesRequestUrl(path = '') {
-  const suffix = path ? `/${encodeChangePath(path)}` : '';
-  const query = currentChangesTargetQuery();
-  return `/api/session/current/changes${suffix}${query ? `?${query}` : ''}`;
-}
-
 function changesRequestParams(path = '') {
   return {
     path: String(path || ''),
@@ -471,10 +463,13 @@ function changesRequestParams(path = '') {
   };
 }
 
+// Transport F8a: the changes reads ride the daemonApi facade — tunnel
+// first, HTTP twin per the GET fallback policy. The descriptor's
+// pathSuffix entry rebuilds the /changes/{path} sub-path on the HTTP
+// lane (the legacy encodeChangePath/changesRequestUrl builders retired
+// onto it); resolves with the facade envelope for parseChangesResponse.
 function fetchChangesResponse(path = '') {
-  return dashboardJsonFetch('api_session_current_changes', changesRequestParams(path), () => (
-    fetch(changesRequestUrl(path))
-  ), 'api_session_current_changes');
+  return daemonApi.request('api_session_current_changes', changesRequestParams(path));
 }
 
 function showChangesTargetMismatch(message) {
@@ -622,7 +617,8 @@ async function refreshHistory() {
     return;
   }
   try {
-    const r = await dashboardJsonFetch('api_session_current_history', {}, () => fetch('/api/session/current/history'), 'api_session_current_history');
+    // Transport F8a: facade GET twin (tunnel first, HTTP fallback).
+    const r = await daemonApi.request('api_session_current_history', {});
     if (!r.ok) {
       // Older sessions or sessions without history support return 404.
       // Hide the timeline rather than showing a confusing error.
@@ -631,7 +627,7 @@ async function refreshHistory() {
       if (wrap) wrap.style.display = 'none';
       return;
     }
-    historyCache = await r.json();
+    historyCache = r.body;
     renderTimeline();
   } catch (e) {
     // Network error — stay silent; the WS event for the next mutation
@@ -900,23 +896,13 @@ async function confirmRollback() {
       revert_files: revertFiles,
       revert_conversation: revertConv,
     };
-    const resp = await dashboardJsonFetch('api_session_current_rollback', payload, () => fetch('/api/session/current/rollback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_session_current_rollback', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin — the verb-derived no-replay policy
+    // is the legacy fallbackAfterRpcFailure:false semantics.
+    const resp = await daemonApi.request('api_session_current_rollback', payload);
     if (!resp.ok) {
       // Prefer the structured {error} shape the server already uses for
-      // this endpoint; fall back to raw text for unexpected error bodies.
-      let errMsg = resp.statusText;
-      try {
-        const j = await resp.clone().json();
-        if (j && j.error) errMsg = j.error;
-      } catch (_) {
-        const t = await resp.text().catch(() => '');
-        if (t) errMsg = t;
-      }
-      showControlToast('error', `Rollback failed: ${errMsg}`);
+      // this endpoint; fall back to the status for unexpected bodies.
+      showControlToast('error', `Rollback failed: ${resp.body?.error || `HTTP ${resp.status}`}`);
     }
     // Success: backend emits `rolled_back` / `conversation_rolled_back`
     // events, the WASM layer raises HistoryChanged, and the UI refreshes.
@@ -928,10 +914,10 @@ window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
-    const r = await dashboardJsonFetch('api_session_current_redo', {}, () => fetch('/api/session/current/redo', { method: 'POST' }), 'api_session_current_redo', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_redo', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Redo failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Redo failed: ${r.body?.error || `HTTP ${r.status}`}`);
     }
   } catch (e) {
     showControlToast('error', `Redo error: ${e.message || e}`);
@@ -948,15 +934,15 @@ async function doPrune() {
   });
   if (!ok) return;
   try {
-    const r = await dashboardJsonFetch('api_session_current_prune', {}, () => fetch('/api/session/current/prune', { method: 'POST' }), 'api_session_current_prune', { fallbackAfterRpcFailure: false });
+    // Transport F8a: facade POST twin (verb-derived no-replay policy).
+    const r = await daemonApi.request('api_session_current_prune', {});
     if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      showControlToast('error', `Prune failed: ${err.error || r.statusText}`);
+      showControlToast('error', `Prune failed: ${r.body?.error || `HTTP ${r.status}`}`);
       return;
     }
     // History event will redraw; the console line is a belt-and-suspenders
     // confirmation so curious users can verify the server response shape.
-    const data = await r.json().catch(() => ({}));
+    const data = (r.body && typeof r.body === 'object') ? r.body : {};
     if (typeof data.bytes_freed === 'number') {
       const mb = (data.bytes_freed / 1024 / 1024).toFixed(1);
       console.log(`Pruned ${data.branches_removed || 0} branches, ${mb} MB freed`);
@@ -1016,6 +1002,35 @@ let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
 let newSessionCodexLaunchDefaultsLoaded = false;
+// Keep an embedded offline catalog for a settings fetch that has not landed
+// yet (or an older/unreachable daemon). A daemon-side parity test pins this
+// JSON fallback to project::CODEX_MODEL_CATALOG; a successful settings fetch
+// replaces it with the signed-in Codex account's cached catalog.
+const NEW_SESSION_CODEX_MODEL_FALLBACK = Object.freeze(
+/* codex-model-catalog:start */
+[
+  {"id":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-terra","display_name":"GPT-5.6-Terra","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max","ultra"]},
+  {"id":"gpt-5.6-luna","display_name":"GPT-5.6-Luna","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh","max"]},
+  {"id":"gpt-5.5","display_name":"GPT-5.5","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark","default_reasoning_effort":"high","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4","display_name":"GPT-5.4","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]},
+  {"id":"gpt-5.4-mini","display_name":"GPT-5.4-Mini","default_reasoning_effort":"medium","reasoning_efforts":["low","medium","high","xhigh"]}
+]
+/* codex-model-catalog:end */
+);
+const NEW_SESSION_CODEX_REASONING_FALLBACK = Object.freeze(
+/* codex-reasoning-efforts:start */
+["none","minimal","low","medium","high","xhigh","max","ultra"]
+/* codex-reasoning-efforts:end */
+);
+let newSessionCodexModelCatalog = NEW_SESSION_CODEX_MODEL_FALLBACK.map(entry => ({
+  ...entry,
+  reasoning_efforts: [...entry.reasoning_efforts],
+}));
+let newSessionCodexReasoningEfforts = [...NEW_SESSION_CODEX_REASONING_FALLBACK];
+let newSessionCodexGlobalModel = '';
+let newSessionCodexGlobalReasoningEffort = '';
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -1179,15 +1194,32 @@ function dispatchControlMsg(payload) {
     dispatchDashboardActionMsg(payload);
     return;
   }
+  // Transport F7: the RPC leg rides the daemonApi facade. api_control_msg
+  // is WS-twin residue (no HTTP row exists by design — its HTTP-era twin
+  // is the /ws intent stream below), so the facade can never take an HTTP
+  // lane for it; the availability derivation replaces the hand-rolled
+  // canUseRpc + status-boolean probe (the status boolean once landed, the
+  // hello_ack features list before that — denied and too-old daemons fall
+  // through to /ws exactly as the strict boolean did). A tunnel attempt is
+  // final either way: never replayed over /ws (the hosted validators probe
+  // exactly this).
   if (
     action &&
     DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
-    dashboardTransport &&
-    dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc() &&
-    dashboardControlTransport?.lastStatus?.api_control_msg_available === true
+    daemonApi.availability('api_control_msg').ok
   ) {
-    dashboardTransport.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+    daemonApi.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+      .then(resp => {
+        if (resp.ok) return;
+        // A delivered refusal (the daemon's action allowlist said no —
+        // drift the SPA/daemon parity pins make near-impossible) is a
+        // delivered response: surface it instead of the pre-facade silent
+        // swallow, and still never replay it.
+        console.warn(`[dashboard-control] ${action} ControlMsg RPC refused; not replaying over /ws`, resp.body?.error || resp.status);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', resp.body?.error || 'Dashboard control request failed');
+        }
+      })
       .catch(err => {
         console.warn(`[dashboard-control] ${action} ControlMsg RPC failed; not replaying over /ws`, err);
         if (typeof showControlToast === 'function') {
@@ -1201,7 +1233,17 @@ function dispatchControlMsg(payload) {
     return;
   }
   if (app && app.send_server_action) {
-    app.send_server_action(payload);
+    // Refused-send contract (see dispatchSessionControlMsg): only an
+    // explicit false means the frame never reached an open /ws.
+    if (app.send_server_action(payload) === false) {
+      if (typeof dashboardTriggerEventLaneFallback === 'function') {
+        dashboardTriggerEventLaneFallback(`${action || 'control'} intent found no open event lane`);
+      }
+      console.warn('control pane: no open event lane, refused', action || payload);
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Dashboard control connection is down — reconnecting. Retry in a moment.');
+      }
+    }
   } else {
     console.warn('control pane: no app connection, dropped', payload);
   }
@@ -2270,4 +2312,3 @@ if (document.readyState === 'loading') {
 } else {
   wireControlPaneListeners();
 }
-

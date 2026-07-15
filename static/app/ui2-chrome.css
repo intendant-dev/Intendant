@@ -10,11 +10,34 @@
    that never overlaps the Station canvases — the fixed rail and the
    oversight bar sit outside #app's content box, never over the canvas. */
 
-html.ui-v2 { --ui2-nav-w: 244px; --ui2-ovs-h: 48px; }
+html.ui-v2 {
+  --ui2-nav-w: 244px;
+  --ui2-ovs-h: 48px;
+  /* Device cutout / home-indicator insets. viewport-fit=cover makes these
+     nonzero on notched phones (0 everywhere else); they are composed into
+     every fixed-chrome coordinate below so no control sits under hardware. */
+  --ui2-sa-t: env(safe-area-inset-top, 0px);
+  --ui2-sa-r: env(safe-area-inset-right, 0px);
+  --ui2-sa-b: env(safe-area-inset-bottom, 0px);
+  --ui2-sa-l: env(safe-area-inset-left, 0px);
+  /* Left edge of the content area: rail width + left cutout. */
+  --ui2-nav-edge: calc(var(--ui2-nav-w) + var(--ui2-sa-l));
+  /* Composer geometry. --ui2-composer-h is kept at the bar's REAL rendered
+     height by ui2WireComposerMech (the bar wraps and grows: focus expand,
+     attachments row, the 500-600px wrap band) — the old 92px/64px constants
+     under-reserved whenever it did, letting the bar cover the Files save
+     row and the Live control banner. The fallback approximates the at-rest
+     bar for the pre-boot paint. --ui2-kb-inset lifts the bar above the iOS
+     soft keyboard while composing (0 otherwise). */
+  --ui2-composer-off: 16px;
+  --ui2-composer-h: 62px;
+  --ui2-kb-inset: 0px;
+}
 
 html.ui-v2 #app {
-  padding-left: var(--ui2-nav-w);
-  padding-top: var(--ui2-ovs-h);
+  padding-left: var(--ui2-nav-edge);
+  padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
+  padding-right: var(--ui2-sa-r);
 }
 html.ui-v2 .tab-bar { display: none; }
 
@@ -22,7 +45,9 @@ html.ui-v2 .tab-bar { display: none; }
 html.ui-v2 #ui2-nav {
   position: fixed;
   inset: 0 auto 0 0;
-  width: var(--ui2-nav-w);
+  width: var(--ui2-nav-edge);
+  padding-left: var(--ui2-sa-l);
+  padding-bottom: var(--ui2-sa-b);
   z-index: 40;
   display: flex;
   flex-direction: column;
@@ -132,11 +157,11 @@ html.ui-v2 .ui2-identity-sub { font-size: 10.5px; color: var(--text-3); }
 /* ── oversight bar ── */
 html.ui-v2 #ui2-oversight {
   position: fixed;
-  top: 0; left: var(--ui2-nav-w); right: 0;
-  height: var(--ui2-ovs-h);
+  top: 0; left: var(--ui2-nav-edge); right: 0;
+  height: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
   z-index: 39;
   display: flex; align-items: center; gap: 12px;
-  padding: 0 18px;
+  padding: var(--ui2-sa-t) calc(18px + var(--ui2-sa-r)) 0 18px;
   background: var(--glass);
   -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
@@ -295,10 +320,21 @@ html.ui-v2 .ui2-palette-row {
   text-align: left; font-family: inherit; font-size: 13.5px; font-weight: 600;
 }
 html.ui-v2 .ui2-palette-row .ui2-nav-icon { color: inherit; }
-html.ui-v2 .ui2-palette-row-label { flex: 1; min-width: 0; }
+html.ui-v2 .ui2-palette-row-label {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 html.ui-v2 .ui2-palette-row-hint {
   font-family: var(--mono); font-size: 10.5px; color: var(--text-3);
 }
+/* Message hits: session name + highlighted snippet on one ellipsized line */
+html.ui-v2 .ui2-palette-msg-session { color: var(--text); }
+html.ui-v2 .ui2-palette-msg-snippet { color: var(--text-3); margin-left: 8px; }
+html.ui-v2 .ui2-palette-msg-snippet mark {
+  background: color-mix(in srgb, var(--iris) 28%, transparent);
+  color: var(--text); border-radius: 3px; padding: 0 1px;
+}
+html.ui-v2 .ui2-palette-row.inert { cursor: default; color: var(--text-3); }
 html.ui-v2 .ui2-palette-row.selected,
 html.ui-v2 .ui2-palette-row:hover { background: var(--surface-2); color: var(--text); }
 html.ui-v2 .ui2-palette-row.selected { color: var(--iris-2); }
@@ -409,14 +445,19 @@ html.ui-v2 .ui2-theme-btn:hover { background: var(--surface-2); color: var(--tex
    the bottom — the design's composer. Same element, same ids, all v1
    listeners intact; phase + stop inside it are hidden because the
    oversight bar already mirrors them. Solid surface, no backdrop-filter:
-   fixed chrome overlaps the Station canvases on the Station tab. */
-html.ui-v2 #app { padding-bottom: 92px; }
+   fixed chrome overlaps the Station canvases on the Station tab.
+   The #app bottom reservation tracks the bar's measured height (see the
+   --ui2-composer-h note at the vars block): panes must never draw under
+   the dock, whatever the dock's current size. */
+html.ui-v2 #app {
+  padding-bottom: calc(var(--ui2-composer-h) + var(--ui2-composer-off) + var(--ui2-sa-b) + 14px);
+}
 html.ui-v2 .global-task-bar {
   position: fixed;
-  left: var(--ui2-nav-w);
-  right: 0;
-  bottom: 16px;
-  width: min(920px, calc(100vw - var(--ui2-nav-w) - 36px));
+  left: var(--ui2-nav-edge);
+  right: var(--ui2-sa-r);
+  bottom: calc(var(--ui2-composer-off) + var(--ui2-sa-b) + var(--ui2-kb-inset));
+  width: min(920px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 36px));
   margin-inline: auto;
   z-index: 70;
   padding: 9px 11px;
@@ -432,6 +473,66 @@ html.ui-v2 .global-task-bar:focus-within {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22), var(--shadow-card);
 }
+
+/* ── composer states: expanded ⇄ pill ─────────────────────────────────
+   ui2WireComposerState stamps data-composer-state on <html>: "expanded"
+   is the full dock; "pill" collapses the same fixed element into a small
+   centered lozenge so immersive surfaces (the per-tab defaults: Live,
+   Station, Terminal, Files) keep the bottom of the viewport. The
+   reservation invariant is untouched — --ui2-composer-h simply measures
+   the pill. The child hide is !important on purpose: chip/attachment
+   children carry inline display toggles and focus-within reveals, and
+   the pill state must override every one of them. */
+html.ui-v2 .ui2-composer-pill { display: none; }
+html.ui-v2 .ui2-composer-collapse {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex-shrink: 0; padding: 0;
+  border: 0; border-radius: var(--r-ctl);
+  background: transparent; color: var(--text-3); cursor: pointer;
+}
+html.ui-v2 .ui2-composer-collapse:hover { background: var(--hover-wash); color: var(--text); }
+html.ui-v2 .ui2-composer-collapse svg { transform: rotate(90deg); } /* chev points down */
+html.ui-v2[data-composer-state="pill"] .global-task-bar {
+  width: auto;
+  min-width: 0;
+  max-width: min(340px, calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 24px));
+  padding: 8px 16px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  justify-content: center;
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar:hover {
+  background: var(--surface-2);
+  border-color: var(--line-2);
+}
+html.ui-v2[data-composer-state="pill"] .global-task-bar > *:not(.ui2-composer-pill) { display: none !important; }
+html.ui-v2[data-composer-state="pill"] .ui2-composer-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12.5px; font-weight: 700; color: var(--text-2);
+  white-space: nowrap;
+  pointer-events: none; /* the whole lozenge is the click target */
+}
+html.ui-v2 .ui2-composer-pill-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--text-3);
+}
+html.ui-v2 .ui2-composer-pill[data-phase="running"] .ui2-composer-pill-dot,
+html.ui-v2 .ui2-composer-pill[data-phase="thinking"] .ui2-composer-pill-dot {
+  background: var(--iris);
+  animation: ui2-pulse 1.3s infinite;
+}
+html.ui-v2 .ui2-composer-pill[data-phase="waiting"] .ui2-composer-pill-dot { background: var(--amber); }
+html.ui-v2 .ui2-composer-pill[data-phase="done"] .ui2-composer-pill-dot { background: var(--green); }
+html.ui-v2 .ui2-composer-pill-draft {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--amber);
+  display: none;
+}
+html.ui-v2 .ui2-composer-pill.has-draft .ui2-composer-pill-draft { display: inline-block; }
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .ui2-composer-pill-dot { animation: none !important; }
+}
+
 /* phase + stop live in the oversight bar under v2 */
 html.ui-v2 .global-task-bar .phase-banner { display: none; }
 html.ui-v2 .global-task-bar .stop-btn { display: none; }
@@ -530,4 +631,106 @@ html.ui-v2 .ui2-skip:focus-visible { top: 8px; outline: 2px solid var(--iris); o
   html.ui-v2 .ui2-nav-item { justify-content: center; padding: 10px 0; }
   html.ui-v2 .ui2-nav-item-label, html.ui-v2 .ui2-nav-badge { display: none; }
   html.ui-v2 .ui2-nav-bottom { display: none; }
+}
+
+/* ── rail: short viewports ──
+   The nav-groups region is the ONLY scroller; the autonomy/account footer
+   stays pinned and opaque. min-height:0 is the flexbox correctness bit —
+   without it the groups' content size can win and push the SYSTEM group
+   under the footer instead of scrolling. */
+html.ui-v2 .ui2-nav-groups { min-height: 0; }
+html.ui-v2 .ui2-nav-bottom { flex-shrink: 0; background: var(--bg); }
+@media (max-height: 950px) {
+  html.ui-v2 .ui2-nav-top { padding: 10px 16px 8px; gap: 8px; }
+  html.ui-v2 .ui2-nav-group { margin-bottom: 6px; }
+  html.ui-v2 .ui2-nav-eyebrow { padding: 4px 8px 3px; }
+  html.ui-v2 .ui2-nav-item { padding: 6px 9px; }
+  html.ui-v2 .ui2-nav-bottom { padding: 8px 10px; gap: 6px; }
+}
+
+/* ── composer: phones (≤500px) ──
+   At rest the dock is one compact row — the input plus Send — instead of
+   ~40% of the viewport; focusing it (or targeting a session) expands the
+   full control set. :focus-within covers typing, target chip, attach and
+   Direct once expanded. */
+@media (max-width: 600px) {
+  /* The dock hugs the edge tighter on phones; the #app reservation keeps
+     following the measured bar height (the old fixed 64px was smaller
+     than the bar itself — the root of the covered-controls bug). The
+     breakpoint is 600, not 500: v1's ≤600 wrap rules force the input
+     onto its own row with Send alone under it — the order/flex resets
+     below re-join them into one compact resting row across the whole
+     band, with the secondary controls appearing on focus. */
+  html.ui-v2 { --ui2-composer-off: 8px; }
+  html.ui-v2 .global-task-bar {
+    width: calc(100vw - var(--ui2-nav-edge) - var(--ui2-sa-r) - 16px);
+    padding: 6px 8px;
+    flex-wrap: wrap;
+  }
+  html.ui-v2 .global-task-bar .global-task-input {
+    order: 0;
+    flex: 1 1 auto;
+    width: auto;
+    font-size: 16px; /* under 16px iOS Safari zooms the page on focus */
+    max-height: 2.4em;
+  }
+  html.ui-v2 .global-task-bar .global-send-btn { order: 0; flex: 0 0 auto; }
+  html.ui-v2 .global-task-bar .task-new-session-btn,
+  html.ui-v2 .global-task-bar .global-attach-btn,
+  html.ui-v2 .global-task-bar .global-direct-toggle,
+  html.ui-v2 .global-task-bar .ui2-composer-collapse {
+    display: none;
+  }
+  html.ui-v2 .global-task-bar:focus-within .task-new-session-btn,
+  html.ui-v2 .global-task-bar:focus-within .global-attach-btn,
+  html.ui-v2 .global-task-bar:focus-within .global-direct-toggle,
+  html.ui-v2 .global-task-bar:focus-within .ui2-composer-collapse {
+    display: inline-flex;
+  }
+  html.ui-v2 .global-task-bar:focus-within .global-task-input {
+    max-height: 6em;
+  }
+}
+
+/* ── Activity subtab strip: phones scroll horizontally, never wrap ──
+   Supersedes 14-styles-displays-voice.css's ≤600px flex-wrap rule (this
+   file loads later and the html.ui-v2 prefix outweighs it): the strip
+   scrolls sideways; buttons and the verbosity/host controls keep their
+   natural width. */
+@media (max-width: 600px) {
+  html.ui-v2 #activity-subtabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  html.ui-v2 #activity-subtabs::-webkit-scrollbar { display: none; }
+  html.ui-v2 #activity-subtabs .subtab-btn { flex: 0 0 auto; white-space: nowrap; }
+  html.ui-v2 #activity-subtabs .activity-subtab-controls {
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+}
+
+/* ── fuel/lease chip (oversight bar, display-only) ── */
+html.ui-v2 .ui2-fuel-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: rgba(var(--green-rgb), .12);
+  color: var(--green);
+  border: 1px solid rgba(var(--green-rgb), .28);
+  white-space: nowrap;
+}
+
+/* ── touch behavior ──
+   The viewport meta no longer carries user-scalable=no (pinch-zoom is an
+   accessibility escape hatch and the recovery gesture when a layout goes
+   wrong on a phone). Double-tap-to-zoom on controls is suppressed
+   per-element instead; manipulation still allows pan and pinch. */
+html.ui-v2 :is(button, select, input, textarea, label, .ui2-nav-item, .tab-btn) {
+  touch-action: manipulation;
 }

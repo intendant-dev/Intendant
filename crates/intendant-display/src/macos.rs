@@ -14,6 +14,10 @@ use super::{
     capture::damage::Rect, DisplayBackend, DisplayInfoKind, Frame, FrameFormat, InputEvent,
 };
 use async_trait::async_trait;
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, ScrollEventUnit,
@@ -271,10 +275,16 @@ fn current_input_geometry(target: &Arc<RwLock<InputGeometry>>) -> InputGeometry 
 }
 
 fn display_scale_for_sck_rect(rect: ScRect) -> f64 {
-    let cg_rect = CgRect::new(
-        &CGPoint::new(rect.origin.x, rect.origin.y),
-        &CGSize::new(rect.size.width.max(1.0), rect.size.height.max(1.0)),
-    );
+    display_scale_for_rect(
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
+fn display_scale_for_rect(x: f64, y: f64, w: f64, h: f64) -> f64 {
+    let cg_rect = CgRect::new(&CGPoint::new(x, y), &CGSize::new(w.max(1.0), h.max(1.0)));
     if let Ok((display_ids, count)) = CGDisplay::displays_with_rect(cg_rect, 8) {
         if count > 0 {
             if let Some(id) = display_ids.first().copied() {
@@ -379,31 +389,43 @@ fn scaled_rect_to_damage_rect(
     ))
 }
 
-/// Enumerate macOS displays via ScreenCaptureKit.
+/// Enumerate macOS displays and capturable windows via CoreGraphics.
 ///
-/// Returns a `DisplayInfo` per connected display.  The primary display
+/// Deliberately avoids ScreenCaptureKit here: `SCShareableContent::get()`
+/// rides a per-process XPC round-trip that, in a long-lived daemon,
+/// eventually stops replying — every later call parks its thread forever
+/// (observed 2026-07-13 after sustained `/api/displays` polling; a fresh
+/// process on the same box answers instantly). Enumeration only needs
+/// metadata, which `CGDisplay`/`CGWindowList` serve without that XPC
+/// dependency; SCK stays confined to capture-stream setup, where a stream
+/// start is rare and user-visible when it fails.
+///
+/// Returns a `DisplayInfo` per connected display. The primary display
 /// (`CGMainDisplayID()`) gets `id: 0`; additional displays get sequential
-/// IDs starting from 1.
+/// IDs starting from 1. On-screen layer-0 windows follow as
+/// `DisplayInfoKind::Window` entries.
 pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
-    let content = match SCShareableContent::create()
-        .with_on_screen_windows_only(true)
-        .with_exclude_desktop_windows(true)
-        .get()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[display/macos] SCShareableContent::get failed: {e}");
-            return Vec::new();
+    // CGDisplay/CGWindowList are synchronous WindowServer IPC — quick,
+    // but still off-reactor by policy (lib.rs's single-flight + TTL cache
+    // keeps a request burst down to one round-trip every couple seconds).
+    match tokio::task::spawn_blocking(enumerate_displays_blocking).await {
+        Ok(list) => list,
+        Err(join_err) => {
+            eprintln!("[display/macos] display enumeration task failed: {join_err}");
+            Vec::new()
         }
-    };
+    }
+}
 
+fn enumerate_displays_blocking() -> Vec<super::DisplayInfo> {
     let main_id = CGDisplay::main().id;
+    let active = CGDisplay::active_displays().unwrap_or_default();
     let mut displays = Vec::new();
     let mut next_id: u32 = 1;
 
-    for sc_display in content.displays() {
-        let cg = CGDisplay::new(sc_display.display_id());
-        let is_primary = sc_display.display_id() == main_id;
+    for did in active {
+        let cg = CGDisplay::new(did);
+        let is_primary = did == main_id;
         let id = if is_primary {
             0
         } else {
@@ -414,17 +436,18 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
         let width = cg.pixels_wide() as u32;
         let height = cg.pixels_high() as u32;
 
-        // Build a human-readable name. SCDisplay does not expose a name
-        // property, so we use the display ID and resolution.
+        // Build a human-readable name. CoreGraphics does not expose a
+        // localized display name, so we use the display ID and resolution
+        // (same shape the ScreenCaptureKit-era enumeration produced).
         let name = if is_primary {
             format!("Primary Display ({}x{})", width, height)
         } else {
-            format!("Display {} ({}x{})", sc_display.display_id(), width, height)
+            format!("Display {} ({}x{})", did, width, height)
         };
 
         displays.push(super::DisplayInfo {
             id,
-            platform_id: sc_display.display_id() as u64,
+            platform_id: did as u64,
             name,
             width,
             height,
@@ -437,17 +460,70 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
 
     // Ensure primary is first.
     displays.sort_by_key(|d| if d.is_primary { 0 } else { 1 });
-    displays.extend(enumerate_window_display_infos(&content));
+    displays.extend(enumerate_window_display_infos());
     displays
 }
 
-fn enumerate_window_display_infos(content: &SCShareableContent) -> Vec<super::DisplayInfo> {
+/// CGWindowList metadata lookups. The dictionary keys' CFString contents
+/// equal their symbol names (`kCGWindowNumber` → "kCGWindowNumber"), per
+/// the CGWindow.h contract; `kCGWindowName` is populated only when the
+/// process holds the screen-recording TCC grant (which capture already
+/// requires) — absent names fall back the same way SCK's optional
+/// `title()` did.
+fn window_dict_i64(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<i64> {
+    dict.find(CFString::new(key))
+        .and_then(|v| v.downcast::<CFNumber>())
+        .and_then(|n| n.to_i64())
+}
+
+fn window_dict_string(dict: &CFDictionary<CFString, CFType>, key: &str) -> Option<String> {
+    dict.find(CFString::new(key))
+        .and_then(|v| v.downcast::<CFString>())
+        .map(|s| s.to_string())
+}
+
+/// `kCGWindowBounds` is a `CGRectCreateDictionaryRepresentation` dict
+/// ("X"/"Y"/"Width"/"Height" CFNumbers), in global display points.
+fn window_dict_bounds(dict: &CFDictionary<CFString, CFType>) -> Option<(f64, f64, f64, f64)> {
+    let bounds = dict
+        .find(CFString::new("kCGWindowBounds"))?
+        .downcast::<CFDictionary>()?;
+    // SAFETY: re-wrap of the same CFDictionaryRef under the get rule with
+    // typed views; the rect-representation contract guarantees CFString
+    // keys and CFNumber values, and `wrap_under_get_rule` retains, so the
+    // typed handle is independent of `bounds`'s lifetime.
+    let typed: CFDictionary<CFString, CFNumber> =
+        unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+    let get = |key: &str| typed.find(CFString::new(key)).and_then(|n| n.to_f64());
+    Some((get("X")?, get("Y")?, get("Width")?, get("Height")?))
+}
+
+fn enumerate_window_display_infos() -> Vec<super::DisplayInfo> {
+    use core_graphics::window as cg_window;
+    let Some(list) = cg_window::copy_window_info(
+        cg_window::kCGWindowListOptionOnScreenOnly | cg_window::kCGWindowListExcludeDesktopElements,
+        cg_window::kCGNullWindowID,
+    ) else {
+        return Vec::new();
+    };
+
     let mut windows = Vec::new();
-    for window in content.windows() {
-        if !window.is_on_screen() || window.window_layer() != 0 {
+    for item in list.iter() {
+        // SAFETY: CGWindowListCopyWindowInfo returns an array whose
+        // elements are CFDictionaryRef by API contract; wrap_under_get_rule
+        // retains, so `dict` owns a reference independent of `item`'s
+        // borrow of `list`.
+        let dict: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(*item as CFDictionaryRef) };
+
+        if window_dict_i64(&dict, "kCGWindowLayer") != Some(0) {
             continue;
         }
-        let native_window_id = window.window_id();
+        let Some(native_window_id) =
+            window_dict_i64(&dict, "kCGWindowNumber").and_then(|n| u32::try_from(n).ok())
+        else {
+            continue;
+        };
         let Some(id) = window_display_id(native_window_id) else {
             eprintln!(
                 "[display/macos] window {} cannot be represented as synthetic display id",
@@ -455,24 +531,24 @@ fn enumerate_window_display_infos(content: &SCShareableContent) -> Vec<super::Di
             );
             continue;
         };
-        let frame = window.frame();
-        if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        let Some((x, y, w, h)) = window_dict_bounds(&dict) else {
+            continue;
+        };
+        if w <= 0.0 || h <= 0.0 {
             continue;
         }
-        let scale = display_scale_for_sck_rect(frame);
-        let width = even_dimension_from_f64(frame.size.width * scale);
-        let height = even_dimension_from_f64(frame.size.height * scale);
+        let scale = display_scale_for_rect(x, y, w, h);
+        let width = even_dimension_from_f64(w * scale);
+        let height = even_dimension_from_f64(h * scale);
         if width < super::encode::pool::MIN_LAYER_DIM || height < super::encode::pool::MIN_LAYER_DIM
         {
             continue;
         }
-        let title = window
-            .title()
+        let title = window_dict_string(&dict, "kCGWindowName")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let app_name = window
-            .owning_application()
-            .map(|app| app.application_name().trim().to_string())
+        let app_name = window_dict_string(&dict, "kCGWindowOwnerName")
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         let name = match (app_name.as_deref(), title.as_deref()) {
             (Some(app), Some(title)) => format!("{app}: {title}"),
@@ -497,6 +573,73 @@ fn enumerate_window_display_infos(content: &SCShareableContent) -> Vec<super::Di
     windows
 }
 
+/// True when a ScreenCaptureKit failure is the TCC screen-recording denial.
+///
+/// The two shapes Apple surfaces for a missing/invalid grant:
+/// `SCShareableContent::get` fails with "The user declined TCCs for
+/// application, window, display capture", and some paths report
+/// "no shareable content" instead. Matched case-insensitively on the
+/// stable fragments so wording drift around them doesn't break detection.
+fn is_tcc_denied_sck_error(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("declined tcc") || lower.contains("no shareable content")
+}
+
+/// Enrich a ScreenCaptureKit capture-start error with actionable guidance
+/// when it is the TCC denial; every other error passes through unchanged.
+///
+/// The denial is ambiguous at this layer: either Screen Recording was never
+/// granted, or a previous grant was silently invalidated because the binary
+/// was rebuilt/re-signed under a different code-signing identity — macOS
+/// keys TCC grants to the app's signing requirement, and System Settings
+/// keeps showing the toggle ON either way. The appended guidance spells out
+/// both causes and the recovery steps (kept in sync with the re-grant
+/// warning in scripts/bundle-macos.sh).
+fn enrich_sck_capture_error(raw: &str) -> String {
+    if !is_tcc_denied_sck_error(raw) {
+        return raw.to_string();
+    }
+    format!(
+        "{raw} — Screen Recording permission is missing, or a previous grant \
+         was invalidated by a rebuilt/re-signed binary (macOS keys TCC grants \
+         to the app's code signature; System Settings can still show the \
+         toggle ON). Fix: System Settings → Privacy & Security → Screen & \
+         System Audio Recording (\"Screen Recording\" on older macOS) → \
+         toggle Intendant off and back on (re-add it if missing), then \
+         relaunch Intendant — grants are only re-read at launch."
+    )
+}
+
+/// Pop the system Screen Recording prompt at most once per process.
+///
+/// `CGRequestScreenCaptureAccess` shows the "would like to record this
+/// computer's screen" dialog only when the app has no recorded TCC decision
+/// yet, and otherwise just returns the current verdict — so calling it on
+/// the first TCC-denied capture failure gives a fresh install the native
+/// prompt without nagging an already-denied user on every retry. Safe
+/// wrapper from the already-linked `core-graphics` crate (no new FFI).
+fn request_screen_capture_access_once() {
+    static REQUEST: std::sync::Once = std::sync::Once::new();
+    REQUEST.call_once(|| {
+        let granted = core_graphics::access::ScreenCaptureAccess.request();
+        eprintln!(
+            "[display/macos] requested Screen Recording access (granted: {granted}); \
+             re-granting requires relaunching Intendant"
+        );
+    });
+}
+
+/// Wrap an SCK capture-start failure into `CallerError::Display`, enriching
+/// TCC denials with recovery guidance and (once per process) requesting
+/// screen-capture access so the system prompt appears when it can.
+fn sck_capture_error(context: &str, err: impl std::fmt::Display) -> CallerError {
+    let raw = format!("{context}: {err}");
+    if is_tcc_denied_sck_error(&raw) {
+        request_screen_capture_access_once();
+    }
+    CallerError::Display(enrich_sck_capture_error(&raw))
+}
+
 #[async_trait]
 impl DisplayBackend for MacOSBackend {
     async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
@@ -511,7 +654,7 @@ impl DisplayBackend for MacOSBackend {
             .with_on_screen_windows_only(matches!(self.target, CaptureTarget::Window(_)))
             .with_exclude_desktop_windows(true)
             .get()
-            .map_err(|e| CallerError::Display(format!("SCShareableContent::get: {e}")))?;
+            .map_err(|e| sck_capture_error("SCShareableContent::get", e))?;
 
         let resolved = resolve_capture_target(&content, self.target)?;
         let width = resolved.width;
@@ -647,7 +790,7 @@ impl DisplayBackend for MacOSBackend {
 
         stream
             .start_capture()
-            .map_err(|e| CallerError::Display(format!("start_capture: {e}")))?;
+            .map_err(|e| sck_capture_error("start_capture", e))?;
 
         *self.capture.lock().await = Some(CaptureState {
             stream,
@@ -894,6 +1037,44 @@ mod tests {
         let point = geometry.point(0.5, 0.25);
         assert_eq!(point.x, 250.0);
         assert_eq!(point.y, 300.0);
+    }
+
+    #[test]
+    fn tcc_denial_detection_matches_known_shapes_case_insensitively() {
+        // Apple's observed wording for the two denial shapes.
+        assert!(is_tcc_denied_sck_error(
+            "The user declined TCCs for application, window, display capture"
+        ));
+        assert!(is_tcc_denied_sck_error("no shareable content available"));
+        assert!(is_tcc_denied_sck_error("Error: No Shareable Content"));
+        // Unrelated SCK failures must not classify as denials.
+        assert!(!is_tcc_denied_sck_error("connection interrupted"));
+        assert!(!is_tcc_denied_sck_error("the stream was stopped"));
+        assert!(!is_tcc_denied_sck_error(""));
+    }
+
+    #[test]
+    fn tcc_denied_errors_keep_original_text_and_gain_guidance() {
+        let raw = "SCShareableContent::get: The user declined TCCs for \
+                   application, window, display capture";
+        let enriched = enrich_sck_capture_error(raw);
+        assert!(
+            enriched.starts_with(raw),
+            "original error text must be preserved verbatim: {enriched}"
+        );
+        // The guidance must name both causes and the recovery path.
+        assert!(enriched.contains("rebuilt/re-signed"));
+        assert!(enriched.contains("Privacy & Security"));
+        assert!(enriched.contains("Screen & System Audio Recording"));
+        assert!(enriched.contains("relaunch"));
+    }
+
+    #[test]
+    fn non_tcc_errors_pass_through_unchanged() {
+        let raw = "SCShareableContent::get: connection interrupted";
+        assert_eq!(enrich_sck_capture_error(raw), raw);
+        let raw = "start_capture: stream failed to start";
+        assert_eq!(enrich_sck_capture_error(raw), raw);
     }
 
     #[test]

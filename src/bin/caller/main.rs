@@ -9,6 +9,8 @@ pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
 mod browser_workspace;
+#[path = "../../build_info.rs"]
+mod build_info;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;
@@ -19,31 +21,38 @@ mod credential_audit;
 mod credential_egress;
 mod credential_leases;
 mod ctl;
+mod cu_observation;
+mod cu_readiness;
 mod daemon_identity;
 mod daemon_log_tee;
 mod dashboard_control;
 mod debug;
 mod diagnostics;
-pub(crate) use intendant_display as display;
+mod display_requests;
 pub(crate) use intendant_core::error;
+pub(crate) use intendant_display as display;
+mod display_peer_ids;
 mod event;
 mod external_agent;
 mod external_wrapper_index;
 mod file_watcher;
-mod fleet_cert;
 mod fission_ledger;
 mod fission_lifecycle;
+mod fleet_cert;
 pub(crate) use intendant_core::frames;
 mod frontend;
 mod gateway_routes;
 mod global_store;
+mod hosted_verify;
 pub(crate) use intendant_core::knowledge;
+mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+mod message_search;
 mod peer;
 mod peer_file_transfer;
 pub(crate) use intendant_platform::platform;
@@ -63,8 +72,9 @@ mod session_log;
 mod session_names;
 mod session_supervisor;
 mod session_vitals;
-mod usage_rail;
 mod setup;
+mod shared_view_lifecycle;
+mod usage_rail;
 pub(crate) use intendant_core::skills;
 mod sub_agent;
 mod task_dispatch;
@@ -77,6 +87,7 @@ mod transcription;
 mod transfer_store;
 mod types;
 mod upload_store;
+mod vault_deposits;
 mod vault_store;
 mod virtual_display;
 pub(crate) use intendant_platform::vision;
@@ -120,7 +131,7 @@ mod display_glue;
 pub(crate) use display_glue::*;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
-use conversation::Conversation;
+use conversation::{Conversation, MessageProvenance};
 use error::CallerError;
 use event::{AppEvent, ControlMsg, EventBus};
 use project::Project;
@@ -134,6 +145,19 @@ use std::time::Duration;
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
+
+/// The legacy browser-key owner bootstrap is retired on every CLI entry point,
+/// including the service install/supervisor boundaries that bypass the normal
+/// daemon flag parser.
+const RETIRED_OWNER_ERROR: &str =
+    "--owner is retired: browser identity keys cannot anchor root authority. \
+Run `intendant access setup`, then use the generated mTLS certificate over an \
+independently verified direct daemon URL. Loopback access remains local root; \
+this release has no signed-native remote anchor.";
+
+fn is_retired_owner_arg(arg: &str) -> bool {
+    arg == "--owner" || arg.starts_with("--owner=")
+}
 
 /// Session log directory for the panic hook to write panic.log into.
 /// Set once when a session starts; read by the panic hook on crash.
@@ -176,14 +200,23 @@ fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -
 ///
 /// This is the single source of truth for the dispatch log line: it lives in
 /// the backend (where the task is actually accepted for processing) rather
-/// than in any frontend, so the log is consistent across TUI, headless, and
-/// daemon modes regardless of which interface originated the task.
+/// than in any frontend, so the log is consistent across dashboard, MCP,
+/// JSON, and headless daemon modes regardless of which interface originated
+/// the task.
 fn emit_task_dispatched_log(
     bus: &EventBus,
     session_log: &SharedSessionLog,
     task: &str,
     attachment_count: usize,
 ) {
+    // Synthesized empty envelopes (the persistent lane's idle queued-steer
+    // flush) are delivery plumbing, not task acceptance: logging them
+    // printed a contentless "[runtime] Task dispatched: " row per flush.
+    // The external CLI lane's flush logs nothing — match it. A task that is
+    // only attachments still logs (the attachment suffix carries meaning).
+    if task.trim().is_empty() && attachment_count == 0 {
+        return;
+    }
     let suffix = if attachment_count > 0 {
         format!(
             " with {} attachment{}",
@@ -245,10 +278,6 @@ struct CliFlags {
     /// to wildcard dual-stack when available. Use 127.0.0.1 with --no-tls
     /// for local automation.
     web_bind: Option<IpAddr>,
-    /// --owner <CLIENT-KEY-FINGERPRINT>: seed a root grant pinned to that
-    /// browser identity key at startup (the install.sh bootstrap: authority
-    /// minted locally from first boot, no secrets on the wire).
-    owner: Option<String>,
     /// --no-tls: Explicitly serve the web dashboard over plain HTTP. The
     /// dashboard defaults to mTLS; this flag is the debug/programmatic escape
     /// hatch for callers that knowingly want cleartext.
@@ -256,9 +285,10 @@ struct CliFlags {
     /// --allow-public-plaintext: Acknowledge that --no-tls on a wildcard
     /// listener can expose the dashboard on public interfaces.
     allow_public_plaintext: bool,
-    /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring
-    /// browser/client certificates. Installed access certs are preferred when
-    /// present, otherwise a self-signed cert is minted at startup.
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring a
+    /// certificate at the TLS handshake. Certless dashboard authority remains
+    /// loopback-only; remote protected routes still require a verified client
+    /// certificate or authenticated peer identity.
     tls: bool,
     /// --tls-cert <PATH>: PEM cert (chain) overriding default cert selection.
     /// Must be paired with `--tls-key`. Implies `--tls`.
@@ -315,13 +345,12 @@ fn print_help() {
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle start runs the daemon)");
     println!("    --bind <ADDR>         IP address for the web dashboard listener");
-    println!("    --owner <FINGERPRINT> Pin root authority to a browser client key at startup (install bootstrap)");
     println!(
         "    --no-tls              Serve the web dashboard over plain HTTP (explicit debug escape)"
     );
     println!("    --allow-public-plaintext  Allow --no-tls wildcard bind when public IPs exist");
     println!(
-        "    --tls                 Serve HTTPS/WSS without requiring browser client certificates"
+        "    --tls                 Serve HTTPS/WSS; certless dashboard authority stays loopback-only"
     );
     println!("    --tls-cert <PATH>     PEM cert overriding default cert selection (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
@@ -329,7 +358,7 @@ fn print_help() {
         "    --mtls                Require client certificates signed by the Intendant access CA (default)"
     );
     println!("    --mtls-ca <PATH>      PEM CA bundle for --mtls client certificate verification");
-    println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
+    println!("    --no-web              Disable web dashboard and run headless in the terminal");
     println!("    --transcription       Enable user speech transcription");
     println!(
         "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
@@ -343,10 +372,14 @@ fn print_help() {
         "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
     );
     println!("    --help, -h            Show this help message");
+    println!(
+        "    --version, -V         Print version and build provenance (commit, timestamp, target)"
+    );
     println!();
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    hosted-verify         Verify a rendezvous serves the code its transparency log commits to (--releases: app release artifacts)");
     println!("    org                   Create or print a local org root key");
     println!("    peer                  Pair and configure federated Intendant peers");
     println!("    service               Install, remove, inspect, or run the boot service");
@@ -379,9 +412,28 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     parse_cli_flags_from(env::args().skip(1).collect())
 }
 
-/// Testable core of [`parse_cli_flags`]: `args` is argv minus the binary
-/// name.
+enum CliParseOutcome {
+    Flags(Box<CliFlags>),
+    Help,
+}
+
+/// Testable wrapper for normal process startup. The reusable parser below
+/// reports help as data so service installation can validate daemon argv
+/// without accidentally exiting the installer process.
 fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
+    match parse_cli_flags_outcome(args)? {
+        CliParseOutcome::Flags(flags) => Ok(*flags),
+        CliParseOutcome::Help => {
+            print_help();
+            std::process::exit(0);
+        }
+    }
+}
+
+/// Pure CLI parser: `args` is argv minus the binary name. Service mode uses
+/// this same parser before persisting/spawning daemon arguments, so value
+/// consumption and the `--` task delimiter cannot drift from real startup.
+fn parse_cli_flags_outcome(args: Vec<String>) -> Result<CliParseOutcome, CallerError> {
     let mut flags = CliFlags {
         task: None,
         task_file: None,
@@ -402,7 +454,6 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
         web_bind: None,
-        owner: None,
         no_tls: false,
         allow_public_plaintext: false,
         tls: false,
@@ -425,7 +476,10 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
-                print_help();
+                return Ok(CliParseOutcome::Help);
+            }
+            "--version" | "-V" => {
+                println!("{}", build_info::version_line("intendant"));
                 std::process::exit(0);
             }
             "--provider" => {
@@ -564,30 +618,8 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
                     return Err(CallerError::Config("Missing value for --bind".to_string()));
                 }
             }
-            "--owner" => {
-                if i + 1 < args.len() {
-                    // Fail a typo at the flag, not after it's pinned: an
-                    // install whose owner fingerprint is garbage is an
-                    // unclaimable box that believes it's owned.
-                    let value = args[i + 1].trim().to_string();
-                    if !access::client_key::is_client_key_fingerprint(&value) {
-                        let shown: String = if value.chars().count() > 48 {
-                            value.chars().take(48).chain("…".chars()).collect()
-                        } else {
-                            value.clone()
-                        };
-                        return Err(CallerError::Config(format!(
-                            "--owner: '{shown}' is not a client-key fingerprint (expected 43 \
-                             base64url characters — copy it from the dashboard's Access drawer)"
-                        )));
-                    }
-                    flags.owner = Some(value);
-                    i += 2;
-                } else {
-                    return Err(CallerError::Config(
-                        "Missing value for --owner (a client-key fingerprint)".to_string(),
-                    ));
-                }
+            arg if is_retired_owner_arg(arg) => {
+                return Err(CallerError::Config(RETIRED_OWNER_ERROR.to_string()));
             }
             "--no-tls" => {
                 flags.no_tls = true;
@@ -720,7 +752,7 @@ fn parse_cli_flags_from(args: Vec<String>) -> Result<CliFlags, CallerError> {
     }
     validate_tls_cli_flags(&flags)?;
 
-    Ok(flags)
+    Ok(CliParseOutcome::Flags(Box::new(flags)))
 }
 
 /// Wire the fission branch lifecycle into a startup path: spawn the bus
@@ -734,7 +766,7 @@ fn start_fission_lifecycle(
     bus: &EventBus,
     session_log: &SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
-    let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
+    let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus);
     match fission_lifecycle::rehydrate_from_logs(&platform::intendant_home().join("logs")) {
         Ok(0) => {}
         Ok(count) => slog(session_log, |l| {
@@ -972,9 +1004,9 @@ fn batch_is_all_ask_human(json_str: &str) -> bool {
         .and_then(|v| v.as_array())
         .map(|commands| {
             !commands.is_empty()
-                && commands.iter().all(|cmd| {
-                    cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman")
-                })
+                && commands
+                    .iter()
+                    .all(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
         })
         .unwrap_or(false)
 }
@@ -1283,11 +1315,11 @@ async fn start_external_display_recordings(
 /// Side effects a user approval carries beyond unblocking the waiting
 /// command: dedup recording for plain approvals, autonomy escalation for
 /// approve-all, and the first DisplayControl approval granting user-display
-/// access session-wide. Every approval surface (JSON stdin slot, TUI/MCP
+/// access session-wide. Every approval surface (JSON stdin, dashboard/MCP
 /// registry) must apply these identically, or an approval "succeeds" and
 /// the action still fails its grant check afterwards.
 /// Shared side effects for NATIVE runtime approvals, applied identically
-/// by every surface (TUI Enter, web, MCP): Approve records the command
+/// by every surface (JSON stdin, web, MCP): Approve records the command
 /// for dedup, ApproveAll raises global autonomy to Full, DisplayControl
 /// grants user display access.
 ///
@@ -1386,6 +1418,43 @@ fn normalize_command_batch(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idle queued-steer flush synthesizes an EMPTY task envelope per
+    /// flush; logging it produced spurious "[runtime] Task dispatched: "
+    /// rows. Empty task + no attachments is plumbing, not acceptance —
+    /// while an attachments-only task still logs.
+    #[test]
+    fn task_dispatched_log_skips_empty_synthesized_envelopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = std::sync::Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(dir.path().join("session")).unwrap(),
+        ));
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+
+        emit_task_dispatched_log(&bus, &session_log, "", 0);
+        emit_task_dispatched_log(&bus, &session_log, "   ", 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty synthesized envelope must not log a dispatch row"
+        );
+
+        emit_task_dispatched_log(&bus, &session_log, "", 2);
+        match rx.try_recv().expect("attachment-only dispatch logs") {
+            AppEvent::LogEntry { content, .. } => {
+                assert!(content.contains("with 2 attachments"), "{content}");
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        emit_task_dispatched_log(&bus, &session_log, "real task", 0);
+        match rx.try_recv().expect("real dispatch logs") {
+            AppEvent::LogEntry { content, .. } => {
+                assert!(content.contains("real task"), "{content}");
+            }
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+    }
 
     #[test]
     fn extract_json_from_json_fence() {
@@ -1518,11 +1587,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_drop_turns() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"drop_turns":[1,2]}}"#;
@@ -1540,11 +1609,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_summarize() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}],"context":{"summarize":{"turns":[1,2,3,4],"summary":"Setup phase"}}}"#;
@@ -1559,11 +1628,11 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_context_only() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
-        conv.add_user("u2".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u2".to_string());
         conv.add_assistant("a2".to_string());
-        conv.add_user("u3".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u3".to_string());
         conv.add_assistant("a3".to_string());
 
         let json = r#"{"commands":[],"context":{"drop_turns":[1,2]}}"#;
@@ -1575,7 +1644,7 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_no_context() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
 
         let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
@@ -1588,7 +1657,7 @@ Also: {"source": "bare"}"#;
     #[test]
     fn apply_context_directives_empty_commands_no_context() {
         let mut conv = Conversation::new("sys".to_string(), 128_000);
-        conv.add_user("u1".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "u1".to_string());
         conv.add_assistant("a1".to_string());
 
         let json = r#"{"commands":[]}"#;
@@ -1741,7 +1810,6 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -1898,14 +1966,21 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn parse_cli_flags_value_flags_accept_dash_leading_values() {
-        // Value positions must never reject a token for its leading dash:
-        // --owner takes a base64url fingerprint, 1 in 64 of which starts
-        // with '-'.
+    fn parse_cli_flags_retired_owner_fails_with_mtls_migration_guidance() {
         let fingerprint = "-vyeJaE3hyqm4J45K5j_sVTXAAAABBBBCCCCDDDDEEE";
         assert_eq!(fingerprint.len(), 43);
-        let flags = parse_cli_flags_from(cli(&["--owner", fingerprint])).unwrap();
-        assert_eq!(flags.owner.as_deref(), Some(fingerprint));
+        for argv in [
+            cli(&["--owner", fingerprint]),
+            cli(&[&format!("--owner={fingerprint}")]),
+        ] {
+            let error = match parse_cli_flags_from(argv) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("retired --owner must fail closed"),
+            };
+            assert!(error.contains("--owner is retired"), "{error}");
+            assert!(error.contains("intendant access setup"), "{error}");
+            assert!(error.contains("mTLS"), "{error}");
+        }
     }
 
     #[test]
@@ -1931,7 +2006,6 @@ Also: {"source": "bare"}"#;
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -1986,7 +2060,6 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -2029,7 +2102,6 @@ Also: {"source": "bare"}"#;
             web: true,
             web_port: 9000,
             web_bind: None,
-            owner: None,
             no_tls: false,
             allow_public_plaintext: false,
             tls: false,
@@ -2162,7 +2234,7 @@ Also: {"source": "bare"}"#;
         let mut events = bus.subscribe();
 
         // Plain approval records the command for dedup; a DisplayControl
-        // approval grants the user display session-wide. The TUI/MCP
+        // approval grants the user display session-wide. The dashboard/MCP
         // registry path used to skip both, so approving there left the
         // action failing its grant check afterwards.
         apply_user_approval(
@@ -2682,25 +2754,27 @@ Also: {"source": "bare"}"#;
             ),
         }
     }
-
 }
 
 /// Set up a fresh conversation with project context, memory, and skills (without a task).
 /// Used by both `setup_fresh_conversation` and the persistent presence conversation.
 fn setup_fresh_conversation_no_task(conv: &mut Conversation, project: &Project) {
     // Inject project root so the model knows which directory to work in
-    conv.add_user(format!(
-        "Working directory: {}\nThis is the project you should examine and modify. \
+    conv.add_user(
+        MessageProvenance::SystemInjection,
+        format!(
+            "Working directory: {}\nThis is the project you should examine and modify. \
 All relative paths and commands execute from this directory.",
-        project.root.display()
-    ));
+            project.root.display()
+        ),
+    );
     conv.add_assistant(
         "Understood. I will work within the specified project directory.".to_string(),
     );
 
     // Inject INTENDANT.md instructions
     if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
-        conv.add_user(instructions);
+        conv.add_user(MessageProvenance::SystemInjection, instructions);
         conv.add_assistant("Acknowledged. I will follow the project instructions.".to_string());
     }
 
@@ -2710,7 +2784,7 @@ All relative paths and commands execute from this directory.",
             let refs: Vec<&_> = kstore.entries.iter().collect();
             let msg = knowledge::format_for_injection(&refs);
             if !msg.is_empty() {
-                conv.add_user(msg);
+                conv.add_user(MessageProvenance::SystemInjection, msg);
                 conv.add_assistant(
                     "Acknowledged. I have loaded the project knowledge.".to_string(),
                 );
@@ -2722,32 +2796,34 @@ All relative paths and commands execute from this directory.",
     let discovered_skills = skills::discover_skills(Some(&project.root));
     if !discovered_skills.is_empty() {
         let catalog = skills::format_skill_catalog(&discovered_skills);
-        conv.add_user(catalog);
+        conv.add_user(MessageProvenance::SystemInjection, catalog);
         conv.add_assistant("Acknowledged. I see the available skills.".to_string());
     }
 }
 
 /// Set up a fresh conversation with project context, memory, skills, and task.
 #[allow(dead_code)]
-fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) {
+fn setup_fresh_conversation(conv: &mut Conversation, project: &Project, task: &str) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
-    conv.add_user(task.to_string());
+    conv.add_user(MessageProvenance::Task, task.to_string())
 }
 
 /// Set up a fresh conversation with project context, memory, skills, task, and
 /// optional user-attached images.  When images are present, they are added to
 /// the same user message as the task so the model sees them as inline context.
+/// Returns the seq of the task message, so callers can emit its canonical
+/// `conversation_message` record (this helper has no session-log handle).
 fn setup_fresh_conversation_with_attachments(
     conv: &mut Conversation,
     project: &Project,
     task: &str,
     images: Vec<conversation::ImageData>,
-) {
+) -> u64 {
     setup_fresh_conversation_no_task(conv, project);
     if images.is_empty() {
-        conv.add_user(task.to_string());
+        conv.add_user(MessageProvenance::Task, task.to_string())
     } else {
-        conv.add_user_with_images(task.to_string(), images);
+        conv.add_user_with_images(MessageProvenance::Task, task.to_string(), images)
     }
 }
 
@@ -2827,6 +2903,25 @@ pub fn spawn_user_display_listener(
                         display_id,
                         "capture lost",
                     );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // A missed grant/revoke/capture-loss leaves no trustworthy
+                    // lifecycle state. Fail closed: registry drain invokes the
+                    // synchronous input-authority observer before any stale
+                    // session can be looked up again; stop captures and Xvfb
+                    // guards outside the registry lock. The user can explicitly
+                    // re-open the displays after the event stream recovers.
+                    eprintln!(
+                        "[user_display] lifecycle listener lagged by {skipped} events; \
+                         closing all display sessions fail-closed"
+                    );
+                    let sessions = session_registry.write().await.drain();
+                    virtual_display_guards.clear();
+                    for session in sessions {
+                        tokio::spawn(async move {
+                            session.stop().await;
+                        });
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 _ => {}
@@ -3157,6 +3252,16 @@ async fn main() -> Result<(), CallerError> {
         };
     }
 
+    // Intercept `intendant hosted-verify` — the out-of-band code-transparency
+    // check against a rendezvous (docs/src/self-hosted-rendezvous.md). Like
+    // `org`, a local path with no project or provider setup: deliberately
+    // runnable from any machine, since page JS can never honestly
+    // self-verify the origin that serves it.
+    if env::args().nth(1).as_deref() == Some("hosted-verify") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(hosted_verify::run_cli(argv).await);
+    }
+
     // Intercept `intendant service <action>` — install/remove/inspect the
     // boot service for this binary (native supervisor per platform:
     // systemd / launchd / Task Scheduler / cron @reboot). Local path, no
@@ -3170,23 +3275,19 @@ async fn main() -> Result<(), CallerError> {
     // Intercept `intendant access <action>` before the main runtime setup.
     // This is a local certificate/enrollment path with no project, no .env,
     // and no provider selection.
+    if env::args().nth(1).as_deref() == Some("vault") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        std::process::exit(vault_deposits::run_vault_cli(argv).await);
+    }
     if env::args().nth(1).as_deref() == Some("access") {
-        #[cfg(not(target_os = "windows"))]
-        {
-            let argv: Vec<String> = env::args().skip(2).collect();
-            return match access::run(argv).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1);
-                }
-            };
-        }
-        #[cfg(target_os = "windows")]
-        {
-            eprintln!("error: `intendant access` is not supported on Windows yet");
-            std::process::exit(1);
-        }
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match access::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // Intercept `intendant peer <action>` before normal project/provider
@@ -3266,6 +3367,35 @@ async fn main() -> Result<(), CallerError> {
     if let Some(ref m) = flags.model {
         env::set_var("MODEL_NAME", m);
     }
+    // Idle web/dashboard startup defaults to the daemon path (the session
+    // supervisor owns all launches). Compute the execution shape before
+    // applying config-derived env so a projectless daemon can first load its
+    // durable machine-wide defaults.
+    let web_daemon_requested =
+        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags);
+    // Projectless: a daemon launched from a directory with no project marker
+    // must not adopt cwd as its sandbox/watcher/session root. It does still
+    // load daemon-wide defaults from `<state-root>/intendant.toml`; config
+    // scope and project scope deliberately remain separate.
+    let projectless_daemon = web_daemon_requested && !project_has_marker;
+    let daemon_project_root: Option<PathBuf> = (!projectless_daemon).then(|| project.root.clone());
+    if projectless_daemon {
+        let settings_root = project::daemon_settings_config_root();
+        project.config = Project::from_root(settings_root.clone())?.config;
+        eprintln!(
+            "Projectless daemon: {} has no project marker (.git or intendant.toml) — \
+             running without a default project; sessions choose their own project directory; \
+             daemon defaults load from {}/intendant.toml",
+            project.root.display(),
+            settings_root.display()
+        );
+    }
+    // Synthetic display for headless test rigs (INTENDANT_MOCK_DISPLAY=
+    // synthetic; fail-closed: honored only under PROVIDER=mock). Evaluated
+    // here — after the .env load and the --provider override settle the
+    // provider, and before any display machinery exists (the Windows
+    // user-display auto-activation at daemon startup included).
+    display_glue::arm_synthetic_display_if_requested();
     // Apply project model config when CLI/env did not override.
     if env::var("MODEL_CONTEXT_WINDOW").is_err() {
         if let Some(ctx) = project.config.model.context_window {
@@ -3276,30 +3406,6 @@ async fn main() -> Result<(), CallerError> {
         if let Some(max_out) = project.config.model.max_output_tokens {
             env::set_var("MAX_OUTPUT_TOKENS", max_out.to_string());
         }
-    }
-    // Idle web/dashboard startup defaults to the daemon path (the session
-    // supervisor owns all launches). Computed here — from flags only, which
-    // are not mutated below — because the daemon shape decides resume
-    // ownership, the sandbox write scope, and whether a markerless cwd
-    // becomes a project at all.
-    let web_daemon_requested =
-        should_start_idle_web_daemon(!flags.no_web && !flags.mcp && !flags.json_output, &flags);
-    // Projectless: a daemon launched from a directory with no project marker
-    // (.git / intendant.toml — `project::root_has_project_marker`) runs
-    // without a project instead of adopting cwd; an installed app or service
-    // otherwise inherits an accident of launch directory as its sandbox
-    // scope, watcher root, and default session project. CLI (headless/MCP)
-    // invocations keep cwd-as-project — correct for `intendant "task"`
-    // inside a repo.
-    let projectless_daemon = web_daemon_requested && !project_has_marker;
-    let daemon_project_root: Option<PathBuf> =
-        (!projectless_daemon).then(|| project.root.clone());
-    if projectless_daemon {
-        eprintln!(
-            "Projectless daemon: {} has no project marker (.git or intendant.toml) — \
-             running without a default project; sessions choose their own project directory",
-            project.root.display()
-        );
     }
     // Create or resume session log.
     //
@@ -3408,28 +3514,19 @@ async fn main() -> Result<(), CallerError> {
 
     configure_sandbox_env(&flags, &project, &log_dir, daemon_project_root.as_deref());
 
-    // --owner bootstrap: pin root authority to the given browser key
-    // before any surface comes up. Failing this with the flag present is
-    // fatal — an install whose only authority path silently failed would
-    // be an unclaimable box.
-    if let Some(owner) = flags.owner.as_deref() {
-        let cert_dir = access::backend::select_backend().cert_dir();
-        match access::iam::seed_owner_bootstrap_grant(&cert_dir, owner) {
-            Ok(true) => eprintln!("[access] owner bootstrap: root grant pinned to client key"),
-            Ok(false) => eprintln!("[access] owner bootstrap: client key already holds root"),
-            Err(e) => {
-                return Err(CallerError::Config(format!(
-                    "--owner bootstrap failed: {e}"
-                )));
-            }
-        }
-    }
-
     // Credential custody: leases never survive a restart, so stale
     // materialized auth files (a crash's leftovers) are deleted before
     // anything can spawn an external agent; the timer keeps expiry
     // deleting materializations even when the lease store sees no calls.
     credential_leases::startup_materialization_sweep();
+    // Message-search retention: expired shards die at boot (plan §6 —
+    // the sweep's own GC rides a slow cadence).
+    message_search::startup_gc();
+    // The message-search indexer: a 30s cursor-driven sweep over this
+    // box's session logs, Codex/Claude homes (including leased-active
+    // ones), and staged lease remnants. First sweep runs one interval
+    // after boot, so one-shot CLI runs exit before paying for it.
+    message_search::spawn_indexer();
     tokio::spawn(async {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3570,7 +3667,7 @@ async fn main() -> Result<(), CallerError> {
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
              (cleartext HTTP/WS connections are refused){}",
             if web_tls_client_cert_required {
-                "; mTLS client certificates are required except for peer access and Connect bootstrap requests"
+                "; mTLS client certificates are required except for peer access and public Connect bootstrap/status requests"
             } else {
                 ""
             }
@@ -3602,8 +3699,9 @@ async fn main() -> Result<(), CallerError> {
                 );
             } else {
                 eprintln!(
-                    "Note: starting without a model provider — AI features stay off until an API key is configured. \
-                     The dashboard, display control, and session browsing still work.",
+                    "Note: starting without a model provider — the built-in agent stays off until an API key is configured. \
+                     External agents signed in with their own accounts (Claude Code, Codex) still work, \
+                     as do the dashboard, display control, and session browsing.",
                 );
             }
             slog(&session_log, |l| {

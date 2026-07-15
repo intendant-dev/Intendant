@@ -102,14 +102,24 @@ fn format_agent_output_with_stderr(stdout: &str, stderr: &str) -> String {
 pub struct IntendantServer {
     state: SharedMcpState,
     bus: EventBus,
+    /// The home dir persisted-session lookups resolve against. Resolved
+    /// once at construction (the MCP transport edge); tests inject a temp
+    /// home via [`IntendantServer::new_with_home`] so fixtures never read
+    /// or write the machine's real `~/.intendant` store.
+    home: std::path::PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
 impl IntendantServer {
     pub fn new(state: SharedMcpState, bus: EventBus) -> Self {
+        Self::new_with_home(state, bus, crate::platform::home_dir())
+    }
+
+    pub fn new_with_home(state: SharedMcpState, bus: EventBus, home: std::path::PathBuf) -> Self {
         Self {
             state,
             bus,
+            home,
             tool_router: Self::tool_router(),
         }
     }
@@ -329,9 +339,7 @@ impl IntendantServer {
                 )?;
                 Ok(match self.post_session_note_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
-                    Err(message) => {
-                        text_tool_error(format!("post_session_note failed: {message}"))
-                    }
+                    Err(message) => text_tool_error(format!("post_session_note failed: {message}")),
                 })
             }
             "ask_user" => {
@@ -490,6 +498,18 @@ impl IntendantServer {
                 let params = parse_params::<RevokeUserDisplayParams>(args)?;
                 Ok(text_tool_result(self.revoke_user_display(params).await))
             }
+            "request_user_display" => {
+                // The doorbell: callable by Scoped callers by design — the
+                // tool only asks; the user's dashboard click is what mints
+                // the grant (control plane ResolveDisplayRequest arm).
+                let Parameters(params) = parse_params::<RequestUserDisplayParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(
+                    self.request_user_display_for_session(params, session_id)
+                        .await,
+                ))
+            }
             "show_shared_view" => {
                 let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
                 Ok(text_tool_result(
@@ -501,6 +521,13 @@ impl IntendantServer {
                 let Parameters(params) = parse_params::<HideSharedViewParams>(args)?;
                 Ok(text_tool_result(
                     self.hide_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "clear_shared_view_focus" => {
+                let Parameters(params) = parse_params::<ClearSharedViewFocusParams>(args)?;
+                Ok(text_tool_result(
+                    self.clear_shared_view_focus_for_session(params, session_id)
+                        .await,
                 ))
             }
             "focus_shared_view" => {
@@ -544,6 +571,12 @@ impl IntendantServer {
                     .await
                     .map_err(|e| e.to_string())
             }
+            "display_readiness" => {
+                let params = parse_params::<DisplayReadinessParams>(args)?;
+                self.display_readiness_as_caller(params, caller)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
                 self.execute_cu_actions_with_output(
@@ -563,8 +596,10 @@ impl IntendantServer {
                 Ok(text_tool_result(self.read_frame(params).await))
             }
             "spawn_live_audio" => {
-                let params = parse_params::<SpawnLiveAudioParams>(args)?;
-                Ok(text_tool_result(self.spawn_live_audio(params).await))
+                let Parameters(params) = parse_params::<SpawnLiveAudioParams>(args)?;
+                Ok(text_tool_result(
+                    self.spawn_live_audio_for_session(params, session_id).await,
+                ))
             }
             "list_peers" => Ok(text_tool_result(self.list_peers().await)),
             "peer_send_message" => {
@@ -795,6 +830,29 @@ async fn active_display_session_resolution(
     Some(session.resolution())
 }
 
+/// Attach the user-session OS readiness gap to a user-display result when
+/// any OS layer is not ready (CU-02): Intendant authority (`already_granted`
+/// / an approved click) is only one layer — TCC permissions, portal
+/// sessions, and display presence can still block actual CU, and the
+/// operator must see that in the same answer. No-op when everything is
+/// ready. Probes live state; never cached.
+async fn attach_os_readiness_gap(
+    result: &mut serde_json::Value,
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) {
+    let readiness = crate::cu_readiness::probe_user_session_os_readiness(session_registry).await;
+    if readiness.ready {
+        return;
+    }
+    result["os_readiness"] = readiness.gap_json();
+    result["readiness_note"] = serde_json::json!(
+        "the display grant is Intendant authority only — OS layers listed in \
+         os_readiness are still blocking; fix them (see each layer's fix) or CU \
+         calls will fail. Check again with display_readiness \
+         (or `intendant ctl display status`)."
+    );
+}
+
 async fn clear_wayland_user_session_activation_pending_after_capture(
     state: &SharedMcpState,
     target: crate::computer_use::DisplayTarget,
@@ -849,33 +907,40 @@ impl UserSessionDisplayActivationRequest {
     }
 }
 
-pub(crate) fn shared_view_display_target(
-    display_target: Option<String>,
-    display_id: Option<u32>,
-) -> Option<String> {
-    display_target
-        .map(|target| target.trim().to_string())
-        .filter(|target| !target.is_empty())
-        .or_else(|| display_id.map(|id| format!(":{}", id)))
+/// Canonical dashboard wire representation for an already-resolved display
+/// target. Shared-view callers that omit their target must resolve it before
+/// emitting an event: otherwise the browser has to guess among its streamed
+/// displays, and `capture` can show one display while screenshotting another.
+pub(crate) fn concrete_shared_view_target(
+    target: crate::computer_use::DisplayTarget,
+) -> (String, u32) {
+    match target {
+        crate::computer_use::DisplayTarget::UserSession => ("user_session".to_string(), 0),
+        crate::computer_use::DisplayTarget::Virtual { id } => (format!(":{id}"), id),
+    }
 }
 
-pub(crate) fn shared_view_display_id(
-    display_target: Option<&str>,
+/// Resolve the two public shared-view target aliases into one canonical
+/// target/id pair. `display_id` is documented as the preferred field, so it
+/// wins when both are supplied; deriving both outputs from that one choice
+/// prevents dashboard activation and screenshot capture from diverging.
+pub(crate) fn resolve_concrete_shared_view_target(
+    display_target: Option<String>,
     display_id: Option<u32>,
-) -> Option<u32> {
-    if display_id.is_some() {
-        return display_id;
+) -> Option<(String, u32)> {
+    if let Some(id) = display_id {
+        let target = if id == 0 {
+            crate::computer_use::DisplayTarget::UserSession
+        } else {
+            crate::computer_use::DisplayTarget::Virtual { id }
+        };
+        return Some(concrete_shared_view_target(target));
     }
-    let target = display_target?.trim();
-    if target.eq_ignore_ascii_case("user_session") || target.eq_ignore_ascii_case("primary") {
-        return Some(0);
-    }
-    target
-        .strip_prefix(':')
-        .or_else(|| target.strip_prefix("display_"))
-        .unwrap_or(target)
-        .parse::<u32>()
-        .ok()
+
+    let target = display_target
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())?;
+    Some(concrete_shared_view_target(resolve_display_target(&target)))
 }
 
 pub(crate) fn shared_view_target_label(
@@ -925,7 +990,10 @@ fn shared_view_user_display_id(
         .map(str::trim)
         .filter(|target| !target.is_empty())
     else {
-        return Some(0);
+        // Omission means availability-aware auto-detection, never an
+        // implicit user-session request. Shared-view entry points resolve
+        // it before reaching this activation helper.
+        return None;
     };
     if target.eq_ignore_ascii_case("user_session")
         || target.eq_ignore_ascii_case("user")
@@ -959,7 +1027,11 @@ impl IntendantServer {
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
             {
-                hydrate_requested_session_status_from_logs(&mut s, requested_session_id);
+                hydrate_requested_session_status_from_logs(
+                    &self.home,
+                    &mut s,
+                    requested_session_id,
+                );
             }
             let target_session_id = session_id_override
                 .map(str::trim)
@@ -1020,6 +1092,13 @@ impl IntendantServer {
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
             let usage = s.usage_snapshot_for(Some(&session_id));
+            // Running-binary provenance (EV-02): the daemon's own embedded
+            // version line, so `intendant ctl status` can pin the exact
+            // revision serving this answer.
+            obj.insert(
+                "daemon_version".to_string(),
+                serde_json::Value::String(crate::build_info::version_line("intendant")),
+            );
             obj.insert(
                 "session_id".to_string(),
                 serde_json::Value::String(session_id.clone()),
@@ -1054,7 +1133,7 @@ impl IntendantServer {
         // Supervised parents log under `~/.intendant/logs/<id>/`, which is not
         // necessarily this server's primary log dir, so merge the ledger reads
         // across every candidate dir the requested session is known by.
-        let ledger_dirs = status_ledger_candidate_dirs(&log_dir, &session_id);
+        let ledger_dirs = status_ledger_candidate_dirs(&self.home, &log_dir, &session_id);
         if let Some(ledger) = merged_lineage_ledger_for_session(&ledger_dirs, &session_id) {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
@@ -1093,7 +1172,9 @@ impl IntendantServer {
         session_id: Option<&str>,
     ) -> String {
         let target_session_id = params.session_id.as_deref().or(session_id);
-        if let Some(entries) = read_persisted_log_entries_for_session(target_session_id, &params) {
+        if let Some(entries) =
+            read_persisted_log_entries_for_session(&self.home, target_session_id, &params)
+        {
             return serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
         }
 
@@ -1286,6 +1367,7 @@ impl IntendantServer {
                                 task: Some(params.task),
                                 direct: params.orchestrate.map(|orchestrate| !orchestrate),
                                 fork: false,
+                                relationship_kind: None,
                                 attachments: vec![],
                                 agent_command: target.agent_command,
                                 codex_sandbox: target.codex_sandbox,
@@ -1334,6 +1416,7 @@ impl IntendantServer {
                     display_target: params.display_target,
                     attachments: vec![],
                     follow_up_id: None,
+                    delegation_id: None,
                 }));
             if target_phase
                 .as_ref()
@@ -1366,6 +1449,7 @@ impl IntendantServer {
                     display_target: params.display_target,
                     attachments: vec![],
                     follow_up_id: None,
+                    delegation_id: None,
                 }));
             return "ok (CU task dispatched)".to_string();
         }
@@ -1586,7 +1670,7 @@ pub enum ToolCallerTrust {
 
 impl ToolCallerTrust {
     pub fn from_principal(principal: &crate::access::iam::AccessPrincipal) -> Self {
-        if principal.is_owner_surface() {
+        if principal.is_owner_surface() || principal.is_enrolled_root_mtls_user_client() {
             ToolCallerTrust::OwnerSurface
         } else {
             ToolCallerTrust::Scoped
@@ -1990,112 +2074,11 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
     }
 }
 
+/// The per-action status label shown to models: `ok` (effect verified),
+/// `injected` (dispatched to the OS, effect unverified — the honest ceiling
+/// for most input injection), or `failed`.
 fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
-    if result.success && result.error.is_none() {
-        "ok"
-    } else {
-        "failed"
-    }
-}
-
-/// Draw red crosshairs on a screenshot at click/double_click coordinates.
-/// Returns annotated base64 PNG, or the original if annotation fails.
-fn annotate_screenshot_with_clicks(
-    base64_png: &str,
-    actions: &[crate::computer_use::CuAction],
-) -> String {
-    use crate::computer_use::CuAction;
-
-    // Collect click coordinates
-    let clicks: Vec<(i32, i32)> = actions
-        .iter()
-        .filter_map(|a| match a {
-            CuAction::Click { x, y, .. }
-            | CuAction::DoubleClick { x, y, .. }
-            | CuAction::TripleClick { x, y, .. }
-            | CuAction::MouseDown { x, y, .. } => Some((*x, *y)),
-            _ => None,
-        })
-        .collect();
-
-    if clicks.is_empty() {
-        return base64_png.to_string();
-    }
-
-    // Decode PNG
-    let png_bytes =
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_png) {
-            Ok(b) => b,
-            Err(_) => return base64_png.to_string(),
-        };
-
-    let mut img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
-        Ok(i) => i.to_rgba8(),
-        Err(_) => return base64_png.to_string(),
-    };
-
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let red = image::Rgba([255u8, 0, 0, 255]);
-    let yellow = image::Rgba([255u8, 255, 0, 255]);
-    let arm = 20i32;
-    let thickness = 3i32;
-
-    for (cx, cy) in &clicks {
-        // Clamp to image bounds; use yellow for out-of-bounds clicks
-        let oob = *cx < 0 || *cx >= w || *cy < 0 || *cy >= h;
-        let color = if oob { yellow } else { red };
-        let dx = (*cx).max(0).min(w - 1);
-        let dy = (*cy).max(0).min(h - 1);
-
-        // Draw crosshair at clamped position
-        for offset in -arm..=arm {
-            for t in -thickness..=thickness {
-                let hx = dx + offset;
-                let hy = dy + t;
-                if hx >= 0 && hx < w && hy >= 0 && hy < h {
-                    img.put_pixel(hx as u32, hy as u32, color);
-                }
-                let vx = dx + t;
-                let vy = dy + offset;
-                if vx >= 0 && vx < w && vy >= 0 && vy < h {
-                    img.put_pixel(vx as u32, vy as u32, color);
-                }
-            }
-        }
-        // Draw circle (radius 12)
-        let r = 12i32;
-        for angle in 0..360 {
-            let rad = (angle as f64) * std::f64::consts::PI / 180.0;
-            let px = dx + (r as f64 * rad.cos()) as i32;
-            let py = dy + (r as f64 * rad.sin()) as i32;
-            for t in 0..=2 {
-                let px2 = px + t;
-                let py2 = py + t;
-                if px2 >= 0 && px2 < w && py2 >= 0 && py2 < h {
-                    img.put_pixel(px2 as u32, py2 as u32, color);
-                }
-            }
-        }
-
-        // Draw "OOB" indicator at top-left if out of bounds
-        if oob {
-            // Draw a solid yellow bar at the top of the image as a warning
-            for bx in 0..80i32 {
-                for by in 0..6i32 {
-                    if bx < w && by < h {
-                        img.put_pixel(bx as u32, by as u32, yellow);
-                    }
-                }
-            }
-        }
-    }
-
-    // Re-encode to PNG
-    let mut buf = std::io::Cursor::new(Vec::new());
-    if img.write_to(&mut buf, image::ImageFormat::Png).is_err() {
-        return base64_png.to_string();
-    }
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, buf.into_inner())
+    result.status.label()
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,9 +2151,65 @@ pub(crate) mod tests {
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
-    // Crate-wide (not module-local): tests in other modules mutate the same
-    // process environment, so a per-module lock would still race them.
-    pub(crate) use crate::test_support::TEST_ENV_LOCK;
+    #[test]
+    fn tool_caller_trust_admits_enrolled_root_mtls_but_not_root_compatible_callers() {
+        let mut root_mtls =
+            crate::access::iam::AccessPrincipal::mcp_token_holder("webrtc-datachannel");
+        root_mtls.id = "principal:human:alice".to_string();
+        root_mtls.kind = "human_user".to_string();
+        root_mtls.grant_id = Some("grant:alice:root".to_string());
+        root_mtls.authn_kind = Some("browser_mtls_cert".to_string());
+        root_mtls.authn_binding = Some("AA:BB:CC".to_string());
+        assert_eq!(
+            ToolCallerTrust::from_principal(&root_mtls),
+            ToolCallerTrust::OwnerSurface
+        );
+
+        let mut non_root_mtls = root_mtls.clone();
+        non_root_mtls.role_id = "role:operator".to_string();
+        assert_eq!(
+            ToolCallerTrust::from_principal(&non_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        let mut hosted_root_mtls = root_mtls.clone();
+        hosted_root_mtls.hosted_connect = true;
+        assert_eq!(
+            ToolCallerTrust::from_principal(&hosted_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        let mut unenrolled_root_mtls = root_mtls;
+        unenrolled_root_mtls.grant_id = None;
+        assert_eq!(
+            ToolCallerTrust::from_principal(&unenrolled_root_mtls),
+            ToolCallerTrust::Scoped
+        );
+
+        assert_eq!(
+            ToolCallerTrust::from_principal(
+                &crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                    "agent-1", "http", true,
+                ),
+            ),
+            ToolCallerTrust::Scoped
+        );
+        assert_eq!(
+            ToolCallerTrust::from_principal(
+                &crate::access::iam::AccessPrincipal::mcp_token_holder("http"),
+            ),
+            ToolCallerTrust::Scoped
+        );
+        assert_eq!(
+            ToolCallerTrust::from_principal(&crate::access::iam::AccessPrincipal::peer_daemon(
+                "fp",
+                "peer",
+                "peer-root",
+                "mtls",
+            )),
+            ToolCallerTrust::Scoped
+        );
+    }
 
     #[test]
     fn format_cu_action_brief_truncates_multibyte_text_on_char_boundary() {
@@ -2201,6 +2240,20 @@ pub(crate) mod tests {
             autonomy,
             log_dir,
         )))
+    }
+
+    /// Test server over an injected temp home. Session-id-driven paths
+    /// (status hydration, persisted get_logs) scan `<home>/.intendant/logs`,
+    /// so a server built on the real home would read the machine's live
+    /// store — machine-dependent duration and a prefix-collision flake
+    /// risk. Keep the TempDir guard alive for the server's lifetime.
+    pub(crate) fn test_server(
+        state: SharedMcpState,
+        bus: EventBus,
+    ) -> (tempfile::TempDir, IntendantServer) {
+        let home = tempdir().expect("temp home");
+        let server = IntendantServer::new_with_home(state, bus, home.path().to_path_buf());
+        (home, server)
     }
 
     pub(crate) struct TestDisplayBackend {
@@ -2250,20 +2303,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cu_result_status_respects_success_flag() {
-        let result = crate::computer_use::CuActionResult {
-            success: false,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "failed");
-
-        let result = crate::computer_use::CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        };
-        assert_eq!(cu_result_status(&result), "ok");
+    fn cu_result_status_distinguishes_dispatch_from_verified_effect() {
+        use crate::computer_use::CuActionResult;
+        // Dispatch failure (and verification mismatch) → failed.
+        assert_eq!(cu_result_status(&CuActionResult::failed("boom")), "failed");
+        // Dispatched but unverified must NOT read as an unqualified ok.
+        assert_eq!(cu_result_status(&CuActionResult::injected()), "injected");
+        assert_eq!(
+            cu_result_status(&CuActionResult::injected_with("note")),
+            "injected"
+        );
+        // Only a verified effect earns "ok".
+        assert_eq!(cu_result_status(&CuActionResult::verified()), "ok");
     }
 
     pub(crate) fn spawn_codex_thread_action_result(
@@ -2356,6 +2407,22 @@ pub(crate) mod tests {
         assert_eq!(
             shared_view_target_label(Some(99), Some(":99")),
             "display 99"
+        );
+    }
+
+    #[test]
+    fn shared_view_target_aliases_resolve_from_one_preferred_field() {
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some("user_session".to_string()), Some(99)),
+            Some((":99".to_string(), 99))
+        );
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some(":99".to_string()), Some(0)),
+            Some(("user_session".to_string(), 0))
+        );
+        assert_eq!(
+            resolve_concrete_shared_view_target(Some("user".to_string()), None),
+            Some(("user_session".to_string(), 0))
         );
     }
 
@@ -2566,12 +2633,13 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // Persisted-session resolution defaults to the process state
-            // root (`platform::intendant_home()`, a per-process scratch in
-            // unit-test builds) — drop the fixture there instead of racing
-            // the parallel runner over the process HOME.
+            // Persisted-session resolution reads the home the server
+            // resolves at construction — inject a temp home and drop the
+            // fixture in its `.intendant/logs`, so the test never touches
+            // the machine's real store and never mutates the process HOME.
+            let home = tempfile::tempdir().unwrap();
             let wrapper_session_id = "6eee2a11-51f2-453b-b993-b47744f34792";
-            let wrapper_dir = crate::platform::intendant_home()
+            let wrapper_dir = crate::platform::intendant_home_in(home.path())
                 .join("logs")
                 .join(wrapper_session_id);
             std::fs::create_dir_all(&wrapper_dir).unwrap();
@@ -2598,7 +2666,11 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-            let server = IntendantServer::new(test_state(), EventBus::new());
+            let server = IntendantServer::new_with_home(
+                test_state(),
+                EventBus::new(),
+                home.path().to_path_buf(),
+            );
             let result = server
                 .call_tool_by_name_for_session(
                     "get_logs",
@@ -2656,7 +2728,7 @@ pub(crate) mod tests {
             let state = test_state();
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus.clone());
+            let (_home, server) = test_server(state, bus.clone());
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -2682,6 +2754,7 @@ pub(crate) mod tests {
                     display_target,
                     attachments,
                     follow_up_id,
+                    delegation_id,
                 }))) => {
                     assert_eq!(session_id.as_deref(), Some("managed-session-1"));
                     assert_eq!(task, "continue existing managed session");
@@ -2691,6 +2764,7 @@ pub(crate) mod tests {
                     assert!(display_target.is_none());
                     assert!(attachments.is_empty());
                     assert!(follow_up_id.is_none());
+                    assert!(delegation_id.is_none());
                 }
                 other => panic!("expected targeted StartTask control event, got {other:?}"),
             }
@@ -2743,7 +2817,7 @@ pub(crate) mod tests {
             state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let result = server
                 .call_tool_by_name_for_session(
                     "start_task",
@@ -2769,6 +2843,7 @@ pub(crate) mod tests {
                     session_id,
                     resume_id,
                     fork: _,
+                    relationship_kind: None,
                     project_root: resumed_project_root,
                     task,
                     direct,
@@ -2849,7 +2924,7 @@ pub(crate) mod tests {
             }
             let bus = EventBus::new();
             let mut rx = bus.subscribe();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -2957,7 +3032,7 @@ pub(crate) mod tests {
                     }
                 }));
             }
-            let server = IntendantServer::new(state.clone(), EventBus::new());
+            let (_home, server) = test_server(state.clone(), EventBus::new());
 
             let status: serde_json::Value = serde_json::from_str(
                 &server
@@ -3031,7 +3106,7 @@ pub(crate) mod tests {
             let mut rx = bus.subscribe();
             let state = test_state();
             state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let result = server
                 .call_tool_by_name_for_session(
                     "start_task",
@@ -3067,7 +3142,7 @@ pub(crate) mod tests {
             .unwrap();
         rt.block_on(async {
             let state = test_state();
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
 
             let result = server
                 .call_tool_by_name_for_session(
@@ -3109,7 +3184,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&125.into()));
@@ -3159,7 +3234,7 @@ pub(crate) mod tests {
                 s.session_codex_managed_context
                     .insert("managed-session".to_string(), true);
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("managed-session"), None)
                 .await;
@@ -3209,7 +3284,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("active-managed-session"), Some(true))
                 .await;
@@ -3275,7 +3350,7 @@ pub(crate) mod tests {
                 s.provider_name = "none".to_string();
                 s.model_name = "none".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("wrapper-session"), Some(true))
                 .await;
@@ -3319,7 +3394,7 @@ pub(crate) mod tests {
                     ..Default::default()
                 });
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server
                 .get_status_for_session(Some("new-session-without-usage"), Some(true))
                 .await;
@@ -3361,7 +3436,7 @@ pub(crate) mod tests {
                 let mut s = state.write().await;
                 s.session_id = "parent".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(
@@ -3402,7 +3477,7 @@ pub(crate) mod tests {
                 let mut s = state.write().await;
                 s.session_id = "child".to_string();
             }
-            let server = IntendantServer::new(state, EventBus::new());
+            let (_home, server) = test_server(state, EventBus::new());
             let status = server.get_status().await;
             let value: serde_json::Value = serde_json::from_str(&status).unwrap();
             assert_eq!(
@@ -3423,12 +3498,14 @@ pub(crate) mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // A supervised parent logs under `<state root>/logs/<id>/`, which
-            // is NOT the MCP server's primary log dir. Resolution defaults to
-            // `platform::intendant_home()` (a per-process scratch in unit-test
-            // builds), so the fixture goes there — no HOME mutation.
+            // A supervised parent logs under `<home>/.intendant/logs/<id>/`,
+            // which is NOT the MCP server's primary log dir. Resolution
+            // reads the home the server resolves at construction — inject
+            // a temp home and drop the fixture in its store (no HOME
+            // mutation, no real-store access).
+            let home = tempfile::tempdir().unwrap();
             let parent_session_id = "0f5b3a52-9f51-4ad8-8a96-fsbstatus001";
-            let parent_dir = crate::platform::intendant_home()
+            let parent_dir = crate::platform::intendant_home_in(home.path())
                 .join("logs")
                 .join(parent_session_id);
             std::fs::create_dir_all(&parent_dir).unwrap();
@@ -3471,7 +3548,8 @@ pub(crate) mod tests {
 
             let primary = tempdir().unwrap();
             let state = test_state_with_log_dir(primary.path().to_path_buf());
-            let server = IntendantServer::new(state, EventBus::new());
+            let server =
+                IntendantServer::new_with_home(state, EventBus::new(), home.path().to_path_buf());
             let status = server
                 .get_status_for_session(Some(parent_session_id), None)
                 .await;
@@ -3622,7 +3700,7 @@ pub(crate) mod tests {
             .unwrap();
         rt.block_on(async {
             let bus = EventBus::new();
-            let server = IntendantServer::new(state, bus);
+            let (_home, server) = test_server(state, bus);
             let info = server.get_info();
             assert_eq!(info.server_info.name, "intendant");
             assert!(info.instructions.is_some());

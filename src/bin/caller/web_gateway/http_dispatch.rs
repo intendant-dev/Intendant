@@ -10,6 +10,10 @@ use super::*;
 /// Everything plain-HTTP serving shares with the rest of the gateway,
 /// cloned once per connection at the call site.
 pub(crate) struct HttpRequestCtx {
+    /// Gateway-scoped access/IAM store resolved once at the transport edge.
+    /// Tests inject a temp store so request authentication never consults the
+    /// runner's real account.
+    pub(crate) access_cert_dir: PathBuf,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -42,6 +46,24 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) file_watcher: Option<crate::file_watcher::SharedFileWatcher>,
 }
 
+fn session_token_api_response(result: Result<String, String>) -> ApiResponse {
+    let (status, body) = match result {
+        Ok(json) => (200, json),
+        Err(message) => (502, serde_json::json!({ "error": message }).to_string()),
+    };
+    ApiResponse::Json {
+        status,
+        body: JsonBody::PreSerialized(body),
+        // The body contains a live, short-lived vendor credential. `no-cache`
+        // still permits storage after revalidation; this response must never
+        // enter a browser, proxy, or native-app cache.
+        headers: vec![
+            ("Cache-Control", "no-store".to_string()),
+            ("Connection", "close".to_string()),
+        ],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_http_request(
     ctx: HttpRequestCtx,
@@ -51,11 +73,13 @@ pub(crate) async fn serve_http_request(
     peer_addr: std::net::SocketAddr,
     source_hint: String,
     is_tls: bool,
+    tls_fleet_origin: bool,
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_connection_identity: Option<PeerConnectionIdentity>,
 ) {
     let HttpRequestCtx {
+        access_cert_dir,
         bus,
         config_json,
         session_provider,
@@ -86,6 +110,7 @@ pub(crate) async fn serve_http_request(
         runtime_settings,
         file_watcher,
     } = ctx;
+    let cert_dir = access_cert_dir;
     // Re-derived rather than passed: the original borrowed header_text.
     let request_line = header_text.lines().next().unwrap_or("");
     // Plain HTTP: consume the peeked request bytes, then send response.
@@ -93,11 +118,41 @@ pub(crate) async fn serve_http_request(
     use tokio::io::AsyncReadExt;
     let _ = stream.read_exact(&mut discard).await;
 
+    // Keep-alive body leg (see the keep_alive module): a request with
+    // no body at all is trivially "fully consumed". Everything below
+    // that DOES read a body under a declared policy upgrades the mark
+    // itself; handlers that drive the stream (BodyPolicy::Streaming)
+    // never do, so their exchanges always close.
+    if request_is_bodyless(header_text) {
+        stream.mark_request_body_consumed();
+    }
+
     // Parse the request target once: the static-asset arms
     // below match on the *exact* path (query stripped), so
     // an API request that merely mentions an asset path in
     // a query parameter can no longer be shadowed by them.
     let (req_method, req_path, req_query) = parse_request_target(request_line);
+
+    // Connect mode belongs on Connect's unprivileged hosted origin. If a
+    // hosted page could navigate an mTLS-bearing browser to the daemon's own
+    // origin with attacker-selected `connect_base`, privileged SPA code would
+    // ingest an untrusted DataChannel as a confused deputy. This gate precedes
+    // method routing: a top-level cross-origin POST can execute an HTML
+    // response too, and browsers decode percent-encoded query names.
+    if query_param(request_line, "connect").as_deref() == Some("1") {
+        use tokio::io::AsyncWriteExt;
+        let response = HttpResponse::with_content(
+            "403 Forbidden",
+            "text/plain; charset=utf-8",
+            "Hosted Connect mode is not served from the daemon origin.\n",
+        )
+        .header("Cache-Control", "no-store")
+        .deny_framing()
+        .header("Connection", "close");
+        let _ = stream.write_all(&response.into_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
 
     // CORS preflight: respond to OPTIONS with permissive headers.
     // Needed when the page is served from a custom scheme (intendant://)
@@ -129,6 +184,7 @@ pub(crate) async fn serve_http_request(
                     && !is_fleet_cors_access_path(opt_path)
                     && !is_public_peer_access_request_path(request_line))
                     || opt_path == "/mcp"
+                    || is_connect_dashboard_signaling_path(opt_path)
             }
         };
         let fleet_scoped = matches!(
@@ -154,16 +210,13 @@ pub(crate) async fn serve_http_request(
                     )
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
                 None => HttpResponse::new("204 No Content")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
             }
         } else if fleet_scoped {
             let methods = table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
-            let cert_dir = crate::access::backend::select_backend().cert_dir();
             let allowed = extract_origin_header(header_text).filter(|origin| {
                 fleet_access_origin_allowed(
                     origin,
@@ -183,12 +236,10 @@ pub(crate) async fn serve_http_request(
                     )
                     .header("Access-Control-Max-Age", "86400")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
                 None => HttpResponse::new("204 No Content")
                     .header("Vary", "Origin")
-                    .header("Connection", "close")
-                    .into_string(),
+                    .header("Connection", "close"),
             }
         } else {
             let methods = table_methods
@@ -203,23 +254,120 @@ pub(crate) async fn serve_http_request(
                 )
                 .header("Access-Control-Max-Age", "86400")
                 .header("Connection", "close")
-                .into_string()
         };
+        // Preflights participate in keep-alive (204: self-framing, no
+        // body): browsers send the actual request right behind the
+        // preflight, so closing here would double every cross-origin
+        // API call's connection count.
+        let reuse = stream.exchange_reusable();
+        let response = response.connection_reuse(reuse).into_string();
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        if reuse && write_ok {
+            stream.park().await;
+        } else {
+            finalize_http_stream(&mut stream).await;
+        }
+        return;
+    }
+
+    let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path);
+
+    // A public fleet/WebPKI name is convenient discovery, but it is not an
+    // authority anchor: the fleet DNS operator can serve JavaScript at that
+    // exact origin and later point it at this daemon. SOP, Origin checks, and
+    // a browser-held client certificate cannot distinguish that code from the
+    // daemon's own page. Keep the endpoint strictly discovery-only before any
+    // IAM, loopback, browser-mTLS, process-token `/mcp`, or signaling context
+    // is resolved. SNI provenance comes from rustls certificate selection,
+    // never this request's mutable Host header.
+    let fleet_origin = tls_fleet_origin || request_names_known_fleet_origin(header_text);
+    if fleet_origin && !authority_free_request {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::json!({
+            "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
+        })
+        .to_string();
+        let response = json_response("403 Forbidden", body);
         let _ = stream.write_all(response.as_bytes()).await;
         finalize_http_stream(&mut stream).await;
         return;
     }
 
-    if tls_client_cert_required
-        && !tls_client_cert_present
-        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
-        && !is_public_peer_access_request_path(request_line)
-        && !is_public_org_grant_path(request_line)
-        && !is_public_connect_bootstrap_path(request_line)
+    // Browser-origin rejection precedes transport-authority resolution for
+    // every route that is not explicitly authority-free. A certificate
+    // attached by the browser, the loopback fallback, or an old IAM file must
+    // never be consulted on behalf of foreign hosted code. Fetch Metadata
+    // closes the navigation/subresource case where browsers omit Origin.
+    // Public signed-document doorbells remain cross-origin by design; their
+    // payload signature is the authority and they receive role:none below.
+    let request_origin = extract_origin_header(header_text);
+    let mut fleet_cors_origin: Option<String> = None;
+    if let Some(origin) = request_origin
+        .as_deref()
+        .filter(|_| !authority_free_request)
+    {
+        let own = is_own_or_app_origin(origin, is_tls, header_text);
+        let fleet_allowed = !own
+            && (is_fleet_cors_access_path(req_path) || req_path == "/config")
+            && fleet_access_origin_allowed(
+                origin,
+                is_tls,
+                header_text,
+                peer_registry.as_ref(),
+                &cert_dir,
+            );
+        if fleet_allowed {
+            fleet_cors_origin = Some(origin.to_string());
+        } else if !own {
+            use tokio::io::AsyncWriteExt;
+            let body = serde_json::json!({
+                "error": "cross-origin caller is not allowed on this API",
+                "origin": origin,
+            })
+            .to_string();
+            let response = json_response("403 Forbidden", body);
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    } else if !authority_free_request
+        && matches!(
+            http_header_value(header_text, "sec-fetch-site")
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("cross-site" | "same-site")
+        )
     {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
-            "error": "mTLS client certificate required"
+            "error": "cross-site browser navigation is not allowed on this route",
+            "sec_fetch_site": http_header_value(header_text, "sec-fetch-site").unwrap_or(""),
+        })
+        .to_string();
+        let response = json_response("403 Forbidden", body);
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+
+    let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+        peer_addr,
+        header_text,
+        tls_client_cert_fingerprint.as_deref(),
+        peer_connection_identity.as_ref(),
+    );
+    if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
+        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
+        && !authority_free_request
+    {
+        use tokio::io::AsyncWriteExt;
+        let body = serde_json::json!({
+            "error": if remote_client_auth_missing {
+                "verified client certificate or authenticated peer identity required for remote dashboard access"
+            } else {
+                "mTLS client certificate required"
+            }
         })
         .to_string();
         let response = HttpResponse::with_content("401 Unauthorized", "application/json", body)
@@ -231,21 +379,24 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let http_access_context = match http_access_context(
-        &cert_dir,
-        peer_connection_identity.as_ref(),
-        tls_client_cert_fingerprint.as_deref(),
-        tls_client_cert_present,
-        is_tls,
-    ) {
-        Ok(context) => context,
-        Err(message) => {
-            use tokio::io::AsyncWriteExt;
-            let response = json_error("500 Internal Server Error", message);
-            let _ = stream.write_all(response.as_bytes()).await;
-            finalize_http_stream(&mut stream).await;
-            return;
+    let http_access_context = if authority_free_request {
+        authority_free_http_access_context(is_tls)
+    } else {
+        match http_access_context(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+            is_tls,
+        ) {
+            Ok(context) => context,
+            Err(message) => {
+                use tokio::io::AsyncWriteExt;
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
         }
     };
 
@@ -322,7 +473,9 @@ pub(crate) async fn serve_http_request(
         }
     }
 
-    if let Some(op) = dashboard_http_operation(req_method, req_path) {
+    if let Some(op) = dashboard_http_operation(req_method, req_path)
+        .or_else(|| legacy_protected_http_operation(req_path))
+    {
         let decision = http_access_context.decision(op);
         if !decision.allowed {
             use tokio::io::AsyncWriteExt;
@@ -333,55 +486,17 @@ pub(crate) async fn serve_http_request(
         }
     }
 
-    // API origin gate + CORS echo. A browser sends an Origin
-    // header on every cross-origin request (and on
-    // same-origin POSTs); the browser-attached mTLS
-    // certificate must not let an arbitrary website drive or
-    // read these APIs cross-site. Policy:
-    //   - no Origin header (same-origin GETs, curl, native
-    //     code, the macOS app's URLSession proxy): untouched;
-    //   - own origin or the intendant:// app scheme: allowed;
-    //   - fleet-allowlisted origins: allowed on the six fleet
-    //     Access APIs, which also echo the origin so the
-    //     anchor page can read the responses;
-    //   - anything else on any /api/ path: 403, except the
-    //     public doorbell, which is designed to be knocked on.
-    let request_origin = extract_origin_header(header_text);
-    let mut fleet_cors_origin: Option<String> = None;
-    if let Some(origin) = request_origin.as_deref().filter(|_| {
-        req_path.starts_with("/api/")
-            && !is_public_peer_access_request_path(request_line)
-            && !is_public_org_grant_path(request_line)
-    }) {
-        let own = is_own_or_app_origin(origin, is_tls, header_text);
-        let fleet_allowed = !own
-            && is_fleet_cors_access_path(req_path)
-            && fleet_access_origin_allowed(
-                origin,
-                is_tls,
-                header_text,
-                peer_registry.as_ref(),
-                &cert_dir,
-            );
-        if fleet_allowed {
-            fleet_cors_origin = Some(origin.to_string());
-        } else if !own {
-            use tokio::io::AsyncWriteExt;
-            let body = serde_json::json!({
-                "error": "cross-origin caller is not allowed on this API",
-                "origin": origin,
-            })
-            .to_string();
-            let response = json_response("403 Forbidden", body);
-            let _ = stream.write_all(response.as_bytes()).await;
-            finalize_http_stream(&mut stream).await;
-            return;
-        }
-    }
+    // Keep-alive response leg for the fall-through chain below: set by
+    // each participating arm after it wrote a self-framing response
+    // under a reusable exchange; the common tail parks instead of
+    // finalizing when it's set. Arms that never set it — the connect
+    // signaling lane, and any arm added without thinking about
+    // keep-alive — fail safe to the historical close.
+    let mut parked_ok = false;
 
-    if let Some((route, _route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
+    if let Some((route, route_captures)) = crate::gateway_routes::match_route(req_method, req_path)
     {
-        // Table-dispatched routes: every /api/* and /mcp route is
+        // Table-dispatched routes: every /api/*, /session, and /mcp route is
         // declared once in gateway_routes::ROUTES (which the IAM
         // gate above already consulted through
         // dashboard_http_operation). The if/else chain below serves
@@ -408,7 +523,25 @@ pub(crate) async fn serve_http_request(
                     _ => crate::gateway_routes::DEFAULT_BODY_CAP_BYTES,
                 };
                 match read_request_body_capped(&mut stream, header_text, cap).await {
-                    Ok(body) => body,
+                    Ok(body) => {
+                        // Keep-alive body leg: dispatch consumed exactly
+                        // the declared body (`read_request_body_capped`
+                        // reads Content-Length bytes), so the exchange
+                        // stays reusable — provided the framing was
+                        // unambiguous (one consistent Content-Length, no
+                        // Transfer-Encoding) AND the captured segment was
+                        // valid UTF-8. The reader does its peeked-body
+                        // accounting on the LOSSY header string; invalid
+                        // bytes inflate to U+FFFD there, skewing the
+                        // byte math and potentially leaving residue in
+                        // the socket — fail toward close in that case.
+                        if request_body_is_delimited(header_text)
+                            && std::str::from_utf8(&discard).is_ok()
+                        {
+                            stream.mark_request_body_consumed();
+                        }
+                        body
+                    }
                     Err((status, body)) => {
                         use tokio::io::AsyncWriteExt;
                         let base = HttpResponse::json(status_reason(status), body);
@@ -426,6 +559,14 @@ pub(crate) async fn serve_http_request(
                 }
             }
         };
+        // The transfer rows' `{id}` capture (both delete shapes capture
+        // exactly the id — the literal segments don't capture).
+        let transfer_job_id = || {
+            route_captures
+                .first()
+                .map(|id| id.to_string())
+                .unwrap_or_default()
+        };
         match route.handler {
             RouteHandlerId::FsWrite => {
                 return handle_fs_write(
@@ -439,29 +580,151 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::TransferJobs => {
+                return handle_transfer_jobs(
+                    stream,
+                    request_line,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobCreate => {
+                return handle_transfer_job_create(
+                    stream,
+                    route_body,
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadChunk => {
+                return handle_transfer_upload_chunk(
+                    stream,
+                    header_text,
+                    request_line,
+                    discard,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferUploadCommit => {
+                return handle_transfer_upload_commit(
+                    stream,
+                    route_body,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferJobDelete => {
+                return handle_transfer_job_delete(
+                    stream,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::TransferDownloadRead => {
+                return handle_transfer_download_read(
+                    stream,
+                    header_text,
+                    request_line,
+                    transfer_job_id(),
+                    project_root_for_changes,
+                    http_access_context,
+                    peer_connection_identity,
+                    bus,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::SessionToken => {
+                let result = mint_session_token(&session_provider, &session_model).await;
+                return write_api_response(
+                    stream,
+                    session_token_api_response(result),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::SessionCurrentChanges => {
                 return handle_session_current_changes(
                     stream,
                     request_line,
                     project_root_for_changes,
                     snapshot_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::WorktreesInspect => {
-                return handle_worktrees_inspect(stream, route_body).await;
+                return handle_worktrees_inspect(
+                    stream,
+                    route_body,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesRemove => {
-                return handle_worktrees_remove(stream, route_body, worktree_inventory_cache).await;
+                return handle_worktrees_remove(
+                    stream,
+                    route_body,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesMerge => {
                 return handle_worktrees_merge(stream, route_body, worktree_inventory_cache).await;
             }
             RouteHandlerId::WorktreesScan => {
-                return handle_worktrees_scan(stream, project_root, worktree_inventory_cache).await;
+                return handle_worktrees_scan(
+                    stream,
+                    project_root,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesList => {
-                return handle_worktrees_list(stream, worktree_inventory_cache).await;
+                return handle_worktrees_list(
+                    stream,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsList => {
                 return handle_sessions_list(
@@ -537,21 +800,55 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::CurrentHistory => {
-                return handle_current_history(stream, file_watcher).await;
+                return handle_current_history(
+                    stream,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentRollback => {
-                return handle_current_rollback(stream, route_body, bus, query_ctx, file_watcher)
-                    .await;
+                return handle_current_rollback(
+                    stream,
+                    route_body,
+                    bus,
+                    query_ctx,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentRedo => {
-                return handle_current_redo(stream, query_ctx, file_watcher).await;
+                return handle_current_redo(
+                    stream,
+                    query_ctx,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentPrune => {
-                return handle_current_prune(stream, file_watcher).await;
+                return handle_current_prune(
+                    stream,
+                    file_watcher,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentAgentOutput => {
-                return handle_current_agent_output(stream, route_body, query_ctx, session_log)
-                    .await;
+                return handle_current_agent_output(
+                    stream,
+                    route_body,
+                    query_ctx,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::CurrentUploadsPost => {
                 return handle_current_uploads_post(
@@ -563,6 +860,8 @@ pub(crate) async fn serve_http_request(
                     project_root_for_changes,
                     session_log,
                     daemon_session_id,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -572,6 +871,8 @@ pub(crate) async fn serve_http_request(
                     request_line,
                     project_root_for_changes,
                     session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -582,11 +883,19 @@ pub(crate) async fn serve_http_request(
                     bus,
                     project_root_for_changes,
                     session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::SessionDelete => {
-                return handle_session_delete(stream, request_line).await;
+                return handle_session_delete(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionAgentOutput => {
                 return handle_session_agent_output(
@@ -603,16 +912,43 @@ pub(crate) async fn serve_http_request(
                     .await;
             }
             RouteHandlerId::McAnchors => {
-                return handle_mc_anchors(stream, request_line, session_log).await;
+                return handle_mc_anchors(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::McRecords => {
-                return handle_mc_records(stream, request_line, session_log).await;
+                return handle_mc_records(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::McFission => {
-                return handle_mc_fission(stream, request_line, session_log).await;
+                return handle_mc_fission(
+                    stream,
+                    request_line,
+                    session_log,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsStream => {
-                return handle_sessions_stream(stream, request_line).await;
+                return handle_sessions_stream(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionsSearch => {
                 return handle_sessions_search(
@@ -623,29 +959,94 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::SessionsMessageSearch => {
+                return handle_sessions_message_search(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ProjectRoot => {
-                return handle_project_root(stream, project_root).await;
+                return handle_project_root(
+                    stream,
+                    project_root,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SettingsPost => {
-                return handle_settings_post(stream, route_body, bus, project_root).await;
+                let settings_root = runtime_settings.settings_root.or(project_root);
+                return handle_settings_post(
+                    stream,
+                    route_body,
+                    bus,
+                    settings_root,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SettingsGet => {
-                return handle_settings_get(stream, project_root, runtime_settings).await;
+                return handle_settings_get(
+                    stream,
+                    project_root,
+                    runtime_settings,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::ApiKeysPost => {
-                return handle_api_keys_post(stream, route_body).await;
+                return handle_api_keys_post(
+                    stream,
+                    route_body,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::ApiKeyStatus => {
-                return handle_api_key_status(stream).await;
+                return handle_api_key_status(stream, route.cors, fleet_cors_origin.as_deref())
+                    .await;
             }
             RouteHandlerId::ExternalAgents => {
-                return handle_external_agents(stream, project_root).await;
+                // The transport edge resolves the ambient home; the
+                // handler below it is path-parameterized (hermeticity
+                // convention).
+                return handle_external_agents(
+                    stream,
+                    project_root,
+                    crate::platform::home_dir(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::DiagnosticsVisualFreshness => {
-                return handle_diagnostics_visual_freshness(stream, route_body, request_line).await;
+                // Same seam: dispatch resolves the state dir the sink
+                // appends under.
+                return handle_diagnostics_visual_freshness(
+                    stream,
+                    route_body,
+                    request_line,
+                    crate::platform::intendant_home(),
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::Displays => {
-                return handle_displays(stream, session_registry).await;
+                return handle_displays(
+                    stream,
+                    session_registry,
+                    http_access_context.principal.role_id == "role:root",
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::Doorbell => {
                 return handle_doorbell(
@@ -663,26 +1064,30 @@ pub(crate) async fn serve_http_request(
                 return handle_access_org_grant_present(
                     stream,
                     route_body,
-                    req_method,
+                    cert_dir,
                     agent_card_value_for_targets,
+                    route.cors,
                 )
                 .await;
             }
             RouteHandlerId::AccessOrgRevocations => {
-                return handle_access_org_revocations(stream, req_path).await;
+                return handle_access_org_revocations(stream, req_path, cert_dir, route.cors).await;
             }
             RouteHandlerId::AccessOrgApplyRenew => {
-                return handle_access_org_apply_renew(stream, route_body, req_method, req_path)
-                    .await;
+                return handle_access_org_apply_renew(
+                    stream, route_body, req_path, cert_dir, route.cors,
+                )
+                .await;
             }
             RouteHandlerId::AccessIamGrants => {
                 return handle_access_iam_grants(
                     stream,
                     route_body,
-                    req_method,
                     req_path,
+                    cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -690,10 +1095,10 @@ pub(crate) async fn serve_http_request(
                 return handle_access_org_manage(
                     stream,
                     route_body,
-                    req_method,
                     req_path,
+                    cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -701,26 +1106,45 @@ pub(crate) async fn serve_http_request(
                 return handle_access_enrollment_decide(
                     stream,
                     route_body,
-                    req_method,
+                    cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::AccessEnrollmentRequests => {
-                return handle_access_enrollment_requests(stream, fleet_cors_origin).await;
+                return handle_access_enrollment_requests(
+                    stream,
+                    cert_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessIamState => {
-                return handle_access_iam_state(stream, fleet_cors_origin).await;
+                return handle_access_iam_state(
+                    stream,
+                    cert_dir,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessConnectStatus => {
-                return handle_access_connect_status(stream, fleet_cors_origin).await;
+                return handle_access_connect_status(
+                    stream,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::AccessConnectClaimCode => {
                 return handle_access_connect_claim_code(
                     stream,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -728,20 +1152,20 @@ pub(crate) async fn serve_http_request(
                 return handle_access_connect_config(
                     stream,
                     route_body,
-                    req_method,
                     http_access_context,
                     project_root,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::AccessConnectUnclaim => {
                 return handle_access_connect_unclaim(
                     stream,
-                    req_method,
                     http_access_context,
                     project_root,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
@@ -749,30 +1173,56 @@ pub(crate) async fn serve_http_request(
                 return handle_access_tier_settings(
                     stream,
                     route_body,
-                    req_method,
-                    req_path,
+                    cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AccessFleetCertRequest => {
+                return handle_fleet_cert_request(
+                    stream,
+                    route_body,
+                    http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::AccessOverview => {
                 return handle_access_overview(
                     stream,
+                    cert_dir,
                     http_access_context,
-                    fleet_cors_origin,
                     peer_registry,
                     agent_card_value_for_targets,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
                 )
                 .await;
             }
             RouteHandlerId::DashboardTargets => {
+                // The transport edge resolves the gateway-scoped cert dir;
+                // the handler takes the derived tier as a parameter.
+                let local_tier = crate::web_gateway::local_daemon_tier(&cert_dir);
                 return handle_dashboard_targets(
                     stream,
                     peer_registry,
                     agent_card_value_for_targets,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                    local_tier.as_deref(),
+                    http_access_context.principal,
                 )
                 .await;
+            }
+            RouteHandlerId::DashboardTabs => {
+                let response =
+                    crate::web_gateway::dashboard_tabs_api_response(dashboard_control.tabs());
+                write_api_response(stream, response, route.cors, fleet_cors_origin.as_deref())
+                    .await;
+                return;
             }
             RouteHandlerId::PeersSubRouter => {
                 return handle_peers_sub_router(
@@ -780,6 +1230,7 @@ pub(crate) async fn serve_http_request(
                     route_body,
                     request_line,
                     req_method,
+                    cert_dir,
                     bus,
                     project_root,
                     peer_registry,
@@ -831,7 +1282,10 @@ pub(crate) async fn serve_http_request(
             }
             _ => base,
         };
-        let _ = stream.write_all(&response.into_bytes()).await;
+        let reuse = stream.exchange_reusable();
+        let response = response.connection_reuse(reuse);
+        let write_ok = stream.write_all(&response.into_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_method == "GET" && req_path == "/connect/bootstrap" {
         use tokio::io::AsyncWriteExt;
         let body = connect_bootstrap_html();
@@ -850,6 +1304,20 @@ pub(crate) async fn serve_http_request(
             .await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
         use tokio::io::AsyncWriteExt;
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -859,23 +1327,79 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response = with_public_cors(
-            connect_dashboard_offer_response(
-                &dashboard_control,
-                &body_text,
-                &agent_card_value_for_targets,
-            )
-            .await,
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        let response = with_allowed_origin_cors(
+            connect_dashboard_offer_response(&dashboard_control, &body_text, grant).await,
+            request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
         use tokio::io::AsyncWriteExt;
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -885,17 +1409,56 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response =
-            with_public_cors(connect_dashboard_ice_response(&dashboard_control, &body_text).await);
+        let response = with_allowed_origin_cors(
+            connect_dashboard_ice_response(&dashboard_control, &body_text, &grant).await,
+            request_origin.as_deref(),
+        );
         let _ = stream.write_all(response.as_bytes()).await;
     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
         use tokio::io::AsyncWriteExt;
+        if remote_dashboard_client_auth_missing(
+            peer_addr,
+            header_text,
+            tls_client_cert_fingerprint.as_deref(),
+            peer_connection_identity.as_ref(),
+        ) {
+            let response = json_error(
+                "401 Unauthorized",
+                "direct dashboard signaling requires local presence, a verified mTLS client, or an authenticated peer",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+        let grant = match dashboard_control_grant_for_client(
+            &cert_dir,
+            peer_connection_identity.as_ref(),
+            tls_client_cert_fingerprint.as_deref(),
+            tls_client_cert_present,
+        ) {
+            Ok(grant) => grant,
+            Err(message) => {
+                let response = json_error("500 Internal Server Error", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        if !grant.has_any_effective_operation() {
+            let response = json_error(
+                "403 Forbidden",
+                "mTLS client has no effective daemon permission",
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
         let body_text = match read_request_body_capped(
             &mut stream,
             header_text,
@@ -905,14 +1468,15 @@ pub(crate) async fn serve_http_request(
         {
             Ok(body) => body,
             Err((status, body)) => {
-                let response = HttpResponse::json(status_reason(status), body).public_cors();
+                let response = HttpResponse::json(status_reason(status), body);
                 let _ = stream.write_all(&response.into_bytes()).await;
                 finalize_http_stream(&mut stream).await;
                 return;
             }
         };
-        let response = with_public_cors(
-            connect_dashboard_close_response(&dashboard_control, &body_text).await,
+        let response = with_allowed_origin_cors(
+            connect_dashboard_close_response(&dashboard_control, &body_text, &grant).await,
+            request_origin.as_deref(),
         );
         let _ = stream.write_all(response.as_bytes()).await;
     // Route WASM binaries (need async write_all for large payloads)
@@ -924,15 +1488,18 @@ pub(crate) async fn serve_http_request(
             "/wasm-station/station_web_bg.wasm",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if let Some(asset) = static_asset_arm(
         req_method,
         req_path,
@@ -945,19 +1512,23 @@ pub(crate) async fn serve_http_request(
             "/manifest.webmanifest",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_path.starts_with("/frames/") {
         // Serve HQ frame images from the frame registry.
         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
-        use tokio::io::AsyncWriteExt;
+        // The registry read stays at this edge; the response shapes are
+        // the neutral fn's (goldens pin the historical wire bytes).
         let frame_id = request_line
             .split("/frames/")
             .nth(1)
@@ -969,179 +1540,48 @@ pub(crate) async fn serve_http_request(
         } else {
             None
         };
-        if let Some(jpeg_data) = data {
-            let header = HttpResponse::new("200 OK")
-                .header("Content-Type", "image/jpeg")
-                .header("Content-Length", jpeg_data.len().to_string())
-                .header("Cache-Control", "public, max-age=31536000, immutable")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(&jpeg_data).await;
-        } else {
-            let body = "Frame not found";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
-    } else if req_method == "POST" && req_path == "/session" {
-        let result = mint_session_token(&session_provider, &session_model).await;
-        let (status, body) = match result {
-            Ok(json) => ("200 OK", json),
-            Err(msg) => (
-                "502 Bad Gateway",
-                serde_json::json!({"error": msg}).to_string(),
-            ),
-        };
-        let response = HttpResponse::with_content(status, "application/json", body)
-            .header("Connection", "close")
-            .into_string();
-        use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
+        return write_api_response(
+            stream,
+            frame_hq_api_response(data),
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path.starts_with("/recordings/") {
-        // Serve recording data: segment files and metadata.
-        use tokio::io::AsyncWriteExt;
+        // Serve recording data: segment files and metadata. Path routing
+        // (verbatim post-"/recordings/" token, historically including any
+        // query string) stays at this edge; resolution and the response
+        // shapes are the neutral fn's, shared with the tunnel's
+        // api_recording_asset (goldens pin the historical wire bytes).
         let path_part = request_line
             .split("/recordings/")
             .nth(1)
             .and_then(|s| s.split_whitespace().next())
             .unwrap_or("");
-        let parts: Vec<&str> = path_part.split('/').collect();
-
-        if let Some(ref rec_reg) = recording_registry {
-            let reg = rec_reg.read().await;
-
-            if parts.len() == 2 && parts[1] == "segments" {
-                // GET /recordings/{stream}/segments — check session then daemon dir
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    // Fallback to daemon recordings dir
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let json: Vec<serde_json::Value> = segments
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "filename": s.filename,
-                            "start_secs": s.start_secs,
-                            "end_secs": s.end_secs,
-                        })
-                    })
-                    .collect();
-                let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
-                let response = HttpResponse::with_content("200 OK", "application/json", body)
-                    .header("Cache-Control", "no-cache")
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
-                // GET /recordings/{stream}/playlist.m3u8 — HLS playlist
-                let stream_name = parts[0];
-                let mut segments = reg.segments(stream_name);
-                if segments.is_empty() {
-                    let daemon_dir = crate::debug::daemon_recordings_dir();
-                    let stream_dir = daemon_dir.join(stream_name);
-                    segments = crate::recording::parse_segment_csv_pub(
-                        &stream_dir.join("segments.csv"),
-                        &stream_dir,
-                    );
-                }
-                let m3u8 = recording_playlist_m3u8(&segments);
-                let response =
-                    HttpResponse::with_content("200 OK", "application/vnd.apple.mpegurl", m3u8)
-                        .header("Cache-Control", "no-cache")
-                        .header("Connection", "close")
-                        .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            } else if parts.len() == 2 {
-                // GET /recordings/{stream}/{filename} — serve segment file
-                let stream_name = parts[0];
-                let filename = parts[1];
-                // Validate filename to prevent path traversal
-                let valid = filename.starts_with("seg_")
-                    && (filename.ends_with(".mp4") || filename.ends_with(".ts"))
-                    && filename.len() < 30
-                    && !filename.contains("..");
-                if valid {
-                    // Check session dir first, then daemon dir
-                    let session_path = reg
-                        .session_dir()
-                        .join("recordings")
-                        .join(stream_name)
-                        .join(filename);
-                    let daemon_path = crate::debug::daemon_recordings_dir()
-                        .join(stream_name)
-                        .join(filename);
-                    let seg_path = if session_path.exists() {
-                        session_path
-                    } else {
-                        daemon_path
-                    };
-                    let content_type = if filename.ends_with(".ts") {
-                        "video/mp2t"
-                    } else {
-                        "video/mp4"
-                    };
-                    match tokio::fs::read(&seg_path).await {
-                        Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", content_type)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
-                            let _ = stream.write_all(&data).await;
-                        }
-                        Err(_) => {
-                            let body = "Segment not found";
-                            let response =
-                                HttpResponse::with_content("404 Not Found", "text/plain", body)
-                                    .header("Connection", "close")
-                                    .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                    }
-                } else {
-                    let body = "Invalid filename";
-                    let response =
-                        HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                            .header("Connection", "close")
-                            .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
-                }
-            } else {
-                let body = "Not found";
-                let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        } else {
-            let body = "Recording not available";
-            let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                .header("Connection", "close")
-                .into_string();
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(response.as_bytes()).await;
-        }
+        let response = live_recordings_path_api_response(
+            recording_registry.clone(),
+            &crate::debug::daemon_recordings_dir(),
+            path_part,
+        )
+        .await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/recordings" {
-        // GET /recordings — list all streams (session + daemon-scoped)
-        use tokio::io::AsyncWriteExt;
-
-        let body = recordings_list_response_body(recording_registry.clone()).await;
-        let response = HttpResponse::with_content("200 OK", "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "close")
-            .into_string();
-        let _ = stream.write_all(response.as_bytes()).await;
+        // GET /recordings — list all streams (session + daemon-scoped),
+        // through the neutral fn the tunnel's api_recordings shares.
+        let response = recordings_list_api_response(recording_registry.clone()).await;
+        return write_api_response(
+            stream,
+            response,
+            crate::gateway_routes::CorsPosture::OwnOrigin,
+            None,
+        )
+        .await;
     } else if req_path == "/debug" {
         // Debug endpoint: returns agent state + voice connection info
         let state = query_ctx.as_ref().map(|ctx| {
@@ -1165,20 +1605,43 @@ pub(crate) async fn serve_http_request(
             "active_connection_id": active_id,
         })
         .to_string();
+        let reuse = stream.exchange_reusable();
         let response = HttpResponse::with_content("200 OK", "application/json", debug_json)
             .header("Connection", "close")
+            .connection_reuse(reuse)
             .into_string();
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
-    } else if let Some(response) = dashboard_local_file_response(request_line) {
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if let Some(response) = authorized_dashboard_local_file_response_blocking(
+        request_line,
+        &http_access_context,
+        peer_connection_identity.as_ref(),
+        &bus,
+    )
+    .await
+    {
         use tokio::io::AsyncWriteExt;
+        let response = match response {
+            Ok(response) => response,
+            Err(message) => {
+                let response = json_error("403 Forbidden", message);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        };
+        let reuse = stream.exchange_reusable();
         match response {
             DashboardLocalFileResponse::Html { status, body } => {
                 let response = HttpResponse::with_content(status, "text/html; charset=utf-8", body)
                     .header("Cache-Control", "no-cache")
+                    .deny_framing()
                     .header("Connection", "close")
+                    .connection_reuse(reuse)
                     .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+                parked_ok = reuse && write_ok;
             }
             DashboardLocalFileResponse::Bytes {
                 status,
@@ -1191,11 +1654,38 @@ pub(crate) async fn serve_http_request(
                     .header("Cache-Control", "no-cache")
                     .header("X-Content-Type-Options", "nosniff")
                     .header("Connection", "close")
+                    .connection_reuse(reuse)
                     .into_string();
-                let _ = stream.write_all(header.as_bytes()).await;
-                let _ = stream.write_all(&bytes).await;
+                let head_ok = stream.write_all(header.as_bytes()).await.is_ok();
+                let body_ok = stream.write_all(&bytes).await.is_ok();
+                parked_ok = reuse && head_ok && body_ok;
             }
         }
+    } else if let Some(asset) = static_asset_arm(req_method, req_path, &["/vault-kernel.js"]) {
+        // The vault crypto kernel — embedded like every static asset, so
+        // the dashboard's VAULT_KERNEL_SHA256 pin (assembled into the same
+        // binary) always matches. Under the INTENDANT_APP_HTML_PATH dev
+        // override the disk sibling wins instead: the overridden app.html
+        // pins THAT file's hash.
+        let reuse = stream.exchange_reusable();
+        let response = app_html_override
+            .as_deref()
+            .and_then(|path| {
+                vault_kernel_override_response(req_method, header_text, req_query, path, reuse)
+            })
+            .unwrap_or_else(|| {
+                build_static_asset_response(
+                    req_method,
+                    header_text,
+                    req_query,
+                    asset_version(),
+                    asset.view(),
+                    reuse,
+                )
+            });
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if let Some(asset) = static_asset_arm(
         req_method,
         req_path,
@@ -1205,6 +1695,7 @@ pub(crate) async fn serve_http_request(
             "/three.module.min.js",
             "/codemirror-bundle.js",
             "/codemirror-bundle.css",
+            "/tile-test-harness.js",
             "/audio-processor.js",
             "/xterm.min.js",
             "/xterm-addon-fit.min.js",
@@ -1221,37 +1712,49 @@ pub(crate) async fn serve_http_request(
             "/manifest.webmanifest",
         ],
     ) {
+        let reuse = stream.exchange_reusable();
         let response = build_static_asset_response(
             req_method,
             header_text,
             req_query,
             asset_version(),
             asset.view(),
+            reuse,
         );
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
-    } else if req_path == "/.well-known/agent-card.json" || req_path == "/config" {
-        let body = if req_path == "/.well-known/agent-card.json" {
-            // Canonical peer identity + capability surface.
-            // Served alongside /config so the browser and
-            // federated peers can discover who this daemon
-            // is without parsing the voice-runtime config.
-            agent_card_json.clone()
-        } else {
-            config_json.clone()
-        };
-        // CORS: allow the multi-host dashboard to
-        // `fetch()` /config and /.well-known/agent-card.json
-        // on this daemon from a page served by a sibling
-        // daemon (cross-origin). `*` works because our
-        // fetches don't send credentials.
-        let response = HttpResponse::with_content("200 OK", "application/json", body)
-            .header("Cache-Control", "no-cache")
-            .header("Access-Control-Allow-Origin", "*")
-            .header("Connection", "close")
-            .into_string();
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if req_path == "/.well-known/agent-card.json" {
+        // Canonical public peer identity + capability surface. It carries no
+        // runtime secret and remains wildcard-readable for discovery.
+        let reuse = stream.exchange_reusable();
+        let response =
+            HttpResponse::with_content("200 OK", "application/json", agent_card_json.clone())
+                .header("Cache-Control", "no-cache")
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Connection", "close")
+                .connection_reuse(reuse)
+                .into_string();
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if req_path == "/config" {
+        // Runtime config can include ICE/TURN credentials. The IAM and Origin
+        // gates above admit only PresenceRead on the daemon's own origin,
+        // signed-app origin, or an explicitly fleet-allowlisted origin; echo
+        // that approved origin instead of publishing wildcard CORS. This is
+        // intentionally no-store because TURN credentials can be long-lived.
+        let reuse = stream.exchange_reusable();
+        let response =
+            HttpResponse::with_content("200 OK", "application/json", config_json.clone())
+                .header("Cache-Control", "no-store")
+                .fleet_cors(request_origin.as_deref())
+                .header("Connection", "close")
+                .connection_reuse(reuse)
+                .into_string();
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else if req_method == "GET" || req_method == "HEAD" {
         // Default: serve app.html (also matches /app for
         // backward compat). The entry point stays no-cache —
@@ -1262,8 +1765,9 @@ pub(crate) async fn serve_http_request(
         // unlike the constants behind `embedded_static_asset`.
         // Under INTENDANT_APP_HTML_PATH the disk copy is
         // re-read (and re-tagged) on every request instead.
+        let reuse = stream.exchange_reusable();
         let response = if let Some(path) = app_html_override.as_deref() {
-            app_html_override_response(req_method, header_text, req_query, path)
+            app_html_override_response(req_method, header_text, req_query, path, reuse)
         } else {
             let (etag, gzip) = app_html_cache.get_or_init(|| {
                 (
@@ -1283,32 +1787,40 @@ pub(crate) async fn serve_http_request(
                     gzip: Some(gzip),
                     cache_control: Some("no-cache"),
                 },
+                reuse,
             )
         };
         use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(&response).await;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
     } else {
         // Non-GET/HEAD fallback: plain app.html, as before.
         let response =
             HttpResponse::with_content("200 OK", "text/html; charset=utf-8", app_html.as_bytes())
                 .header("Cache-Control", "no-cache")
                 .header("Access-Control-Allow-Origin", "*")
+                .deny_framing()
                 .header("Connection", "close")
                 .into_string();
         use tokio::io::AsyncWriteExt;
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    // Flush + cleanly shut down the stream before this task
-    // returns and drops it. Mandatory for the TLS path so the
-    // final ciphertext records reach the socket (rustls buffers
-    // them; dropping mid-buffer truncates large bodies); a
-    // harmless pass-through on plain TCP. Covers every
-    // fall-through chain arm above in one place; the early
-    // `return`s (OPTIONS / failed federation auth) finalize
-    // inline before returning, and every table-dispatched
-    // handler owns its stream and finalizes it itself.
-    finalize_http_stream(&mut stream).await;
+    // Connection tail for every fall-through chain arm above, in one
+    // place: a participating arm that wrote a self-framing response
+    // under a reusable exchange set `parked_ok`, so the stream goes back
+    // to the listener's request loop (park flushes per response — the
+    // TLS-ciphertext rationale on `finalize_http_stream`). Everything
+    // else — non-participating arms, failed writes, close verdicts —
+    // flushes and cleanly shuts down exactly as before. The early
+    // `return`s (OPTIONS / failed gates / body-cap errors) finish
+    // inline, and every table-dispatched handler owns its stream and
+    // parks or finalizes it itself.
+    if parked_ok {
+        stream.park().await;
+    } else {
+        finalize_http_stream(&mut stream).await;
+    }
 }
 
 /// HTTP adapter for the transport-neutral core (transport-unification
@@ -1350,24 +1862,72 @@ pub(crate) fn api_response_http_bytes(
             meta: _,
         } => {
             let BytesPayload::InMemory(payload) = bytes;
-            let mut http =
-                HttpResponse::with_content(status_reason(status), content_type, payload);
+            let mut http = HttpResponse::with_content(status_reason(status), content_type, payload);
             for (name, value) in headers {
                 http = http.header(name, value);
             }
             http
         }
+        // A line stream cannot be buffered — `write_api_response` owns
+        // that lane before delegating here. Reaching this arm is a
+        // wiring bug; fail closed with the canonical 500.
+        ApiResponse::Stream { .. } => {
+            debug_assert!(
+                false,
+                "ApiResponse::Stream reached the buffered HTTP renderer"
+            );
+            HttpResponse::json(
+                status_reason(500),
+                serde_json::json!({ "error": "stream response on the buffered lane" }).to_string(),
+            )
+        }
     };
-    let http = match cors {
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
+}
+
+/// The row-declared CORS posture, applied to a rendered response — one
+/// place for both the buffered renderer and the Stream-lane head.
+fn apply_cors_posture(
+    http: HttpResponse,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> HttpResponse {
+    match cors {
         crate::gateway_routes::CorsPosture::OwnOrigin => http,
         crate::gateway_routes::CorsPosture::Public => http.public_cors(),
         crate::gateway_routes::CorsPosture::FleetAllowlist => http.fleet_cors(fleet_origin),
-    };
-    http.into_bytes()
+    }
 }
 
-/// Write an [`ApiResponse`] to the HTTP lane and finalize the stream —
-/// the whole tail of a converted handler shim.
+/// Head of a Stream-lane response: status line + Content-Type + the
+/// carried header tail under the row's CORS posture. Deliberately no
+/// Content-Length — the body is EOF-delimited (`Connection: close`)
+/// NDJSON lines the writer appends as they arrive.
+pub(crate) fn stream_response_http_head(
+    status: u16,
+    content_type: &str,
+    headers: Vec<(&'static str, String)>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> Vec<u8> {
+    let mut http = HttpResponse::new(status_reason(status)).header("Content-Type", content_type);
+    for (name, value) in headers {
+        http = http.header(name, value);
+    }
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
+}
+
+/// Write an [`ApiResponse`] to the HTTP lane and finish the exchange —
+/// the whole tail of a converted handler shim. The Stream lane writes
+/// its head then pumps the shared line source until it drains (or the
+/// client hangs up); buffered lanes render in one piece.
+///
+/// Keep-alive: buffered lanes are self-framing (`with_content` always
+/// emits `Content-Length`), so under a reusable exchange the baked
+/// `Connection: close` tail is rewritten to keep-alive and the stream is
+/// parked back to the request loop instead of finalized. The Stream lane
+/// NEVER parks — its body is EOF-delimited by design (`Connection:
+/// close` is pinned in its golden head), so it always finalizes.
 pub(crate) async fn write_api_response(
     mut stream: DemuxStream,
     response: ApiResponse,
@@ -1375,9 +1935,54 @@ pub(crate) async fn write_api_response(
     fleet_origin: Option<&str>,
 ) {
     use tokio::io::AsyncWriteExt;
-    let bytes = api_response_http_bytes(response, cors, fleet_origin);
-    let _ = stream.write_all(&bytes).await;
-    finalize_http_stream(&mut stream).await;
+    match response {
+        ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream: line_stream,
+        } => {
+            let head =
+                stream_response_http_head(status, &content_type, headers, cors, fleet_origin);
+            let LineStream {
+                lines: mut line_rx,
+                source,
+            } = line_stream;
+            if stream.write_all(&head).await.is_ok() {
+                while let Some(line) = line_rx.recv().await {
+                    if stream.write_all(line.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            // Hang up before joining: after an early exit above (client
+            // gone) the source may still be sending into the channel;
+            // dropping the receiver fails those sends so the producer
+            // finishes instead of deadlocking the join.
+            drop(line_rx);
+            let _ = source.await;
+            finalize_http_stream(&mut stream).await;
+        }
+        mut buffered => {
+            let keep = stream.exchange_reusable();
+            if keep {
+                match &mut buffered {
+                    ApiResponse::Json { headers, .. } | ApiResponse::Bytes { headers, .. } => {
+                        apply_keep_alive_header_tail(headers);
+                    }
+                    // The outer match already bound the Stream lane.
+                    ApiResponse::Stream { .. } => {}
+                }
+            }
+            let bytes = api_response_http_bytes(buffered, cors, fleet_origin);
+            let write_ok = stream.write_all(&bytes).await.is_ok();
+            if keep && write_ok {
+                stream.park().await;
+            } else {
+                finalize_http_stream(&mut stream).await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1455,5 +2060,68 @@ mod tests {
         let text = String::from_utf8(rendered).unwrap();
         assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
         assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    #[test]
+    fn ephemeral_session_token_response_is_never_stored() {
+        for result in [
+            Ok(r#"{"client_secret":{"value":"live-token"}}"#.to_string()),
+            Err("provider unavailable".to_string()),
+        ] {
+            let rendered = api_response_http_bytes(
+                session_token_api_response(result),
+                CorsPosture::OwnOrigin,
+                None,
+            );
+            let text = String::from_utf8(rendered).unwrap();
+            assert!(text.contains("Cache-Control: no-store\r\n"), "{text}");
+            assert!(!text.contains("Cache-Control: no-cache\r\n"), "{text}");
+        }
+    }
+
+    // ── S10 golden: the sessions-stream NDJSON head (design §8) ──
+    // Captured from the hand-rolled `handle_sessions_stream` header
+    // block before the Stream-lane conversion: no Content-Length, no
+    // Transfer-Encoding — the response is EOF-delimited
+    // (`Connection: close`), with the wildcard-CORS tail the sessions
+    // family bakes into its responses (the row's posture is OwnOrigin;
+    // the header is response decoration, exactly like `/api/sessions`).
+
+    /// The historical head, byte for byte.
+    pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/x-ndjson\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n";
+
+    #[tokio::test]
+    async fn golden_sessions_stream_http_head_is_pinned() {
+        // The Stream-lane head the neutral core declares, rendered under
+        // the row's declared posture, byte-identical to the retired
+        // hand-rolled header block.
+        let (_line_tx, lines) = tokio::sync::mpsc::channel::<String>(1);
+        let crate::web_gateway::ApiResponse::Stream {
+            status,
+            content_type,
+            headers,
+            stream,
+        } = crate::web_gateway::sessions_stream_api_response_from(crate::web_gateway::LineStream {
+            lines,
+            source: tokio::spawn(async {}),
+        })
+        else {
+            panic!("sessions stream core must answer on the Stream lane");
+        };
+        drop(stream);
+        let row_cors = crate::gateway_routes::match_route("GET", "/api/sessions/stream")
+            .expect("sessions stream route declared")
+            .0
+            .cors;
+        let head = stream_response_http_head(status, &content_type, headers, row_cors, None);
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            SESSIONS_STREAM_HEAD_GOLDEN
+        );
     }
 }

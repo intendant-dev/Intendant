@@ -79,11 +79,19 @@ pub(crate) fn replay_jsonl_to_outbound_entries(
     replay_jsonl_to_outbound_entries_inner(contents, log_dir, false)
 }
 
-pub(crate) fn replay_jsonl_to_browser_entries(
+/// Browser-entry variant with line provenance (this is what the detail
+/// read path consumes, via [`session_log_replay_entries_from_contents`]):
+/// the second vec is index-aligned with the entries and carries the
+/// 1-based `session.jsonl` line each entry was rendered from (`None` for
+/// the synthetic prelude entries — `replay_start` and the wrapper
+/// `session_identity` marker). Message-search locators anchor on source
+/// lines, and this mapping is what turns a verified line into an entry
+/// index without re-deriving the render rules (locate.rs).
+pub(crate) fn replay_jsonl_to_browser_entries_with_lines(
     contents: &str,
     log_dir: &std::path::Path,
-) -> Vec<serde_json::Value> {
-    replay_jsonl_to_outbound_entries_inner(contents, log_dir, true)
+) -> (Vec<serde_json::Value>, Vec<Option<u64>>) {
+    replay_jsonl_to_outbound_entries_tracked(contents, log_dir, true)
 }
 
 pub(crate) fn replay_jsonl_to_outbound_entries_inner(
@@ -91,6 +99,14 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
     log_dir: &std::path::Path,
     compact_historical_context: bool,
 ) -> Vec<serde_json::Value> {
+    replay_jsonl_to_outbound_entries_tracked(contents, log_dir, compact_historical_context).0
+}
+
+fn replay_jsonl_to_outbound_entries_tracked(
+    contents: &str,
+    log_dir: &std::path::Path,
+    compact_historical_context: bool,
+) -> (Vec<serde_json::Value>, Vec<Option<u64>>) {
     let (provider, model, autonomy) = scan_replay_status(contents);
     let external_replay_session = external_backend_session_from_replay(contents);
     let external_replay_session_id = external_replay_session
@@ -107,6 +123,9 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
     };
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
+    // Index-aligned 1-based source line per entry; None = synthetic
+    // prelude (see `replay_jsonl_to_browser_entries_with_lines`).
+    let mut entry_lines: Vec<Option<u64>> = Vec::new();
     entries.push(serde_json::json!({
         "event": "replay_start",
         "provider": provider,
@@ -118,6 +137,7 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
         ),
         "delivery": "state",
     }));
+    entry_lines.push(None);
     if let (Some((source, backend_session_id)), Some(wrapper_session_id)) = (
         external_replay_session.as_ref(),
         wrapper_replay_session_id.as_ref(),
@@ -137,12 +157,14 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
                 ),
                 "delivery": "state",
             }));
+            entry_lines.push(None);
         }
     }
 
     let legacy_model_spans = validated_legacy_model_response_spans(contents, log_dir);
     let mut legacy_model_indices: HashMap<String, usize> = HashMap::new();
-    for line in contents.lines() {
+    for (line_index, line) in contents.lines().enumerate() {
+        let line_no = line_index as u64 + 1;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -176,6 +198,7 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
                     wrapper_replay_session_id.as_deref(),
                 );
                 entries.push(value);
+                entry_lines.push(Some(line_no));
                 continue;
             }
         }
@@ -202,9 +225,10 @@ pub(crate) fn replay_jsonl_to_outbound_entries_inner(
             wrapper_replay_session_id.as_deref(),
         );
         entries.push(value);
+        entry_lines.push(Some(line_no));
     }
 
-    entries
+    (entries, entry_lines)
 }
 
 pub(crate) fn legacy_model_response_file_and_len(
@@ -910,14 +934,26 @@ pub(crate) fn annotate_replay_user_turns_from_external_transcript(
 pub(crate) fn session_log_replay_entries_from_dir(
     log_dir: &std::path::Path,
 ) -> Option<(Vec<serde_json::Value>, Option<String>)> {
-    let session_jsonl = log_dir.join("session.jsonl");
-    let contents = std::fs::read_to_string(&session_jsonl).ok()?;
-    let external_session = external_backend_session_from_replay(&contents);
+    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
+    let (entries, _, external_session_id) =
+        session_log_replay_entries_from_contents(log_dir, &contents);
+    Some((entries, external_session_id))
+}
+
+/// Core of [`session_log_replay_entries_from_dir`] over already-read
+/// contents, also returning the per-entry source-line provenance (the
+/// `locate=` resolver reads the same contents to verify locators, so it
+/// must not re-read the file between verification and rendering).
+pub(crate) fn session_log_replay_entries_from_contents(
+    log_dir: &std::path::Path,
+    contents: &str,
+) -> (Vec<serde_json::Value>, Vec<Option<u64>>, Option<String>) {
+    let external_session = external_backend_session_from_replay(contents);
     let external_session_id = external_session
         .as_ref()
         .map(|(_, id)| id.clone())
-        .or_else(|| external_backend_session_id_from_replay(&contents));
-    let mut entries = replay_jsonl_to_browser_entries(&contents, log_dir);
+        .or_else(|| external_backend_session_id_from_replay(contents));
+    let (mut entries, entry_lines) = replay_jsonl_to_browser_entries_with_lines(contents, log_dir);
     if let Some((source, session_id)) = external_session.as_ref() {
         let home = home_from_intendant_log_dir(log_dir).unwrap_or_else(crate::platform::home_dir);
         annotate_replay_user_turns_from_external_transcript(
@@ -927,7 +963,7 @@ pub(crate) fn session_log_replay_entries_from_dir(
             session_id,
         );
     }
-    Some((entries, external_session_id))
+    (entries, entry_lines, external_session_id)
 }
 
 pub(crate) fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
@@ -1110,6 +1146,34 @@ pub(crate) fn prepare_websocket_bootstrap_replay_entries(
     entries
 }
 
+/// [`prepare_websocket_bootstrap_replay_entries`] over borrowed entries
+/// (the cached replay tier): drops context snapshots and clones only the
+/// kept window instead of the whole converted log.
+pub(crate) fn prepare_websocket_bootstrap_replay_entries_ref(
+    entries: &[serde_json::Value],
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let filtered: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|entry| entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot"))
+        .collect();
+    let selection = session_detail_page_selection_over(filtered.iter().copied(), Some(limit), None);
+    let mut out: Vec<serde_json::Value> = match &selection.keep {
+        None => filtered[..selection.page_end]
+            .iter()
+            .map(|entry| (*entry).clone())
+            .collect(),
+        Some(keep) => keep
+            .iter()
+            .filter_map(|idx| filtered.get(*idx).map(|entry| (*entry).clone()))
+            .collect(),
+    };
+    for entry in &mut out {
+        compact_replay_entry_text_fields_for_websocket(entry);
+    }
+    out
+}
+
 pub(crate) fn annotate_context_snapshot_raw_exact_replay(
     entry: &mut serde_json::Value,
     snapshot_file: &str,
@@ -1159,19 +1223,30 @@ pub(crate) fn session_log_replay_payload_from_dir_with_limit(
     log_dir: &std::path::Path,
     limit: Option<usize>,
 ) -> Option<(String, Option<String>)> {
-    let (mut entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
-    if let Some(limit) = limit {
-        entries = prepare_websocket_bootstrap_replay_entries(entries, limit);
+    // Both shapes ride the fingerprint caches in `replay_cache`: the
+    // windowed shape (every websocket bootstrap + external activity
+    // replay) additionally takes the tail-scan path on large logs, so a
+    // dashboard connect no longer converts the entire transcript to keep
+    // its last few hundred entries.
+    match limit {
+        Some(limit) => cached_bootstrap_replay_payload(log_dir, limit),
+        None => {
+            let (entries, external_session_id) = cached_session_log_replay_entries(log_dir)?;
+            Some((
+                replay_payload_string(entries.as_slice()),
+                external_session_id,
+            ))
+        }
     }
-    compact_context_snapshot_entries_for_replay(&mut entries);
-    Some((
-        serde_json::json!({
-            "t": "log_replay",
-            "entries": entries,
-        })
-        .to_string(),
-        external_session_id,
-    ))
+}
+
+/// The `log_replay` wire envelope over already-prepared entries.
+pub(crate) fn replay_payload_string(entries: &[serde_json::Value]) -> String {
+    serde_json::json!({
+        "t": "log_replay",
+        "entries": entries,
+    })
+    .to_string()
 }
 
 pub(crate) fn session_log_replay_payload_for_websocket_bootstrap(
@@ -1197,24 +1272,38 @@ pub(crate) struct SessionDetailPageEntries {
     pub(crate) page_end: usize,
 }
 
-pub(crate) fn session_detail_page_entries(
-    entries: Vec<serde_json::Value>,
+/// The paging decision, shared by the by-value and by-ref variants:
+/// which indices survive (pinned kinds + latest goal per session + the
+/// requested window), and the window bounds. `None` keep-set means
+/// "all of `0..page_end`" (the no-limit fast paths).
+pub(crate) struct SessionDetailPageSelection {
+    pub(crate) keep: Option<BTreeSet<usize>>,
+    pub(crate) total_entries: usize,
+    pub(crate) page_start: usize,
+    pub(crate) page_end: usize,
+}
+
+pub(crate) fn session_detail_page_selection(
+    entries: &[serde_json::Value],
     limit: Option<usize>,
     before: Option<usize>,
-) -> SessionDetailPageEntries {
+) -> SessionDetailPageSelection {
+    session_detail_page_selection_over(entries.iter(), limit, before)
+}
+
+pub(crate) fn session_detail_page_selection_over<'a, I>(
+    entries: I,
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> SessionDetailPageSelection
+where
+    I: ExactSizeIterator<Item = &'a serde_json::Value>,
+{
     let total_entries = entries.len();
     let Some(limit) = limit else {
-        if before.is_none() {
-            return SessionDetailPageEntries {
-                entries,
-                total_entries,
-                page_start: 0,
-                page_end: total_entries,
-            };
-        }
         let end = before.unwrap_or(total_entries).min(total_entries);
-        return SessionDetailPageEntries {
-            entries: entries.into_iter().take(end).collect(),
+        return SessionDetailPageSelection {
+            keep: None,
             total_entries,
             page_start: 0,
             page_end: end,
@@ -1224,8 +1313,8 @@ pub(crate) fn session_detail_page_entries(
     let page_end = before.unwrap_or(total_entries).min(total_entries);
     let page_start = page_end.saturating_sub(limit);
     if total_entries <= limit && before.is_none() {
-        return SessionDetailPageEntries {
-            entries,
+        return SessionDetailPageSelection {
+            keep: None,
             total_entries,
             page_start: 0,
             page_end: total_entries,
@@ -1234,7 +1323,7 @@ pub(crate) fn session_detail_page_entries(
 
     let mut keep = BTreeSet::new();
     let mut latest_goal_by_session: HashMap<String, usize> = HashMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
+    for (idx, entry) in entries.enumerate() {
         let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
         match event {
             "replay_start"
@@ -1257,17 +1346,58 @@ pub(crate) fn session_detail_page_entries(
     keep.extend(latest_goal_by_session.into_values());
     keep.extend(page_start..page_end);
 
-    let entries = entries
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| keep.contains(&idx).then_some(entry))
-        .collect();
-
-    SessionDetailPageEntries {
-        entries,
+    SessionDetailPageSelection {
+        keep: Some(keep),
         total_entries,
         page_start,
         page_end,
+    }
+}
+
+pub(crate) fn session_detail_page_entries(
+    entries: Vec<serde_json::Value>,
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> SessionDetailPageEntries {
+    let selection = session_detail_page_selection(&entries, limit, before);
+    let kept = match &selection.keep {
+        None if selection.page_end == selection.total_entries => entries,
+        None => entries.into_iter().take(selection.page_end).collect(),
+        Some(keep) => entries
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| keep.contains(&idx).then_some(entry))
+            .collect(),
+    };
+    SessionDetailPageEntries {
+        entries: kept,
+        total_entries: selection.total_entries,
+        page_start: selection.page_start,
+        page_end: selection.page_end,
+    }
+}
+
+/// [`session_detail_page_entries`] over borrowed entries (the cached
+/// replay tier hands out `Arc<Vec<_>>`): clones only the kept page
+/// instead of the whole converted log.
+pub(crate) fn session_detail_page_entries_ref(
+    entries: &[serde_json::Value],
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> SessionDetailPageEntries {
+    let selection = session_detail_page_selection(entries, limit, before);
+    let kept = match &selection.keep {
+        None => entries[..selection.page_end].to_vec(),
+        Some(keep) => keep
+            .iter()
+            .filter_map(|idx| entries.get(*idx).cloned())
+            .collect(),
+    };
+    SessionDetailPageEntries {
+        entries: kept,
+        total_entries: selection.total_entries,
+        page_start: selection.page_start,
+        page_end: selection.page_end,
     }
 }
 
@@ -1330,25 +1460,6 @@ pub(crate) fn session_log_mtime(path: &Path) -> std::time::SystemTime {
         .or_else(|_| std::fs::metadata(path))
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
-}
-
-pub(crate) fn external_session_mtime(
-    home: &Path,
-    source: &str,
-    session_id: &str,
-) -> Option<std::time::SystemTime> {
-    let path = session_log_search_file_path(home, source, session_id, None)?;
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-pub(crate) fn external_session_newer_than_wrapper(
-    home: &Path,
-    wrapper_log_dir: &Path,
-    source: &str,
-    session_id: &str,
-) -> bool {
-    external_session_mtime(home, source, session_id)
-        .is_some_and(|external_mtime| external_mtime > session_log_mtime(wrapper_log_dir))
 }
 
 #[cfg(test)]
@@ -1558,7 +1669,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
         log.info("Provider: openai");
-        log.model_response("still here after refresh", 0, 0, 0, 0, None);
+        log.model_response("still here after refresh", 0, 0, 0, 0, 0, None);
         drop(log);
 
         let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");

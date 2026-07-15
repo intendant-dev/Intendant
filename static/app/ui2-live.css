@@ -1,8 +1,8 @@
-/* ── ui-v2 Live display (Video tab) re-skin (design-overhaul P2) ───────
-   Everything here is scoped under `html.ui-v2` and restyles the EXISTING
-   displays DOM (display-slot toolbars/stages, banners, recording replay,
-   annotation + clip editors, peer-display pane controls) to the v2
-   design language — v1 stays pixel-identical.
+/* ── ui-v2 Live display / Computer Use workspace ──────────────────────
+   `html.ui-v2` is the permanent dashboard namespace. This sheet reconciles
+   the stage-first CU concept with the production display lifecycle:
+   selected local display, input authority, sharing, recording, annotation,
+   peer launchers, and the private-vs-agent-visible user-screen grant.
 
    HARD GUARDRAILS honoured throughout (audit §5, displays.md):
    - No CSS touches video/canvas element DIMENSIONS with !important, and
@@ -25,14 +25,51 @@
      displacement (no request/approve ceremony), and the third state —
      another viewer holding input — renders as an amber chip + rail row.
 
-   The right rail (.ui2-live-rail) is injected by the ui2Enabled()-gated
-   mirror block at the end of 45-displays-webrtc.js: it renders FROM the
-   existing slot DOM / station peer chips / sb-display-access chip and
-   proxies clicks to the existing controls. Display-only, v1 untouched. */
+   The semantic right rail lives in 20-shell.html. The stable keyed
+   projection at the end of 45-displays-webrtc.js renders from displaySlots,
+   Station peer chips, and the user-display grant without replacing focused
+   controls on every metrics update. */
 
-/* ── tab scaffold: content column + fixed right rail ── */
-html.ui-v2 #tab-displays { padding-right: 284px; }
-html.ui-v2 #tab-displays > :not(.ui2-live-rail) { min-width: 0; }
+/* Semantic ink is separate from tint RGB. The base design tokens work on
+   dark surfaces; light mode needs darker foregrounds to keep small status
+   text above WCAG AA against the same 10–14% semantic fills. */
+html.ui-v2 {
+  --cu-green-ink: var(--green);
+  --cu-amber-ink: var(--amber);
+  --cu-rose-ink: var(--rose);
+  --cu-sky-ink: var(--sky);
+  --cu-control-outline: #5c6474;
+  --cu-stage-text: #eaecf2;
+  --cu-stage-text-2: #a7aebe;
+  --cu-stage-rose: #ec6a85;
+  --cu-stage-green: #58c08c;
+  --cu-stage-amber: #e4a85b;
+  --cu-stage-line: rgba(230, 236, 247, .14);
+}
+html.ui-v2[data-theme="light"] {
+  --cu-green-ink: #0d633b;
+  --cu-amber-ink: #774000;
+  --cu-rose-ink: #a01f3b;
+  --cu-sky-ink: #15568c;
+  --cu-control-outline: #818899;
+}
+
+/* ── tab scaffold: stage/recording column + semantic right rail ── */
+html.ui-v2 #tab-displays.active {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-live-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+html.ui-v2 .ui2-live-mobile-bar,
+html.ui-v2 .ui2-live-rail-scrim,
+html.ui-v2 .ui2-live-rail-close { display: none; }
 
 /* ── degraded state: macOS capture-approval banner (amber = needs you) ── */
 html.ui-v2 .display-approval-banner {
@@ -59,7 +96,7 @@ html.ui-v2 .display-approval-banner .icon {
 html.ui-v2 .display-approval-banner .title {
   font-size: 13px;
   font-weight: 800;
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   margin-bottom: 3px;
 }
 html.ui-v2 .display-approval-banner .subtitle { font-size: 12px; color: var(--text-2); }
@@ -75,7 +112,7 @@ html.ui-v2 .shared-view-banner {
   font-size: 12.5px;
 }
 html.ui-v2 .shared-view-kicker {
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .08em;
@@ -99,9 +136,9 @@ html.ui-v2 .shared-view-action:hover {
   filter: brightness(1.08);
 }
 html.ui-v2 .shared-view-close {
-  width: 26px;
-  min-height: 26px;
-  border: 1px solid var(--line);
+  width: 36px;
+  min-height: 36px;
+  border: 1px solid var(--cu-control-outline);
   border-radius: 8px;
   background: transparent;
   color: var(--text-2);
@@ -110,7 +147,7 @@ html.ui-v2 .shared-view-close {
 }
 html.ui-v2 .shared-view-close:hover {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   background: rgba(var(--rose-rgb), .08);
 }
 /* compact variant docks flush inside the activity strip */
@@ -125,8 +162,14 @@ html.ui-v2 .shared-view-banner-compact {
 }
 
 /* ── displays container + empty state ── */
-html.ui-v2 .displays-container { padding: 2px 16px 14px; }
+html.ui-v2 .displays-container { padding: 2px 0 0; }
 html.ui-v2 .displays-container:not(.has-displays) { padding: 24px 16px; }
+html.ui-v2 .displays-container.ui2-live-single-stage > .display-slot.ui2-live-inactive {
+  display: none;
+}
+html.ui-v2 .displays-container.ui2-live-single-stage > .display-slot.ui2-live-selected {
+  display: flex;
+}
 html.ui-v2 #tab-displays .ui-empty-glyph {
   width: 40px;
   height: 40px;
@@ -182,23 +225,37 @@ html.ui-v2 .display-slot + .display-slot { margin-top: 8px; }
 html.ui-v2 .display-toolbar {
   background: transparent;
   border-bottom: 0;
-  padding: 10px 2px 10px;
-  gap: 8px;
-  /* v1 never wraps; at narrow widths the trailing buttons (incl. Take
-     Control) clipped off the right edge with no scroll. Wrap instead. */
+  padding: 14px 16px 10px;
+  gap: 14px;
   flex-wrap: wrap;
+  min-width: 0;
 }
-/* display name wears the design's picker-button look (static: every
-   granted display renders simultaneously — no dropdown to fake) */
+html.ui-v2 .display-toolbar-meta {
+  flex: 1 1 260px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 10px;
+}
+html.ui-v2 .display-toolbar-actions {
+  flex: 1 1 680px;
+  min-width: 0;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 7px;
+  overflow-x: visible;
+}
+/* Display selection lives in the real rail. The stage label is therefore
+   an honest heading, not a non-interactive span styled as a dropdown. */
 html.ui-v2 .display-label {
   font-family: var(--sans);
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 800;
   color: var(--text);
-  padding: 6px 12px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--surface);
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -234,11 +291,26 @@ html.ui-v2 .display-status.error {
   border: 1px solid rgba(var(--rose-rgb), .26);
   border-radius: var(--r-pill);
   background: rgba(var(--rose-rgb), .10);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
   font-size: 11.5px;
 }
 html.ui-v2 .display-status.error::before { background: var(--rose); }
+/* transient degradation ('disconnected' — usually self-heals): amber,
+   informational, deliberately calmer than the rose error pill */
+html.ui-v2 .display-status.warn {
+  padding: 3px 10px;
+  border: 1px solid rgba(var(--amber-rgb), .26);
+  border-radius: var(--r-pill);
+  background: rgba(var(--amber-rgb), .12);
+  color: var(--cu-amber-ink);
+  font-weight: 700;
+  font-size: 11.5px;
+}
+html.ui-v2 .display-status.warn::before {
+  background: var(--amber);
+  animation: ui2-pulse 1.4s infinite;
+}
 
 /* input-authority chip — the three real states, honestly labeled:
    you (green) / another viewer (amber, the displacement-aware third
@@ -260,12 +332,12 @@ html.ui-v2 .display-input-authority {
 html.ui-v2 .display-input-authority.you {
   background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
-  color: var(--green);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .display-input-authority.other {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .26);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-input-authority.unclaimed {
   background: var(--surface-3);
@@ -273,11 +345,34 @@ html.ui-v2 .display-input-authority.unclaimed {
   color: var(--text-2);
 }
 
+html.ui-v2 .display-visibility {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2);
+  font-family: var(--sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+html.ui-v2 .display-visibility.private {
+  color: var(--cu-green-ink);
+  border-color: rgba(var(--green-rgb), .26);
+  background: rgba(var(--green-rgb), .1);
+}
+html.ui-v2 .display-visibility.agent {
+  color: var(--cu-amber-ink);
+  border-color: rgba(var(--amber-rgb), .28);
+  background: rgba(var(--amber-rgb), .11);
+}
+
 /* toolbar buttons: quiet secondaries by default */
 html.ui-v2 .display-toolbar button {
+  flex: 0 0 auto;
   min-height: 0;
   padding: 6px 11px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--cu-control-outline);
   border-radius: var(--r-ctl);
   background: transparent;
   color: var(--text-2);
@@ -286,17 +381,19 @@ html.ui-v2 .display-toolbar button {
   font-weight: 600;
   transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
 }
+html.ui-v2 .display-toolbar-actions .take-control-btn { margin-left: 0; }
+html.ui-v2 .display-toolbar-actions .display-fullscreen-btn { margin-left: 6px; }
 html.ui-v2 .display-toolbar button:hover {
   background: var(--surface-2);
-  border-color: var(--line-2);
+  border-color: var(--text-2);
   color: var(--text);
 }
 /* streaming to the presence model = sky (live/info) while active */
-html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--sky); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
+html.ui-v2 .display-toolbar .stream-btn:hover { color: var(--cu-sky-ink); border-color: rgba(var(--sky-rgb), .4); background: rgba(var(--sky-rgb), .08); }
 html.ui-v2 .display-toolbar .stream-btn.active {
   background: rgba(var(--sky-rgb), .14);
   border-color: rgba(var(--sky-rgb), .32);
-  color: var(--sky);
+  color: var(--cu-sky-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .annotate-btn:hover,
@@ -310,13 +407,13 @@ html.ui-v2 .display-toolbar .annotate-btn.active {
    dot would double it.) */
 html.ui-v2 .display-toolbar .record-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .record-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .record-btn.active {
   background: var(--rose);
@@ -332,7 +429,7 @@ html.ui-v2 .display-toolbar .display-close-btn {
 html.ui-v2 .display-toolbar .display-close-btn:hover {
   background: rgba(var(--rose-rgb), .08);
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 /* Take control — the design's iris primary. The verb is honest: it takes
    (displacing any other viewer), it does not request. */
@@ -356,26 +453,27 @@ html.ui-v2 .display-toolbar .take-control-btn:hover {
 html.ui-v2 .display-toolbar .release-control-btn {
   background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .32);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
   font-weight: 700;
 }
 html.ui-v2 .display-toolbar .release-control-btn:hover {
   background: rgba(var(--amber-rgb), .2);
   border-color: rgba(var(--amber-rgb), .45);
-  color: var(--amber);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .display-toolbar .delete-recording-btn {
   border-color: rgba(var(--rose-rgb), .4);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
   font-size: 11.5px;
 }
 html.ui-v2 .display-toolbar .delete-recording-btn:hover {
   background: rgba(var(--rose-rgb), .10);
   border-color: rgba(var(--rose-rgb), .55);
-  color: var(--rose);
+  color: var(--cu-rose-ink);
 }
 html.ui-v2 .display-toolbar .release-note {
-  border: 1px solid var(--line-2);
+  flex: 0 0 150px;
+  border: 1px solid var(--cu-control-outline);
   border-radius: 9px;
   background: var(--surface-2);
   color: var(--text);
@@ -397,14 +495,64 @@ html.ui-v2 .display-canvas {
   display: flex;
   align-items: center;
   justify-content: center;
+  margin: 0 16px 16px;
   border-radius: 16px;
   overflow: hidden;
   background: radial-gradient(120% 120% at 30% 0%, #10131b, #070810 70%);
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(0, 0, 0, .5);
 }
+html.ui-v2 .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+
+/* Explicit feedback that input listeners are bound to THIS stage. The
+   server authority chip remains the source of truth; this banner only
+   appears after DisplaySlot._enterInteractive has installed the capture
+   stack (including the document paste handler). */
+html.ui-v2 .display-control-banner {
+  display: none;
+  position: absolute;
+  z-index: 8;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 210px);
+  padding: 6px 12px 6px 26px;
+  border: 1px solid rgba(var(--green-rgb), .34);
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .76);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--cu-stage-green);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+html.ui-v2 .display-control-banner::before {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cu-stage-green);
+  transform: translateY(-50%);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .display-slot.is-interactive .display-control-banner { display: block; }
 /* LIVE pill — pure CSS, derived from the real connection state; any
    reconnect/degraded state drops .connected and the pill vanishes. */
 html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::after {
@@ -416,10 +564,10 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::after {
   padding: 5px 11px 5px 24px;
   border-radius: var(--r-pill);
   background: rgba(11, 12, 16, .72);
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--cu-stage-line);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
-  color: var(--rose);
+  color: var(--cu-stage-rose);
   font-family: var(--sans);
   font-size: 11px;
   font-weight: 700;
@@ -436,10 +584,124 @@ html.ui-v2 .display-slot:has(.display-status.connected) .display-canvas::before 
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--rose);
+  background: var(--cu-stage-rose);
   animation: ui2-pulse 1.4s infinite;
   pointer-events: none;
 }
+/* ── in-stage status overlay (items 1/5): staged connect copy + error
+      states with a Reconnect/Retry action. Reuses the MSE loading-
+      overlay pattern (dark wash + centered inner) but with a pill card,
+      spinner, and an actionable button. pointer-events stay off except
+      on the button so view-only interactions pass through. ── */
+html.ui-v2 .display-stage-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: rgba(7, 8, 16, .55);
+}
+html.ui-v2 .display-stage-overlay.error { background: rgba(7, 8, 16, .78); }
+html.ui-v2 .stage-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  max-width: 78%;
+  padding: 14px 18px;
+  text-align: center;
+  border-radius: 12px;
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--cu-stage-line);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+html.ui-v2 .stage-overlay-text {
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--cu-stage-text-2);
+}
+html.ui-v2 .display-stage-overlay.error .stage-overlay-text { color: var(--cu-stage-rose); }
+html.ui-v2 .stage-overlay-spinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid var(--cu-stage-line);
+  border-top-color: var(--iris);
+  animation: ui2-stage-spin .8s linear infinite;
+}
+@keyframes ui2-stage-spin { to { transform: rotate(360deg); } }
+html.ui-v2 .stage-overlay-retry {
+  pointer-events: auto;
+  min-height: 0;
+  padding: 7px 14px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  transition: filter var(--t-med);
+}
+html.ui-v2 .stage-overlay-retry:hover { filter: brightness(1.08); }
+
+/* ── live metrics chip (item 6): "LIVE · fps · kbps · relay", fed by the
+      3s getStats sampler. Same placement/backdrop recipe as the pure-CSS
+      LIVE pill; when it carries data (.active) it SUPERSEDES that pill
+      (rule below) so the corner never shows two badges. ── */
+html.ui-v2 .display-live-metrics {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--cu-stage-line);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--cu-stage-text-2);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .03em;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+html.ui-v2 .display-live-metrics::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--cu-stage-rose);
+  animation: ui2-pulse 1.4s infinite;
+}
+html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::after,
+html.ui-v2 .display-slot:has(.display-live-metrics.active) .display-canvas::before {
+  content: none;
+}
+
+/* Take Control while the authority request is in flight (item 7b) */
+html.ui-v2 .display-toolbar .take-control-btn.is-pending,
+html.ui-v2 .peer-display-controls .take-control-btn.is-pending {
+  opacity: .6;
+  filter: none;
+  cursor: default;
+  transform: none;
+}
+
 /* shared-view focus ring on the stage instead of a square slot outline */
 html.ui-v2 .display-slot.shared-view-active { outline: 0; }
 html.ui-v2 .display-slot.shared-view-active .display-canvas {
@@ -450,23 +712,25 @@ html.ui-v2 .display-slot.shared-view-active .display-canvas {
 }
 html.ui-v2 .shared-view-focus-box {
   border-radius: 6px;
-  border-color: var(--amber);
+  border-color: var(--cu-stage-amber);
   background: rgba(var(--amber-rgb), .06);
   box-shadow:
     0 0 0 1px rgba(7, 8, 16, .72),
     0 0 12px rgba(var(--amber-rgb), .38);
 }
-html.ui-v2 .shared-view-focus-box::after {
+html.ui-v2 .shared-view-focus-note {
   border-radius: 8px;
   background: rgba(11, 13, 18, .92);
-  border-color: rgba(var(--amber-rgb), .5);
+  border-color: rgba(228, 168, 91, .5);
+  color: var(--cu-stage-text);
   font-family: var(--sans);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .38);
 }
 /* light theme: the stage stays a dark viewport, but its .5-black drop
    shadow is dark-tuned — soften toward the light elevation vocabulary. */
 html.ui-v2[data-theme="light"] .display-canvas {
   box-shadow:
-    inset 0 0 0 1px var(--line-2),
+    inset 0 0 0 1px var(--cu-stage-line),
     inset 0 1px 0 rgba(255, 255, 255, .04),
     0 24px 60px rgba(23, 28, 50, .22);
 }
@@ -480,15 +744,39 @@ html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas 
 /* contexts that must NOT wear the stage chrome: activity thumbnails and
    in-page fullscreen (the reparented canvas keeps its geometry honest) */
 html.ui-v2 .activity-display-thumb > .display-canvas {
+  margin: 0;
   border-radius: 3px;
   box-shadow: none;
 }
+/* thumbs are glanceable mini-views — the status overlay and metrics chip
+   would swallow them; both stay slot-only. (Higher specificity than the
+   base rules, so this wins whenever JS clears the inline display.) */
+html.ui-v2 .activity-display-thumb .display-stage-overlay,
+html.ui-v2 .activity-display-thumb .display-live-metrics {
+  display: none;
+}
 html.ui-v2 .display-slot.display-fullscreen { background: var(--bg); }
 html.ui-v2 .display-slot.display-fullscreen .display-canvas {
+  margin: 0 14px 14px;
   border-radius: 0;
   box-shadow: none;
 }
 html.ui-v2 .display-slot.display-fullscreen .display-toolbar { padding: 10px 14px; }
+/* Interaction focus outranks the shared-view/fullscreen state rings above. */
+html.ui-v2 .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2 .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(0, 0, 0, .5);
+}
+html.ui-v2[data-theme="light"] .display-slot.shared-view-active .display-canvas:has(video:focus-visible),
+html.ui-v2[data-theme="light"] .display-slot.display-fullscreen .display-canvas:has(video:focus-visible) {
+  box-shadow:
+    inset 0 0 0 2px var(--iris),
+    inset 0 1px 0 rgba(255, 255, 255, .04),
+    0 24px 60px rgba(23, 28, 50, .22);
+}
 
 /* ── collapse bar + split handles ── */
 html.ui-v2 .displays-collapse-bar {
@@ -914,20 +1202,42 @@ html.ui-v2 .thumb-label {
 /* ── user-display picker popover (opens from the status-bar chip; the
       rail's "Your screen" card proxies the same control) ── */
 html.ui-v2 .display-picker {
+  display: none;
+  min-width: 260px;
+  max-width: min(360px, calc(100vw - 24px));
+  max-height: min(440px, calc(100vh - 24px));
+  overflow-y: auto;
   background: linear-gradient(180deg, var(--surface-2), var(--surface));
   border: 1px solid var(--line-2);
   border-radius: var(--r-card);
   padding: 5px;
   box-shadow: var(--shadow-overlay);
 }
+html.ui-v2 .display-picker.visible { display: block; }
 html.ui-v2 .display-picker-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font-family: var(--sans);
+  text-align: left;
+  cursor: pointer;
   border-radius: 8px;
   font-size: 12.5px;
   font-weight: 600;
   color: var(--text);
+  min-height: 44px;
   padding: 8px 11px;
 }
 html.ui-v2 .display-picker-item:hover { background: rgba(var(--iris-rgb), .1); }
+html.ui-v2 .display-picker-item.dp-action {
+  margin-top: 5px;
+  padding-top: 11px;
+  border-top: 1px solid var(--line);
+  border-radius: 0 0 8px 8px;
+  color: var(--iris-2);
+}
 html.ui-v2 .display-picker-item .dp-primary {
   font-family: var(--mono);
   font-size: 10px;
@@ -944,6 +1254,23 @@ html.ui-v2 .peer-display-controls { gap: 8px; padding: 4px 0; }
 html.ui-v2 .peer-display-status { font-size: 11.5px; font-weight: 600; color: var(--text-2); }
 html.ui-v2 .peer-display-status.connected { color: var(--green); }
 html.ui-v2 .peer-display-status.error { color: var(--rose); }
+html.ui-v2 .peer-display-status.warn { color: var(--amber); }
+/* peer pane hosts the same overlay/chip elements as the local stage,
+   but as a top-anchored banner (the pane is a video+controls column —
+   an inset-0 wash would cover the Close button) */
+html.ui-v2 .peer-display-pane { position: relative; }
+html.ui-v2 .peer-display-pane > .display-stage-overlay {
+  inset: auto 8px auto 8px;
+  top: 8px;
+  background: transparent;
+}
+html.ui-v2 .peer-display-pane > .display-stage-overlay .stage-overlay-inner {
+  flex-direction: row;
+  padding: 8px 12px;
+  gap: 8px;
+  text-align: left;
+}
+html.ui-v2 .peer-display-pane > .display-live-metrics { top: 8px; left: 8px; }
 html.ui-v2 .peer-display-controls .take-control-btn,
 html.ui-v2 .peer-display-controls .release-control-btn,
 html.ui-v2 .peer-display-close {
@@ -974,53 +1301,211 @@ html.ui-v2 .peer-display-controls .release-control-btn {
 html.ui-v2 .peer-display-close { color: var(--rose); border-color: rgba(var(--rose-rgb), .4); }
 html.ui-v2 .peer-display-close:hover { background: rgba(var(--rose-rgb), .1); }
 
-/* ── right rail (injected, display-only mirror) ── */
-html.ui-v2 .ui2-live-rail {
+/* ── Annotate / Callout on live surfaces ──────────────────────────────
+   Peer-pane Annotate/Callout wear the same quiet-secondary chrome as
+   the other peer controls; the local Callout inherits the
+   .display-toolbar button base. Callout's armed state is the pressed
+   toggle (aria-pressed), amber to match the stroked rectangle. */
+html.ui-v2 .peer-display-controls .annotate-btn,
+html.ui-v2 .peer-display-controls .callout-btn {
+  min-height: 0;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 600;
+  transition: background var(--t-fast), color var(--t-fast), border-color var(--t-fast), filter var(--t-fast);
+}
+html.ui-v2 .peer-display-controls .annotate-btn:hover,
+html.ui-v2 .peer-display-controls .annotate-btn.active {
+  background: rgba(var(--iris-rgb), .14);
+  border-color: rgba(var(--iris-rgb), .3);
+  color: var(--iris-2);
+}
+html.ui-v2 .display-toolbar .callout-btn:hover,
+html.ui-v2 .peer-display-controls .callout-btn:hover {
+  background: rgba(var(--amber-rgb), .10);
+  border-color: rgba(var(--amber-rgb), .45);
+  color: var(--cu-amber-ink);
+}
+html.ui-v2 .display-toolbar .callout-btn[aria-pressed="true"],
+html.ui-v2 .peer-display-controls .callout-btn[aria-pressed="true"] {
+  background: rgba(var(--amber-rgb), .16);
+  border-color: rgba(var(--amber-rgb), .5);
+  color: var(--cu-amber-ink);
+  font-weight: 700;
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .display-toolbar .callout-btn:disabled,
+html.ui-v2 .peer-display-controls .callout-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+html.ui-v2 .display-toolbar .callout-btn:disabled:hover,
+html.ui-v2 .peer-display-controls .callout-btn:disabled:hover {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--text-2);
+  box-shadow: none;
+}
+
+/* Callout arm overlay: pinned over the rendered frame's content box
+   (letterbox math in 47's surfaceContentBox); swallows pointer input
+   while armed so the drag never reaches the remote display. z-index
+   above the live-annotation layers (4/5), the stage overlay (5), and
+   the metrics chip (8) so the drag can start anywhere on the frame. */
+html.ui-v2 .callout-arm-overlay {
   position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 284px;
+  z-index: 9;
+  cursor: crosshair;
+  touch-action: none;
+  background: rgba(var(--amber-rgb), .05);
+  outline: 1.5px dashed rgba(var(--amber-rgb), .55);
+  outline-offset: -1.5px;
+}
+html.ui-v2 .callout-arm-rect {
+  position: absolute;
+  border: 2px solid var(--cu-stage-amber);
+  background: rgba(var(--amber-rgb), .12);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .35);
+  pointer-events: none;
+}
+html.ui-v2 .callout-arm-hint {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 16px);
+  padding: 4px 10px;
+  border-radius: var(--r-pill);
+  background: rgba(11, 12, 16, .72);
+  border: 1px solid var(--cu-stage-line);
+  color: var(--cu-stage-amber);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+/* Live-annotation editor on peer panes: same stacking contract as the
+   local stage (14-styles scopes the original rules to .display-canvas;
+   here the pane is the stage). */
+html.ui-v2 .peer-display-pane .live-annotation-source,
+html.ui-v2 .peer-display-pane .live-annotation-overlay {
+  position: absolute;
+  pointer-events: none;
+}
+html.ui-v2 .peer-display-pane .live-annotation-source { z-index: 4; background: #000; }
+html.ui-v2 .peer-display-pane .live-annotation-overlay { z-index: 5; }
+
+/* ── Computer Use right rail ── */
+html.ui-v2 .ui2-live-rail {
+  position: relative;
+  z-index: 20;
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 22px;
-  padding: 20px 18px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   border-left: 1px solid var(--line);
   background: var(--bg-1);
 }
+html.ui-v2 .ui2-live-rail-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg-1) 92%, transparent);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+html.ui-v2 .ui2-live-rail-kicker,
+html.ui-v2 .ui2-live-mobile-kicker {
+  display: block;
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+html.ui-v2 .ui2-live-rail-header h2 {
+  margin: 2px 0 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+html.ui-v2 .ui2-live-rail > section {
+  flex: 0 0 auto;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+html.ui-v2 .ui2-live-rail > section:last-child { border-bottom: 0; }
 html.ui-v2 .ui2-live-rail-eyebrow {
+  margin: 0 0 10px;
+  color: var(--text-3);
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: .1em;
   text-transform: uppercase;
-  color: var(--text-3);
-  margin-bottom: 10px;
 }
-html.ui-v2 .ui2-live-rail-list { display: flex; flex-direction: column; gap: 8px; }
-html.ui-v2 .ui2-live-rail-empty { font-size: 11.5px; color: var(--text-3); line-height: 1.5; }
+html.ui-v2 .ui2-live-rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+html.ui-v2 .ui2-live-rail-empty {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
 html.ui-v2 .ui2-live-row {
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  min-height: 0;
-  padding: 11px 12px;
-  border: 1px solid var(--line);
+  min-height: 50px;
+  padding: 10px 11px;
+  border: 1px solid var(--cu-control-outline);
   border-radius: 11px;
   background: var(--surface);
   color: var(--text);
   font-family: var(--sans);
   text-align: left;
   cursor: pointer;
-  transition: border-color var(--t-fast), background var(--t-fast);
+  transition:
+    border-color var(--t-fast),
+    background var(--t-fast),
+    box-shadow var(--t-fast);
 }
-html.ui-v2 .ui2-live-row:hover { border-color: var(--line-2); background: var(--surface-2); }
-html.ui-v2 .ui2-live-row:disabled { opacity: .55; cursor: default; }
-html.ui-v2 .ui2-live-row:disabled:hover { border-color: var(--line); background: var(--surface); }
-html.ui-v2 .ui2-live-row.viewing {
+html.ui-v2 .ui2-live-row:hover {
+  border-color: var(--line-2);
+  background: var(--surface-2);
+}
+html.ui-v2 .ui2-live-row:disabled {
+  opacity: .55;
+  cursor: default;
+}
+html.ui-v2 .ui2-live-row:disabled:hover {
+  border-color: var(--line);
+  background: var(--surface);
+}
+html.ui-v2 .ui2-live-row.viewing,
+html.ui-v2 .ui2-live-row.selected {
   border-color: var(--iris);
   background: rgba(var(--iris-rgb), .08);
+  box-shadow: inset 3px 0 0 var(--iris);
 }
 html.ui-v2 .ui2-live-row-dot {
   width: 7px;
@@ -1044,89 +1529,605 @@ html.ui-v2 .ui2-live-row-main {
   flex-direction: column;
 }
 html.ui-v2 .ui2-live-row-title {
+  overflow: hidden;
+  color: var(--text);
   font-size: 13px;
   font-weight: 700;
-  white-space: nowrap;
-  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 html.ui-v2 .ui2-live-row-meta {
   margin-top: 2px;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--text-3);
-  white-space: nowrap;
   overflow: hidden;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10px;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+html.ui-v2 .ui2-live-row-tags {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 3px;
 }
 html.ui-v2 .ui2-live-row-tag {
-  flex: 0 0 auto;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .05em;
   color: var(--iris-2);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .05em;
 }
-html.ui-v2 .ui2-live-row-chev { flex: 0 0 auto; color: var(--text-3); font-size: 14px; }
+html.ui-v2 .ui2-live-row-privacy { color: var(--cu-green-ink); }
+html.ui-v2 .ui2-live-row-media.streaming { color: var(--cu-sky-ink); }
+html.ui-v2 .ui2-live-row-media.recording { color: var(--cu-rose-ink); }
+html.ui-v2 .ui2-live-row-chev {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-size: 14px;
+}
 
 html.ui-v2 .ui2-live-card {
+  padding: 14px 15px;
   border: 1px solid var(--line);
   border-radius: var(--r-card);
   background: var(--surface);
-  padding: 14px 15px;
 }
-html.ui-v2 .ui2-live-card-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
+html.ui-v2 .ui2-live-card-title {
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 800;
+}
 html.ui-v2 .ui2-live-card-sub {
-  margin-top: 6px;
-  font-size: 11.5px;
-  line-height: 1.55;
+  margin-top: 5px;
   color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+html.ui-v2 .ui2-live-authority-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+html.ui-v2 .ui2-live-authority-copy {
+  flex: 1;
+  min-width: 0;
+}
+html.ui-v2 .ui2-live-authority-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+  box-shadow: 0 0 0 3px rgba(var(--text-rgb), .06);
+}
+html.ui-v2 .ui2-live-authority-card.state-you .ui2-live-authority-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .ui2-live-authority-card.state-other .ui2-live-authority-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
 }
 html.ui-v2 .ui2-live-auth-row {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
 }
 html.ui-v2 .ui2-live-auth-name {
   flex: 1;
   min-width: 0;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text);
-  white-space: nowrap;
   overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 html.ui-v2 .ui2-live-state-pill {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  padding: 2px 9px;
-  border-radius: var(--r-pill);
+  padding: 2px 8px;
   border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
   background: var(--surface-3);
   color: var(--text-2);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 700;
+  white-space: nowrap;
 }
 html.ui-v2 .ui2-live-state-pill.you {
-  background: rgba(var(--green-rgb), .12);
   border-color: rgba(var(--green-rgb), .26);
-  color: var(--green);
+  background: rgba(var(--green-rgb), .12);
+  color: var(--cu-green-ink);
 }
 html.ui-v2 .ui2-live-state-pill.other {
-  background: rgba(var(--amber-rgb), .14);
   border-color: rgba(var(--amber-rgb), .26);
-  color: var(--amber);
+  background: rgba(var(--amber-rgb), .14);
+  color: var(--cu-amber-ink);
 }
 html.ui-v2 .ui2-live-card-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 100%;
-  min-height: 0;
+  min-height: 44px;
   margin-top: 9px;
   padding: 9px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  font-weight: 800;
+  transition: filter var(--t-med), background var(--t-fast), border-color var(--t-fast);
+}
+html.ui-v2 .ui2-live-card-btn:hover { filter: brightness(1.08); }
+html.ui-v2 .ui2-live-card-btn[hidden] { display: none; }
+html.ui-v2 .ui2-live-card-btn:disabled {
+  opacity: .55;
+  cursor: wait;
+  filter: none;
+}
+html.ui-v2 .ui2-live-card-btn.release {
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  background: rgba(var(--amber-rgb), .14);
+  box-shadow: none;
+  color: var(--cu-amber-ink);
+}
+html.ui-v2 .ui2-live-card-btn.secondary {
+  border: 1px solid var(--cu-control-outline);
+  background: var(--surface-2);
+  box-shadow: none;
+  color: var(--text);
+  font-weight: 700;
+}
+html.ui-v2 .ui2-live-card-btn.secondary:hover {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  filter: none;
+}
+html.ui-v2 .ui2-live-card-btn.danger {
+  border: 1px solid rgba(var(--rose-rgb), .4);
+  background: transparent;
+  box-shadow: none;
+  color: var(--cu-rose-ink);
+  font-weight: 700;
+}
+html.ui-v2 .ui2-live-card-btn.danger:hover {
+  background: rgba(var(--rose-rgb), .1);
+  filter: none;
+}
+html.ui-v2 .ui2-live-screen-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+html.ui-v2 .ui2-live-screen-head .ui2-live-card-title {
+  flex: 1;
+  min-width: 0;
+}
+html.ui-v2 .ui2-live-screen-actions {
+  display: flex;
+  flex-direction: column;
+}
+
+html.ui-v2 .ui2-live-activity {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+html.ui-v2 .ui2-live-activity-row {
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  /* Rows size to their wrapped content and the LIST scrolls. Never let
+     these flex items shrink: the explicit min-height replaces the
+     `min-height: auto` floor, so a shrinkable row gets squashed to 31px
+     when entries exceed the list budget and its wrapped text paints over
+     the neighboring rows (the 2026-07-13 feed-overlap bug). */
+  flex: 0 0 auto;
+  min-height: 31px;
+  padding: 5px 4px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 6px;
+  transition: background var(--t-fast);
+}
+html.ui-v2 .ui2-live-activity-row:hover { background: var(--hover-wash); }
+html.ui-v2 .ui2-live-activity-row:last-child { border-bottom: 0; }
+/* Feed dots: 8px + 3px semantic halo (concept grammar). Color map:
+   sky = look/connect · iris = click/focus · violet = type · amber =
+   waiting/attention · green = control/grants · rose = stop/error/rec ·
+   neutral = scroll/move. */
+html.ui-v2 .ui2-live-activity-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--neutral-dot);
+  box-shadow: 0 0 0 3px rgba(var(--text-rgb), .06);
+}
+html.ui-v2 .ui2-live-activity-row.kind-live .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-control .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-private .ui2-live-activity-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 3px rgba(var(--green-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-row.kind-attention .ui2-live-activity-dot {
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-row.kind-error .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-recording .ui2-live-activity-dot {
+  background: var(--rose);
+  box-shadow: 0 0 0 3px rgba(var(--rose-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-row.kind-focus .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-click .ui2-live-activity-dot {
+  background: var(--iris);
+  box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-row.kind-share .ui2-live-activity-dot,
+html.ui-v2 .ui2-live-activity-row.kind-look .ui2-live-activity-dot {
+  background: var(--sky);
+  box-shadow: 0 0 0 3px rgba(var(--sky-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-row.kind-type .ui2-live-activity-dot {
+  background: var(--violet);
+  box-shadow: 0 0 0 3px rgba(var(--violet-rgb), .16);
+}
+html.ui-v2 .ui2-live-activity-text {
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.35;
+}
+html.ui-v2 .ui2-live-activity-time {
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── CU action rows: the concept's two-line grammar (friendly sentence +
+      seconds ts, raw mono call below). Lifecycle rows stay one-line. ── */
+html.ui-v2 .ui2-live-activity-row.cu-action-row {
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 0 10px;
+  padding: 6px 2px;
+}
+html.ui-v2 .cu-action-row .ui2-live-activity-dot {
+  justify-self: center;
+  margin-top: 5px;
+}
+html.ui-v2 .cu-action-main { min-width: 0; }
+html.ui-v2 .cu-action-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+html.ui-v2 .cu-action-friendly {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+html.ui-v2 .cu-action-head .ui2-live-activity-time {
+  flex: 0 0 auto;
+  font-size: 10px;
+}
+html.ui-v2 .cu-action-raw {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* Long raw payloads render collapsed (readable preview + char count) with
+   the full literal call one click away — the disclosure is a real button
+   so keyboards and screen readers get it for free. */
+html.ui-v2 .cu-action-raw-toggle {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+  transition: color var(--t-fast);
+}
+html.ui-v2 .cu-action-raw-toggle:hover { color: var(--text-2); }
+html.ui-v2 .cu-action-raw-toggle:focus-visible {
+  outline: 2px solid var(--iris);
+  outline-offset: 2px;
+}
+@keyframes cu-row-in {
+  from { opacity: 0; transform: translateX(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes cu-chip-in {
+  from { opacity: 0; transform: translateY(4px) scale(.9); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .ui2-live-activity-row.cu-action-row { animation: cu-row-in .22s ease; }
+  html.ui-v2 .cu-key-chip { animation: cu-chip-in .16s ease; }
+}
+
+/* ── CU stage overlays (45b-cu-overlays.js) ───────────────────────────
+   Absolutely-positioned pointer-events:none children of .display-canvas;
+   JS drives all positions/opacities from letterboxed geometry
+   (surfaceContentBox). Inks are the pinned --cu-stage-* values: the stage
+   stays a dark viewport in both themes. z-order (inline from JS):
+   flash 9 < ripple 16 < keys 18 < cursor 20. */
+html.ui-v2 .cu-overlay-flash {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, .9);
+  opacity: 0;
+  pointer-events: none;
+}
+html.ui-v2 .cu-overlay-ripple {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--iris);
+  background: rgba(var(--iris-rgb), .14);
+  opacity: 0;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+html.ui-v2 .cu-overlay-keys {
+  position: absolute;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 5px;
+  max-width: calc(100% - 24px);
+  overflow: hidden;
+  pointer-events: none;
+}
+html.ui-v2 .cu-key-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 26px;
+  padding: 0 7px;
+  border-radius: 7px;
+  background: rgba(11, 12, 16, .82);
+  border: 1px solid var(--cu-stage-line);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--cu-stage-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+}
+html.ui-v2 .cu-overlay-cursor {
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+  will-change: left, top, opacity;
+}
+html.ui-v2 .cu-overlay-cursor svg {
+  display: block;
+  position: relative;
+  z-index: 1;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .55));
+}
+/* Presence halo: a soft breathing ring centered on the pointer hotspot so
+   the agent cursor stays findable on busy content. It rides the cursor
+   element (inherits its ease + idle fade) and hides entirely while the
+   dashboard user holds input — their real cursor rules the stage, and a
+   glowing second cursor would read as a double pointer. */
+html.ui-v2 .cu-cursor-halo {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid rgba(var(--iris-rgb), .58);
+  background: radial-gradient(circle,
+    rgba(var(--iris-rgb), .16) 0%,
+    rgba(var(--iris-rgb), .07) 52%,
+    transparent 68%);
+  box-shadow:
+    0 0 16px rgba(var(--iris-rgb), .38),
+    inset 0 0 9px rgba(var(--iris-rgb), .2);
+  pointer-events: none;
+  transition: opacity var(--t-med);
+}
+html.ui-v2 .cu-overlay-cursor.cu-user-driving .cu-cursor-halo { opacity: 0; }
+@keyframes cu-halo-breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50% { transform: translate(-50%, -50%) scale(1.12); }
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .cu-cursor-halo { animation: cu-halo-breathe 2.6s ease-in-out infinite; }
+}
+html.ui-v2 .cu-cursor-pill {
+  position: absolute;
+  left: 17px;
+  top: 19px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(180deg, var(--iris), var(--iris-deep));
+  color: var(--on-accent);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+  letter-spacing: .01em;
+  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .4);
+}
+html.ui-v2 .cu-cursor-pill:empty { display: none; }
+
+/* Host identity chip: "{host} · {display}" + gradient identity square
+   (bottom-right stage chrome; text synced by the live workspace). */
+html.ui-v2 .cu-host-chip {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 28px);
+  padding: 5px 11px;
+  border-radius: var(--r-pill);
+  background: rgba(8, 10, 16, .5);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, .08);
+  color: rgba(233, 236, 244, .72);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .02em;
+  white-space: nowrap;
+  pointer-events: none;
+}
+html.ui-v2 .cu-host-chip-mark {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  background: linear-gradient(145deg, #8b93ff, #6470d0);
+}
+html.ui-v2 .cu-host-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Thumbs are glanceable mini-views and fullscreen strips its chrome —
+   same contexts that hide the metrics chip / stage overlay above. */
+html.ui-v2 .activity-display-thumb .cu-host-chip,
+html.ui-v2 .activity-display-thumb .cu-overlay-flash,
+html.ui-v2 .activity-display-thumb .cu-overlay-ripple,
+html.ui-v2 .activity-display-thumb .cu-overlay-keys,
+html.ui-v2 .activity-display-thumb .cu-overlay-cursor,
+html.ui-v2 .display-slot.display-fullscreen .cu-host-chip {
+  display: none;
+}
+
+/* Authority-card holder avatar (concept): 24px dark circle + initials.
+   The disc is pinned dark in both themes, so the ink is the pinned
+   stage text, not var(--text). */
+html.ui-v2 .ui2-live-auth-avatar {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: linear-gradient(145deg, #3a4152, #20242f);
+  border: 1px solid var(--line-2);
+  color: var(--cu-stage-text);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+html.ui-v2 .ui2-live-auth-avatar[hidden] { display: none; }
+
+/* ── Session-attributed approval card (rail, 45b-cu-overlays.js) ── */
+html.ui-v2 #ui2-live-approval { margin-top: 14px; }
+html.ui-v2 #ui2-live-approval[hidden] { display: none; }
+html.ui-v2 .cu-approval-card {
+  padding: 14px 15px;
+  border: 1px solid rgba(var(--amber-rgb), .32);
+  border-radius: var(--r-card);
+  background: linear-gradient(180deg, rgba(var(--amber-rgb), .12), rgba(var(--amber-rgb), .03));
+  box-shadow: var(--shadow-card);
+}
+html.ui-v2 .cu-approval-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+html.ui-v2 .cu-approval-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px rgba(var(--amber-rgb), .18);
+}
+@media (prefers-reduced-motion: no-preference) {
+  html.ui-v2 .cu-approval-dot { animation: ui2-pulse 2s infinite; }
+}
+html.ui-v2 .cu-approval-eyebrow {
+  color: var(--cu-amber-ink);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+html.ui-v2 .cu-approval-title {
+  margin-top: 9px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 800;
+}
+html.ui-v2 .cu-approval-body {
+  margin-top: 5px;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+html.ui-v2 .cu-approval-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+html.ui-v2 .cu-approval-chips:empty { display: none; }
+html.ui-v2 .cu-approval-chip {
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  word-break: break-all;
+}
+html.ui-v2 .cu-approval-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+html.ui-v2 .cu-approval-approve {
+  flex: 1;
+  min-height: 36px;
   border: 0;
   border-radius: var(--r-ctl);
   background: linear-gradient(180deg, var(--iris), var(--iris-deep));
@@ -1134,35 +2135,175 @@ html.ui-v2 .ui2-live-card-btn {
   font-family: var(--sans);
   font-size: 12.5px;
   font-weight: 800;
-  box-shadow: 0 6px 16px rgba(var(--iris-rgb), .32);
+  cursor: pointer;
+  box-shadow: var(--shadow-primary);
   transition: filter var(--t-med);
 }
-html.ui-v2 .ui2-live-card-btn:hover { filter: brightness(1.08); }
-html.ui-v2 .ui2-live-card-btn.release {
-  background: rgba(var(--amber-rgb), .14);
-  border: 1px solid rgba(var(--amber-rgb), .32);
-  color: var(--amber);
-  box-shadow: none;
-}
-html.ui-v2 .ui2-live-card-btn.secondary {
-  background: var(--surface-2);
-  border: 1px solid var(--line);
-  color: var(--text);
-  box-shadow: none;
-  font-weight: 700;
-}
-html.ui-v2 .ui2-live-card-btn.secondary:hover { background: var(--surface-3); border-color: var(--line-2); filter: none; }
-html.ui-v2 .ui2-live-card-btn.danger {
-  background: transparent;
+html.ui-v2 .cu-approval-approve:hover { filter: brightness(1.08); }
+html.ui-v2 .cu-approval-deny {
+  min-height: 36px;
+  padding: 0 14px;
   border: 1px solid rgba(var(--rose-rgb), .4);
-  color: var(--rose);
-  box-shadow: none;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--cu-rose-ink);
+  font-family: var(--sans);
+  font-size: 12.5px;
   font-weight: 700;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
 }
-html.ui-v2 .ui2-live-card-btn.danger:hover { background: rgba(var(--rose-rgb), .1); filter: none; }
+html.ui-v2 .cu-approval-deny:hover {
+  background: rgba(var(--rose-rgb), .1);
+  border-color: rgba(var(--rose-rgb), .55);
+}
+html.ui-v2 .cu-approval-card button:disabled {
+  opacity: .55;
+  cursor: wait;
+  filter: none;
+}
 
-/* narrow: the rail yields to the stage */
-@media (max-width: 1100px) {
-  html.ui-v2 #tab-displays { padding-right: 0; }
-  html.ui-v2 .ui2-live-rail { display: none; }
+@media (max-width: 1279px) {
+  html.ui-v2 #tab-displays.active { display: block; }
+  html.ui-v2 .ui2-live-main { height: 100%; }
+  html.ui-v2 .ui2-live-mobile-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex: 0 0 auto;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-1);
+  }
+  html.ui-v2 .ui2-live-mobile-summary {
+    display: block;
+    max-width: 52vw;
+    margin-top: 1px;
+    overflow: hidden;
+    color: var(--text-2);
+    font-size: 11.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  html.ui-v2 .ui2-live-rail-toggle {
+    flex: 0 0 auto;
+    min-height: 44px;
+    padding: 7px 12px;
+    border: 1px solid var(--cu-control-outline);
+    border-radius: var(--r-ctl);
+    background: var(--surface);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 750;
+  }
+  html.ui-v2 .ui2-live-rail {
+    position: absolute;
+    inset: 0 0 0 auto;
+    z-index: 61;
+    width: min(360px, calc(100% - 20px));
+    border-left: 1px solid var(--line-2);
+    box-shadow: var(--shadow-overlay);
+    visibility: hidden;
+    transform: translateX(102%);
+    transition: transform var(--t-slow), visibility 0s linear var(--t-slow);
+  }
+  html.ui-v2 #tab-displays.ui2-live-rail-open .ui2-live-rail {
+    visibility: visible;
+    transform: translateX(0);
+    transition-delay: 0s;
+  }
+  html.ui-v2 .ui2-live-rail-close {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    border: 1px solid var(--cu-control-outline);
+    border-radius: var(--r-ctl);
+    background: var(--surface);
+    color: var(--text-2);
+    font-size: 18px;
+  }
+  html.ui-v2 .ui2-live-rail-close:hover {
+    border-color: rgba(var(--rose-rgb), .4);
+    background: rgba(var(--rose-rgb), .08);
+    color: var(--rose);
+  }
+  html.ui-v2 .ui2-live-rail-scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 60;
+    display: block;
+    padding: 0;
+    border: 0;
+    background: rgba(5, 6, 10, .58);
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity var(--t-slow), visibility 0s linear var(--t-slow);
+  }
+  html.ui-v2 #tab-displays.ui2-live-rail-open .ui2-live-rail-scrim {
+    opacity: 1;
+    visibility: visible;
+    transition-delay: 0s;
+  }
+}
+
+@media (max-width: 820px) {
+  html.ui-v2 .display-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 10px 8px;
+  }
+  html.ui-v2 .display-toolbar-meta {
+    flex: 0 0 auto;
+    min-height: 30px;
+  }
+  html.ui-v2 .display-toolbar-actions {
+    flex: 0 0 auto;
+    width: 100%;
+    margin-left: 0;
+    padding: 1px 0 4px;
+  }
+  html.ui-v2 .display-toolbar button {
+    min-height: 44px;
+    padding: 7px 11px;
+  }
+  html.ui-v2 .display-toolbar .release-note {
+    flex-basis: 145px;
+    min-height: 44px;
+  }
+  html.ui-v2 .display-toolbar .display-fullscreen-btn,
+  html.ui-v2 .display-toolbar .display-close-btn { width: 44px; }
+  html.ui-v2 .shared-view-action,
+  html.ui-v2 .shared-view-close { min-height: 44px; }
+  html.ui-v2 .shared-view-close { width: 44px; }
+  html.ui-v2 .display-canvas { margin: 0 10px 10px; }
+  html.ui-v2 .display-control-banner {
+    top: auto;
+    right: 10px;
+    bottom: 10px;
+    left: 10px;
+    max-width: none;
+    transform: none;
+  }
+  html.ui-v2 .display-live-metrics {
+    max-width: calc(100% - 28px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}
+
+@media (max-width: 520px) {
+  html.ui-v2 .ui2-live-rail { width: 100%; }
+  html.ui-v2 .ui2-live-mobile-kicker { display: none; }
+  html.ui-v2 .ui2-live-mobile-summary { max-width: 46vw; }
+  html.ui-v2 .ui2-live-rail > section { padding: 14px; }
+  html.ui-v2 .ui2-live-rail-header { padding: 14px; }
+}
+
+@media (max-height: 680px) {
+  html.ui-v2 .ui2-live-rail-header { padding-top: 12px; padding-bottom: 12px; }
+  html.ui-v2 .ui2-live-rail > section { padding-top: 12px; padding-bottom: 12px; }
 }

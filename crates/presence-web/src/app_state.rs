@@ -264,7 +264,10 @@ pub enum UiCommand {
     /// A federated peer's display stopped being available (capture
     /// lost, or the peer's user revoked their grant); JS drops it from
     /// the peer row's `displays` list.
-    PeerDisplayRemoved { host_id: String, display_id: u32 },
+    PeerDisplayRemoved {
+        host_id: String,
+        display_id: u32,
+    },
     /// One leg of a federation-driven WebRTC signaling exchange
     /// arriving from a peer. JS feeds the `signal` payload to the
     /// matching per-peer `RTCPeerConnection` keyed by
@@ -452,6 +455,7 @@ pub struct QueuedSteer {
 #[derive(Debug, Clone, Copy)]
 pub struct ModelPricing {
     pub input: f64,
+    pub cache_write: f64,
     pub cached: f64,
     pub output: f64,
 }
@@ -460,9 +464,46 @@ pub struct ModelPricing {
 const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // OpenAI
     (
+        "gpt-5.6",
+        ModelPricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-sol",
+        ModelPricing {
+            input: 5.0e-6,
+            cache_write: 6.25e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-terra",
+        ModelPricing {
+            input: 2.5e-6,
+            cache_write: 3.125e-6,
+            cached: 0.25e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "gpt-5.6-luna",
+        ModelPricing {
+            input: 1.0e-6,
+            cache_write: 1.25e-6,
+            cached: 0.1e-6,
+            output: 6.0e-6,
+        },
+    ),
+    (
         "gpt-5.5",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 5.0e-6,
             cached: 0.5e-6,
             output: 30.0e-6,
         },
@@ -471,6 +512,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4",
         ModelPricing {
             input: 2.5e-6,
+            cache_write: 2.5e-6,
             cached: 0.25e-6,
             output: 15.0e-6,
         },
@@ -479,6 +521,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4-mini",
         ModelPricing {
             input: 0.75e-6,
+            cache_write: 0.75e-6,
             cached: 0.075e-6,
             output: 4.5e-6,
         },
@@ -487,6 +530,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.4-nano",
         ModelPricing {
             input: 0.2e-6,
+            cache_write: 0.2e-6,
             cached: 0.02e-6,
             output: 1.25e-6,
         },
@@ -495,6 +539,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.2",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -503,6 +548,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.2-codex",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -511,6 +557,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5.3-codex",
         ModelPricing {
             input: 1.75e-6,
+            cache_write: 1.75e-6,
             cached: 0.175e-6,
             output: 14.0e-6,
         },
@@ -519,6 +566,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5",
         ModelPricing {
             input: 1.25e-6,
+            cache_write: 1.25e-6,
             cached: 0.125e-6,
             output: 10.0e-6,
         },
@@ -527,6 +575,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-5-mini",
         ModelPricing {
             input: 0.25e-6,
+            cache_write: 0.25e-6,
             cached: 0.025e-6,
             output: 2.0e-6,
         },
@@ -535,6 +584,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1",
         ModelPricing {
             input: 2.0e-6,
+            cache_write: 2.0e-6,
             cached: 0.5e-6,
             output: 8.0e-6,
         },
@@ -543,6 +593,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-mini",
         ModelPricing {
             input: 0.4e-6,
+            cache_write: 0.4e-6,
             cached: 0.1e-6,
             output: 1.6e-6,
         },
@@ -551,6 +602,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gpt-4.1-nano",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.025e-6,
             output: 0.4e-6,
         },
@@ -559,6 +611,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o3",
         ModelPricing {
             input: 2.0e-6,
+            cache_write: 2.0e-6,
             cached: 1.0e-6,
             output: 8.0e-6,
         },
@@ -567,6 +620,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o3-pro",
         ModelPricing {
             input: 150.0e-6,
+            cache_write: 150.0e-6,
             cached: 75.0e-6,
             output: 600.0e-6,
         },
@@ -575,6 +629,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "o4-mini",
         ModelPricing {
             input: 1.1e-6,
+            cache_write: 1.1e-6,
             cached: 0.55e-6,
             output: 4.4e-6,
         },
@@ -584,6 +639,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-8",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -592,6 +648,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-fable-5",
         ModelPricing {
             input: 10.0e-6,
+            cache_write: 12.5e-6,
             cached: 1.0e-6,
             output: 50.0e-6,
         },
@@ -600,6 +657,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-6",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -608,6 +666,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-7",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -616,6 +675,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-sonnet-4-6",
         ModelPricing {
             input: 3.0e-6,
+            cache_write: 3.75e-6,
             cached: 0.3e-6,
             output: 15.0e-6,
         },
@@ -624,6 +684,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-sonnet-4-5-20250929",
         ModelPricing {
             input: 3.0e-6,
+            cache_write: 3.75e-6,
             cached: 0.3e-6,
             output: 15.0e-6,
         },
@@ -632,6 +693,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-opus-4-5-20250929",
         ModelPricing {
             input: 5.0e-6,
+            cache_write: 6.25e-6,
             cached: 0.5e-6,
             output: 25.0e-6,
         },
@@ -640,6 +702,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "claude-haiku-4-5",
         ModelPricing {
             input: 1.0e-6,
+            cache_write: 1.25e-6,
             cached: 0.1e-6,
             output: 5.0e-6,
         },
@@ -649,6 +712,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-3-flash",
         ModelPricing {
             input: 0.5e-6,
+            cache_write: 0.5e-6,
             cached: 0.05e-6,
             output: 3.0e-6,
         },
@@ -657,6 +721,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-3.1-flash",
         ModelPricing {
             input: 0.5e-6,
+            cache_write: 0.5e-6,
             cached: 0.05e-6,
             output: 3.0e-6,
         },
@@ -665,6 +730,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-pro",
         ModelPricing {
             input: 1.25e-6,
+            cache_write: 1.25e-6,
             cached: 0.125e-6,
             output: 10.0e-6,
         },
@@ -673,6 +739,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-flash",
         ModelPricing {
             input: 0.3e-6,
+            cache_write: 0.3e-6,
             cached: 0.03e-6,
             output: 2.5e-6,
         },
@@ -681,6 +748,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.5-flash-lite",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.01e-6,
             output: 0.4e-6,
         },
@@ -689,6 +757,7 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         "gemini-2.0-flash",
         ModelPricing {
             input: 0.1e-6,
+            cache_write: 0.1e-6,
             cached: 0.01e-6,
             output: 0.4e-6,
         },
@@ -719,10 +788,15 @@ pub fn calculate_cost(
     prompt_tokens: u64,
     completion_tokens: u64,
     cached_tokens: u64,
+    cache_creation_tokens: u64,
     pricing: &ModelPricing,
 ) -> CostBreakdown {
-    let uncached = prompt_tokens.saturating_sub(cached_tokens);
-    let input_cost = uncached as f64 * pricing.input + cached_tokens as f64 * pricing.cached;
+    let uncached = prompt_tokens
+        .saturating_sub(cached_tokens)
+        .saturating_sub(cache_creation_tokens);
+    let input_cost = uncached as f64 * pricing.input
+        + cache_creation_tokens as f64 * pricing.cache_write
+        + cached_tokens as f64 * pricing.cached;
     let output_cost = completion_tokens as f64 * pricing.output;
     CostBreakdown {
         input_cost,
@@ -899,6 +973,7 @@ pub fn calculate_live_cost(usage: &LiveUsageSnapshot) -> Option<CostBreakdown> {
             usage.input_tokens,
             usage.output_tokens + usage.thinking_tokens,
             usage.cached_tokens,
+            0,
             &pricing,
         )
     })
@@ -928,6 +1003,8 @@ pub struct UsageSnapshot {
     pub completion_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1110,6 +1187,12 @@ pub struct AppState {
     pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         Self {
@@ -1167,7 +1250,11 @@ impl AppState {
                 turn: None,
                 budget_pct: Some(usage.usage_pct),
                 autonomy: None,
-                session_id: None,
+                // Attributed to the selected session: the dashboard's status
+                // gate only lets the focused session drive the header meter,
+                // so an unattributed push would be dropped whenever any
+                // window is focused — exactly when selection happens.
+                session_id: Some(session_id.to_string()),
                 external_agent: None,
             });
         }
@@ -1534,13 +1621,17 @@ impl AppState {
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
+                // kind tool_call: a command ANNOUNCEMENT row, never command
+                // output — without the kind, the level-'agent' fallback in
+                // isCommandOutputLog swallowed these into output groups
+                // (external tool calls showed no command line at all).
                 cmds.extend(self.add_log_with_metadata(
                     "agent",
                     preview,
                     None,
                     source,
                     Vec::new(),
-                    None,
+                    Some("tool_call"),
                     None,
                     item_id,
                     None,
@@ -1559,6 +1650,9 @@ impl AppState {
             "agent_output" => {
                 let source = msg["source"].as_str().unwrap_or("agent");
                 let output_id = msg["output_id"].as_str().map(str::to_string);
+                // Originating tool call — groups output under its command
+                // row instead of coalescing consecutive tools' output.
+                let item_id = msg["item_id"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
@@ -1571,7 +1665,7 @@ impl AppState {
                                 out.images,
                                 Some("agent_output"),
                                 output_id.clone(),
-                                None,
+                                item_id.clone(),
                                 None,
                                 None,
                                 false,
@@ -1590,7 +1684,7 @@ impl AppState {
                             Vec::new(),
                             Some("agent_output"),
                             output_id.clone(),
-                            None,
+                            item_id.clone(),
                             None,
                             None,
                             false,
@@ -1843,7 +1937,7 @@ impl AppState {
                     "info",
                     &format!("\u{23F3} Steer sent: {}", truncate(&text, 80)),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -1864,7 +1958,7 @@ impl AppState {
                     "warn",
                     &format!("\u{23F0} Steer queued: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 // Prefer the stored text so late/out-of-order queue
                 // events still render the original message in the strip.
@@ -1892,7 +1986,7 @@ impl AppState {
                     "info",
                     &format!("\u{21AA} Steer accepted: {}", reason),
                     None,
-                    "user",
+                    "steer",
                 ));
                 let text = self
                     .queued_steers
@@ -1925,7 +2019,7 @@ impl AppState {
                         truncate(&text, 80)
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
@@ -1951,12 +2045,46 @@ impl AppState {
                         }
                     ),
                     None,
-                    "user",
+                    "steer",
                 ));
                 cmds.push(UiCommand::SteerStatusUpdate {
                     id,
                     text,
                     status: "cancelled".into(),
+                    reason: if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
+                });
+            }
+
+            // A cancel that found nothing to clear — the message already
+            // delivered or converted to a follow-up. Renders as a failed
+            // clear, never as a successful one. The entry is READ, not
+            // removed: the steer is still on its way to the model (that is
+            // what the failed clear means), so a later `steer_delivered`
+            // must still find the original text — removing here made that
+            // delivery render blank. Terminal cleanup stays with
+            // delivered/cancelled.
+            "steer_cancel_failed" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                let text = self
+                    .queued_steers
+                    .get(&id)
+                    .map(|q| q.text.clone())
+                    .unwrap_or_default();
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("\u{2715} Couldn't clear message: {}", reason),
+                    None,
+                    "steer",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "failed".into(),
                     reason: if reason.is_empty() {
                         None
                     } else {
@@ -2254,7 +2382,7 @@ impl AppState {
                     None,
                     "system",
                 ));
-                if !self.known_displays.iter().any(|&id| id == display_id) {
+                if !self.known_displays.contains(&display_id) {
                     self.known_displays.push(display_id);
                 }
                 cmds.push(UiCommand::AddDisplay {
@@ -2284,6 +2412,12 @@ impl AppState {
                 };
                 cmds.extend(self.add_log("info", &text, None, "system"));
             }
+
+            // Live CU action-visualization events: consumed by the plain-JS
+            // Live-tab overlay layer (45b-cu-overlays.js), not by this app
+            // state. Swallow them here so the unknown-event catch-all below
+            // doesn't dump one debug log line per executed agent action.
+            "cu_action" => {}
 
             "recording_started" => {
                 let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
@@ -2471,6 +2605,7 @@ impl AppState {
                     prompt_tokens: msg["prompt_tokens"].as_u64().unwrap_or(0),
                     completion_tokens: msg["completion_tokens"].as_u64().unwrap_or(0),
                     cached_tokens: msg["cached_tokens"].as_u64().unwrap_or(0),
+                    cache_creation_tokens: msg["cache_creation_tokens"].as_u64().unwrap_or(0),
                 };
                 self.presence_usage = Some(u);
                 cmds.push(self.build_usage_command());
@@ -2908,6 +3043,7 @@ impl AppState {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     fn add_log_with_metadata(
         &mut self,
         level: &str,
@@ -3058,6 +3194,7 @@ impl AppState {
                         u.prompt_tokens,
                         u.completion_tokens,
                         u.cached_tokens,
+                        u.cache_creation_tokens,
                         &pricing,
                     );
                     summary.total += cost.total;
@@ -3076,6 +3213,7 @@ impl AppState {
                         u.prompt_tokens,
                         u.completion_tokens,
                         u.cached_tokens,
+                        u.cache_creation_tokens,
                         &pricing,
                     );
                     summary.total += cost.total;
@@ -3655,6 +3793,42 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn pricing_gpt_5_6_variants_use_longest_provider_aware_prefix() {
+        let cases = [
+            ("gpt-5.6", 5.0e-6, 6.25e-6, 0.5e-6, 30.0e-6),
+            (
+                "openai/gpt-5.6-sol-20260711",
+                5.0e-6,
+                6.25e-6,
+                0.5e-6,
+                30.0e-6,
+            ),
+            ("gpt-5.6-terra-preview", 2.5e-6, 3.125e-6, 0.25e-6, 15.0e-6),
+            ("gpt-5.6-luna-20260711", 1.0e-6, 1.25e-6, 0.1e-6, 6.0e-6),
+        ];
+
+        for (model, input, cache_write, cached, output) in cases {
+            let pricing = find_pricing(model).unwrap();
+            assert!(
+                (pricing.input - input).abs() < 1e-12,
+                "unexpected {model} input rate"
+            );
+            assert!(
+                (pricing.cache_write - cache_write).abs() < 1e-12,
+                "unexpected {model} cache-write rate"
+            );
+            assert!(
+                (pricing.cached - cached).abs() < 1e-12,
+                "unexpected {model} cached rate"
+            );
+            assert!(
+                (pricing.output - output).abs() < 1e-12,
+                "unexpected {model} output rate"
+            );
+        }
+    }
+
+    #[test]
     fn pricing_exact_match() {
         let p = find_pricing("claude-opus-4-8").unwrap();
         assert!((p.input - 5.0e-6).abs() < 1e-12);
@@ -3686,15 +3860,16 @@ mod tests {
     fn cost_calculation() {
         let pricing = ModelPricing {
             input: 1.0e-6,
+            cache_write: 1.25e-6,
             cached: 0.1e-6,
             output: 2.0e-6,
         };
-        let cost = calculate_cost(1000, 500, 200, &pricing);
-        // uncached = 800, input_cost = 800*1e-6 + 200*0.1e-6 = 0.00082
+        let cost = calculate_cost(1000, 500, 200, 100, &pricing);
+        // uncached = 700, input_cost = 700*1e-6 + 100*1.25e-6 + 200*0.1e-6
         // output_cost = 500*2e-6 = 0.001
-        assert!((cost.input_cost - 0.00082).abs() < 1e-10);
+        assert!((cost.input_cost - 0.000845).abs() < 1e-10);
         assert!((cost.output_cost - 0.001).abs() < 1e-10);
-        assert!((cost.total - 0.00182).abs() < 1e-10);
+        assert!((cost.total - 0.001845).abs() < 1e-10);
     }
 
     #[test]
@@ -4031,10 +4206,9 @@ mod tests {
         });
         let cmds = s.handle_state_snapshot(&snapshot);
         assert_eq!(s.pending_question_id, Some(4));
-        assert!(cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::ShowUserQuestion { id: 4, .. }
-        )));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowUserQuestion { id: 4, .. })));
     }
 
     #[test]
@@ -4985,12 +5159,14 @@ mod tests {
             prompt_tokens: 4000,
             completion_tokens: 1000,
             cached_tokens: 500,
+            cache_creation_tokens: 250,
         };
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains("hard_context_window"));
         let back: UsageSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tokens_used, 5000);
         assert_eq!(back.hard_context_window, Some(272000));
+        assert_eq!(back.cache_creation_tokens, 250);
     }
 
     #[test]
@@ -5001,10 +5177,12 @@ mod tests {
             "provider": "gemini", "model": "gemini-2.5-flash",
             "total_tokens": 2000, "context_window": 1048576,
             "usage_pct": 0.2, "prompt_tokens": 1500,
-            "completion_tokens": 500, "cached_tokens": 100
+            "completion_tokens": 500, "cached_tokens": 100,
+            "cache_creation_tokens": 50
         });
         let cmds = s.handle_message(&msg);
         assert!(s.presence_usage.is_some());
+        assert_eq!(s.presence_usage.as_ref().unwrap().cache_creation_tokens, 50);
         assert!(cmds
             .iter()
             .any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
@@ -5621,6 +5799,71 @@ mod tests {
         );
     }
 
+    /// A failed clear means the message is still on its way to the model —
+    /// the tracked entry must survive so the eventual `steer_delivered`
+    /// renders the original text (removing it here made that delivery
+    /// render blank for steers that converted to follow-ups).
+    #[test]
+    fn handle_event_steer_cancel_failed_keeps_entry_for_delivery() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "in-flight".into(),
+            QueuedSteer {
+                text: "switch to SQLite".into(),
+                status: SteerStatus::Queued,
+                reason: Some("queued as follow-up".into()),
+            },
+        );
+        let msg = json!({
+            "event": "steer_cancel_failed",
+            "id": "in-flight",
+            "reason": "nothing pending to clear — the message already delivered or converted to a follow-up"
+        });
+        let cmds = s.handle_message(&msg);
+
+        // Rendered as a failed clear with the original text …
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, text, .. }
+                    if id == "in-flight" && status == "failed" && text == "switch to SQLite"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected failed SteerStatusUpdate, got {cmds:?}"
+        );
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "warn" && content.contains("Couldn't clear message")
+        )));
+        // … and the entry survives for the delivery that is still coming.
+        assert!(
+            s.queued_steers.contains_key("in-flight"),
+            "cancel-failed must not discard the in-flight entry"
+        );
+
+        let delivered = json!({
+            "event": "steer_delivered",
+            "id": "in-flight",
+            "mid_turn": false
+        });
+        let cmds = s.handle_message(&delivered);
+        let saw_delivered = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, text, .. }
+                    if id == "in-flight" && status == "delivered" && text == "switch to SQLite"
+            )
+        });
+        assert!(
+            saw_delivered,
+            "delivery after a failed clear must render the original text, got {cmds:?}"
+        );
+        assert!(s.queued_steers.get("in-flight").is_none());
+    }
+
     #[test]
     fn steer_delivered_followup_log_variant() {
         // When mid_turn=false (queued delivery at turn boundary), the log
@@ -5699,8 +5942,7 @@ mod tests {
             } => Some((host_id, *display_id, *width, *height)),
             _ => None,
         });
-        let (host_id, display_id, width, height) =
-            upsert.expect("PeerDisplayReady emitted");
+        let (host_id, display_id, width, height) = upsert.expect("PeerDisplayReady emitted");
         assert_eq!(host_id, "intendant:alpha");
         assert_eq!((display_id, width, height), (99, 1920, 1080));
         assert!(
@@ -5769,8 +6011,7 @@ mod tests {
         assert_eq!(session["session_id"], "s1");
         assert_eq!(session["label"], "federated task");
         assert!(
-            cmds.iter()
-                .any(|c| matches!(c, UiCommand::PeerLog { .. })),
+            cmds.iter().any(|c| matches!(c, UiCommand::PeerLog { .. })),
             "session_started keeps its log line"
         );
 

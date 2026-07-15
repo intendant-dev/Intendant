@@ -26,6 +26,15 @@ pub(crate) fn frame_api_response(
             "ok": false,
             "error": format!("{label} returned an unexpected byte response"),
         }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
+        }),
     }
 }
 
@@ -50,6 +59,71 @@ pub(crate) fn frame_api_json_body_response(
             "id": id,
             "ok": false,
             "error": format!("{label} returned an unexpected byte response"),
+        }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
+        }),
+    }
+}
+
+/// Tunnel adapter for the access family's historical ok/error envelope:
+/// a 2xx JSON body renders as `{t:"response", id, ok:true,
+/// result:<body>}` — the body-only shape, no `_httpStatus` metadata
+/// (this family predates the injected-status envelope) — while an error
+/// status surfaces the body's `error` string as the frame-level
+/// `{ok:false, error}` shape the family has always answered with. A
+/// byte response on these JSON-only methods is a wiring bug and fails
+/// closed.
+pub(crate) fn frame_api_ok_error_response(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { status, body, .. } => {
+            let body = body.into_string();
+            if (200..300).contains(&status) {
+                return json_body_response(id, body, label);
+            }
+            // The family's error bodies are the shared cores'
+            // `{"error": <string>}` shape; the frame carries the string
+            // itself (with the whole body as a defensive fallback).
+            let error = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or(body);
+            serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": error,
+            })
+        }
+        crate::web_gateway::ApiResponse::Bytes { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected byte response"),
+        }),
+        // The Stream lane never renders as a single response frame; its
+        // writer is the stream_* framer (S10). Reaching a buffered
+        // adapter is a wiring bug.
+        crate::web_gateway::ApiResponse::Stream { .. } => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned an unexpected stream response"),
         }),
     }
 }
@@ -97,9 +171,23 @@ pub(crate) fn frame_api_task_response(
             byte_stream: None,
             done: true,
         },
+        // The Stream lane's writer is the stream_* framer (S10); a
+        // byte-capable buffered method never answers on it.
+        crate::web_gateway::ApiResponse::Stream { .. } => ControlTaskResponse {
+            id: id.clone(),
+            frame: serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("{label} returned an unexpected stream response"),
+            }),
+            byte_stream: None,
+            done: true,
+        },
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,
@@ -109,6 +197,7 @@ pub(crate) fn control_frame_response(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+    display_input_tx: &DisplayInputForwarder,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -148,7 +237,12 @@ pub(crate) fn control_frame_response(
             "unix_ms": chrono::Utc::now().timestamp_millis(),
         })),
         "display_input" => {
-            spawn_dashboard_display_input(parsed, runtime.clone());
+            // Ordered handoff to the per-connection forwarder (see
+            // `spawn_display_input_forwarder`): the wire loop dispatches
+            // frames sequentially and this send preserves that order —
+            // never a per-event spawn, which would race events across
+            // runtime workers and could invert kd/ku or md/mu pairs.
+            display_input_tx.try_forward(parsed);
             None
         }
         "terminal_open" => {
@@ -390,6 +484,97 @@ pub(crate) fn control_frame_response(
                         Err(error) => dashboard_control_error_response(id, error.message()),
                     })
                 }
+                "api_daemon_vault_deposit_key_fetch" => {
+                    let result = match crate::vault_deposits::load_deposit_key_in(
+                        &crate::vault_deposits::deposit_key_path(),
+                    ) {
+                        Ok(Some(key)) => serde_json::json!({
+                            "present": true,
+                            "alg": key.alg,
+                            "pub_raw_b64u": key.pub_raw_b64u,
+                            "published_unix_ms": key.published_unix_ms,
+                        }),
+                        Ok(None) => serde_json::json!({ "present": false }),
+                        Err(error) => return Some(dashboard_control_error_response(id, error)),
+                    };
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": result,
+                    }))
+                }
+                "api_daemon_vault_deposit_key_publish" => {
+                    let params_ref = params.as_ref();
+                    let pub_raw_b64u = params_ref
+                        .and_then(|p| p.get("pub_raw_b64u"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    let alg = params_ref
+                        .and_then(|p| p.get("alg"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ECDH-P256")
+                        .to_string();
+                    let key = crate::vault_deposits::DepositKey {
+                        alg,
+                        pub_raw_b64u,
+                        published_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    };
+                    Some(
+                        match crate::vault_deposits::save_deposit_key_in(
+                            &crate::vault_deposits::deposit_key_path(),
+                            &key,
+                        ) {
+                            Ok(()) => serde_json::json!({
+                                "t": "response",
+                                "id": id,
+                                "ok": true,
+                                "result": { "stored": true },
+                            }),
+                            Err(error) => dashboard_control_error_response(id, error),
+                        },
+                    )
+                }
+                "api_daemon_vault_deposits_fetch" => Some(
+                    match crate::vault_deposits::list_deposits_in(
+                        &crate::vault_deposits::deposits_dir(),
+                    ) {
+                        Ok(deposits) => serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": {
+                                "deposits": serde_json::to_value(&deposits)
+                                    .unwrap_or(serde_json::Value::Null),
+                            },
+                        }),
+                        Err(error) => dashboard_control_error_response(id, error),
+                    },
+                ),
+                "api_daemon_vault_deposits_consume" => {
+                    let ids: Vec<String> = params
+                        .as_ref()
+                        .and_then(|p| p.get("ids"))
+                        .and_then(|v| v.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|v| v.as_str())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let removed = crate::vault_deposits::consume_deposits_in(
+                        &crate::vault_deposits::deposits_dir(),
+                        &ids,
+                    );
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": { "removed": removed },
+                    }))
+                }
                 "api_credential_egress_register" => {
                     let kinds: Vec<String> = params
                         .as_ref()
@@ -467,253 +652,205 @@ pub(crate) fn control_frame_response(
                         "error": "peer registry unavailable",
                     })),
                 },
-                "api_dashboard_targets" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::dashboard_targets_response_value(
-                        &runtime.agent_card,
-                        runtime.peer_registry.as_ref(),
-                    ),
-                })),
-                "api_access_overview" => {
+                // The access inspect/connect/tier twins delegate to the
+                // S6 neutral cores under the family's historical
+                // ok/error envelope; the transport edge resolves the
+                // ambient cert dir (hermeticity convention).
+                "api_dashboard_targets" => {
                     let current_principal = runtime.grant.access_principal();
-                    Some(serde_json::json!({
-                        "t": "response",
-                        "id": id,
-                        "ok": true,
-                        "result": crate::web_gateway::access_overview_response_value_for_principal(
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::dashboard_targets_api_response(
                             &runtime.agent_card,
                             runtime.peer_registry.as_ref(),
+                            crate::web_gateway::local_daemon_tier(
+                                &crate::access::backend::select_backend().cert_dir(),
+                            )
+                            .as_deref(),
                             Some(&current_principal),
                         ),
-                    }))
+                        "dashboard targets",
+                    ))
                 }
-                "api_access_iam_state" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_iam_state_response_value(),
-                })),
-                "api_access_enrollment_requests" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_enrollment_requests_response_value(),
-                })),
+                "api_dashboard_tabs" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::dashboard_tabs_api_response(&runtime.tabs),
+                    "dashboard tabs",
+                )),
+                "api_access_overview" => {
+                    let current_principal = runtime.grant.access_principal();
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_overview_api_response(
+                            &cert_dir,
+                            &runtime.agent_card,
+                            runtime.peer_registry.as_ref(),
+                            &current_principal,
+                        ),
+                        "access overview",
+                    ))
+                }
+                "api_access_iam_state" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_iam_state_api_response(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
+                    "access iam state",
+                )),
+                "api_access_enrollment_requests" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_enrollment_requests_api_response(
+                        &crate::access::backend::select_backend().cert_dir(),
+                    ),
+                    "access enrollment requests",
+                )),
                 "api_access_enrollment_decide" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_enrollment_decide_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_enrollment_decide_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "enrollment decide",
+                    ))
                 }
-                "api_access_connect_status" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_connect_status_response_value(),
-                })),
-                "api_access_connect_claim_code" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_connect_claim_code_response_value(),
-                })),
+                "api_access_connect_status" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_connect_status_api_response(),
+                    "connect status",
+                )),
+                "api_access_connect_claim_code" => Some(frame_api_ok_error_response(
+                    id,
+                    crate::web_gateway::access_connect_claim_code_api_response(),
+                    "connect claim code",
+                )),
                 "api_access_connect_config" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_connect_config_response_value(
-                        params,
-                        runtime.project_root.as_deref(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_connect_config_api_response(
+                            params,
+                            runtime.project_root.as_deref(),
+                        ),
+                        "connect config",
+                    ))
                 }
-                "api_access_set_tier" | "api_access_set_hosted_ceiling" => {
+                "api_access_set_tier" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let actor = runtime.grant.access_principal();
-                    let result = if method == "api_access_set_hosted_ceiling" {
-                        crate::web_gateway::access_set_hosted_ceiling_response_value(params, &actor)
-                    } else {
-                        crate::web_gateway::access_set_tier_response_value(params, &actor)
-                    };
-                    match result {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_tier_settings_api_response(
+                            &cert_dir, params, &actor,
+                        ),
+                        "trust tier settings",
+                    ))
                 }
                 "api_fleet_cert_request" => {
-                    // Optional explicit addresses; default = every
-                    // routable local address (the LAN is the point).
-                    let addresses: Vec<String> = params
-                        .as_ref()
-                        .and_then(|p| p.get("addresses"))
-                        .and_then(|v| v.as_array())
-                        .map(|list| {
-                            list.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .filter(|list: &Vec<String>| !list.is_empty())
-                        .unwrap_or_else(crate::fleet_cert::default_publish_addresses);
-                    if crate::fleet_cert::status_snapshot().name.is_none() {
-                        return Some(dashboard_control_error_response(
-                            id,
-                            "this daemon has no fleet name — enable Connect against a \
-                             rendezvous with fleet DNS and let it register first",
-                        ));
-                    }
-                    let spawned_addresses = addresses.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            crate::fleet_cert::request_certificate(spawned_addresses).await
-                        {
-                            eprintln!("[fleet-cert] request failed: {error}");
-                        }
-                    });
-                    Some(serde_json::json!({
-                        "t": "response",
-                        "id": id,
-                        "ok": true,
-                        "result": { "started": true, "addresses": addresses },
-                    }))
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::fleet_cert_request_api_response(params),
+                        "fleet cert request",
+                    ))
                 }
+                // The seven org-manage twins delegate to the S6 neutral
+                // core (leaf addressed by method name); the signed-org
+                // doorbell quartet below keeps its legacy path until its
+                // own slice ports it.
                 "api_access_org_trust"
                 | "api_access_org_revoke"
                 | "api_access_org_issue"
-                | "api_access_org_present"
                 | "api_access_org_revoke_member"
                 | "api_access_org_issuer_init"
                 | "api_access_org_issuer_delegate"
-                | "api_access_org_issuer_install"
+                | "api_access_org_issuer_install" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    let leaf = crate::web_gateway::OrgManageLeaf::from_control_method(method)
+                        .expect("org-manage arm methods all map to leaves");
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_org_manage_api_response(&cert_dir, leaf, params),
+                        "org manage",
+                    ))
+                }
+                // The signed-org doorbell twins delegate to the S6
+                // neutral cores under the family's ok/error envelope.
+                // Their route rows are Public — the tunnel methods gate
+                // stricter on purpose (documented op overrides on the
+                // rows): a bound session is required to courier a
+                // document through the tunnel.
+                "api_access_org_present"
                 | "api_access_org_orl"
                 | "api_access_org_orl_apply"
                 | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    let result = match method {
-                        "api_access_org_trust" => {
-                            crate::web_gateway::access_org_trust_response_value(params)
-                        }
-                        "api_access_org_revoke" => {
-                            crate::web_gateway::access_org_revoke_response_value(params)
-                        }
-                        "api_access_org_issue" => {
-                            crate::web_gateway::access_org_issue_response_value(params)
-                        }
-                        "api_access_org_revoke_member" => {
-                            crate::web_gateway::access_org_revoke_member_response_value(params)
-                        }
-                        "api_access_org_issuer_init" => {
-                            crate::web_gateway::access_org_issuer_init_response_value(params)
-                        }
-                        "api_access_org_issuer_delegate" => {
-                            crate::web_gateway::access_org_issuer_delegate_response_value(params)
-                        }
-                        "api_access_org_issuer_install" => {
-                            crate::web_gateway::access_org_issuer_install_response_value(params)
-                        }
-                        "api_access_org_orl" => crate::web_gateway::access_org_orl_response_value(
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    let response = match method {
+                        "api_access_org_orl" => crate::web_gateway::access_org_orl_api_response(
+                            &cert_dir,
+                            // Transport-owned addressing: the tunnel
+                            // names the org in params; HTTP by path
+                            // capture.
                             params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
                         ),
                         "api_access_org_orl_apply" => {
-                            crate::web_gateway::access_org_orl_apply_response_value(params)
+                            crate::web_gateway::access_org_orl_apply_api_response(&cert_dir, params)
                         }
                         "api_access_org_renew" => {
-                            crate::web_gateway::access_org_renew_response_value(params)
+                            crate::web_gateway::access_org_renew_api_response(&cert_dir, params)
                         }
-                        _ => crate::web_gateway::access_org_present_response_value(
+                        _ => crate::web_gateway::access_org_present_api_response(
+                            &cert_dir,
                             params,
                             &runtime.agent_card,
                         ),
                     };
-                    match result {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    Some(frame_api_ok_error_response(id, response, "org doorbell"))
                 }
                 "api_access_iam_upsert_user_client_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_iam_upsert_user_client_grant_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_iam_upsert_user_client_grant_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "iam grant upsert",
+                    ))
                 }
                 "api_access_iam_update_grant" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
-                    match crate::web_gateway::access_iam_update_grant_response_value(
-                        params,
-                        &runtime.grant.access_principal(),
-                    ) {
-                        Ok(result) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": true,
-                            "result": result,
-                        })),
-                        Err(error) => Some(serde_json::json!({
-                            "t": "response",
-                            "id": id,
-                            "ok": false,
-                            "error": error,
-                        })),
-                    }
+                    // Transport edge resolves the ambient cert dir
+                    // (hermeticity convention).
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    Some(frame_api_ok_error_response(
+                        id,
+                        crate::web_gateway::access_iam_update_grant_api_response(
+                            &cert_dir,
+                            params,
+                            &runtime.grant.access_principal(),
+                        ),
+                        "iam grant update",
+                    ))
                 }
                 "subscribe_events" => {
                     runtime.events_subscribed = true;
@@ -752,6 +889,7 @@ pub(crate) fn control_frame_response(
                 "api_cached_bootstrap_events" => Some(cached_bootstrap_events_response_frame(
                     id,
                     &runtime.bootstrap_caches,
+                    &runtime.grant,
                 )),
                 "api_sessions_stream" => {
                     spawn_control_stream(
@@ -763,92 +901,19 @@ pub(crate) fn control_frame_response(
                     );
                     None
                 }
-                "api_sessions"
-                | "api_session_detail"
-                | "api_session_report"
-                | "api_session_delete"
-                | "api_session_agent_output"
-                | "api_session_current_agent_output"
-                | "api_session_current_history"
-                | "api_session_current_rollback"
-                | "api_session_current_redo"
-                | "api_session_current_prune"
-                | "api_session_current_changes"
-                | "api_session_context_snapshot"
-                | "api_session_current_uploads"
-                | "api_session_current_upload_raw"
-                | "api_session_current_upload_delete"
-                | "api_transfer_jobs"
-                | "api_transfer_job_create"
-                | "api_transfer_job_delete"
-                | "api_transfer_download_read"
-                | "api_transfer_upload_commit"
-                | "api_media_clip_start"
-                | "api_media_clip_end"
-                | "api_media_clip_cancel"
-                | "api_fs_stat"
-                | "api_fs_list"
-                | "api_fs_mkdir"
-                | "api_fs_rename"
-                | "api_fs_delete"
-                | "api_fs_read"
-                | "api_sessions_search"
-                | "api_settings"
-                | "api_settings_save"
-                | "api_control_msg"
-                | "api_session_control_msg"
-                | "api_dashboard_action_msg"
-                | "api_diagnostics_visual_freshness"
-                | "api_key_status"
-                | "api_api_keys_save"
-                | "api_external_agents"
-                | "api_voice_session"
-                | "api_project_root"
-                | "api_displays"
-                | "api_recordings"
-                | "api_recording_asset"
-                | "api_session_recordings"
-                | "api_session_recording_asset"
-                | "api_session_frame_asset"
-                | "api_browser_workspace_snapshot"
-                | "api_state_snapshot"
-                | "api_display_bootstrap"
-                | "api_display_webrtc_signal"
-                | "api_display_input_authority_snapshot"
-                | "api_display_input_authority_request"
-                | "api_display_input_authority_release"
-                | "api_session_log_replay"
-                | "api_external_session_activity_replay"
-                | "api_dashboard_bootstrap"
-                | "api_worktrees"
-                | "api_worktrees_inspect"
-                | "api_worktrees_scan"
-                | "api_worktrees_remove"
-                | "api_worktrees_merge"
-                | "api_managed_context_records"
-                | "api_managed_context_anchors"
-                | "api_managed_context_fission"
-                | "api_mcp_tool_call"
-                | "api_peer_add"
-                | "api_peer_remove"
-                | "api_peer_eligible"
-                | "api_peer_message"
-                | "api_peer_task"
-                | "api_peer_approval"
-                | "api_peer_webrtc_signal"
-                | "api_peer_file_transfer_signal"
-                | "api_peer_dashboard_control_signal"
-                | "api_peer_pairing_invite"
-                | "api_peer_pairing_join"
-                | "api_peer_pairing_request_access"
-                | "api_peer_pairing_request_access_poll"
-                | "api_peer_pairing_requests"
-                | "api_peer_pairing_request_decision"
-                | "api_peer_pairing_identities"
-                | "api_peer_pairing_identity_revoke"
-                | "api_credential_egress_probe"
-                | "api_access_connect_unclaim"
-                | "api_coordinator_route" => {
+                // Every other declared method rides the spawned request
+                // lane (transport-unification S11): the authorizer above
+                // fail-closes undeclared names against the effective
+                // method table (route-row tunnel specs ∪ the
+                // `CONTROL_ONLY_METHODS` residue), so reaching this arm
+                // means the method is declared — the per-name mirror list
+                // this arm replaces could only drift out of sync with
+                // those declarations. The spawned lane owns the
+                // method→handler binding (byte-stream tasks and JSON
+                // arms alike); a declared name it does not bind answers
+                // with the same `unknown method` shape this match used to
+                // return inline.
+                _ => {
                     spawn_control_request(
                         id,
                         method.to_string(),
@@ -859,12 +924,6 @@ pub(crate) fn control_frame_response(
                     );
                     None
                 }
-                _ => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": false,
-                    "error": format!("unknown method: {method}"),
-                })),
             }
         }
         "cancel" => {
@@ -927,16 +986,13 @@ pub(crate) fn control_upload_start_frame(
         return Some(control_upload_error_response(id, 400, "missing request id"));
     }
     let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(
-        method,
-        "api_session_current_upload"
-            | "api_transfer_upload_chunk"
-            | "api_fs_write"
-            | "api_media_annotation_attach"
-            | "api_media_annotation_submit"
-            | "api_media_clip_frame"
-            | "api_presence_video_frame"
-    ) {
+    // Derived, not mirrored (transport-unification S11): a method is
+    // upload-deliverable iff its declaration says so — the `upload` flag
+    // on its route-row tunnel spec or `CONTROL_ONLY_METHODS` residue
+    // entry — replacing the per-name list this gate used to restate.
+    // Undeclared names keep the historical 400 shape; the operation gate
+    // below answers 403 like every other authorization failure.
+    if !control_method_spec(method).is_some_and(|spec| spec.upload) {
         return Some(control_upload_error_response(
             id,
             400,
@@ -1211,7 +1267,7 @@ pub(crate) fn control_terminal_open_frame(
             .get("shared")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
-        scope: runtime.grant.filesystem().cloned(),
+        scope: runtime.grant.filesystem(),
     };
     let handle = tokio::spawn(async move {
         let key = crate::terminal::TerminalKey {
@@ -1223,8 +1279,7 @@ pub(crate) fn control_terminal_open_frame(
             .await
         {
             Ok((session, _created)) => {
-                let (tx, mut rx) = mpsc::unbounded_channel();
-                session.attach(tx);
+                let mut rx = session.attach();
                 let _ = terminal_events_tx.send(serde_json::json!({
                     "t": "terminal_opened",
                     "host_id": host_id.clone(),
@@ -1404,7 +1459,10 @@ pub(crate) fn control_presence_frame(
     }
 }
 
-pub(crate) async fn handle_dashboard_presence_frame(frame: serde_json::Value, runtime: ControlRuntime) {
+pub(crate) async fn handle_dashboard_presence_frame(
+    frame: serde_json::Value,
+    runtime: ControlRuntime,
+) {
     let frame_type = frame
         .get("t")
         .and_then(|value| value.as_str())
@@ -1425,7 +1483,10 @@ pub(crate) async fn handle_dashboard_presence_frame(frame: serde_json::Value, ru
     }
 }
 
-pub(crate) fn dashboard_control_emit_browser_event(runtime: &ControlRuntime, payload: serde_json::Value) {
+pub(crate) fn dashboard_control_emit_browser_event(
+    runtime: &ControlRuntime,
+    payload: serde_json::Value,
+) {
     if let Some(tx) = &runtime.control_frames_tx {
         let _ = tx.send(serde_json::json!({
             "t": "event",
@@ -1665,7 +1726,10 @@ pub(crate) async fn dashboard_voice_log(frame: serde_json::Value, runtime: Contr
     });
 }
 
-pub(crate) async fn dashboard_presence_checkpoint(frame: serde_json::Value, runtime: ControlRuntime) {
+pub(crate) async fn dashboard_presence_checkpoint(
+    frame: serde_json::Value,
+    runtime: ControlRuntime,
+) {
     let summary = frame
         .get("summary")
         .and_then(|value| value.as_str())
@@ -1968,47 +2032,239 @@ pub(crate) async fn dashboard_async_query(frame: serde_json::Value, runtime: Con
     );
 }
 
-pub(crate) fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
-    tokio::spawn(async move {
-        let display_id = frame
-            .get("display_id")
-            .and_then(|value| value.as_u64())
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(0);
-        let Some(event) = frame.get("event").cloned() else {
-            return;
-        };
-        let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
-            return;
-        };
-        let Some(bridge) = runtime.display_authority.as_ref() else {
-            return;
-        };
-        if !bridge.input_authorized(&runtime.session_id, display_id) {
-            return;
+/// Spawn the per-connection display-input forwarder (F1, 2026-07-13
+/// display review): ONE task per control connection that consumes
+/// `display_input` frames from an ordered channel and routes each to the
+/// display session's ordered input queue.
+///
+/// The previous shape — one `tokio::spawn` per input event — discarded
+/// the data channel's wire ordering: two spawned tasks race across
+/// runtime workers, and a `kd`/`ku` or `md`/`mu` inversion wedges a key
+/// or scrambles a click (the window widens under host load). The wire
+/// loop (`drain_control_outputs`) dispatches frames sequentially, its
+/// a non-blocking bounded send into this channel preserves that order, and
+/// the single consumer here preserves it into `enqueue_input` — whose
+/// per-session pump preserves it into the backend. Saturation cancels the
+/// connection instead of dropping one edge-triggered key/button frame and
+/// leaving the lane alive in a potentially stuck state.
+///
+/// The forwarder ends when the wire loop drops the sender (connection
+/// teardown) or the shared shutdown token fires.
+pub(crate) struct DisplayInputForwarder {
+    tx: mpsc::Sender<serde_json::Value>,
+    shutdown: CancellationToken,
+    overload_reported: Arc<AtomicBool>,
+    sources:
+        Arc<std::sync::Mutex<HashMap<u32, std::sync::Weak<crate::display::BrowserInputSource>>>>,
+}
+
+impl DisplayInputForwarder {
+    fn new(tx: mpsc::Sender<serde_json::Value>, shutdown: CancellationToken) -> Self {
+        Self {
+            tx,
+            shutdown,
+            overload_reported: Arc::new(AtomicBool::new(false)),
+            sources: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
-        let session_registry = {
-            let session = runtime.shared_session.read().await;
-            session.session_registry.clone()
-        };
-        let Some(session_registry) = session_registry else {
-            return;
-        };
-        let display_session = {
-            let registry = session_registry.read().await;
-            registry.get(display_id)
-        };
-        if let Some(display_session) = display_session {
-            if let Err(e) = display_session.inject_input(input_event).await {
-                eprintln!("[dashboard/control] display input injection failed: {e}");
+    }
+
+    fn trip_active_sources(&self, reason: &str) {
+        let sources: Vec<_> = self
+            .sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for source in sources {
+            source.invalidate(reason);
+        }
+    }
+
+    /// Sync/non-blocking handoff from the sans-I/O control driver. A full
+    /// queue means the async resolver is not keeping up with an authorized
+    /// input flood; fail closed by ending the connection and letting its
+    /// authority cleanup run instead of silently dropping a key/button edge.
+    fn try_forward(&self, frame: serde_json::Value) -> bool {
+        match self.tx.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if !self.overload_reported.swap(true, Ordering::SeqCst) {
+                    eprintln!(
+                        "[dashboard/control] display-input handoff reached its {}-frame hard cap; closing the control connection",
+                        crate::display::BROWSER_INPUT_QUEUE_HARD_CAP,
+                    );
+                }
+                self.trip_active_sources("the dashboard-control input handoff overloaded");
+                self.shutdown.cancel();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.trip_active_sources("the dashboard-control input handoff closed");
+                self.shutdown.cancel();
+                false
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_sink() -> Self {
+        let (tx, _rx) = mpsc::channel(1);
+        Self::new(tx, CancellationToken::new())
+    }
+}
+
+pub(crate) fn spawn_display_input_forwarder(
+    runtime: ControlRuntime,
+    shutdown: CancellationToken,
+) -> DisplayInputForwarder {
+    let (tx, mut rx) =
+        mpsc::channel::<serde_json::Value>(crate::display::BROWSER_INPUT_QUEUE_HARD_CAP);
+    let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+    let sources = Arc::clone(&forwarder.sources);
+    let runtime = Arc::new(runtime);
+    tokio::spawn(async move {
+        let mut input_sources: HashMap<
+            u32,
+            (
+                std::sync::Weak<crate::display::DisplaySession>,
+                Arc<crate::display::BrowserInputSource>,
+            ),
+        > = HashMap::new();
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                frame = rx.recv() => match frame {
+                    Some(frame) => frame,
+                    None => break,
+                },
+            };
+            forward_dashboard_display_input(
+                frame,
+                &runtime,
+                &shutdown,
+                &sources,
+                &mut input_sources,
+            )
+            .await;
+        }
     });
+    forwarder
+}
+
+/// Route one `display_input` frame: parse, authority-gate, resolve the
+/// display session, and enqueue onto its ordered input queue. Gating
+/// happens before enqueue (per-event, so authority revocation applies to
+/// every later event), preserving the pre-queue semantics.
+async fn forward_dashboard_display_input(
+    frame: serde_json::Value,
+    runtime: &Arc<ControlRuntime>,
+    shutdown: &CancellationToken,
+    sources: &Arc<
+        std::sync::Mutex<HashMap<u32, std::sync::Weak<crate::display::BrowserInputSource>>>,
+    >,
+    input_sources: &mut HashMap<
+        u32,
+        (
+            std::sync::Weak<crate::display::DisplaySession>,
+            Arc<crate::display::BrowserInputSource>,
+        ),
+    >,
+) {
+    let Some(display_id) = frame
+        .get("display_id")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(event) = frame.get("event").cloned() else {
+        return;
+    };
+    let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
+        return;
+    };
+    if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
+        return;
+    }
+    let session_registry = {
+        let session = runtime.shared_session.read().await;
+        session.session_registry.clone()
+    };
+    let Some(session_registry) = session_registry else {
+        return;
+    };
+    // Retain the registry read guard through the final synchronous enqueue.
+    // Removal/replacement closes the old queue under the write guard, so each
+    // raw frame is linearized wholly before or wholly after that lifecycle
+    // boundary. The grant-aware lookup keeps private views owner-only.
+    let registry = session_registry.read().await;
+    if let Some(display_session) = runtime.grant.display_session(&registry, display_id) {
+        // The registry reads above yield. Re-check after them so a live IAM,
+        // peer-identity, or holder change cannot race the final enqueue.
+        if !dashboard_display_input_remains_authorized(runtime, display_id, shutdown) {
+            return;
+        }
+        let replace = input_sources
+            .get(&display_id)
+            .and_then(|(known, _)| known.upgrade())
+            .is_none_or(|known| !Arc::ptr_eq(&known, &display_session));
+        if replace {
+            let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> = {
+                let runtime = Arc::clone(runtime);
+                let shutdown = shutdown.clone();
+                Arc::new(move || {
+                    dashboard_display_input_remains_authorized(&runtime, display_id, &shutdown)
+                })
+            };
+            let source = display_session.browser_input_source(
+                crate::display::BrowserInputAuthorization::versioned(
+                    input_authorized,
+                    runtime
+                        .display_authority
+                        .as_ref()
+                        .expect("authorized display input requires authority bridge")
+                        .input_revision(display_id),
+                ),
+            );
+            sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(display_id, Arc::downgrade(&source));
+            input_sources.insert(display_id, (Arc::downgrade(&display_session), source));
+        }
+        if let Some((_, source)) = input_sources.get(&display_id) {
+            // Fire-and-forget: the source binds buffered events to this
+            // dashboard-control worker; the session pump preserves order and
+            // performs the final live check.
+            source.enqueue(input_event);
+        }
+    }
+    drop(registry);
+}
+
+/// Revalidate a frame that already passed the operation gate in
+/// [`control_frame_response`]. Exact opening-grant equality implies the
+/// original DisplayInput permission is unchanged; the remaining checks bind
+/// the buffered event to the live transport and current display holder.
+fn dashboard_display_input_remains_authorized(
+    runtime: &ControlRuntime,
+    display_id: u32,
+    shutdown: &CancellationToken,
+) -> bool {
+    !shutdown.is_cancelled()
+        && runtime.grant.opening_authority_is_current()
+        && runtime
+            .display_authority
+            .as_ref()
+            .is_some_and(|bridge| bridge.input_authorized(&runtime.session_id, display_id))
 }
 
 pub(crate) fn cached_bootstrap_events_response_frame(
     id: String,
     caches: &DashboardBootstrapCaches,
+    grant: &DashboardControlGrant,
 ) -> serde_json::Value {
     let mut events = Vec::new();
     let mut malformed = Vec::new();
@@ -2060,6 +2316,11 @@ pub(crate) fn cached_bootstrap_events_response_frame(
             }
         }
     }
+    events.retain(|event| {
+        serde_json::to_string(event)
+            .ok()
+            .is_some_and(|line| grant.allows_dashboard_event_line(&line))
+    });
     let event_count = events.len();
 
     serde_json::json!({
@@ -2115,7 +2376,10 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
         "created_unix_ms".to_string(),
         serde_json::json!(runtime.created_unix_ms),
     );
-    result.insert("features".to_string(), serde_json::json!(control_features()));
+    result.insert(
+        "features".to_string(),
+        serde_json::json!(control_features()),
+    );
     result.insert(
         "transport".to_string(),
         serde_json::json!("webrtc-datachannel"),
@@ -2143,6 +2407,22 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
     if let Some(profile) = runtime.grant.profile() {
         result.insert("grant_profile".to_string(), serde_json::json!(profile));
     }
+    // Delegation-lane attribution, when the relayed offer was signed by a
+    // browser identity key: the raw material for the routing badge ("via
+    // <daemon> · <profile> · you"). Never widens authority.
+    if let crate::dashboard_control::DashboardControlGrant::Peer {
+        attributed: Some(attributed),
+        ..
+    } = &runtime.grant
+    {
+        result.insert(
+            "attributed_fingerprint".to_string(),
+            serde_json::json!(attributed.fingerprint),
+        );
+        if let Some(label) = attributed.enrolled_label.as_deref() {
+            result.insert("attributed_label".to_string(), serde_json::json!(label));
+        }
+    }
     let access_principal = runtime.grant.access_principal();
     result.insert("access_principal".to_string(), access_principal.as_value());
     // Whether ANY provider credential is usable (.env key or active lease).
@@ -2160,7 +2440,6 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             "principal_kind": access_principal.kind,
             "principal_binding": match runtime.grant {
                 DashboardControlGrant::TrustedLocal => "root_session",
-                DashboardControlGrant::UserClientRoot { .. } => "user_client_root",
                 DashboardControlGrant::UserClient { .. } => "user_client",
                 DashboardControlGrant::Peer { .. } => "peer_daemon",
             },
@@ -2216,7 +2495,7 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 
     // Every gated api_* method derives its `<method>_available` boolean from
     // the effective method table (route-row tunnel specs ∪ the
-    // CONTROL_METHODS residue): operation granted && backing subsystem wired
+    // CONTROL_ONLY_METHODS residue): operation granted && backing subsystem wired
     // (`control_method_runtime_ready`). One boolean per advertised RPC lets
     // the SPA distinguish "denied for this session" from "unsupported
     // daemon" (feature list) without probing calls.
@@ -2275,9 +2554,11 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
             peer_registry_available && peer_use,
         ),
         ("api_peer_pairing_available", peer_manage || access_manage),
+        // Coordinator routing acts *through* a peer too (owner decision
+        // 2026-07-11): the aggregate follows the method's PeerUse gate.
         (
             "api_coordinator_available",
-            peer_registry_available && peer_manage,
+            peer_registry_available && peer_use,
         ),
         // Host capability, not a grant: dashboards derive the "New virtual
         // display" affordance from this (Xvfb-based, Linux-only).
@@ -2302,6 +2583,239 @@ pub(crate) fn status_response_frame(id: String, runtime: &ControlRuntime) -> ser
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::{runtime, scoped_user_client_grant};
+
+    struct ForwarderResetBackend {
+        injected: mpsc::UnboundedSender<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for ForwarderResetBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, intendant_core::error::CallerError>
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+        async fn stop_capture(&self) {}
+        async fn inject_input(
+            &self,
+            event: crate::display::InputEvent,
+        ) -> Result<(), intendant_core::error::CallerError> {
+            let tag = match event {
+                crate::display::InputEvent::KeyDown { .. } => "kd",
+                crate::display::InputEvent::KeyUp { .. } => "ku",
+                crate::display::InputEvent::MouseDown { .. } => "md",
+                crate::display::InputEvent::MouseUp { .. } => "mu",
+                crate::display::InputEvent::MouseMove { .. } => "mm",
+                crate::display::InputEvent::Scroll { .. } => "sc",
+            };
+            let _ = self.injected.send(tag);
+            Ok(())
+        }
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+        fn kind(&self) -> &'static str {
+            "forwarder-reset-test"
+        }
+    }
+
+    #[test]
+    fn display_input_forwarder_is_bounded_and_cancels_on_overflow() {
+        let shutdown = CancellationToken::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 1})));
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 2})));
+        assert!(!forwarder.try_forward(serde_json::json!({"seq": 3})));
+        assert!(shutdown.is_cancelled(), "overflow must close the lane");
+        assert_eq!(rx.try_recv().unwrap()["seq"], 1);
+        assert_eq!(rx.try_recv().unwrap()["seq"], 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "the channel must never exceed its cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn display_input_forwarder_overload_releases_held_native_input() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let display = Arc::new(crate::display::DisplaySession::new(
+            0,
+            Arc::new(ForwarderResetBackend {
+                injected: injected_tx,
+            }),
+        ));
+        let source = display.browser_input_source(crate::display::BrowserInputAuthorization::new(
+            Arc::new(|| true),
+        ));
+        source.enqueue(crate::display::InputEvent::KeyDown {
+            code: "KeyA".to_string(),
+            key: "a".to_string(),
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        });
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .unwrap(),
+            Some("kd")
+        );
+
+        let shutdown = CancellationToken::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let forwarder = DisplayInputForwarder::new(tx, shutdown.clone());
+        forwarder
+            .sources
+            .lock()
+            .unwrap()
+            .insert(0, Arc::downgrade(&source));
+        assert!(forwarder.try_forward(serde_json::json!({"seq": 1})));
+        assert!(!forwarder.try_forward(serde_json::json!({"seq": 2})));
+        assert!(shutdown.is_cancelled());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .unwrap(),
+            Some("ku"),
+            "overload cancellation must synthesize a release for held input"
+        );
+        display.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dashboard_input_reaches_private_user_view() {
+        let (injected_tx, mut injected_rx) = mpsc::unbounded_channel();
+        let display = Arc::new(crate::display::DisplaySession::new(
+            17,
+            Arc::new(ForwarderResetBackend {
+                injected: injected_tx,
+            }),
+        ));
+        display.set_agent_visible(false);
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        registry.write().await.insert(17, Arc::clone(&display));
+
+        let (change_tx, _change_rx) = tokio::sync::broadcast::channel(1);
+        let subscribe_tx = change_tx.clone();
+        let bridge = DashboardDisplayAuthorityBridge::new(
+            |_session_id, _display_ids| Vec::new(),
+            |_session_id, _display_id| None,
+            |_session_id, _display_id, _include_private| Vec::new(),
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| true,
+            |_display_id| Arc::new(AtomicU64::new(0)),
+            |_session_id| {},
+            move || subscribe_tx.subscribe(),
+        );
+        let mut rt = runtime();
+        rt.display_authority = Some(bridge);
+        rt.shared_session.write().await.session_registry = Some(registry);
+        let rt = Arc::new(rt);
+        let shutdown = CancellationToken::new();
+        let sources = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut input_sources = HashMap::new();
+
+        forward_dashboard_display_input(
+            serde_json::json!({
+                "display_id": 17,
+                "event": {
+                    "t": "kd",
+                    "code": "KeyA",
+                    "key": "a",
+                    "shift": false,
+                    "ctrl": false,
+                    "alt": false,
+                    "meta": false
+                }
+            }),
+            &rt,
+            &shutdown,
+            &sources,
+            &mut input_sources,
+        )
+        .await;
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), injected_rx.recv())
+                .await
+                .expect("private display input must reach the backend"),
+            Some("kd")
+        );
+        display.stop().await;
+    }
+
+    #[test]
+    fn display_input_rechecks_persisted_iam_before_enqueue() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:77".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:77",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+
+        let (change_tx, _change_rx) = tokio::sync::broadcast::channel(1);
+        let subscribe_tx = change_tx.clone();
+        let bridge = DashboardDisplayAuthorityBridge::new(
+            |_session_id, _display_ids| Vec::new(),
+            |_session_id, _display_id| None,
+            |_session_id, _display_id, _include_private| Vec::new(),
+            |_session_id, _display_id| Vec::new(),
+            |_session_id, _display_id| true,
+            |_display_id| Arc::new(AtomicU64::new(0)),
+            |_session_id| {},
+            move || subscribe_tx.subscribe(),
+        );
+        let mut rt = runtime();
+        rt.display_authority = Some(bridge);
+        rt.grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        };
+        let shutdown = CancellationToken::new();
+        assert!(dashboard_display_input_remains_authorized(
+            &rt, 0, &shutdown
+        ));
+
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        assert!(
+            !dashboard_display_input_remains_authorized(&rt, 0, &shutdown),
+            "a queued frame must observe live IAM revocation"
+        );
+    }
 
     #[test]
     fn frame_api_response_fails_closed_on_byte_payloads() {
@@ -2385,41 +2899,6 @@ mod tests {
     }
 
     #[test]
-    fn user_client_root_grant_reports_identity_without_scoping_permissions() {
-        let mut rt = runtime();
-        rt.grant = DashboardControlGrant::UserClientRoot {
-            principal: crate::access::iam::AccessPrincipal::root_user_client(
-                "browser-mtls",
-                "webrtc-datachannel",
-                "Browser certificate ab123",
-                None,
-                None,
-                vec![serde_json::json!({
-                    "kind": "browser_mtls_cert",
-                    "fingerprint": "ab123"
-                })],
-            ),
-        };
-
-        let status = status_response_frame("s1".to_string(), &rt);
-        assert_eq!(status["result"]["grant_kind"], "user-client-root");
-        assert_eq!(status["result"]["access_principal"]["kind"], "root_session");
-        assert_eq!(
-            status["result"]["access_principal"]["authn"][0]["kind"],
-            "browser_mtls_cert"
-        );
-        assert_eq!(
-            status["result"]["iam_enforcement"]["principal_binding"],
-            "user_client_root"
-        );
-        assert_eq!(
-            status["result"]["iam_enforcement"]["user_client_grants"],
-            false
-        );
-        assert_eq!(status["result"]["access_manage_available"], true);
-    }
-
-    #[test]
     fn upload_start_authorizes_by_delivered_method_not_blanket_fs_write() {
         let file_operator = ControlRuntime {
             grant: DashboardControlGrant::Peer {
@@ -2427,6 +2906,9 @@ mod tests {
                 label: "peer".into(),
                 profile: "file-operator".into(),
                 filesystem: Default::default(),
+                attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             },
             ..runtime()
         };
@@ -2484,6 +2966,9 @@ mod tests {
                 label: "peer".into(),
                 profile: "admin".into(),
                 filesystem: Default::default(),
+                attributed: None,
+                identity_record: None,
+                iam_cert_dir: None,
             },
             ..runtime()
         };
@@ -2516,6 +3001,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let bytes = b"hello upload";
         let first = &bytes[..6];
         let second = &bytes[6..];
@@ -2542,6 +3028,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
         assert!(pending.contains_key("up1"));
@@ -2562,6 +3049,7 @@ mod tests {
                 &mut inbound_uploads,
                 &terminal_tx,
                 &mut terminal_forwarders,
+                &display_input_tx,
             )
             .is_none());
         }
@@ -2580,6 +3068,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2624,6 +3113,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let display_input_tx = DisplayInputForwarder::test_sink();
 
         let start = serde_json::json!({
             "t": "upload_start",
@@ -2647,6 +3137,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
         assert!(pending.contains_key("up-empty"));
@@ -2665,6 +3156,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2695,6 +3187,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let terminal_id = "dash-control-test-shell";
 
         let open = serde_json::json!({
@@ -2713,6 +3206,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2789,6 +3283,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .is_none());
 
@@ -2811,6 +3306,7 @@ mod tests {
             &mut inbound_uploads,
             &terminal_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         );
         for (_, handle) in terminal_forwarders {
             handle.abort();
@@ -2832,6 +3328,7 @@ mod tests {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
         let mut terminal_forwarders = HashMap::new();
+        let display_input_tx = DisplayInputForwarder::test_sink();
         let mut frame = |text: &str,
                          rt: &mut ControlRuntime,
                          pending: &mut HashMap<String, CancellationToken>,
@@ -2846,6 +3343,7 @@ mod tests {
                 inbound,
                 &terminal_tx,
                 &mut terminal_forwarders,
+                &display_input_tx,
             )
         };
 
@@ -2937,6 +3435,11 @@ mod tests {
         std::fs::write(&source, b"durable download fixture").unwrap();
 
         let mut rt = runtime();
+        // Transfer availability must not require a project root: the store
+        // falls back to the daemon-global scope (Wave 1F), and the HTTP rows
+        // serve projectless — both lanes advertise alike.
+        let projectless = status_response_frame("transfer-status-projectless".to_string(), &rt);
+        assert_eq!(projectless["result"]["api_transfer_jobs_available"], true);
         rt.project_root = Some(project.clone());
 
         let status = status_response_frame("transfer-status".to_string(), &rt);
@@ -2965,7 +3468,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let list = api_transfer_jobs_response("transfer-list".to_string(), &rt).await;
+        let list = api_transfer_jobs_response("transfer-list".to_string(), None, &rt).await;
         assert_eq!(list["result"]["jobs"].as_array().unwrap().len(), 1);
         assert_eq!(list["result"]["jobs"][0]["id"], job_id);
 

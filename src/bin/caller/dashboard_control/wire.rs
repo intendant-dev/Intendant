@@ -4,6 +4,7 @@
 
 use super::*;
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     mut rtc: RTCPeerConnection<I>,
     sockets: Vec<Arc<UdpSocket>>,
@@ -64,13 +65,26 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     runtime.control_frames_tx = Some(terminal_events_tx.clone());
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
+    // Per-connection ordered display-input lane (F1): `display_input`
+    // frames are handed to ONE forwarder task in dispatch order instead
+    // of spawning a task per event (which raced kd/ku / md/mu pairs
+    // across runtime workers). Dropping `display_input_tx` when this
+    // driver exits ends the forwarder; the shared shutdown token covers
+    // the cancel path.
+    let display_input_tx = spawn_display_input_forwarder(runtime.clone(), shutdown.clone());
     let mut display_authority_rx = runtime
         .display_authority
         .as_ref()
         .map(DashboardDisplayAuthorityBridge::subscribe);
     let mut drop_stats = TransmitDropStats::default();
+    let mut authority_tick = tokio::time::interval(LIVE_AUTHORITY_RECHECK_INTERVAL);
+    authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        if !runtime.grant.opening_authority_is_current() {
+            shutdown.cancel();
+            break;
+        }
         let timeout_at = match drain_control_outputs(
             &mut rtc,
             &sockets_by_addr,
@@ -84,6 +98,7 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
             &mut inbound_uploads,
             &terminal_events_tx,
             &mut terminal_forwarders,
+            &display_input_tx,
         )
         .await
         {
@@ -99,6 +114,12 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
+            _ = authority_tick.tick() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
+            }
             Some(pkt) = inbound_rx.recv() => {
                 let input = TaggedBytesMut {
                     now: pkt.received_at,
@@ -232,6 +253,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             Some(task_response) = task_rx.recv() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 if pending_requests.contains_key(&task_response.id) {
                     let task_id = task_response.id.clone();
                     let done = task_response.done;
@@ -249,17 +274,40 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             event = event_rx.recv(), if runtime.events_subscribed => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 match event {
                     Ok(line) => {
+                        let owner = runtime.grant.has_owner_dashboard_authority();
+                        if !owner
+                            && DashboardControlGrant::dashboard_event_line_requires_owner(&line)
+                        {
+                            continue;
+                        }
+                        if !owner {
+                            let private = {
+                                let active_session = runtime.shared_session.read().await;
+                                match active_session.session_registry.as_ref() {
+                                    Some(session_registry) => {
+                                        let registry = session_registry.read().await;
+                                        runtime
+                                            .grant
+                                            .dashboard_event_targets_hidden_display(
+                                                &line, &registry,
+                                            )
+                                    }
+                                    None => false,
+                                }
+                            };
+                            if private {
+                                continue;
+                            }
+                        }
                         runtime.events_sent = runtime.events_sent.saturating_add(1);
-                        let payload = serde_json::from_str::<serde_json::Value>(&line)
-                            .unwrap_or_else(|_| serde_json::json!({"raw": line}));
-                        let frame = serde_json::json!({
-                            "t": "event",
-                            "seq": runtime.events_sent,
-                            "payload": payload,
-                        });
-                        send_control_text(&mut rtc, &channels, frame.to_string());
+                        let frame = event_lane_frame(runtime.events_sent, &line);
+                        send_control_text(&mut rtc, &channels, frame);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         let frame = serde_json::json!({
@@ -275,6 +323,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 let _ = rtc.handle_timeout(Instant::now());
             }
             Some(frame) = terminal_events_rx.recv() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 send_control_text(&mut rtc, &channels, frame.to_string());
                 let _ = rtc.handle_timeout(Instant::now());
             }
@@ -284,6 +336,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                     None => std::future::pending::<Option<Result<u32, tokio::sync::broadcast::error::RecvError>>>().await,
                 }
             }, if runtime.events_subscribed && display_authority_rx.is_some() => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
                 match authority {
                     Some(Ok(display_id)) => {
                         send_display_authority_event(&mut rtc, &channels, &mut runtime, display_id);
@@ -313,6 +369,12 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
         }
     }
 
+    // Invalidate every interactive display guard minted by this control
+    // session before any other teardown can yield. The display transport is
+    // separate WebRTC and may reap a beat later; it must not retain input or
+    // clipboard authority during that window.
+    shutdown.cancel();
+    remove_dashboard_display_peers(&runtime).await;
     for (_, token) in pending_requests {
         token.cancel();
     }
@@ -323,12 +385,43 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     // Egress relays die with their session: no more frames can arrive,
     // so drop the registration and fail any in-flight relayed requests.
     crate::credential_egress::unregister_session(&runtime.session_id);
+    runtime.tabs.unregister(&runtime.session_id);
+    if let Some(bridge) = &runtime.display_authority {
+        bridge.cleanup(&runtime.session_id);
+    }
     if let Some(bridge) = &runtime.presence {
         bridge.cleanup(runtime.session_id.clone()).await;
     }
     for handle in forwarder_handles {
         let _ = handle.await;
     }
+}
+
+/// Build one event-lane frame `{"t":"event","seq":N,"payload":<line>}` by
+/// splicing the already-serialized outbound line into the envelope instead
+/// of parse→wrap→re-serialize per event per tunnel: every producer into the
+/// outbound broadcast serializes JSON objects, so the line embeds verbatim.
+/// Lines that don't look like a JSON object/array (never produced today)
+/// take the legacy parse path and wrap as `{"raw": <line>}`.
+pub(crate) fn event_lane_frame(seq: u64, line: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        let mut frame = String::with_capacity(line.len() + 40);
+        frame.push_str("{\"t\":\"event\",\"seq\":");
+        frame.push_str(&seq.to_string());
+        frame.push_str(",\"payload\":");
+        frame.push_str(line);
+        frame.push('}');
+        return frame;
+    }
+    let payload = serde_json::from_str::<serde_json::Value>(line)
+        .unwrap_or_else(|_| serde_json::json!({ "raw": line }));
+    serde_json::json!({
+        "t": "event",
+        "seq": seq,
+        "payload": payload,
+    })
+    .to_string()
 }
 
 pub(crate) fn send_event_payload<I: rtc::interceptor::Interceptor>(
@@ -352,6 +445,24 @@ pub(crate) fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
     runtime: &mut ControlRuntime,
     display_id: u32,
 ) {
+    if !runtime.grant.has_owner_dashboard_authority() {
+        let Ok(active_session) = runtime.shared_session.try_read() else {
+            return;
+        };
+        let Some(session_registry) = active_session.session_registry.as_ref() else {
+            return;
+        };
+        let Ok(registry) = session_registry.try_read() else {
+            return;
+        };
+        if runtime
+            .grant
+            .display_session(&registry, display_id)
+            .is_none()
+        {
+            return;
+        }
+    }
     let Some(bridge) = runtime.display_authority.as_ref() else {
         return;
     };
@@ -360,6 +471,7 @@ pub(crate) fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
@@ -373,6 +485,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+    display_input_tx: &DisplayInputForwarder,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1
@@ -446,6 +559,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             inbound_uploads,
             terminal_events_tx,
             terminal_forwarders,
+            display_input_tx,
         ) {
             send_control_frame(
                 rtc,
@@ -701,7 +815,10 @@ pub(crate) fn byte_stream_frame_text_parts(
 }
 
 #[cfg(test)]
-pub(crate) fn byte_stream_frame_texts(byte_stream: ControlByteStream, chunk_bytes: usize) -> Vec<String> {
+pub(crate) fn byte_stream_frame_texts(
+    byte_stream: ControlByteStream,
+    chunk_bytes: usize,
+) -> Vec<String> {
     match byte_stream_frame_text_parts(byte_stream, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
@@ -853,7 +970,10 @@ pub(crate) fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     }
 }
 
-pub(crate) fn dashboard_control_error_response(id: String, message: impl Into<String>) -> serde_json::Value {
+pub(crate) fn dashboard_control_error_response(
+    id: String,
+    message: impl Into<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "t": "response",
         "id": id,
@@ -865,6 +985,33 @@ pub(crate) fn dashboard_control_error_response(id: String, message: impl Into<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spliced fast path must be byte-equivalent (as JSON) to the old
+    /// parse→wrap→serialize path: same `t`/`seq`, payload embedded as the
+    /// parsed object, no double-encoding.
+    #[test]
+    fn event_lane_frame_splices_serialized_lines_without_reparsing() {
+        let line = r#"{"event":"status","session_id":"s-1","turn":3}"#;
+        let frame = event_lane_frame(42, line);
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(parsed["t"], "event");
+        assert_eq!(parsed["seq"], 42);
+        assert_eq!(parsed["payload"]["event"], "status");
+        assert_eq!(parsed["payload"]["session_id"], "s-1");
+        assert_eq!(parsed["payload"]["turn"], 3);
+        // The payload text is embedded verbatim — proof no reserialization
+        // (which would reorder keys) happened on the fast path.
+        assert!(frame.contains(line));
+    }
+
+    #[test]
+    fn event_lane_frame_wraps_non_json_lines_as_raw() {
+        let frame = event_lane_frame(7, "not json at all");
+        let parsed: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(parsed["t"], "event");
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["payload"]["raw"], "not json at all");
+    }
 
     #[test]
     fn oversized_response_frames_are_chunked_and_reassemble() {

@@ -91,7 +91,7 @@ fn write_stored(path: &std::path::Path, record: &StoredVault) -> Result<(), Stri
         .map_err(|e| format!("write vault blob: {e}"))?;
     }
     restrict_file(&tmp);
-    std::fs::rename(&tmp, &path).map_err(|e| format!("finalize vault blob: {e}"))
+    std::fs::rename(&tmp, path).map_err(|e| format!("finalize vault blob: {e}"))
 }
 
 /// Same private-permissions convention as the custody trail (0600 on

@@ -16,13 +16,13 @@ use super::*;
 
 mod launch;
 pub(crate) use launch::*;
-mod sub_agents;
 mod routing;
+mod sub_agents;
 pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
-mod registry;
 mod dispatch;
+mod registry;
 
 #[derive(Clone)]
 pub struct SessionSupervisorConfig {
@@ -53,8 +53,7 @@ pub struct SessionSupervisorConfig {
     /// sessions construct their ChatProvider from this factory instead of
     /// `provider::select_provider()` (which needs API keys). None in
     /// production; tests use it to run the loop against a mock provider.
-    pub provider_factory:
-        Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
+    pub provider_factory: Option<Arc<dyn Fn() -> Box<dyn provider::ChatProvider> + Send + Sync>>,
     /// Injection point for the persisted-session home: resume/attach
     /// resolution (wrapper logs, the wrapper index, persisted launch
     /// configs) reads from here. None in production (the real home); tests
@@ -63,6 +62,13 @@ pub struct SessionSupervisorConfig {
     /// otherwise resolve against a real session log and flip the flow
     /// from follow-up routing to a fresh resume dispatch.
     pub logs_home_override: Option<PathBuf>,
+    /// Git-vitals target registry: the supervisor registers each managed
+    /// session's effective project root (the worktree checkout for
+    /// worktree sessions) at launch, which is what puts the dirty /
+    /// merge-parity / unpushed rows on dashboard-spawned sessions.
+    /// `SessionEnded` prunes on the producer side. None when the daemon
+    /// runs without the vitals producer (no web frontends).
+    pub git_vitals_targets: Option<crate::session_vitals::GitVitalsTargets>,
 }
 
 #[derive(Clone)]
@@ -74,6 +80,11 @@ pub struct SessionSupervisor {
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SESSION_STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SESSION_RESTART_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on the peer-delegation dedup ledger (`delegation_receipts`).
+/// Entries only need to outlive the delegating side's bounded re-send
+/// window (~30 s), so a FIFO of this size is generous; the bound keeps
+/// a peer that mints endless delegation ids from growing the map.
+const MAX_DELEGATION_RECEIPTS: usize = 128;
 const EXTERNAL_ATTACH_DEDUPE_WINDOW: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
 #[cfg(not(test))]
 const EDIT_ATTACH_ROUTE_TIMEOUT: std::time::Duration = EXTERNAL_ATTACH_READY_TIMEOUT;
@@ -105,6 +116,15 @@ pub(crate) struct SupervisorState {
     /// The fallback responder defers to the advertising loop for exactly
     /// these ops instead of false-rejecting non-external sessions.
     advertised_thread_actions: HashMap<String, std::collections::HashSet<String>>,
+    /// Peer-delegation dedup ledger: delegation id → the session the
+    /// task was dispatched as. A `StartTask` re-sent with an
+    /// already-recorded `delegation_id` (the delegating daemon's
+    /// at-least-once retry after a connection drop) re-acks with the
+    /// original session instead of starting a duplicate task. Bounded
+    /// by [`MAX_DELEGATION_RECEIPTS`], oldest-accepted evicted
+    /// (tracked in `delegation_receipt_order`).
+    delegation_receipts: HashMap<String, String>,
+    delegation_receipt_order: std::collections::VecDeque<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +421,32 @@ impl SupervisorState {
             self.external_attach_dedupe.remove(key);
         }
     }
+
+    /// The session a delegation id was already dispatched as, if any.
+    fn recorded_delegation_session(&self, delegation_id: &str) -> Option<String> {
+        self.delegation_receipts.get(delegation_id).cloned()
+    }
+
+    /// Record an accepted delegation for dedup, evicting the oldest
+    /// entry beyond [`MAX_DELEGATION_RECEIPTS`]. First writer wins —
+    /// a delegation id is never re-pointed at a different session.
+    fn record_delegation(&mut self, delegation_id: &str, session_id: &str) {
+        if self.delegation_receipts.contains_key(delegation_id) {
+            return;
+        }
+        while self.delegation_receipt_order.len() >= MAX_DELEGATION_RECEIPTS {
+            match self.delegation_receipt_order.pop_front() {
+                Some(evicted) => {
+                    self.delegation_receipts.remove(&evicted);
+                }
+                None => break,
+            }
+        }
+        self.delegation_receipt_order
+            .push_back(delegation_id.to_string());
+        self.delegation_receipts
+            .insert(delegation_id.to_string(), session_id.to_string());
+    }
 }
 
 impl SessionSupervisor {
@@ -421,96 +467,98 @@ impl SessionSupervisor {
             .unwrap_or_else(crate::platform::home_dir)
     }
 
-    pub fn spawn(self) -> JoinHandle<()> {
-        let mut rx = self.config.bus.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        self.observe_lifecycle_event(&event).await;
-                        match event {
-                            AppEvent::ControlCommand(msg) => {
-                                self.handle_control_msg(msg).await;
-                            }
-                            AppEvent::SessionIdentity {
-                                session_id,
-                                source,
-                                backend_session_id,
-                            } => {
-                                self.apply_session_identity(session_id, source, backend_session_id)
-                                    .await;
-                            }
-                            AppEvent::SessionRelationship {
-                                parent_session_id,
-                                child_session_id,
-                                relationship,
-                                ..
-                            } => {
-                                self.apply_session_relationship(
-                                    parent_session_id,
-                                    child_session_id,
-                                    relationship,
-                                )
-                                .await;
-                            }
-                            AppEvent::SessionEnded { session_id, .. } => {
-                                self.remove_session_alias(&session_id).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+    /// Act on one intent-lane event. Split from the receive loops so the
+    /// primary supervisor and the resume listener share exactly one
+    /// action path; `filter_session_control` is the resume listener's
+    /// `should_handle_session_control` gate.
+    async fn handle_intent_lane_event(&self, event: AppEvent, filter_session_control: bool) {
+        match event {
+            AppEvent::ControlCommand(msg) => {
+                if !filter_session_control || self.should_handle_session_control(&msg).await {
+                    self.handle_control_msg(msg).await;
                 }
             }
-        })
+            AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            } => {
+                self.apply_session_identity(session_id, source, backend_session_id)
+                    .await;
+            }
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ..
+            } => {
+                self.apply_session_relationship(parent_session_id, child_session_id, relationship)
+                    .await;
+            }
+            AppEvent::SessionEnded { session_id, .. } => {
+                self.remove_session_alias(&session_id).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// The supervisor's receive loop, shared by [`Self::spawn`] and
+    /// [`Self::spawn_resume_listener`].
+    ///
+    /// Two lanes, one loop:
+    /// - the lossless intent lane ([`EventBus::subscribe_intents`]) carries
+    ///   everything the supervisor ACTS on — `ControlCommand` dispatch plus
+    ///   the identity/relationship/end bookkeeping that routes future
+    ///   commands. Losing one of these corrupts routing state, so they must
+    ///   never drop to `RecvError::Lagged`.
+    /// - the broadcast ring still feeds `observe_lifecycle_event` (phase
+    ///   chips): best-effort by design — a lagged phase update is cosmetic
+    ///   and the next status event heals it.
+    ///
+    /// `biased` drains intents first so a user command is never queued
+    /// behind an observation backlog. Cross-lane skew is tolerable because
+    /// the observation side is display-only; intent-lane events are NOT
+    /// re-observed here (they'd double-apply phase updates when the
+    /// broadcast copy arrives).
+    ///
+    /// Receivers are subscribed by the caller BEFORE the task is spawned:
+    /// daemon startup sends `ResumeSession` immediately after `spawn()`
+    /// returns and relies on the subscription already existing.
+    async fn run_event_loop(
+        self,
+        mut intent_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+        mut rx: tokio::sync::broadcast::Receiver<AppEvent>,
+        filter_session_control: bool,
+    ) {
+        loop {
+            tokio::select! {
+                biased;
+                intent = intent_rx.recv() => match intent {
+                    Some(event) => {
+                        self.handle_intent_lane_event(event, filter_session_control)
+                            .await;
+                    }
+                    None => break,
+                },
+                event = rx.recv() => match event {
+                    Ok(event) => self.observe_lifecycle_event(&event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    }
+
+    pub fn spawn(self) -> JoinHandle<()> {
+        let intent_rx = self.config.bus.subscribe_intents();
+        let rx = self.config.bus.subscribe();
+        tokio::spawn(self.run_event_loop(intent_rx, rx, false))
     }
 
     pub fn spawn_resume_listener(self) -> JoinHandle<()> {
-        let mut rx = self.config.bus.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        self.observe_lifecycle_event(&event).await;
-                        match event {
-                            AppEvent::ControlCommand(msg) => {
-                                if self.should_handle_session_control(&msg).await {
-                                    self.handle_control_msg(msg).await;
-                                }
-                            }
-                            AppEvent::SessionIdentity {
-                                session_id,
-                                source,
-                                backend_session_id,
-                            } => {
-                                self.apply_session_identity(session_id, source, backend_session_id)
-                                    .await;
-                            }
-                            AppEvent::SessionRelationship {
-                                parent_session_id,
-                                child_session_id,
-                                relationship,
-                                ..
-                            } => {
-                                self.apply_session_relationship(
-                                    parent_session_id,
-                                    child_session_id,
-                                    relationship,
-                                )
-                                .await;
-                            }
-                            AppEvent::SessionEnded { session_id, .. } => {
-                                self.remove_session_alias(&session_id).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        })
+        let intent_rx = self.config.bus.subscribe_intents();
+        let rx = self.config.bus.subscribe();
+        tokio::spawn(self.run_event_loop(intent_rx, rx, true))
     }
 
     pub async fn run(self) {
@@ -663,10 +711,19 @@ mod tests {
             // a box with live session history (a dev box, the peer-testing
             // Dell) can otherwise match a test's hardcoded wrapper id. The
             // dir is never created unless a test writes through it.
-            logs_home_override: Some(
-                std::env::temp_dir()
-                    .join(format!("intendant-test-logs-home-{}", std::process::id())),
-            ),
+            // PID alone is not unique across runs (recycled PIDs inherit a
+            // previous run's scratch — the state_paths precedent); a nanos
+            // component makes the scratch per process INSTANCE. Sub-agent
+            // and rename flows now WRITE through this home, not just read.
+            logs_home_override: Some(std::env::temp_dir().join(format!(
+                "intendant-test-logs-home-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ))),
+            git_vitals_targets: None,
         })
     }
 
@@ -680,6 +737,43 @@ mod tests {
                 as Box<dyn provider::ChatProvider>
         }));
         SessionSupervisor::new(config)
+    }
+
+    /// The delegation dedup ledger: first writer wins for a given id,
+    /// and the FIFO bound evicts the oldest acceptance, never the
+    /// newest.
+    #[test]
+    fn delegation_ledger_dedups_bounds_and_first_writer_wins() {
+        let mut state = SupervisorState::default();
+        state.record_delegation("dg-a", "sess-original");
+        // A re-record for the same id must NOT re-point it — the
+        // re-ack contract promises the ORIGINAL session identity.
+        state.record_delegation("dg-a", "sess-imposter");
+        assert_eq!(
+            state.recorded_delegation_session("dg-a").as_deref(),
+            Some("sess-original")
+        );
+
+        for i in 0..MAX_DELEGATION_RECEIPTS {
+            state.record_delegation(&format!("dg-fill-{i}"), &format!("sess-{i}"));
+        }
+        assert_eq!(
+            state.recorded_delegation_session("dg-a"),
+            None,
+            "oldest entry is evicted at the bound"
+        );
+        assert!(
+            state
+                .recorded_delegation_session(&format!("dg-fill-{}", MAX_DELEGATION_RECEIPTS - 1))
+                .is_some(),
+            "newest entry survives"
+        );
+        assert!(state.delegation_receipts.len() <= MAX_DELEGATION_RECEIPTS);
+        assert_eq!(
+            state.delegation_receipts.len(),
+            state.delegation_receipt_order.len(),
+            "map and eviction order stay in lockstep"
+        );
     }
 
     #[test]
@@ -771,5 +865,4 @@ mod tests {
         assert!(!state.mark_restart_requested("codex:thread"));
         assert!(state.mark_restart_requested("codex:other-thread"));
     }
-
 }

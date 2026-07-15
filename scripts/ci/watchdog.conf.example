@@ -1,0 +1,57 @@
+# /etc/intendant-ci/watchdog.conf — fleet watchdog configuration.
+# Copy to the host and fill in the runner specifics; this file stays ON
+# THE HOST (the repo is public — never commit host identifiers, user
+# names, or LAN details).
+
+# Disk thresholds (GB, measured on VOLUME with `df -Pk`).
+STOP_GB=50        # pause idle listeners below this
+HARD_STOP_GB=25   # pause even mid-job below this
+RESUME_GB=75      # resume listeners at/above this (hysteresis gap is deliberate)
+
+# External cargo target cache roots (the workflows'
+# "External cargo target dir" steps create per-listener keys here).
+# Space-separated if a host serves several accounts.
+#CACHE_ROOTS="/Users/<runner-account>/.cache/intendant-ci/target"
+#CACHE_ROOTS="/home/<runner-account>/.cache/intendant-ci/target"
+CACHE_ROOTS=""
+
+PRUNE_DAYS=7      # drop cache keys with no run this long
+CAP_GB=50         # total per cache root (2 listeners x 25G budget)
+
+# Memory-pressure assignment gate (see README "fleet-watchdog"): pauses
+# NEW job assignment on sustained pressure; cannot constrain builds
+# already running (the rustc governor bounds those). Hysteresis is in
+# consecutive watchdog ticks (5 min each).
+#MEM_PRESSURE_LEVEL=4   # macOS kern.memorystatus_vm_pressure_level: 2=warning, 4=critical
+#MEM_PSI_PAUSE=40       # Linux /proc/pressure/memory `some avg10` percentage
+#MEM_PAUSE_TICKS=2      # consecutive pressured ticks before pausing
+#MEM_RESUME_TICKS=2     # consecutive normal ticks before resuming
+
+VOLUME="/"
+STATE_DIR="/var/db/intendant-ci"        # /var/lib/intendant-ci on Linux
+LOG="/var/log/intendant-ci-watchdog.log"
+
+# Listener control.
+# RUNNER_USER may list several accounts space-separated (mid-migration a
+# host runs LaunchAgent listeners as the operator and LaunchDaemon
+# listeners as the CI service account at the same time).
+RUNNER_USER=""    # account(s) the listeners run as
+
+# macOS (LaunchAgent listeners, gui domain):
+#RUNNER_UID=501
+#RUNNER_LABELS="actions.runner.<org>-<repo>.<runner-name> actions.runner.<org>-<repo>.<runner-name>-b"
+#RUNNER_PLIST_DIR="/Users/<runner-account>/Library/LaunchAgents"
+RUNNER_UID=""
+RUNNER_LABELS=""
+RUNNER_PLIST_DIR=""
+
+# macOS (LaunchDaemon listeners, system domain — the service-account shape
+# migrate-runner-macos.sh installs; it edits these lines itself):
+#RUNNER_DAEMON_LABELS="actions.runner.<org>-<repo>.<runner-name>"
+#RUNNER_DAEMON_PLIST_DIR="/Library/LaunchDaemons"
+RUNNER_DAEMON_LABELS=""
+RUNNER_DAEMON_PLIST_DIR="/Library/LaunchDaemons"
+
+# Linux (systemd listeners):
+#RUNNER_UNITS="actions.runner.<org>-<repo>.<runner-name>.service"
+RUNNER_UNITS=""

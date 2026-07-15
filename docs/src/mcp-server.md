@@ -55,7 +55,8 @@ model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises the bootstrap set:
 status, shared-view collaboration, and the minimal real-display/CU tools
-(`list_displays`, `grant_user_display`, `revoke_user_display`, `read_screen`,
+(`list_displays`, `grant_user_display`, `request_user_display`,
+`revoke_user_display`, `read_screen`,
 `take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
 context additionally advertises the managed-context rewind/backout and fission
 tools. Omitting `tool_profile` keeps the historical full tool list. Profile
@@ -74,10 +75,11 @@ and `grant_user_display` require `display.input`, `start_task` requires
 `task.run`, unclassified tools require `runtime.control`). `tools/list` is
 filtered to what the principal may actually call. The display tools carry a
 second, separate gate: a `user_session` target needs the standing
-user-display grant unless the bound principal is an owner surface (the
-trusted dashboard / enrolled root user client or bare local loopback —
-`AccessPrincipal::is_owner_surface`); the stdio transport, being wired up by
-the owner's own client config, always counts as an owner surface. See
+user-display grant unless the bound principal is an owner/root caller (the
+trusted dashboard, an independently enrolled direct-mTLS `role:root` user
+client, or bare local loopback — derived by `ToolCallerTrust` without
+widening `AccessPrincipal::is_owner_surface`); the stdio transport, being
+wired up by the owner's own client config, always counts as an owner surface. See
 [Computer Use](./computer-use-and-audio.md#display-targets). Binding order:
 
 1. **Peer daemons** (mTLS peer identity) use their peer-profile principal.
@@ -92,7 +94,7 @@ the owner's own client config, always counts as an owner surface. See
    sessions with no binding at all do.
 3. **Browser pages** may only call `/mcp` from this daemon's own origin (or
    the macOS app scheme) and then bind like any dashboard HTTP request
-   (mTLS certificate principal or trusted-transport root). Foreign origins
+   (an enrolled mTLS certificate principal or trusted-local root). Foreign origins
    get 403 — same posture as the rest of `/api/*`.
 4. **Tokenless loopback** processes bind to
    `principal:local-process:loopback`. Tokenless non-loopback requests are
@@ -199,7 +201,8 @@ Full MCP tool groups:
 | `list_displays`      | Enumerate displays with their session state. | — |
 | `take_display`       | Take control of a display. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
-| `grant_user_display` | Grant access to the user's real display session; on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
+| `grant_user_display` | Grant access to the user's real display session (owner surfaces only — this call *is* the opt-in); on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
+| `request_user_display` | Ask the user for their display: raises the dashboard doorbell popup with your reason and blocks for their click — the only thing that can grant it (never auto-approved; see [Autonomy — the display request rail](./autonomy.md#the-display-request-rail-doorbell)). `access="view"` shares the stream without CU input; `"view_and_control"` requests the full grant. | `reason`, `access?`, `wait_seconds?`, `session_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
 | `read_screen`        | Frontmost app's accessibility element tree — cheap textual grounding (macOS user session). | `display_target?`, `format?` |
@@ -260,7 +263,7 @@ input for `peer_execute_cu_actions` (`peer-operator` / `peer-root`).
 | `peer_delegate_task` | Delegate a task executed by the peer's own agent; returns `task_id`. | `peer_id`, `instructions`, `context?` |
 | `peer_list_displays` | List a peer's displays (ids, names, resolutions) over its `/mcp`. | `peer_id` |
 | `peer_take_screenshot` | Screenshot a peer display; returns an MCP image content block. | `peer_id`, `display_target?` |
-| `peer_execute_cu_actions` | Run CU actions on a peer display; returns per-action status + annotated post-action screenshot. | `peer_id`, `actions`, `display_target?`, `coordinate_space?` |
+| `peer_execute_cu_actions` | Run CU actions on a peer display; returns per-action status + the peer's post-action observation (clean screenshot by default). | `peer_id`, `actions`, `display_target?`, `coordinate_space?`, `observe?`, `annotate?` |
 
 ### Controller Orchestration
 

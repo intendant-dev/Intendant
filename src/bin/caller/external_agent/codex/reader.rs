@@ -7,6 +7,7 @@ use super::*;
 
 /// Runs on a background tokio task, reading JSONL from the Codex process
 /// stdout and dispatching events / resolving pending requests.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn reader_task(
     stdout: tokio::process::ChildStdout,
     event_tx: mpsc::UnboundedSender<AgentEvent>,
@@ -888,7 +889,9 @@ pub(crate) struct CodexNotificationState {
 /// Parse an `account/rateLimits/updated` payload (app-server v2 shape:
 /// `rateLimits.{primary,secondary}.{usedPercent,windowDurationMins,
 /// resetsAt}`, camelCase with snake_case tolerated) into vitals windows.
-pub(crate) fn codex_rate_limit_windows(params: &serde_json::Value) -> Vec<crate::types::SessionLimitWindow> {
+pub(crate) fn codex_rate_limit_windows(
+    params: &serde_json::Value,
+) -> Vec<crate::types::SessionLimitWindow> {
     let snapshot = params
         .get("rateLimits")
         .or_else(|| params.get("rate_limits"))
@@ -912,11 +915,12 @@ pub(crate) fn codex_rate_limit_windows(params: &serde_json::Value) -> Vec<crate:
             .and_then(|v| v.as_u64());
         windows.push(crate::types::SessionLimitWindow {
             label: codex_rate_limit_label(minutes, key),
-            used_pct: used.round().clamp(0.0, 100.0) as u8,
+            used_pct: Some(used.round().clamp(0.0, 100.0) as u8),
             resets_at_epoch: window
                 .get("resetsAt")
                 .or_else(|| window.get("resets_at"))
                 .and_then(|v| v.as_u64()),
+            status: None,
         });
     }
     windows
@@ -1407,7 +1411,11 @@ pub(crate) fn compact_codex_output_line(line: &str) -> String {
     }
 }
 
-pub(crate) fn truncate_middle_chars_with_notice(text: &str, max_chars: usize, label: &str) -> String {
+pub(crate) fn truncate_middle_chars_with_notice(
+    text: &str,
+    max_chars: usize,
+    label: &str,
+) -> String {
     let total = text.chars().count();
     if total <= max_chars {
         return text.to_string();
@@ -2698,7 +2706,9 @@ pub(crate) fn codex_mcp_tool_result_text(result: &serde_json::Value) -> String {
     }
 }
 
-pub(crate) fn sanitize_codex_mcp_tool_result_for_text(value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn sanitize_codex_mcp_tool_result_for_text(
+    value: &serde_json::Value,
+) -> serde_json::Value {
     match value {
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
@@ -2749,7 +2759,9 @@ pub(crate) fn sanitize_codex_mcp_tool_result_for_text(value: &serde_json::Value)
     }
 }
 
-pub(crate) fn codex_mcp_result_object_is_image(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+pub(crate) fn codex_mcp_result_object_is_image(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
     let type_text = map
         .get("type")
         .or_else(|| map.get("mimeType"))
@@ -2965,10 +2977,10 @@ mod tests {
         let windows = codex_rate_limit_windows(&params);
         assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
-        assert_eq!(windows[0].used_pct, 34);
+        assert_eq!(windows[0].used_pct, Some(34));
         assert_eq!(windows[0].resets_at_epoch, Some(1_783_300_000));
         assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].used_pct, 12);
+        assert_eq!(windows[1].used_pct, Some(12));
         assert_eq!(windows[1].resets_at_epoch, None);
 
         let snake = serde_json::json!({
@@ -2979,7 +2991,7 @@ mod tests {
         let windows = codex_rate_limit_windows(&snake);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label, "1h");
-        assert_eq!(windows[0].used_pct, 91);
+        assert_eq!(windows[0].used_pct, Some(91));
 
         assert!(codex_rate_limit_windows(&serde_json::json!({})).is_empty());
         assert_eq!(codex_rate_limit_label(Some(2880), "primary"), "2d");

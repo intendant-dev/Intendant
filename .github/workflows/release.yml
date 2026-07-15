@@ -1,0 +1,363 @@
+name: macOS app release
+
+# Builds, signs, notarizes, and publishes the native macOS app
+# (the macos-app/ WKWebView wrapper bundling the release `intendant` +
+# `intendant-runtime` binaries) via scripts/bundle-macos.sh.
+#
+# Triggers are version tags (v*) and manual dispatch ONLY — deliberately
+# never pull_request or merge_group, so this workflow can never gate the
+# merge queue. A red release run blocks a release, not landings.
+#
+# Signing/notarization secrets (repo Settings → Secrets and variables →
+# Actions → Repository secrets). On a workflow_dispatch DRY-RUN with the
+# secrets absent, the job still runs end to end and keeps an UNSIGNED
+# "-unsigned-dev" artifact on the workflow run. TAG builds fail closed
+# instead: an official release is always signed, notarized, and committed
+# to the transparency log, or the run goes red before publishing anything.
+# Secret names, exactly:
+#
+#   MACOS_SIGN_P12_B64       base64 of a "Developer ID Application" identity
+#                            exported as .p12 — export WITH the certificate
+#                            chain included, or identity validation fails
+#   MACOS_SIGN_P12_PASSWORD  password protecting that .p12
+#   NOTARY_KEY_B64           base64 of an App Store Connect API private key (.p8)
+#   NOTARY_KEY_ID            Key ID of that API key
+#   NOTARY_ISSUER_ID         Issuer ID of the API-keys page
+#
+# Each group is all-or-nothing; a partially configured group fails the run
+# rather than silently shipping a less-signed artifact. Provisioning ceremony
+# (exporting the p12, minting the notary key): docs/src/getting-started.md,
+# "Signed releases".
+#
+# Release transparency (docs/src/self-hosted-rendezvous.md, "Release
+# transparency"): after publishing, tag builds commit the released
+# artifacts' hashes to the rendezvous's public transparency log. One more
+# repo secret, exactly:
+#
+#   CONNECT_RELEASE_TOKEN    bearer token the rendezvous was started with
+#                            (--release-token / INTENDANT_CONNECT_RELEASE_TOKEN
+#                            on intendant-connect) — authorizes ONLY
+#                            release-manifest submission, nothing else
+#
+# The submission step only runs on tag builds, and a missing token FAILS
+# the run there — a published-but-unlogged release is exactly the failure
+# the log exists to prevent. Forks and dry-runs exercise the pipeline via
+# workflow_dispatch, which never reaches the publish/submit steps. The
+# optional CONNECT_RELEASE_URL repo *variable* points self-hosted forks at
+# their own rendezvous (default https://intendant.dev).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # gh release create / upload
+
+# One release build at a time per ref; never cancel a half-published release.
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-app:
+    name: macos-app
+    # Tags and manual dispatch only exist on trusted refs, so this always
+    # runs on the fleet Mac (same label windows.yml places its macOS leg on);
+    # there is no fork-PR path to route to hosted runners.
+    runs-on: [self-hosted, intendant-macos]
+    timeout-minutes: 120
+    steps:
+      # Same fleet preflight as windows.yml: a nearly-full disk produces
+      # resource-kill compile failures with useless diagnostics.
+      - name: Fleet preflight
+        shell: bash
+        run: |
+          avail_kb=$(df -Pk . | awk 'NR==2 {print $4}')
+          avail_gb=$((avail_kb / 1024 / 1024))
+          echo "disk available: ${avail_gb}G"
+          if [ "$avail_gb" -lt 20 ]; then
+            echo "::error::fleet preflight: only ${avail_gb}G free on this runner — below the 20G floor. Reclaim disk (merged worktrees' target/ dirs are the usual culprits) and rerun."
+            exit 1
+          fi
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # The default persisted token grants every later step push access;
+          # nothing in these jobs pushes.
+          persist-credentials: false
+          # Full history so dev builds (workflow_dispatch off a branch) can
+          # stamp a `git describe --tags` version.
+          fetch-depth: 0
+
+      # One version, everywhere: the binaries and Agent Card report
+      # CARGO_PKG_VERSION, the app bundle stamps the tag, and the release
+      # manifest strips the tag's "v" — so a tag that disagrees with
+      # Cargo.toml would publish artifacts that misreport their own
+      # identity. Fail before building anything.
+      - name: Version identity gate
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; m=json.load(sys.stdin); print(next(p["version"] for p in m["packages"] if p["name"]=="intendant"))')"
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::Version identity: Cargo.toml says $version but the tag is $tag. The tag, binaries, Agent Card, app bundle, and release manifest must agree — bump the version (and Cargo.lock) first, then re-tag."
+            exit 1
+          fi
+          echo "version identity OK: $tag matches Cargo.toml $version"
+
+      - name: Gate on signing secrets
+        id: gate
+        shell: bash
+        env:
+          P12_B64: ${{ secrets.MACOS_SIGN_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+          NOTARY_KEY_B64: ${{ secrets.NOTARY_KEY_B64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          sign_set=0
+          [ -n "$P12_B64" ] && sign_set=$((sign_set + 1))
+          [ -n "$P12_PASSWORD" ] && sign_set=$((sign_set + 1))
+          notary_set=0
+          [ -n "$NOTARY_KEY_B64" ] && notary_set=$((notary_set + 1))
+          [ -n "$NOTARY_KEY_ID" ] && notary_set=$((notary_set + 1))
+          [ -n "$NOTARY_ISSUER_ID" ] && notary_set=$((notary_set + 1))
+          if [ "$sign_set" = "1" ]; then
+            echo "::error::Partial signing config: set both MACOS_SIGN_P12_B64 and MACOS_SIGN_P12_PASSWORD, or neither."
+            exit 1
+          fi
+          if [ "$notary_set" != "0" ] && [ "$notary_set" != "3" ]; then
+            echo "::error::Partial notarization config: set all of NOTARY_KEY_B64, NOTARY_KEY_ID, NOTARY_ISSUER_ID, or none."
+            exit 1
+          fi
+          if [ "$notary_set" = "3" ] && [ "$sign_set" = "0" ]; then
+            echo "::error::Notarization secrets are set but the signing identity is not; Apple only notarizes Developer ID-signed bundles."
+            exit 1
+          fi
+          sign=false notarize=false
+          [ "$sign_set" = "2" ] && sign=true
+          [ "$notary_set" = "3" ] && notarize=true
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "notarize=$notarize" >> "$GITHUB_OUTPUT"
+          echo "Signing: $sign — notarization: $notarize"
+          # Official releases fail closed: a tag build must be fully signed
+          # AND notarized, or nothing is built or published. Unsigned output
+          # stays available for workflow_dispatch dry-runs only.
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && { [ "$sign" != "true" ] || [ "$notarize" != "true" ]; }; then
+            echo "::error::Official tag releases must be signed and notarized — configure the MACOS_SIGN_* and NOTARY_* secrets, or dry-run the pipeline via workflow_dispatch instead."
+            exit 1
+          fi
+          if [ "$sign" = "false" ]; then
+            echo "::warning::No signing secrets configured — this dry-run produces an unsigned-dev artifact."
+          fi
+
+      # Throwaway keychain: created fresh, added to the FRONT of the user
+      # search list (codesign cannot find identities in a keychain outside
+      # the search list — verified empirically; --keychain alone is not
+      # enough), deleted and the original list restored in the always()
+      # cleanup step below.
+      - name: Import signing identity (throwaway keychain)
+        if: steps.gate.outputs.sign == 'true'
+        shell: bash
+        env:
+          P12_B64: ${{ secrets.MACOS_SIGN_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYCHAIN="$RUNNER_TEMP/intendant-release.keychain-db"
+          KEYCHAIN_PASS="$(uuidgen)"
+          # A hard-cancelled previous run may have left one behind.
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          # Save the original search list (one absolute path per line) BEFORE
+          # touching it; `security list-keychains -s` replaces the whole list.
+          security list-keychains -d user | sed 's/^ *"//; s/"$//' > "$RUNNER_TEMP/keychain-list.orig"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          printf '%s' "$P12_B64" | base64 -d > "$RUNNER_TEMP/sign.p12"
+          security import "$RUNNER_TEMP/sign.p12" -k "$KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/sign.p12"
+          # Let codesign use the imported key without a GUI prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" > /dev/null
+          { echo "$KEYCHAIN"; cat "$RUNNER_TEMP/keychain-list.orig"; } | tr '\n' '\0' \
+            | xargs -0 security list-keychains -d user -s
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -n 1)"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No valid 'Developer ID Application' identity in the imported .p12. Re-export it from Keychain Access WITH the certificate chain included."
+            security find-identity -p codesigning "$KEYCHAIN" || true
+            exit 1
+          fi
+          echo "Imported identity: $IDENTITY"
+          {
+            echo "INTENDANT_SIGN_IDENTITY=$IDENTITY"
+            echo "INTENDANT_SIGN_KEYCHAIN=$KEYCHAIN"
+          } >> "$GITHUB_ENV"
+
+      - name: Materialize notary API key
+        if: steps.gate.outputs.notarize == 'true'
+        shell: bash
+        env:
+          NOTARY_KEY_B64: ${{ secrets.NOTARY_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$NOTARY_KEY_B64" | base64 -d > "$RUNNER_TEMP/notary-key.p8"
+          echo "INTENDANT_NOTARY_KEY_FILE=$RUNNER_TEMP/notary-key.p8" >> "$GITHUB_ENV"
+
+      # Lockfile gate first (the bundle script's own cargo build is not
+      # --locked); its build then reuses this compilation unchanged.
+      - name: Build release binaries
+        shell: bash
+        run: cargo build --release --locked --bin intendant --bin intendant-runtime
+
+      - name: Bundle, sign, notarize
+        shell: bash
+        env:
+          INSTALL_APP: "0"
+          INTENDANT_ARTIFACT_DIR: ${{ github.workspace }}/dist
+          # Tag builds stamp the tag; dispatch builds fall back to the
+          # script's `git describe` dev version.
+          INTENDANT_APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          # The gate step guarantees these are either all present or all
+          # empty; bundle-macos.sh treats empty as unset.
+          INTENDANT_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          INTENDANT_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          ./scripts/bundle-macos.sh
+          ls -l dist
+
+      # Always remove the key material and restore the runner's keychain
+      # state, even when a build/notarization step failed.
+      - name: Clean up signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/sign.p12" "$RUNNER_TEMP/notary-key.p8"
+          if [ -f "$RUNNER_TEMP/keychain-list.orig" ]; then
+            tr '\n' '\0' < "$RUNNER_TEMP/keychain-list.orig" | xargs -0 security list-keychains -d user -s
+            rm -f "$RUNNER_TEMP/keychain-list.orig"
+          fi
+          if [ -f "$RUNNER_TEMP/intendant-release.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/intendant-release.keychain-db" || true
+          fi
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Self-hosted runner PATH may not include Homebrew.
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+          command -v gh > /dev/null || { echo "::error::gh CLI not found on the runner"; exit 1; }
+          tag="$GITHUB_REF_NAME"
+          zip_file="$(ls dist/Intendant-*.zip)"
+          # Belt and suspenders behind the signing gate: a less-signed
+          # artifact must never be published under an official tag, even if
+          # the bundle script's fallback behavior ever drifts.
+          case "$zip_file" in
+            *-unsigned-dev.zip|*-signed-unnotarized.zip)
+              echo "::error::Refusing to publish $(basename "$zip_file") for tag $tag — official releases are signed and notarized; the signing gate should have failed this run before the build."
+              exit 1 ;;
+          esac
+          signing_note="Signed with a Developer ID certificate, notarized by Apple, and stapled — Gatekeeper opens it without warnings."
+          {
+            echo "Native macOS app: the \`macos-app/\` WKWebView wrapper bundling the release \`intendant\` and \`intendant-runtime\` binaries (Apple Silicon)."
+            echo
+            echo "$signing_note"
+            echo
+            echo "**Install:** unzip, drag \`Intendant.app\` to /Applications, launch. The app spawns its own daemon and serves the dashboard; grant Screen Recording / Accessibility / Microphone when prompted."
+            echo
+            echo "**Verify the download:**"
+            echo '```'
+            echo "shasum -a 256 -c $(basename "$zip_file").sha256"
+            echo '```'
+            echo
+            echo '```'
+            cat dist/*.sha256
+            echo '```'
+          } > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "Intendant $tag" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+
+      # Commit what was just published to the public transparency log:
+      # sha256 + size of every artifact uploaded to the GitHub release,
+      # POSTed as a release_manifest (docs/src/self-hosted-rendezvous.md,
+      # "Release transparency"). `intendant hosted-verify --releases`
+      # checks the two sides against each other out of band. Runs AFTER
+      # the publish step so the log commits exactly the uploaded bytes;
+      # if submission fails — including a missing CONNECT_RELEASE_TOKEN —
+      # the run goes red so the operator notices a published-but-unlogged
+      # release. Dry-runs exercise the pipeline via workflow_dispatch,
+      # which never reaches this step.
+      - name: Submit release manifest to the transparency log
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          CONNECT_RELEASE_TOKEN: ${{ secrets.CONNECT_RELEASE_TOKEN }}
+          CONNECT_RELEASE_URL: ${{ vars.CONNECT_RELEASE_URL || 'https://intendant.dev' }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CONNECT_RELEASE_TOKEN" ]; then
+            echo "::error::CONNECT_RELEASE_TOKEN is not configured — an official tag release must commit its manifest to the transparency log (a published-but-unlogged release is the failure this gate exists to catch). Configure the secret, or dry-run without a tag via workflow_dispatch."
+            exit 1
+          fi
+          manifest="$RUNNER_TEMP/release-manifest.json"
+          python3 - "$RELEASE_TAG" dist/* > "$manifest" <<'PY'
+          import hashlib, json, os, sys
+          tag, *paths = sys.argv[1:]
+          artifacts = []
+          for path in sorted(paths, key=os.path.basename):
+              digest = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1 << 20), b""):
+                      digest.update(chunk)
+              artifacts.append({
+                  "name": os.path.basename(path),
+                  "sha256": digest.hexdigest(),
+                  "size": os.path.getsize(path),
+              })
+          print(json.dumps({
+              "tag": tag,
+              "version": tag.removeprefix("v"),
+              "platforms": ["macos-arm64"],
+              "artifacts": artifacts,
+          }, indent=2))
+          PY
+          echo "release manifest for $RELEASE_TAG:"
+          cat "$manifest"
+          curl -sS --fail-with-body -X POST \
+            "$CONNECT_RELEASE_URL/api/log/release-manifest" \
+            -H "Authorization: Bearer $CONNECT_RELEASE_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary @"$manifest"
+          echo
+          echo "release manifest committed to $CONNECT_RELEASE_URL/api/log/release-manifest"
+
+      # Manual dispatch has no tag to hang a release on; keep the artifact
+      # on the workflow run instead.
+      - name: Upload workflow artifact (no tag)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: intendant-macos-app
+          path: dist/*
+          if-no-files-found: error

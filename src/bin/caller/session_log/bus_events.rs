@@ -19,6 +19,7 @@ impl SessionLog {
             .map(|session_id| serde_json::json!({ "session_id": session_id }));
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -49,6 +50,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "task_complete".to_string(),
             level: Some("info".to_string()),
@@ -59,6 +61,7 @@ impl SessionLog {
         });
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub(crate) fn steer_event(
         &mut self,
         event: &str,
@@ -122,11 +125,15 @@ impl SessionLog {
             "steer_cancelled" => reason
                 .map(|reason| format!("Steer cancelled: {reason}"))
                 .unwrap_or_else(|| "Steer cancelled".to_string()),
+            "steer_cancel_failed" => reason
+                .map(|reason| format!("Steer cancel failed: {reason}"))
+                .unwrap_or_else(|| "Steer cancel failed".to_string()),
             _ => format!("Steer {status}"),
         };
 
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -206,6 +213,24 @@ impl SessionLog {
         );
     }
 
+    /// A cancel found nothing to clear (`AppEvent::SteerCancelFailed`) —
+    /// terminal like `steer_cancelled`, but the message reached or will
+    /// reach the model. Structured so replay retires the pending row as a
+    /// failed clear instead of resurrecting it (or worse, a fabricated
+    /// successful one) on reload.
+    pub fn steer_cancel_failed(&mut self, session_id: Option<&str>, id: &str, reason: &str) {
+        self.steer_event(
+            "steer_cancel_failed",
+            "warn",
+            session_id,
+            id,
+            None,
+            Some(reason),
+            "failed",
+            None,
+        );
+    }
+
     /// Persist a display-only session note (`AppEvent::SessionNote`).
     ///
     /// The full note text and the attachment *references* live in `data`;
@@ -252,6 +277,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -310,6 +336,7 @@ impl SessionLog {
         data.insert("ts_ms".to_string(), serde_json::Value::from(ts_ms));
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -328,6 +355,7 @@ impl SessionLog {
     pub fn session_started(&mut self, session_id: &str, task: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_started".to_string(),
             level: Some("info".to_string()),
@@ -345,6 +373,7 @@ impl SessionLog {
     pub fn session_identity(&mut self, session_id: &str, source: &str, backend_session_id: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_identity".to_string(),
             level: Some("info".to_string()),
@@ -372,6 +401,7 @@ impl SessionLog {
     pub fn session_attached(&mut self, session_id: &str, source: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_attached".to_string(),
             level: Some("info".to_string()),
@@ -395,6 +425,7 @@ impl SessionLog {
     ) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_relationship".to_string(),
             level: Some("info".to_string()),
@@ -421,6 +452,7 @@ impl SessionLog {
     ) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_capabilities".to_string(),
             level: Some("info".to_string()),
@@ -438,6 +470,7 @@ impl SessionLog {
     pub fn session_goal(&mut self, session_id: &str, goal: Option<&crate::types::SessionGoal>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_goal".to_string(),
             level: Some("info".to_string()),
@@ -457,6 +490,7 @@ impl SessionLog {
     pub fn session_vitals(&mut self, session_id: &str, vitals: &crate::types::SessionVitals) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_vitals".to_string(),
             level: Some("debug".to_string()),
@@ -474,6 +508,7 @@ impl SessionLog {
     pub fn session_ended(&mut self, session_id: &str, reason: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_ended".to_string(),
             level: Some("info".to_string()),
@@ -517,6 +552,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(turn),
             event: "agent_started".to_string(),
             level: Some("info".to_string()),
@@ -535,6 +571,7 @@ impl SessionLog {
     pub fn auto_approved(&mut self, preview: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -561,6 +598,7 @@ impl SessionLog {
         self.last_approval_resolved = Some((id, action.to_string()));
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(id as usize),
             event: "approval_resolved".to_string(),
             level: Some("info".to_string()),
@@ -575,6 +613,7 @@ impl SessionLog {
     pub fn human_question(&mut self, question: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -593,6 +632,7 @@ impl SessionLog {
     pub fn human_response_sent(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -611,6 +651,7 @@ impl SessionLog {
     pub fn round_complete(&mut self, round: usize, turns_in_round: usize) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "round_complete".to_string(),
             level: Some("info".to_string()),
@@ -632,6 +673,7 @@ impl SessionLog {
     pub fn snapshot_created(&mut self, round_id: u64) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "snapshot_created".to_string(),
             level: Some("info".to_string()),
@@ -646,6 +688,7 @@ impl SessionLog {
     pub fn rolled_back(&mut self, from_id: u64, to_id: u64, files_reverted: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "rolled_back".to_string(),
             level: Some("info".to_string()),
@@ -667,6 +710,7 @@ impl SessionLog {
     pub fn redone(&mut self, to_id: u64) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "redone".to_string(),
             level: Some("info".to_string()),
@@ -681,6 +725,7 @@ impl SessionLog {
     pub fn history_pruned(&mut self, branches_removed: u32, bytes_freed: u64) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "history_pruned".to_string(),
             level: Some("info".to_string()),
@@ -707,6 +752,7 @@ impl SessionLog {
     ) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "conversation_rolled_back".to_string(),
             level: Some("info".to_string()),
@@ -730,6 +776,7 @@ impl SessionLog {
     pub fn display_ready(&mut self, display_id: u32, width: u32, height: u32, agent_visible: bool) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "display_ready".to_string(),
             level: Some("info".to_string()),
@@ -738,7 +785,11 @@ impl SessionLog {
                 display_id,
                 width,
                 height,
-                if agent_visible { "" } else { " [private user view]" }
+                if agent_visible {
+                    ""
+                } else {
+                    " [private user view]"
+                }
             )),
             data: Some(serde_json::json!({
                 "display_id": display_id,
@@ -755,6 +806,7 @@ impl SessionLog {
     pub fn display_resize(&mut self, display_id: u32, width: u32, height: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "display_resize".to_string(),
             level: Some("info".to_string()),
@@ -776,6 +828,7 @@ impl SessionLog {
     pub fn display_taken(&mut self, display_id: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "display_taken".to_string(),
             level: Some("info".to_string()),
@@ -790,6 +843,7 @@ impl SessionLog {
     pub fn display_released(&mut self, display_id: u32, note: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "display_released".to_string(),
             level: Some("info".to_string()),
@@ -811,6 +865,7 @@ impl SessionLog {
     pub fn debug_screen_ready(&mut self, display_id: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "debug_screen_ready".to_string(),
             level: Some("info".to_string()),
@@ -827,6 +882,7 @@ impl SessionLog {
     pub fn debug_screen_torn_down(&mut self, display_id: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "debug_screen_torn_down".to_string(),
             level: Some("info".to_string()),
@@ -841,6 +897,7 @@ impl SessionLog {
     pub fn safety_cap_reached(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -859,6 +916,7 @@ impl SessionLog {
     pub fn recording_started(&mut self, stream_name: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "recording_started".to_string(),
             level: Some("info".to_string()),
@@ -873,6 +931,7 @@ impl SessionLog {
     pub fn recording_stopped(&mut self, stream_name: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "recording_stopped".to_string(),
             level: Some("info".to_string()),
@@ -887,6 +946,7 @@ impl SessionLog {
     pub fn recording_error(&mut self, stream_name: &str, message: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "recording_error".to_string(),
             level: Some("warn".to_string()),
@@ -904,6 +964,7 @@ impl SessionLog {
     pub fn recording_deleted(&mut self, stream_name: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "recording_deleted".to_string(),
             level: Some("info".to_string()),
@@ -918,6 +979,7 @@ impl SessionLog {
     pub fn sub_agent_result(&mut self, summary: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -932,11 +994,11 @@ impl SessionLog {
         });
     }
 
-
     /// Log presence layer log message.
     pub fn presence_log(&mut self, message: &str, level: Option<&str>) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_log".to_string(),
             level: Some(level.unwrap_or("info").to_string()),
@@ -958,6 +1020,7 @@ impl SessionLog {
     ) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "presence_usage_update".to_string(),
             level: Some("debug".to_string()),
@@ -988,6 +1051,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "live_usage_update".to_string(),
             level: Some("debug".to_string()),
@@ -1009,6 +1073,7 @@ impl SessionLog {
     pub fn live_audio_started(&mut self, id: &str, provider: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "live_audio_started".to_string(),
             level: Some("info".to_string()),
@@ -1032,6 +1097,7 @@ impl SessionLog {
     ) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "live_audio_progress".to_string(),
             level: Some("debug".to_string()),
@@ -1053,6 +1119,7 @@ impl SessionLog {
     pub fn live_audio_completed(&mut self, id: &str, status: &str, quarantine_count: usize) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "live_audio_completed".to_string(),
             level: Some("info".to_string()),
@@ -1075,6 +1142,7 @@ impl SessionLog {
     pub fn tool_request(&mut self, tool: &str, args: &serde_json::Value) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "tool_request".to_string(),
             level: Some("debug".to_string()),
@@ -1102,6 +1170,7 @@ impl SessionLog {
         };
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "tool_response".to_string(),
             level: Some("debug".to_string()),
@@ -1115,6 +1184,7 @@ impl SessionLog {
     pub fn error(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -1132,6 +1202,7 @@ impl SessionLog {
     pub fn debug(&mut self, msg: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: if self.current_turn > 0 {
                 Some(self.current_turn)
             } else {
@@ -1151,6 +1222,7 @@ impl SessionLog {
         self.current_turn = turn;
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(turn),
             event: "turn_start".to_string(),
             level: Some("info".to_string()),
@@ -1169,6 +1241,7 @@ impl SessionLog {
         let file = self.write_turn_file("messages.json", messages_json);
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "messages_input".to_string(),
             level: Some("debug".to_string()),
@@ -1183,6 +1256,7 @@ impl SessionLog {
 
     /// Log a parsed raw model-context snapshot for dashboard inspection.
     #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn context_snapshot(
         &mut self,
         source: &str,
@@ -1213,6 +1287,7 @@ impl SessionLog {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn context_snapshot_for_session(
         &mut self,
         session_id: Option<&str>,
@@ -1251,6 +1326,7 @@ impl SessionLog {
             .unwrap_or_default();
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: effective_turn,
             event: "context_snapshot".to_string(),
             level: Some("debug".to_string()),
@@ -1279,6 +1355,7 @@ impl SessionLog {
     }
 
     /// Log the full model response. Content is written to a per-turn file.
+    #[allow(clippy::too_many_arguments)] // token billing buckets remain explicit in the log schema
     pub fn model_response(
         &mut self,
         content: &str,
@@ -1286,8 +1363,9 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
         source: Option<&str>,
-    ) {
+    ) -> Option<TurnFileSpan> {
         self.model_response_for_session(
             None,
             content,
@@ -1295,10 +1373,16 @@ impl SessionLog {
             completion_tokens,
             total_tokens,
             cached_tokens,
+            cache_creation_tokens,
             source,
-        );
+        )
     }
 
+    /// Returns the sidecar span the response text was appended to, so the
+    /// combined op ([`Self::model_response_with_message`]) can reference the
+    /// same bytes from the canonical `conversation_message` record without a
+    /// second write.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn model_response_for_session(
         &mut self,
         session_id: Option<&str>,
@@ -1307,8 +1391,9 @@ impl SessionLog {
         completion_tokens: u64,
         total_tokens: u64,
         cached_tokens: u64,
+        cache_creation_tokens: u64,
         source: Option<&str>,
-    ) {
+    ) -> Option<TurnFileSpan> {
         self.summary_builder.total_tokens += total_tokens;
         // Codex fires multiple `model_response` events per turn (one per
         // assistant message in the same turn). Appending keeps the full
@@ -1323,6 +1408,7 @@ impl SessionLog {
                 "completion": completion_tokens,
                 "total": total_tokens,
                 "cached": cached_tokens,
+                "cache_creation": cache_creation_tokens,
             },
             "content_length": content.len(),
         });
@@ -1338,12 +1424,172 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "model_response".to_string(),
             level: Some("info".to_string()),
             message: Some(preview),
             data: Some(data),
             file,
+            file2: None,
+        });
+        span
+    }
+
+    /// Combined assistant logging op (message-search plan §4): ONE call
+    /// writes the sidecar span, the diagnostic `model_response` event, and
+    /// the canonical `conversation_message` record — no crash window between
+    /// diagnostic and canonical, and no second copy of the text. Native
+    /// acceptance-point only; external wrappers keep plain `model_response`
+    /// (their messages are canonical in the NATIVE backend logs, and the
+    /// intendant extractor skips wrapper sessions to avoid duplicates).
+    #[allow(clippy::too_many_arguments)] // token billing buckets remain explicit in the log schema
+    pub fn model_response_with_message(
+        &mut self,
+        seq: u64,
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cached_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> String {
+        let span = self.model_response_for_session(
+            None,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            cache_creation_tokens,
+            None,
+        );
+        let message_id = Uuid::new_v4().to_string();
+        let mut data = serde_json::json!({
+            "message_id": message_id,
+            "message_seq": seq,
+            "role": "assistant",
+            "provenance": crate::conversation::MessageProvenance::Assistant,
+        });
+        let file = span.as_ref().map(|span| {
+            data["model_offset"] = serde_json::Value::from(span.offset);
+            data["model_bytes"] = serde_json::Value::from(span.len);
+            span.relative.clone()
+        });
+        let preview: String = content.chars().take(200).collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: Some(self.current_turn),
+            event: "conversation_message".to_string(),
+            level: Some("info".to_string()),
+            message: Some(preview),
+            data: Some(data),
+            file,
+            file2: None,
+        });
+        message_id
+    }
+
+    /// Canonical message-lane record for a user-side conversation entry
+    /// (task / resume task / follow-up / delivered steer / askHuman answer).
+    /// Emitted only where text genuinely enters the worker conversation;
+    /// system injections, tool output, and context summaries are
+    /// deliberately absent. `text` is the RAW user text — attachment
+    /// preludes and `[Session resumed]`/`[New Task]`/`[User]` wrappers are
+    /// the conversation's concern, not the record's. `ref_seq` marks a
+    /// projection: the text entered the conversation inside another entry
+    /// (the native-tool askHuman answer rides a tool result) whose seq it
+    /// references for rewind-cut semantics.
+    pub fn conversation_message_user(
+        &mut self,
+        seq: u64,
+        provenance: crate::conversation::MessageProvenance,
+        text: &str,
+        ref_seq: Option<u64>,
+    ) -> String {
+        let message_id = Uuid::new_v4().to_string();
+        let mut data = serde_json::json!({
+            "message_id": message_id,
+            "message_seq": seq,
+            "role": "user",
+            "provenance": provenance,
+            "text": text,
+        });
+        if let Some(ref_seq) = ref_seq {
+            data["ref_seq"] = serde_json::Value::from(ref_seq);
+        }
+        let preview: String = text.chars().take(200).collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "conversation_message".to_string(),
+            level: Some("info".to_string()),
+            message: Some(preview),
+            data: Some(data),
+            file: None,
+            file2: None,
+        });
+        message_id
+    }
+
+    /// A rewind/tail-rollback cut: messages with `seq > cut_after_seq` are
+    /// superseded. Compaction (`drop_turns`/`summarize_turns`) deliberately
+    /// does NOT emit this — a compacted message was still said and remains
+    /// canonical history (message-search plan D2).
+    pub fn conversation_rewound(&mut self, cut_after_seq: u64, kind: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: "conversation_rewound".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Conversation rewound ({}): messages after seq {} superseded",
+                kind, cut_after_seq
+            )),
+            data: Some(serde_json::json!({
+                "cut_after_seq": cut_after_seq,
+                "kind": kind,
+                "superseded_at_ms": Self::ts_ms(),
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Mixed-version cutover marker: emitted when a resumed legacy
+    /// conversation gets seqs assigned (`ensure_seqs_assigned`). `mapping`
+    /// is `(seq, role, content-hash)` per message, in order — extractors use
+    /// legacy extraction strictly before this marker and only
+    /// `conversation_message` records after it, correlating legacy records
+    /// through the hashes.
+    pub fn conversation_message_epoch(&mut self, mapping: &[(u64, String, String)]) {
+        let rows: Vec<serde_json::Value> = mapping
+            .iter()
+            .map(|(seq, role, hash)| serde_json::json!([seq, role, hash]))
+            .collect();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
+            turn: None,
+            event: "conversation_message_epoch".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Assigned seqs to {} legacy conversation messages",
+                mapping.len()
+            )),
+            data: Some(serde_json::json!({ "mapping": rows })),
+            file: None,
             file2: None,
         });
     }
@@ -1373,6 +1619,7 @@ impl SessionLog {
 
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "agent_input".to_string(),
             level: Some("info".to_string()),
@@ -1403,7 +1650,7 @@ impl SessionLog {
         source: Option<&str>,
         output_id: Option<&str>,
     ) {
-        self.agent_output_with_session_id(None, stdout, stderr, source, output_id);
+        self.agent_output_with_session_id(None, stdout, stderr, source, output_id, None);
     }
 
     pub fn agent_output_with_session_id(
@@ -1413,6 +1660,7 @@ impl SessionLog {
         stderr: &str,
         source: Option<&str>,
         output_id: Option<&str>,
+        item_id: Option<&str>,
     ) {
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
@@ -1433,6 +1681,9 @@ impl SessionLog {
         if let Some(id) = output_id {
             data["output_id"] = serde_json::Value::String(id.to_string());
         }
+        if let Some(id) = item_id.map(str::trim).filter(|id| !id.is_empty()) {
+            data["item_id"] = serde_json::Value::String(id.to_string());
+        }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
         }
@@ -1449,6 +1700,7 @@ impl SessionLog {
         }
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "agent_output".to_string(),
             level: if stderr.is_empty() {
@@ -1472,6 +1724,7 @@ impl SessionLog {
         let file = full_content.and_then(|c| self.append_turn_file("reasoning.txt", c));
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "reasoning".to_string(),
             level: Some("info".to_string()),
@@ -1490,6 +1743,7 @@ impl SessionLog {
     pub fn approval(&mut self, category: &str, preview: &str, decision: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "approval".to_string(),
             level: Some("warn".to_string()),
@@ -1526,6 +1780,7 @@ impl SessionLog {
 
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
             event: "json_extracted".to_string(),
             level: Some("debug".to_string()),
@@ -1597,6 +1852,7 @@ impl SessionLog {
 
         self.emit(LogEvent {
             ts: Self::ts(),
+            ts_ms: Self::ts_ms(),
             turn: None,
             event: "session_end".to_string(),
             level: Some("info".to_string()),
@@ -1728,6 +1984,7 @@ mod tests {
             50,
             150,
             0,
+            0,
             None,
         );
         drop(log);
@@ -1853,12 +2110,12 @@ mod tests {
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
 
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Response 1", 100, 50, 150, 0, None);
+        log.model_response("Response 1", 100, 50, 150, 0, 0, None);
         log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#);
         log.agent_output("out1", "", None);
 
         log.turn_start(2, 5.0, 190_000);
-        log.model_response("Response 2", 200, 100, 300, 0, None);
+        log.model_response("Response 2", 200, 100, 300, 0, 0, None);
         log.agent_input(r#"{"commands":[{"function":"writeFile","nonce":2}]}"#);
         log.agent_output("out2", "err2", None);
 

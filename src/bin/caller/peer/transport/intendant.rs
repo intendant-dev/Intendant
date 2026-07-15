@@ -42,7 +42,9 @@
 //! - [`PeerOp::DelegateTask`] → [`ControlMsg::StartTask`] (kicks off
 //!   a fresh agent task). `PeerTask::instructions` maps to
 //!   `task`; the orchestration/direct/reference-frame/display-target
-//!   flags default to absent. Returns a synthetic `TaskId`.
+//!   flags default to absent. Returns a synthetic `TaskId` when the
+//!   frame is written; *delivery* is resolved above the transport —
+//!   see the delivery-receipt contract below.
 //! - [`PeerOp::ResolveApproval`] → [`ControlMsg::Approve`] /
 //!   `ApproveAll` / `Deny` / `Skip` based on
 //!   [`ApprovalDecision`]. Requires `request_id` to parse as `u64`
@@ -53,6 +55,46 @@
 //!   native control plane has no wire primitive for them. These
 //!   come in through other transport adapters (OpenClaw's node
 //!   `invoke`, A2A's task queries) when those land.
+//!
+//! ## Task-delegation delivery receipt
+//!
+//! A bare StartTask write proves only that the frame entered this
+//! side's socket: if the connection dies before the peer reads it,
+//! the actor reconnects but nothing re-sends, and the delegation is
+//! silently lost (at-most-once). The receipt closes that gap at the
+//! application level:
+//!
+//! - **Outbound**: `DelegateTask` stamps the StartTask frame with the
+//!   delegation's correlation id —
+//!   `{"action":"start_task","task":…,"delegation_id":"dg-…"}`.
+//! - **Inbound**: a receiving daemon that *dispatches* the task (not
+//!   merely reads the frame) broadcasts
+//!   `{"event":"task_received","delegation_id":"dg-…",
+//!   "session_id":"<its local session id>"}`, which the drain upcasts
+//!   to [`crate::peer::event::PeerEvent::TaskReceipt`]. The per-peer
+//!   actor folds receipts into a bounded ledger that
+//!   [`crate::peer::handle::PeerHandle::delegate_task`] awaits — the
+//!   retry / grace / fallback policy (at-least-once with receiver-side
+//!   dedup by delegation id) lives there, NOT in the transport, so the
+//!   actor's event pump never blocks on a receipt.
+//! - Receipts are informational: they carry no authority, and IAM
+//!   evaluation on the receiving gateway is unchanged.
+//!
+//! ### Compatibility matrix
+//!
+//! | Sender | Receiver | Behavior |
+//! |---|---|---|
+//! | new | new | Receiver acks on dispatch; sender resolves `confirmed` with the peer's real session id; re-sends after a connection drop are deduped by `delegation_id`. |
+//! | new | old | Receiver ignores the unknown `delegation_id` field (plain serde) and runs the task exactly as today; it never acks. The sender's grace elapses on a stable connection — the old-peer signature — and it reports the fire-and-forget fallback (`confirmed: false`, synthetic id) **without re-sending** (an old receiver has no dedup, so a re-send would duplicate the task). |
+//! | old | new | The frame carries no `delegation_id`; the receiver behaves exactly as today (no ack, no dedup entry). |
+//! | old | old | Unchanged fire-and-forget. |
+//!
+//! One deliberate residue: only *daemon* receivers ack (the session
+//! supervisor is the acceptance point). A new-build receiver running
+//! a non-daemon shape routes StartTask through the legacy dispatcher
+//! and never acks — indistinguishable from an old receiver, and safe
+//! for the same reason (grace → fire-and-forget fallback, no
+//! re-send on a stable link).
 //!
 //! ## Disconnection signaling
 //!
@@ -105,9 +147,14 @@ pub struct IntendantWsTransport {
     /// returned from `send`. Intendant's `/ws` control plane is
     /// fire-and-forget — no wire-level id echoes back — so the
     /// transport fabricates an id so callers have something
-    /// unique to log. Real correlation with subsequent activity
-    /// events happens through the drain path's `ActivityStarted`
-    /// / `Message` emissions.
+    /// unique to log. For messages, real correlation with subsequent
+    /// activity happens through the drain path's `ActivityStarted` /
+    /// `Message` emissions. For task delegation the synthetic id is
+    /// only the *fallback* identity: an application-level receipt
+    /// (`task_received`, upcast to `PeerEvent::TaskReceipt`) replaces
+    /// it with the peer's real session id when the receiver
+    /// acknowledges dispatch — see "Task-delegation delivery receipt"
+    /// in the module docs.
     out_seq: AtomicU64,
 }
 
@@ -566,6 +613,17 @@ impl PeerTransport for IntendantWsTransport {
                     display_target: None,
                     attachments: Vec::new(),
                     follow_up_id: None,
+                    // Delivery-receipt correlation id (see the module
+                    // docs' compatibility matrix). A new receiver that
+                    // dispatches this task answers with
+                    // `{"event":"task_received", "delegation_id":…,
+                    // "session_id":…}` on its broadcast, which the
+                    // drain upcasts to `PeerEvent::TaskReceipt`; an old
+                    // receiver ignores the unknown field and never
+                    // acks. The ack returned below stays synthetic —
+                    // the receipt wait lives on `PeerHandle::
+                    // delegate_task`, not in the transport.
+                    delegation_id: task.client_correlation_id.clone(),
                 })
                 .await?;
                 let seq = self.next_out_seq();
@@ -804,8 +862,7 @@ mod tests {
         let mut started_seen = false;
         let mut merged = None;
         for _ in 0..40 {
-            let Ok(Some(event)) =
-                tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
+            let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(250), rx.recv()).await
             else {
                 break;
             };
@@ -976,6 +1033,7 @@ mod tests {
                     sdp: "v=0\r\nm=video".into(),
                     advertise_tcp_via_url: None,
                     client_nonce: None,
+                    client_key: Default::default(),
                 },
             })
             .await
@@ -1012,22 +1070,29 @@ mod tests {
                 task: PeerTask {
                     instructions: "research the federation protocol".into(),
                     context: serde_json::Value::Null,
-                    client_correlation_id: None,
+                    client_correlation_id: Some("corr-wire-1".into()),
                 },
             })
             .await
             .expect("delegate_task succeeds");
         assert!(matches!(ack, PeerOpAck::TaskId(_)));
 
+        // The delivery-receipt correlation id rides the frame as
+        // `delegation_id` (see the module docs' receipt contract);
+        // everything else keeps its legacy shape.
         let event = wait_for_event(&mut bus_rx, |e| {
             matches!(
                 e,
-                AppEvent::ControlCommand(ControlMsg::StartTask { task, .. })
+                AppEvent::ControlCommand(ControlMsg::StartTask { task, delegation_id, .. })
                 if task == "research the federation protocol"
+                    && delegation_id.as_deref() == Some("corr-wire-1")
             )
         })
         .await;
-        assert!(event.is_some(), "StartTask did not land on the bus");
+        assert!(
+            event.is_some(),
+            "StartTask with the delegation id did not land on the bus"
+        );
 
         transport.disconnect().await.unwrap();
         gateway.abort();

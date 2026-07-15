@@ -3,7 +3,6 @@ use crate::presence::{self, AgentStateSnapshot};
 use crate::types::{LogLevel, SessionGoal};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -28,14 +27,23 @@ pub(crate) use static_assets::*;
 mod http;
 pub(crate) use http::*;
 
+mod keep_alive;
+pub(crate) use keep_alive::*;
+
 mod api_core;
 pub(crate) use api_core::*;
 
-mod session_catalog;
+pub(crate) mod session_catalog;
 pub(crate) use session_catalog::*;
+
+mod media_store;
+pub(crate) use media_store::*;
 
 mod routes_files;
 pub(crate) use routes_files::*;
+
+mod routes_transfers;
+pub(crate) use routes_transfers::*;
 
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
@@ -54,6 +62,8 @@ mod dashboard_presence;
 pub(crate) use dashboard_presence::*;
 mod input_authority;
 pub(crate) use input_authority::*;
+mod dashboard_tabs;
+pub(crate) use dashboard_tabs::*;
 mod connect_bootstrap;
 pub(crate) use connect_bootstrap::*;
 mod settings;
@@ -69,11 +79,6 @@ pub(crate) use ws_session::*;
 mod http_dispatch;
 pub(crate) use http_dispatch::*;
 
-
-/// Monotonically increasing counter for assigning unique peer IDs to WebSocket
-/// connections.  Used for WebRTC signaling so that each browser tab gets a
-/// stable identity within a display session.
-static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_LIST_LIMITED_RESPONSE_CACHE: OnceLock<
     Mutex<HashMap<usize, SessionListResponseCacheEntry>>,
 > = OnceLock::new();
@@ -141,6 +146,15 @@ pub struct RuntimeSettingsState {
     pub external_agent:
         Option<Arc<tokio::sync::RwLock<Option<crate::external_agent::AgentBackend>>>>,
     pub presence_enabled: Option<bool>,
+    /// Durable config root for the Settings surface. This is the served
+    /// project root on rooted daemons and the daemon state root when
+    /// projectless; it is intentionally independent of
+    /// `project_root_for_changes` so settings never mint file/sandbox scope.
+    pub settings_root: Option<PathBuf>,
+    /// Codex home whose account-scoped model cache should drive pickers.
+    /// Resolved once at gateway startup so tests can inject/omit it without
+    /// settings helpers consulting the machine's live home.
+    pub codex_home: Option<PathBuf>,
 }
 
 /// Context for answering presence tool queries from browser-side live models.
@@ -156,7 +170,6 @@ pub struct WebQueryCtx {
     /// Shared context injection queue for mid-task interjections.
     pub context_injection: Option<crate::event::ContextInjectionQueue>,
 }
-
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -215,6 +228,12 @@ pub struct WebGatewayConfig {
     /// `[webrtc].federation_allow_h264` in intendant.toml.
     #[serde(default)]
     pub federation_allow_h264: bool,
+    /// Build stamp of the dashboard bundle this daemon serves, extracted at
+    /// startup from the embedded app.html (minted there by
+    /// app-html-assembler). The SPA compares it against its own stamped
+    /// constant and nudges stale tabs to reload after a daemon upgrade.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_build: String,
     /// Public peer access-request hardening. This is gateway runtime state,
     /// not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
@@ -237,20 +256,19 @@ impl Default for WebGatewayConfig {
             transcription_enabled: false,
             ice_servers: Vec::new(),
             federation_allow_h264: false,
+            app_build: String::new(),
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
             connect: crate::project::ConnectConfig::default(),
         }
     }
 }
 
-
 // Deliberately no Access-Control-Allow-Origin here: API responses are
 // same-origin by default. Cross-origin readability is opt-in — the fleet
-// Access APIs echo allowlisted origins (`with_fleet_cors`) and the public
-// bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
+// Access APIs echo allowlisted origins (`HttpResponse::fleet_cors`) and the
+// public bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
 // any website read cert-authenticated responses through a visitor's
 // browser (see docs/src/trust-architecture.md).
-
 
 // ── Persistent session-list index ──
 // The per-session caches below already carry exact invalidation
@@ -270,25 +288,20 @@ impl Default for WebGatewayConfig {
 // source path no longer exists are pruned during the preload sweep —
 // deleted sessions otherwise accumulate dead index files forever.
 
-
 // Stale-while-revalidate: within the TTL a cached list is fresh; past it
 // (up to the stale ceiling) the cached body is served IMMEDIATELY and one
 // background refresh is kicked, so an interactive dashboard never blocks
 // on a rescan. Only a very stale (or absent) entry rebuilds inline.
 
-
 // ---------------------------------------------------------------------------
 // Per-round file snapshot history endpoints
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // File upload endpoints
 // ---------------------------------------------------------------------------
 
-
 // Same-origin by default (the canonical json tail carries no CORS header).
-
 
 /// Check whether it is safe to mutate the project tree (rollback/redo) right
 /// now. Returns `Ok(())` if idle, or an `(status_code, body_json)` pair to
@@ -310,17 +323,20 @@ fn ensure_idle(
     Ok(())
 }
 
-
-pub(crate) async fn displays_response_body(
+/// Transport-neutral core of the displays body, given an
+/// already-enumerated display set: the OS enumeration resolves at the
+/// production edge (`displays_api_response`), so tests inject a fixture
+/// set — a real enumeration is machine state (tests-are-hermetic
+/// convention), and on a session-less CI account macOS's
+/// SCShareableContent call never completes at all.
+pub(crate) async fn displays_response_body_from(
+    displays: Vec<crate::display::DisplayInfo>,
     session_registry: &Option<crate::display::SharedSessionRegistry>,
+    include_private: bool,
 ) -> String {
-    let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
-    // This route serves the owner's dashboards (the display picker), so
-    // each entry is annotated with its live capture state via the
-    // unfiltered registry view: `capture_active` plus `agent_visible`
-    // (false = private user view). Agent-facing display enumeration
-    // (MCP `list_displays`, ctl) uses the filtered lookups and never
-    // sees a private view's session.
+    // Annotate live capture state through the caller's visibility boundary.
+    // Generic display.view callers see agent-visible capture sessions only;
+    // an authenticated owner dashboard may additionally see private views.
     let mut displays: Vec<serde_json::Value> = displays
         .iter()
         .map(|d| serde_json::to_value(d).unwrap_or_else(|_| serde_json::json!({})))
@@ -331,7 +347,12 @@ pub(crate) async fn displays_response_body(
             let Some(id) = entry.get("id").and_then(|v| v.as_u64()) else {
                 continue;
             };
-            if let Some(session) = reg.get_any(id as u32) {
+            let session = if include_private {
+                reg.get_any(id as u32)
+            } else {
+                reg.get(id as u32)
+            };
+            if let Some(session) = session {
                 entry["capture_active"] = serde_json::json!(true);
                 entry["agent_visible"] = serde_json::json!(session.agent_visible());
             }
@@ -348,23 +369,54 @@ pub(crate) async fn displays_response_body(
     .unwrap_or_else(|_| "{\"displays\":[]}".to_string())
 }
 
+/// POST /api/diagnostics/visual-freshness + the tunnel's
+/// `api_diagnostics_visual_freshness` (transport-unification design
+/// §2.1, S5): the **Phase 0 visual-freshness transcript sink**
+/// (task #83). `body` is browser-emitted NDJSON (one JSON record per
+/// `\n`-terminated line), appended verbatim to
+/// `<state_dir>/diagnostics/visual-freshness/<session>.ndjson` —
+/// `state_dir` arrives from each transport edge (dispatch and the
+/// tunnel arm resolve `platform::intendant_home()`), so tests inject a
+/// tempdir instead of writing the live store. No parsing or schema
+/// validation here — that's browser-side or post-hoc analysis on the
+/// transcript. The session id is sanitized aggressively (alnum + `-` +
+/// `_` only) and anything that collapses empty is rejected (400), so a
+/// missing id can't accidentally produce a bare-`.ndjson` write. Each
+/// transport keeps its own param decode: HTTP reads `?session_id=` +
+/// the raw body; the tunnel reads session_id/body params with its
+/// stricter missing-param rejections.
+pub(crate) fn diagnostics_visual_freshness_api_response(
+    state_dir: &Path,
+    session_id_raw: &str,
+    body: &[u8],
+) -> ApiResponse {
+    let (status, body) = match crate::diagnostics::append_visual_freshness_record_in(
+        state_dir,
+        session_id_raw,
+        body,
+    ) {
+        Ok(written) => (
+            200,
+            serde_json::json!({"ok": true, "written": written}).to_string(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            (400, serde_json::json!({"error": e.to_string()}).to_string())
+        }
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    };
+    bare_wildcard_json_response(status, body)
+}
+
 async fn handle_diagnostics_visual_freshness(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     request_line: &str,
+    state_dir: PathBuf,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
-    // **Phase 0 visual-freshness transcript sink** (task #83).
-    // Body is browser-emitted NDJSON (one JSON record per
-    // `\n`-terminated line); server appends verbatim to
-    // `~/.intendant/diagnostics/visual-freshness/<session>.ndjson`.
-    // No parsing or schema validation here — that's
-    // browser-side or post-hoc analysis on the
-    // transcript. Session id arrives via `?session_id=…`
-    // query param; we sanitize aggressively (alnum + `-`
-    // + `_` only) and reject anything that collapses
-    // empty so a missing param can't accidentally
-    // produce a bare-`.ndjson` write.
-    use tokio::io::AsyncWriteExt;
+    // Transport-owned param decode: the session id rides the query
+    // string on the HTTP lane.
     let session_id_raw: String = request_line
         .split('?')
         .nth(1)
@@ -382,32 +434,13 @@ async fn handle_diagnostics_visual_freshness(
                 .unwrap_or_default()
         })
         .unwrap_or_default();
-    let (status, body) =
-        match crate::diagnostics::append_visual_freshness_record(
-            &session_id_raw,
-            body_text.as_bytes(),
-        ) {
-            Ok(written) => (
-                "200 OK",
-                serde_json::json!({"ok": true, "written": written}).to_string(),
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => (
-                "400 Bad Request",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            ),
-            Err(e) => (
-                "500 Internal Server Error",
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            ),
-        };
-    let response = HttpResponse::with_content(status, "application/json", body)
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Connection", "close")
-        .into_string();
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    let response = diagnostics_visual_freshness_api_response(
+        &state_dir,
+        &session_id_raw,
+        body_text.as_bytes(),
+    );
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -435,8 +468,10 @@ mod tests {
         }
     }
 
-
-    pub(crate) async fn next_ws_json_matching<S, F>(ws_rx: &mut S, mut matches: F) -> serde_json::Value
+    pub(crate) async fn next_ws_json_matching<S, F>(
+        ws_rx: &mut S,
+        mut matches: F,
+    ) -> serde_json::Value
     where
         S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
             + Unpin,
@@ -466,6 +501,114 @@ mod tests {
         assert_eq!(DEFAULT_PORT, 8765);
     }
 
+    // ── S5 golden transcripts: the diagnostics visual-freshness sink ──
+    // Second S5 slice, same discipline as the settings/keys set:
+    // byte-exact pins captured before the transport-neutral conversion.
+    // The state dir is injected (the dispatch arm resolves the real one
+    // in production), so the fixtures never touch the live store.
+
+    /// Run one stream-consuming handler and collect every byte it wrote.
+    async fn collect_gateway_handler_response<Fut>(run: impl FnOnce(DemuxStream) -> Fut) -> Vec<u8>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        use tokio::io::AsyncReadExt;
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        run(DemuxStream::new(Box::pin(server))).await;
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("collect handler response");
+        response
+    }
+
+    /// The sink's bare wildcard-CORS JSON framing (`Access-Control-
+    /// Allow-Origin: *` + `Connection` tail, NO `Cache-Control`),
+    /// spelled out literally.
+    fn golden_diagnostics_transcript(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn golden_diagnostics_visual_freshness_transcripts() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let cors = crate::gateway_routes::match_route("POST", "/api/diagnostics/visual-freshness")
+            .expect("diagnostics route declared")
+            .0
+            .cors;
+
+        // Success: the NDJSON batch appends verbatim under the injected
+        // state dir and reports the written byte count.
+        let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                ndjson.to_string(),
+                "POST /api/diagnostics/visual-freshness?session_id=vf-golden HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript(
+                "200 OK",
+                &format!(r#"{{"ok":true,"written":{}}}"#, ndjson.len())
+            )
+        );
+        let path = crate::diagnostics::visual_freshness_path_in(state_dir.path(), "vf-golden")
+            .expect("diagnostics path");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ndjson);
+
+        // Missing/empty session id: rejected by the sanitizer before
+        // any disk touch — the sink's 400 shape.
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                ndjson.to_string(),
+                "POST /api/diagnostics/visual-freshness HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript(
+                "400 Bad Request",
+                r#"{"error":"session_id sanitizes to empty"}"#
+            )
+        );
+
+        // Empty body with a valid session id: the historical HTTP lane
+        // accepts it as a zero-byte append (the tunnel twin instead
+        // pre-rejects a missing body — a pinned per-lane difference).
+        let dir = state_dir.path().to_path_buf();
+        let response = collect_gateway_handler_response(|stream| {
+            handle_diagnostics_visual_freshness(
+                stream,
+                String::new(),
+                "POST /api/diagnostics/visual-freshness?session_id=vf-golden-empty HTTP/1.1",
+                dir,
+                cors,
+                None,
+            )
+        })
+        .await;
+        assert_eq!(
+            String::from_utf8_lossy(&response),
+            golden_diagnostics_transcript("200 OK", r#"{"ok":true,"written":0}"#)
+        );
+    }
 
     #[test]
     fn list_sessions_joins_external_context_from_debug_thread_log() {
@@ -638,7 +781,6 @@ mod tests {
             Some("/tmp/codex-managed")
         );
     }
-
 
     #[test]
     fn list_codex_sessions_exposes_usage_limited_goal() {
@@ -861,7 +1003,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn external_codex_detail_limit_keeps_usage_limited_goal() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -952,7 +1093,6 @@ mod tests {
                 && entry.pointer("/data/goal/status").and_then(|v| v.as_str())
                     == Some("usageLimited")));
     }
-
 
     #[test]
     fn list_codex_sessions_exposes_thread_name_separately_from_task() {
@@ -1193,7 +1333,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn list_codex_sessions_parses_large_prefix_and_daily_usage() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1296,7 +1435,6 @@ mod tests {
         assert_eq!(by_day.get("2026-05-17"), Some(&100));
         assert_eq!(by_day.get("2026-05-18"), Some(&150));
     }
-
 
     #[test]
     fn codex_transcript_imports_function_call_output() {
@@ -1405,7 +1543,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn external_activity_replay_uses_compact_session_transcript() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1499,10 +1636,6 @@ mod tests {
         }));
     }
 
-
-
-
-
     #[test]
     fn test_web_gateway_config_default() {
         let config = WebGatewayConfig::default();
@@ -1518,7 +1651,6 @@ mod tests {
         assert!(json.contains("\"provider\":\"gemini\""));
         assert!(json.contains("\"input_sample_rate\":16000"));
     }
-
 
     #[test]
     fn session_detail_limit_keeps_latest_goal_per_nested_session_id() {
@@ -1623,7 +1755,6 @@ mod tests {
         assert!(oversized_summary.len() < WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 16);
     }
 
-
     #[test]
     fn external_activity_replay_uses_wrapper_index_for_multiple_codex_attaches() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
@@ -1714,7 +1845,6 @@ mod tests {
         assert_eq!(row["intendant_wrappers"].as_array().map(Vec::len), Some(2));
     }
 
-
     // ---- /api/peers endpoint tests ----
 
     /// Spawn a test gateway with the given peer registry option and
@@ -1748,9 +1878,29 @@ mod tests {
         (port, handle)
     }
 
+    /// Insert `Connection: close` after the request line unless the
+    /// request already carries a Connection header (WS upgrades send
+    /// `Connection: Upgrade` and must not gain a second, conflicting
+    /// one).
+    fn pin_connection_close(request: &str) -> String {
+        if request.to_ascii_lowercase().contains("\r\nconnection:") {
+            return request.to_string();
+        }
+        request.replacen("\r\n", "\r\nConnection: close\r\n", 1)
+    }
+
     /// Fire a raw HTTP request and read the response bytes.
+    ///
+    /// One-shot contract: the read runs to EOF, so the request is pinned
+    /// to `Connection: close` here (inserted after the request line) —
+    /// otherwise every keep-alive-eligible response would park the
+    /// connection and this helper would idle out the 2s deadline per
+    /// call. Keep-alive itself is exercised by the dedicated listener
+    /// tests. Requests that already carry a `Connection` header (the WS
+    /// upgrade shapes send `Connection: Upgrade`) pass through verbatim.
     async fn http_request_bytes(port: u16, request: &str) -> Vec<u8> {
         use tokio::io::AsyncWriteExt;
+        let request = pin_connection_close(request);
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .unwrap();
@@ -1797,13 +1947,12 @@ mod tests {
         let local = &targets[0];
         assert_eq!(local["local"], true);
         assert_eq!(local["access_domain"], "user_client");
-        assert_eq!(local["route"], "current_dashboard");
+        assert_eq!(local["route"], "trusted_local");
         assert_eq!(local["effective_role"], "root");
         assert_eq!(local["connected"], true);
 
         handle.abort();
     }
-
 
     #[tokio::test]
     async fn test_api_origin_gate_refuses_foreign_pages() {
@@ -1828,6 +1977,46 @@ mod tests {
         assert!(
             resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
             "foreign origin should be refused on non-fleet APIs: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Legacy protected reads and source-viewer fallthroughs are covered by
+        // the same pre-authority gate, not just route-table APIs.
+        for path in ["/debug", "/recordings", "/frames/example"] {
+            let resp = http_request(
+                port,
+                &format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n"
+                ),
+            )
+            .await;
+            assert!(
+                resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+                "foreign origin reached protected legacy path {path}: {}",
+                resp.lines().next().unwrap_or("")
+            );
+        }
+        // Browser navigations often omit Origin. Fetch Metadata must still
+        // stop a same-site/cross-site page before authority resolution.
+        let resp = http_request(
+            port,
+            "GET /debug HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "cross-site navigation reached protected legacy path: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Authority-free shell bytes remain deliberately public even with
+        // cross-site Fetch Metadata; they resolve under anonymous role:none.
+        let resp = http_request(
+            port,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "authority-free shell should remain public: {}",
             resp.lines().next().unwrap_or("")
         );
         // The daemon's own origin sails through and is echoed on fleet paths.
@@ -1931,7 +2120,6 @@ mod tests {
         handle.abort();
     }
 
-
     /// End-to-end exercise of the static-asset arms through a real
     /// gateway socket: exact-path routing (the `/api/...?path=<asset>`
     /// shadowing regression), conditional requests, gzip negotiation,
@@ -2019,6 +2207,25 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
         assert_eq!(resp.len(), split, "HEAD must carry no body");
 
+        handle.abort();
+    }
+
+    /// The daemon origin is privileged (and may receive a browser's mTLS
+    /// credential automatically), so it must never boot the hosted Connect
+    /// client with an attacker-selected rendezvous origin.
+    #[tokio::test]
+    async fn daemon_origin_refuses_hosted_connect_mode() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        for request in [
+            "GET /?connect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?%63onnect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "POST /?connect=1&connect_base=https%3A%2F%2Fevil.example HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let resp = http_request(port, request).await;
+            assert!(resp.starts_with("HTTP/1.1 403 Forbidden"), "got: {resp}");
+            assert!(resp.contains("Hosted Connect mode is not served"));
+            assert!(!resp.to_ascii_lowercase().contains("<!doctype html"));
+        }
         handle.abort();
     }
 
@@ -2138,25 +2345,39 @@ mod tests {
         (port, handle)
     }
 
+    /// Own the scratch access store for a default TLS test gateway for as
+    /// long as its listener task can run. Aborting on drop prevents a test
+    /// panic from detaching the listener after its temporary store disappears.
+    struct TlsTestGatewayHandle {
+        task: tokio::task::JoinHandle<()>,
+        _access_cert_dir: tempfile::TempDir,
+    }
+
+    impl TlsTestGatewayHandle {
+        fn abort(&self) {
+            self.task.abort();
+        }
+    }
+
+    impl Drop for TlsTestGatewayHandle {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
     /// Spawn a gateway with a self-signed TLS acceptor wired in (strict
     /// HTTPS/WSS mode) plus an optional inbound bearer token. Used by the
     /// strict-TLS demux tests and the TLS variant of the /ws bearer test
     /// (audit F2), which only manifests over TLS — rustls buffers the
     /// response ciphertext, so a missing flush truncates it to empty.
-    async fn spawn_test_gateway_tls(
-        bearer_token: Option<String>,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
+    async fn spawn_test_gateway_tls(bearer_token: Option<String>) -> (u16, TlsTestGatewayHandle) {
         spawn_test_gateway_tls_with_client_cert_requirement(bearer_token, false).await
     }
 
     async fn spawn_test_gateway_tls_with_client_cert_requirement(
         bearer_token: Option<String>,
         tls_client_cert_required: bool,
-    ) -> (u16, tokio::task::JoinHandle<()>) {
-        let bus = EventBus::new();
-        let (broadcast_tx, _) = broadcast::channel::<String>(16);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    ) -> (u16, TlsTestGatewayHandle) {
         // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
         // same construction the production `--tls` self-signed path uses.
         let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
@@ -2164,7 +2385,42 @@ mod tests {
             hostname: None,
         })
         .expect("self-signed acceptor builds");
-        let handle = spawn_web_gateway(
+        spawn_test_gateway_with_tls_acceptor(bearer_token, tls_client_cert_required, acceptor).await
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> (u16, TlsTestGatewayHandle) {
+        let access_cert_dir = tempfile::tempdir().expect("TLS test access store");
+        let (port, task) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            bearer_token,
+            tls_client_cert_required,
+            acceptor,
+            access_cert_dir.path().to_path_buf(),
+        )
+        .await;
+        (
+            port,
+            TlsTestGatewayHandle {
+                task,
+                _access_cert_dir: access_cert_dir,
+            },
+        )
+    }
+
+    async fn spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+        acceptor: tokio_rustls::TlsAcceptor,
+        access_cert_dir: std::path::PathBuf,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = spawn_web_gateway_from_cert_dir(
             listener,
             bus,
             broadcast_tx,
@@ -2180,6 +2436,7 @@ mod tests {
             crate::peer::AuthRequirements::none(),
             tls_client_cert_required,
             Some(acceptor),
+            access_cert_dir,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
@@ -2245,20 +2502,46 @@ mod tests {
     /// self-signed), writes the request as cleartext into the TLS session,
     /// and reads to EOF. Returns the decrypted bytes as a lossy string.
     async fn https_request(port: u16, request: &str) -> String {
+        https_request_for_server_name(port, "localhost", request).await
+    }
+
+    async fn https_request_for_server_name(port: u16, server_name: &str, request: &str) -> String {
+        https_request_for_server_name_with_client_identity(port, server_name, request, None).await
+    }
+
+    async fn https_request_for_server_name_with_client_identity(
+        port: u16,
+        server_name: &str,
+        request: &str,
+        client_identity: Option<(&std::path::Path, &std::path::Path)>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .unwrap()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)));
+        let config = match client_identity {
+            Some((cert_path, key_path)) => {
+                let (cert_chain, key) = crate::web_tls::load_pem_cert_and_key(cert_path, key_path)
+                    .expect("test client identity loads");
+                builder
+                    .with_client_auth_cert(cert_chain, key)
+                    .expect("test client identity is usable")
+            }
+            None => builder.with_no_client_auth(),
+        };
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
         let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        // One-shot contract (same as http_request_bytes): pin the request
+        // to `Connection: close` so a keep-alive-eligible response can't
+        // park the connection and stall the read-to-EOF below.
+        let request = pin_connection_close(request);
         tls.write_all(request.as_bytes()).await.unwrap();
         // Read to EOF under one generous deadline. The old 2s timeout with
         // its result discarded turned this into a load lottery: ~2.8 MB of
@@ -2283,7 +2566,107 @@ mod tests {
         String::from_utf8_lossy(&response).into_owned()
     }
 
+    #[tokio::test]
+    async fn public_fleet_name_is_discovery_only_even_at_its_own_origin() {
+        let access_dir = tempfile::tempdir().unwrap();
+        let server_names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(
+            access_dir.path(),
+            &server_names,
+            "fleet-sni-client-cert",
+            false,
+        )
+        .unwrap();
+        assert!(
+            crate::access::iam::migrate_generated_browser_mtls_owner_root_at_startup(
+                access_dir.path()
+            )
+            .unwrap(),
+            "fixture client certificate must be enrolled before the fleet request"
+        );
+        let acceptor = crate::web_tls::build_acceptor_with_client_auth(
+            &crate::web_tls::TlsCertSource::Files {
+                cert_path: access_dir.path().join("server.crt"),
+                key_path: access_dir.path().join("server.key"),
+            },
+            &crate::web_tls::ClientAuth::RequireCa {
+                ca_path: access_dir.path().join("ca.crt"),
+            },
+        )
+        .expect("access-CA TLS acceptor builds");
+        let (port, handle) = spawn_test_gateway_with_tls_acceptor_and_cert_dir(
+            None,
+            true,
+            acceptor,
+            access_dir.path().to_path_buf(),
+        )
+        .await;
+        let fleet_name = "discovery-only-fleet.test";
+        let fleet_cert = rcgen::generate_simple_self_signed(vec![fleet_name.to_string()]).unwrap();
+        crate::web_tls::install_fleet_certificate(
+            fleet_name,
+            &fleet_cert.cert.pem(),
+            &fleet_cert.signing_key.serialize_pem(),
+        )
+        .unwrap();
 
+        let client_cert_path = access_dir.path().join("client.crt");
+        let client_key_path = access_dir.path().join("client.key");
+        // This is a protected route, not the authority-free dashboard shell:
+        // RequireCa proves rustls received and verified the certificate, and
+        // the 200 proves request IAM resolved that same fingerprint through
+        // the injected temp store as the enrolled owner root.
+        let authenticated_direct = https_request_for_server_name_with_client_identity(
+            port,
+            "localhost",
+            &format!("GET /api/project-root HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
+        )
+        .await;
+        assert!(
+            authenticated_direct.starts_with("HTTP/1.1 200"),
+            "the enrolled access-CA client certificate must authorize the protected direct-SNI route: {authenticated_direct}"
+        );
+
+        for request in [
+            format!("GET /api/project-root HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            format!("POST /mcp HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nContent-Length: 0\r\n\r\n"),
+            format!(
+                "GET /ws HTTP/1.1\r\nHost: {fleet_name}:{port}\r\nOrigin: https://{fleet_name}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            ),
+        ] {
+            let response = https_request_for_server_name_with_client_identity(
+                port,
+                fleet_name,
+                &request,
+                Some((&client_cert_path, &client_key_path)),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "fleet control route was not refused: {response}"
+            );
+            assert!(response.contains("discovery-only"));
+        }
+
+        let public_shell = https_request_for_server_name_with_client_identity(
+            port,
+            fleet_name,
+            &format!("GET / HTTP/1.1\r\nHost: {fleet_name}:{port}\r\n\r\n"),
+            Some((&client_cert_path, &client_key_path)),
+        )
+        .await;
+        assert!(
+            public_shell.starts_with("HTTP/1.1 200"),
+            "authority-free shell should remain available: {public_shell}"
+        );
+        handle.abort();
+    }
 
     /// Routes served by the legacy dispatch chain (the non-API surface:
     /// connect bootstrap, recordings, frames, debug, config, static/SPA)
@@ -2298,7 +2681,6 @@ mod tests {
             ("POST", "/connect/dashboard/ice"),
             ("POST", "/connect/dashboard/close"),
             ("GET", "/frames/f1"),
-            ("POST", "/session"),
             ("GET", "/recordings"),
             ("GET", "/recordings/stream1/meta"),
             ("GET", "/debug"),
@@ -2318,6 +2700,109 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_token_mint_rejects_foreign_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let response = http_request(
+            port,
+            &format!(
+                "POST /session HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://attacker.example\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.contains("403 Forbidden"),
+            "foreign page must not spend a daemon-held provider credential: {response}"
+        );
+        assert!(
+            response.contains("cross-origin caller is not allowed"),
+            "unexpected rejection: {response}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_dashboard_signaling_rejects_foreign_browser_origins() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = http_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed"),
+            "got: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "authority-bearing signaling must never be wildcard-CORS: {resp}"
+        );
+
+        // DNS rebinding preserves matching Origin + Host while changing
+        // where the hostname resolves. Cleartext loopback authority only
+        // accepts a literal loopback/localhost origin, so this must still
+        // fail even though the two attacker-controlled headers match.
+        let rebound = http_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: attacker.example:{port}\r\n\
+                 Origin: http://attacker.example:{port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(
+            rebound.contains("401 Unauthorized") || rebound.contains("403 Forbidden"),
+            "DNS-rebound signaling must be rejected before upgrade: {rebound}"
+        );
+        assert!(!rebound.contains("101 Switching Protocols"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_dashboard_signaling_requires_client_cert_under_mtls() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let body = r#"{"sdp":"offer"}"#;
+        let resp = https_request(
+            port,
+            &format!(
+                "POST /connect/dashboard/offer HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: {}\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            ),
+        )
+        .await;
+        assert!(resp.contains("401 Unauthorized"), "got: {resp}");
+        assert!(
+            resp.contains("mTLS client certificate required"),
+            "got: {resp}"
+        );
+        handle.abort();
+    }
 
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
@@ -2330,7 +2815,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         // Request without auth — should 401, NOT pass through to the
         // 503-no-registry response that would happen otherwise.
-        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
         assert!(resp.contains("missing Authorization"));
         assert!(
@@ -2346,7 +2831,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n",
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong\r\n\r\n",
         )
         .await;
         assert!(resp.contains("401"), "expected 401, got: {resp}");
@@ -2362,7 +2847,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n\r\n",
+            "GET /api/peers HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\n\r\n",
         )
         .await;
         // Auth passed; handler returned its 503 (no registry).
@@ -2377,17 +2862,50 @@ mod tests {
     /// /config is exempt — even when bearer is required for
     /// federation endpoints, the dashboard bootstrap continues to work
     /// without auth. This is how the dashboard remains usable on the
-    /// loopback / trusted-network case where the operator has set a
-    /// bearer for WAN federation.
+    /// direct-loopback case where the operator has set a bearer for WAN
+    /// federation. Remote browsers still require mTLS.
     #[tokio::test]
     async fn test_config_endpoint_unauthenticated_when_bearer_set() {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
-        let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
             resp.contains("200 OK"),
             "config should serve unauthenticated, got: {resp}"
         );
         assert!(!resp.contains("401"));
+        assert!(
+            resp.contains("Cache-Control: no-store"),
+            "TURN-bearing config must never be stored: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "runtime config must not be wildcard-readable: {resp}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn config_rejects_foreign_browser_origin_without_wildcard_cors() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /config HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://attacker.example\r\n\
+                 \r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed"),
+            "unexpected rejection: {resp}"
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "rejected config must not publish wildcard CORS: {resp}"
+        );
         handle.abort();
     }
 
@@ -2396,7 +2914,7 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
 
         for path in ["/icon-128.png", "/favicon.ico"] {
-            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
             let resp = http_request_bytes(port, &request).await;
             let response_str = String::from_utf8_lossy(&resp);
             assert!(
@@ -2426,7 +2944,6 @@ mod tests {
         handle.abort();
     }
 
-
     /// Real /ws upgrade through `spawn_test_gateway_with_auth`:
     /// connecting without a token gets a plain HTTP 401 *before* the
     /// WebSocket handshake completes — the dashboard sees a 401 page,
@@ -2437,7 +2954,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2453,6 +2970,107 @@ mod tests {
         assert!(
             !resp.contains("101 Switching Protocols"),
             "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// WebSocket SOP is a server-side Origin check. A foreign hosted page
+    /// must not turn the loopback/no-mTLS dashboard's trusted-local fallback
+    /// into a cross-site root session.
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_foreign_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "expected 403, got: {resp}");
+        assert!(
+            resp.contains("cross-origin caller is not allowed on this WebSocket"),
+            "got: {resp}"
+        );
+        assert!(!resp.contains("101 Switching Protocols"), "got: {resp}");
+
+        let rebound = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: attacker.example:{port}\r\n\
+                 Origin: http://attacker.example:{port}\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            rebound.contains("403 Forbidden"),
+            "DNS-rebound matching Origin + Host must fail: {rebound}"
+        );
+        assert!(!rebound.contains("101 Switching Protocols"));
+        handle.abort();
+    }
+
+    /// Pin the gate ahead of mTLS grant resolution. Browser-held client
+    /// certificates are connection credentials, not permission for a foreign
+    /// page to drive the daemon; the Origin verdict is independent of whether
+    /// the TLS handshake supplied a certificate.
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_foreign_origin_before_mtls_identity() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let resp = https_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: https://connect.intendant.dev\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(resp.contains("403 Forbidden"), "expected 403, got: {resp}");
+        assert!(
+            !resp.contains("mTLS client certificate required"),
+            "Origin must be rejected before transport authority is resolved: {resp}"
+        );
+        assert!(!resp.contains("101 Switching Protocols"), "got: {resp}");
+        handle.abort();
+    }
+
+    /// The browser dashboard's own origin remains able to open the legacy
+    /// event socket when no bearer token is configured.
+    #[tokio::test]
+    async fn test_ws_upgrade_accepts_same_browser_origin() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, None).await;
+        let resp = http_request(
+            port,
+            &format!(
+                "GET /ws HTTP/1.1\r\n\
+                 Host: localhost:{port}\r\n\
+                 Origin: http://localhost:{port}\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Key: dGVzdA==\r\n\
+                 Sec-WebSocket-Version: 13\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.contains("101 Switching Protocols"),
+            "expected same-origin upgrade success, got: {resp}"
         );
         handle.abort();
     }
@@ -2474,7 +3092,7 @@ mod tests {
         let resp = https_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2505,7 +3123,7 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_rejects_cleartext_http() {
         let (port, handle) = spawn_test_gateway_tls(None).await;
-        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(
             resp.contains("426"),
             "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
@@ -2526,7 +3144,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2686,7 +3304,7 @@ mod tests {
         // it falls through to the SPA shell like any unknown route.
         let resp = http_request(
             port,
-            "POST /x/api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /x/api/api-keys HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .await;
         assert!(
@@ -2698,7 +3316,7 @@ mod tests {
         // The exact route still reaches the writer (a JSON responder).
         let resp = http_request(
             port,
-            "POST /api/api-keys HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /api/api-keys HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .await;
         assert!(
@@ -2715,7 +3333,7 @@ mod tests {
         // list, which scans the real home directory.)
         let resp = http_request(
             port,
-            "GET /debug?note=/api/project-root HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /debug?note=/api/project-root HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
@@ -2725,7 +3343,11 @@ mod tests {
         );
 
         // Look-alike longer paths are not the route.
-        let resp = http_request(port, "GET /api/sessionsfoo HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let resp = http_request(
+            port,
+            "GET /api/sessionsfoo HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
         assert!(
             resp.contains("Content-Type: text/html"),
             "look-alike path must fall through, got: {}",
@@ -2737,7 +3359,7 @@ mod tests {
         // /api/session/current/changes/{path}).
         let resp = http_request(
             port,
-            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
@@ -2758,7 +3380,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2783,7 +3405,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws?token=ws-token HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2805,7 +3427,7 @@ mod tests {
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
-             Host: x\r\n\
+             Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: dGVzdA==\r\n\
@@ -2827,14 +3449,22 @@ mod tests {
         let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
-            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(
             resp.contains("200 OK"),
             "agent card should serve unauthenticated, got: {resp}"
         );
-        assert!(!resp.contains("401"));
+        // Status line only: the card body embeds ws:// advertise URLs with
+        // the kernel-assigned test port, so scanning the whole response for
+        // "401" flaked whenever the port happened to contain it (seen live
+        // with port 40169 in a merge-group run).
+        let status_line = resp.lines().next().unwrap_or("");
+        assert!(
+            !status_line.contains("401"),
+            "agent card must not challenge for auth, got: {status_line}"
+        );
         handle.abort();
     }
 
@@ -2850,8 +3480,6 @@ mod tests {
         assert!(resp.contains("peer registry not configured"));
         handle.abort();
     }
-
-
 
     /// `GET /api/peers` on a registry with no peers returns
     /// `{"peers":[]}`. Baseline for the list endpoint shape.
@@ -3136,8 +3764,13 @@ mod tests {
     }
 
     /// `POST /api/peers/{id}/task` with `{instructions}` returns 200 +
-    /// `task_id`. Wire-level encoding covered by
-    /// `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`.
+    /// `task_id` + the delivery-receipt fields. The target here is a bare
+    /// gateway with no session supervisor, i.e. a receiver that never
+    /// acks — the canonical old-peer/fire-and-forget shape, so `delivery`
+    /// must read `unconfirmed` after exactly one send (no retry storm
+    /// against a stable-but-silent receiver). Wire-level encoding covered
+    /// by `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`;
+    /// the acknowledged shape by `peer::handle::tests::delegate_task_confirms_on_peer_receipt`.
     #[tokio::test]
     async fn test_api_peers_delegate_task_returns_200() {
         let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
@@ -3158,6 +3791,22 @@ mod tests {
         assert!(
             parsed["task_id"].as_str().is_some(),
             "expected task_id in response: {resp_body}"
+        );
+        assert_eq!(
+            parsed["delivery"].as_str(),
+            Some("unconfirmed"),
+            "a supervisor-less receiver never acks: {resp_body}"
+        );
+        assert!(
+            parsed["delegation_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "expected delegation_id in response: {resp_body}"
+        );
+        assert_eq!(
+            parsed["sends"].as_u64(),
+            Some(1),
+            "stable-but-silent receiver must not trigger re-sends: {resp_body}"
         );
 
         target_handle.abort();
@@ -3462,7 +4111,7 @@ mod tests {
     /// it return `Err`, which the production code already tolerates
     /// (the WS-close path would have cleared this entry in real life).
     pub(crate) fn seed_holder(
-        map: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+        map: &Arc<DisplayInputAuthority>,
         display_id: u32,
         connection_id: &str,
     ) {
@@ -3475,6 +4124,4 @@ mod tests {
             },
         );
     }
-
-
 }

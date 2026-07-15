@@ -10,3 +10,7 @@
 # review instead of collapsing to "Binary files differ".
 static/app.html -text linguist-generated=true
 static/app/** -text diff
+# The vault crypto kernel's sha256 is pinned into app.html by the assembler
+# and parity-tested against the served bytes — eol conversion would change
+# the hash per platform (and churn the regenerated pin on autocrlf runners).
+static/vault-kernel.js -text diff

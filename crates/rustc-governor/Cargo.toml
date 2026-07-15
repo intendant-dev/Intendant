@@ -1,0 +1,17 @@
+[package]
+name = "rustc-governor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "rustc-governor"
+path = "src/main.rs"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Acceptance + unit tests build hermetic permit dirs / fake homes in tempdirs.
+tempfile = "3"

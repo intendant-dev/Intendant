@@ -23,8 +23,9 @@ and are converted to milliseconds (clamped to 30 s) at parse time.
 The full `CuAction` vocabulary (the same tagged JSON accepted by the MCP
 `execute_cu_actions` tool and `intendant ctl cu actions`):
 `click`, `double_click`, `triple_click`, `mouse_down`, `mouse_up`, `type`,
-`paste` (clipboard + paste chord — fast for long text; restores the previous
-clipboard text on the user's macOS session), `key`, `hold_key`, `scroll`,
+`paste` (clipboard + paste chord — fast for long text; previous clipboard
+text is restored where the platform allows, see "Action results" below),
+`key`, `hold_key`, `scroll`,
 `move_mouse`, `drag`, `screenshot`, `zoom` (region capture at the highest
 resolution the platform can supply — native 2x pixels on Retina), and `wait`.
 `intendant ctl cu actions --help` prints the per-action field shapes with an
@@ -50,9 +51,11 @@ the executor returns an actionable error naming the recovery path. X11 and
 macOS inject input directly — X11 uses a persistent `x11rb`/XTest connection
 with in-process root-window capture and clipboard support; macOS posts
 CoreGraphics `CGEvent`s in-process (no `cliclick`/`osascript` subprocesses; key
-chords use ANSI-US virtual keycodes, unicode typing is layout-independent) —
-and prefer the in-memory frame of a live capture session for screenshots,
-falling back to their platform capture paths when no session exists.
+chords and typed ASCII use ANSI-US virtual keycodes, characters with no
+ANSI-US key ride paced unicode-string events, and typed text is read back via
+AX where possible — see "Action results" below) — and prefer the in-memory
+frame of a live capture session for screenshots, falling back to their
+platform capture paths when no session exists.
 
 **Post-action freshness:** capture backends are damage-driven, so a screenshot
 taken right after an input action waits (bounded, 300 ms) for a frame captured
@@ -65,6 +68,90 @@ on HiDPI and under the Wayland portal, which reports its own stream size).
 `zoom` is the deliberate exception: on macOS it captures raw physical pixels
 (2x on Retina) and crops the requested logical region, because detail is the
 point.
+
+### Action results: dispatch vs. effect
+
+OS input APIs only confirm that events were *dispatched* — not that the
+target app acted on them — so every action result carries an honest status
+(`CuActionStatus`) instead of a bare boolean:
+
+- **`ok`** — the intended effect was verified: screenshots and zooms (the
+  captured bytes are the effect), `wait`, and `type` on the macOS user
+  session when the focused element's AX value was read back and contained
+  the typed text.
+- **`injected`** — events were dispatched to the OS but the effect was not
+  verified. This is the honest ceiling for clicks, keys, scrolls, drags, and
+  typing on backends without read-back; verify from the post-action
+  screenshot. A dispatched-but-ineffective action (a click that only
+  activated an inactive window, a chord swallowed by the wrong app) reports
+  `injected`, never `ok`.
+- **`failed`** — dispatch failed, or verification contradicted the intent: a
+  macOS `type` whose read-back does not contain the typed text returns
+  `failed` with expected-vs-observed evidence rather than pretending
+  success.
+
+Type read-back is bounded and best-effort (two AX reads of the focused
+element): multi-line/control text (Return may submit, Tab may move focus),
+secure fields, and elements without an AX-readable value stay `injected`
+with the reason in the result detail.
+
+**Typing on macOS**: ASCII is delivered as real ANSI-US keycode events (the
+same proven event shape as `key`), newlines as Return and tabs as Tab;
+characters with no ANSI-US key are delivered as paced unicode-string events
+(≤ 20 UTF-16 units per event, payload on both keyDown and keyUp, surrogate
+pairs never split). This replaces the 2026-07-13 failure mode where
+back-to-back `CGEventKeyboardSetUnicodeString` chunks were silently dropped
+by the focused app while the action still reported success.
+
+**Clipboard hygiene (`paste`)**: paste routes through the system clipboard,
+so each backend restores what it can and reports what it did in the result
+detail. macOS captures the previous *text* clipboard (`pbpaste`) and
+restores it ~300 ms after the chord — non-text content (images) cannot be
+captured, so the clipboard is cleared rather than left holding the paste
+payload; Windows does the same via arboard. X11 and Wayland selections are
+pull-based (the target may fetch the payload after the chord returns), so
+restore would race the paste itself: the pasted text deliberately remains
+the active selection and the result detail says so. The restore delay is an
+honest race, not a guarantee — an app that lazily re-reads the clipboard
+later sees the restored content.
+
+### Screen-capture permissions & signing identity (macOS)
+
+macOS TCC keys every permission grant (Screen Recording, Accessibility,
+Apple Events, Microphone, Camera) to the app's **code-signing designated
+requirement** as it was at grant time. If the binary is rebuilt or re-signed
+under a different identity — or the signing *identifier* changes — every
+existing grant silently stops validating: System Settings keeps showing the
+toggle ON while `SCShareableContent::get` fails with "The user declined
+TCCs…". The macOS capture backend classifies that failure and appends the
+recovery path to the error (permission missing **or** invalidated by a
+re-signed build; toggle it off/on under System Settings → Privacy &
+Security → Screen & System Audio Recording, then relaunch — grants are only
+re-read at launch), and requests screen-capture access once per process so
+a fresh install gets the native prompt. The CU executor's raw
+`screencapture` fallback gets the same treatment
+(`cu_readiness::enrich_capture_failure`): when the capture fails **and**
+`CGPreflightScreenCaptureAccess` confirms the permission is missing, the
+error names Screen Recording, the affected binary path, and the System
+Settings destination instead of the bare "could not create image from
+display".
+
+`scripts/bundle-macos.sh` defends the identity's stability:
+
+- The local-dev signing identity ("Intendant Dev", in
+  `~/.intendant/signing.keychain-db`) is **escrowed** to
+  `~/.intendant/signing-identity.p12` (chmod 600) when created, and
+  backfilled from the keychain for identities that predate the escrow. If
+  the keychain is ever lost, the script re-imports that file — same cert,
+  same designated requirement, existing grants keep validating — instead of
+  silently minting a fresh identity that voids them all.
+- When a genuinely new identity must be minted (keychain *and* escrow both
+  gone), the script prints a loud re-grant warning listing the System
+  Settings steps.
+- After every signing run it diffs the bundle's designated requirement
+  against `~/.intendant/last-signed-dr.txt` and prints the same warning on
+  any drift (this also catches signing-identifier changes and dev-cert ↔
+  Developer ID switches), then refreshes the cache.
 
 ### Element Observation (`read_screen`)
 
@@ -84,6 +171,16 @@ available. Exposed as an MCP tool (in the `core` bootstrap profile) and as
 `intendant ctl cu elements [--format json]`. Pixels remain the fallback for
 visual verification and for apps with sparse accessibility trees (web views
 notably).
+
+Long element values and window titles (a `data:` URL, a whole document in a
+text view) are length-capped **once, centrally**
+(`computer_use::cap_screen_elements_texts`, 80 chars) with a stable marker —
+`prefix… [N chars total, #hash8]` — so one long value cannot dominate the
+observation while staying distinguishable from other long values sharing its
+prefix. The platform readers deliberately do not pre-truncate; the
+`full_values: true` tool param (`ctl cu elements --full-values`) skips the
+cap for exact-value requests (Linux AT-SPI still bounds each text fetch at a
+documented 4096-char transport cap).
 
 ### Who Can Call CU
 
@@ -110,7 +207,7 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   `display_env_string()` → `":<id>"`. Virtual displays come into being three
   ways: the agent loop's Xvfb auto-launch, the agent starting one itself
   (`Xvfb :99 … &`), or the dashboard's keyless **New virtual display** action
-  (`create_virtual_display`) — the path that gives a claimed headless box a
+  (`create_virtual_display`) — the path that gives an authorized headless box a
   display with no API key configured. Dashboard-created displays register a
   capture session immediately (streaming tile, CU-routable), are daemon-owned,
   and are destroyed when their tile is closed (a hard daemon kill leaves the
@@ -122,7 +219,7 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   autonomy system — enforced fail-closed at the `execute_actions` chokepoint
   on **every** backend (the raw X11/macOS capture/injection paths included,
   not just by session existence on Wayland/Windows), with one exemption: an
-  **owner surface** (the trusted dashboard, an enrolled root user client,
+  **owner surface** (an owner/root dashboard, an enrolled root user client,
   local loopback `ctl`, or the stdio MCP transport the owner wired up —
   `ToolCallerTrust` in `mcp/mod.rs`, derived from the bound
   `AccessPrincipal`) may target its own desktop ungranted, because the
@@ -153,6 +250,121 @@ physical portal dialog before clicking **Share**; approving screen sharing alone
 can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [Autonomy & Approvals](./autonomy.md) for the approval surface.
 
+### CU Readiness Diagnosis (`display_readiness`)
+
+The display grant is **Intendant authority only** — OS-level capability is a
+separate set of layers, and any of them can block actual CU while the grant
+reads as held (the classic macOS shape: `already_granted`, yet Screen
+Recording denies every capture). `src/bin/caller/cu_readiness.rs` probes five
+layers independently and names the non-ready ones, each with a fix:
+
+1. **`intendant_display_authority`** — the user-display grant / caller trust
+   (virtual targets need none).
+2. **`screen_capture_permission`** — macOS Screen Recording
+   (`CGPreflightScreenCaptureAccess`); Linux Wayland portal session or X11
+   socket; Windows desktop capture session.
+3. **`accessibility_permission`** — macOS Accessibility (`AXIsProcessTrusted`);
+   Linux AT-SPI bus reachability (bounded probe); Windows UIA client
+   instantiation.
+4. **`target_display`** — the requested display exists / has a live capture
+   session.
+5. **`input_backend`** — CGEvent (macOS, rides Accessibility), XTest (X11),
+   portal remote desktop (Wayland), SendInput via session (Windows).
+
+Probes are cheap, strictly read-only (they never pop permission prompts), and
+**never cached** — TCC and portal state can change or be revoked at any
+moment. A probe that cannot determine its layer reports `unknown`, and
+unknown counts as **not ready** (fail closed). Surfaces:
+
+- the `display_readiness` MCP tool (display-view IAM class; listed in the
+  `core` and `screen` profiles),
+- `intendant ctl display status [--target TARGET]`,
+- `request_user_display` answers (`already_granted` and approvals) carry an
+  `os_readiness` gap block naming any still-blocked OS layers, so a granted
+  request can never masquerade as a CU-ready one.
+
+### Observation Policy (`observe`)
+
+Every `execute_cu_actions` batch ends with a **trailing observation**, and
+what that observation is is a per-call policy (`observe` param;
+`src/bin/caller/cu_observation.rs`), not an unconditional screenshot:
+
+- **`pixels`** (default) — the historical behavior: a post-action screenshot
+  is captured and appended as one extra result. The default stays `pixels`
+  because the tool description and the native `peer cu` guidance promise a
+  screenshot; token-sensitive callers opt in to the cheaper modes (managed
+  Codex's developer instructions teach `observe:"auto"`).
+- **`ax`** — the frontmost element tree (the `read_screen` walk, same central
+  text caps) is attached as text *instead of* pixels: a few hundred tokens
+  versus ~1.5k image tokens, and no capture/encode work at all. User-session
+  targets only (element trees exist nowhere else); a failed walk reports the
+  error as the observation rather than silently substituting an image.
+- **`auto`** — `ax` when the frontmost tree is usable (≥
+  `cu_observation::AX_AUTO_MIN_NODES` nodes), `pixels` otherwise (sparse
+  tree, walk error, virtual-display target).
+- **`none`** — per-action results only, for callers chaining batches that
+  will observe once at the end.
+
+The result always **names the observation it carries and why**
+(`observation: pixels (auto: ax sparse (2 nodes) → pixels)`), so a fallback
+is never silent. Two invariants regardless of mode: an explicit trailing
+`screenshot`/`zoom` action always returns its pixels (the action *is* the
+request), and the managed-context compact contract is preserved — path +
+metadata, no inline image bytes — with `ax`/`auto` the compact caller gets
+the element tree **inline**, which is the first time the managed path
+carries an actual observation instead of a path to fetch.
+
+**Screenshots are clean by default, encoded once.** Click markers
+(crosshairs at click coordinates) are opt-in via `annotate: true` — baked-in
+markers obscured the very controls being verified (e2e finding CU-06), and
+the dashboard Live tab already overlays actions in real time. Annotation is
+drawn on the raw frame *before* the single PNG encode; the historical
+pipeline (capture → encode → decode → draw → re-encode → rewrite the disk
+artifact) is gone, and the disk artifact now always carries the same bytes
+as the model payload. That parity is deliberate: the artifact's remaining
+reader is the managed-Codex `view_image` path (the Activity-tab
+disk-substitution consumer was retired with the Gemini CLI backend), which
+wants exactly what the model would have seen — including, on macOS, the
+logical-size (not raw-Retina) image that CU coordinates map to. Each batch
+logs a `[cu]` measurement line (observation kind/reason, capture+encode ms,
+AX walk ms, observation bytes, settle outcome) to the daemon log, and the
+native loop logs the same line into the session log.
+
+### Settle: bounded UI quiescence (`settle`)
+
+The 300 ms freshness floor guarantees a *recent* frame, not a *finished* UI —
+after a click that starts a page load, the model historically padded batches
+with guessed `wait` actions. `settle` replaces the guess with a bounded
+quiescence wait (`cu_observation`): after the last input action, watch the
+display and return once no content change has been observed for a ~300 ms
+quiet window, capped at 2 s (`settle: true`) or a caller-supplied cap
+(`settle: <ms>`, clamped to 5 s; `0`/`false` = off).
+
+- **Anchoring:** the wait is anchored at the last input action. It runs
+  before the batch's first capture that follows an input (`[click,
+  screenshot]` settles between the two), or before the trailing observation
+  — the AX walk and the auto-screenshot both read the settled UI. A batch
+  with no input actions settles from call start ("capture once quiet").
+- **Damage signal:** platform-native dirty rects when frames carry them
+  (ScreenCaptureKit); otherwise a per-frame content fingerprint — the X11
+  backend polls at the capture rate and re-delivers unchanged frames, so
+  frame *arrival* is deliberately not treated as change.
+- **Honest reporting:** the result carries `settle: settled after Nms (no
+  display change for 300ms)` or `still_loading after Nms (display still
+  changing at the cap)`. Paths without a usable damage signal — no live
+  capture session, a capture stream that ends mid-wait, or the synthetic
+  test-card backend (whose counter strip free-runs, which also keeps the
+  e2e suite deterministic) — degrade to a fixed minimal wait and say so
+  (`fixed 300ms wait (...)`).
+- **No double-wait:** a damage-verified settle subsumes the capture
+  freshness wait — the stream was watched past the input, so the following
+  capture serves the current frame immediately.
+
+`settle` composes with every `observe` mode (with `none` it simply bounds
+the batch's return for callers chaining batches), and is exposed on the MCP
+tool, `ctl cu actions --settle MS`, and the peer twins (older peers ignore
+it).
+
 ### Three separate concepts: private view, agent share, presence streaming
 
 Putting the user's screen on the wire means one of three deliberately
@@ -162,8 +374,11 @@ distinct things, and the surfaces never conflate them:
    view/control of this machine's display from the owner's dashboards.
    The capture session is created with **`agent_visible = false`**
    (`ControlMsg::GrantUserDisplay { agent_visible: false }`): it streams
-   over WebRTC to connected dashboards and accepts dashboard input like
-   any display, but it is invisible to agents, **fail closed**, at two
+   over WebRTC only to owner/root dashboard connections and accepts input only
+   from those connections. The same ceiling is enforced on the legacy `/ws`
+   path and the verified dashboard-control DataChannel; a scoped role's
+   `display.view` or `display.input` permission covers agent-visible displays
+   only. The private view is invisible to agents, **fail closed**, at two
    independent layers:
    - the `DisplayControl` autonomy grant is never set (so the CU
      `execute_actions` chokepoint, `INTENDANT_USER_DISPLAY_GRANTED` on
@@ -177,10 +392,14 @@ distinct things, and the surfaces never conflate them:
      peer display announcements, presence's available-display list, and
      the 1 Hz FrameRegistry sampler (`display_<id>` model-feed frames,
      hence `list_frames`/`read_frame` and conversation auto-attach) all
-     read it as absent. Dashboard surfaces use the unfiltered
-     `get_any` / `all_display_ids` accessors.
-   Auto-recording also skips private views (an explicit user-initiated
-   `StartRecording` still works — that is the user's own decision).
+     read it as absent. Owner/root dashboard paths may use the unfiltered
+     `get_any` / `all_display_ids` accessors after that authority check;
+     scoped dashboards and federated peers stay on the filtered accessors.
+   Auto-recording also skips private views. For the alpha, an explicit
+   `StartRecording` is owner/root-only and still requires an active
+   agent-visible display. A private or absent display is rejected before
+   ffmpeg starts: recording artifacts live in the ordinary session tree, so
+   private pixels must never be written there in the first place.
 2. **Agent share** (dashboard **Share with agent**, MCP
    `grant_user_display`, ctl `display grant-user`) — the classic grant:
    `agent_visible = true`, the autonomy grant is set, and the display is
@@ -199,13 +418,86 @@ the per-daemon grant flag. On the wire, `GrantUserDisplay` without
 `agent_visible` keeps its historical meaning (`true` — the agent share),
 so pre-split frontends and scripts are unaffected.
 
-Granting is itself owner-surface-only: `grant_user_display` from a scoped
-caller is refused (revoke stays open — de-escalation is fail-safe), and the
-shared-view tools (`show_shared_view`, `focus_shared_view`,
-`request_shared_view_input`, `capture_shared_view_frame`) activate a
-user-session target only for a granted or owner caller instead of flipping
-the grant themselves. Sharing an agent-owned virtual display never touches
-the user-display grant.
+Granting and resolving a display request are themselves owner/root-only:
+`GrantUserDisplay` and `ResolveDisplayRequest` from a scoped caller are refused
+on both dashboard transports. `RevokeUserDisplay` stays open to an otherwise
+authorized scoped caller — de-escalation is fail-safe. The shared-view tools
+(`show_shared_view`, `focus_shared_view`, `request_shared_view_input`,
+`capture_shared_view_frame`) activate a user-session target only for a granted
+or owner caller instead of flipping the grant themselves. Sharing an
+agent-owned virtual display never touches the user-display grant.
+
+### Dashboard Live workspace
+
+The dashboard's **Live** tab presents local Computer Use as one selected
+display stage. Every active `DisplaySlot` and its WebRTC connection remain
+alive, but only the selected slot is visible; the rail switches that
+projection without recreating the capture or video element. Agent-requested
+shared views select their target when the current stage has no active human
+work. They remain advisory when the user is controlling, awaiting input,
+annotating, calling out, or viewing full-screen; the banner and rail keep the
+requested target discoverable without discarding that work. Peer-display
+launchers are different: they route to the peer-aware **Station** surface
+before opening the stream rather than pretending a federated pane is local.
+
+Input authority in the stage and rail is always the browser-relative server
+state: **you**, **another viewer**, **available** (unclaimed), or connecting.
+Take is last-take-wins; no holder identity or approval ceremony is inferred.
+Only one hidden-input hazard is handled locally: selecting another display or
+leaving Live releases an actively bound slot after flushing held keys and mouse
+buttons, then removes its keyboard, pointer, and document-level paste listeners.
+Annotation and armed-callout state is editable work, so display and tab
+navigation is blocked with a visible explanation until the user finishes or
+closes it.
+Pending Take requests and already-held-but-locally-unbound authority are also
+cancelled before a surface can be hidden. Activity's shared-view **Take input**
+returns to the full Live stage before requesting authority; thumbnails remain
+view-only.
+
+The rail's per-display activity feed combines browser-observed lifecycle
+events (stream connection, authority, private/share mode, presence streaming,
+recording, annotation, and shared-view focus) with the daemon's **live action
+lane**: `computer_use::execute_actions` emits one `cu_action` event per
+successfully executed CU action (`CuActionObserver`), carrying the kind
+(`left_click`, `type`, `screenshot`, …), display id, driving session id,
+display-space coordinates plus their reference resolution, a short raw call
+string (`left_click(612, 233)`; embedded text truncated for presentation —
+the Activity log keeps the full trace), a unix-ms timestamp, and a dedupe
+`event_id`. The lane is deliberately **ephemeral**: it rides the outbound
+broadcast to the `/ws` and dashboard-control lanes only — never the session
+log, never replay — and mouse moves coalesce to 10 Hz. Failed actions never
+emit; the overlays must not show clicks that did not happen. Peer upcasters
+drop the event, so **federated (peer) displays render no action overlays**
+today — a known follow-up.
+
+Those events drive the stage's action overlays on the display they belong
+to: an agent cursor (white arrow + verb pill reading Look / Move / Click /
+Type / Scroll / Waiting) that eases toward each action point, dims while the
+dashboard user holds input authority, and fades out when idle; a click
+ripple; last-typed keypress chips (from the truncated raw call, space shown
+as `·`); and a full-stage screenshot flash. The concept's target-highlight
+box + role tag are deliberately not implemented — no element/role data
+exists on the wire (future AX integration). All overlays are
+`pointer-events: none`, `aria-hidden`, honor `prefers-reduced-motion`, and
+compute geometry from the letterboxed video rect — nothing touches the video
+element itself. Feed rows for actions use a two-line grammar (friendly
+sentence + seconds-precision timestamp, raw mono call below); the feed keeps
+the last 50 entries per display and follows the bottom only when already
+scrolled there.
+
+`cu_action` session attribution also feeds the rail's **approval card**:
+when a pending approval belongs to the session the daemon last reported
+driving the selected display, an amber card renders under Input authority
+whose Approve/Deny proxy the main approval panel's own session-scoped
+actions. No attribution, no card — it never guesses. Recording transitions
+enter the feed only after the daemon confirms them; Start, Stop, and Delete
+remain pending and retain the last confirmed state on transport error or
+timeout, and while recording the Record button ticks the elapsed time from
+the confirmation. At narrow widths the same rail becomes a
+keyboard-accessible modal drawer; the stage toolbar remains the fallback for
+primary controls. In-page full screen similarly contains focus, hides its
+background from assistive technology, supports Escape, and restores the
+invoking control.
 
 ### CU-First Routing
 

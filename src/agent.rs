@@ -675,6 +675,17 @@ impl Agent {
             let build_pty_cmd = |program: &str, args: &[String]| {
                 let mut c = PtyCommandBuilder::new(program);
                 c.args(args);
+                // Unit-test builds point the shell's HOME at a per-process
+                // scratch: even with --norc, an interactive bash writes
+                // ~/.bash_history on exit, and tests must never mutate the
+                // account's real home (tests-are-hermetic). Production
+                // keeps the user's real HOME.
+                if cfg!(test) {
+                    let scratch = std::env::temp_dir()
+                        .join(format!("intendant-test-shell-home-{}", std::process::id()));
+                    let _ = std::fs::create_dir_all(&scratch);
+                    c.env("HOME", &scratch);
+                }
                 c
             };
             let (shell, shell_args) = crate::utils::pty_shell_command();

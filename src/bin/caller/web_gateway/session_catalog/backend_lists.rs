@@ -926,54 +926,15 @@ pub(crate) fn list_gemini_sessions_with_limit(
     rows
 }
 
-pub(crate) fn codex_session_file_id(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line).ok()?;
-        if bytes == 0 {
-            return None;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
-            return obj
-                .get("payload")
-                .and_then(|payload| value_str(payload, "id"));
-        }
-    }
-}
+// Consolidated (message-search F3 phase 2): the streaming id reader moved
+// to `external_agent::codex::rollout` (this file's copy was the canonical
+// body), and the finder delegates to `codex_history`'s engine — which
+// ported this file's filename fast path and adds the wrapper-index
+// stored-path cache, so catalog lookups stop rescanning migrated homes.
+pub(crate) use crate::external_agent::codex::rollout::codex_session_file_id;
 
 pub(crate) fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
-    let codex = codex_dir(home);
-    let mut files = Vec::new();
-    collect_files(&codex.join("sessions"), ".jsonl", &mut files);
-    collect_files(&codex.join("archived_sessions"), ".jsonl", &mut files);
-
-    if let Some(path) = files
-        .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(session_id))
-                && codex_session_file_id(path).as_deref() == Some(session_id)
-        })
-        .cloned()
-    {
-        return Some(path);
-    }
-
-    files
-        .into_iter()
-        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+    crate::codex_history::find_codex_session_file_in(&codex_dir(home), home, session_id)
 }
 
 #[allow(dead_code)]
@@ -1002,28 +963,39 @@ pub(crate) fn external_session_detail_from_home_with_page(
     limit: Option<usize>,
     before: Option<usize>,
 ) -> Option<String> {
-    let mut entries = external_session_entries_from_home(home, source, session_id)?;
+    let entries = external_session_entries_from_home(home, source, session_id)?;
     let effective_limit = limit.or(Some(EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT));
-    let mut page = session_detail_page_entries(entries, effective_limit, before);
-    entries = page.entries;
-    for entry in &mut entries {
+    let page = session_detail_page_entries(entries, effective_limit, before);
+    Some(external_session_detail_body(session_id, page, None))
+}
+
+/// Shared assembly of the external session-detail body (the historical
+/// field set — per-entry websocket text compaction included) plus the
+/// optional additive `locate` object the anchored read (`locate.rs`)
+/// attaches.
+pub(crate) fn external_session_detail_body(
+    session_id: &str,
+    mut page: SessionDetailPageEntries,
+    locate: Option<serde_json::Value>,
+) -> String {
+    for entry in &mut page.entries {
         compact_replay_entry_text_fields_for_websocket(entry);
     }
-    page.entries = entries;
 
-    Some(
-        serde_json::json!({
-            "session_id": session_id,
-            "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
-            "entries": page.entries,
-            "total_entries": page.total_entries,
-            "page_start": page.page_start,
-            "page_end": page.page_end,
-            "has_older": page.page_start > 0,
-            "frames": [],
-        })
-        .to_string(),
-    )
+    let mut body = serde_json::json!({
+        "session_id": session_id,
+        "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+        "entries": page.entries,
+        "total_entries": page.total_entries,
+        "page_start": page.page_start,
+        "page_end": page.page_end,
+        "has_older": page.page_start > 0,
+        "frames": [],
+    });
+    if let Some(locate) = locate {
+        body["locate"] = locate;
+    }
+    body.to_string()
 }
 
 #[cfg(test)]
@@ -1608,7 +1580,7 @@ mod tests {
                     "id": id,
                     "timestamp": "2026-05-17T21:10:00Z",
                     "cwd": "/Users/vm/projects/intendant",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.6",
                     "model_provider": "openai"
                 }
             }),
@@ -1631,6 +1603,7 @@ mod tests {
                         "total_token_usage": {
                             "input_tokens": 1000,
                             "cached_input_tokens": 400,
+                            "cache_write_tokens": 200,
                             "output_tokens": 250,
                             "total_tokens": 1250
                         },
@@ -1664,9 +1637,10 @@ mod tests {
         assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
         assert_eq!(session["completion_tokens"].as_u64(), Some(250));
         assert_eq!(session["cached_tokens"].as_u64(), Some(400));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(200));
         assert_eq!(session["total_tokens"].as_u64(), Some(1250));
         let cost = session["estimated_cost"].as_f64().unwrap();
-        assert!((cost - 0.00535).abs() < 1e-12, "unexpected cost {cost}");
+        assert!((cost - 0.01095).abs() < 1e-12, "unexpected cost {cost}");
     }
 
     #[test]

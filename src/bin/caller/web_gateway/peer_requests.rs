@@ -49,12 +49,10 @@ pub(crate) struct AddPeerRequest {
     pub(crate) browser_tcp_via_url: Option<String>,
 }
 
-
 #[derive(Deserialize)]
 pub(crate) struct RemovePeerRequest {
     pub(crate) peer_id: String,
 }
-
 
 pub(crate) fn trimmed_nonempty(value: Option<String>) -> Option<String> {
     value
@@ -100,7 +98,6 @@ pub(crate) fn persist_manual_peer(
     Ok(project.root.join("intendant.toml"))
 }
 
-
 pub(crate) fn target_card_url_from_request(header_text: &str, is_tls: bool) -> Option<String> {
     let host = header_text
         .lines()
@@ -117,7 +114,6 @@ pub(crate) fn target_card_url_from_request(header_text: &str, is_tls: bool) -> O
         crate::peer::pairing::AGENT_CARD_PATH
     ))
 }
-
 
 pub(crate) fn identity_summary_json(
     record: crate::peer::access_policy::PeerIdentityRecord,
@@ -145,7 +141,6 @@ pub(crate) fn identity_summary_json(
         "issued_via": record.issued_via,
     })
 }
-
 
 // ---------------------------------------------------------------------------
 // Per-peer outbound op handlers
@@ -224,7 +219,6 @@ pub(crate) struct ResolveApprovalRequest {
     pub(crate) request_id: String,
     pub(crate) decision: crate::peer::ApprovalDecision,
 }
-
 
 /// Slice 3b: rewrite an outgoing federated `WebRtcSignal::Answer` to
 /// (a) register the peer's ICE ufrag in the relay registry and
@@ -431,7 +425,6 @@ pub(crate) async fn resolve_url_to_socket_addr(url: &str) -> Option<std::net::So
     // regular connect()).
     tokio::net::lookup_host(authority).await.ok()?.next()
 }
-
 
 // ---------------------------------------------------------------------------
 // Coordinator endpoints — capability-based discovery + delegation

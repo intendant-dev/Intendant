@@ -27,7 +27,8 @@ pub(crate) fn provider_request_item_count(raw: &serde_json::Value) -> Option<usi
 /// drain's select arms. An unbounded await there freezes event and control
 /// processing — including the interrupt-again escape hatch — whenever the
 /// backend stops responding.
-pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const EXTERNAL_INTERRUPT_RPC_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Time-bounded `interrupt_turn()`. Every call inside the drain must go
 /// through this so an unresponsive backend can't wedge the drain loop itself.
@@ -47,6 +48,7 @@ pub(crate) async fn interrupt_turn_bounded(
 /// forwards it to the external agent via `ExternalAgent::interrupt_turn()`.
 /// Backends that don't support interruption return a typed error we log and
 /// continue waiting for — the caller can escalate to `shutdown()` if needed.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -84,6 +86,7 @@ pub(crate) async fn drain_external_agent_events(
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn drain_external_agent_events_with_prefetched(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
@@ -165,18 +168,45 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     // approval handler has unblocked and returned.
     let watcher_handle = {
         let mut watcher_rx = config.bus.subscribe();
+        let watcher_bus = config.bus.clone();
         let registry = config.approval_registry.clone();
         let watcher_session_id = local_session_id.clone();
         let watcher_alias_session_id = alias_session_id.clone();
+        // The backend-native id joins the group mid-flight (announced on the
+        // backend's first stdout); frontends target it afterwards. Seed from
+        // the previous turn's announcement and fold identity events live.
+        // The broadcast lane is LOSSY: a lag here permanently drops events —
+        // a missed SessionIdentity leaves `watcher_native_id` stale (healed
+        // only when the next drain re-seeds from `stats`), and a missed
+        // Interrupt/Stop skips the approval drain — so lags are warned, not
+        // shrugged off.
+        let mut watcher_native_id = stats.announced_native_session_id.clone();
         tokio::spawn(async move {
             loop {
                 match watcher_rx.recv().await {
+                    Ok(AppEvent::SessionIdentity {
+                        session_id,
+                        backend_session_id,
+                        ..
+                    }) => {
+                        if event_targets_session_or_alias(
+                            &Some(session_id),
+                            &watcher_session_id,
+                            &watcher_alias_session_id,
+                        ) {
+                            watcher_native_id = Some(backend_session_id);
+                        }
+                    }
                     Ok(AppEvent::InterruptRequested { session_id })
                     | Ok(AppEvent::SessionStopRequested { session_id, .. })
                         if event_targets_session_or_alias(
                             &session_id,
                             &watcher_session_id,
                             &watcher_alias_session_id,
+                        ) || event_targets_session_or_alias(
+                            &session_id,
+                            &watcher_native_id,
+                            &None,
                         ) =>
                     {
                         let pending: Vec<_> = {
@@ -190,7 +220,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         // a follow-up turn starts new approvals.
                     }
                     Ok(_) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        watcher_bus.send(AppEvent::LogEntry {
+                            session_id: watcher_session_id.clone(),
+                            level: "warn".to_string(),
+                            source: "system".to_string(),
+                            content: format!(
+                                "Drain approval watcher lagged; {} dropped event(s) — a missed SessionIdentity or Interrupt may leave native-id targeting stale or an approval blocked until the next event",
+                                n
+                            ),
+                            turn: None,
+                        });
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -226,6 +268,19 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
             tokio::select! {
             biased;
             bus_event = bus_rx.recv() => {
+                // Frontends address this session by its backend-native id
+                // once announced (mid-flight, via SessionIdentity). The
+                // local/alias ids below were snapshotted at launch — an
+                // un-normalized native target silently missed every guard,
+                // which is how dashboard steers/interrupts vanished after
+                // the identity upgrade.
+                let bus_event = bus_event.map(|event| {
+                    normalize_native_session_target(
+                        event,
+                        &local_session_id,
+                        stats.announced_native_session_id.as_deref(),
+                    )
+                });
                 match bus_event {
                     Ok(AppEvent::SessionStopRequested { session_id, reason })
                         if event_targets_session_or_alias(
@@ -380,13 +435,18 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                             &reason,
                         );
                         if cancelled_queue + cancelled_pending == 0 {
-                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
-                                config.bus.send(AppEvent::SteerCancelled {
-                                    session_id: target_session_id.or_else(|| local_session_id.clone()),
-                                    id,
-                                    reason,
-                                });
-                            }
+                            // Nothing left to cancel: the steer already
+                            // delivered, drained into a follow-up at a turn
+                            // boundary, or was handed to the runtime. The
+                            // old fabricated `SteerCancelled` here made the
+                            // dashboard report a clear while the text still
+                            // reached the model.
+                            emit_steer_cancel_failed_for_unmatched(
+                                config.bus,
+                                target_session_id.or_else(|| local_session_id.clone()),
+                                id,
+                                STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+                            );
                         }
                         continue;
                     }
@@ -405,6 +465,17 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                                     .map(|state| &*state.open_side_threads),
                             )
                         else {
+                            // Foreign session's steer in a multi-session
+                            // daemon — normal. Logged because a WRONGLY
+                            // unmatched id here silently eats a user action
+                            // (the "steering doesn't work" failure class).
+                            slog(config.session_log, |l| {
+                                l.debug(&format!(
+                                    "Steer {} target {:?} does not match this drain (primary {:?}, alias {:?}, native {:?}) — left for its owner",
+                                    id, session_id, local_session_id, alias_session_id,
+                                    stats.announced_native_session_id
+                                ))
+                            });
                             continue;
                         };
                         if steer_id_has_been_handled(handled_steer_ids, &id) {
@@ -1551,7 +1622,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 }
                 let stdout = text;
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
-                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
+                    emit_external_tool_output(
+                        config,
+                        config.session_id.as_deref(),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
@@ -1562,7 +1638,12 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 tool_start_seq.remove(&item_id);
                 pending_context_rewind_turn_stop.record_tool_completed(&item_id, &status);
                 if let Some(stdout) = tool_output_limiter.complete(&item_id) {
-                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
+                    emit_external_tool_output(
+                        config,
+                        config.session_id.as_deref(),
+                        stdout,
+                        Some(&item_id),
+                    );
                 }
                 let tool_preview = tool_previews.remove(&item_id);
                 // Success: nothing to emit.  The tool command was already
@@ -2237,6 +2318,97 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
     }
 }
 
+/// Rewrite session-targeted control events addressed to this drain's
+/// announced backend-native id so they read as targeting the primary
+/// session. The identity contract lets frontends use either id after the
+/// mid-flight upgrade; the drain's launch-time local/alias snapshot can't
+/// know the native id, so targeted control events — Steer/Interrupt/Stop/
+/// CancelSteer/CancelFollowUp/ThreadAction/ConversationRollback — otherwise
+/// fall through every guard and vanish during the announce window.
+pub(crate) fn normalize_native_session_target(
+    event: AppEvent,
+    local_session_id: &Option<String>,
+    announced_native_id: Option<&str>,
+) -> AppEvent {
+    let Some(native) = announced_native_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return event;
+    };
+    let matches_native = |session_id: &Option<String>| {
+        session_id.as_deref().map(str::trim) == Some(native)
+            // Never shadow the real primary/local id (resume launches use
+            // the native id AS the local id — leave those events alone).
+            && local_session_id.as_deref().map(str::trim) != Some(native)
+    };
+    match event {
+        AppEvent::SessionStopRequested { session_id, reason } if matches_native(&session_id) => {
+            AppEvent::SessionStopRequested {
+                session_id: local_session_id.clone(),
+                reason,
+            }
+        }
+        AppEvent::InterruptRequested { session_id } if matches_native(&session_id) => {
+            AppEvent::InterruptRequested {
+                session_id: local_session_id.clone(),
+            }
+        }
+        AppEvent::SteerRequested {
+            session_id,
+            text,
+            id,
+        } if matches_native(&session_id) => AppEvent::SteerRequested {
+            session_id: local_session_id.clone(),
+            text,
+            id,
+        },
+        AppEvent::SteerCancelRequested {
+            session_id,
+            id,
+            reason,
+        } if matches_native(&session_id) => AppEvent::SteerCancelRequested {
+            session_id: local_session_id.clone(),
+            id,
+            reason,
+        },
+        AppEvent::FollowUpCancelRequested {
+            session_id,
+            id,
+            reason,
+        } if matches_native(&session_id) => AppEvent::FollowUpCancelRequested {
+            session_id: local_session_id.clone(),
+            id,
+            reason,
+        },
+        AppEvent::CodexThreadActionRequested {
+            request_id,
+            session_id,
+            action,
+            params,
+            origin,
+        } if matches_native(&session_id) => AppEvent::CodexThreadActionRequested {
+            request_id,
+            session_id: local_session_id.clone(),
+            action,
+            params,
+            origin,
+        },
+        AppEvent::ConversationRollbackRequested {
+            session_id,
+            round_id,
+            target_native_message_count,
+            turns_to_drop,
+        } if matches_native(&session_id) => AppEvent::ConversationRollbackRequested {
+            session_id: local_session_id.clone(),
+            round_id,
+            target_native_message_count,
+            turns_to_drop,
+        },
+        other => other,
+    }
+}
+
 pub(crate) fn emit_follow_up_status(
     bus: &EventBus,
     session_id: Option<&str>,
@@ -2321,7 +2493,9 @@ pub(crate) fn external_turn_status_task(agent_name: &str, round: usize, text: &s
     }
 }
 
-pub(crate) fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<String, String> {
+pub(crate) fn codex_subagent_parent_threads_from_log(
+    log_dir: &std::path::Path,
+) -> HashMap<String, String> {
     let path = log_dir.join("session.jsonl");
     let Ok(contents) = std::fs::read_to_string(path) else {
         return HashMap::new();
@@ -2367,6 +2541,223 @@ pub(crate) fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A dashboard steer targeting the (rotated) primary id, arriving while
+    /// a turn drains, must reach the backend's steer hook — this is the
+    /// turn-2 shape of the "steering doesn't work" report.
+    #[tokio::test]
+    async fn drain_processes_targeted_steer_mid_turn() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            // Post-rotation shape: native id primary, wrapper as alias.
+            session_id: Some("native-thread".to_string()),
+            alias_session_id: Some("wrapper-log-id".to_string()),
+            backend_thread_id: Some("native-thread".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The steer is already on the bus when the drain starts — the
+        // biased select must consume it before the turn's terminal event.
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("native-thread".to_string()),
+            text: "mid-turn steer text".to_string(),
+            id: "steer-e2e-1".to_string(),
+        });
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DrainOutcome::TurnCompleted { .. }),
+            "expected TurnCompleted"
+        );
+        let steers = steers.lock().unwrap();
+        assert_eq!(
+            steers.as_slice(),
+            ["mid-turn steer text"],
+            "targeted steer must reach the backend steer hook"
+        );
+    }
+
+    /// Post-upgrade, frontends target the backend-native id; the drain's
+    /// launch snapshot only knows the wrapper id. Targeted control events
+    /// must be rewritten to the primary — and left alone for foreign
+    /// sessions or when the native id IS the local id (resume launches).
+    #[test]
+    fn native_session_target_normalizes_to_primary() {
+        let local = Some("wrapper-id".to_string());
+        let event = AppEvent::SteerRequested {
+            session_id: Some("native-id".into()),
+            text: "go left".into(),
+            id: "steer-1".into(),
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::SteerRequested { session_id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let foreign = AppEvent::InterruptRequested {
+            session_id: Some("someone-else".into()),
+        };
+        match normalize_native_session_target(foreign, &local, Some("native-id")) {
+            AppEvent::InterruptRequested { session_id } => {
+                assert_eq!(session_id.as_deref(), Some("someone-else"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // Resume shape: local IS the native id — leave the event untouched
+        // (rewriting would be a no-op but must not mint a different id).
+        let resume_local = Some("native-id".to_string());
+        let event = AppEvent::InterruptRequested {
+            session_id: Some("native-id".into()),
+        };
+        match normalize_native_session_target(event, &resume_local, Some("native-id")) {
+            AppEvent::InterruptRequested { session_id } => {
+                assert_eq!(session_id.as_deref(), Some("native-id"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    /// The rest of the targeted control family — follow-up cancels, thread
+    /// actions, conversation rollbacks — must normalize under the same
+    /// identity-group rules: during Claude Code's turn-1 announce window
+    /// they otherwise fall through every drain guard and vanish.
+    #[test]
+    fn native_session_target_normalizes_control_family() {
+        let local = Some("wrapper-id".to_string());
+
+        let event = AppEvent::FollowUpCancelRequested {
+            session_id: Some("native-id".into()),
+            id: Some("fu-1".into()),
+            reason: "cleared by user".into(),
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::FollowUpCancelRequested {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(id.as_deref(), Some("fu-1"));
+                assert_eq!(reason, "cleared by user");
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let event = AppEvent::CodexThreadActionRequested {
+            request_id: "req-1".into(),
+            session_id: Some("native-id".into()),
+            action: "compact".into(),
+            params: serde_json::json!({"k": "v"}),
+            origin: Some("dashboard".into()),
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::CodexThreadActionRequested {
+                request_id,
+                session_id,
+                action,
+                params,
+                origin,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(action, "compact");
+                assert_eq!(params, serde_json::json!({"k": "v"}));
+                assert_eq!(origin.as_deref(), Some("dashboard"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        let event = AppEvent::ConversationRollbackRequested {
+            session_id: Some("native-id".into()),
+            round_id: 7,
+            target_native_message_count: Some(12),
+            turns_to_drop: 2,
+        };
+        match normalize_native_session_target(event, &local, Some("native-id")) {
+            AppEvent::ConversationRollbackRequested {
+                session_id,
+                round_id,
+                target_native_message_count,
+                turns_to_drop,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-id"));
+                assert_eq!(round_id, 7);
+                assert_eq!(target_native_message_count, Some(12));
+                assert_eq!(turns_to_drop, 2);
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+
+        // Foreign targets stay foreign across the whole family.
+        let foreign = AppEvent::FollowUpCancelRequested {
+            session_id: Some("someone-else".into()),
+            id: None,
+            reason: "x".into(),
+        };
+        match normalize_native_session_target(foreign, &local, Some("native-id")) {
+            AppEvent::FollowUpCancelRequested { session_id, .. } => {
+                assert_eq!(session_id.as_deref(), Some("someone-else"));
+            }
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
 
     struct ManagedDrainTestAgent {
         interrupts: Arc<std::sync::atomic::AtomicUsize>,

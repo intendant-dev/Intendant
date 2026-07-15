@@ -28,7 +28,7 @@
     <span class="display-toggle-wrap">
       <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
       <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
-      <div class="display-picker" id="display-picker"></div>
+      <div class="display-picker" id="display-picker" aria-hidden="true"></div>
     </span>
     <span class="sep">|</span>
     <span class="field-label">Intendant session</span>
@@ -81,6 +81,11 @@
 
   <!-- Global Task Bar — always visible across tabs -->
   <div class="global-task-bar">
+    <!-- Conversation peek: the prompt-target session's tail, floated above
+         the dock card (absolute → anchors to the bar, never adds to its
+         measured height / the #app reservation). Filled by
+         ui2-composer-peek.js; inert while hidden. -->
+    <div id="ui2-composer-peek" class="ui2-composer-peek" hidden></div>
     <div class="phase-banner phase-idle" id="phase-banner">
       <span class="spinner" id="phase-spinner"></span>
       <span class="phase-text" id="phase-text">Idle</span>
@@ -88,6 +93,12 @@
     <button id="stop-btn" class="stop-btn" onclick="sendInterrupt()" title="Interrupt current turn" style="display:none">&#x23F9; Stop</button>
     <button id="task-new-session-btn" class="task-new-session-btn" onclick="openNewSessionFromPrompt()" title="Create a new session" aria-label="Create a new session">+ New</button>
     <button id="task-target-chip" class="task-target-chip" type="button" onclick="focusForegroundSessionWindow()" title="Prompt target" style="display:none"></button>
+    <!-- Target hot-swap: in-place session switcher. Button revealed and
+         both wired by ui2-target-switch.js (display:none keeps them inert
+         if that fragment ever regresses to a stub); the popover anchors to
+         the dock card like the peek. -->
+    <button id="task-target-switch-btn" class="task-target-switch-btn" type="button" title="Choose prompt target" aria-haspopup="listbox" aria-expanded="false" style="display:none">&#x25BE;</button>
+    <div id="ui2-target-switch" class="ui2-target-switch" hidden role="listbox" aria-label="Prompt target sessions"></div>
     <div id="edit-message-chip" class="edit-message-chip hidden" title="Editing a previous user message">
       <span id="edit-message-label">Editing</span>
       <button type="button" id="edit-message-cancel" title="Cancel edit">x</button>
@@ -195,12 +206,14 @@
               <button class="strip-minimize-btn" id="strip-minimize" type="button" title="Minimize displays" aria-label="Minimize displays" aria-pressed="false">&minus;</button>
               <button class="strip-toggle-btn" id="strip-toggle" title="Expand displays">&#x25BE;</button>
             </div>
-            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner" data-shared-view-banner>
+            <div class="shared-view-banner shared-view-banner-compact hidden" id="activity-shared-view-banner"
+                 data-shared-view-banner role="status" aria-live="polite" aria-atomic="true">
               <span class="shared-view-kicker">Shared view</span>
               <span class="shared-view-message" data-shared-view-message></span>
               <span class="shared-view-actions">
                 <button class="shared-view-action" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-                <button class="shared-view-close" type="button" data-shared-view-close title="Hide shared view">&times;</button>
+                <button class="shared-view-close" type="button" data-shared-view-close
+                        aria-label="Hide shared view" title="Hide shared view">&times;</button>
               </span>
             </div>
             <div class="activity-display-row" id="activity-display-row"></div>
@@ -276,6 +289,22 @@
               <div class="approval-card">
                 <div class="approval-icon">&#x2753;</div>
                 <div class="approval-content" id="question-content"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Display Request Panel (the user-display doorbell): a scoped
+               agent asked to access display 0 via request_user_display.
+               Body is rendered by showDisplayRequest() in
+               58-display-request.js: requesting session, reason, access
+               level, a duration select, and Allow / Deny / Deny-for-this-
+               session actions. Deliberately NOT the approval panel: display
+               requests have no Approve-all and are never auto-approved. -->
+          <div class="bottom-panel" id="display-request-panel">
+            <div class="panel-body">
+              <div class="approval-card">
+                <div class="approval-icon">&#x1F5B5;</div>
+                <div class="approval-content" id="display-request-content"></div>
               </div>
             </div>
           </div>
@@ -689,11 +718,6 @@
                   <label for="control-codex-reasoning">Reasoning effort</label>
                   <select id="control-codex-reasoning">
                     <option value="">(default)</option>
-                    <option value="minimal">minimal</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                    <option value="xhigh">xhigh</option>
                   </select>
                 </div>
                 <div class="control-hint">Maps to <code>-c&nbsp;model_reasoning_effort=...</code>. Only meaningful for reasoning-capable models; ignored otherwise.</div>
@@ -782,11 +806,13 @@
                     <option value="default" selected>default</option>
                     <option value="acceptEdits">acceptEdits</option>
                     <option value="plan">plan</option>
+                    <option value="auto">auto</option>
+                    <option value="dontAsk">dontAsk</option>
                     <option value="bypassPermissions">bypassPermissions</option>
                   </select>
                 </div>
                 <div class="control-hint">
-                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
+                  <strong>default</strong>: tools outside the allowed list ask — prompts surface as Intendant approvals. <strong>acceptEdits</strong>: file edits auto-approve, commands still ask. <strong>plan</strong>: read-only planning. <strong>auto</strong>: a classifier auto-approves safe calls, the rest still ask. <strong>dontAsk</strong>: anything that would ask is denied instead. <strong>bypassPermissions</strong>: nothing asks — prefer an external sandbox.
                 </div>
               </fieldset>
               <fieldset class="control-group">
@@ -961,19 +987,32 @@
 
     <!-- Displays Tab -->
     <div id="tab-displays" class="tab-pane">
-      <div class="display-approval-banner hidden" id="display-approval-banner">
+      <div class="ui2-live-main" id="ui2-live-main">
+      <div class="ui2-live-mobile-bar">
+        <div>
+          <span class="ui2-live-mobile-kicker">Computer use</span>
+          <span class="ui2-live-mobile-summary" id="ui2-live-mobile-summary">No display selected</span>
+        </div>
+        <button class="ui2-live-rail-toggle" id="ui2-live-rail-toggle" type="button"
+                aria-controls="ui2-live-rail" aria-expanded="false">
+          Displays &amp; input
+        </button>
+      </div>
+      <div class="display-approval-banner hidden" id="display-approval-banner" role="alert" aria-atomic="true">
         <div class="icon">&#x26A0;</div>
         <div class="text">
           <div class="title">Screen sharing approval needed</div>
           <div class="subtitle">A dialog should be visible on the guest desktop — approve it to start the video stream.</div>
         </div>
       </div>
-      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner>
+      <div class="shared-view-banner hidden" id="shared-view-banner" data-shared-view-banner
+           role="status" aria-live="polite" aria-atomic="true">
         <span class="shared-view-kicker">Shared view</span>
         <span class="shared-view-message" id="shared-view-message" data-shared-view-message></span>
         <span class="shared-view-actions">
           <button class="shared-view-action" id="shared-view-take-input" type="button" style="display:none" data-shared-view-take-input title="Take input authority for the focused display">Take input</button>
-          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close title="Hide shared view">&times;</button>
+          <button class="shared-view-close" type="button" id="shared-view-close" data-shared-view-close
+                  aria-label="Hide shared view" title="Hide shared view">&times;</button>
         </span>
       </div>
       <div class="displays-container" id="displays-container">
@@ -1090,6 +1129,44 @@
           <button id="rec-clip-btn" title="Send Clip (C)">&#127916; Clip</button>
         </div>
       </div>
+      </div>
+      <button class="ui2-live-rail-scrim" id="ui2-live-rail-scrim" type="button"
+              aria-label="Close live display controls" tabindex="-1"></button>
+      <aside class="ui2-live-rail" id="ui2-live-rail" aria-labelledby="ui2-live-rail-title">
+        <header class="ui2-live-rail-header">
+          <div>
+            <div class="ui2-live-rail-kicker">Live workspace</div>
+            <h2 id="ui2-live-rail-title">Computer use</h2>
+          </div>
+          <button class="ui2-live-rail-close" id="ui2-live-rail-close" type="button"
+                  aria-label="Close live display controls">&times;</button>
+        </header>
+        <section aria-labelledby="ui2-live-displays-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-displays-heading">Displays</h3>
+          <div class="ui2-live-rail-list" id="ui2-live-displays-list" role="group" aria-label="Live displays"></div>
+        </section>
+        <section aria-labelledby="ui2-live-authority-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-authority-heading">Input authority</h3>
+          <div id="ui2-live-authority-card"></div>
+          <!-- Session-attributed approval card (45b-cu-overlays.js): shown
+               only when a pending approval's session is known to drive the
+               selected display; actions proxy the main approval panel. -->
+          <div id="ui2-live-approval" hidden></div>
+        </section>
+        <section aria-labelledby="ui2-live-activity-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-activity-heading">Display activity</h3>
+          <div class="ui2-live-activity" id="ui2-live-activity" role="log"
+               aria-live="polite" aria-relevant="additions text"></div>
+        </section>
+        <section aria-labelledby="ui2-live-peer-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-peer-heading">Peer displays</h3>
+          <div class="ui2-live-rail-list" id="ui2-live-peer-list" role="group" aria-label="Peer displays"></div>
+        </section>
+        <section aria-labelledby="ui2-live-yourscreen-heading">
+          <h3 class="ui2-live-rail-eyebrow" id="ui2-live-yourscreen-heading">Your screen</h3>
+          <div id="ui2-live-yourscreen"></div>
+        </section>
+      </aside>
     </div>
 
     <!-- Sessions Tab -->
@@ -1147,6 +1224,16 @@
                     <span>Show</span>
                   </label>
                 </div>
+                <!-- Message-search superseded toggle: default-on lane; hidden
+                     when ?message_search=off or unavailable on this daemon
+                     (57-sessions-message-search.js). -->
+                <div class="sessions-control sessions-toggle-field hidden" id="sessions-msg-superseded-field">
+                  <span>Superseded</span>
+                  <label class="sessions-toggle sessions-superseded-toggle" title="Include message matches superseded by rewinds and restores (they stay badged)">
+                    <input type="checkbox" id="sessions-include-superseded" checked>
+                    <span>Include</span>
+                  </label>
+                </div>
                 <label class="sessions-sort">
                   <span>Sort</span>
                   <select id="sort-sessions">
@@ -1166,6 +1253,8 @@
             </div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
             <div class="sessions-hydration-status hidden" id="sessions-hydration-status" aria-live="polite"></div>
+            <!-- Message-search lane status (default on; 57-sessions-message-search.js). -->
+            <div class="sessions-msg-search-status hidden" id="sessions-msg-search-status" aria-live="polite"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
             </div>
@@ -1419,6 +1508,23 @@
                           <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                         </div>
                       </div>
+                      <label class="sessions-new-session-field" for="new-session-codex-model-select">
+                        Codex model
+                        <select id="new-session-codex-model-select" onchange="onNewSessionCodexModelSelectChange()" disabled>
+                          <option value="">Global setting</option>
+                          <option value="__custom__">Custom model id…</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field hidden" for="new-session-codex-model" id="new-session-codex-model-custom-row">
+                        Custom model id
+                        <input id="new-session-codex-model" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. staged-model-id" disabled>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-reasoning-effort">
+                        Reasoning effort
+                        <select id="new-session-codex-reasoning-effort" disabled>
+                          <option value="">Model / global default</option>
+                        </select>
+                      </label>
                       <label class="sessions-new-session-field" for="new-session-claude-model-select">
                         Claude model
                         <select id="new-session-claude-model-select" onchange="onNewSessionClaudeModelSelectChange()" disabled>
@@ -1441,6 +1547,8 @@
                           <option value="default">default</option>
                           <option value="acceptEdits">acceptEdits</option>
                           <option value="plan">plan</option>
+                          <option value="auto">auto</option>
+                          <option value="dontAsk">dontAsk</option>
                           <option value="bypassPermissions">bypassPermissions</option>
                         </select>
                       </label>
@@ -1453,6 +1561,7 @@
                           <option value="high">high</option>
                           <option value="xhigh">xhigh</option>
                           <option value="max">max</option>
+                          <option value="ultracode">ultracode</option>
                         </select>
                       </label>
                       <label class="sessions-new-session-field" for="new-session-codex-sandbox">
@@ -1690,4 +1799,3 @@
       </div>
 
       <div class="subtab-panes">
-

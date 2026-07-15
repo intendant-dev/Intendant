@@ -92,6 +92,38 @@
 .acc-chip.route-webrtc { border-color: color-mix(in srgb, var(--teal) 35%, transparent); color: var(--teal); }
 .acc-chip.route-remembered::before { background: transparent; border: 1px dashed var(--overlay0); width: 5px; height: 5px; }
 .acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
+/* Trust tier chips on fleet cards (docs/src/trust-tiers.md): integrated
+   is the warm keep-your-guard-up accent, disposable stays muted. */
+.acc-chip.acc-tier-integrated::before { background: var(--peach); }
+.acc-chip.acc-tier-integrated { border-color: color-mix(in srgb, var(--peach) 35%, transparent); color: var(--peach); }
+.acc-chip.acc-tier-disposable::before { background: var(--overlay1); }
+.acc-chip.acc-tier-disposable { color: var(--subtext0); }
+/* Two-lane badges (trust-tiers § Two lanes): whose authority a pane
+   spends. 'you · role' stays quiet; 'via daemon · profile' is visibly
+   other; the warn variant marks the one doctrine alarm — an integrated
+   machine reached through the delegation lane. */
+.acc-badge.lane-user { color: var(--subtext0); }
+.acc-badge.lane-via { border-color: color-mix(in srgb, var(--mauve) 35%, transparent); color: var(--mauve); }
+.acc-badge.lane-via.lane-warn,
+.target-summary-kind.lane-warn {
+  border-color: color-mix(in srgb, var(--peach) 55%, transparent);
+  color: var(--peach);
+  font-weight: 600;
+}
+/* Petnames (trust-tiers § lookalike names): the muted self-label beside
+   an owner-named machine, and the inline rename affordance. */
+.acc-fleet-selflabel { color: var(--overlay1); font-size: 10.5px; white-space: nowrap; }
+.acc-fleet-rename {
+  background: none; border: none; color: var(--overlay1);
+  font-size: 11px; cursor: pointer; padding: 0 2px; line-height: 1;
+}
+.acc-fleet-rename:hover { color: var(--text); }
+.acc-fleet-rename-input {
+  background: color-mix(in srgb, var(--surface0) 55%, transparent);
+  border: 1px solid var(--glass-hairline-bright); border-radius: 6px;
+  color: var(--text); font-size: 12px; padding: 1px 6px; min-width: 0;
+  width: 12ch;
+}
 
 /* Role badges — warmer = more authority. */
 .acc-badge, .ui-badge {
@@ -750,6 +782,15 @@
   border-radius: 6px;
   padding: 12px 16px;
   margin: 0 0 16px;
+}
+/* One-shot attention pulse for deep links that land on a panel
+   (openConnectionDiagnostics); removed by the caller after it plays. */
+@keyframes ui-attention-flash {
+  0% { box-shadow: 0 0 0 3px var(--blue); }
+  100% { box-shadow: 0 0 0 3px transparent; }
+}
+.ui-attention-flash {
+  animation: ui-attention-flash 1.6s ease-out;
 }
 .settings-group legend {
   color: var(--blue);

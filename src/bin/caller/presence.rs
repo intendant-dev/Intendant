@@ -1,4 +1,4 @@
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, MessageProvenance};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::knowledge::{self, KnowledgeQuery};
@@ -46,6 +46,7 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
                     display_target: envelope.display_target.clone(),
                     attachments: envelope.attachment_frame_ids.clone(),
                     follow_up_id: None,
+                    delegation_id: None,
                 },
                 confirmation,
             ))
@@ -127,14 +128,17 @@ pub struct PresenceLayer {
     paused: Arc<AtomicUsize>,
     /// Shared context injection queue for mid-task interjections into the agent loop.
     context_injection: crate::event::ContextInjectionQueue,
-    /// Cumulative prompt/completion/cached tokens across all presence turns.
+    /// Cumulative prompt/completion/cache-read/cache-write tokens across all
+    /// presence turns.
     cumulative_prompt: u64,
     cumulative_completion: u64,
     cumulative_cached: u64,
+    cumulative_cache_creation: u64,
 }
 
 impl PresenceLayer {
     /// Create a new presence layer.
+    #[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
     pub fn new(
         provider: Box<dyn ChatProvider>,
         system_prompt: String,
@@ -167,6 +171,7 @@ impl PresenceLayer {
             cumulative_prompt: 0,
             cumulative_completion: 0,
             cumulative_cached: 0,
+            cumulative_cache_creation: 0,
         }
     }
 
@@ -189,7 +194,8 @@ impl PresenceLayer {
             return Ok(String::new());
         }
         self.turn += 1;
-        self.conversation.add_user(input.to_string());
+        self.conversation
+            .add_user(MessageProvenance::FollowUp, input.to_string());
         let result = self.run_model_loop().await;
         self.emit_usage_update();
         result
@@ -207,6 +213,7 @@ impl PresenceLayer {
             prompt_tokens: self.cumulative_prompt,
             completion_tokens: self.cumulative_completion,
             cached_tokens: self.cumulative_cached,
+            cache_creation_tokens: self.cumulative_cache_creation,
         }
     }
 
@@ -230,6 +237,7 @@ impl PresenceLayer {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
         });
     }
 
@@ -252,8 +260,10 @@ impl PresenceLayer {
         }
         self.turn += 1;
         let event_text = format_event(&event);
-        self.conversation
-            .add_user(format!("[Event] {}", event_text));
+        self.conversation.add_user(
+            MessageProvenance::SystemInjection,
+            format!("[Event] {}", event_text),
+        );
         let response = self.run_model_loop().await?;
         if response.trim().is_empty() {
             Ok(None)
@@ -293,6 +303,7 @@ impl PresenceLayer {
             self.cumulative_prompt += response.usage.prompt_tokens;
             self.cumulative_completion += response.usage.completion_tokens;
             self.cumulative_cached += response.usage.cached_tokens;
+            self.cumulative_cache_creation += response.usage.cache_creation_tokens;
             self.conversation.set_usage(response.usage.clone());
             self.conversation.auto_compact();
 
@@ -738,6 +749,7 @@ impl ToolQueryResult {
 ///
 /// For action tools (approve, deny, submit_task, etc.), the caller must handle
 /// dispatch separately — this function only handles read-only query tools.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub async fn handle_tool_query(
     agent_state: &Arc<Mutex<AgentStateSnapshot>>,
     project_root: &std::path::Path,
@@ -1018,6 +1030,10 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
         | AppEvent::SharedView { .. }
+        // The display-request doorbell rings on dashboards (popup +
+        // attention chain), not through presence narration.
+        | AppEvent::DisplayRequestRaised { .. }
+        | AppEvent::DisplayRequestResolved { .. }
         | AppEvent::BrowserWorkspaceChanged { .. }
 
         // Pull-only events — not pushed to presence
@@ -1068,9 +1084,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }
         | AppEvent::ControlCommand(_)
-        | AppEvent::Resize(_, _)
         | AppEvent::Tick
-        | AppEvent::Quit
         | AppEvent::RecordingStarted { .. }
         | AppEvent::RecordingStopped { .. }
         | AppEvent::RecordingError { .. }
@@ -1083,6 +1097,9 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DebugScreenTornDown { .. }
         | AppEvent::DisplayCaptureLost { .. }
         | AppEvent::DisplayApprovalPending { .. }
+        // Presence sees the display via frames; per-action overlay events
+        // are dashboard presentation, not narration material.
+        | AppEvent::CuActionExecuted { .. }
         | AppEvent::LiveAudioStarted { .. }
         | AppEvent::LiveAudioProgress { .. }
         | AppEvent::LiveAudioCompleted { .. }
@@ -1105,7 +1122,12 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SteerDelivered { .. }
         | AppEvent::SteerCancelRequested { .. }
         | AppEvent::SteerCancelled { .. }
-        | AppEvent::FollowUpCancelRequested { .. } => None,
+        | AppEvent::SteerCancelFailed { .. }
+        | AppEvent::FollowUpCancelRequested { .. }
+        // Peer-delegation delivery receipts are wire-facing correlation
+        // events (OutboundEvent::TaskReceived); the accepted task
+        // narrates itself through its own session lifecycle.
+        | AppEvent::TaskReceived { .. } => None,
     }
 }
 
@@ -1276,8 +1298,7 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.phase = "waiting_human".to_string();
             s.pending_question = Some(presence_core::PendingQuestionSnapshot {
                 id: *id,
-                questions: serde_json::to_value(questions)
-                    .unwrap_or(serde_json::Value::Null),
+                questions: serde_json::to_value(questions).unwrap_or(serde_json::Value::Null),
             });
         }
         AppEvent::SubAgentResult { formatted } => {
@@ -1473,6 +1494,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
@@ -1597,6 +1619,7 @@ mod tests {
                 stderr: String::new(),
                 source: None,
                 output_id: None,
+                item_id: None,
             },
             &state,
         );

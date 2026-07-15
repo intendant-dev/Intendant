@@ -647,7 +647,7 @@ function codexThreadActionSpec(op) {
 
 const SESSION_WINDOW_CODEX_ACTIONS = [
   { op: 'fork', label: 'Fork...', title: 'Fork this thread into a new session', ...CODEX_THREAD_ACTION_SPECS.fork },
-  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
+  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral context fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
     label: 'Configure goal...',
@@ -771,6 +771,10 @@ function trimSessionWindowHistoryIfNeeded(win) {
     }
   }
   win.logHistory = history.slice(drop);
+  // New array identity already misses the signature cache; drop it
+  // explicitly so the stale Set (with the trimmed items' signatures)
+  // frees instead of lingering behind the ref check.
+  invalidateSessionWindowHistorySignatureCache(win);
   win.renderStart -= drop;
   win.renderEnd -= drop;
   if (win.log) {
@@ -932,11 +936,13 @@ function buildSessionWindowCommandOutputEntry(c) {
   wrap.appendChild(body);
   const stats = commandOutputRecordStats(c, content);
   const canFetchFull = commandOutputRecordHasFullFetch(c);
+  const itemId = String(c?.item_id || c?.itemId || '').trim();
   summary.innerHTML = commandOutputSummaryHtml({
     chunks: 1,
     lines: stats.lines,
     bytes: stats.bytes,
     warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
+    commandPreview: itemId ? (commandPreviewsByItemId.get(itemId) || '') : '',
   });
   if (content && !canFetchFull) {
     setDeferredCommandOutputText(entry, body, content, stats);
@@ -1047,6 +1053,10 @@ function materializeSessionWindowHistoryItem(win, item, index) {
   node.dataset.historyIndex = String(index);
   if (win?.sessionId && node.dataset?.sessionId && node.dataset.sessionId !== win.sessionId) {
     retargetSessionWindowLogEntry(node, win.sessionId);
+    // In-place retarget rewrites the node's session id, which changes
+    // every signature derived from it — force the window's dedup set to
+    // rebuild (the per-item cache re-keys itself off the new id).
+    win.historySignatureGen = (win.historySignatureGen || 0) + 1;
   }
   return node;
 }
@@ -1068,7 +1078,11 @@ function renderSessionWindowRange(win, start) {
   if (history.length === 0) {
     win.renderStart = 0;
     win.renderEnd = 0;
-    win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+    if (typeof renderSessionWindowLogPlaceholder === 'function') {
+      renderSessionWindowLogPlaceholder(win);
+    } else {
+      win.log.innerHTML = '<div class="session-window-empty">Waiting for events...</div>';
+    }
     scheduleSessionWindowGridFit();
     return;
   }
@@ -1174,12 +1188,56 @@ function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '', op
   }
 }
 
+// The replay-dedup signature set used to be rebuilt from the whole
+// retained history (up to SESSION_WINDOW_HISTORY_LIMIT items, each read
+// through a cloneNode-based content walk) for EVERY streamed line. Keep
+// one Set per window, maintained incrementally by the append paths, and
+// rebuild only when the history was restructured underneath it: trim
+// swaps the array (ref change), dedup splices and transfer empties/pushes
+// (length change), and render-time in-place retargets bump the
+// generation. Entry paths retarget items to win.sessionId BEFORE the
+// first signature computation, so cached items' ids only change through
+// those tracked paths.
 function sessionWindowHistorySignatureSet(win, fallbackSessionId = '') {
+  const history = ensureSessionWindowHistory(win);
+  if (!win) return new Set();
+  const fallback = String(fallbackSessionId || '');
+  const cache = win.historySignatureCache;
+  if (
+    cache &&
+    cache.ref === win.logHistory &&
+    cache.len === history.length &&
+    cache.gen === (win.historySignatureGen || 0) &&
+    cache.fallback === fallback
+  ) {
+    return cache.set;
+  }
   const signatures = new Set();
-  for (const item of ensureSessionWindowHistory(win)) {
+  for (const item of history) {
     addSessionWindowHistorySignatures(signatures, item, fallbackSessionId);
   }
+  win.historySignatureCache = {
+    ref: win.logHistory,
+    len: history.length,
+    gen: win.historySignatureGen || 0,
+    fallback,
+    set: signatures,
+  };
   return signatures;
+}
+
+// Append paths push into history and add the new items' signatures to the
+// live Set themselves; this re-anchors the cache's length so the next
+// lookup stays a hit. Only valid when `signatures` IS the cached set.
+function commitSessionWindowHistorySignatureAppend(win, signatures) {
+  const cache = win?.historySignatureCache;
+  if (cache && cache.set === signatures && cache.ref === win.logHistory) {
+    cache.len = win.logHistory.length;
+  }
+}
+
+function invalidateSessionWindowHistorySignatureCache(win) {
+  if (win) win.historySignatureCache = null;
 }
 
 function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSessionId = '') {
@@ -1205,15 +1263,44 @@ function deduplicateSessionWindowHistory(win, shouldFollow = null) {
   if (history.length < 2) return 0;
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   const kept = [];
-  let signatureToIndex = new Map();
+  // Single-pass replacement bookkeeping (the old version rebuilt the whole
+  // index inside the loop on every priority replacement — O(n²) on replay
+  // bursts). `signatureToIndex` must always equal what a full rebuild
+  // would produce: signature → the SMALLEST kept index owning it. Owners
+  // are tracked per signature (sorted; almost always a single entry) so a
+  // replacement can release the old item's claims and re-derive the
+  // minimum without touching the rest of the index.
+  const keptSignatures = [];
+  const signatureOwners = new Map();
+  const signatureToIndex = new Map();
   let removed = 0;
-  const rebuildIndex = () => {
-    signatureToIndex = new Map();
-    kept.forEach((item, index) => {
-      for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, win.sessionId, { includeUserNearTime: true })) {
-        if (!signatureToIndex.has(signature)) signatureToIndex.set(signature, index);
+  const claim = (signature, index) => {
+    let owners = signatureOwners.get(signature);
+    if (!owners) {
+      owners = [];
+      signatureOwners.set(signature, owners);
+    }
+    if (!owners.length || owners[owners.length - 1] < index) {
+      owners.push(index);
+    } else if (!owners.includes(index)) {
+      const at = owners.findIndex(existing => existing > index);
+      owners.splice(at === -1 ? owners.length : at, 0, index);
+    }
+    signatureToIndex.set(signature, owners[0]);
+  };
+  const release = (signatures, index) => {
+    for (const signature of signatures) {
+      const owners = signatureOwners.get(signature);
+      if (!owners) continue;
+      const at = owners.indexOf(index);
+      if (at >= 0) owners.splice(at, 1);
+      if (!owners.length) {
+        signatureOwners.delete(signature);
+        signatureToIndex.delete(signature);
+      } else {
+        signatureToIndex.set(signature, owners[0]);
       }
-    });
+    }
   };
   for (const item of history) {
     const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, win.sessionId, { includeUserNearTime: true });
@@ -1222,19 +1309,22 @@ function deduplicateSessionWindowHistory(win, shouldFollow = null) {
       .find(index => index !== undefined);
     if (existingIndex !== undefined) {
       if (sessionWindowHistoryItemPriority(item) > sessionWindowHistoryItemPriority(kept[existingIndex])) {
+        release(keptSignatures[existingIndex], existingIndex);
         kept[existingIndex] = item;
-        rebuildIndex();
+        keptSignatures[existingIndex] = itemSignatures;
+        for (const signature of itemSignatures) claim(signature, existingIndex);
       }
       removed += 1;
       continue;
     }
+    const index = kept.length;
     kept.push(item);
-    for (const signature of itemSignatures) {
-      if (!signatureToIndex.has(signature)) signatureToIndex.set(signature, kept.length - 1);
-    }
+    keptSignatures.push(itemSignatures);
+    for (const signature of itemSignatures) claim(signature, index);
   }
   if (removed === 0) return 0;
   history.splice(0, history.length, ...kept);
+  invalidateSessionWindowHistorySignatureCache(win);
   const follow = shouldFollow === null ? wasRenderingTail : !!shouldFollow;
   if (follow || wasRenderingTail) {
     renderSessionWindowTail(win);
@@ -1260,6 +1350,8 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
   ) return;
   stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
   history.push(item);
+  addSessionWindowHistorySignatures(signatures, item, win.sessionId);
+  commitSessionWindowHistorySignatureAppend(win, signatures);
   const renderedIncrementally = wasRenderingTail
     && appendSessionWindowRenderedTailItem(win, item, history.length - 1, history.length);
   if ((shouldFollow || wasRenderingTail) && !renderedIncrementally) {
@@ -1292,6 +1384,7 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
     addSessionWindowHistorySignatures(signatures, item, win.sessionId);
   }
   if (items.length === 0) return;
+  commitSessionWindowHistorySignatureAppend(win, signatures);
   const renderedIncrementally = wasRenderingTail
     && items.length <= SESSION_WINDOW_PREPEND_CHUNK
     && appendSessionWindowRenderedTailItems(win, items, startIndex, history.length);
@@ -1908,9 +2001,12 @@ function hydrateSessionRelationshipRows(rel) {
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
   const url = `/api/sessions?ids=${encodeURIComponent(pending.join(','))}`;
-  dashboardJsonFetch('api_sessions', { ids: pending }, () => authedFetch(url), 'api_sessions_relationships')
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+  // daemonApi (transport F2): tunnel first, direct HTTP per the GET-twin
+  // fallback policy (`url` survives as the error label).
+  daemonApi.request('api_sessions', { ids: pending })
+    .then(resp => resp.ok ? resp.body : Promise.reject(new Error(`${url} returned ${resp.status}`)))
     .then(rows => {
+      noteSessionMetadataPollRecovery('session relationship hydration', pending);
       if (!Array.isArray(rows)) return;
       for (const id of pending) {
         if (!rows.some(row => sessionRowMatchesId(row, id))) {
@@ -1920,7 +2016,7 @@ function hydrateSessionRelationshipRows(rel) {
       cacheSessionWindowMetadata(rows);
       mergeSessionRowsIntoLoadedSessions(rows);
     })
-    .catch(() => {})
+    .catch(err => noteSessionMetadataPollFailure('session relationship hydration', err, pending))
     .finally(() => {
       sessionRelationshipHydrationInFlight.delete(key);
     });
@@ -2175,12 +2271,23 @@ function sideCloseParamsForSession(sessionId) {
   };
 }
 
+// Capability-driven: only a parent that advertises `side-close` can end the
+// side in-process (Codex). A respawned side (Claude Code /btw) is its own
+// live backend — no advertised op, so Stop session applies to it instead.
+function sideCloseSupportedForSession(sessionId) {
+  const close = sideCloseParamsForSession(sessionId);
+  if (!close) return false;
+  const parentMeta = sessionMetadataById.get(close.parentSessionId) || {};
+  const ops = (parentMeta.capabilities || {}).codexThreadActions;
+  return Array.isArray(ops) && ops.includes('side-close');
+}
+
 function maybeDispatchSideClose(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!sid || win?.ended) return false;
+  if (!sideCloseSupportedForSession(sid)) return false;
   const close = sideCloseParamsForSession(sid);
-  if (!close) return false;
   return dispatchCodexThreadAction('side-close', close.params, close.parentSessionId, {
     internalSideClose: true,
   });
@@ -2378,11 +2485,22 @@ function sessionWindowExternalActionContext(sessionId) {
 function sessionWindowExternalActionAvailability(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return { ok: false, reason: 'No session selected.', toast: '' };
-  if (sessionWindowIsSide(sid) || sessionWindowIsSubagent(sid)) {
+  if (sessionWindowIsSubagent(sid)) {
     return {
       ok: false,
       reason: 'This is a related session. Stop the parent session instead.',
       toast: 'Stop the parent session instead',
+    };
+  }
+  // A side window is close-only when its parent can actually end it
+  // in-process; a respawned side (Claude Code /btw) is its own live
+  // backend and falls through to the normal Stop path — the old
+  // unconditional side gate left those children unstoppable.
+  if (sessionWindowIsSide(sid) && sideCloseSupportedForSession(sid)) {
+    return {
+      ok: false,
+      reason: 'This side conversation lives inside its parent thread. Use Close side instead.',
+      toast: 'Use Close side for this side conversation',
     };
   }
   const source = externalSourceForSessionWindow(sid);
@@ -2459,7 +2577,7 @@ async function chooseSessionWindowCloseAction(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
   const stopAvailability = sessionWindowStopAvailability(sid);
-  const canCloseSide = !stopAvailability.ok && !!sideCloseParamsForSession(sid);
+  const canCloseSide = !stopAvailability.ok && sideCloseSupportedForSession(sid);
   const alternateLabel = stopAvailability.ok
     ? 'Stop session'
     : canCloseSide

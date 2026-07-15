@@ -1,6 +1,5 @@
 //! The served surface: landing/connect/trust/access pages and their HTML
-//! builders, the embedded installers and brand assets, health probes, and
-//! the static-asset fallback.
+//! builders, the embedded installers and brand assets, and health probes.
 
 use super::*;
 
@@ -8,10 +7,10 @@ pub(crate) async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
-/// The bootstrap installer (credential custody, rollout step 6), embedded
+/// The hosted installer, embedded
 /// at build time so the service — hosted or self-hosted — serves the
 /// installer that matches its own version:
-///   curl -fsSL <origin>/install.sh | sh -s -- --owner <fingerprint>
+///   curl -fsSL <origin>/install.sh | sh -s --
 ///
 /// Served with this rendezvous' public origin injected as the default
 /// `--connect` URL: fetching the installer from a rendezvous IS the opt-in,
@@ -21,7 +20,8 @@ pub(crate) async fn healthz() -> impl IntoResponse {
 /// phone home to intendant.dev; serve-time injection keeps self-hosting
 /// exact.) Explicit `--connect` / `-Connect` still wins over the default.
 pub(crate) const INSTALL_SH: &str = include_str!("../../../scripts/install.sh");
-pub(crate) const INSTALL_SH_CONNECT_DEFAULT: &str = r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
+pub(crate) const INSTALL_SH_CONNECT_DEFAULT: &str =
+    r#"CONNECT_URL="${INTENDANT_CONNECT_RENDEZVOUS_URL:-}""#;
 
 /// Only a plain URL charset may be spliced into the scripts — anything
 /// else (quotes, spaces, `$`) could change what the shell parses. A
@@ -55,7 +55,7 @@ pub(crate) async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoR
 }
 
 /// The Windows counterpart, for PowerShell:
-///   & ([scriptblock]::Create((irm <origin>/install.ps1))) -Owner <fingerprint>
+///   & ([scriptblock]::Create((irm <origin>/install.ps1)))
 pub(crate) const INSTALL_PS1: &str = include_str!("../../../scripts/install.ps1");
 pub(crate) const INSTALL_PS1_CONNECT_DEFAULT: &str = "    [string]$Connect = \"\",";
 
@@ -86,6 +86,10 @@ pub(crate) async fn install_ps1(State(state): State<Arc<AppState>>) -> impl Into
 /// viewBox space; the PNG fallback is rendered from it (`rsvg-convert -w 128`).
 pub(crate) const LOGO_SVG: &str = include_str!("../../../static/logo.svg");
 pub(crate) const BRAND_ICON_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
+/// Connect's push-notification worker. This is the sole shared-static source
+/// file the rendezvous exposes, and it is embedded at compile time under one
+/// explicit route rather than reachable through a filesystem fallback.
+pub(crate) const CONNECT_SERVICE_WORKER_JS: &str = include_str!("../../../static/sw.js");
 
 pub(crate) async fn logo_svg() -> impl IntoResponse {
     (
@@ -107,19 +111,39 @@ pub(crate) async fn favicon_png() -> impl IntoResponse {
     )
 }
 
+pub(crate) async fn service_worker_js() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert("service-worker-allowed", HeaderValue::from_static("/"));
+    (headers, CONNECT_SERVICE_WORKER_JS).into_response()
+}
+
 /// Product screenshots for the landing page, embedded like the installer so
 /// every deployment serves visuals that match its own UI. Captured from a
 /// staged local rig (daemon "atlas", account "@ada") — synthetic content only.
+/// A table rather than a match so the artifact-transparency manifest
+/// (transparency.rs) enumerates exactly what this route serves.
+pub(crate) const LANDING_ASSETS: &[(&str, &[u8])] = &[
+    ("hero.webp", include_bytes!("assets/landing-hero.webp")),
+    ("video.webp", include_bytes!("assets/landing-video.webp")),
+    ("vault.webp", include_bytes!("assets/landing-vault.webp")),
+    (
+        "station.webp",
+        include_bytes!("assets/landing-station.webp"),
+    ),
+    ("claim.webp", include_bytes!("assets/landing-claim.webp")),
+    ("phone.webp", include_bytes!("assets/landing-phone.webp")),
+];
+
 pub(crate) fn landing_asset_bytes(name: &str) -> Option<&'static [u8]> {
-    match name {
-        "hero.webp" => Some(include_bytes!("assets/landing-hero.webp")),
-        "video.webp" => Some(include_bytes!("assets/landing-video.webp")),
-        "vault.webp" => Some(include_bytes!("assets/landing-vault.webp")),
-        "station.webp" => Some(include_bytes!("assets/landing-station.webp")),
-        "claim.webp" => Some(include_bytes!("assets/landing-claim.webp")),
-        "phone.webp" => Some(include_bytes!("assets/landing-phone.webp")),
-        _ => None,
-    }
+    LANDING_ASSETS
+        .iter()
+        .find(|(asset_name, _)| *asset_name == name)
+        .map(|(_, bytes)| *bytes)
 }
 
 pub(crate) async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response {
@@ -137,15 +161,13 @@ pub(crate) async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response 
 }
 
 pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> Response {
-    let app_html = state.config.static_root.join("app.html");
-    let static_ok = app_html.is_file();
     let state_parent_ok = state
         .config
         .data_file
         .parent()
         .map(|parent| parent.exists() || std::fs::create_dir_all(parent).is_ok())
         .unwrap_or(false);
-    let ok = static_ok && state_parent_ok;
+    let ok = state_parent_ok;
     let status = if ok {
         StatusCode::OK
     } else {
@@ -155,108 +177,77 @@ pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> Response {
         status,
         Json(json!({
             "ok": ok,
-            "static_app": static_ok,
             "state_parent": state_parent_ok,
         })),
     )
         .into_response()
 }
 
-pub(crate) async fn landing_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(landing_ui_html(&state.config.public_origin))
+const HTML_FRAME_ANCESTORS: &str = "frame-ancestors 'none'";
+
+fn deny_html_framing(headers: &mut HeaderMap) {
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(HTML_FRAME_ANCESTORS),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
 }
 
-pub(crate) async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(connect_ui_html(
-        &state.config.public_origin,
-        "Intendant Connect",
-        "Rendezvous account",
-    ))
+fn html_response(body: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    deny_html_framing(&mut headers);
+    (headers, body).into_response()
 }
 
-pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(trust_ui_html(&state.config.public_origin))
+pub(crate) async fn landing_ui(State(state): State<Arc<AppState>>) -> Response {
+    html_response(landing_ui_html(&state.config.public_origin))
 }
 
-pub(crate) async fn access_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(connect_ui_html(
-        &state.config.public_origin,
+/// The `/connect` page body — shared by the route handler and the
+/// artifact-transparency manifest so both hash/serve identical bytes.
+pub(crate) fn connect_page_html(origin: &str) -> String {
+    connect_ui_html(origin, "Intendant Connect", "Rendezvous account")
+}
+
+/// The `/access` page body (see `connect_page_html`).
+pub(crate) fn access_page_html(origin: &str) -> String {
+    connect_ui_html(
+        origin,
         "Intendant Access",
         "Rendezvous and fleet navigation",
-    ))
-}
-
-pub(crate) async fn app_html(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
-    if !valid_connect_app_query(uri.query()) {
-        return Ok(Redirect::to("/connect").into_response());
-    }
-    let path = state.config.static_root.join("app.html");
-    serve_file(&state.config.static_root, &path)
-}
-
-pub(crate) fn valid_connect_app_query(query: Option<&str>) -> bool {
-    let Some(query) = query else {
-        return false;
-    };
-    let mut connect_mode = false;
-    let mut daemon_id = false;
-    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        match key.as_ref() {
-            "connect" => connect_mode = value == "1",
-            "daemon_id" => daemon_id = !value.trim().is_empty(),
-            _ => {}
-        }
-    }
-    connect_mode && daemon_id
-}
-
-pub(crate) async fn static_asset(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
-    let path = safe_static_path(&state.config.static_root, uri.path())
-        .ok_or_else(|| ApiError::not_found("not found"))?;
-    serve_file(&state.config.static_root, &path)
-}
-
-pub(crate) fn safe_static_path(root: &Path, uri_path: &str) -> Option<PathBuf> {
-    let trimmed = uri_path.trim_start_matches('/');
-    if trimmed.is_empty() || trimmed.contains('\0') {
-        return None;
-    }
-    let rel = Path::new(trimmed);
-    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return None;
-    }
-    Some(root.join(rel))
-}
-
-pub(crate) fn serve_file(root: &Path, path: &Path) -> ApiResult<Response> {
-    if !path.starts_with(root) || !path.is_file() {
-        return Err(ApiError::not_found("not found"));
-    }
-    let body = std::fs::read(path).map_err(|e| ApiError::not_found(format!("not found: {e}")))?;
-    let content_type = content_type_for_path(path);
-    Ok((
-        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-        body,
     )
-        .into_response())
 }
 
-pub(crate) fn content_type_for_path(path: &Path) -> &'static str {
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "wasm" => "application/wasm",
-        "json" => "application/json; charset=utf-8",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "webmanifest" => "application/manifest+json",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "woff2" => "font/woff2",
-        _ => "application/octet-stream",
-    }
+pub(crate) async fn connect_ui(State(state): State<Arc<AppState>>) -> Response {
+    html_response(connect_page_html(&state.config.public_origin))
+}
+
+pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>) -> Response {
+    html_response(trust_ui_html(&state.config.public_origin))
+}
+
+pub(crate) async fn access_ui(State(state): State<Arc<AppState>>) -> Response {
+    html_response(access_page_html(&state.config.public_origin))
+}
+
+/// The default Connect build is a directory, not a daemon-control client.
+/// Keep both historical entry-point spellings as fail-closed redirects so
+/// bookmarked or crafted `?connect=1&daemon_id=...` URLs cannot load the
+/// dashboard SPA from the hosted origin.
+pub(crate) async fn app_html() -> Response {
+    Redirect::to("/connect").into_response()
+}
+
+/// No filesystem fallback exists in the default Connect binary. This is a
+/// security boundary: the repo's static root contains the daemon dashboard
+/// and authority-bearing control client, which hosted-origin JS must never
+/// serve or activate.
+pub(crate) async fn not_found() -> Response {
+    StatusCode::NOT_FOUND.into_response()
 }
 
 pub(crate) fn trust_ui_html(origin: &str) -> String {
@@ -306,34 +297,34 @@ pub(crate) fn trust_ui_html(origin: &str) -> String {
   <header><div class="topbar"><img class="brand-mark" src="/logo.svg" alt=""><a href="/connect">Intendant Connect</a></div></header>
   <main>
     <h1>How trust works here</h1>
-    <p class="lede">The short version: this service makes introductions and carries ciphertext. Authority over your computers never lives here &mdash; not even when you sign in.</p>
+    <p class="lede">The short version: this service handles accounts, routes, availability, hosted code, installers, and optional encrypted push delivery. A daemon grant can only be minted by that daemon's local IAM.</p>
 
     <h2>What this service actually does</h2>
-    <p>Four jobs, all deliberately powerless: it <em>introduces</em> your browser to your computers (signaling), <em>relays</em> encrypted traffic when networks are awkward, <em>stores</em> your fleet list as client-signed records whose private fields are end-to-end encrypted, and <em>remembers</em> which computers your account claimed. Every session that reaches one of your computers is verified twice at the ends: your browser checks a signature made by the computer itself, and the computer checks a signature made by your browser&rsquo;s own key &mdash; a key that never leaves your device.</p>
+    <p>Connect <em>serves</em> this discovery client and its installers, <em>publishes</em> daemon routes and presence, <em>stores</em> client-signed fleet records, and <em>remembers</em> which routes an account linked. A link creates no daemon principal or grant. This hosted build and its fleet WebPKI names are discovery-only and cannot open a daemon control session; use a trusted local or independently verified direct-mTLS surface for access. No signed/notarized native release exists for this alpha.</p>
 
     <h2>"But I sign in with a passkey&hellip;"</h2>
     <p>A fair question: doesn&rsquo;t signing in give the server something it could use?</p>
-    <p>A passkey never hands over a key. Your device signs a one-time challenge, bound to this origin &mdash; the server can&rsquo;t replay it anywhere, can&rsquo;t sign anything with it, and can&rsquo;t derive anything from it. The signature proves you <em>to the rendezvous, for rendezvous-scoped things</em>: your claim list, your encrypted fleet metadata, your signaling session. The encryption key for that metadata is computed inside your authenticator (the WebAuthn PRF extension) and handed only to the page in your browser &mdash; it is not part of what the server receives.</p>
+    <p>The authenticator&rsquo;s passkey secret remains non-extractable: this service does not receive the private key and cannot use it at another origin. But this service controls the JavaScript running at this origin. Malicious replacement code could prompt for user verification, request a valid assertion or PRF evaluation, and then use or exfiltrate the resulting assertion, PRF output, or decrypted account state available to that page. The passkey authenticates you only for Connect account, route, and encrypted-metadata operations; none of those results authenticates to a daemon or grants daemon authority.</p>
 
     <h2>If this service turned malicious</h2>
     <ol>
-      <li><strong>It could lie in introductions.</strong><span>When relaying, it could claim your account is someone else &mdash; but computers treat account claims as the weakest identity there is: they only matter if the computer&rsquo;s owner already granted that account a role locally, hosted sessions are capped below full control by default, and the strong identity in every offer is your browser&rsquo;s end-to-end signature, which this service cannot forge.</span></li>
-      <li><strong>It could deny service.</strong><span>Any relay can. You would notice, and nothing would be exposed.</span></li>
-      <li><strong>It could serve this page with malicious code.</strong><span>The honest residual risk of any hosted web app. It is bounded on purpose: sessions from this origin are role-capped by every computer&rsquo;s own policy, your durable identity key is scoped to each origin (code served here can never wield the key your own computer&rsquo;s dashboard holds), and organization membership never flows through accounts. If you don&rsquo;t want to extend even this much trust, don&rsquo;t: browse via your own computer&rsquo;s address, or run your own rendezvous.</span></li>
+      <li><strong>It could lie in introductions.</strong><span>It can alter account and routing metadata, substitute the daemon key at first introduction, or deny a route. A daemon signature checked by this page proves consistency with the key Connect linked; it is not an independent key pin, because this service supplies both the first key record and the browser code doing the check. Account assertions never authenticate to a daemon, and this hosted build has an immutable <code>role:none</code> ceiling: it cannot open a control session even if local state is edited to grant its browser key.</span></li>
+      <li><strong>It could deny service.</strong><span>Connect controls availability for its account, route, presence, and push services. Denial does not add daemon authority, but it can hide or delay those updates.</span></li>
+      <li><strong>It could serve malicious code or installers.</strong><span>Hosted code can misuse Connect account state and any decrypted vault or fleet data made available after a user gesture; a replaced installer can compromise what it installs. There is no hosted or fleet-name daemon-control session in the default product. Use a trusted local or independently verified direct-mTLS root surface; self-host or verify artifacts out of band if you do not trust this deployment. The current native artifact is unsigned development-only.</span></li>
     </ol>
 
     <div class="card good">
-      <strong>The rule the whole design follows:</strong> privileged code is served by you or by the resource owner; authority is only ever minted by the target computer&rsquo;s local access control; global services carry introductions, ciphertext, and signatures &mdash; nothing else.
+      <strong>The rule the protocol follows:</strong> authority records are minted and enforced only by the target daemon's local access control; the rendezvous API cannot mint one. Connect is still trusted for availability, account and route metadata, and the code and installers it serves. A malicious installer can compromise what it installs, so those are real limits rather than a claim that the service is powerless.
     </div>
 
     <h2>Notifications</h2>
     <p class="dim">Optional Web Push alerts ("your computer went offline") are composed from the polling presence this service already sees &mdash; no new knowledge &mdash; and each payload is encrypted to your browser&rsquo;s subscription, so the push relays in between carry ciphertext.</p>
 
     <h2>Names are checkable here</h2>
-    <p class="dim">Every name binding this service hands out &mdash; which key a computer had when claimed, handle creations, revocation lists, verified badges &mdash; is committed to an append-only transparency log. Your browser pins the signed tree head and re-verifies on every visit that history only ever grew. Handles can carry <em>verified identity</em> badges (a DNS record or GitHub gist you control); verification is decoration, never authority. Dormant handles with no computers and no sign-ins are eventually freed &mdash; squatted names don&rsquo;t keep.</p>
+    <p class="dim">Every name binding this service hands out &mdash; which daemon key Connect recorded for a linked computer, handle creations, revocation lists, verified badges &mdash; is committed to an append-only transparency log. Your browser pins the signed tree head and re-verifies on every visit that history only ever grew. This makes later rewriting detectable; it does not independently validate the first key or the browser code served by this origin. Handles can carry <em>verified identity</em> badges (a DNS record or GitHub gist you control); verification is decoration, never authority. Dormant handles with no computers and no sign-ins are eventually freed &mdash; squatted names don&rsquo;t keep.</p>
 
     <h2>Organizations</h2>
-    <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em> &mdash; also root-signed and rollback-protected, so the worst a malicious board can do is withhold it, never forge it.</p>
+    <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em>, also root-signed. A computer that has recorded a sequence high-water mark rejects rollback below it; a fresh computer can still be shown an older signed list. A malicious board can withhold or serve stale data, but cannot forge a newer valid list.</p>
 
     <h2>Verify all of this</h2>
     <p class="dim">The component is open and self-hostable: <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">run your own rendezvous</a>, read the <a href="https://intendant-dev.github.io/Intendant/trust-architecture.html" target="_blank" rel="noopener">full trust architecture</a>, or audit the <a href="https://github.com/intendant-dev/Intendant" target="_blank" rel="noopener">source</a>.</p>
@@ -350,15 +341,15 @@ pub(crate) const REPO_URL: &str = "https://github.com/intendant-dev/Intendant";
 
 /// The deployment advisor — the lead of the landing install section: four
 /// questions -> one command per platform (sh or PowerShell, `--service` where it belongs)
-/// plus an honest fueling plan for after the claim. A separate const so
+/// plus an honest credential-setup plan for after the claim. A separate const so
 /// its CSS/JS braces stay out of the page-level `format!`; it derives
 /// the command from `location.origin` at runtime, so a self-hosted
 /// rendezvous advertises its own installer here too. The default answers'
 /// command is server-rendered into the terminal (via the
 /// `__ADVISOR_DEFAULT_CMD__` placeholder) so the page works without JS
 /// and the one-command story is visible before any click. Every question
-/// is about the agent's machine — the client side needs no install and
-/// therefore no questions.
+/// is about the agent's machine. A browser needs no separate app install,
+/// but daemon control still requires trusted certificate/profile enrollment.
 pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advisor">
         <style>
           .advisor { border: 1px solid var(--line); border-radius: var(--radius); background: rgba(30, 30, 46, .55); }
@@ -420,36 +411,32 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
             // script (the page-level invariant the tests pin).
             var svc = pick.box !== 'laptop';
             var cmd = pick.os === 'windows'
-              ? '& ([scriptblock]::Create((irm ' + location.origin + "/install.ps1))) -Owner '\u003cyour-key\u003e'" + (svc ? ' -Service' : '')
-              : 'curl -fsSL ' + location.origin + '/install.sh | sh -s -- --owner \u003cyour-key\u003e' + (svc ? ' --service' : '');
+              ? '& ([scriptblock]::Create((irm ' + location.origin + '/install.ps1)))' + (svc ? ' -Service' : '')
+              : 'curl -fsSL ' + location.origin + '/install.sh | sh -s --' + (svc ? ' --service' : '');
             document.getElementById('advps').textContent = pick.os === 'windows' ? 'PS> ' : '$ ';
             document.getElementById('advtitle').textContent = pick.os === 'windows' ? 'fresh box — PowerShell' : 'fresh box — sh';
             document.getElementById('advcmd').textContent = cmd;
             var plan = [];
             if (pick.box === 'laptop') {
-              plan.push('<b>Fueling is optional here.</b> A local .env key works as-is; the vault still adds cross-device sync and one-click revocation.');
+              plan.push('<b>Local credentials work as-is.</b> A .env key remains supported. The daemon-store vault is available from a trusted local or independently verified direct-mTLS client. Connect implements blind account-vault storage, but this directory serves no vault client or delivery bridge.');
             } else {
               var watched = pick.solo === 'no';
               if (pick.fuel !== 'sub') {
-                plan.push(watched
-                  ? '<b>Anthropic & Gemini: client egress.</b> The box never holds a key — its provider calls detour through this browser, and stop when it closes. OpenAI’s API refuses browser relay, so lease that one with the offline window at “while connected only”.'
-                  : '<b>API keys: leases with a 24 h offline window.</b> Borrowed in memory only, never on disk, revocable from any signed-in device.');
+                plan.push('<b>API keys:</b> configure .env on the box, or open the daemon through a trusted local/direct-mTLS client and grant a memory-only lease from its daemon-store vault. This hosted Connect tab cannot fuel the daemon or relay its calls.');
               }
               if (pick.fuel !== 'api') {
-                plan.push('<b>Subscriptions: access-token OAuth leases</b> (the default) — your browser refreshes the token and leases only the short-lived result. Codex works out of the box.');
-                plan.push(watched
-                  ? '<b>Claude Code</b> still needs the full-credential opt-in (Anthropic’s token endpoint refuses browser refresh) — decide per box.'
-                  : '<b>Unattended subscription runs</b> beyond the token’s life (≈ 1 h) need the full-credential opt-in: the honest trade is durable authority on the box for the lease window. Claude Code always needs it today.');
+                plan.push('<b>Subscriptions:</b> establish auth through the signed client or another trusted direct surface. Access-token leases are short-lived; full-credential OAuth mode temporarily materializes a private auth home on the daemon for the lease window.');
+                if (!watched) plan.push('<b>Unattended runs:</b> plan for local credential custody or an explicitly authorized trusted client. Closing this hosted tab changes no daemon credential state.');
               }
             }
             document.getElementById('advplan').innerHTML = plan.map(function (item) { return '<li>' + item + '</li>'; }).join('');
-            var note = { vps: 'A disposable box should hold nothing durable. With client egress the key was never on it; with access-token leases what lands there dies in minutes. Wipe it — or lose it — and nothing leaks.',
-                         server: 'Nothing rests on disk either way — leases only bound what a runtime compromise could spend before you revoke.',
-                         laptop: 'Custody buys the least on the machine your browser already runs on.' }[pick.box];
+            var note = { vps: 'A deliberately keyless box outside a full-credential OAuth lease can avoid durable provider secrets. That is a deployment choice, not a promise made by Connect.',
+                         server: 'Choose the daemon’s credential source deliberately: .env is durable; API-key leases are memory-only; full-credential OAuth leases temporarily write private auth files.',
+                         laptop: 'Connect account-vault storage has no shipped client or trusted delivery bridge; use the daemon-store vault from a trusted surface.' }[pick.box];
             if (svc) {
               note += pick.os === 'windows'
-                ? ' -Service installs a Task Scheduler entry (at boot when elevated, at logon otherwise) supervised by a built-in restart loop; the installer prints the log file the claim phrase lands in. Run it from PowerShell.'
-                : ' --service keeps the daemon alive past this SSH session via the platform’s own supervisor — systemd where present, launchd on macOS, cron plus the built-in supervisor elsewhere — and prints where the claim phrase lands.';
+                ? ' -Service installs a Task Scheduler entry (at boot when elevated, at logon otherwise) supervised by a built-in restart loop; the installer prints the log file the one-time claim code lands in. Run it from PowerShell.'
+                : ' --service keeps the daemon alive past this SSH session via the platform’s own supervisor — systemd where present, launchd on macOS, cron plus the built-in supervisor elsewhere — and prints where the one-time claim code lands.';
             }
 
             document.getElementById('advnote').textContent = note;
@@ -473,8 +460,7 @@ pub(crate) const LANDING_ADVISOR_HTML: &str = r##"<div class="advisor" id="advis
 /// the install one-liner is origin-aware so a self-hosted rendezvous
 /// advertises its own installer.
 pub(crate) fn landing_ui_html(origin: &str) -> String {
-    // The placeholder must be entity-escaped or the browser eats it as a tag.
-    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s -- --owner &lt;your-key&gt;");
+    let install_cmd = format!("curl -fsSL {origin}/install.sh | sh -s --");
     // r## because the page contains fragment links (`href="#install"`),
     // whose `"#` would terminate a plain r#-string.
     format!(
@@ -694,7 +680,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
 <body>
   <div class="wrap">
     <header>
-      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span><span class="pill-alpha">pre-alpha</span></div>
+      <div class="mark"><img src="/logo.svg" alt="">intendant<span>.dev</span><span class="pill-alpha">alpha</span></div>
       <nav>
         <a href="/trust">How trust works</a>
         <a href="{DOCS_URL}">Docs</a>
@@ -712,11 +698,13 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
         phone calls — with layered human supervision. It runs its own agent
         loop, supervises Codex and Claude Code as managed backends, and is
         portable across OpenAI, Anthropic, and Gemini. The agent's machine
-        can run macOS, Linux, or Windows; yours just needs a browser —
-        nothing to install on your side of the glass.
+        can run macOS, Linux, or Windows. Route discovery needs only this
+        browser tab; control uses local presence or a browser enrolled for
+        independently verified direct mTLS by a trusted daemon owner. No
+        signed/notarized native release exists for this alpha.
       </p>
       <div class="cta">
-        <a class="btn" href="/connect">Open your dashboard</a>
+        <a class="btn" href="/connect">Open Connect</a>
         <a class="btn ghost" href="#install">Install a daemon</a>
       </div>
     </section>
@@ -725,26 +713,28 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <h2>Stand up a daemon in about ninety seconds</h2>
       <p class="sectionlede">
         Four answers about the machine the agent will live on, and the exact
-        command appears. That machine is the only one that installs anything
-        — you can be reading this from your phone.
+        command appears. You can discover it from your phone without a separate
+        app; controlling the daemon still requires trusted certificate or
+        profile enrollment.
       </p>
       <div class="igrid">
         {advisor}
         <div>
           <div class="steps">
             <div class="step"><b><span class="n">1</span>Install</b>
-              One command on a fresh box pins root authority to your browser's key. Nothing sensitive travels.</div>
-            <div class="step"><b><span class="n">2</span>Claim</b>
-              The daemon prints a twelve-word phrase; claim it from the browser you're already holding.</div>
-            <div class="step"><b><span class="n">3</span>Fuel</b>
-              Grant time-boxed credential leases from your encrypted vault — or relay calls through your browser and never hand over a key at all.</div>
+              One command installs the daemon. Code served here is part of the installer trust boundary.</div>
+            <div class="step"><b><span class="n">2</span>Link</b>
+              Enter its twelve-word one-time claim code to add the route to your account. This grants no access.</div>
+            <div class="step"><b><span class="n">3</span>Establish owner</b>
+              Use the machine's local console or independently verified direct mTLS to establish root outside hosted-origin JavaScript. No signed/notarized native release exists for this alpha.</div>
+            <div class="step"><b><span class="n">4</span>Fuel</b>
+              Configure credentials from a trusted daemon surface. Connect implements blind account-vault storage but serves no vault client or daemon-delivery bridge in this build.</div>
           </div>
           <p class="installnote">
-            New here? <a href="/connect">Sign in</a> first — your key is in the
-            dashboard's Access drawer. Nothing sensitive travels in the command
-            or lands on the box: the daemon boots already owned by you, you claim
-            it with a twelve-word phrase, and it borrows credentials from your
-            vault only while you let it.
+            New here? <a href="/connect">Sign in</a> to link the route for
+            discovery. The link does not create a daemon principal or grant;
+            establish access from a trusted local or independently verified direct-mTLS
+            surface. This hosted build remains discovery-only.
           </p>
         </div>
       </div>
@@ -760,7 +750,7 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
              alt="The Intendant dashboard's Activity feed: an agent diagnoses a failing nightly job with an auto-approved tail command, proposes a one-line diff to jobs/rollup.py, waits for an approval-gated backfill run, and reports the verified result.">
       </div>
       <p class="shotcaption">
-        The Activity feed on a claimed daemon: autonomy is a dial, approvals
+        The Activity feed on an authorized daemon: autonomy is a dial, approvals
         are explicit, and every command, diff, and decision is logged and
         replayable.
       </p>
@@ -791,8 +781,8 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
           <h3>Every agent, one canvas</h3>
           <p>Station renders the whole machine live — sessions, approvals,
           context budgets, changes, and worktrees orbiting one WebGPU canvas.
-          The same state is a keystroke away in the terminal TUI and the CLI,
-          and a glance away from your phone.</p>
+          The same daemon is operable from the CLI and MCP, and a glance away
+          from your phone in an enrolled browser.</p>
         </div>
         <div class="pic">
           <div class="shot">
@@ -806,60 +796,61 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <div class="trow">
         <div class="txt">
           <div class="eyebrow">Credential custody</div>
-          <h3>Fueling, not surrendering</h3>
-          <p>Provider keys and subscription OAuth live end-to-end encrypted
-          behind your passkeys, and a machine gets fuel one of two ways. A
-          lease is borrowed authority — held in memory, renewed from your
-          browser, dead on expiry or the moment you revoke it. Client egress
-          goes further: the key never leaves your browser at all — the box's
-          provider calls detour through the tab you're signed in on. A
-          disposable VPS can be wiped, or seized, with nothing on it worth
-          taking.</p>
+          <h3>Custody machinery, with a boundary</h3>
+          <p>Intendant implements sealed vault storage, time-boxed leases,
+          and client egress for authorized control sessions. The Connect
+          account-vault backend and a daemon's own vault are separate today.
+          This directory does not serve the vault client or crypto worker and
+          has no daemon-control channel, so it cannot create or unseal account
+          entries, grant a lease, or relay a provider call. Use a
+          trusted direct client for those mechanisms, or use
+          the daemon's local credential configuration.</p>
           <div class="fuelmap">
-            <div class="fuelrow"><span class="fueltag">lease</span>
-              <span class="fuelflow">the key travels: vault <span class="fx">→</span> daemon memory <em>(expires on its own)</em> <span class="fx">→</span> provider calls from the box</span></div>
-            <div class="fuelrow"><span class="fueltag">client egress</span>
-              <span class="fuelflow">the calls travel: daemon <span class="fx">→</span> your browser <em>(the key stays here)</em> <span class="fx">→</span> provider</span></div>
+            <div class="fuelrow"><span class="fueltag">trusted client</span>
+              <span class="fuelflow">daemon-store vault <span class="fx">→</span> authorized lease or relay <span class="fx">→</span> daemon workload</span></div>
+            <div class="fuelrow"><span class="fueltag">Connect tab</span>
+              <span class="fuelflow">account-vault API/storage only <em>(no shipped client or daemon bridge)</em></span></div>
           </div>
         </div>
         <div class="pic">
           <div class="shot">
             <img loading="lazy" src="/assets/landing/vault.webp" width="1800" height="975"
-                 alt="The credential vault panel: three credentials with masked secrets, two active leases expiring in 15 minutes granted by @ada, re-fuel buttons, and a client-egress relay option.">
+                 alt="The trusted daemon dashboard's credential vault panel, showing masked entries and time-boxed lease controls.">
           </div>
-          <div class="shotnote">Leases expire on their own; Revoke is always one click away.</div>
+          <div class="shotnote">Shown on an authorized daemon surface; Connect cannot invoke these controls.</div>
         </div>
       </div>
 
       <div class="trow rev">
         <div class="txt">
           <div class="eyebrow">Arrival</div>
-          <h3>Claim a machine with twelve words</h3>
-          <p>Start the daemon anywhere and it prints a claim phrase. Paste it
-          in the browser you're already holding and the box is yours — owned
-          by your key from first boot, reachable from every device you sign
-          in on, with the powerful knobs one fold away when you want them.</p>
+          <h3>Link a machine with twelve words</h3>
+          <p>Start the daemon anywhere and it prints a one-time claim code.
+          Enter it here to link the route to your account for discovery. The
+          link changes no daemon IAM and grants no machine access; ownership
+          starts only from a trusted local or independently verified direct-mTLS surface.</p>
         </div>
         <div class="pic">
           <div class="shot">
             <img loading="lazy" src="/assets/landing/claim.webp" width="1800" height="635"
-                 alt="Intendant Connect: a claimed computer named atlas shown online with uptime history, next to the add-a-computer flow that accepts a twelve-word claim phrase.">
+             alt="Intendant Connect: a linked computer named atlas shown online with uptime history, next to the add-a-computer flow that accepts a twelve-word one-time claim code.">
           </div>
-          <div class="shotnote">atlas, online seconds after its claim phrase was pasted.</div>
+          <div class="shotnote">atlas, discoverable seconds after its one-time code was entered.</div>
         </div>
       </div>
 
       <div class="trow">
         <div class="txt">
           <div class="eyebrow">The client</div>
-          <h3>Nothing to install on your side</h3>
-          <p>Most agent environments start by installing software on the
-          device in front of you. Intendant never does: the whole client is
-          a browser tab. Approve a diff from your phone, watch the live
-          desktop from a tablet, run mission control from any laptop — same
-          daemon, same authority, zero client software. On intendant.dev
-          there is nothing to set up at all; even fully self-hosted, the
-          one-time cost is trusting a certificate, never installing an app.</p>
+          <h3>Zero-install discovery; trusted enrollment for control</h3>
+          <p>Link and discover a daemon from this browser tab without client
+          software. To approve a diff, watch the live desktop, or run mission
+          control, use local loopback access or first enroll that browser for
+          independently verified direct mTLS from a trusted owner surface.
+          After enrollment the dashboard remains browser-based and carries
+          only the authority that daemon granted to the authenticated
+          principal. Installing a client certificate or profile is a real
+          enrollment step, not a zero-install claim.</p>
         </div>
         <div class="pic phonepic">
           <div class="phoneframe">
@@ -882,16 +873,20 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
         </div>
         <div class="card">
           <h3>Your keys stay yours</h3>
-          <p>Provider keys and subscription OAuth live end-to-end encrypted
-          behind your passkeys. Daemons borrow leases that expire, or relay
-          calls through your browser; disks hold nothing worth stealing.</p>
+          <p>Sealed vaults, expiring API-key leases, and client egress are
+          available on authorized daemon sessions. Connect can store an
+          opaque account-vault envelope, but this directory serves neither its
+          vault client nor a path that could deliver it to a daemon.
+          Local .env credentials remain supported, and full-credential OAuth
+          leases temporarily materialize private auth files.</p>
         </div>
         <div class="card">
-          <h3>Every interface, any device</h3>
-          <p>Web dashboard, terminal TUI, CLI, MCP, live voice, and phone
-          calls — every capability reachable from each of them. The web
-          client runs in any browser, phone included, with nothing to
-          install client-side.</p>
+          <h3>Multiple trusted interfaces</h3>
+          <p>Use the web dashboard for visual control, CLI or MCP for
+          automation, and live voice or phone for conversation. A remote
+          browser enrolled for direct mTLS by a trusted owner runs the web
+          client there, phone included, without a separate app install; that
+          remote browser still needs certificate or profile enrollment.</p>
         </div>
         <div class="card">
           <h3>A fleet, not a box</h3>
@@ -917,10 +912,12 @@ pub(crate) fn landing_ui_html(origin: &str) -> String {
       <h2>Built to be distrusted</h2>
       <div class="grid">
         <div class="card">
-          <h3>This service holds no authority</h3>
-          <p>The rendezvous stores ciphertext and relays signaling. Your
-          daemons mint and enforce their own access; passkeys and a
-          transparency log keep the service honest — and you can
+          <h3>The daemon is the authority mint</h3>
+          <p>Connect is trusted for the code and installers it serves,
+          availability, accounts, routes, fleet metadata, and optional push delivery. Its rendezvous
+          protocol cannot mint a daemon grant, but a replaced installer can
+          compromise what it installs, and malicious hosted code can misuse
+          Connect account or decrypted browser state available after a gesture. You can
           <a href="/trust">read exactly what it can and cannot do</a>,
           or run your own.</p>
         </div>
@@ -1066,7 +1063,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
     .computer-name strong {{ font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .computer-name .sub {{ color: var(--muted-2); font-size: 12px; }}
     .computer-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
-    .computer-actions .open {{ flex: 1 1 auto; }}
+    .route-only {{ flex: 1 1 180px; align-self: center; color: var(--muted-2); font-size: 12px; line-height: 1.4; }}
     .presence {{ display: grid; gap: 5px; }}
     .presence-bars {{ display: flex; gap: 2px; align-items: flex-end; height: 14px; }}
     .presence-bars span {{ flex: 1 1 auto; min-width: 2px; height: 5px; border-radius: 1px; background: var(--surface-3); }}
@@ -1180,7 +1177,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
       <div class="hero">
         <img class="hero-mark" src="/logo.svg" alt="">
         <h2 class="hero-title">Your computers, anywhere.</h2>
-        <p class="hero-sub">Sign in with a passkey and open any machine you own, from any browser. This service only makes the introduction &mdash; each computer verifies you itself and decides what you may do, end to end.</p>
+        <p class="hero-sub">Sign in with a passkey to find machines linked to your account. Linking is discovery only: daemon control still requires loopback or independently verified direct mTLS and a grant approved through a trusted root surface. No signed/notarized native release exists for this alpha.</p>
       </div>
       <div class="auth-card">
         <div>
@@ -1195,7 +1192,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
           <input id="invite-code" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="registration is invite-only during the alpha">
         </div>
         <div id="invite-note" class="auth-note hidden">
-          Intendant is in private pre-alpha &mdash; creating an account needs an
+          Intendant is in invite-only alpha &mdash; creating an account needs an
           invite right now. No code yet? Follow the project on
           <a href="{REPO_URL}" target="_blank" rel="noopener">GitHub</a>,
           or run your own rendezvous (below) &mdash; self-hosting is never gated.
@@ -1208,7 +1205,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
       </div>
       <ul class="feature-strip">
         <li><strong>Passkeys only</strong><span>No passwords. Your devices already sync the key.</span></li>
-        <li><strong>Holds no power</strong><span>An introducer and relay. Your computers check your identity themselves &mdash; <a href="/trust">how trust works here</a>.</span></li>
+        <li><strong>Honest limits</strong><span>Connect serves this code and handles accounts, routes, availability, fleet metadata, and optional push delivery; daemons alone mint access. <a href="/trust">See the complete trust boundary</a>.</span></li>
         <li><strong>Self-hostable</strong><span>Run your own rendezvous &mdash; <a href="https://intendant-dev.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">read how</a>.</span></li>
       </ul>
     </section>
@@ -1225,12 +1222,13 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
         <div class="computer-card add-card">
           <h3>Add a computer</h3>
           <ol class="steps">
-            <li>On that machine, start <code>intendant</code> with Connect enabled &mdash; it prints a 12&#8209;word claim phrase in its log.</li>
-            <li>Paste the phrase here to link it to this account.</li>
+            <li>On that machine, start <code>intendant</code> with Connect enabled &mdash; it prints a 12&#8209;word one-time claim code in its log.</li>
+            <li>Enter the code here to link its route to this account for discovery.</li>
           </ol>
           <div>
-            <label for="claim-code">Claim phrase</label>
-            <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="twelve words from the startup log">
+            <label for="claim-code">One-time claim code</label>
+            <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="twelve words printed by the daemon">
+            <div class="sub">Discovery only: linking grants no machine access and changes no daemon IAM. Single use. We will never ask for a password, API key, recovery phrase, private key, or passkey secret here.</div>
           </div>
           <button id="claim">Connect it</button>
           <div id="claim-status" class="status" role="status"></div>
@@ -1262,7 +1260,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
             <span id="session-passkeys" class="pill"></span>
             <span id="enc-pill" class="pill"></span>
           </div>
-          <div class="sub">Give this user id to a daemon owner when they grant your account access under Access &rarr; People &amp; Devices.</div>
+          <div class="sub">This user id identifies Connect account, route, and audit metadata. It never authenticates to a daemon. Browser identity keys are metadata-only in this alpha; use loopback or independently verified direct mTLS for control.</div>
           <div class="user-id-row">
             <code id="session-user-id"></code>
             <button id="copy-user-id" class="ghost" type="button">Copy</button>
@@ -1270,12 +1268,12 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
         </div>
         <div class="advanced-block" id="orgs-block">
           <h3>Organizations</h3>
-          <div class="sub">Signed membership documents this browser holds on this origin. They never touch this server &mdash; your browser presents them directly to daemons that trust the issuing org.</div>
+          <div class="sub">Signed membership-document records already stored in this browser origin. Connect does not present them to daemons. Human browser-key subjects are record-only in this alpha; usable access still requires a trusted mTLS or peer identity.</div>
           <div id="org-rows"></div>
         </div>
         <div class="advanced-block">
           <h3>What this account can and cannot do</h3>
-          <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM, dashboard sessions verify a signature from the daemon itself, and private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF. <a href="/trust">The full story.</a></div>
+          <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM. Daemon-signed link acknowledgements are checked against the key Connect recorded, which proves consistency with that directory record but is not an independent first-introduction pin: Connect also serves the record and this browser code. Private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF. <a href="/trust">The full story.</a></div>
         </div>
         <div class="advanced-block" id="identity-block">
           <h3>Verified identity</h3>
@@ -1293,7 +1291,7 @@ pub(crate) fn connect_ui_html(origin: &str, product_title: &str, account_subtitl
         </div>
         <div class="advanced-block" id="log-block">
           <h3>Transparency log</h3>
-          <div class="sub">Every name binding this service hands out (which key a computer had when claimed, handle creations, revocation lists, badges) is committed to an append-only log. Your browser pins the signed tree head and re-verifies consistency on every visit &mdash; rewriting history here is detectable, not just forbidden.</div>
+          <div class="sub">Every name binding this service hands out (which daemon key Connect recorded for a linked computer, handle creations, revocation lists, badges) is committed to an append-only log. Your browser pins the signed tree head and re-verifies consistency on every visit &mdash; later rewriting is detectable, but the first key introduction and browser code are still trusted to this Connect deployment.</div>
           <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span><button id="log-reset-trust" class="ghost hidden" title="Discard the pinned tree head and trust the log's current signing key from now on. Only do this if you expected the operator to rotate the key.">Reset trust</button></div>
         </div>
         <div class="advanced-block" id="push-block">
@@ -1399,13 +1397,12 @@ function authenticationCredentialJSON(credential) {{
   }};
 }}
 
-// Fleet-sync encryption (trust architecture phase 5 follow-on): evaluate
-// the WebAuthn PRF extension during the passkey ceremony and stash the
-// per-tab secrets; /app derives AES keys from them so private fleet fields
-// and the credential vault sync end-to-end encrypted. Two salts, one
-// gesture: `first` feeds fleet-sync, `second` feeds the vault — separate
-// PRF domains, so the two features never share key material. The server
-// never sees either output.
+// Fleet-sync encryption: evaluate the WebAuthn PRF extension during the
+// passkey ceremony and stash the per-tab secret used for private fleet fields.
+// The second output reserves compatibility with the account-vault envelope
+// format; this directory does not ship that vault client or its crypto worker.
+// Separate PRF domains keep the two designs from sharing key material. The
+// server never sees either output.
 const FLEET_PRF_SALT = new TextEncoder().encode('intendant-fleet-sync-v1');
 const VAULT_PRF_SALT = new TextEncoder().encode('intendant-vault-v1');
 
@@ -1495,7 +1492,7 @@ async function login() {{
 
 /* Mirrors the daemon/service normalize_claim_code: lowercase alphanumeric
    runs joined by '-'. */
-function normalizeClaimPhrase(input) {{
+function normalizeClaimCode(input) {{
   return String(input || '')
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -1508,105 +1505,20 @@ async function sha256B64uOfText(text) {{
   return bufToB64u(digest);
 }}
 
-/* Load or CREATE this origin's browser identity key — the exact record
-   the dashboard app uses (IndexedDB intendant-client-identity/keys/v1,
-   non-extractable P-256, {{privateKey, publicRaw, createdAtMs}}).
-   Creating here is what makes bootstrap one ceremony: the key that
-   claims is the key the daemon enrolls, and the dashboard then signs in
-   with it. */
-async function ensureOwnIdentity() {{
-  if (!window.indexedDB || !crypto?.subtle) throw new Error('WebCrypto unavailable');
-  const db = await new Promise((resolve, reject) => {{
-    const req = indexedDB.open('intendant-client-identity', 1);
-    req.onupgradeneeded = () => {{
-      if (!req.result.objectStoreNames.contains('keys')) req.result.createObjectStore('keys');
-    }};
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  }});
-  try {{
-    let record = await new Promise((resolve, reject) => {{
-      const tx = db.transaction('keys', 'readonly');
-      const req = tx.objectStore('keys').get('v1');
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    }});
-    if (!record?.privateKey || !record?.publicRaw) {{
-      const pair = await crypto.subtle.generateKey(
-        {{ name: 'ECDSA', namedCurve: 'P-256' }},
-        false,
-        ['sign']
-      );
-      const publicRaw = await crypto.subtle.exportKey('raw', pair.publicKey);
-      record = {{ privateKey: pair.privateKey, publicRaw, createdAtMs: Date.now() }};
-      await new Promise((resolve, reject) => {{
-        const tx = db.transaction('keys', 'readwrite');
-        tx.objectStore('keys').put(record, 'v1');
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
-      }});
-    }}
-    return {{ publicRawB64u: bufToB64u(record.publicRaw) }};
-  }} finally {{
-    db.close();
-  }}
-}}
-
-/* First-owner bootstrap tag (mirrors connect_rendezvous.rs): HMAC-SHA256
-   keyed by SHA-256(normalized phrase) over a payload binding this
-   browser's key and account. The service relays it blind — it holds the
-   phrase's hash, never the phrase, so only a phrase-holder can endorse a
-   key for enrollment. */
-async function bootstrapTag(normalizedPhrase, daemonId, daemonPublicKey, clientKeyB64u, userId, accountName) {{
-  const phraseDigest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(normalizedPhrase)
-  );
-  const hmacKey = await crypto.subtle.importKey(
-    'raw',
-    phraseDigest,
-    {{ name: 'HMAC', hash: 'SHA-256' }},
-    false,
-    ['sign']
-  );
-  const payload = `intendant-connect-bootstrap-v1\n${{daemonId}}\n${{daemonPublicKey}}\n${{clientKeyB64u}}\n${{userId}}\n${{accountName}}\n`;
-  const tag = await crypto.subtle.sign('HMAC', hmacKey, new TextEncoder().encode(payload));
-  return bufToB64u(tag);
-}}
-
 async function claimDaemon() {{
   const claimCode = $('claim-code').value.trim();
-  if (!claimCode) throw new Error('Claim phrase is required');
+  if (!claimCode) throw new Error('One-time claim code is required');
   setBusy('claim', true);
-  setStatus('claim-status', 'Waiting for daemon proof', '');
+  setStatus('claim-status', 'Waiting for daemon route acknowledgment', '');
   try {{
-    const normalized = normalizeClaimPhrase(claimCode);
-    if (!normalized) throw new Error('Claim phrase is required');
-    // Hash-only claim: the service routes by digest and never sees the
-    // plaintext phrase (a daemon-minted phrase must stay between the
-    // daemon and this browser).
+    const normalized = normalizeClaimCode(claimCode);
+    if (!normalized) throw new Error('One-time claim code is required');
+    // Hash-only submission avoids sending the plaintext code in this API
+    // request. The code links Connect route metadata only.
     const start = await api('/api/claims/claim', {{
       method: 'POST',
       body: JSON.stringify({{ claim_code_hash: await sha256B64uOfText(normalized) }}),
     }});
-    let bootstrap = false;
-    if (start.needs_bootstrap_arm) {{
-      bootstrap = true;
-      setStatus('claim-status', 'Fresh daemon — enrolling this browser as its first owner', '');
-      const identity = await ensureOwnIdentity();
-      const tag = await bootstrapTag(
-        normalized,
-        String(start.daemon_id || ''),
-        String(start.daemon_public_key || ''),
-        identity.publicRawB64u,
-        String(state.user?.id || ''),
-        String(state.user?.account_name || '')
-      );
-      await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}/arm`, {{
-        method: 'POST',
-        body: JSON.stringify({{ client_key: identity.publicRawB64u, client_key_tag: tag }}),
-      }});
-    }}
     const deadline = Date.now() + 65000;
     while (Date.now() < deadline) {{
       await new Promise(resolve => setTimeout(resolve, 750));
@@ -1614,9 +1526,7 @@ async function claimDaemon() {{
       if (status.result?.status === 'approved') {{
         setStatus(
           'claim-status',
-          bootstrap
-            ? `Claimed ${{status.result.daemon_id}} — and this browser is enrolled as its first owner (role: root, co-signed by the daemon). Open it from your computers list; the dashboard signs in with this browser's key.`
-            : `Rendezvous route claimed for ${{status.result.daemon_id}}. Next: open that daemon directly (its https://host:8765 address) as root, go to Access → People & Devices, and grant this account a role — until then the daemon will refuse hosted dashboard control.`,
+          `Linked ${{status.result.daemon_id}} to this account for discovery. No machine access was granted. Establish owner access directly on the machine or through an independently verified direct-mTLS daemon connection.`,
           'ok'
         );
         $('claim-code').value = '';
@@ -1666,7 +1576,7 @@ async function renderOrgs() {{
   try {{ map = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{{}}') || {{}}; }} catch {{}}
   const docs = Object.values(map).filter(doc => doc && typeof doc === 'object' && doc.org?.handle);
   if (!docs.length) {{
-    rows.innerHTML = '<div class="empty-hint">None stored in this browser. Daemon dashboards keep a membership document here when you join with one; it is then presented automatically on every connection.</div>';
+    rows.innerHTML = '<div class="empty-hint">None stored in this browser origin. Connect neither fetches nor presents organization documents. Human browser-key documents are record-only in this alpha.</div>';
     return;
   }}
   const ownFp = await ownIdentityFingerprint();
@@ -1698,7 +1608,7 @@ async function renderOrgs() {{
   rows.querySelectorAll('[data-org-remove]').forEach(button => {{
     button.addEventListener('click', () => {{
       const handle = button.getAttribute('data-org-remove');
-      if (!confirm(`Remove the stored @${{handle}} document from this browser? Access already granted on daemons is unaffected; automatic presentation stops.`)) return;
+      if (!confirm(`Remove the stored @${{handle}} document record from this browser? Existing daemon records are unaffected.`)) return;
       try {{
         const current = JSON.parse(localStorage.getItem('intendant_org_grants_v1') || '{{}}') || {{}};
         delete current[handle];
@@ -2020,7 +1930,7 @@ function renderDaemons() {{
         </div>
       </div>
       <div class="computer-actions">
-        <button class="open" data-open="${{escapeAttr(daemonId)}}">Open</button>
+        <span class="route-only">Discovery only &mdash; open this daemon from a trusted local or independently verified direct-mTLS client.</span>
         <button class="secondary" data-rename="${{escapeAttr(daemonId)}}">Rename</button>
       </div>
       ${{presenceSparkline(daemon)}}
@@ -2028,18 +1938,12 @@ function renderDaemons() {{
         <summary>Details</summary>
         <div class="kv">
           <div><div class="k">Daemon id</div><code>${{escapeHtml(daemonId)}}</code></div>
-          <div><div class="k">Public key &mdash; sessions verify this end to end</div><code>${{escapeHtml(key)}}</code></div>
+          <div><div class="k">Connect-linked daemon key &mdash; signed link metadata is checked for consistency, not independent identity</div><code>${{escapeHtml(key)}}</code></div>
           <div class="danger-row"><button class="danger" data-revoke="${{escapeAttr(daemonId)}}">Disconnect from this account</button></div>
         </div>
       </details>`;
     grid.appendChild(card);
   }}
-  grid.querySelectorAll('[data-open]').forEach(button => {{
-    button.addEventListener('click', () => {{
-      const id = button.getAttribute('data-open');
-      window.location.href = `/app?connect=1&daemon_id=${{encodeURIComponent(id)}}`;
-    }});
-  }});
   grid.querySelectorAll('[data-revoke]').forEach(button => {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-revoke');
@@ -2078,10 +1982,13 @@ function renderFleetTargets() {{
     const label = (!rawLabel || rawLabel === id) ? (shortId(id) || 'Place') : rawLabel;
     const locked = target.fleet_locked === true;
     const route = locked
-      ? 'End-to-end encrypted — opens on a device signed in with your passkey'
+      ? 'End-to-end encrypted — passkey sign-in reveals this saved route; opening the daemon still requires trusted mTLS'
       : String(target.route_label || target.route || target.url || 'Remembered route');
     const online = target.online || target.connected;
-    const url = String(target.url || '');
+    // A live claim link is directory metadata and must never grow a control
+    // URL. Only a separately remembered/decrypted direct route may navigate
+    // away to its daemon's mTLS origin.
+    const url = target.claimed_daemon === true ? '' : String(target.url || '');
     const canForget = target.claimed_daemon !== true;
     const row = document.createElement('div');
     row.className = 'place-row';
@@ -2092,7 +1999,7 @@ function renderFleetTargets() {{
       </div>
       <span class="pill ${{online ? 'ok' : ''}}">${{online ? 'online' : (locked ? 'locked' : 'remembered')}}</span>
       <div class="place-actions">
-        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open</button>
+        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open direct route</button>
         <button class="ghost" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
       </div>`;
     rows.appendChild(row);
@@ -2246,7 +2153,23 @@ $('account').addEventListener('keydown', event => {{ if (event.key === 'Enter') 
 $('claim-code').addEventListener('keydown', event => {{ if (event.key === 'Enter') claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')); }});
 
 const params = new URLSearchParams(location.search);
-if (params.get('claim_code')) $('claim-code').value = params.get('claim_code');
+const fragmentParams = new URLSearchParams(location.hash.replace(/^#/, ''));
+// Current claim links put the phrase in the fragment, which browsers do not
+// send in HTTP requests or referrers. Query-string claim codes are deliberately
+// not supported: even reading one after load would normalize an unsafe link
+// format that already exposed the phrase to HTTP and proxy logs.
+const claimCodeFromUrl = fragmentParams.get('claim_code');
+if (claimCodeFromUrl) {{
+  $('claim-code').value = claimCodeFromUrl;
+  fragmentParams.delete('claim_code');
+  const nextQuery = params.toString();
+  const nextFragment = fragmentParams.toString();
+  history.replaceState(
+    null,
+    '',
+    location.pathname + (nextQuery ? `?${{nextQuery}}` : '') + (nextFragment ? `#${{nextFragment}}` : '')
+  );
+}}
 // Shareable invites: /connect?invite=CODE prefills the invite field.
 if (params.get('invite')) $('invite-code').value = params.get('invite');
 refreshAll().catch(() => renderAuth());
@@ -2260,29 +2183,213 @@ refreshAll().catch(() => renderAuth());
 mod tests {
     use super::*;
 
+    fn assert_framing_denied(response: &Response) {
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some(HTML_FRAME_ANCESTORS)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY")
+        );
+    }
+
     #[test]
-    fn app_route_requires_connect_mode_and_daemon_id() {
-        assert!(valid_connect_app_query(Some(
-            "connect=1&daemon_id=vortex-deb-x11-intendant"
-        )));
-        assert!(valid_connect_app_query(Some(
-            "daemon_id=vortex-deb-x11-intendant&connect=1"
-        )));
-        assert!(!valid_connect_app_query(None));
-        assert!(!valid_connect_app_query(Some("")));
-        assert!(!valid_connect_app_query(Some(
-            "daemon_id=vortex-deb-x11-intendant"
-        )));
-        assert!(!valid_connect_app_query(Some("connect=1")));
-        assert!(!valid_connect_app_query(Some("connect=0&daemon_id=daemon")));
-        assert!(!valid_connect_app_query(Some("connect=1&daemon_id=%20")));
+    fn every_server_rendered_connect_page_denies_framing() {
+        for body in [
+            landing_ui_html("https://connect.example"),
+            connect_page_html("https://connect.example"),
+            trust_ui_html("https://connect.example"),
+            access_page_html("https://connect.example"),
+        ] {
+            let response = html_response(body);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/html; charset=utf-8")
+            );
+            assert_framing_denied(&response);
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_app_entry_points_redirect_and_unknown_paths_are_404() {
+        // Drive real HTTP requests through the production route table. This
+        // catches an accidental wildcard/static fallback or one spelling
+        // losing its explicit route; a test-only mini-router would not.
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let app = connect_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        for historical_path in ["/app", "/app?connect=1&daemon_id=crafted", "/app.html"] {
+            let response = client
+                .get(format!("http://{address}{historical_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SEE_OTHER,
+                "{historical_path}"
+            );
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                "/connect",
+                "{historical_path}"
+            );
+        }
+        for forbidden_static_path in [
+            "/static/app.html",
+            "/app.js",
+            "/vault-kernel.js",
+            "/wasm-web/presence_web.js",
+            "/wasm-station/station_web.js",
+        ] {
+            let response = client
+                .get(format!("http://{address}{forbidden_static_path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{forbidden_static_path}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn production_router_refuses_hosted_control_without_relay_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let user_id = Uuid::new_v4();
+        let mut store = Store::default();
+        store.users.push(UserRecord {
+            id: user_id,
+            account_name: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            passkeys: Vec::new(),
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+            last_login_unix_ms: 1,
+            attestations: Vec::new(),
+        });
+        let state = production_router_test_state(root.path(), store);
+        let (session, csrf) = create_session(&state, user_id).await;
+        state.event_queues.lock().await.insert(
+            "daemon-1".to_string(),
+            VecDeque::from([serde_json::from_value(json!({
+                "id": "existing-route-event",
+                "kind": "claim_challenge",
+            }))
+            .unwrap()]),
+        );
+        state.active_sessions.lock().await.insert(
+            "legacy-session".to_string(),
+            ActiveDashboardSession {
+                daemon_id: "daemon-1".to_string(),
+                session_id: "legacy-session".to_string(),
+                created_unix_ms: now_unix_ms(),
+            },
+        );
+
+        let origin = state.config.public_origin.clone();
+        let app = connect_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        for endpoint in [
+            "/api/browser/offer",
+            "/api/browser/ice",
+            "/api/browser/close",
+        ] {
+            let response = client
+                .post(format!("http://{address}{endpoint}"))
+                .header(header::COOKIE, format!("{COOKIE_NAME}={session}"))
+                .header(CSRF_HEADER, &csrf)
+                .header(header::ORIGIN, &origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{endpoint}");
+            let body = response.text().await.unwrap();
+            assert!(
+                body.contains("hosted daemon control is unavailable"),
+                "{endpoint}: {body}"
+            );
+        }
+
+        assert!(state.pending_offers.lock().await.is_empty());
+        let queues = state.event_queues.lock().await;
+        let queue = queues.get("daemon-1").unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            serde_json::to_value(queue.front().unwrap()).unwrap()["id"],
+            "existing-route-event"
+        );
+        drop(queues);
+        assert!(state
+            .active_sessions
+            .lock()
+            .await
+            .contains_key("legacy-session"));
+        assert!(state.rate_limits.lock().await.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_push_worker_is_explicitly_embedded() {
+        let response = service_worker_js().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get("service-worker-allowed").unwrap(),
+            "/"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), CONNECT_SERVICE_WORKER_JS.as_bytes());
+    }
+
+    #[test]
+    fn daemon_spa_source_cannot_activate_hosted_connect_mode_from_query() {
+        let source = include_str!("../../../static/app/31-init-identity-fleet.js");
+        assert!(source.contains("const DASHBOARD_CONNECT_MODE = false;"));
+        assert!(source.contains("const DASHBOARD_CONNECT_DAEMON_ID = '';"));
+        assert!(source.contains("const DASHBOARD_CONNECT_SIGNALING_BASE = '';"));
+        assert!(!source.contains("dashboardUrlParams.get('connect')"));
     }
 
     #[test]
     fn trust_page_states_the_model() {
         let html = trust_ui_html("https://connect.intendant.dev");
         assert!(html.contains("<title>How trust works"));
-        assert!(html.contains("rendezvous-scoped things"));
+        assert!(html.contains("authenticator&rsquo;s passkey secret remains non-extractable"));
+        assert!(html.contains("controls the JavaScript"));
+        assert!(html.contains("none of those results authenticates to a daemon"));
+        assert!(html.contains("not an independent key pin"));
+        assert!(html.contains("does not independently validate the first key"));
         assert!(html.contains("run your own rendezvous"));
         assert!(html.contains("<code>https://connect.intendant.dev</code>"));
     }
@@ -2316,12 +2423,11 @@ mod tests {
     fn landing_page_states_the_product_and_reuses_the_origin() {
         let html = landing_ui_html("https://rendezvous.example");
         assert!(html.contains("<title>Intendant — an operating environment"));
-        // The install one-liner advertises the serving origin, so a
-        // self-hosted rendezvous shows its own installer — with the
-        // placeholder entity-escaped so browsers render it as text.
+        // The install one-liner advertises the serving origin, but the
+        // hosted installer never accepts or mints an owner key.
         assert!(html.contains("curl -fsSL https://rendezvous.example/install.sh"));
-        assert!(html.contains("--owner &lt;your-key&gt;"));
-        assert!(!html.contains("--owner <your-key>"));
+        assert!(!html.contains("--owner"));
+        assert!(!html.contains("-Owner"));
         // Beginner path and depth are both one click away.
         assert!(html.contains(r#"href="/connect""#));
         assert!(html.contains(r#"href="/trust""#));
@@ -2344,10 +2450,15 @@ mod tests {
             );
         }
         assert!(html.contains("alt=\"The Intendant dashboard's Activity feed"));
-        // The differentiator is stated where people will read it: the client
-        // installs nothing, on any device — only the agent's machine does.
-        assert!(html.contains("Nothing to install on your side"));
-        assert!(html.contains("nothing to install on your side of the glass"));
+        // Discovery is zero-install; control honestly names its trusted
+        // enrollment or native/local anchor instead of inheriting that claim.
+        assert!(html.contains("Zero-install discovery; trusted enrollment for control"));
+        assert!(html.contains("Installing a client certificate or profile is a real"));
+        assert!(html.contains("controlling the daemon still requires trusted certificate or"));
+        assert!(html.contains("Multiple trusted interfaces"));
+        assert!(html.contains("without a separate app install"));
+        assert!(html.contains("remote browser still needs certificate or profile enrollment"));
+        assert!(!html.contains("terminal TUI"));
         // "How do I use it" is the page's first answer: the install
         // questionnaire sits directly under the hero, before the shot tour.
         let install_at = html.find(r#"<section class="install-section""#).unwrap();
@@ -2360,19 +2471,20 @@ mod tests {
         // The name is the thesis, stated once, quietly, before the trust row.
         assert!(html.contains("Why “Intendant”"));
         assert!(html.contains("a network of agentic networks"));
-        // Custody names the two fueling modes by what travels: the key
-        // (lease) vs the calls (client egress — the disposable-box mode).
+        // Custody names both stores and makes the missing bridge explicit.
         assert!(html.contains(r#"class="fuelmap""#));
-        assert!(html.contains("the key travels:"));
-        assert!(html.contains("the calls travel:"));
+        assert!(html.contains("account-vault API/storage only"));
+        assert!(html.contains("no shipped client or daemon bridge"));
+        assert!(html.contains("Connect cannot invoke these controls"));
         // The canonical mark, not an ad-hoc monogram: favicon + header logo.
         assert!(html.contains(r#"<link rel="icon" type="image/svg+xml" href="/logo.svg">"#));
         assert!(html.contains(r#"<link rel="icon" type="image/png" href="/favicon.png">"#));
         assert!(html.contains(r#"<img src="/logo.svg""#));
         assert!(!html.contains("data:image/svg"));
         // The deployment advisor LEADS the install section — no fold to
-        // find, four questions all about the agent's machine (the client
-        // side installs nothing, so it gets no questions), and
+        // find, four questions all about the agent's machine (the browser
+        // needs no separate app install, while trusted enrollment is handled
+        // on the daemon/client access path), and
         // runtime-origin commands so self-hosted rendezvous advertise their
         // own installers there too — the sh one-liner AND the PowerShell
         // one (Windows is first-class).
@@ -2387,9 +2499,9 @@ mod tests {
         }
         // The default answers' command is server-rendered, so the page
         // shows a working one-liner (Linux VPS ⇒ --service) without JS.
-        assert!(html.contains(
-            "curl -fsSL https://rendezvous.example/install.sh | sh -s -- --owner &lt;your-key&gt; --service"
-        ));
+        assert!(
+            html.contains("curl -fsSL https://rendezvous.example/install.sh | sh -s -- --service")
+        );
         assert!(!html.contains("__ADVISOR_DEFAULT_CMD__"));
         assert!(html.contains("location.origin + '/install.sh"));
         assert!(html.contains("/install.ps1"));
@@ -2398,8 +2510,8 @@ mod tests {
         // No init system is asserted as a given — the note speaks in
         // native-supervisor terms, not systemd.
         assert!(!html.contains("journalctl"));
-        // Honest pre-alpha framing before anyone clicks Sign in.
-        assert!(html.contains(r#"<span class="pill-alpha">pre-alpha</span>"#));
+        // Honest alpha framing before anyone clicks Sign in.
+        assert!(html.contains(r#"<span class="pill-alpha">alpha</span>"#));
     }
 
     #[test]
@@ -2410,11 +2522,44 @@ mod tests {
             "Rendezvous account",
         );
         // The invite dead-end explains itself and offers the two open paths.
-        assert!(html.contains("private pre-alpha"));
+        assert!(html.contains("invite-only alpha"));
         assert!(html.contains("self-hosting is never gated"));
         assert!(html.contains(r#"$('invite-note').classList.toggle"#));
         // Shareable invite links prefill the code.
         assert!(html.contains("params.get('invite')"));
+        assert!(html.contains("One-time claim code"));
+        assert!(html.contains("linking grants no machine access"));
+        assert!(html.contains("No machine access was granted"));
+        assert!(html.contains("new URLSearchParams(location.hash"));
+        assert!(html.contains("claim_code_hash: await sha256B64uOfText(normalized)"));
+        assert!(!html.contains("JSON.stringify({ claim_code:"));
+        assert!(!html.contains("params.get('claim_code')"));
+        assert!(html.contains("history.replaceState("));
+        assert!(html.contains("not an independent first-introduction pin"));
+        assert!(html.contains("signed link metadata is checked for consistency"));
+        assert!(html.contains("Connect neither fetches nor presents organization documents"));
+        assert!(!html.contains("presented automatically on every connection"));
+        assert!(html.contains("Discovery only &mdash; open this daemon from a trusted local"));
+        assert!(!html.contains("data-open="));
+        assert!(html.contains("target.claimed_daemon === true ? ''"));
+        assert!(html.contains("Open direct route"));
+        assert!(html.contains("passkey sign-in reveals this saved route"));
+        assert!(html.contains("opening the daemon still requires trusted mTLS"));
+        assert!(!html.contains("/app?connect=1"));
+        assert!(!html.contains("sessions verify this end to end"));
+        for forbidden in [
+            "/arm",
+            "client_key_tag",
+            "connect-bootstrap",
+            "role: root",
+            "ensureOwnIdentity",
+            "bootstrapTag",
+        ] {
+            assert!(
+                !html.contains(forbidden),
+                "claim page must not contain hosted authority behavior: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -2468,15 +2613,12 @@ mod tests {
     }
 
     #[test]
-    fn embedded_installer_is_the_bootstrap_script() {
+    fn embedded_installer_never_accepts_hosted_owner_bootstrap() {
         assert!(
             INSTALL_SH.starts_with("#!/bin/sh"),
             "installer must be a sh script"
         );
-        assert!(
-            INSTALL_SH.contains("--owner"),
-            "installer must support the owner bootstrap"
-        );
+        assert!(!INSTALL_SH.contains("--owner"));
         assert!(
             INSTALL_SH.contains("cargo build --release"),
             "installer must build release binaries"
@@ -2498,7 +2640,6 @@ mod tests {
         assert!(INSTALL_PS1.is_ascii(), "install.ps1 must be pure ASCII");
         for needle in [
             "param(",
-            "$Owner",
             "$Connect",
             "$Service",
             "cargo build --release",
@@ -2509,6 +2650,7 @@ mod tests {
                 "install.ps1 must contain {needle}"
             );
         }
+        assert!(!INSTALL_PS1.contains("$Owner"));
     }
 
     #[test]

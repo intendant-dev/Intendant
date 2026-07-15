@@ -26,15 +26,29 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Ceiling for a `--web` daemon to bind its port and serve the agent card
-/// on a cold CI runner.
-const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(60);
+/// on a cold CI runner. The deadline guards a daemon that comes up wedged —
+/// alive but never serving its gateway — a permanent failure class that any
+/// bound catches; a *crashed* daemon is caught immediately by the boot
+/// poll's child-exit check regardless of this value, and a healthy boot
+/// returns on its first successful poll, so headroom costs green runs
+/// nothing. 60s was blown once by a healthy debug-build boot on the fleet
+/// Mac leg at load >20 on 12 cores (2026-07-12), so 180s — the same scale
+/// as RUN_TIMEOUT's one-shot ceiling — shrugs off runner load without
+/// weakening the guard.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Deadline for the load-sensitive cross-daemon waits in the federated peer
 /// test (the A->B connection forming, the delegated task completing on B).
 /// A 90s ceiling was blown twice by a healthy tree on a loaded CI box —
 /// debug binaries, several daemons, and concurrent jobs stack up — and the
 /// suite's wall-clock cost is bounded by how fast the waits *succeed*, not
-/// by this deadline, so be generous.
+/// by this deadline, so be generous. (The Windows leg blew even 240s on the
+/// task-completion wait on 2026-07-12; that incident's likely mechanism — a
+/// StartTask lost to a fire-and-forget wire — is now fixed at the product
+/// level: delegation resolves through an application delivery receipt with
+/// at-least-once re-send + receiver dedup, so by the time `ctl peer task`
+/// reports `delivery: "acknowledged"` the task is dispatched on B and this
+/// deadline only covers the scripted run itself.)
 const PEER_WAIT_TIMEOUT: Duration = Duration::from_secs(240);
 
 fn intendant_bin() -> &'static str {
@@ -93,6 +107,16 @@ impl TestRig {
             // grant. Pin the virtual-display convention instead — nothing
             // here opens an X connection, and display ids > 0 need no grant.
             .env("DISPLAY", ":99")
+            // The macOS/Windows half of the same contract: display
+            // enumeration and capture serve a deterministic 1280×720
+            // synthetic source instead of touching ScreenCaptureKit or
+            // GDI/DXGI. Without this, a Windows daemon's startup
+            // auto-activation BitBlts the runner's real desktop (or spins
+            // in an Access-denied retry storm when the runner's screen is
+            // locked), and a macOS grant starts a real SCK stream of the
+            // runner account's screen. Honored only alongside
+            // PROVIDER=mock — fail closed, like the provider itself.
+            .env("INTENDANT_MOCK_DISPLAY", "synthetic")
             .env("PROVIDER", "mock");
         cmd
     }
@@ -212,6 +236,33 @@ impl DaemonRig {
         let contents = std::fs::read_to_string(&path).unwrap_or_default();
         tail(&contents, 4000)
     }
+
+    /// Tail of the daemon's durable federated peer-event record
+    /// (`peers.jsonl`; see `peer::spawn_peer_log_writer`), for failure
+    /// context AND for the delivery-receipt assertion: connection
+    /// transitions and delegation-time activity live here, on the
+    /// *sending* daemon, where a lost cross-daemon message leaves its
+    /// only trace. The file lives in the daemon's *session* log dir —
+    /// `build_and_hydrate_peer_registry(log_dir, …)` is called with the
+    /// daemon session's directory (startup/wiring.rs), not the logs
+    /// root — so scan every session dir like [`TestRig::session_logs`]
+    /// does. (This helper originally read a flat
+    /// `.intendant/logs/peers.jsonl` that nothing writes, so the
+    /// forensics rail dumped empty; the receipt assertion made that
+    /// visible.)
+    fn peer_log_tail(&self) -> String {
+        let logs_dir = self.rig.home.path().join(".intendant").join("logs");
+        let mut combined = String::new();
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                if let Ok(contents) = std::fs::read_to_string(entry.path().join("peers.jsonl")) {
+                    combined.push_str(&contents);
+                    combined.push('\n');
+                }
+            }
+        }
+        tail(&combined, 4000)
+    }
 }
 
 /// Spawn an idle daemon (no task) with the given mock script and wait until
@@ -255,9 +306,13 @@ async fn spawn_daemon_on_rig(
         // to a file instead.
         .stdout(log.try_clone().expect("clone daemon log"))
         .stderr(log);
-    cmd.arg("--web")
-        .arg(port.to_string())
-        .args(["--bind", "127.0.0.1", "--no-tui", "--autonomy", "full"]);
+    cmd.arg("--web").arg(port.to_string()).args([
+        "--bind",
+        "127.0.0.1",
+        "--no-tui",
+        "--autonomy",
+        "full",
+    ]);
     let (ws_scheme, http_scheme) = if tls {
         ("wss", "https")
     } else {
@@ -362,6 +417,26 @@ async fn connected_peer(client: &reqwest::Client, port: u16) -> Option<serde_jso
         .cloned()
 }
 
+/// [`poll_until`]'s non-panicking core: poll `probe` every 250 ms until it
+/// yields `Some`, or return `None` once `timeout` elapses — for
+/// opportunistic waits where the caller has a recovery move on a miss
+/// (e.g. re-delegating a possibly-lost peer task) rather than a verdict.
+async fn try_poll_until<T, Fut>(timeout: Duration, mut probe: impl FnMut() -> Fut) -> Option<T>
+where
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(found) = probe().await {
+            return Some(found);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Poll `probe` every 250 ms until it yields `Some`, panicking after
 /// `timeout` — the suite's polling convention for daemon-shaped tests
 /// (one-shot runs use [`TestRig::run`]'s hard timeout instead). On timeout
@@ -371,24 +446,18 @@ async fn connected_peer(client: &reqwest::Client, port: u16) -> Option<serde_jso
 async fn poll_until<T, Fut>(
     what: &str,
     timeout: Duration,
-    mut probe: impl FnMut() -> Fut,
+    probe: impl FnMut() -> Fut,
     context: impl Fn() -> String,
 ) -> T
 where
     Fut: std::future::Future<Output = Option<T>>,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if let Some(found) = probe().await {
-            return found;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out after {timeout:?} waiting for {what}:\n{}",
-                context()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    match try_poll_until(timeout, probe).await {
+        Some(found) => found,
+        None => panic!(
+            "timed out after {timeout:?} waiting for {what}:\n{}",
+            context()
+        ),
     }
 }
 
@@ -643,6 +712,15 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
     use futures_util::SinkExt;
 
     let rig = TestRig::new();
+    // Projectless daemons keep durable dashboard defaults under their state
+    // root without turning that root into a session project.
+    let daemon_state = rig.home.path().join(".intendant");
+    std::fs::create_dir_all(&daemon_state).expect("create daemon state root");
+    std::fs::write(
+        daemon_state.join("intendant.toml"),
+        "[agent.codex]\nmodel = \"gpt-5.6-sol\"\n\n[agent.claude_code]\nmodel = \"fable\"\n",
+    )
+    .expect("seed daemon-wide settings");
     let script = rig.write_script(&serde_json::json!({
         "profiles": [{
             "steps": [
@@ -713,6 +791,42 @@ async fn projectless_daemon_serves_and_requires_an_explicit_session_project() {
             .is_some_and(|v| v.is_null()),
         "projectless daemon must report project_root: null, got {project_root_body}"
     );
+
+    // Config scope is independent of project scope: Settings loads and saves
+    // against the daemon root while /api/project-root remains null.
+    let mut settings: serde_json::Value = http
+        .get(format!("{base}/api/settings"))
+        .send()
+        .await
+        .expect("GET projectless settings")
+        .error_for_status()
+        .expect("projectless settings status")
+        .json()
+        .await
+        .expect("projectless settings JSON");
+    assert_eq!(settings["codex_model"], "gpt-5.6-sol");
+    assert_eq!(settings["claude_model"], "fable");
+    assert!(settings["codex_models"]
+        .as_array()
+        .is_some_and(|models| models.iter().all(|model| model["id"] != "gpt-5.6")));
+    settings["codex_model"] = serde_json::json!("gpt-5.6-terra");
+    settings["claude_model"] = serde_json::json!("sonnet");
+    let save: serde_json::Value = http
+        .post(format!("{base}/api/settings"))
+        .json(&settings)
+        .send()
+        .await
+        .expect("POST projectless settings")
+        .error_for_status()
+        .expect("projectless settings save status")
+        .json()
+        .await
+        .expect("projectless settings save JSON");
+    assert_eq!(save["ok"], true);
+    let saved = std::fs::read_to_string(daemon_state.join("intendant.toml"))
+        .expect("read daemon-wide settings");
+    assert!(saved.contains("model = \"gpt-5.6-terra\""), "{saved}");
+    assert!(saved.contains("model = \"sonnet\""), "{saved}");
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
         .await
@@ -977,7 +1091,11 @@ async fn create_session_with_worktree_runs_inside_the_worktree() {
     let linkage = meta.get("worktree").expect("meta records worktree linkage");
     assert_eq!(linkage["branch"], "wt-e2e", "{linkage}");
     assert_eq!(linkage["base_branch"], "main", "{linkage}");
-    assert_eq!(linkage["base_sha"], serde_json::json!(base_head), "{linkage}");
+    assert_eq!(
+        linkage["base_sha"],
+        serde_json::json!(base_head),
+        "{linkage}"
+    );
     assert!(
         linkage
             .get("base_root")
@@ -1115,7 +1233,11 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
     assert_eq!(event["text"], NOTE_TEXT, "{event}");
     assert_eq!(event["source"], "e2e", "{event}");
     assert_eq!(event["session_id"], "note-e2e-session", "{event}");
-    assert_eq!(event["attachments"][0]["url"], attachment_url.as_str(), "{event}");
+    assert_eq!(
+        event["attachments"][0]["url"],
+        attachment_url.as_str(),
+        "{event}"
+    );
     assert_eq!(event["attachments"][0]["mime"], "image/png", "{event}");
     assert!(
         event["attachments"][0].get("data").is_none(),
@@ -1165,6 +1287,857 @@ async fn ctl_session_note_posts_a_display_only_note_with_image() {
         },
     )
     .await;
+}
+
+/// Task #6 end to end, against the real binaries: a resumable upload
+/// rides direct HTTP as job create → capped raw chunks → commit,
+/// survives a "client restart" (re-list by handle, resume at the
+/// received extent, wrong-offset refusal), verifies the declared
+/// sha256 at commit, and the finished file rides back out over the
+/// download row — full read with `X-Content-Sha256`, then a `Range`
+/// request answering 206 with the `X-Transfer-*` resume echoes. Both
+/// delete shapes (native DELETE + the WKWebView POST fallback) tear the
+/// jobs down.
+#[tokio::test]
+async fn transfer_jobs_round_trip_over_direct_http() {
+    use sha2::Digest as _;
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    // Two uneven chunks force a mid-file resume boundary.
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let (head, tail_bytes) = payload.split_at(180_000);
+    let sha256 = {
+        let digest = sha2::Sha256::digest(&payload);
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let dest = daemon.rig.project.path().join("received").join("big.bin");
+    std::fs::create_dir_all(dest.parent().expect("dest parent")).expect("mk dest dir");
+
+    // Create the upload job (declared size + checksum).
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/transfers"))
+        .json(&serde_json::json!({
+            "kind": "upload",
+            "destination": dest.to_string_lossy(),
+            "name": "big.bin",
+            "total_size": payload.len(),
+            "sha256": sha256,
+        }))
+        .send()
+        .await
+        .expect("create upload job")
+        .json()
+        .await
+        .expect("create body");
+    assert_eq!(created["ok"], true, "{created}");
+    let job_id = created["job"]["id"].as_str().expect("job id").to_string();
+    let resume_token = created["job"]["resume_token"]
+        .as_str()
+        .expect("resume token")
+        .to_string();
+    assert_eq!(created["job"]["completed_bytes"], 0, "{created}");
+
+    // First chunk.
+    let first = client
+        .post(format!("{base}/api/transfers/{job_id}/chunk?offset=0"))
+        .body(head.to_vec())
+        .send()
+        .await
+        .expect("first chunk");
+    assert_eq!(first.status().as_u16(), 200);
+    let first: serde_json::Value = first.json().await.expect("first chunk body");
+    assert_eq!(first["job"]["status"], "running", "{first}");
+    assert_eq!(first["job"]["completed_bytes"], head.len(), "{first}");
+
+    // "Client restart": re-list by handle and read the received extent.
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/transfers?id={job_id}"))
+        .send()
+        .await
+        .expect("list jobs")
+        .json()
+        .await
+        .expect("list body");
+    let jobs = listed["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "{listed}");
+    let boundary = jobs[0]["completed_bytes"].as_u64().expect("extent") as usize;
+    assert_eq!(boundary, head.len(), "{listed}");
+
+    // A wrong-offset chunk that overlaps the persisted extent without
+    // being covered by it is refused — the resume contract (a fully
+    // covered duplicate would be answered idempotently instead).
+    let conflict = client
+        .post(format!(
+            "{base}/api/transfers/{job_id}/chunk?offset={}",
+            boundary - 1
+        ))
+        .body(tail_bytes.to_vec())
+        .send()
+        .await
+        .expect("conflicting chunk");
+    assert_eq!(conflict.status().as_u16(), 409);
+
+    // Resume at the boundary, addressing the job by resume token.
+    let second = client
+        .post(format!(
+            "{base}/api/transfers/{resume_token}/chunk?offset={boundary}"
+        ))
+        .body(tail_bytes.to_vec())
+        .send()
+        .await
+        .expect("second chunk");
+    assert_eq!(second.status().as_u16(), 200);
+    let second: serde_json::Value = second.json().await.expect("second chunk body");
+    assert_eq!(second["job"]["status"], "ready", "{second}");
+
+    // Commit verifies size + sha256 and renames into place.
+    let committed = client
+        .post(format!("{base}/api/transfers/{job_id}/commit"))
+        .send()
+        .await
+        .expect("commit");
+    assert_eq!(committed.status().as_u16(), 200);
+    let committed: serde_json::Value = committed.json().await.expect("commit body");
+    assert_eq!(committed["job"]["status"], "completed", "{committed}");
+    assert_eq!(std::fs::read(&dest).expect("committed file"), payload);
+
+    // Round-trip back out: a download job over the same lane.
+    let download: serde_json::Value = client
+        .post(format!("{base}/api/transfers"))
+        .json(&serde_json::json!({
+            "kind": "download",
+            "path": dest.to_string_lossy(),
+        }))
+        .send()
+        .await
+        .expect("create download job")
+        .json()
+        .await
+        .expect("download job body");
+    assert_eq!(download["ok"], true, "{download}");
+    let download_id = download["job"]["id"].as_str().expect("dl id").to_string();
+
+    // Full read: 200 with the content hash + resume echoes.
+    let full = client
+        .get(format!("{base}/api/transfers/{download_id}/download"))
+        .send()
+        .await
+        .expect("full download");
+    assert_eq!(full.status().as_u16(), 200);
+    assert_eq!(
+        full.headers()
+            .get("X-Content-Sha256")
+            .and_then(|value| value.to_str().ok()),
+        Some(sha256.as_str())
+    );
+    assert_eq!(
+        full.headers()
+            .get("X-Transfer-Total-Size")
+            .and_then(|value| value.to_str().ok()),
+        Some(payload.len().to_string().as_str())
+    );
+    assert_eq!(full.bytes().await.expect("full body").as_ref(), payload);
+
+    // Ranged read: standard 206/Content-Range plus the end-exclusive
+    // X-Transfer resume echoes.
+    let ranged = client
+        .get(format!("{base}/api/transfers/{download_id}/download"))
+        .header("Range", "bytes=100-199")
+        .send()
+        .await
+        .expect("ranged download");
+    assert_eq!(ranged.status().as_u16(), 206);
+    assert_eq!(
+        ranged
+            .headers()
+            .get("Content-Range")
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("bytes 100-199/{}", payload.len()).as_str())
+    );
+    assert_eq!(
+        ranged
+            .headers()
+            .get("X-Transfer-Range-End")
+            .and_then(|value| value.to_str().ok()),
+        Some("200")
+    );
+    assert_eq!(
+        ranged.bytes().await.expect("ranged body").as_ref(),
+        &payload[100..200]
+    );
+
+    // Teardown over both delete shapes.
+    let deleted: serde_json::Value = client
+        .delete(format!("{base}/api/transfers/{job_id}"))
+        .send()
+        .await
+        .expect("native delete")
+        .json()
+        .await
+        .expect("delete body");
+    assert_eq!(deleted["deleted"], true, "{deleted}");
+    let fallback: serde_json::Value = client
+        .post(format!("{base}/api/transfers/{download_id}/delete"))
+        .send()
+        .await
+        .expect("fallback delete")
+        .json()
+        .await
+        .expect("fallback delete body");
+    assert_eq!(fallback["deleted"], true, "{fallback}");
+}
+
+/// The Stream lane over direct HTTP (transport-unification S10):
+/// `GET /api/sessions/stream` answers the NDJSON head (EOF-delimited,
+/// `application/x-ndjson`) and the shared line source's lifecycle —
+/// start, the hydrating phase marker, the replace payload, done — as
+/// parseable one-object lines, against the real daemon binary.
+#[tokio::test]
+async fn sessions_stream_serves_ndjson_over_direct_http() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{port}/api/sessions/stream?limit=50"
+        ))
+        .send()
+        .await
+        .expect("stream response");
+    assert_eq!(response.status().as_u16(), 200, "{}", daemon.log_tail());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-ndjson")
+    );
+    // EOF-delimited: no Content-Length on the streamed head.
+    assert!(response.headers().get("content-length").is_none());
+
+    let body = response.text().await.expect("stream body");
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("one JSON object per NDJSON line"))
+        .collect();
+    assert!(events.len() >= 3, "{body}");
+    assert_eq!(events.first().unwrap()["type"], "start", "{body}");
+    assert_eq!(events.first().unwrap()["limit"], 50, "{body}");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "phase" && event["phase"] == "hydrating"),
+        "{body}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "replace" && event["sessions"].is_array()),
+        "{body}"
+    );
+    assert_eq!(events.last().unwrap()["type"], "done", "{body}");
+}
+
+/// The display-request rail end to end: a caller rings the user-display
+/// doorbell (`ctl display request` → the `request_user_display` tool), a
+/// dashboard surface (here: a raw `/ws` client) receives the dedicated
+/// `display_request_raised` event and resolves it with the dedicated
+/// `resolve_display_request` action — approve mints the real grant
+/// (`user_display_granted` broadcast) and the blocked ctl call returns the
+/// structured approved result. The daemon runs at `--autonomy full`, which
+/// proves the rail's core invariant live: even full autonomy never
+/// auto-approves a display request — it waits for the click. The deny leg
+/// exercises deny + the per-session cooldown (the following ask is refused
+/// without raising anything).
+///
+/// Leg 0 pins the held-grant short-circuit, which is also what makes the
+/// test platform-uniform: a Windows daemon auto-registers the user desktop
+/// and holds the grant from startup
+/// (`display_glue::auto_activate_windows_user_display` — capture consent
+/// is implicit there by design), so a request on a fresh Windows daemon
+/// correctly answers `already_granted` without ringing. Granting
+/// explicitly first makes every platform take that same path, and the
+/// revoke that follows gives the popup legs one clean, grantless starting
+/// state everywhere.
+#[tokio::test]
+async fn display_request_rail_round_trips_over_ws() {
+    use futures_util::SinkExt;
+
+    const REASON: &str = "E2E_DISPLAY_REQUEST verify the deploy output";
+
+    // Displayless contract: with the suite-wide synthetic display backend
+    // (`INTENDANT_MOCK_DISPLAY=synthetic`), the whole rail round-trip is
+    // fast on every platform. A platform capture stack sneaking back in
+    // shows up here as seconds-to-minutes (Windows GDI Access-denied retry
+    // storms on a locked runner, SCK/TCC stalls) — so pin the wall clock.
+    // Generous versus the single-digit-second measured times: the fleet
+    // Mac leg breached a 30s bound at 35s while 3x oversubscribed (load
+    // avg 39 on 12 cores, two merge-queue ejections on 2026-07-12), and
+    // the failure classes this guards are minutes-scale, so 90s keeps
+    // the guard while shrugging off runner load.
+    let wall_clock = std::time::Instant::now();
+    const RAIL_WALL_CLOCK_BOUND: Duration = Duration::from_secs(90);
+
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before requesting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // ── Leg 0: a held grant short-circuits without ringing ──
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "is the door already open?",
+            "--session",
+            "display-e2e-pregrant",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "already_granted", "{result}");
+
+    // Clean slate for the popup legs (this also revokes the Windows
+    // startup auto-grant like any other grant).
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    // ── Leg 1: request(view_and_control) → user approves ──
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            REASON,
+            "--access",
+            "control",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-approve",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_raised never broadcast on /ws:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["session_id"], "display-e2e-approve", "{raised}");
+        assert_eq!(raised["access"], "view_and_control", "{raised}");
+        assert_eq!(raised["reason"], REASON, "{raised}");
+        assert!(
+            raised["expires_unix_ms"].as_u64().unwrap_or(0) > 0,
+            "{raised}"
+        );
+        let id = raised["id"].as_u64().expect("request id");
+
+        // The user's click: the dedicated resolution action (a display
+        // request is NEVER resolvable through approve/approve_all).
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-approve",
+                "id": id,
+                "decision": "approve",
+                "duration": "until_revoked",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send resolve_display_request");
+
+        // The approval minted the real grant through the existing path.
+        // Emission order inside the control plane's approve arm: the grant
+        // event first, then the resolution — and a /ws reader consumes
+        // frames in order, so wait for them in that order.
+        let granted = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_display_granted")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "user_display_granted never broadcast after approval:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(granted["display_id"], 0, "{granted}");
+        assert_eq!(granted["agent_visible"], true, "{granted}");
+
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["id"], id, "{resolved}");
+        assert_eq!(resolved["outcome"], "approved", "{resolved}");
+        assert_eq!(resolved["duration"], "until_revoked", "{resolved}");
+
+        // The grant the approval minted also activated a capture session,
+        // and under the suite-wide synthetic display mode that session is
+        // the deterministic synthetic source on every platform: 1280×720,
+        // no ScreenCaptureKit / GDI / X11 involved. Its `display_ready`
+        // geometry is the end-to-end proof — a platform backend would
+        // report the host's real resolution (or never come up at all on a
+        // headless runner). Any leg-0 display events were consumed by the
+        // raised-matcher above, so the next display_ready is this leg's.
+        let ready = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_ready")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "display_ready never broadcast after the approved grant:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(ready["display_id"], 0, "{ready}");
+        assert_eq!(ready["width"], 1280, "{ready}");
+        assert_eq!(ready["height"], 720, "{ready}");
+        assert_eq!(ready["agent_visible"], true, "{ready}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "approved", "{result}");
+    assert_eq!(result["access"], "view_and_control", "{result}");
+    assert_eq!(result["duration"], "until_revoked", "{result}");
+
+    // ── Leg 2: revoke, then a request the user denies ──
+    let output = ctl(&daemon, &["display", "revoke-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let request = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "second look please",
+            "--access",
+            "view",
+            "--wait",
+            "60",
+            "--session",
+            "display-e2e-deny",
+        ],
+    );
+    let resolver = async {
+        let raised = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_raised")
+                && json.get("session_id").and_then(|v| v.as_str()) == Some("display-e2e-deny")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_raised never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(raised["access"], "view", "{raised}");
+        let id = raised["id"].as_u64().expect("request id");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "resolve_display_request",
+                "session_id": "display-e2e-deny",
+                "id": id,
+                "decision": "deny",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send deny");
+        let resolved = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("display_request_resolved")
+                && json.get("id").and_then(|v| v.as_u64()) == Some(id)
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "deny-leg display_request_resolved never broadcast:\n{}",
+                daemon.log_tail()
+            )
+        });
+        assert_eq!(resolved["outcome"], "denied", "{resolved}");
+    };
+    let (output, ()) = tokio::join!(request, resolver);
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "denied", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+
+    // ── Leg 3: the cooldown refuses the next ask without a popup ──
+    let output = ctl(
+        &daemon,
+        &[
+            "--json",
+            "display",
+            "request",
+            "--reason",
+            "asking again immediately",
+            "--session",
+            "display-e2e-deny",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let result = stdout_json(&output);
+    assert_eq!(result["status"], "cooldown", "{result}");
+    assert!(
+        result["retry_after_secs"].as_u64().unwrap_or(0) > 0,
+        "{result}"
+    );
+
+    let elapsed = wall_clock.elapsed();
+    assert!(
+        elapsed < RAIL_WALL_CLOCK_BOUND,
+        "display-request rail e2e took {elapsed:?} (bound {RAIL_WALL_CLOCK_BOUND:?}) — \
+         is a real capture backend in play?\n{}",
+        daemon.log_tail()
+    );
+}
+
+/// The CU action-visualization lane end to end: grant the (synthetic) user
+/// display, execute one `screenshot` action through `ctl cu actions` (the
+/// MCP `execute_cu_actions` tool → `computer_use::execute_actions` → the
+/// `CuActionObserver`), and require the display-scoped `cu_action` event
+/// the Live tab's overlays/feed render from to broadcast on `/ws` with the
+/// pinned wire shape. A screenshot is the one action that is safe on every
+/// backend here: it is input-free and the suite-wide synthetic display
+/// serves the frame (no SCK/GDI/X11). Also pins the lane's ephemerality —
+/// the event must never land in session.jsonl (no replay).
+#[tokio::test]
+async fn cu_actions_broadcast_display_scoped_events_over_ws() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // Subscribe before acting so the broadcast cannot race the assert.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Synthetic user-display capture session (1280×720 on every platform).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously — "capture is ready after DisplayReady" is the
+    // command's own contract. A CU call racing past registration misses
+    // the session lookup and falls to the subprocess capture path, which
+    // for a user-session target on Linux is a real X server — correctly
+    // absent on a headless runner, so the action fails and the observer
+    // (by design) emits nothing. Proven live on the Linux fleet box:
+    // firing immediately after grant-user loses that race 5/5 with
+    // "cannot connect to X display". Screenshots are idempotent, so
+    // retry the action itself until its per-action result reports ok —
+    // this also avoids racing the /ws broadcast for the grant's own
+    // display_ready, and `ctl cu actions` exits 0 even for failed
+    // actions (failures are informational summaries), so only the
+    // per-action text is trustworthy. A persistent real failure
+    // surfaces here with its actual error text instead of as a /ws
+    // timeout downstream.
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+    loop {
+        let output = ctl(
+            &daemon,
+            &[
+                "--json",
+                "cu",
+                "actions",
+                "--actions",
+                r#"[{"type":"screenshot"}]"#,
+                "--target",
+                "user_session",
+            ],
+        )
+        .await;
+        assert!(output.status.success(), "{}", text_of(&output));
+        if String::from_utf8_lossy(&output.stdout).contains("(screenshot): ok") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CU screenshot never succeeded (capture session still absent?):\n{}\n{}",
+            text_of(&output),
+            daemon.log_tail()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let event = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("cu_action")
+    })
+    .await
+    .unwrap_or_else(|| panic!("cu_action never broadcast on /ws:\n{}", daemon.log_tail()));
+    assert_eq!(event["display_id"], 0, "{event}");
+    assert_eq!(event["kind"], "screenshot", "{event}");
+    assert_eq!(event["raw"], "screenshot()", "{event}");
+    // Coordinate reference = the synthetic session resolution, the space
+    // viewers normalize overlay geometry against.
+    assert_eq!(event["ref_w"], 1280, "{event}");
+    assert_eq!(event["ref_h"], 720, "{event}");
+    // A screenshot has no landing point, and the MCP surface is
+    // sessionless — absent fields are omitted from the wire, not nulled.
+    assert!(event.get("x").is_none(), "{event}");
+    assert!(event.get("y").is_none(), "{event}");
+    assert!(event.get("session_id").is_none(), "{event}");
+    assert!(event["ts"].as_u64().unwrap_or(0) > 0, "{event}");
+    assert!(
+        event["event_id"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("cu-"),
+        "{event}"
+    );
+
+    // Ephemeral lane: the broadcast above is the event's ONLY life — it
+    // must never be written to session.jsonl (and hence never replays).
+    // An absence check can pass early by timing alone; the authoritative
+    // pin is event.rs's cu_action_events_never_reach_the_session_log —
+    // this asserts the same contract at the wire edge.
+    assert!(
+        !daemon.rig.session_logs().contains("\"cu_action\""),
+        "cu_action must not be written to session.jsonl"
+    );
+}
+
+/// The CU observation policy end to end on the synthetic rig: `--observe`
+/// drives what the batch result carries, and the result names the
+/// observation and why. A `wait` action is the safe probe on every backend
+/// (no OS input path, no capture race): `ax`/`auto`/`none` never capture
+/// pixels, and under the armed synthetic backend the element walk serves the
+/// deterministic synthetic tree instead of touching a native accessibility
+/// API (macOS AX / AT-SPI / UIA) — this must stay true or CI walks a fleet
+/// runner's real desktop.
+#[tokio::test]
+async fn cu_observe_modes_choose_ax_pixels_or_nothing() {
+    let idle_script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "fallback profile (unexpected session)",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "unexpected session" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let port = free_loopback_port();
+    let daemon = spawn_daemon(&client, &idle_script, port).await;
+
+    // user_session CU requires the display grant (the synthetic backend
+    // serves the capture session it registers).
+    let output = ctl(&daemon, &["display", "grant-user"]).await;
+    assert!(output.status.success(), "{}", text_of(&output));
+
+    let run = |observe: &'static str| {
+        let daemon = &daemon;
+        async move {
+            let output = ctl(
+                daemon,
+                &[
+                    "cu",
+                    "actions",
+                    "--actions",
+                    r#"[{"type":"wait","ms":1}]"#,
+                    "--target",
+                    "user_session",
+                    "--observe",
+                    observe,
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{}", text_of(&output));
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+    };
+
+    // The grant returns once RECORDED; the capture session registers
+    // asynchronously, and on the session-only backends (Windows) a CU call
+    // racing past registration fails with the no-session guidance — same
+    // race as cu_actions_broadcast_display_scoped_events_over_ws, same
+    // remedy: retry the (idempotent) batch until its per-action result
+    // reports ok. On X11/macOS a `wait` needs no session, so the first
+    // attempt already passes there.
+    let text = {
+        let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
+        loop {
+            let text = run("ax").await;
+            if text.contains("(wait 1ms): ok") {
+                break text;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "CU wait batch never succeeded (capture session still absent?):\n{text}\n{}",
+                daemon.log_tail()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    // observe=ax: the element tree IS the observation — synthetic tree text
+    // inline, no screenshot capture at all.
+    assert!(
+        text.contains("observation: ax (observe=ax"),
+        "result must name the ax observation:\n{text}"
+    );
+    assert!(
+        text.contains("Synthetic Desktop") && text.contains("button \"OK\""),
+        "synthetic element tree must ride the result:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured"),
+        "ax observation must not capture pixels:\n{text}"
+    );
+
+    // observe=auto: the synthetic tree is above the usability floor, so auto
+    // deterministically picks ax and says so.
+    let text = run("auto").await;
+    assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (auto):\n{text}"
+    );
+    assert!(
+        text.contains("observation: ax (auto: ax usable ("),
+        "auto must pick the usable tree and give the reason:\n{text}"
+    );
+    assert!(
+        text.contains("--- screen elements ---"),
+        "auto-chosen ax observation must carry the tree:\n{text}"
+    );
+
+    // observe=none: results only.
+    let text = run("none").await;
+    assert!(
+        text.contains("(wait 1ms): ok"),
+        "wait action must verify (none):\n{text}"
+    );
+    assert!(
+        text.contains("observation: none (observe=none)"),
+        "none must be named:\n{text}"
+    );
+    assert!(
+        !text.contains("post-action screenshot captured")
+            && !text.contains("--- screen elements ---"),
+        "observe=none must attach nothing:\n{text}"
+    );
+
+    // settle: the synthetic test card free-runs (its counter strip changes
+    // every frame), so it has no quiescence semantics — settle must degrade
+    // to the fixed minimal wait AND SAY SO, deterministically, on every
+    // platform (session present → "synthetic display has no damage signal";
+    // session still absent on the subprocess backends → "no live capture
+    // session" — both are the honest fixed-wait label).
+    let output = ctl(
+        &daemon,
+        &[
+            "cu",
+            "actions",
+            "--actions",
+            r#"[{"type":"wait","ms":1}]"#,
+            "--target",
+            "user_session",
+            "--observe",
+            "none",
+            "--settle",
+            "1000",
+        ],
+    )
+    .await;
+    assert!(output.status.success(), "{}", text_of(&output));
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        text.contains("settle: fixed 300ms wait ("),
+        "settle on the synthetic rig must report the honest fixed wait:\n{text}"
+    );
 }
 
 /// `intendant ctl ask` end to end: the ctl process BLOCKS while the daemon
@@ -1229,7 +2202,12 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
         json.get("event").and_then(|v| v.as_str()) == Some("user_question")
     })
     .await
-    .unwrap_or_else(|| panic!("user_question never broadcast on /ws:\n{}", daemon.log_tail()));
+    .unwrap_or_else(|| {
+        panic!(
+            "user_question never broadcast on /ws:\n{}",
+            daemon.log_tail()
+        )
+    });
     assert_eq!(question["session_id"], "ask-e2e-session", "{question}");
     assert_eq!(question["questions"][0]["question"], QUESTION, "{question}");
     assert_eq!(question["questions"][0]["header"], "Paint", "{question}");
@@ -1270,7 +2248,12 @@ async fn ctl_ask_blocks_until_the_dashboard_answers() {
     // (3) The blocked ctl returns the structured outcome with the answer.
     let output = tokio::time::timeout(RUN_TIMEOUT, ask_child.wait_with_output())
         .await
-        .unwrap_or_else(|_| panic!("ctl ask did not return after the answer:\n{}", daemon.log_tail()))
+        .unwrap_or_else(|_| {
+            panic!(
+                "ctl ask did not return after the answer:\n{}",
+                daemon.log_tail()
+            )
+        })
         .expect("collect ctl ask output");
     assert!(output.status.success(), "{}", text_of(&output));
     let outcome = stdout_json(&output);
@@ -1436,6 +2419,26 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     let mut a = spawn_daemon(&client, &idle_script, port_a).await;
     let mut b = spawn_daemon(&client, &peer_script, port_b).await;
 
+    // Failure forensics shared by every cross-daemon wait below. Always
+    // dump BOTH sides: the narrative of a delegation lost in flight lives
+    // on A (connection transitions in its daemon log, the durable
+    // peer-event record in its peers.jsonl), while only session activity
+    // shows on B — a B-only dump cannot distinguish "B is slow" from "B
+    // never received the task" (the blind spot of the 2026-07-12 Windows
+    // timeout, which dumped B alone).
+    let dump_daemons = || {
+        format!(
+            "--- daemon A log tail ---\n{}\n\
+             --- daemon A peers.jsonl tail ---\n{}\n\
+             --- daemon B log tail ---\n{}\n\
+             --- daemon B session logs (tail) ---\n{}",
+            a.log_tail(),
+            a.peer_log_tail(),
+            b.log_tail(),
+            tail(&b.rig.session_logs(), 4000),
+        )
+    };
+
     // Zero peers: a fresh daemon lists an empty registry.
     let empty = ctl(&a, &["peer", "list"]).await;
     assert!(empty.status.success(), "{}", text_of(&empty));
@@ -1471,13 +2474,7 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
             let client = client.clone();
             async move { connected_peer(&client, port_a).await }
         },
-        || {
-            format!(
-                "--- daemon A log tail ---\n{}\n--- daemon B log tail ---\n{}",
-                a.log_tail(),
-                b.log_tail()
-            )
-        },
+        &dump_daemons,
     )
     .await;
     let peer_id = peer
@@ -1525,7 +2522,15 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         text_of(&list)
     );
 
-    // Delegate a task to B through A; the command must print a task id.
+    // Delegate a task to B through A. Delegation now resolves through the
+    // application-level delivery receipt (`delegation_id` on the StartTask
+    // frame; B acks with `task_received` when it actually dispatches):
+    // `delivery: "acknowledged"` means the task is running on B and
+    // `task_id` is B's real session id — not the sender-minted
+    // `task-out-{n}` marker of the fire-and-forget era. A StartTask lost
+    // before B reads it is re-sent under the same delegation id and B
+    // dedups, so this test's former arrival gate + one-shot re-delegation
+    // is retired: the product owns the retry now.
     let instructions = format!("{TASK_MARK} - run the scripted delegated steps");
     let task = ctl(&a, &["peer", "task", &peer_id, &instructions]).await;
     assert!(task.status.success(), "{}", text_of(&task));
@@ -1533,12 +2538,67 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     let task_id = task_json
         .get("task_id")
         .and_then(|v| v.as_str())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     assert!(
         !task_id.is_empty(),
         "ctl peer task did not print a task_id:\n{}",
         text_of(&task)
     );
+    assert_eq!(
+        task_json.get("delivery").and_then(|v| v.as_str()),
+        Some("acknowledged"),
+        "peer delegation was not acknowledged by B:\n{}\n{}",
+        text_of(&task),
+        dump_daemons()
+    );
+    let delegation_id = task_json
+        .get("delegation_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !delegation_id.is_empty(),
+        "acknowledged delegation must report its delegation_id:\n{}",
+        text_of(&task)
+    );
+    assert!(
+        !task_id.starts_with("task-out-"),
+        "acknowledged delivery must carry B's session id, not the \
+         sender-side marker {task_id}:\n{}",
+        dump_daemons()
+    );
+    // The acknowledged id is real on B: its session log directory exists
+    // (created before dispatch, so by receipt time it must be on disk).
+    assert!(
+        b.rig
+            .home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(&task_id)
+            .join("session.jsonl")
+            .exists(),
+        "B has no session log for acknowledged session {task_id}:\n{}",
+        dump_daemons()
+    );
+    // And the receipt leaves a durable trace on A's federated peer-event
+    // record (`peers.jsonl`, the forensics rail dump_daemons reads). The
+    // actor writes it via the async log sink, so it may trail the ctl
+    // response by a beat — poll briefly.
+    poll_until(
+        "the task_receipt landing in daemon A's peers.jsonl",
+        Duration::from_secs(30),
+        || {
+            let tail = a.peer_log_tail();
+            let delegation_id = delegation_id.clone();
+            async move {
+                (tail.contains("task_receipt") && tail.contains(&delegation_id)).then_some(())
+            }
+        },
+        &dump_daemons,
+    )
+    .await;
 
     // B really ran it: only the TASK_MARK-matched profile emits the done
     // message, and the mock releases it only after the runtime's echo
@@ -1551,13 +2611,7 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
             let logs = b.rig.session_logs();
             async move { logs.contains(DONE_MESSAGE).then_some(()) }
         },
-        || {
-            format!(
-                "--- daemon B log tail ---\n{}\n--- daemon B session logs (tail) ---\n{}",
-                b.log_tail(),
-                tail(&b.rig.session_logs(), 4000)
-            )
-        },
+        &dump_daemons,
     )
     .await;
     let artifacts = b.rig.turn_artifacts();
@@ -1668,7 +2722,8 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
             ]
         }]
     });
-    let mut daemon_b = spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
+    let mut daemon_b =
+        spawn_daemon_on_rig(&insecure_probe, rig_b, &idle_script, port_b, true).await;
 
     // Side A: a bare project, nothing else.
     let rig_a = TestRig::new();
@@ -1823,7 +2878,13 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 
     let approve_op = {
         let mut cmd = daemon_b.rig.command();
-        cmd.args(["peer", "approve", &approval_op_code, "--profile", "peer-operator"]);
+        cmd.args([
+            "peer",
+            "approve",
+            &approval_op_code,
+            "--profile",
+            "peer-operator",
+        ]);
         daemon_b.rig.run(cmd).await
     };
     assert!(
@@ -1834,7 +2895,13 @@ async fn ctl_peer_mtls_pairing_binds_scoped_profile_and_gates_display_input() {
 
     let complete_op = {
         let mut cmd = rig_a.command();
-        cmd.args(["peer", "complete", &request_op_id, "--label", "peer-e2e-b-op"]);
+        cmd.args([
+            "peer",
+            "complete",
+            &request_op_id,
+            "--label",
+            "peer-e2e-b-op",
+        ]);
         rig_a.run(cmd).await
     };
     let complete_op_text = text_of(&complete_op);
@@ -2157,4 +3224,968 @@ async fn supervised_session_ask_human_reaches_the_question_rail() {
     .await;
 
     let _ = child.kill().await;
+}
+
+/// Shared assertions for the message-search wire contract (plan §4/§11):
+/// the intendant extractor consumes exactly these `session.jsonl` shapes,
+/// and its unit tests use fixtures of them — these helpers pin the shapes
+/// to the real binary so schema drift fails here instead of silently
+/// unindexing. Returns the parsed `conversation_message` rows.
+fn canonical_message_rows(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+    let messages: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_message"))
+        .collect();
+    for row in &messages {
+        assert!(
+            msg_field(row, "message_id")
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "conversation_message without a message_id: {row}"
+        );
+        assert!(
+            msg_field(row, "message_seq").as_u64().is_some(),
+            "conversation_message without a message_seq: {row}"
+        );
+        assert!(
+            row.get("ts_ms").and_then(|v| v.as_i64()).is_some(),
+            "conversation_message without ts_ms: {row}"
+        );
+    }
+    let seqs: Vec<u64> = messages
+        .iter()
+        .filter_map(|row| msg_field(row, "message_seq").as_u64())
+        .collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        seqs.len(),
+        sorted.len(),
+        "message seqs must be unique: {seqs:?}"
+    );
+    messages
+}
+
+fn msg_field(row: &serde_json::Value, name: &str) -> serde_json::Value {
+    row.pointer(&format!("/data/{name}"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The user-side row with exactly this RAW text (no attachment preludes,
+/// no tool-result envelopes, no delivery wrappers).
+fn user_message_row<'rows>(
+    messages: &[&'rows serde_json::Value],
+    text: &str,
+) -> &'rows serde_json::Value {
+    messages
+        .iter()
+        .find(|row| {
+            msg_field(row, "role").as_str() == Some("user")
+                && msg_field(row, "text").as_str() == Some(text)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no user conversation_message with raw text {text:?}; rows:\n{}",
+                messages
+                    .iter()
+                    .map(|row| row.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        })
+}
+
+/// Resolve an assistant row's sidecar span byte-for-byte, exactly like
+/// the extractor does.
+fn resolve_assistant_span(log_dir: &std::path::Path, row: &serde_json::Value) -> String {
+    let file = row
+        .get("file")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("assistant row without a sidecar file: {row}"));
+    let offset = msg_field(row, "model_offset")
+        .as_u64()
+        .unwrap_or_else(|| panic!("assistant row without model_offset: {row}"));
+    let len = msg_field(row, "model_bytes")
+        .as_u64()
+        .unwrap_or_else(|| panic!("assistant row without model_bytes: {row}"));
+    let bytes = std::fs::read(log_dir.join(file)).expect("read sidecar");
+    String::from_utf8_lossy(&bytes[offset as usize..(offset + len) as usize]).into_owned()
+}
+
+fn assert_assistant_spans_resolve(
+    log_dir: &std::path::Path,
+    messages: &[&serde_json::Value],
+    expected: &[&str],
+) {
+    let assistant_texts: Vec<String> = messages
+        .iter()
+        .filter(|row| msg_field(row, "role").as_str() == Some("assistant"))
+        .map(|row| resolve_assistant_span(log_dir, row))
+        .collect();
+    for text in expected {
+        assert!(
+            assistant_texts.iter().any(|resolved| resolved == text),
+            "no assistant span resolved to {text:?}; got {assistant_texts:?}"
+        );
+    }
+}
+
+fn parsed_session_rows(log_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let log = std::fs::read_to_string(log_dir.join("session.jsonl")).expect("read session.jsonl");
+    log.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Message-lane wire contract, supervised-session half: a create_session
+/// child run through task → askHuman answer → between-rounds steer writes
+/// canonical `conversation_message` rows with RAW user text (provenances
+/// `task` / `ask_human_answer` / `steer`), the askHuman projection's
+/// `ref_seq`, and assistant sidecar spans that resolve byte-for-byte. The
+/// steer rides the supervisor's parked-delivery fallback (`route_steer`
+/// queues an id-carrying steer as a follow-up when no active turn acks
+/// it) — the shape the dashboard uses. Conversation rollback deliberately
+/// lives in the OTHER half: a child parks in `run_round_loop`'s follow-up
+/// drain, which never sees `ConversationRollbackRequested`.
+#[tokio::test]
+async fn supervised_session_writes_task_ask_human_and_steer_message_rows() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Need input before charting.",
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 1, "question": "Which payload?" } }] },
+                { "content": "Round one done, payload chosen.",
+                  "expect_transcript_contains": "the emerald payload",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Steered round two.",
+                  "expect_transcript_contains": "steer toward the vault",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the askHuman e2e above.
+    let mut question = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "chart the payload course",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        question = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+        })
+        .await;
+        if question.is_some() {
+            break;
+        }
+    }
+    let question = question.unwrap_or_else(|| {
+        panic!(
+            "no user_question from the session's askHuman; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = question
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries its session id")
+        .to_string();
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .expect("user_question carries an id");
+    let question_text = question
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries the question text")
+        .to_string();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": session_id,
+            "id": question_id,
+            "answers": { question_text: "the emerald payload" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send answer_question");
+
+    // Round 1 completes (the transcript gate proved the answer landed).
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // A between-rounds steer. The id is load-bearing: only an id-carrying
+    // steer arms route_steer's no-active-turn fallback that delivers to a
+    // parked session, and the dashboard always sends one.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "steer-e2e-1",
+            "text": "steer toward the vault",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "steered round 2 never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Both rounds are already consumed above — only the stop half of the
+    // usual completion ritual remains (the session parks by design).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({ "action": "stop_session", "session_id": session_id })
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send stop_session");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_ended")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "stopped session never ended; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let _ = child.kill().await;
+
+    // ---- The wire contract the extractor consumes ----
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+
+    let task_row = user_message_row(&messages, "chart the payload course");
+    assert_eq!(msg_field(task_row, "provenance").as_str(), Some("task"));
+    let answer_row = user_message_row(&messages, "the emerald payload");
+    assert_eq!(
+        msg_field(answer_row, "provenance").as_str(),
+        Some("ask_human_answer")
+    );
+    assert!(
+        msg_field(answer_row, "ref_seq").as_u64().is_some(),
+        "the native-tool askHuman projection must reference its tool result: {answer_row}"
+    );
+    let steer_row = user_message_row(&messages, "steer toward the vault");
+    assert_eq!(msg_field(steer_row, "provenance").as_str(), Some("steer"));
+
+    assert_assistant_spans_resolve(
+        &log_dir,
+        &messages,
+        &[
+            "Need input before charting.",
+            "Round one done, payload chosen.",
+            "Steered round two.",
+        ],
+    );
+}
+
+/// A steer WITHOUT an id delivered to a parked session must still start
+/// the next round (regression: nothing consumed SteerRequested for a
+/// parked session — the supervisor's queue-as-follow-up fallback only
+/// arms for id-carrying steers, and the round watcher dies with its
+/// round — so id-less steers, the API/MCP default, vanished silently;
+/// the parked drain now picks them up directly). Also covers the
+/// round-boundary acceptance race: a steer arriving as the round dies
+/// may be "accepted" by the doomed watcher, and the drain must deliver
+/// it anyway.
+#[tokio::test]
+async fn parked_session_delivers_an_id_less_steer() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Round one answer.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Steered onward.",
+                  "expect_transcript_contains": "quiet steer text",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the sibling tests.
+    let mut completed = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "run the first round",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        completed = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+        })
+        .await;
+        if completed.is_some() {
+            break;
+        }
+    }
+    let completed = completed.unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = completed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("round_complete carries its session id")
+        .to_string();
+
+    // The id-less steer (API/MCP default shape) to the parked session.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "text": "quiet steer text",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "id-less steered round never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    let _ = child.kill().await;
+
+    // The steer text entered the message lane with steer provenance.
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+    let steer_row = user_message_row(&messages, "quiet steer text");
+    assert_eq!(msg_field(steer_row, "provenance").as_str(), Some("steer"));
+}
+
+/// Targeted conversation rollback: a SUPERVISED session's parked drain
+/// executes `POST /api/session/current/rollback { session_id, round_id,
+/// revert_conversation: true, revert_files: false }` — previously the
+/// signal was only handled by the headless boot-session loop, so the
+/// pure-daemon rollback rail was dead (the gap the B2 message-lane e2e
+/// documented). Two rounds run, the conversation rolls back to round 1,
+/// and a third round proves the session keeps working on the truncated
+/// conversation; the session log carries the same `conversation_rewound`
+/// cut the message-search extractor derives supersession from, and the
+/// completion event carries the session id.
+#[tokio::test]
+async fn supervised_session_rolls_back_conversation_to_a_round() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Round one done.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Round two done.",
+                  "expect_transcript_contains": "start round two",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] },
+                { "content": "Post-rollback round done.",
+                  "expect_transcript_contains": "after the rewind",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round three" } }] }
+            ]
+        }]
+    }));
+    let session_project = tempfile::tempdir().expect("session project dir");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script)
+        .args(["--no-tls", "--web", "0"]);
+    let mut child = cmd.spawn().expect("spawn intendant daemon");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Same startup race + retry shape as the sibling tests.
+    let mut completed = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "run round one",
+                "project_root": session_project.path().to_string_lossy(),
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        completed = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+        })
+        .await;
+        if completed.is_some() {
+            break;
+        }
+    }
+    let completed = completed.unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = completed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("round_complete carries its session id")
+        .to_string();
+
+    // Round 2 via a follow-up steer (id-carrying, the delivered path).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "rollback-e2e-steer-1",
+            "text": "start round two",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send round-2 steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("round").and_then(|v| v.as_u64()) == Some(2)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 2 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // Targeted conversation rollback to round 1 through the route.
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{port}/api/session/current/rollback"
+        ))
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "round_id": 1,
+            "revert_conversation": true,
+            "revert_files": false,
+        }))
+        .send()
+        .await
+        .expect("send targeted rollback");
+    assert!(
+        response.status().is_success(),
+        "targeted rollback rejected: {:?}",
+        response.text().await
+    );
+    let rolled = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("conversation_rolled_back")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "targeted rollback never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    assert!(
+        rolled
+            .get("turns_removed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0,
+        "rollback must remove round 2's messages: {rolled}"
+    );
+
+    // The session still works: round 3 on the truncated conversation.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "steer",
+            "session_id": session_id,
+            "id": "rollback-e2e-steer-2",
+            "text": "after the rewind",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send post-rollback steer");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json.get("session_id").and_then(|v| v.as_str()) == Some(session_id.as_str())
+            && json.get("round").and_then(|v| v.as_u64()) == Some(2)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "post-rollback round never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+    let _ = child.kill().await;
+
+    // The wire contract: the cut partitions round 2, round 3's steer rides
+    // after it with a fresh seq.
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+    let round2_seq = msg_field(
+        user_message_row(&messages, "start round two"),
+        "message_seq",
+    )
+    .as_u64()
+    .unwrap();
+    let round3_seq = msg_field(
+        user_message_row(&messages, "after the rewind"),
+        "message_seq",
+    )
+    .as_u64()
+    .unwrap();
+    let rewound = rows
+        .iter()
+        .find(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_rewound"))
+        .expect("conversation_rewound row exists");
+    let cut_after_seq = msg_field(rewound, "cut_after_seq").as_u64().unwrap();
+    assert!(
+        cut_after_seq < round2_seq && round2_seq < round3_seq,
+        "cut {cut_after_seq} must supersede round 2 (seq {round2_seq}) and precede          round 3 (seq {round3_seq})"
+    );
+}
+
+/// Message-lane wire contract, rollback half: the HEADLESS shape (task on
+/// argv) is the one execution shape whose outer loop (run_with_presence)
+/// handles `ConversationRollbackRequested`, so the round-rollback rail —
+/// `GET /api/session/current/history` + `POST
+/// /api/session/current/rollback` — runs here. Two rounds (boot task with
+/// an askHuman answer, then a second task into the same primary session),
+/// then a conversation-only revert to round 1 must write a
+/// `conversation_rewound` row whose cut keeps round 1 and supersedes
+/// round 2 — exactly the SeqCut semantics the extractor derives
+/// supersession from.
+#[tokio::test]
+async fn headless_rollback_writes_a_conversation_rewound_cut() {
+    use futures_util::SinkExt;
+
+    let rig = TestRig::new();
+    let script = rig.write_script(&serde_json::json!({
+        "profiles": [{
+            "steps": [
+                // The boot task starts before any websocket can connect,
+                // and rail events do not replay to late joiners — the
+                // scripted think-time holds the question back until this
+                // test's connection is up.
+                { "content": "Need input before charting.",
+                  "delay_ms": 8_000,
+                  "tool_calls": [{ "name": "ask_human",
+                                   "arguments": { "nonce": 1, "question": "Which payload?" } }] },
+                { "content": "Round one done, payload chosen.",
+                  "expect_transcript_contains": "the emerald payload",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one" } }] },
+                { "content": "Second round response.",
+                  "expect_transcript_contains": "chase the decoy",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two" } }] }
+            ]
+        }]
+    }));
+    // The rollback rail needs the file watcher's round history, which a
+    // projectless run turns off — mark the rig project.
+    std::fs::write(rig.project.path().join("intendant.toml"), "").expect("project marker");
+
+    let mut cmd = rig.command();
+    cmd.env("INTENDANT_MOCK_SCRIPT", &script).args([
+        "--no-tls",
+        "--web",
+        "0",
+        "--direct",
+        "chart the payload course",
+    ]);
+    let mut child = cmd.spawn().expect("spawn intendant with a boot task");
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let stdout_buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let _stderr_drain = drain_pipe_into(child.stderr.take().expect("stderr"), stderr_buf.clone());
+    let _stdout_drain = drain_pipe_into(child.stdout.take().expect("stdout"), stdout_buf.clone());
+
+    let stderr_so_far = wait_for_output(&stderr_buf, "Dashboard: http://", RUN_TIMEOUT).await;
+    let port: u16 = stderr_so_far
+        .lines()
+        .find_map(|line| {
+            let url = line.strip_prefix("Dashboard: http://")?;
+            url.rsplit(':').next()?.trim().parse().ok()
+        })
+        .expect("parse the dashboard port from the startup line");
+    // The primary (boot) session announces its id and log dir at startup.
+    let primary_id = stderr_so_far
+        .lines()
+        .find_map(|line| line.strip_prefix("Session ID: "))
+        .expect("parse the primary session id from the startup lines")
+        .trim()
+        .to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    let question = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("user_question")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "no user_question from the boot task's askHuman; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+    let session_id = question
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&primary_id)
+        .to_string();
+    let question_id = question
+        .get("id")
+        .and_then(|v| v.as_u64())
+        .expect("user_question carries an id");
+    let question_text = question
+        .pointer("/questions/0/question")
+        .and_then(|v| v.as_str())
+        .expect("user_question carries the question text")
+        .to_string();
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "answer_question",
+            "session_id": session_id,
+            "id": question_id,
+            "answers": { question_text: "the emerald payload" },
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send answer_question");
+
+    let round_complete_for_primary = |json: &serde_json::Value, session_id: &str| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+            && json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| id == session_id)
+    };
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        round_complete_for_primary(json, &session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 1 never completed; daemon stderr:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default()
+        )
+    });
+
+    // Round 2: a second task into the SAME primary session (the dispatcher
+    // claims start_task for the primary id; the supervisor would claim an
+    // id-less one as a fresh child session).
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "start_task",
+            "session_id": primary_id,
+            "task": "chase the decoy",
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send start_task");
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        round_complete_for_primary(json, &session_id)
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "round 2 never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Conversation-only revert to the first recorded round, through the
+    // dashboard's route (the production `conversation_rewound` path).
+    // Idle-state and history-visibility race the round_complete event, so
+    // poll both.
+    let client = reqwest::Client::new();
+    let stderr_ctx = stderr_buf.clone();
+    let first_round_id = poll_until(
+        "the session history to list its first round",
+        Duration::from_secs(30),
+        || {
+            let client = client.clone();
+            async move {
+                let history = http_get_json(
+                    &client,
+                    &format!("http://127.0.0.1:{port}/api/session/current/history"),
+                )
+                .await?;
+                history
+                    .get("rounds")?
+                    .as_array()?
+                    .first()?
+                    .get("id")?
+                    .as_u64()
+            }
+        },
+        move || stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default(),
+    )
+    .await;
+    let stderr_ctx = stderr_buf.clone();
+    poll_until(
+        "the rollback route to accept the revert",
+        Duration::from_secs(30),
+        || {
+            let client = client.clone();
+            async move {
+                let response = client
+                    .post(format!(
+                        "http://127.0.0.1:{port}/api/session/current/rollback"
+                    ))
+                    .json(&serde_json::json!({
+                        "round_id": first_round_id,
+                        "revert_conversation": true,
+                        "revert_files": false,
+                    }))
+                    .send()
+                    .await
+                    .ok()?;
+                response.status().is_success().then_some(())
+            }
+        },
+        move || stderr_ctx.lock().map(|b| b.clone()).unwrap_or_default(),
+    )
+    .await;
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("conversation_rolled_back")
+    })
+    .await
+    .unwrap_or_else(|| {
+        panic!(
+            "conversation rollback never completed; daemon stderr:\n{}\nsession logs:\n{}",
+            stderr_buf.lock().map(|b| b.clone()).unwrap_or_default(),
+            tail(&rig.session_logs(), 6000)
+        )
+    });
+
+    // Every event row is flushed per write; killing the daemon loses
+    // nothing, and the primary session is not user-stoppable anyway.
+    let _ = child.kill().await;
+
+    // ---- The wire contract the extractor consumes ----
+    let log_dir = rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let rows = parsed_session_rows(&log_dir);
+    let messages = canonical_message_rows(&rows);
+
+    let task_row = user_message_row(&messages, "chart the payload course");
+    assert_eq!(msg_field(task_row, "provenance").as_str(), Some("task"));
+    let answer_row = user_message_row(&messages, "the emerald payload");
+    assert_eq!(
+        msg_field(answer_row, "provenance").as_str(),
+        Some("ask_human_answer")
+    );
+    assert!(
+        msg_field(answer_row, "ref_seq").as_u64().is_some(),
+        "the native-tool askHuman projection must reference its tool result: {answer_row}"
+    );
+    let round2_row = user_message_row(&messages, "chase the decoy");
+    assert_assistant_spans_resolve(
+        &log_dir,
+        &messages,
+        &[
+            "Need input before charting.",
+            "Round one done, payload chosen.",
+            "Second round response.",
+        ],
+    );
+
+    // The rollback cut partitions round 2 strictly after the cut, with
+    // all of round 1 surviving — the SeqCut semantics the extractor
+    // derives supersession from.
+    let rewound = rows
+        .iter()
+        .find(|row| row.get("event").and_then(|v| v.as_str()) == Some("conversation_rewound"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no conversation_rewound row; session log:\n{}",
+                tail(&rig.session_logs(), 6000)
+            )
+        });
+    assert_eq!(msg_field(rewound, "kind").as_str(), Some("tail_rollback"));
+    assert!(
+        msg_field(rewound, "superseded_at_ms").as_i64().is_some(),
+        "conversation_rewound must stamp superseded_at_ms: {rewound}"
+    );
+    let cut_after_seq = msg_field(rewound, "cut_after_seq")
+        .as_u64()
+        .expect("conversation_rewound carries cut_after_seq");
+    let round1_max = ["chart the payload course", "the emerald payload"]
+        .iter()
+        .map(|text| {
+            msg_field(user_message_row(&messages, text), "message_seq")
+                .as_u64()
+                .unwrap()
+        })
+        .max()
+        .unwrap();
+    let round2_seq = msg_field(round2_row, "message_seq").as_u64().unwrap();
+    assert!(
+        round1_max <= cut_after_seq && cut_after_seq < round2_seq,
+        "cut_after_seq {cut_after_seq} must keep round 1 (max seq {round1_max}) and \
+         supersede round 2 (seq {round2_seq})"
+    );
 }

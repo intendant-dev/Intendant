@@ -191,7 +191,27 @@ impl WasmCrate {
             // `-Wl,-rpath,/usr/lib/swift` from .cargo/config.toml break
             // rust-lld. Scrub them so the inner build resolves flags fresh.
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("RUSTFLAGS")
+            // Then set exactly the canonical artifact flags — keep in
+            // LOCKSTEP with scripts/build-wasm.sh (the CI drift gate
+            // rebuilds through that script and byte-diffs the result, so
+            // any divergence here fails the gate rather than shipping):
+            // dependency panic-locations embed the building account's
+            // cargo registry path; remapping it is what makes artifact
+            // bytes account-independent.
+            .env("RUSTFLAGS", {
+                let cargo_home = std::env::var_os("CARGO_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .or_else(|| std::env::var_os("USERPROFILE"))
+                            .map(|h| std::path::PathBuf::from(h).join(".cargo"))
+                    })
+                    .unwrap_or_else(|| std::path::PathBuf::from(".cargo"));
+                format!(
+                    "--remap-path-prefix {}=/cargo/registry/src",
+                    cargo_home.join("registry").join("src").display()
+                )
+            })
             .env("CARGO_TARGET_DIR", &wasm_target_abs)
             .status();
 
@@ -271,8 +291,17 @@ fn main() {
     // generated file is reverted to fragment truth on the next build rather
     // than silently shipping. Fail loudly on manifest ↔ directory mismatch:
     // a silently dropped fragment would embed a broken dashboard.
-    println!("cargo:rerun-if-changed={}/", app_html_assembler::FRAGMENT_DIR);
+    println!(
+        "cargo:rerun-if-changed={}/",
+        app_html_assembler::FRAGMENT_DIR
+    );
     println!("cargo:rerun-if-changed={}", app_html_assembler::OUTPUT);
+    // The vault crypto kernel's sha256 is pinned into the assembled
+    // app.html (VAULT_KERNEL_SHA256), so a kernel edit must re-assemble.
+    println!(
+        "cargo:rerun-if-changed={}",
+        app_html_assembler::VAULT_KERNEL_PATH
+    );
     // The wasm-pack pin gates artifact rebuilds; a pin bump must re-run
     // the staleness/version checks.
     println!("cargo:rerun-if-changed=.wasm-pack-version");
@@ -285,22 +314,17 @@ fn main() {
         krate.emit_rerun_directives();
     }
 
-    // Expose the current git commit SHA as an env var so `/config` can
-    // report it. The multi-host dashboard compares the primary's SHA
-    // against each secondary's SHA and warns on mismatch — same class of
-    // version-skew confusion we just hit when the mac guest was running
-    // stale code without CORS headers.
+    // Expose the current git commit SHA as an env var so `/config` and
+    // `intendant --version` can report it. The multi-host dashboard compares
+    // the primary's SHA against each secondary's SHA and warns on mismatch —
+    // same class of version-skew confusion we just hit when the mac guest
+    // was running stale code without CORS headers.
     //
     // rerun-if-changed on HEAD + the branch ref file covers the common
     // "committed but didn't recompile" path. If the git command fails
     // (no .git, binary missing, detached head in weird state) the value
     // falls back to "unknown".
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
-        if let Some(ref_path) = head.strip_prefix("ref: ").map(|s| s.trim()) {
-            println!("cargo:rerun-if-changed=.git/{}", ref_path);
-        }
-    }
+    emit_git_rerun_paths();
     let git_sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -335,12 +359,152 @@ fn main() {
     };
     println!("cargo:rustc-env=INTENDANT_GIT_SHA={sha_with_dirty}");
 
+    // Build provenance for `--version`: timestamp + target triple. The
+    // timestamp is cached in OUT_DIR keyed by the SHA (see the helper), so
+    // its rustc-env value only changes when INTENDANT_GIT_SHA changes —
+    // a fresh wall-clock stamp on every build-script re-run would force a
+    // full crate recompile even when nothing else changed (defeating the
+    // write-if-different app.html/WASM-hash machinery above).
+    println!(
+        "cargo:rustc-env=INTENDANT_BUILD_TIMESTAMP={}",
+        provenance_build_timestamp(&sha_with_dirty)
+    );
+    // TARGET is set by cargo for every build-script invocation; per-target
+    // OUT_DIRs make it stable within a build directory.
+    if let Ok(target) = std::env::var("TARGET") {
+        println!("cargo:rustc-env=INTENDANT_TARGET_TRIPLE={target}");
+    }
+
     // Rebuild stale WASM first, then hash the (possibly fresh) artifacts so
     // OUT_DIR reflects what `include_bytes!` will embed in this build.
     for krate in WASM_CRATES {
         krate.rebuild_if_stale();
         krate.write_artifact_hash();
     }
+}
+
+/// Emit `rerun-if-changed` directives for the git files whose changes can
+/// move `INTENDANT_GIT_SHA`: HEAD, the checked-out branch's loose ref file,
+/// and packed-refs (a `git pack-refs`/gc can retire the loose file).
+///
+/// Worktree-aware: in a linked worktree `.git` is a FILE pointing at the
+/// per-worktree gitdir, and refs live in the shared common dir — so the
+/// paths are resolved through `git rev-parse` instead of assuming `.git/`
+/// is a directory. Only paths that actually exist are emitted: cargo treats
+/// a missing rerun-if-changed path as always-changed, which would re-run
+/// this script on every build (the pre-worktree-fix behavior).
+fn emit_git_rerun_paths() {
+    let Some(git_dir) = git_rev_parse_path("--git-dir") else {
+        // No git (tarball build, git binary missing): emit nothing rather
+        // than a dangling path that forces a re-run every build.
+        return;
+    };
+    // Refs are shared between worktrees; HEAD and index are per-worktree.
+    let common_dir = git_rev_parse_path("--git-common-dir").unwrap_or_else(|| git_dir.clone());
+
+    let head = git_dir.join("HEAD");
+    if head.exists() {
+        println!("cargo:rerun-if-changed={}", head.display());
+    }
+    if let Ok(contents) = std::fs::read_to_string(&head) {
+        if let Some(ref_path) = contents.strip_prefix("ref: ").map(str::trim) {
+            let loose_ref = common_dir.join(ref_path);
+            if loose_ref.exists() {
+                println!("cargo:rerun-if-changed={}", loose_ref.display());
+            }
+        }
+    }
+    let packed_refs = common_dir.join("packed-refs");
+    if packed_refs.exists() {
+        println!("cargo:rerun-if-changed={}", packed_refs.display());
+    }
+}
+
+/// `git rev-parse --path-format=absolute <flag>` → an absolute PathBuf, or
+/// None when git is unavailable or the flag fails. `--path-format=absolute`
+/// (git ≥ 2.31) avoids joining relative answers against the cwd ourselves;
+/// older gits fall back to manual resolution.
+fn git_rev_parse_path(flag: &str) -> Option<std::path::PathBuf> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").args(args).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let raw = run(&["rev-parse", "--path-format=absolute", flag])
+        .or_else(|| run(&["rev-parse", flag]))?;
+    let path = std::path::PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+/// The wall-clock timestamp (RFC 3339 UTC, second precision) of the first
+/// build of the current `<sha>[-dirty]` provenance in this target dir,
+/// cached in OUT_DIR so the emitted rustc-env value changes exactly when
+/// the SHA value does (keeping rebuild-triggering minimal — see the call
+/// site). Falls back to a fresh uncached stamp if OUT_DIR is unavailable.
+fn provenance_build_timestamp(sha_with_dirty: &str) -> String {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| rfc3339_utc(d.as_secs()))
+            .unwrap_or_else(|_| "unknown".to_string())
+    };
+    let Ok(out_dir) = std::env::var("OUT_DIR") else {
+        return now();
+    };
+    let stamp_path = Path::new(&out_dir).join("provenance_stamp.txt");
+    if let Ok(existing) = std::fs::read_to_string(&stamp_path) {
+        let mut lines = existing.lines();
+        if let (Some(sha), Some(ts)) = (lines.next(), lines.next()) {
+            if sha == sha_with_dirty && !ts.trim().is_empty() {
+                return ts.trim().to_string();
+            }
+        }
+    }
+    let ts = now();
+    if let Err(err) = std::fs::write(&stamp_path, format!("{sha_with_dirty}\n{ts}\n")) {
+        println!(
+            "cargo:warning=failed to cache build timestamp {}: {}",
+            stamp_path.display(),
+            err
+        );
+    }
+    ts
+}
+
+/// Format seconds since the Unix epoch as RFC 3339 UTC
+/// (`YYYY-MM-DDTHH:MM:SSZ`) without a date/time dependency, using Howard
+/// Hinnant's `civil_from_days` algorithm (exact for the proleptic Gregorian
+/// calendar; build scripts stay std-only per the build-dependencies note in
+/// Cargo.toml).
+fn rfc3339_utc(secs_since_epoch: u64) -> String {
+    let days = (secs_since_epoch / 86_400) as i64;
+    let secs_of_day = secs_since_epoch % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        secs_of_day / 3_600,
+        (secs_of_day / 60) % 60,
+        secs_of_day % 60
+    )
 }
 
 /// Find the newest modification time among all files in a directory (recursive).

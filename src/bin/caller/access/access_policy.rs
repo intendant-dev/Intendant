@@ -7,12 +7,23 @@
 //! signed by the access CA as equivalent.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CallerError;
 use crate::event::ControlMsg;
+
+fn with_identity_store_lock<T>(
+    cert_dir: &Path,
+    operation: impl FnOnce() -> Result<T, CallerError>,
+) -> Result<T, CallerError> {
+    super::authority_store::with_lock(cert_dir, || {
+        operation().map_err(|error| super::AccessError(error.to_string()))
+    })
+    .map_err(|error| CallerError::Config(error.to_string()))
+}
 
 pub(crate) fn unix_timestamp() -> i64 {
     SystemTime::now()
@@ -31,6 +42,119 @@ pub(crate) fn unix_timestamp() -> i64 {
 pub const DEFAULT_PROFILE: &str = "read-only-display";
 const POLICY_DIR: &str = "peer-access-identities";
 
+/// Stat-level identity of one peer record. Identity writes replace the file
+/// atomically, so a fresh inode distinguishes same-length/same-timestamp
+/// replacements on Unix; length and mtime provide the portable fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerRecordFingerprint {
+    len: u64,
+    mtime_nanos: u128,
+    dev: u64,
+    ino: u64,
+}
+
+fn peer_record_fingerprint_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> Option<PeerRecordFingerprint> {
+    if !metadata.is_file() {
+        return None;
+    }
+    let (dev, ino) = crate::platform::metadata_dev_ino(metadata);
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some(PeerRecordFingerprint {
+        len: metadata.len(),
+        mtime_nanos,
+        dev,
+        ino,
+    })
+}
+
+fn peer_record_fingerprint(path: &Path) -> Option<PeerRecordFingerprint> {
+    peer_record_fingerprint_from_metadata(&std::fs::metadata(path).ok()?)
+}
+
+struct PeerRecordCacheEntry {
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+}
+
+type PeerRecordCache = std::collections::HashMap<PathBuf, PeerRecordCacheEntry>;
+
+/// Peer records are reread from their own file, so key the cache by the full
+/// path rather than only the certificate fingerprint. Tests and multiple
+/// configured stores in one process must never share an entry.
+fn peer_record_cache() -> &'static Mutex<PeerRecordCache> {
+    static CACHE: OnceLock<Mutex<PeerRecordCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+const PEER_RECORD_CACHE_MAX_PATHS: usize = 128;
+
+fn cached_peer_record_in(
+    cache: &PeerRecordCache,
+    path: &Path,
+    fingerprint: &PeerRecordFingerprint,
+) -> Option<Arc<PeerIdentityRecord>> {
+    cache
+        .get(path)
+        .filter(|entry| entry.fingerprint == *fingerprint)
+        .map(|entry| Arc::clone(&entry.record))
+}
+
+fn cached_peer_record(
+    path: &Path,
+    fingerprint: &PeerRecordFingerprint,
+) -> Option<Arc<PeerIdentityRecord>> {
+    let cache = peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    cached_peer_record_in(&cache, path, fingerprint)
+}
+
+fn store_cached_peer_record_in(
+    cache: &mut PeerRecordCache,
+    path: &Path,
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+) {
+    if cache.len() >= PEER_RECORD_CACHE_MAX_PATHS && !cache.contains_key(path) {
+        // Peer stores are tiny in normal operation. Clearing instead of
+        // maintaining an eviction list keeps this authorization cache
+        // bounded without introducing recency bookkeeping on the hot path.
+        cache.clear();
+    }
+    cache.insert(
+        path.to_path_buf(),
+        PeerRecordCacheEntry {
+            fingerprint,
+            record,
+        },
+    );
+}
+
+fn store_cached_peer_record(
+    path: &Path,
+    fingerprint: PeerRecordFingerprint,
+    record: Arc<PeerIdentityRecord>,
+) {
+    let mut cache = peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    store_cached_peer_record_in(&mut cache, path, fingerprint, record);
+}
+
+fn invalidate_cached_peer_record(path: &Path) {
+    peer_record_cache()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(path);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerIdentityStatus {
@@ -38,7 +162,7 @@ pub enum PeerIdentityStatus {
     Revoked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerIdentityRecord {
     pub version: u8,
     pub fingerprint: String,
@@ -346,9 +470,12 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
                 | Task
                 | Approval
         ),
-        // Credential leases stay out of the peer lane entirely in v1: a
-        // peer daemon never fuels or drains another daemon's credentials,
-        // matching the org peer-cap philosophy for access.manage.
+        // Lane rule, not a v1 deferral (docs/src/trust-tiers.md § Two
+        // lanes): access administration and credential custody are
+        // user-lane-only. No peer profile — AdminPeer included — may
+        // exercise them, because both must be attributable to an
+        // identified person the target itself admitted, and a peer
+        // connection's principal is a daemon.
         AdminPeer => !matches!(op, AccessManage | CredentialsManage),
     }
 }
@@ -366,8 +493,8 @@ pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
 /// tunnel's WebRTC signaling relay is a transport door, not a single
 /// operation: it opens for an identity that can use at least one of these,
 /// and every method/frame inside is then authorized individually against
-/// the same identity (`dashboard_control_method_operation` /
-/// `dashboard_control_frame_operation` and their `/ws` twins). Presence-
+/// the same identity (`authorize_dashboard_control_method` and the
+/// [`FRAME_LANES`] per-frame gates on both transports). Presence-
 /// and stats-only profiles have nothing reachable inside, so the door
 /// stays shut for them.
 pub const DASHBOARD_CONTROL_TUNNEL_OPERATIONS: &[PeerOperation] = &[
@@ -383,6 +510,369 @@ pub fn profile_allows_dashboard_control_tunnel(profile: &str) -> bool {
     DASHBOARD_CONTROL_TUNNEL_OPERATIONS
         .iter()
         .any(|op| profile_allows_operation(profile, *op))
+}
+
+/// A realtime transport that carries typed frames: the direct `/ws`
+/// WebSocket session or the dashboard-control datachannel tunnel.
+///
+/// The request/response API surface is declared once in
+/// `gateway_routes::ROUTES` (+ the tunnel residue table); realtime frames
+/// stay bespoke per lane — connection-scoped state machines on
+/// latency-sensitive paths (transport design §2.6) — but their IAM mapping
+/// is declared once, in [`FRAME_LANES`], and both lanes' per-frame gates
+/// ([`crate::web_gateway::ws_frame_operation`] and
+/// `dashboard_control::dashboard_control_frame_operation`) are lookups into
+/// it: parity by construction, where hand-kept "Parity:" comments used to
+/// carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLane {
+    /// The direct `/ws` WebSocket session (`web_gateway/ws_session.rs`).
+    Ws,
+    /// The dashboard-control datachannel tunnel (`dashboard_control/`).
+    Tunnel,
+}
+
+/// One realtime frame kind: the floor operation it exercises and the lanes
+/// that carry it.
+pub struct FrameLaneSpec {
+    /// Wire frame type — the frame's `t` tag.
+    pub frame: &'static str,
+    /// Floor operation the frame exercises on the lanes that carry it.
+    /// `None` = the frame carries no blanket authority of its own; `note`
+    /// says why. Floor means floor: handlers still enforce whatever
+    /// stateful checks apply (session visibility, connection binding,
+    /// shell.spawn on fresh terminal_open, …).
+    pub op: Option<PeerOperation>,
+    /// Carried on the direct `/ws` session.
+    pub ws: bool,
+    /// Carried on the dashboard-control tunnel.
+    pub tunnel: bool,
+    /// Why the row is shaped this way — op rationale, `None` reason, or
+    /// single-lane reason. Mandatory; an invariant test pins it non-empty.
+    /// Documentation-bearing only: no runtime path reads it (the lookup
+    /// keys on `frame` + lanes), hence the targeted allow.
+    #[allow(dead_code)]
+    pub note: &'static str,
+}
+
+/// The single declaration of realtime-frame IAM: every frame kind either
+/// lane's per-frame gate maps, the operation it requires, and which lanes
+/// carry it. A kind absent here (or carried only on the other lane)
+/// answers `None` — no blanket authority, matching the pre-table
+/// behavior: per-frame gating fails open by design for dispatch machinery
+/// and replies, whose authority (if any) is enforced elsewhere (the
+/// method table for `request`, per-delivered-method auth for uploads,
+/// stateful checks in handlers).
+///
+/// Changing a row is an IAM change. The frozen golden test
+/// (`realtime_frame_operation_golden_mapping_is_frozen`) pins the full
+/// mapping on both lanes — update it deliberately, with the grant model
+/// in view, never to satisfy a refactor.
+pub const FRAME_LANES: &[FrameLaneSpec] = &[
+    // ---- carried on both lanes, same floor operation ----
+    FrameLaneSpec {
+        frame: "terminal_open",
+        op: Some(PeerOperation::TerminalView),
+        ws: true,
+        tunnel: true,
+        note: "attach/replay is the floor; opening a session that does not exist yet \
+               additionally requires shell.spawn, enforced statefully in the handlers",
+    },
+    FrameLaneSpec {
+        frame: "terminal_input",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "keystrokes into a visible shell session (session visibility enforced in handlers)",
+    },
+    FrameLaneSpec {
+        frame: "terminal_resize",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "resize mutates the PTY like input does",
+    },
+    FrameLaneSpec {
+        frame: "terminal_close",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "closing a session mutates it",
+    },
+    FrameLaneSpec {
+        frame: "terminal_share",
+        op: Some(PeerOperation::TerminalWrite),
+        ws: true,
+        tunnel: true,
+        note: "sharing re-scopes a session's audience — a mutation, not a view",
+    },
+    FrameLaneSpec {
+        frame: "display_input",
+        op: Some(PeerOperation::DisplayInput),
+        ws: true,
+        tunnel: true,
+        note: "pointer/keyboard injection into a display",
+    },
+    // ---- /ws only: display signaling + diagnostics marker ----
+    FrameLaneSpec {
+        frame: "set_diagnostics_visual_marker",
+        op: Some(PeerOperation::DisplayInput),
+        ws: true,
+        tunnel: false,
+        note: "twin of api_diagnostics_visual_freshness: the marker is stamped pre-encoder \
+               and lands in every viewer's stream — display mutation, not viewing",
+    },
+    FrameLaneSpec {
+        frame: "display_offer",
+        op: Some(PeerOperation::DisplayView),
+        ws: true,
+        tunnel: false,
+        note: "display WebRTC signaling; tunnel twins are the api_display_bootstrap / \
+               api_display_webrtc_signal methods, not frames",
+    },
+    FrameLaneSpec {
+        frame: "display_ice",
+        op: Some(PeerOperation::DisplayView),
+        ws: true,
+        tunnel: false,
+        note: "ICE leg of display_offer",
+    },
+    // The legacy web-TUI lane (`key`, `resize`, `term_subscribe`,
+    // `term_unsubscribe`) lived here until the owner dropped it
+    // (2026-07-11). Its /ws handlers died when the TUI was gutted
+    // (84afe9d8) and no tunnel twin ever existed; the kinds now take the
+    // unknown-frame path — no denial frame, /ws silence. The golden
+    // mapping pins them at `None` so a merge can't resurrect the rows.
+    // ---- /ws only: live voice/media presence machinery ----
+    // The tunnel carries this family wrapped in a single presence_frame
+    // envelope (its own row below); /ws speaks the kinds raw. Method-lane
+    // twins: api_voice_session, api_presence_video_frame,
+    // api_media_annotation_*, api_media_clip_*.
+    FrameLaneSpec {
+        frame: "presence_connect",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "joins the live voice/presence session driving the daemon's runtime",
+    },
+    FrameLaneSpec {
+        frame: "presence_disconnect",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "leaves the live presence session",
+    },
+    FrameLaneSpec {
+        frame: "make_active",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "claims the active presence slot (voice handover)",
+    },
+    FrameLaneSpec {
+        frame: "user_audio",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "microphone PCM into transcription + the live session",
+    },
+    FrameLaneSpec {
+        frame: "video_frame",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "camera/screen frame into the live session (twin: api_presence_video_frame)",
+    },
+    FrameLaneSpec {
+        frame: "voice_log",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "browser-side voice transcript/log entry into the session record",
+    },
+    FrameLaneSpec {
+        frame: "voice_diagnostic",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "voice-pipeline diagnostics into the session record",
+    },
+    FrameLaneSpec {
+        frame: "presence_checkpoint",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "checkpoints presence conversation state",
+    },
+    FrameLaneSpec {
+        frame: "live_usage_update",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "browser-metered live-API usage folded into daemon accounting",
+    },
+    FrameLaneSpec {
+        frame: "annotation_attach",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "attaches an annotation image to the worker turn (twin: api_media_annotation_attach)",
+    },
+    FrameLaneSpec {
+        frame: "annotation_submit",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "submits the annotation composition (twin: api_media_annotation_submit)",
+    },
+    FrameLaneSpec {
+        frame: "clip_start",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "starts a media clip capture (twin: api_media_clip_start)",
+    },
+    FrameLaneSpec {
+        frame: "clip_frame",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "appends a clip frame (twin: api_media_clip_frame)",
+    },
+    FrameLaneSpec {
+        frame: "clip_end",
+        op: Some(PeerOperation::RuntimeControl),
+        ws: true,
+        tunnel: false,
+        note: "finalizes the clip (twin: api_media_clip_end)",
+    },
+    // ---- /ws only: presence tool dispatch ----
+    FrameLaneSpec {
+        frame: "tool_request",
+        op: Some(PeerOperation::Message),
+        ws: true,
+        tunnel: false,
+        note: "presence tool dispatch is messaging into the worker (parity: api_mcp_tool_call)",
+    },
+    FrameLaneSpec {
+        frame: "async_query",
+        op: Some(PeerOperation::Message),
+        ws: true,
+        tunnel: false,
+        note: "async presence query — same messaging lane as tool_request",
+    },
+    // ---- /ws only: tunnel-establishment signaling, deliberately open ----
+    FrameLaneSpec {
+        frame: "dashboard_control_offer",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "establishing the tunnel carries no authority: the tunnel enforces this very \
+               grant per-frame itself, and scoped clients must be able to reach their \
+               allowed surface through it",
+    },
+    FrameLaneSpec {
+        frame: "dashboard_control_ice",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "ICE leg of dashboard_control_offer — same open-by-design rationale",
+    },
+    FrameLaneSpec {
+        frame: "dashboard_control_close",
+        op: None,
+        ws: true,
+        tunnel: false,
+        note: "tearing the tunnel down needs no more authority than opening it",
+    },
+    // ---- tunnel only ----
+    FrameLaneSpec {
+        frame: "presence_frame",
+        op: Some(PeerOperation::Message),
+        ws: false,
+        tunnel: true,
+        note: "the tunnel's envelope for the presence family /ws speaks raw (rows above); \
+               gated as messaging into the presence layer",
+    },
+    FrameLaneSpec {
+        frame: "upload_start",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "upload frames carry no blanket authority: upload_start is authorized by the \
+               operation of the method it delivers (a media annotation is runtime control, \
+               a transfer chunk is a filesystem write, …) inside control_upload_start_frame",
+    },
+    FrameLaneSpec {
+        frame: "upload_chunk",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "acts only on an entry an authorized upload_start created on this connection",
+    },
+    FrameLaneSpec {
+        frame: "upload_end",
+        op: None,
+        ws: false,
+        tunnel: true,
+        note: "same connection-bound rationale as upload_chunk; delivery re-authorizes as \
+               the method",
+    },
+    FrameLaneSpec {
+        frame: "egress_response",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "client-egress relay answers: only a session that could have registered as a \
+               relay (credentials.manage) may answer, and the handler additionally binds \
+               each frame to the request's own registering session",
+    },
+    FrameLaneSpec {
+        frame: "egress_chunk",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "streamed continuation of egress_response — same gate",
+    },
+    FrameLaneSpec {
+        frame: "egress_end",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "stream terminator — same gate",
+    },
+    FrameLaneSpec {
+        frame: "egress_error",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "error terminator — same gate",
+    },
+    // ---- both lanes: liveness ----
+    FrameLaneSpec {
+        frame: "ping",
+        op: None,
+        ws: true,
+        tunnel: true,
+        note: "liveness probe; no authority",
+    },
+];
+
+/// Map a typed realtime frame to the `PeerOperation` it exercises on the
+/// given lane — the single lookup behind both lanes' per-frame gates.
+/// `None` means the frame carries no blanket authority there (no row, an
+/// op-less row, or a row the lane does not carry).
+pub fn frame_operation(lane: FrameLane, frame_type: &str) -> Option<PeerOperation> {
+    FRAME_LANES
+        .iter()
+        .find(|spec| {
+            spec.frame == frame_type
+                && match lane {
+                    FrameLane::Ws => spec.ws,
+                    FrameLane::Tunnel => spec.tunnel,
+                }
+        })
+        .and_then(|spec| spec.op)
 }
 
 pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
@@ -401,6 +891,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::ReleaseDisplay { .. }
         | ControlMsg::GrantUserDisplay { .. }
         | ControlMsg::RevokeUserDisplay { .. }
+        | ControlMsg::ResolveDisplayRequest { .. }
         | ControlMsg::CreateVirtualDisplay { .. }
         | ControlMsg::SetDiagnosticsVisualMarker { .. } => PeerOperation::DisplayInput,
         ControlMsg::Input { .. }
@@ -469,6 +960,22 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
     }
 }
 
+/// Actions whose operation permission is only a coarse floor. These mutate
+/// owner-only display state or initiate durable capture, so they additionally
+/// require an authenticated owner dashboard at the transport edge. The
+/// recording layer separately rejects private and absent displays.
+pub fn control_msg_requires_owner_dashboard(ctrl: &ControlMsg) -> bool {
+    matches!(
+        ctrl,
+        ControlMsg::GrantUserDisplay { .. }
+            | ControlMsg::ResolveDisplayRequest { .. }
+            | ControlMsg::SetupDebugScreen
+            | ControlMsg::StartDebugRecording
+            | ControlMsg::StartRecording { .. }
+            | ControlMsg::SetDiagnosticsVisualMarker { .. }
+    )
+}
+
 #[allow(dead_code)]
 pub fn profile_allows_federated_display_input(profile: &str) -> bool {
     profile_allows_operation(profile, PeerOperation::DisplayInput)
@@ -479,6 +986,20 @@ pub fn filesystem_access_allowed(
     kind: FilesystemAccessKind,
     path: &Path,
 ) -> Result<(), String> {
+    filesystem_access_canonical_subject(policy, kind, path).map(|_| ())
+}
+
+/// Resolve and authorize the filesystem object used for an access decision.
+///
+/// Callers that subsequently open an existing object should use the returned
+/// canonical path instead of resolving the untrusted input a second time.
+/// For writes to a not-yet-existing path, the returned value is the nearest
+/// existing parent used for the policy decision.
+pub fn filesystem_access_canonical_subject(
+    policy: &FilesystemAccessPolicy,
+    kind: FilesystemAccessKind,
+    path: &Path,
+) -> Result<PathBuf, String> {
     let root_candidates: Vec<&PathBuf> = match kind {
         FilesystemAccessKind::Read => policy
             .read_roots
@@ -510,7 +1031,7 @@ pub fn filesystem_access_allowed(
             Err(_) => continue,
         };
         if canonical_subject == canonical_root || canonical_subject.starts_with(&canonical_root) {
-            return Ok(());
+            return Ok(canonical_subject);
         }
     }
 
@@ -569,7 +1090,9 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
     // for this daemon. Keeping the quick controls on peer.manage would be a
     // hollow boundary anyway — a peer.use principal can reach the same
     // effects through the dashboard-control tunnel it may already open.
-    // Registry and pairing mutations stay peer.manage.
+    // Registry and pairing mutations stay peer.manage. Coordinator
+    // routing (the `/api/coordinator/` branch below) is the same action
+    // class and rides the same doctrine.
     if method == "POST" {
         let mut segments = path
             .strip_prefix("/api/peers/")
@@ -597,8 +1120,15 @@ pub fn federation_http_operation(method: &str, path: &str) -> Option<PeerOperati
         }
         return Some(PeerOperation::PeerManage);
     }
+    // Coordinator routing dispatches a task to a capability-matched
+    // connected peer under this daemon's peer identity — the same action
+    // class as the `/api/peers/{id}/task` quick control, so it rides the
+    // peer-use doctrine above. Owner decision 2026-07-11: both transport
+    // lanes gate on PeerUse (this branch previously classified as Task
+    // while the tunnel twin gated on PeerManage — a split that let a
+    // task-authority peer spend this daemon's identity on a third peer).
     if path.starts_with("/api/coordinator/") {
-        return Some(PeerOperation::Task);
+        return Some(PeerOperation::PeerUse);
     }
     if under("/api/sessions") {
         return Some(PeerOperation::SessionInspect);
@@ -617,40 +1147,77 @@ pub fn write_approved_identity(
     card_url: Option<&str>,
     request_id: Option<&str>,
 ) -> Result<PeerIdentityRecord, CallerError> {
+    with_identity_store_lock(cert_dir, || {
+        let fingerprint = normalize_fingerprint(fingerprint)?;
+        let profile = normalize_profile(profile)?;
+        let record = PeerIdentityRecord {
+            version: 1,
+            fingerprint,
+            label: label.trim().to_string(),
+            profile,
+            status: PeerIdentityStatus::Approved,
+            card_url: card_url.map(str::to_string),
+            request_id: request_id.map(str::to_string),
+            filesystem: FilesystemAccessPolicy::default(),
+            created_at_unix: unix_timestamp(),
+            revoked_at_unix: None,
+            expires_at_unix: None,
+            source: None,
+            org_grant_id: None,
+            issued_via: None,
+        };
+        write_identity_record(cert_dir, &record)?;
+        Ok(record)
+    })
+}
+
+pub(crate) fn lookup_identity_cached_arc(
+    cert_dir: &Path,
+    fingerprint: &str,
+) -> Result<Option<Arc<PeerIdentityRecord>>, CallerError> {
     let fingerprint = normalize_fingerprint(fingerprint)?;
-    let profile = normalize_profile(profile)?;
-    let record = PeerIdentityRecord {
-        version: 1,
-        fingerprint,
-        label: label.trim().to_string(),
-        profile,
-        status: PeerIdentityStatus::Approved,
-        card_url: card_url.map(str::to_string),
-        request_id: request_id.map(str::to_string),
-        filesystem: FilesystemAccessPolicy::default(),
-        created_at_unix: unix_timestamp(),
-        revoked_at_unix: None,
-        expires_at_unix: None,
-        source: None,
-        org_grant_id: None,
-        issued_via: None,
+    let path = identity_path(cert_dir, &fingerprint);
+    // Path::exists also performs metadata I/O and collapses errors to false.
+    // Do that compatibility check and build the cache fingerprint from one
+    // metadata call so an unchanged hot-path lookup pays exactly one stat.
+    let before = match std::fs::metadata(&path) {
+        Ok(metadata) => peer_record_fingerprint_from_metadata(&metadata),
+        Err(_) => {
+            invalidate_cached_peer_record(&path);
+            return Ok(None);
+        }
     };
-    write_identity_record(cert_dir, &record)?;
-    Ok(record)
+    if let Some(cached) = before
+        .as_ref()
+        .and_then(|fingerprint| cached_peer_record(&path, fingerprint))
+    {
+        return Ok(Some(cached));
+    }
+
+    let text = std::fs::read_to_string(&path)?;
+    let record = Arc::new(serde_json::from_str::<PeerIdentityRecord>(&text)?);
+    // Re-stat after the read. If an atomic replacement raced the read, the
+    // parsed record is still a valid point-in-time result, but caching it
+    // under the pre-read fingerprint could pin that stale view indefinitely.
+    // Parse failures return above and are never cached.
+    if let Some(before) = before {
+        if matches!(peer_record_fingerprint(&path), Some(after) if after == before) {
+            store_cached_peer_record(&path, before, Arc::clone(&record));
+        } else {
+            invalidate_cached_peer_record(&path);
+        }
+    } else {
+        invalidate_cached_peer_record(&path);
+    }
+    Ok(Some(record))
 }
 
 pub fn lookup_identity(
     cert_dir: &Path,
     fingerprint: &str,
 ) -> Result<Option<PeerIdentityRecord>, CallerError> {
-    let fingerprint = normalize_fingerprint(fingerprint)?;
-    let path = identity_path(cert_dir, &fingerprint);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(path)?;
-    let record: PeerIdentityRecord = serde_json::from_str(&text)?;
-    Ok(Some(record))
+    lookup_identity_cached_arc(cert_dir, fingerprint)
+        .map(|record| record.map(|record| (*record).clone()))
 }
 
 pub fn list_identities(cert_dir: &Path) -> Result<Vec<PeerIdentityRecord>, CallerError> {
@@ -680,37 +1247,39 @@ pub fn revoke_identity(
     cert_dir: &Path,
     fingerprint_or_label: &str,
 ) -> Result<PeerIdentityRecord, CallerError> {
-    let needle = fingerprint_or_label.trim();
-    if needle.is_empty() {
-        return Err(CallerError::Config("peer identity is required".into()));
-    }
-    let mut record = if let Ok(fp) = normalize_fingerprint(needle) {
-        lookup_identity(cert_dir, &fp)?.ok_or_else(|| {
-            CallerError::Config(format!("no peer identity found for fingerprint {needle}"))
-        })?
-    } else {
-        let matches: Vec<_> = list_identities(cert_dir)?
-            .into_iter()
-            .filter(|r| r.label == needle || r.request_id.as_deref() == Some(needle))
-            .collect();
-        match matches.len() {
-            1 => matches.into_iter().next().unwrap(),
-            0 => {
-                return Err(CallerError::Config(format!(
-                    "no peer identity found for {needle}"
-                )))
-            }
-            _ => {
-                return Err(CallerError::Config(format!(
-                    "multiple peer identities match {needle}; use fingerprint"
-                )))
-            }
+    with_identity_store_lock(cert_dir, || {
+        let needle = fingerprint_or_label.trim();
+        if needle.is_empty() {
+            return Err(CallerError::Config("peer identity is required".into()));
         }
-    };
-    record.status = PeerIdentityStatus::Revoked;
-    record.revoked_at_unix = Some(unix_timestamp());
-    write_identity_record(cert_dir, &record)?;
-    Ok(record)
+        let mut record = if let Ok(fp) = normalize_fingerprint(needle) {
+            lookup_identity(cert_dir, &fp)?.ok_or_else(|| {
+                CallerError::Config(format!("no peer identity found for fingerprint {needle}"))
+            })?
+        } else {
+            let matches: Vec<_> = list_identities(cert_dir)?
+                .into_iter()
+                .filter(|r| r.label == needle || r.request_id.as_deref() == Some(needle))
+                .collect();
+            match matches.len() {
+                1 => matches.into_iter().next().unwrap(),
+                0 => {
+                    return Err(CallerError::Config(format!(
+                        "no peer identity found for {needle}"
+                    )))
+                }
+                _ => {
+                    return Err(CallerError::Config(format!(
+                        "multiple peer identities match {needle}; use fingerprint"
+                    )))
+                }
+            }
+        };
+        record.status = PeerIdentityStatus::Revoked;
+        record.revoked_at_unix = Some(unix_timestamp());
+        write_identity_record(cert_dir, &record)?;
+        Ok(record)
+    })
 }
 
 /// Outcome of [`set_identity_profile`]: the updated record plus the
@@ -737,19 +1306,21 @@ pub fn set_identity_profile(
     selector: &str,
     profile: &str,
 ) -> Result<ProfileChange, CallerError> {
-    let profile = require_known_profile(profile)?;
-    let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
-    if !matches!(record.status, PeerIdentityStatus::Approved) {
-        return Err(CallerError::Config(format!(
-            "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
-            record.fingerprint, record.label
-        )));
-    }
-    let previous_profile = std::mem::replace(&mut record.profile, profile);
-    write_identity_record(cert_dir, &record)?;
-    Ok(ProfileChange {
-        record,
-        previous_profile,
+    with_identity_store_lock(cert_dir, || {
+        let profile = require_known_profile(profile)?;
+        let mut record = find_identity_by_fingerprint(cert_dir, selector)?;
+        if !matches!(record.status, PeerIdentityStatus::Approved) {
+            return Err(CallerError::Config(format!(
+                "peer identity {} ({}) is revoked; approve a new pairing instead of changing its profile",
+                record.fingerprint, record.label
+            )));
+        }
+        let previous_profile = std::mem::replace(&mut record.profile, profile);
+        write_identity_record(cert_dir, &record)?;
+        Ok(ProfileChange {
+            record,
+            previous_profile,
+        })
     })
 }
 
@@ -821,10 +1392,29 @@ pub fn write_identity_record(
     cert_dir: &Path,
     record: &PeerIdentityRecord,
 ) -> Result<(), CallerError> {
-    std::fs::create_dir_all(identities_dir(cert_dir))?;
-    let body = serde_json::to_string_pretty(record)?;
-    std::fs::write(identity_path(cert_dir, &record.fingerprint), body)?;
-    Ok(())
+    with_identity_store_lock(cert_dir, || {
+        let path = identity_path(cert_dir, &record.fingerprint);
+        let mut body = serde_json::to_vec_pretty(record)?;
+        body.push(b'\n');
+        super::authority_store::atomic_write_private_locked(&path, &body)
+            .map_err(|error| CallerError::Config(error.to_string()))?;
+        // Best-effort write-through refresh. Correctness never depends on
+        // this: every lookup stats the file and rejects a mismatched cache
+        // entry. Refreshing here lets in-process revoke/profile writes avoid
+        // paying a read+parse on the next authorization predicate.
+        let before = peer_record_fingerprint(&path);
+        let persisted_bytes_match = std::fs::read(&path)
+            .map(|persisted| persisted == body)
+            .unwrap_or(false);
+        let after = peer_record_fingerprint(&path);
+        match (before, after, persisted_bytes_match) {
+            (Some(before), Some(after), true) if before == after => {
+                store_cached_peer_record(&path, after, Arc::new(record.clone()));
+            }
+            _ => invalidate_cached_peer_record(&path),
+        }
+        Ok(())
+    })
 }
 
 fn identities_dir(cert_dir: &Path) -> PathBuf {
@@ -866,6 +1456,136 @@ pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Structural invariants of [`FRAME_LANES`]: one row per frame kind
+    /// (the lookup takes the first match, so a duplicate would shadow),
+    /// every row carried on at least one lane, and every row annotated —
+    /// the notes are the documentation the old per-arm "Parity:" comments
+    /// used to carry.
+    #[test]
+    fn frame_lanes_rows_are_unique_lane_marked_and_annotated() {
+        let mut seen = std::collections::HashSet::new();
+        for spec in FRAME_LANES {
+            assert!(
+                seen.insert(spec.frame),
+                "duplicate FRAME_LANES row for {:?}",
+                spec.frame
+            );
+            assert!(
+                spec.ws || spec.tunnel,
+                "FRAME_LANES row {:?} is carried on no lane",
+                spec.frame
+            );
+            assert!(
+                !spec.note.trim().is_empty(),
+                "FRAME_LANES row {:?} is missing its note",
+                spec.frame
+            );
+        }
+    }
+
+    /// The frozen realtime-frame IAM contract: every frame kind either
+    /// per-frame gate explicitly maps, on both transports. The fixture
+    /// was committed byte-for-byte BEFORE the `FRAME_LANES` unification
+    /// (its history proves the table rewrite re-plumbed without
+    /// re-gating) and stays frozen after it: with both gates reading one
+    /// table, this pin is what makes silent re-gating impossible on
+    /// either lane. Columns: frame kind, the
+    /// operation `web_gateway::ws_frame_operation` answers (the direct
+    /// `/ws` session), the operation
+    /// `dashboard_control::dashboard_control_frame_operation` answers
+    /// (the datachannel tunnel). `None` = the frame carries no blanket
+    /// authority on that lane (off-lane kinds, no-authority dispatch
+    /// machinery, and unknown kinds all answer `None` — per-frame gating
+    /// here fails open by design; handlers own the stateful checks).
+    ///
+    /// Changing ANY cell is an IAM change: make it deliberately, with the
+    /// grant model in view — never to satisfy a refactor.
+    #[test]
+    fn realtime_frame_operation_golden_mapping_is_frozen() {
+        use PeerOperation::*;
+        #[rustfmt::skip]
+        const GOLDEN: &[(&str, Option<PeerOperation>, Option<PeerOperation>)] = &[
+            // frame kind                      /ws lane              tunnel lane
+            // -- carried on both lanes, same floor operation --
+            ("terminal_open",                  Some(TerminalView),   Some(TerminalView)),
+            ("terminal_input",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_resize",                Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_close",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("terminal_share",                 Some(TerminalWrite),  Some(TerminalWrite)),
+            ("display_input",                  Some(DisplayInput),   Some(DisplayInput)),
+            // -- /ws only: display signaling + diagnostics marker --
+            ("set_diagnostics_visual_marker",  Some(DisplayInput),   None),
+            ("display_offer",                  Some(DisplayView),    None),
+            ("display_ice",                    Some(DisplayView),    None),
+            // -- dropped: the legacy web-TUI lane (owner decision,
+            //    2026-07-11). Handlers were gutted with the TUI
+            //    (84afe9d8); the gate rows are now gone too, so these
+            //    kinds answer like any unknown kind — no blanket
+            //    authority, no denial frame, /ws unknown-frame silence.
+            //    Pinned at `None` so a merge can't resurrect the rows. --
+            ("key",                            None,                 None),
+            ("resize",                         None,                 None),
+            ("term_subscribe",                 None,                 None),
+            ("term_unsubscribe",               None,                 None),
+            // -- /ws only: live voice/media presence machinery --
+            ("presence_connect",               Some(RuntimeControl), None),
+            ("presence_disconnect",            Some(RuntimeControl), None),
+            ("make_active",                    Some(RuntimeControl), None),
+            ("user_audio",                     Some(RuntimeControl), None),
+            ("video_frame",                    Some(RuntimeControl), None),
+            ("voice_log",                      Some(RuntimeControl), None),
+            ("voice_diagnostic",               Some(RuntimeControl), None),
+            ("presence_checkpoint",            Some(RuntimeControl), None),
+            ("live_usage_update",              Some(RuntimeControl), None),
+            ("annotation_attach",              Some(RuntimeControl), None),
+            ("annotation_submit",              Some(RuntimeControl), None),
+            ("clip_start",                     Some(RuntimeControl), None),
+            ("clip_frame",                     Some(RuntimeControl), None),
+            ("clip_end",                       Some(RuntimeControl), None),
+            // -- /ws only: presence tool dispatch --
+            ("tool_request",                   Some(Message),        None),
+            ("async_query",                    Some(Message),        None),
+            // -- /ws only: tunnel-establishment signaling stays open (the
+            //    tunnel enforces this very grant per-frame itself) --
+            ("dashboard_control_offer",        None,                 None),
+            ("dashboard_control_ice",          None,                 None),
+            ("dashboard_control_close",        None,                 None),
+            // -- tunnel only: the presence wrapper envelope --
+            ("presence_frame",                 None,                 Some(Message)),
+            // -- tunnel only: upload frames are authorized by the method
+            //    they deliver, never by a blanket grant --
+            ("upload_start",                   None,                 None),
+            ("upload_chunk",                   None,                 None),
+            ("upload_end",                     None,                 None),
+            // -- tunnel only: client-egress relay answers --
+            ("egress_response",                None,                 Some(CredentialsManage)),
+            ("egress_chunk",                   None,                 Some(CredentialsManage)),
+            ("egress_end",                     None,                 Some(CredentialsManage)),
+            ("egress_error",                   None,                 Some(CredentialsManage)),
+            // -- no-authority dispatch machinery + unknown kinds --
+            ("ping",                           None,                 None),
+            ("hello",                          None,                 None),
+            ("request",                        None,                 None),
+            ("response",                       None,                 None),
+            ("cancel",                         None,                 None),
+            ("credit",                         None,                 None),
+            ("event",                          None,                 None),
+            ("no_such_frame_kind",             None,                 None),
+        ];
+        for (frame, ws_expected, tunnel_expected) in GOLDEN {
+            assert_eq!(
+                crate::web_gateway::ws_frame_operation(frame),
+                *ws_expected,
+                "/ws frame {frame:?} drifted from the golden mapping",
+            );
+            assert_eq!(
+                crate::dashboard_control::dashboard_control_frame_operation(frame),
+                *tunnel_expected,
+                "tunnel frame {frame:?} drifted from the golden mapping",
+            );
+        }
+    }
 
     /// Pins the least-privilege pairing default (owner decision,
     /// 2026-07-08): an unlabeled pairing views displays and never holds
@@ -922,12 +1642,7 @@ mod tests {
             regex::Regex::new(r"(?m)^\s+'?([a-z][a-z-]*)'?: '([a-z-]+)',")
                 .unwrap()
                 .captures_iter(alias_block)
-                .map(|caps| {
-                    (
-                        caps.get(1).unwrap().as_str(),
-                        caps.get(2).unwrap().as_str(),
-                    )
-                })
+                .map(|caps| (caps.get(1).unwrap().as_str(), caps.get(2).unwrap().as_str()))
                 .collect();
         let rust_aliases: std::collections::BTreeSet<(&str, &str)> =
             PROFILE_ALIASES.iter().copied().collect();
@@ -938,7 +1653,10 @@ mod tests {
 
         // Every alias lands on a canonical profile and classes agree.
         for (alias, target) in PROFILE_ALIASES {
-            assert!(canonical.contains(target), "alias {alias} → unknown {target}");
+            assert!(
+                canonical.contains(target),
+                "alias {alias} → unknown {target}"
+            );
             assert_eq!(profile_class(alias), profile_class(target));
         }
     }
@@ -954,6 +1672,7 @@ mod tests {
             display_target: None,
             attachments: Vec::new(),
             follow_up_id: None,
+            delegation_id: None,
         };
         let approval = ControlMsg::Approve {
             session_id: None,
@@ -1138,6 +1857,37 @@ mod tests {
         ));
     }
 
+    /// Owner decision 2026-07-11: coordinator routing is peer *use* on
+    /// both transport lanes. `POST /api/coordinator/route` dispatches a
+    /// task to a capability-matched connected peer under this daemon's
+    /// peer identity — the same action class as the `/api/peers/{id}/task`
+    /// quick control — so the federation ladder classifies it as PeerUse;
+    /// the tunnel twin derives the same operation from its route row
+    /// (pinned by gateway_routes'
+    /// `peers_family_tunnel_ops_assert_against_the_federation_ladder`).
+    /// Supersedes the historical per-lane split (HTTP: Task, tunnel:
+    /// PeerManage): among peer profiles only peer-root holds PeerUse, so a
+    /// task-runner or peer-operator peer can no longer spend this daemon's
+    /// identity on a third peer through the coordinator — the
+    /// transitive-delegation seam the Task classification left open.
+    #[test]
+    fn coordinator_routing_classifies_as_peer_use() {
+        assert_eq!(
+            federation_http_operation("POST", "/api/coordinator/route"),
+            Some(PeerOperation::PeerUse)
+        );
+        // The gate is delegation authority, not task authority: the
+        // task-running profiles hold Task but not PeerUse.
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerUse
+        ));
+        for profile in ["task-runner", "peer-operator"] {
+            assert!(profile_allows_operation(profile, PeerOperation::Task));
+            assert!(!profile_allows_operation(profile, PeerOperation::PeerUse));
+        }
+    }
+
     #[test]
     fn identity_round_trip_and_revoke() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1162,6 +1912,136 @@ mod tests {
         assert!(revoked.revoked_at_unix.is_some());
     }
 
+    fn replace_peer_record_bytes_without_cache(
+        cert_dir: &Path,
+        fingerprint: &str,
+        contents: &[u8],
+    ) {
+        let path = identity_path(cert_dir, fingerprint);
+        crate::access::authority_store::with_lock(cert_dir, || {
+            crate::access::authority_store::atomic_write_private_locked(&path, contents)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn peer_record_cache_hit_requires_the_exact_file_fingerprint() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Arc::new(
+            write_approved_identity(tmp.path(), fp, "peer-cache", "stats", None, None).unwrap(),
+        );
+        let path = identity_path(tmp.path(), fp);
+        let fingerprint = peer_record_fingerprint(&path).unwrap();
+        let mut cache = PeerRecordCache::new();
+        cache.insert(
+            path.clone(),
+            PeerRecordCacheEntry {
+                fingerprint: fingerprint.clone(),
+                record: Arc::clone(&record),
+            },
+        );
+
+        let hit = cached_peer_record_in(&cache, &path, &fingerprint).unwrap();
+        assert!(Arc::ptr_eq(&record, &hit));
+
+        let mut changed = fingerprint;
+        changed.len = changed.len.wrapping_add(1);
+        assert!(
+            cached_peer_record_in(&cache, &path, &changed).is_none(),
+            "a changed stat fingerprint must never reuse the parsed record"
+        );
+    }
+
+    #[test]
+    fn peer_record_cache_is_bounded_by_full_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "4123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let record = Arc::new(
+            write_approved_identity(tmp.path(), fp, "peer-bound", "stats", None, None).unwrap(),
+        );
+        let mut cache = PeerRecordCache::new();
+        for index in 0..=PEER_RECORD_CACHE_MAX_PATHS {
+            let path = PathBuf::from(format!("isolated/peer-record-{index}.json"));
+            let fingerprint = PeerRecordFingerprint {
+                len: index as u64,
+                mtime_nanos: index as u128,
+                dev: 1,
+                ino: index as u64 + 1,
+            };
+            store_cached_peer_record_in(
+                &mut cache,
+                &path,
+                fingerprint.clone(),
+                Arc::clone(&record),
+            );
+            assert!(cache.len() <= PEER_RECORD_CACHE_MAX_PATHS);
+        }
+        let last_index = PEER_RECORD_CACHE_MAX_PATHS;
+        let last_path = PathBuf::from(format!("isolated/peer-record-{last_index}.json"));
+        let last_fingerprint = PeerRecordFingerprint {
+            len: last_index as u64,
+            mtime_nanos: last_index as u128,
+            dev: 1,
+            ino: last_index as u64 + 1,
+        };
+        let hit = cached_peer_record_in(&cache, &last_path, &last_fingerprint).unwrap();
+        assert!(Arc::ptr_eq(&record, &hit));
+    }
+
+    #[test]
+    fn external_peer_record_replacement_invalidates_the_cached_parse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let opening =
+            write_approved_identity(tmp.path(), fp, "peer-external", "stats", None, None).unwrap();
+        let cached = lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+
+        // Bypass write_identity_record to model another daemon/CLI process
+        // replacing the shared authority file. The next lookup must detect
+        // the new file fingerprint rather than trusting in-process invalidation.
+        let mut replacement = opening;
+        replacement.profile = "peer-root".to_string();
+        let mut body = serde_json::to_vec_pretty(&replacement).unwrap();
+        body.push(b'\n');
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, &body);
+
+        let reloaded = lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+        assert_eq!(reloaded.profile, "peer-root");
+        assert!(
+            !Arc::ptr_eq(&cached, &reloaded),
+            "an atomic external replacement must discard the cached parse"
+        );
+    }
+
+    #[test]
+    fn malformed_peer_record_replacement_is_never_masked_or_cached() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut valid =
+            write_approved_identity(tmp.path(), fp, "peer-malformed", "stats", None, None).unwrap();
+        lookup_identity_cached_arc(tmp.path(), fp).unwrap().unwrap();
+
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, b"not-json\n");
+        assert!(
+            lookup_identity(tmp.path(), fp).is_err(),
+            "a changed malformed record must fail closed instead of returning the old cache entry"
+        );
+        assert!(
+            lookup_identity(tmp.path(), fp).is_err(),
+            "parse errors must not become successful cached results"
+        );
+
+        valid.profile = "read-only-display".to_string();
+        let mut body = serde_json::to_vec_pretty(&valid).unwrap();
+        body.push(b'\n');
+        replace_peer_record_bytes_without_cache(tmp.path(), fp, &body);
+        assert_eq!(
+            lookup_identity(tmp.path(), fp).unwrap().unwrap().profile,
+            "read-only-display"
+        );
+    }
+
     #[test]
     fn require_known_profile_accepts_canonical_and_resolves_aliases() {
         for (name, _) in PROFILES {
@@ -1180,7 +2060,10 @@ mod tests {
         // The typo class that used to silently degrade to presence-only.
         let err = require_known_profile("read-only-dsplay").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("unknown peer profile 'read-only-dsplay'"), "{msg}");
+        assert!(
+            msg.contains("unknown peer profile 'read-only-dsplay'"),
+            "{msg}"
+        );
         for (name, _) in PROFILES {
             assert!(msg.contains(name), "missing {name} in: {msg}");
         }
@@ -1195,10 +2078,7 @@ mod tests {
         // The strict CLI check must not tighten wire semantics: a stored
         // profile this build does not know keeps authorizing as the
         // least-capable class rather than erroring.
-        assert_eq!(
-            profile_class("future-profile"),
-            ProfileClass::PresenceOnly
-        );
+        assert_eq!(profile_class("future-profile"), ProfileClass::PresenceOnly);
         assert!(profile_allows_operation(
             "future-profile",
             PeerOperation::PresenceRead

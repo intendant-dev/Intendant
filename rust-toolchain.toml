@@ -1,0 +1,18 @@
+[toolchain]
+# One toolchain for the whole fleet and every dev checkout. Three things
+# only hold on a uniform compiler: the per-listener CI caches (keyed by
+# `rustc -V` — a version skew means a permanently cold key on the odd
+# box), the committed WASM artifacts (byte-sensitive to the compiler),
+# and the fmt/clippy zero-warning baselines (each release adds lints).
+# Verified 2026-07-11: all three runner platforms resolve toolchains via
+# rustup, so a bump here auto-installs everywhere on next use. Bump
+# deliberately: every runner cache re-keys (one cold build per listener)
+# and dev worktrees re-toolchain on their next build.
+channel = "1.96.1"
+# rustfmt + clippy are gate dependencies (windows.yml's Linux leg), and a
+# minimal-profile rustup — the fleet runner default — installs the pinned
+# toolchain WITHOUT them (live 2026-07-11: the fmt gate's first run died
+# on "rustfmt is missing"). Declaring them here makes rustup guarantee
+# the components wherever the toolchain file resolves.
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

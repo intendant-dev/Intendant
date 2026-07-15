@@ -35,7 +35,13 @@ function stationUpdateMetricsChip() {
   const el = document.getElementById('station-status-metrics');
   if (!el) return;
   const m = stationParsedMetrics();
-  const text = `${m.renderer} · ${m.fps || '--'} fps · ${m.displays} display${m.displays === '1' ? '' : 's'}`;
+  // fps=0 usually means the renderer is intentionally quiescent (the
+  // canvas fallback repaints on demand; the loop parks between changes) —
+  // "Canvas · 0 fps" read as breakage, so label it idle instead. A live
+  // loop keeps the real number. (A wrongly parked WebGPU loop shows
+  // "idle" for at most one watchdog window before recovery re-arms it.)
+  const fpsLabel = m.fps === '0' ? 'idle' : `${m.fps || '--'} fps`;
+  const text = `${m.renderer} · ${fpsLabel} · ${m.displays} display${m.displays === '1' ? '' : 's'}`;
   if (text === stationMetricsLastText) return;
   stationMetricsLastText = text;
   el.textContent = text;
@@ -146,7 +152,9 @@ async function ensureStation() {
   stationInitPromise = (async () => {
     if (!stationWasmReady) {
       stationStatus('Loading Station WASM');
-      await stationInit('/wasm-station/station_web_bg.wasm');
+      // Object form: the positional signature is deprecated by wasm-bindgen
+      // and was the tour's only console warning.
+      await stationInit({ module_or_path: '/wasm-station/station_web_bg.wasm' });
       stationWasmReady = true;
     }
     const scene = document.getElementById('station-scene-canvas');
@@ -201,6 +209,9 @@ function stationSetActive(active) {
     } else {
       // The composer overlay must never float over another tab.
       stationSyncComposer();
+      // Release the legend's capture-phase Escape listener when leaving
+      // the tab (the hidden pane keeps it invisible; this frees the key).
+      stationSetLegendOpen(false);
     }
   } else if (active) {
     ensureStation().catch(err => {
@@ -342,6 +353,12 @@ function stationOpenPanel(target, message = '') {
 window.stationProbe = Object.assign(window.stationProbe || {}, {
   renderedPrimary: () => stationRenderedPrimaryActive(),
   state: () => station?.debug_state?.() || stationRendererStateLabel(),
+  // QA hook: simulate WebGPU device loss (validators drive the recovery
+  // path). False until a station-web build exporting debug_lose_gpu loads.
+  loseGpu: () => {
+    try { return Boolean(station && typeof station.debug_lose_gpu === 'function' && station.debug_lose_gpu()); }
+    catch (_) { return false; }
+  },
   debugJson: () => {
     try {
       return station && typeof station.debug_json === 'function' ? String(station.debug_json() || '') : '';
@@ -969,6 +986,8 @@ function stationRenderPeerChips() {
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'station-peer-chip';
+        chip.dataset.hostId = hostId;
+        chip.dataset.displayId = String(displayId);
         chip.disabled = !d.connected;
         chip.title = d.connected
           ? `Open a live view of display ${displayId}${size} on ${name}`
@@ -989,6 +1008,8 @@ function stationRenderPeerChips() {
     const chip = document.createElement('button');
     chip.type = 'button';
     chip.className = 'station-peer-chip';
+    chip.dataset.hostId = hostId;
+    chip.dataset.displayId = String(displayId);
     chip.disabled = !d.connected;
     chip.title = d.connected
       ? `Open a live view of display ${displayId} on ${name}`
@@ -1948,6 +1969,146 @@ if ('ResizeObserver' in window) {
   if (stationPaneForHotspots) stationHotspotResizeObserver.observe(stationPaneForHotspots);
 }
 
+// ── Station toolbar: world-panes flag + keyboard legend ──
+// Small DOM overlay in the canvas's bottom-right corner (opposite the
+// status chip). Gives the ?station_panes flag its first UI surface and
+// documents the canvas keyboard vocabulary (which is otherwise invisible
+// — it lives in the WASM's window keydown handler). Buttons reuse the
+// .station-peer-chip look; layout is inline so no stylesheet edit rides
+// along with this fragment.
+const STATION_KEYBOARD_LEGEND_ROWS = Object.freeze([
+  ['Arrows / WASD', 'orbit the camera'],
+  ['+ / −', 'zoom in / out'],
+  ['/', 'open the composer'],
+  ['1 / 2', 'orbital / constellation layout'],
+  ['PageUp / PageDown', 'scroll the focused panel'],
+  ['Escape', 'close composer, then transcript, then selection'],
+]);
+
+// Mirrors crates/station-web/src/util.rs world_panes_requested(): the flag
+// counts only as `station_panes=on` or `=1` in the query string.
+function stationWorldPanesEnabled() {
+  const value = String(new URLSearchParams(window.location.search).get('station_panes') || '');
+  return value === 'on' || value === '1';
+}
+
+function stationToggleWorldPanes() {
+  const url = new URL(window.location.href);
+  if (stationWorldPanesEnabled()) {
+    url.searchParams.delete('station_panes');
+  } else {
+    url.searchParams.set('station_panes', 'on');
+  }
+  // The WASM reads the flag once at construction, so the supported flip is
+  // replaceState (preserving every other param and the hash) + reload.
+  history.replaceState(null, '', url.toString());
+  location.reload();
+}
+
+let stationLegendEscapeHandler = null;
+
+function stationSetLegendOpen(open) {
+  const legend = document.getElementById('station-keyboard-legend');
+  const btn = document.getElementById('station-legend-btn');
+  if (!legend) return;
+  legend.hidden = !open;
+  btn?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open && !stationLegendEscapeHandler) {
+    // Capture phase so the WASM's own window keydown (which treats Escape
+    // as "unwind Station surfaces") doesn't also fire for this dismissal.
+    stationLegendEscapeHandler = (ev) => {
+      if (ev.key !== 'Escape') return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      stationSetLegendOpen(false);
+    };
+    window.addEventListener('keydown', stationLegendEscapeHandler, true);
+  } else if (!open && stationLegendEscapeHandler) {
+    window.removeEventListener('keydown', stationLegendEscapeHandler, true);
+    stationLegendEscapeHandler = null;
+  }
+}
+
+(function stationSetupToolbar() {
+  const pane = document.querySelector('.station-pane');
+  if (!pane || document.getElementById('station-toolbar')) return;
+
+  const bar = document.createElement('div');
+  bar.id = 'station-toolbar';
+  bar.setAttribute('role', 'group');
+  bar.setAttribute('aria-label', 'Station tools');
+  // bottom:60px clears the canvas-drawn compass, whose glass disc spans
+  // roughly h-51..h-15 at the right edge (hud/widgets.rs draw_compass).
+  bar.style.cssText = 'position:absolute;right:12px;bottom:60px;z-index:4;display:flex;gap:6px;align-items:center;';
+
+  const panesOn = stationWorldPanesEnabled();
+  const panesBtn = document.createElement('button');
+  panesBtn.type = 'button';
+  panesBtn.id = 'station-world-panes-toggle';
+  panesBtn.className = 'station-peer-chip';
+  panesBtn.textContent = `World panes: ${panesOn ? 'on' : 'off'}`;
+  panesBtn.setAttribute('aria-pressed', panesOn ? 'true' : 'false');
+  panesBtn.title = panesOn
+    ? 'World-space panes (experimental) are ON — click to turn off and reload'
+    : 'World-space panes (experimental) render the focus panel inside the 3D scene — click to turn on and reload';
+  panesBtn.addEventListener('click', stationToggleWorldPanes);
+
+  const legendBtn = document.createElement('button');
+  legendBtn.type = 'button';
+  legendBtn.id = 'station-legend-btn';
+  legendBtn.className = 'station-peer-chip';
+  legendBtn.textContent = '?';
+  legendBtn.title = 'Keyboard controls';
+  legendBtn.setAttribute('aria-haspopup', 'dialog');
+  legendBtn.setAttribute('aria-expanded', 'false');
+  legendBtn.setAttribute('aria-label', 'Show Station keyboard controls');
+  legendBtn.addEventListener('click', () => {
+    const legend = document.getElementById('station-keyboard-legend');
+    stationSetLegendOpen(!!legend && legend.hidden);
+  });
+
+  const legend = document.createElement('div');
+  legend.id = 'station-keyboard-legend';
+  legend.hidden = true;
+  legend.setAttribute('role', 'dialog');
+  legend.setAttribute('aria-label', 'Station keyboard controls');
+  legend.style.cssText = [
+    'position:absolute', 'right:12px', 'bottom:94px', 'z-index:6',
+    'min-width:240px', 'max-width:320px', 'padding:10px 12px',
+    'border:1px solid var(--glass-hairline-bright)', 'border-radius:9px',
+    'background:linear-gradient(180deg, color-mix(in srgb, var(--base) 88%, transparent), color-mix(in srgb, var(--crust) 92%, transparent))',
+    'box-shadow:var(--glass-highlight), 0 6px 18px rgba(0,0,0,0.4)',
+    'font-size:11px', 'line-height:1.5', 'color:var(--subtext1)',
+  ].join(';');
+  const legendTitle = document.createElement('div');
+  legendTitle.textContent = 'Keyboard controls';
+  legendTitle.style.cssText = 'font-weight:600;color:var(--text);margin-bottom:6px;';
+  legend.appendChild(legendTitle);
+  for (const [keys, what] of STATION_KEYBOARD_LEGEND_ROWS) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;justify-content:space-between;';
+    const k = document.createElement('span');
+    k.textContent = keys;
+    k.style.cssText = 'color:var(--text);font-family:inherit;white-space:nowrap;';
+    const v = document.createElement('span');
+    v.textContent = what;
+    v.style.cssText = 'color:var(--overlay1);text-align:right;';
+    row.append(k, v);
+    legend.appendChild(row);
+  }
+  const legendClose = document.createElement('button');
+  legendClose.type = 'button';
+  legendClose.className = 'station-peer-chip';
+  legendClose.textContent = 'Close';
+  legendClose.style.marginTop = '8px';
+  legendClose.setAttribute('aria-label', 'Close keyboard controls');
+  legendClose.addEventListener('click', () => stationSetLegendOpen(false));
+  legend.appendChild(legendClose);
+
+  bar.append(panesBtn, legendBtn);
+  pane.append(bar, legend);
+})();
+
 function stationActivityLevelFor(ev) {
   return String(ev?.level || 'info').trim().toLowerCase() || 'info';
 }
@@ -2595,4 +2756,3 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
     }
   }
 }
-

@@ -52,9 +52,10 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// unless `$INTENDANT_HOME` overrides it, matching the session-log writer.
 ///
 /// Production-dormant but kept: the ambient twin of
-/// `append_visual_freshness_record` (which is production-used) for the
-/// read side, pinned by tests; the explicit `_in` variant is what live
-/// callers use today.
+/// `append_visual_freshness_record` (itself dormant since the S5
+/// transport seams moved state-dir resolution to the transport edges),
+/// pinned by tests; the explicit `_in` variant is what live callers
+/// use today.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     visual_freshness_path_in(&intendant_state_dir(), session_id)
@@ -88,6 +89,13 @@ pub fn visual_freshness_path_in(state_dir: &Path, session_id: &str) -> Option<Pa
 /// on POSIX, typically 4 KB). The browser sampler batches its records
 /// into single ~5s POSTs of much less than 4 KB so concurrent
 /// interleaving is not a practical concern at the smoke-run scale.
+///
+/// Production-dormant since the S5 transport seams: both the HTTP
+/// dispatch arm and the tunnel arm resolve the state dir at the edge
+/// and call [`append_visual_freshness_record_in`]; the ambient form
+/// stays for its tests and any future caller with a process-ambient
+/// home.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io::Result<usize> {
     append_visual_freshness_record_in(&intendant_state_dir(), session_id, body)
 }

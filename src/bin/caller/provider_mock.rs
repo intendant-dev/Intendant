@@ -83,6 +83,12 @@ struct MockStep {
     /// limit gauges keyless.
     #[serde(default)]
     limit_used_pct: Option<u8>,
+    /// Scripted think-time before this step answers. E2e rigs use it to
+    /// hold a boot-started task's first step until their dashboard
+    /// connection is up — nothing replays missed rail events (e.g.
+    /// `user_question`) to late-joining websockets.
+    #[serde(default)]
+    delay_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,9 +116,8 @@ impl MockProvider {
                 "PROVIDER=mock requires {MOCK_SCRIPT_ENV}=<path to script JSON>"
             ))
         })?;
-        let raw = std::fs::read_to_string(&path).map_err(|e| {
-            CallerError::Config(format!("mock script {path} is unreadable: {e}"))
-        })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| CallerError::Config(format!("mock script {path} is unreadable: {e}")))?;
         Self::from_json(&raw)
     }
 
@@ -125,10 +130,7 @@ impl MockProvider {
             ));
         }
         Ok(Self {
-            model: script
-                .model
-                .clone()
-                .unwrap_or_else(|| "mock-1".to_string()),
+            model: script.model.clone().unwrap_or_else(|| "mock-1".to_string()),
             script,
             cursor: Mutex::new(None),
         })
@@ -172,55 +174,70 @@ impl ChatProvider for MockProvider {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let mut cursor = self.cursor.lock().expect("mock cursor poisoned");
-        let (profile_index, step_index) = match *cursor {
-            Some(state) => state,
-            None => {
-                let profile = self.select_profile(&transcript).ok_or_else(|| {
-                    CallerError::Config(
-                        "mock script has no profile matching this conversation and no \
-                         fallback profile (empty match)"
-                            .to_string(),
-                    )
-                })?;
-                (profile, 0)
-            }
-        };
+        // The guard protects only the cursor, and it must not live across
+        // the think-time await below — scope it (async-Send analysis does
+        // not credit an explicit drop).
+        let (profile_index, step_index) = {
+            let mut cursor = self.cursor.lock().expect("mock cursor poisoned");
+            let (profile_index, step_index) = match *cursor {
+                Some(state) => state,
+                None => {
+                    let profile = self.select_profile(&transcript).ok_or_else(|| {
+                        CallerError::Config(
+                            "mock script has no profile matching this conversation and no \
+                             fallback profile (empty match)"
+                                .to_string(),
+                        )
+                    })?;
+                    (profile, 0)
+                }
+            };
 
-        let profile = &self.script.profiles[profile_index];
-        let Some(step) = profile.steps.get(step_index) else {
-            return Err(CallerError::Config(format!(
-                "mock script exhausted: profile {profile_index} (match {:?}) has only {} steps \
-                 but the loop asked for step {} — scripts must end in signal_done/submit_result",
-                profile.match_text,
-                profile.steps.len(),
-                step_index + 1,
-            )));
-        };
-
-        if let Some(expected) = &step.expect_transcript_contains {
-            if !transcript.contains(expected) {
+            let profile = &self.script.profiles[profile_index];
+            let Some(step) = profile.steps.get(step_index) else {
                 return Err(CallerError::Config(format!(
-                    "mock expectation failed at profile {profile_index} step {step_index}: \
-                     transcript does not contain {expected:?}"
+                    "mock script exhausted: profile {profile_index} (match {:?}) has only {} steps \
+                     but the loop asked for step {} — scripts must end in signal_done/submit_result",
+                    profile.match_text,
+                    profile.steps.len(),
+                    step_index + 1,
                 )));
-            }
-        }
+            };
 
-        *cursor = Some((profile_index, step_index + 1));
+            if let Some(expected) = &step.expect_transcript_contains {
+                if !transcript.contains(expected) {
+                    return Err(CallerError::Config(format!(
+                        "mock expectation failed at profile {profile_index} step {step_index}: \
+                         transcript does not contain {expected:?}"
+                    )));
+                }
+            }
+
+            *cursor = Some((profile_index, step_index + 1));
+            (profile_index, step_index)
+        };
+        let profile = &self.script.profiles[profile_index];
+        let step = &profile.steps[step_index];
+        if step.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(step.delay_ms)).await;
+        }
 
         // Plausible non-zero usage so budget and usage accounting run.
         // Cache counters emulate a warm prompt cache (first request writes,
         // later requests read half) so cache-vitals plumbing runs keyless.
         let prompt_tokens = (transcript.len() as u64 / 4).max(1);
         let completion_tokens = (step.content.len() as u64 / 4).max(1);
-        let cached_tokens = if step_index == 0 { 0 } else { prompt_tokens / 2 };
+        let cached_tokens = if step_index == 0 {
+            0
+        } else {
+            prompt_tokens / 2
+        };
         let rate_limit_windows = step
             .limit_used_pct
             .map(|used_pct| {
                 vec![crate::types::SessionLimitWindow {
                     label: "5h".to_string(),
-                    used_pct,
+                    used_pct: Some(used_pct),
                     resets_at_epoch: Some(
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -228,6 +245,7 @@ impl ChatProvider for MockProvider {
                             .unwrap_or(0)
                             + 7200,
                     ),
+                    status: None,
                 }]
             })
             .unwrap_or_default();
@@ -310,8 +328,10 @@ mod tests {
     #[tokio::test]
     async fn serves_fallback_profile_steps_in_order() {
         let provider = two_profile_script();
-        let mut conversation = vec![message("system", "you are an agent"),
-            message("user", "do the thing")];
+        let mut conversation = vec![
+            message("system", "you are an agent"),
+            message("user", "do the thing"),
+        ];
 
         let first = provider.chat(&conversation).await.expect("step one");
         assert_eq!(first.content, "step one");
@@ -333,7 +353,10 @@ mod tests {
     #[tokio::test]
     async fn matching_profile_wins_over_fallback() {
         let provider = two_profile_script();
-        let conversation = [message("system", "sub-agent"), message("user", "CHILD-TASK: go")];
+        let conversation = [
+            message("system", "sub-agent"),
+            message("user", "CHILD-TASK: go"),
+        ];
         let response = provider.chat(&conversation).await.expect("child step");
         assert_eq!(response.content, "child answer");
         assert_eq!(response.tool_calls[0].name, "submit_result");

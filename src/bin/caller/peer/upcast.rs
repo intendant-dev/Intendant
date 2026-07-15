@@ -51,7 +51,7 @@ use crate::event::AppEvent;
 use crate::peer::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, Capability,
     LogLevel, MessageContent, MessageId, MessageRole, ModelUsage, PeerDisplayInfo, PeerEvent,
-    PeerStatus, SessionInfo, UsageSnapshot,
+    PeerStatus, SessionInfo, TaskId, UsageSnapshot,
 };
 use crate::types::OutboundEvent;
 
@@ -565,8 +565,7 @@ impl AppEventUpcaster {
     pub fn upcast(&mut self, event: &AppEvent) -> Vec<PeerEvent> {
         match event {
             // ---- Dropped internal events ----
-            AppEvent::Resize(_, _)
-            | AppEvent::Tick
+            AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
             | AppEvent::ContextSnapshot { .. }
@@ -577,6 +576,15 @@ impl AppEventUpcaster {
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
+            // Display requests are an owner-surface doorbell on THIS
+            // daemon's dashboards; the peer rail deliberately does not
+            // carry them (peers resolve nothing here).
+            | AppEvent::DisplayRequestRaised { .. }
+            | AppEvent::DisplayRequestResolved { .. }
+            // Live CU action overlays are a LOCAL-dashboard presentation
+            // lane; peer viewers don't render them (documented follow-up
+            // in docs/src/computer-use-and-audio.md).
+            | AppEvent::CuActionExecuted { .. }
             | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
@@ -917,6 +925,24 @@ impl AppEventUpcaster {
                 format!("session attached: {} ({})", session_id, source),
             )],
 
+            // This daemon acknowledged an inbound peer delegation.
+            // Narrate on the log rail only — the receipt's correlation
+            // job happens on the *delegating* side (its wire upcaster
+            // maps `OutboundEvent::TaskReceived` to
+            // `PeerEvent::TaskReceipt`); locally the accepted task
+            // already narrates itself via SessionStarted.
+            AppEvent::TaskReceived {
+                delegation_id,
+                session_id,
+            } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!(
+                    "accepted delegated task {} as session {}",
+                    delegation_id, session_id
+                ),
+            )],
+
             AppEvent::SessionEnded {
                 session_id, reason, ..
             } => {
@@ -1252,13 +1278,14 @@ impl AppEventUpcaster {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                cache_creation_tokens,
             } => {
                 let cost_usd = estimate_session_cost(
                     model,
                     *prompt_tokens,
                     *completion_tokens,
                     *cached_tokens,
-                    0,
+                    *cache_creation_tokens,
                 );
                 vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -1336,7 +1363,7 @@ impl AppEventUpcaster {
                     main.prompt_tokens,
                     main.completion_tokens,
                     main.cached_tokens,
-                    0,
+                    main.cache_creation_tokens,
                 );
                 let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -1594,11 +1621,6 @@ impl AppEventUpcaster {
                 vec![log_event(LogLevel::Info, "User", content.clone())]
             }
 
-            // ---- Terminal ----
-            AppEvent::Quit => vec![PeerEvent::Disconnected {
-                reason: "quit".to_string(),
-            }],
-
             // ---- Interruption ----
             AppEvent::InterruptRequested { .. } => vec![log_event(
                 LogLevel::Info,
@@ -1678,6 +1700,18 @@ impl AppEventUpcaster {
                     LogLevel::Info,
                     "agent",
                     format!("steer cancelled{id_part}: {reason}"),
+                )]
+            }
+            AppEvent::SteerCancelFailed { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Warn,
+                    "agent",
+                    format!("steer cancel failed{id_part}: {reason}"),
                 )]
             }
         }
@@ -1788,9 +1822,9 @@ impl WireEventUpcaster {
                 s.relationship = relationship.clone();
                 s.ephemeral = *ephemeral;
             })),
-            OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
-                self.sessions.update(session_id, |s| s.goal = goal.clone()),
-            ),
+            OutboundEvent::SessionGoal { session_id, goal } => {
+                session_updated_events(self.sessions.update(session_id, |s| s.goal = goal.clone()))
+            }
             OutboundEvent::SessionVitals { session_id, vitals } => session_updated_events(
                 self.sessions
                     .update(session_id, |s| s.vitals = Some(vitals.clone())),
@@ -1807,9 +1841,9 @@ impl WireEventUpcaster {
                 }
             })),
             OutboundEvent::TurnStarted { session_id, .. }
-            | OutboundEvent::AgentStarted { session_id, .. } => session_updated_events(
-                self.sessions.phase(session_id.as_deref(), "working"),
-            ),
+            | OutboundEvent::AgentStarted { session_id, .. } => {
+                session_updated_events(self.sessions.phase(session_id.as_deref(), "working"))
+            }
             OutboundEvent::DoneSignal { session_id, .. }
             | OutboundEvent::TaskComplete { session_id, .. } => {
                 session_updated_events(self.sessions.phase(session_id.as_deref(), "done"))
@@ -1828,11 +1862,9 @@ impl WireEventUpcaster {
                 }
                 None => vec![],
             },
-            OutboundEvent::ApprovalRequired {
-                session_id, id, ..
-            } => session_updated_events(
-                self.sessions.approval_requested(*id, session_id.as_deref()),
-            ),
+            OutboundEvent::ApprovalRequired { session_id, id, .. } => {
+                session_updated_events(self.sessions.approval_requested(*id, session_id.as_deref()))
+            }
             OutboundEvent::ApprovalResolved { id, .. } => {
                 session_updated_events(self.sessions.approval_resolved(*id))
             }
@@ -1920,6 +1952,15 @@ impl WireEventUpcaster {
             | OutboundEvent::SessionCapabilities { .. }
             | OutboundEvent::FollowUpStatus { .. }
             | OutboundEvent::SharedView { .. }
+            // A secondary's display-request doorbell rings on its own
+            // dashboards; the peer rail does not mirror it (see the
+            // AppEvent upcaster twin above).
+            | OutboundEvent::DisplayRequestRaised { .. }
+            | OutboundEvent::DisplayRequestResolved { .. }
+            // A peer's live CU action overlays render on ITS dashboards;
+            // the peer rail doesn't mirror them (same class as the
+            // AppEvent upcaster twin above).
+            | OutboundEvent::CuAction { .. }
             | OutboundEvent::BrowserWorkspaceChanged { .. }
             | OutboundEvent::SessionRenameResult { .. }
             | OutboundEvent::SessionAgentConfigResult { .. }
@@ -2298,6 +2339,19 @@ impl WireEventUpcaster {
                 format!("session attached: {} ({})", session_id, source),
             )],
 
+            // Peer-delegation delivery receipt: the peer accepted a
+            // task this side delegated and names its local session for
+            // it. Upcast 1:1 so the per-peer actor can fold it into the
+            // bounded receipt ledger `PeerHandle::delegate_task` awaits
+            // (and so peers.jsonl keeps the durable acceptance record).
+            OutboundEvent::TaskReceived {
+                delegation_id,
+                session_id,
+            } => vec![PeerEvent::TaskReceipt {
+                delegation_id: delegation_id.clone(),
+                task: TaskId(session_id.clone()),
+            }],
+
             OutboundEvent::SessionEnded {
                 session_id, reason, ..
             } => {
@@ -2568,13 +2622,14 @@ impl WireEventUpcaster {
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
+                cache_creation_tokens,
             } => {
                 let cost_usd = estimate_session_cost(
                     model,
                     *prompt_tokens,
                     *completion_tokens,
                     *cached_tokens,
-                    0,
+                    *cache_creation_tokens,
                 );
                 vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -2655,7 +2710,7 @@ impl WireEventUpcaster {
                     main.prompt_tokens,
                     main.completion_tokens,
                     main.cached_tokens,
-                    0,
+                    main.cache_creation_tokens,
                 );
                 let mut out = vec![PeerEvent::Usage {
                     snapshot: UsageSnapshot {
@@ -2998,6 +3053,18 @@ impl WireEventUpcaster {
                     format!("steer cancelled{id_part}: {reason}"),
                 )]
             }
+            OutboundEvent::SteerCancelFailed { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Warn,
+                    "agent",
+                    format!("steer cancel failed{id_part}: {reason}"),
+                )]
+            }
         }
     }
 }
@@ -3155,7 +3222,6 @@ mod tests {
     fn internal_events_are_dropped() {
         let mut u = AppEventUpcaster::new();
         assert!(u.upcast(&AppEvent::Tick).is_empty());
-        assert!(u.upcast(&AppEvent::Resize(80, 24)).is_empty());
         // ControlCommand carries arbitrary ControlMsg variants; Status is
         // a trivially-constructable one.
         assert!(u
@@ -3437,6 +3503,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         });
         let progress_id = output
             .iter()
@@ -3532,6 +3599,7 @@ mod tests {
             stderr: String::new(),
             source: None,
             output_id: None,
+            item_id: None,
         });
         let progress_id = output
             .iter()
@@ -4601,10 +4669,7 @@ mod tests {
             PeerEvent::SessionUpdated { session } => Some(session.clone()),
             _ => None,
         });
-        assert_eq!(
-            updated.expect("TurnStarted folds phase").phase,
-            "working"
-        );
+        assert_eq!(updated.expect("TurnStarted folds phase").phase, "working");
 
         // Same-phase repeat (AgentStarted while already working) must
         // not re-emit.

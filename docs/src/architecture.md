@@ -53,13 +53,31 @@ Two facts about this diagram drive everything below:
 
 1. **Frontends are display-only.** The web dashboard, MCP server, and
    control socket all *render* state and *emit intents* (`ControlMsg`) onto the
-   EventBus. None of them mutate shared state directly. The single writer is the
-   [control plane](./control-plane-and-daemon.md).
-2. **The EventBus is the spine.** It is one `tokio::sync::broadcast` channel
-   (`event.rs`, `EventBus`) carrying `AppEvent`. `ControlMsg` intents travel as
-   `AppEvent::ControlCommand`. Every long-lived subsystem subscribes to the bus;
-   adding a frontend or a backend means adding a subscriber, not rewiring the
-   others.
+   EventBus. For intent handling there is exactly one writer — the
+   [control plane](./control-plane-and-daemon.md) interprets the
+   state-mutating `ControlMsg`s and applies them. The rule governs the
+   intent path, not literally every write to shared state: a few
+   documented paths mutate shared state from their own tasks — approval
+   side effects (the agent loop applies approve-all escalation and the
+   first display-control grant directly to the shared autonomy state,
+   identically from every approval surface), the MCP autonomy/display
+   tools, and platform display activation. Anything beyond those is a
+   bug, not a precedent.
+2. **The EventBus is the spine.** Its main channel is one bounded
+   `tokio::sync::broadcast` (`event.rs`, `EventBus`) carrying `AppEvent`;
+   `ControlMsg` intents travel as `AppEvent::ControlCommand`. Broadcast
+   subscribers are best-effort — a flooded ring drops oldest events
+   (`RecvError::Lagged`) — so the bus also fans out two **lossless
+   lanes**, unbounded per-subscriber mpsc queues fed at the emit point
+   with declared low-volume subsets: `subscribe_intents` (user intents
+   plus the session-bookkeeping events that route them — a flooded ring
+   must never eat an approve/interrupt click) and
+   `subscribe_session_log` (the lifecycle subset persisted to
+   `session.jsonl`; also what durable-state consumers like the fission
+   ledger watcher fold). Every long-lived subsystem subscribes to the
+   bus; adding a frontend or a backend means adding a subscriber, not
+   rewiring the others — but a consumer that *acts durably* on an event
+   must take a lossless lane, never the broadcast ring.
 
 ## Security Model
 
@@ -74,8 +92,13 @@ The runtime/controller split is a deliberate security boundary:
   but **never executes user-requested shell commands directly** — it pipes them
   to the runtime subprocess.
 - **intendant-connect** is the hosted rendezvous/account metadata service. It is
-  outside the runtime/controller command-execution boundary and holds no daemon
-  API keys or runtime authority.
+  outside the runtime/controller command-execution boundary, holds no daemon
+  API keys, cannot mint daemon-local IAM, and exposes no hosted daemon-control
+  session in the default build. It is still trusted for account, route, fleet,
+  and availability metadata plus the browser code and installers it serves.
+  Malicious served code can lie about or exfiltrate Connect-visible account,
+  route, or unlocked vault/fleet state, while a malicious installer can
+  compromise what it installs; neither is a path to a hosted control session.
 
 A compromised model conversation therefore cannot reach API keys, and the
 runtime process cannot exfiltrate data through a model API. See

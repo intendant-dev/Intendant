@@ -143,6 +143,7 @@ pub(crate) async fn run_with_presence(
             prompt_tokens: 0,
             completion_tokens: 0,
             cached_tokens: 0,
+            cache_creation_tokens: 0,
         });
 
         let presence_prompt = prompts::resolve_presence_prompt(Some(&project.root));
@@ -370,95 +371,253 @@ pub(crate) async fn run_with_presence(
     }
 
     loop {
-        let signal = tokio::select! {
-            biased;
-            env = task_rx.recv() => match env {
-                Some(e) => OuterSignal::Task(e),
-                None => OuterSignal::Done,
-            },
-            msg = outer_bus_rx.recv() => match msg {
-                Ok(AppEvent::CodexThreadActionRequested {
-                    request_id,
-                    session_id,
-                    action,
-                    params,
-                    ..
-                }) if event_targets_external_session_or_side(
-                    &session_id,
-                    &local_session_id,
-                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
-                    &persistent_open_side_threads,
-                ) => {
-                    if !codex_thread_action_dedupe.mark_seen(&request_id) {
+        // Queued steers with no turn to ride (the backend finished before
+        // the queue drained, or a steer arrived while idle): synthesize an
+        // empty task — the send path prepends queued steers as `[User]`
+        // lines, so the flush IS the delivery. Mirrors
+        // run_external_agent_mode's idle-loop check; without it a queued
+        // steer sat in `context_injection` until the user happened to send
+        // another message.
+        let queued_steer_flush = persistent_agent.is_some()
+            && has_queued_steers_for_session(
+                &context_injection,
+                local_session_id.as_deref(),
+                persistent_thread
+                    .as_ref()
+                    .map(|thread| thread.thread_id.as_str()),
+            );
+        // Before flushing, drain any event the backend already buffered
+        // while idle: the flush writes to the backend's stdin, and a
+        // buffered turn start (Claude Code's spontaneous task-notification
+        // round) means that write lands MID-TURN — CC 2.1.2xx discards it,
+        // while `drain_steer_queue_as_followup` has already emitted
+        // `SteerDelivered`. Processing the buffered event first routes a
+        // turn start through the spontaneous-round drain (queued steers
+        // then deliver at the real boundary); housekeeping events simply
+        // re-loop and the flush happens next iteration.
+        let buffered_idle_event = if queued_steer_flush {
+            try_buffered_idle_agent_event(&mut persistent_event_rx)
+                .map(|event| OuterSignal::IdleAgentEvent(Box::new(event)))
+        } else {
+            None
+        };
+        let signal = if let Some(signal) = buffered_idle_event {
+            signal
+        } else if queued_steer_flush {
+            OuterSignal::Task(presence::TaskEnvelope {
+                task: String::new(),
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+                steer_id: None,
+            })
+        } else {
+            tokio::select! {
+                biased;
+                env = task_rx.recv() => match env {
+                    Some(e) => OuterSignal::Task(e),
+                    None => OuterSignal::Done,
+                },
+                msg = outer_bus_rx.recv() => match msg {
+                    Ok(AppEvent::CodexThreadActionRequested {
+                        request_id,
+                        session_id,
+                        action,
+                        params,
+                        ..
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                            continue;
+                        }
+                        OuterSignal::ThreadAction {
+                            session_id,
+                            op: action,
+                            params,
+                        }
+                    }
+                    Ok(AppEvent::ConversationRollbackRequested {
+                        session_id,
+                        round_id,
+                        target_native_message_count,
+                        turns_to_drop,
+                    }) if session_id.is_none()
+                        || event_targets_session(&session_id, &local_session_id) =>
+                    {
+                        OuterSignal::ConversationRollback {
+                            round_id,
+                            target_native_message_count,
+                            turns_to_drop,
+                        }
+                    }
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_external_session_or_side(
+                            &session_id,
+                            &local_session_id,
+                            &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                            &persistent_open_side_threads,
+                        ) =>
+                    {
+                        // Drop idle interrupts so an old Stop action cannot
+                        // interrupt the next task that happens to start later.
+                        turn_bus_rx = bus.subscribe();
                         continue;
                     }
-                    OuterSignal::ThreadAction {
+                    // Idle steers: no turn to inject into, so queue for the
+                    // pre-select flush above — the steer becomes its own turn
+                    // immediately instead of vanishing into the `_` arm.
+                    // The handled-ids gate is load-bearing: this receiver is
+                    // SEPARATE from the turn drain's, so a steer the drain
+                    // already delivered mid-turn replays here at the next
+                    // idle select (broadcast fan-out) and would deliver
+                    // twice without it.
+                    Ok(AppEvent::SteerRequested {
                         session_id,
-                        op: action,
-                        params,
-                    }
-                }
-                Ok(AppEvent::ConversationRollbackRequested {
-                    round_id,
-                    target_native_message_count,
-                    turns_to_drop,
-                }) => OuterSignal::ConversationRollback {
-                    round_id,
-                    target_native_message_count,
-                    turns_to_drop,
-                },
-                Ok(AppEvent::InterruptRequested { session_id })
-                    if event_targets_session(&session_id, &local_session_id) =>
-                {
-                    // Drop idle interrupts so an old Stop action cannot
-                    // interrupt the next task that happens to start later.
-                    turn_bus_rx = bus.subscribe();
-                    continue;
-                }
-                Ok(AppEvent::FollowUpCancelRequested {
-                    session_id,
-                    id,
-                    reason,
-                }) if event_targets_external_session_or_side(
-                    &session_id,
-                    &local_session_id,
-                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
-                    &persistent_open_side_threads,
-                ) => {
-                    let status_session = session_id.as_deref().or(local_session_id.as_deref());
-                    record_cancelled_follow_up_id(
-                        &mut persistent_cancelled_follow_ups,
-                        &bus,
-                        status_session,
+                        text,
                         id,
-                        &reason,
-                    );
-                    continue;
-                }
-                // Any other bus event: skip, keep selecting. Lagged /
-                // Closed also fall through — task_rx close is the
-                // authoritative "we're done" signal.
-                _ => continue,
-            },
-            // Agent events while idle: without this arm they would buffer
-            // until the next task's drain and complete it prematurely
-            // (async Claude Code sub-agents finish — and the CLI starts its
-            // notification turn — while the loop sits here).
-            maybe_event = async {
-                persistent_event_rx
-                    .as_mut()
-                    .expect("branch guarded by is_some")
-                    .recv()
-                    .await
-            }, if persistent_event_rx.is_some() => match maybe_event {
-                Some(event) => OuterSignal::IdleAgentEvent(Box::new(event)),
-                None => {
-                    // Reader task ended (agent process gone); disable the
-                    // arm — the next task recreates the agent.
-                    persistent_event_rx = None;
-                    continue;
-                }
-            },
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) && persistent_agent.is_some()
+                        && !steer_id_has_been_handled(&persistent_handled_steer_ids, &id) => {
+                        // Resolve to the same (target, kind) the turn drain
+                        // uses, and queue with the RESOLVED target: the old
+                        // handler rewrote every target to `local_session_id`,
+                        // so a side-thread steer flushed into the parent
+                        // conversation. Side-targeted entries stay queued for
+                        // the side conversation's next turn instead of riding
+                        // the parent's empty-turn flush below.
+                        let Some((target_session_id, target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
+                                Some(&persistent_open_side_threads),
+                            )
+                        else {
+                            // Unreachable given the guard matched, but a
+                            // resolution miss must leave the steer for its
+                            // owner rather than mis-deliver it.
+                            continue;
+                        };
+                        mark_steer_id_handled(&mut persistent_handled_steer_ids, &id);
+                        queue_idle_external_steer(
+                            &context_injection,
+                            &bus,
+                            target_session_id,
+                            target_kind,
+                            text,
+                            id,
+                        );
+                        continue;
+                    }
+                    Ok(AppEvent::SteerCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        // Resolve like the drain and the external CLI idle
+                        // loop do: idle steers queue with their RESOLVED
+                        // target (side steers keep the side id), so the
+                        // cancel sweep must address the same target or a
+                        // still-queued side steer would falsely report
+                        // "nothing pending to clear".
+                        let Some((target_session_id, _target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
+                                Some(&persistent_open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
+                        let cancelled = cancel_queued_steers_for_session(
+                            &context_injection,
+                            &bus,
+                            target_session_id.as_deref(),
+                            if target_session_id == local_session_id {
+                                persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.as_str())
+                            } else {
+                                None
+                            },
+                            id.as_deref(),
+                            &reason,
+                        );
+                        if cancelled == 0 {
+                            emit_steer_cancel_failed_for_unmatched(
+                                &bus,
+                                target_session_id.or_else(|| local_session_id.clone()),
+                                id,
+                                STEER_CANCEL_UNMATCHED_EXTERNAL_REASON,
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(AppEvent::FollowUpCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_external_session_or_side(
+                        &session_id,
+                        &local_session_id,
+                        &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                        &persistent_open_side_threads,
+                    ) => {
+                        let status_session = session_id.as_deref().or(local_session_id.as_deref());
+                        record_cancelled_follow_up_id(
+                            &mut persistent_cancelled_follow_ups,
+                            &bus,
+                            status_session,
+                            id,
+                            &reason,
+                        );
+                        continue;
+                    }
+                    // Any other bus event: skip, keep selecting. Lagged /
+                    // Closed also fall through — task_rx close is the
+                    // authoritative "we're done" signal.
+                    _ => continue,
+                },
+                // Agent events while idle: without this arm they would buffer
+                // until the next task's drain and complete it prematurely
+                // (async Claude Code sub-agents finish — and the CLI starts its
+                // notification turn — while the loop sits here).
+                maybe_event = async {
+                    persistent_event_rx
+                        .as_mut()
+                        .expect("branch guarded by is_some")
+                        .recv()
+                        .await
+                }, if persistent_event_rx.is_some() => match maybe_event {
+                    Some(event) => OuterSignal::IdleAgentEvent(Box::new(event)),
+                    None => {
+                        // Reader task ended (agent process gone); disable the
+                        // arm — the next task recreates the agent.
+                        persistent_event_rx = None;
+                        continue;
+                    }
+                },
+            }
         };
         let envelope = match signal {
             OuterSignal::Task(e) => e,
@@ -477,8 +636,7 @@ pub(crate) async fn run_with_presence(
                     // boundary of a running task, surviving idle gaps to
                     // prelude the next prompt (idle updates never buy a
                     // turn).
-                    let result_session =
-                        session_id.clone().or_else(|| local_session_id.clone());
+                    let result_session = session_id.clone().or_else(|| local_session_id.clone());
                     let fresh = goal_fresh_tokens(&cumulative_stats.usage);
                     let (success, message) =
                         match native_goal_engine.dispatch(&op, &action_params, fresh) {
@@ -486,10 +644,9 @@ pub(crate) async fn run_with_presence(
                                 // goal_event: None = nothing to broadcast;
                                 // Some(None) = cleared; Some(goal) = state.
                                 let (message, goal_event, notice) = match outcome {
-                                    external_agent::GoalActionOutcome::Report {
-                                        message,
-                                        goal,
-                                    } => (message, goal.map(Some), None),
+                                    external_agent::GoalActionOutcome::Report { message, goal } => {
+                                        (message, goal.map(Some), None)
+                                    }
                                     external_agent::GoalActionOutcome::Cleared {
                                         message,
                                         notice,
@@ -644,7 +801,7 @@ pub(crate) async fn run_with_presence(
                                         match apply_chained_context_rewind_resume_turns(
                                             agent,
                                             thread,
-                                            request,
+                                            *request,
                                             &mut resume,
                                         )
                                         .await
@@ -974,56 +1131,27 @@ pub(crate) async fn run_with_presence(
                 } else if let Some(ref mut agent) = persistent_agent {
                     // Backends without an in-process fork (Claude Code) fork
                     // by respawning — mirror the drain-level
-                    // `ForkHandling::RespawnResume` branch. (This inline
-                    // presence dispatcher duplicates the drain's action
-                    // handling; keep the two in sync.)
-                    if op == "fork" {
+                    // `ForkHandling::RespawnResume` branch through the shared
+                    // helper (fork bare; side/btw with the boundary prompt).
+                    if respawn_resume_thread_action_op(&op) {
                         if let external_agent::ForkHandling::RespawnResume { thread_id } =
                             agent.fork_handling()
                         {
-                            let (success, message) = match thread_id {
-                                Some(parent_thread_id) => {
-                                    bus.send(AppEvent::ControlCommand(
-                                        event::ControlMsg::ResumeSession {
-                                            source: agent.name().to_string(),
-                                            session_id: parent_thread_id.clone(),
-                                            resume_id: Some(parent_thread_id.clone()),
-                                            project_root: Some(
-                                                project.root.to_string_lossy().to_string(),
-                                            ),
-                                            task: None,
-                                            direct: Some(true),
-                                            attachments: Vec::new(),
-                                            fork: true,
-                                            agent_command:
-                                                crate::session_config::read_log_dir_config(
-                                                    &log_dir,
-                                                )
-                                                .and_then(|cfg| cfg.agent_command),
-                                            codex_sandbox: None,
-                                            codex_approval_policy: None,
-                                            codex_managed_context: None,
-                                            codex_context_archive: None,
-                                        },
-                                    ));
-                                    (
-                                        true,
-                                        format!(
-                                            "forking thread {} — the fork announces its own session id on its first turn",
-                                            short_external_session_id(&parent_thread_id)
-                                        ),
-                                    )
-                                }
-                                None => (
-                                    false,
-                                    "fork needs a native session id — run a turn in this session first"
-                                        .to_string(),
-                                ),
-                            };
+                            let (success, message) = respawn_resume_thread_action(
+                                &bus,
+                                agent.name(),
+                                thread_id,
+                                &op,
+                                &action_params,
+                                &project.root,
+                                crate::session_config::read_log_dir_config(&log_dir)
+                                    .and_then(|cfg| cfg.agent_command),
+                            );
                             slog(&session_log, |l| {
                                 l.info(&format!(
-                                    "{} thread action /fork: {} — {}",
+                                    "{} thread action /{}: {} — {}",
                                     agent.name(),
+                                    op,
                                     if success { "ok" } else { "FAILED" },
                                     message
                                 ))
@@ -1130,6 +1258,7 @@ pub(crate) async fn run_with_presence(
                             task: None,
                             direct: Some(true),
                             fork: false,
+                            relationship_kind: None,
                             attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
                             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
@@ -1293,11 +1422,7 @@ pub(crate) async fn run_with_presence(
                         }
                     }
                     external_agent::AgentEvent::GoalUpdated { goal } => {
-                        emit_external_session_goal(
-                            &idle_drain_config,
-                            event_thread_id,
-                            Some(goal),
-                        );
+                        emit_external_session_goal(&idle_drain_config, event_thread_id, Some(goal));
                     }
                     external_agent::AgentEvent::GoalCleared => {
                         emit_external_session_goal(&idle_drain_config, event_thread_id, None);
@@ -1333,17 +1458,14 @@ pub(crate) async fn run_with_presence(
                         will_retry,
                         ..
                     } => {
-                        let label = external_agent_log_source(
-                            idle_drain_config.agent_source.as_deref(),
-                        );
+                        let label =
+                            external_agent_log_source(idle_drain_config.agent_source.as_deref());
                         let mut content = if let Some(code) = code.as_deref() {
                             format!("{label} backend error while idle ({code}): {message}")
                         } else {
                             format!("{label} backend error while idle: {message}")
                         };
-                        if let Some(details) =
-                            details.as_deref().filter(|s| !s.trim().is_empty())
-                        {
+                        if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
                             content.push('\n');
                             content.push_str(details.trim());
                         }
@@ -1439,10 +1561,9 @@ pub(crate) async fn run_with_presence(
                             if let Some(native) =
                                 cumulative_stats.announced_native_session_id.take()
                             {
-                                let is_canonical =
-                                    persistent_agent_backend.as_ref().is_some_and(|backend| {
-                                        backend.thread_id_is_canonical(&native)
-                                    });
+                                let is_canonical = persistent_agent_backend
+                                    .as_ref()
+                                    .is_some_and(|backend| backend.thread_id_is_canonical(&native));
                                 if is_canonical {
                                     if let Some(thread) = persistent_thread.as_mut() {
                                         if thread.thread_id != native {
@@ -1556,6 +1677,7 @@ pub(crate) async fn run_with_presence(
                     match agent.rollback_turns(turns_to_drop).await {
                         Ok(()) => {
                             bus.send(AppEvent::ConversationRolledBack {
+                                session_id: local_session_id.clone(),
                                 round_id,
                                 turns_removed: turns_to_drop,
                                 backend: backend_name,
@@ -1582,6 +1704,7 @@ pub(crate) async fn run_with_presence(
                             persistent_codex_config = None;
                             persistent_claude_config = None;
                             bus.send(AppEvent::ConversationRolledBack {
+                                session_id: local_session_id.clone(),
                                 round_id,
                                 turns_removed: turns_to_drop,
                                 backend: backend_name,
@@ -1597,10 +1720,26 @@ pub(crate) async fn run_with_presence(
                     // emit a 0-turn event so the dashboard clears the
                     // pending state.
                     let removed = match target_native_message_count {
-                        Some(n) => conv.truncate_to(n as usize),
+                        Some(n) => {
+                            // Capture the surviving tail's seq BEFORE the
+                            // truncate: truncate_to appends synthetic
+                            // dangling-call repairs with fresh (higher)
+                            // seqs that must not shift the cut.
+                            let clamped = (n as usize).max(1).min(conv.len());
+                            let cut_after_seq =
+                                conv.messages().get(clamped - 1).map(|m| m.seq).unwrap_or(0);
+                            let removed = conv.truncate_to(n as usize);
+                            if removed > 0 {
+                                slog(&session_log, |l| {
+                                    l.conversation_rewound(cut_after_seq, "tail_rollback")
+                                });
+                            }
+                            removed
+                        }
                         None => 0,
                     };
                     bus.send(AppEvent::ConversationRolledBack {
+                        session_id: local_session_id.clone(),
                         round_id,
                         turns_removed: removed as u32,
                         backend: "native".into(),
@@ -1610,6 +1749,7 @@ pub(crate) async fn run_with_presence(
                     // No conversation to revert — emit completion
                     // anyway so the dashboard doesn't wait forever.
                     bus.send(AppEvent::ConversationRolledBack {
+                        session_id: local_session_id.clone(),
                         round_id,
                         turns_removed: 0,
                         backend: "native".into(),
@@ -1991,11 +2131,13 @@ pub(crate) async fn run_with_presence(
                     bus: &bus,
                     web_port,
                     session_id: session_log_id(&session_log),
-                    alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
-                        Some(thread_id_at_turn_start.clone())
-                    } else {
-                        None
-                    },
+                    // The backend-native thread id is a first-class address
+                    // for THIS session (SessionIdentity contract): steers,
+                    // interrupts, and cancels from the dashboard target it
+                    // after the identity upgrade. This used to be
+                    // Codex-only, which silently dropped every native-id
+                    // control for Claude Code sessions in the daemon lane.
+                    alias_session_id: Some(thread_id_at_turn_start.clone()),
                     backend_thread_id: Some(thread_id_at_turn_start.clone()),
                     autonomy: autonomy.clone(),
                     session_log: &session_log,
@@ -2761,12 +2903,15 @@ pub(crate) async fn run_with_presence(
 
                 // Frame directory awareness
                 let frames_dir = log_dir.join("frames");
-                conv.add_user(format!(
-                    "[System] Video frames from the user's camera are stored at: {}\n\
+                conv.add_user(
+                    MessageProvenance::SystemInjection,
+                    format!(
+                        "[System] Video frames from the user's camera are stored at: {}\n\
                      Each frame is a JPEG named by frame ID (e.g., cam0-f00001.jpg).\n\
                      When you receive frame references, you can read them from this path.",
-                    frames_dir.display()
-                ));
+                        frames_dir.display()
+                    ),
+                );
                 conv.add_assistant("Understood.".to_string());
 
                 // Add task with optional frame images. Combine context-hint
@@ -2775,11 +2920,23 @@ pub(crate) async fn run_with_presence(
                 // image content the model should see alongside the task.
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
-                if combined_images.is_empty() {
-                    conv.add_user(task_text.clone());
+                let task_seq = if combined_images.is_empty() {
+                    conv.add_user(MessageProvenance::Task, task_text.clone())
                 } else {
-                    conv.add_user_with_images(task_text.clone(), combined_images);
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::Task,
+                        task_text.clone(),
+                        combined_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        task_seq,
+                        MessageProvenance::Task,
+                        &task_text,
+                        None,
+                    );
+                });
 
                 persistent_project = Some(proj);
                 persistent_provider = Some(task_provider);
@@ -2802,11 +2959,26 @@ pub(crate) async fn run_with_presence(
 
                 let mut combined_images = frame_images;
                 combined_images.extend(attachment_images.iter().cloned());
-                if combined_images.is_empty() {
-                    conv.add_user(format!("[New Task] {}", task_text));
+                let task_seq = if combined_images.is_empty() {
+                    conv.add_user(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                    )
                 } else {
-                    conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::FollowUp,
+                        format!("[New Task] {}", task_text),
+                        combined_images,
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        task_seq,
+                        MessageProvenance::FollowUp,
+                        &task_text,
+                        None,
+                    );
+                });
             }
 
             if let Some(id) = envelope.steer_id.as_deref() {
@@ -3003,6 +3175,23 @@ pub(crate) async fn run_direct_mode(
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
+                // Mixed-version cutover: a legacy file (no seqs) gets them
+                // assigned once, and the epoch marker records the mapping so
+                // extractors can correlate (message-search plan §4).
+                if conv.ensure_seqs_assigned() {
+                    let mapping: Vec<(u64, String, String)> = conv
+                        .messages()
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.seq,
+                                m.role.clone(),
+                                session_log::content_hash_hex16(&m.content),
+                            )
+                        })
+                        .collect();
+                    slog(&session_log, |l| l.conversation_message_epoch(&mapping));
+                }
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Resumed conversation ({} messages, turn {})",
@@ -3013,11 +3202,23 @@ pub(crate) async fn run_direct_mode(
                 // Append the new task as a continuation message
                 let resume_msg = attachments
                     .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
-                if attachment_images.is_empty() {
-                    conv.add_user(resume_msg);
+                let resume_seq = if attachment_images.is_empty() {
+                    conv.add_user(MessageProvenance::ResumeTask, resume_msg)
                 } else {
-                    conv.add_user_with_images(resume_msg, attachment_images.clone());
-                }
+                    conv.add_user_with_images(
+                        MessageProvenance::ResumeTask,
+                        resume_msg,
+                        attachment_images.clone(),
+                    )
+                };
+                slog(&session_log, |l| {
+                    let _ = l.conversation_message_user(
+                        resume_seq,
+                        MessageProvenance::ResumeTask,
+                        &task,
+                        None,
+                    );
+                });
                 conv
             }
             Err(e) => {
@@ -3029,24 +3230,31 @@ pub(crate) async fn run_direct_mode(
                 });
                 fresh_conversation = true;
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
-                setup_fresh_conversation_with_attachments(
+                let task_seq = setup_fresh_conversation_with_attachments(
                     &mut conv,
                     &project,
                     &attachments.text_with_file_prelude(&task),
                     attachment_images.clone(),
                 );
+                slog(&session_log, |l| {
+                    let _ =
+                        l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+                });
                 conv
             }
         }
     } else {
         fresh_conversation = true;
         let mut conv = Conversation::new(system_prompt, provider.context_window());
-        setup_fresh_conversation_with_attachments(
+        let task_seq = setup_fresh_conversation_with_attachments(
             &mut conv,
             &project,
             &attachments.text_with_file_prelude(&task),
             attachment_images.clone(),
         );
+        slog(&session_log, |l| {
+            let _ = l.conversation_message_user(task_seq, MessageProvenance::Task, &task, None);
+        });
         conv
     };
 
@@ -3057,7 +3265,7 @@ pub(crate) async fn run_direct_mode(
             let refs: Vec<&_> = kstore.entries.iter().collect();
             let msg = knowledge::format_for_injection(&refs);
             if !msg.is_empty() {
-                conversation.add_user(msg);
+                conversation.add_user(MessageProvenance::SystemInjection, msg);
                 conversation.add_assistant(
                     "Acknowledged. I have loaded the project knowledge.".to_string(),
                 );

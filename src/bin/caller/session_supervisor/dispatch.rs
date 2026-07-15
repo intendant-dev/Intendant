@@ -17,6 +17,7 @@ impl SessionSupervisor {
                 claude_permission_mode,
                 claude_effort,
                 codex_model,
+                codex_reasoning_effort,
                 codex_sandbox,
                 codex_approval_policy,
                 codex_managed_context,
@@ -30,9 +31,8 @@ impl SessionSupervisor {
                 worktree,
                 worktree_branch,
             } => {
-                let worktree_request = worktree
-                    .unwrap_or(false)
-                    .then(|| SessionWorktreeRequest {
+                let worktree_request =
+                    worktree.unwrap_or(false).then_some(SessionWorktreeRequest {
                         branch: worktree_branch,
                     });
                 if let Some(parsed) = parse_codex_slash_command(&task) {
@@ -53,32 +53,34 @@ impl SessionSupervisor {
                                     "/fast creates an idle Codex session; attachments and display metadata were ignored",
                                 );
                             }
-                            self.start_new_session(
-                                String::new(),
-                                name,
-                                project_root,
-                                agent,
-                                agent_command,
-                                None,
-                                None,
-                                None,
-                                codex_model,
-                                codex_sandbox,
-                                codex_approval_policy,
-                                codex_managed_context,
-                                codex_context_archive,
-                                orchestrate,
-                                direct,
-                                Vec::new(),
-                                None,
-                                Vec::new(),
-                                Some(
-                                    crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
-                                        .to_string(),
-                                ),
-                                worktree_request,
-                            )
-                            .await;
+                            let _ = self
+                                .start_new_session(
+                                    String::new(),
+                                    name,
+                                    project_root,
+                                    agent,
+                                    agent_command,
+                                    None,
+                                    None,
+                                    None,
+                                    codex_model,
+                                    codex_reasoning_effort,
+                                    codex_sandbox,
+                                    codex_approval_policy,
+                                    codex_managed_context,
+                                    codex_context_archive,
+                                    orchestrate,
+                                    direct,
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    Some(
+                                        crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
+                                            .to_string(),
+                                    ),
+                                    worktree_request,
+                                )
+                                .await;
                             return;
                         }
                         Ok(_) | Err(_) => {}
@@ -91,6 +93,7 @@ impl SessionSupervisor {
                         || claude_permission_mode.is_some()
                         || claude_effort.is_some()
                         || codex_model.is_some()
+                        || codex_reasoning_effort.is_some()
                         || codex_sandbox.is_some()
                         || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
@@ -107,29 +110,31 @@ impl SessionSupervisor {
                         .await;
                     return;
                 }
-                self.start_new_session(
-                    task,
-                    name,
-                    project_root,
-                    agent,
-                    agent_command,
-                    claude_model,
-                    claude_permission_mode,
-                    claude_effort,
-                    codex_model,
-                    codex_sandbox,
-                    codex_approval_policy,
-                    codex_managed_context,
-                    codex_context_archive,
-                    orchestrate,
-                    direct,
-                    reference_frame_ids,
-                    display_target,
-                    attachments,
-                    codex_service_tier,
-                    worktree_request,
-                )
-                .await;
+                let _ = self
+                    .start_new_session(
+                        task,
+                        name,
+                        project_root,
+                        agent,
+                        agent_command,
+                        claude_model,
+                        claude_permission_mode,
+                        claude_effort,
+                        codex_model,
+                        codex_reasoning_effort,
+                        codex_sandbox,
+                        codex_approval_policy,
+                        codex_managed_context,
+                        codex_context_archive,
+                        orchestrate,
+                        direct,
+                        reference_frame_ids,
+                        display_target,
+                        attachments,
+                        codex_service_tier,
+                        worktree_request,
+                    )
+                    .await;
             }
             event::ControlMsg::StartTask {
                 session_id: Some(session_id),
@@ -159,7 +164,28 @@ impl SessionSupervisor {
                 display_target,
                 attachments,
                 follow_up_id: _,
+                delegation_id,
             } => {
+                // Peer-delegation dedup: the delegating daemon re-sends
+                // the same delegation_id after a connection drop
+                // (at-least-once delivery). An id this supervisor
+                // already dispatched re-acks with the ORIGINAL session
+                // identity instead of starting a duplicate task.
+                if let Some(id) = delegation_id.as_deref() {
+                    let already = self.state.lock().await.recorded_delegation_session(id);
+                    if let Some(session_id) = already {
+                        self.info(&format!(
+                            "Duplicate peer delegation {} re-acknowledged as session {}",
+                            id,
+                            short_session(&session_id)
+                        ));
+                        self.config.bus.send(AppEvent::TaskReceived {
+                            delegation_id: id.to_string(),
+                            session_id,
+                        });
+                        return;
+                    }
+                }
                 if let Some(parsed) = parse_codex_slash_command(&task) {
                     match parsed {
                         Ok(command) if command.op == "fast" => {
@@ -171,32 +197,39 @@ impl SessionSupervisor {
                                     "/fast creates an idle Codex session; attachments and display metadata were ignored",
                                 );
                             }
-                            self.start_new_session(
-                                String::new(),
-                                None,
-                                None,
-                                Some("codex".to_string()),
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                orchestrate,
-                                direct,
-                                Vec::new(),
-                                None,
-                                Vec::new(),
-                                Some(
-                                    crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
-                                        .to_string(),
-                                ),
-                                None,
-                            )
-                            .await;
+                            let started = self
+                                .start_new_session(
+                                    String::new(),
+                                    None,
+                                    None,
+                                    Some("codex".to_string()),
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    orchestrate,
+                                    direct,
+                                    Vec::new(),
+                                    None,
+                                    Vec::new(),
+                                    Some(
+                                        crate::external_agent::codex::CODEX_FAST_SERVICE_TIER
+                                            .to_string(),
+                                    ),
+                                    None,
+                                )
+                                .await;
+                            if let (Some(id), Some(session_id)) =
+                                (delegation_id.as_deref(), started.as_deref())
+                            {
+                                self.acknowledge_delegation(id, session_id).await;
+                            }
                             return;
                         }
                         Ok(_) | Err(_) => {}
@@ -206,33 +239,51 @@ impl SessionSupervisor {
                             "Slash command dropped reference frame/display metadata; routing to active Codex session",
                         );
                     }
+                    // Slash commands route as follow-ups into an existing
+                    // session — there is no fresh dispatch identity to
+                    // acknowledge, so a delegated slash command is NOT
+                    // acked and the delegating side reports its
+                    // fire-and-forget fallback after the grace window.
                     self.route_follow_up(None, task, direct, attachments, None)
                         .await;
                     return;
                 }
-                self.start_new_session(
-                    task,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    orchestrate,
-                    direct,
-                    reference_frame_ids,
-                    display_target,
-                    attachments,
-                    None,
-                    None,
-                )
-                .await;
+                let started = self
+                    .start_new_session(
+                        task,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        orchestrate,
+                        direct,
+                        reference_frame_ids,
+                        display_target,
+                        attachments,
+                        None,
+                        None,
+                    )
+                    .await;
+                // Acknowledge acceptance only once the task is actually
+                // dispatched (start_new_session returned the launched
+                // session): the receipt means "running here as this
+                // session", never "frame parsed". Failed launches return
+                // None and stay unacked — the delegating side reports
+                // the delegation unconfirmed instead of pointing at a
+                // session that never existed.
+                if let (Some(id), Some(session_id)) = (delegation_id.as_deref(), started.as_deref())
+                {
+                    self.acknowledge_delegation(id, session_id).await;
+                }
             }
             event::ControlMsg::SpawnSubAgent {
                 session_id,
@@ -254,6 +305,7 @@ impl SessionSupervisor {
                 direct,
                 attachments,
                 fork,
+                relationship_kind,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -269,6 +321,7 @@ impl SessionSupervisor {
                     direct,
                     attachments,
                     fork,
+                    relationship_kind,
                     LaunchOverrides {
                         agent_command,
                         codex_sandbox,
@@ -473,6 +526,29 @@ impl SessionSupervisor {
         }
     }
 
+    /// Record an accepted peer delegation in the dedup ledger and
+    /// broadcast the delivery receipt (`AppEvent::TaskReceived` →
+    /// `OutboundEvent::TaskReceived` on every connected client,
+    /// including the delegating daemon's federation transport).
+    /// Duplicate deliveries are answered at the dispatch site via
+    /// [`SupervisorState::recorded_delegation_session`] without
+    /// re-recording.
+    pub(crate) async fn acknowledge_delegation(&self, delegation_id: &str, session_id: &str) {
+        self.state
+            .lock()
+            .await
+            .record_delegation(delegation_id, session_id);
+        self.info(&format!(
+            "Accepted peer delegation {} as session {}",
+            delegation_id,
+            short_session(session_id)
+        ));
+        self.config.bus.send(AppEvent::TaskReceived {
+            delegation_id: delegation_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+
     pub(crate) async fn should_handle_session_control(&self, msg: &event::ControlMsg) -> bool {
         match msg {
             event::ControlMsg::CreateSession { .. } => true,
@@ -496,7 +572,11 @@ impl SessionSupervisor {
         }
     }
 
-    pub(crate) async fn report_unattached_codex_thread_action(&self, session_id: Option<String>, op: String) {
+    pub(crate) async fn report_unattached_codex_thread_action(
+        &self,
+        session_id: Option<String>,
+        op: String,
+    ) {
         let Some(target_id) = session_id
             .as_deref()
             .map(str::trim)
@@ -604,7 +684,9 @@ pub(crate) fn control_msg_can_attach_unmanaged_session(msg: &event::ControlMsg) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_supervisor::tests::{managed_session, test_supervisor};
+    use crate::session_supervisor::tests::{
+        managed_session, test_supervisor, test_supervisor_with_mock_provider,
+    };
 
     #[tokio::test]
     async fn thread_action_fallback_defers_to_advertised_ops() {
@@ -649,15 +731,13 @@ mod tests {
         // managed non-external session.
         {
             let mut state = supervisor.state.lock().await;
-            state
-                .sessions
-                .insert("native-1".to_string(), managed_session("native-1", "intendant"));
+            state.sessions.insert(
+                "native-1".to_string(),
+                managed_session("native-1", "intendant"),
+            );
         }
         supervisor
-            .report_unattached_codex_thread_action(
-                Some("native-1".to_string()),
-                "side".to_string(),
-            )
+            .report_unattached_codex_thread_action(Some("native-1".to_string()), "side".to_string())
             .await;
         let results = drain_results(&mut rx);
         assert_eq!(results.len(), 1);
@@ -773,5 +853,173 @@ mod tests {
             attachments: Vec::new(),
         };
         assert!(control_msg_can_attach_unmanaged_session(&msg));
+    }
+
+    fn delegated_start_task(delegation_id: &str) -> event::ControlMsg {
+        event::ControlMsg::StartTask {
+            session_id: None,
+            task: "delegated: report project status".to_string(),
+            orchestrate: None,
+            direct: Some(true),
+            reference_frame_ids: vec![],
+            display_target: None,
+            attachments: vec![],
+            follow_up_id: None,
+            delegation_id: Some(delegation_id.to_string()),
+        }
+    }
+
+    /// The receiver half of the peer-delegation delivery receipt: a
+    /// StartTask carrying a `delegation_id` is acknowledged with
+    /// `AppEvent::TaskReceived` naming the session it actually
+    /// dispatched, and an at-least-once re-send of the SAME id re-acks
+    /// with the ORIGINAL session instead of starting a duplicate task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peer_delegation_acks_on_dispatch_and_dedups_resend() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor =
+            test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+
+        supervisor
+            .handle_control_msg(delegated_start_task("dg-recv-1"))
+            .await;
+
+        // Collect until the receipt arrives; remember every announced
+        // session so we can pin the receipt to a real launch.
+        let mut started_sessions: Vec<String> = Vec::new();
+        let mut receipt_session: Option<String> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while receipt_session.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no TaskReceived receipt within the deadline (started: {started_sessions:?})"
+            );
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SessionStarted { session_id, .. })) => {
+                    started_sessions.push(session_id);
+                }
+                Ok(Ok(AppEvent::TaskReceived {
+                    delegation_id,
+                    session_id,
+                })) => {
+                    assert_eq!(delegation_id, "dg-recv-1");
+                    receipt_session = Some(session_id);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                other => panic!("bus closed before the receipt: {other:?}"),
+            }
+        }
+        let receipt_session = receipt_session.unwrap();
+        assert!(
+            started_sessions.contains(&receipt_session),
+            "receipt must name a session that actually started \
+             (receipt: {receipt_session}, started: {started_sessions:?})"
+        );
+
+        // Re-send of the same delegation id (the delegating daemon's
+        // at-least-once retry): re-ack with the original session, and
+        // no second session starts.
+        supervisor
+            .handle_control_msg(delegated_start_task("dg-recv-1"))
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let re_ack_session = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "no re-ack for the duplicate delivery");
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::TaskReceived {
+                    delegation_id,
+                    session_id,
+                })) if delegation_id == "dg-recv-1" => break session_id,
+                Ok(Ok(AppEvent::SessionStarted { session_id, .. })) => {
+                    panic!("duplicate delegation must not start a session ({session_id})")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                other => panic!("bus closed before the re-ack: {other:?}"),
+            }
+        };
+        assert_eq!(
+            re_ack_session, receipt_session,
+            "re-ack must carry the ORIGINAL session identity"
+        );
+
+        // And the dedup really did keep it to one session: nothing new
+        // starts in a short settle window after the re-ack.
+        let settle = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        loop {
+            let remaining = settle.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SessionStarted { session_id, .. })) => {
+                    panic!("late duplicate session started: {session_id}")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                _ => break,
+            }
+        }
+    }
+
+    /// A StartTask without a delegation id (browsers, ctl, pre-receipt
+    /// peers) never emits a receipt — the field is strictly opt-in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn undelegated_start_task_emits_no_receipt() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let project_dir = tempfile::tempdir().unwrap();
+        let supervisor =
+            test_supervisor_with_mock_provider(project_dir.path().to_path_buf(), bus.clone());
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::StartTask {
+                session_id: None,
+                task: "plain local task".to_string(),
+                orchestrate: None,
+                direct: Some(true),
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+            })
+            .await;
+
+        // The session starts; give the pipeline a short settle window
+        // and assert no TaskReceived ever fires.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_start = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::TaskReceived { delegation_id, .. })) => {
+                    panic!("undelegated task must not be acked (got {delegation_id})")
+                }
+                Ok(Ok(AppEvent::SessionStarted { .. })) => {
+                    saw_start = true;
+                    // Short settle after the launch, then stop watching.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    while let Ok(event) = rx.try_recv() {
+                        if let AppEvent::TaskReceived { delegation_id, .. } = event {
+                            panic!("undelegated task must not be acked (got {delegation_id})");
+                        }
+                    }
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                _ => break,
+            }
+        }
+        assert!(saw_start, "the plain task should still launch");
     }
 }

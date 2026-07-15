@@ -67,11 +67,11 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     AclSizeInformation, CreateRestrictedToken, CreateWellKnownSid, DeleteAce, EqualSid, GetAce,
-    GetAclInformation, WinBuiltinUsersSid, WinRestrictedCodeSid, WinWorldSid, ACCESS_ALLOWED_ACE,
-    ACE_FLAGS, ACL as WIN_ACL, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR,
-    PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_QUERY, WELL_KNOWN_SID_TYPE, WRITE_RESTRICTED,
+    GetAclInformation, IsValidSid, WinBuiltinUsersSid, WinRestrictedCodeSid, WinWorldSid,
+    ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL as WIN_ACL, ACL_SIZE_INFORMATION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, OBJECT_INHERIT_ACE,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_QUERY, WELL_KNOWN_SID_TYPE, WRITE_RESTRICTED,
 };
 use windows::Win32::Storage::FileSystem::{
     DELETE, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -98,6 +98,21 @@ pub const SANDBOX_APPLIED_ENV: &str = "INTENDANT_SANDBOX_APPLIED";
 /// `FILE_DELETE_CHILD` is not exported as a constant by the crate feature
 /// set we use; its value is stable Win32 ABI (0x40).
 const FILE_DELETE_CHILD: u32 = 0x40;
+
+/// `ACCESS_ALLOWED_ACE_TYPE` is not exported under the Windows feature set
+/// used by this crate. Its Win32 ABI value is stable.
+const ACCESS_ALLOWED_ACE_TYPE_VALUE: u8 = 0;
+
+/// A SID starts with revision + sub-authority count + identifier authority.
+const SID_HEADER_SIZE: usize = 8;
+
+fn access_allowed_ace_size(header: &ACE_HEADER, bytes_available: usize) -> Option<usize> {
+    let ace_size = usize::from(header.AceSize);
+    (header.AceType == ACCESS_ALLOWED_ACE_TYPE_VALUE
+        && ace_size >= std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        && ace_size <= bytes_available)
+        .then_some(ace_size)
+}
 
 /// Access mask for read-lane grants: read + traverse/execute.
 fn read_mask() -> u32 {
@@ -328,30 +343,77 @@ fn remove_restricted_ace(path: &Path, mask: u32) -> Result<(), String> {
     }
     .map_err(|e| format!("GetAclInformation({}): {e}", path.display()))?;
 
+    let acl_start = dacl as usize;
+    let acl_end = acl_start
+        .checked_add(info.AclBytesInUse as usize)
+        .ok_or_else(|| format!("GetAclInformation({}): invalid ACL size", path.display()))?;
+
     let mut removed = false;
     // Iterate downward so DeleteAce index shifts don't skip entries.
     for i in (0..info.AceCount).rev() {
-        let mut ace_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        // SAFETY: index is within AceCount for this ACL.
-        if unsafe { GetAce(dacl, i, &mut ace_ptr) }.is_err() {
+        let mut ace_out = std::mem::MaybeUninit::<*mut std::ffi::c_void>::uninit();
+        // SAFETY: index is within AceCount for this ACL; on success GetAce
+        // initializes the output pointer.
+        if unsafe { GetAce(dacl, i, ace_out.as_mut_ptr()) }.is_err() {
             continue;
         }
-        // SAFETY: GetAce returned a pointer to an ACE header inside the ACL.
-        let header = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
-        // ACCESS_ALLOWED_ACE_TYPE — stable Win32 ABI value (0x0); the crate
-        // does not export it under our feature set.
-        if header.Header.AceType != 0u8 {
+        // SAFETY: a successful GetAce call initializes its output pointer.
+        let ace_ptr = unsafe { ace_out.assume_init() };
+        if ace_ptr.is_null() {
             continue;
         }
-        if header.Mask != mask {
+
+        let ace_start = ace_ptr as usize;
+        let Some(header_end) = ace_start.checked_add(std::mem::size_of::<ACE_HEADER>()) else {
+            continue;
+        };
+        if ace_start < acl_start || header_end > acl_end {
             continue;
         }
-        if header.Header.AceFlags & (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8
+        // SAFETY: successful GetAce returned a non-null pointer into this ACL,
+        // and the range check above proves that a complete ACE_HEADER remains
+        // within the ACL buffer. read_unaligned avoids assuming ACE alignment.
+        let header = unsafe { ace_ptr.cast::<ACE_HEADER>().read_unaligned() };
+        let Some(ace_size) = access_allowed_ace_size(&header, acl_end - ace_start) else {
+            continue;
+        };
+        // SAFETY: the header identifies ACCESS_ALLOWED_ACE, and its validated
+        // AceSize covers the full fixed structure inside the ACL buffer.
+        let ace = unsafe { ace_ptr.cast::<ACCESS_ALLOWED_ACE>().read_unaligned() };
+        if ace.Mask != mask {
+            continue;
+        }
+        if header.AceFlags & (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8
             != (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8
         {
             continue;
         }
-        let sid_ptr = PSID(&header.SidStart as *const _ as *mut _);
+
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let sid_bytes_available = ace_size - sid_offset;
+        if sid_bytes_available < SID_HEADER_SIZE {
+            continue;
+        }
+        // SAFETY: AceSize and sid_offset were validated against the ACL buffer,
+        // and the SID header fits entirely within this ACE.
+        let sid_bytes = unsafe { ace_ptr.cast::<u8>().add(sid_offset) };
+        // SAFETY: the SID header's second byte is within the validated range.
+        let sub_authority_count = usize::from(unsafe { *sid_bytes.add(1) });
+        let Some(sid_size) = sub_authority_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|sub_authorities| SID_HEADER_SIZE.checked_add(sub_authorities))
+        else {
+            continue;
+        };
+        if sid_size > sid_bytes_available {
+            continue;
+        }
+        let sid_ptr = PSID(sid_bytes.cast());
+        // SAFETY: the complete SID length derived from its bounded header fits
+        // inside the validated ACE. IsValidSid performs the ABI-level checks.
+        if !unsafe { IsValidSid(sid_ptr) }.as_bool() {
+            continue;
+        }
         // SAFETY: both SIDs are valid for the comparison; EqualSid reads only.
         let equal = unsafe { EqualSid(sid_ptr, restricted.as_psid()) }.is_ok();
         if equal {
@@ -961,6 +1023,29 @@ mod tests {
     /// The grant table, journal file, and temp-dir ACEs are process-global
     /// — these tests must not interleave.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn access_allowed_ace_size_requires_matching_type_and_bounded_structure() {
+        let fixed_size = std::mem::size_of::<ACCESS_ALLOWED_ACE>();
+        let header = ACE_HEADER {
+            AceType: ACCESS_ALLOWED_ACE_TYPE_VALUE,
+            AceFlags: 0,
+            AceSize: fixed_size as u16,
+        };
+        assert_eq!(
+            access_allowed_ace_size(&header, fixed_size),
+            Some(fixed_size)
+        );
+        assert_eq!(access_allowed_ace_size(&header, fixed_size - 1), None);
+
+        let mut wrong_type = header;
+        wrong_type.AceType = 1;
+        assert_eq!(access_allowed_ace_size(&wrong_type, fixed_size), None);
+
+        let mut truncated = header;
+        truncated.AceSize = (fixed_size - 1) as u16;
+        assert_eq!(access_allowed_ace_size(&truncated, fixed_size), None);
+    }
 
     /// The restricted token must carry exactly one privilege —
     /// `SeChangeNotifyPrivilege`. Anything else surviving from an elevated

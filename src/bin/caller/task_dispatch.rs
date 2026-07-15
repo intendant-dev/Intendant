@@ -25,7 +25,8 @@
 //! synchronous tool-result semantics — the dispatcher coordinates frontend
 //! → backend routing, not presence-internal LLM tool calls.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -48,39 +49,96 @@ pub struct Dispatcher {
     pub follow_up_tx: Option<mpsc::Sender<FollowUpMessage>>,
     /// Session id owned by the legacy single-session loop. When set, targeted
     /// commands for any other session are left for the session supervisor.
+    ///
+    /// External backends upgrade their session address mid-flight
+    /// (`persist_native_backend_session_id`): frontends may target the session
+    /// by either the wrapper/log id or the backend-native id afterwards. The
+    /// spawned dispatcher watches `SessionIdentity` events and accepts every
+    /// id in the primary session's identity group — an exact-match here used
+    /// to silently drop every post-upgrade Steer/Interrupt/StartTask from the
+    /// dashboard.
     pub primary_session_id: Option<String>,
 }
 
 impl Dispatcher {
-    /// Spawn a background task that subscribes to the bus and routes task
-    /// dispatch commands. The handle is aborted on session end.
+    /// Spawn a background task that consumes the bus's lossless intent lane
+    /// ([`EventBus::subscribe_intents`]) and routes task dispatch commands.
+    /// The handle is aborted on session end.
+    ///
+    /// The lane — not the lossy broadcast ring — because a dropped
+    /// `StartTask`/`FollowUp`/`Interrupt` is an unrecoverable lost user
+    /// action: the dispatcher is the only consumer that acts on it.
     pub fn spawn(self, bus: EventBus) -> JoinHandle<()> {
-        let mut rx = bus.subscribe();
+        let mut intent_rx = bus.subscribe_intents();
         let bus_for_log = bus.clone();
+        let accepted = Arc::new(RwLock::new(
+            self.primary_session_id
+                .iter()
+                .cloned()
+                .collect::<HashSet<String>>(),
+        ));
+        if self.primary_session_id.is_some() {
+            // Identity listener: fold backend-native ids into the accepted
+            // set as sessions upgrade their address. The broadcast lane is
+            // LOSSY: a lagged receiver has permanently dropped events, and a
+            // `SessionIdentity` among them is forfeited — commands addressed
+            // to that backend-native id are then silently ignored until some
+            // later announcement re-links it (the wrapper id keeps working
+            // regardless). No cheap authoritative snapshot of announced
+            // identities exists in-process (they persist per-session-dir in
+            // `session.jsonl`), so the honest response is to say so loudly.
+            let accepted = accepted.clone();
+            let mut identity_rx = bus.subscribe();
+            let lag_bus = bus.clone();
+            let lag_session_id = self.primary_session_id.clone();
+            tokio::spawn(async move {
+                loop {
+                    match identity_rx.recv().await {
+                        Ok(AppEvent::SessionIdentity {
+                            session_id,
+                            backend_session_id,
+                            ..
+                        }) => {
+                            let mut ids = accepted.write().expect("dispatcher alias lock");
+                            if ids.contains(&session_id) || ids.contains(&backend_session_id) {
+                                ids.insert(session_id);
+                                ids.insert(backend_session_id);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            lag_bus.send(AppEvent::LogEntry {
+                                session_id: lag_session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "system".to_string(),
+                                content: format!(
+                                    "Dispatcher identity listener lagged; {} dropped event(s) — a missed SessionIdentity means commands targeting the backend-native id may be ignored until the next announcement (session {})",
+                                    n,
+                                    lag_session_id.as_deref().unwrap_or("?")
+                                ),
+                                turn: None,
+                            });
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
         let arc = Arc::new(self);
 
         tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if let AppEvent::ControlCommand(msg) = event {
-                            arc.route(msg, &bus_for_log).await;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Bus lagged — continue; the dispatcher is idempotent
-                        // per event and cannot recover lost ones.
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            while let Some(event) = intent_rx.recv().await {
+                if let AppEvent::ControlCommand(msg) = event {
+                    arc.route(msg, &bus_for_log, &accepted).await;
                 }
             }
         })
     }
 
-    async fn route(&self, msg: ControlMsg, bus: &EventBus) {
+    async fn route(&self, msg: ControlMsg, bus: &EventBus, accepted: &RwLock<HashSet<String>>) {
         if let Some(target_session_id) = control_target_session_id(&msg) {
-            if !self.handles_target_session(target_session_id) {
+            if !self.handles_target_session_in(target_session_id, accepted) {
                 return;
             }
         }
@@ -102,6 +160,14 @@ impl Dispatcher {
                 display_target,
                 attachments,
                 follow_up_id,
+                // The legacy single-session dispatcher deliberately does
+                // NOT acknowledge peer delegations: it routes into an
+                // existing loop (presence/task/follow-up channels), so
+                // there is no fresh dispatch identity to report. A
+                // delegating daemon falls back to its fire-and-forget
+                // path exactly as against a pre-receipt build — see the
+                // compatibility matrix in peer::transport::intendant.
+                delegation_id: _,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
                 let has_metadata = !reference_frame_ids.is_empty()
@@ -232,15 +298,15 @@ impl Dispatcher {
                 attachments,
             } => {
                 if !attachments.is_empty() {
+                    let steer_id = id.unwrap_or_default();
                     if let Some(ref tx) = self.task_tx {
-                        let steer_id = id.unwrap_or_default();
                         let envelope = presence_core::TaskEnvelope {
                             task: text.clone(),
                             force_direct: true,
                             context_hints: vec![],
                             reference_frame_ids: vec![],
                             display_target: None,
-                            attachment_frame_ids: attachments,
+                            attachment_frame_ids: attachments.clone(),
                             steer_id: if steer_id.is_empty() {
                                 None
                             } else {
@@ -248,6 +314,29 @@ impl Dispatcher {
                             },
                         };
                         if tx.try_send(envelope).is_ok() {
+                            bus.send(AppEvent::SteerQueued {
+                                session_id,
+                                id: steer_id,
+                                reason: "attachments are queued for the next turn".to_string(),
+                            });
+                            return;
+                        }
+                    }
+                    // External-agent shape: no task channel, but the
+                    // follow-up lane carries attachments (as unresolved
+                    // frame ids) and keeps the steer id so cancel and
+                    // delivery receipts stay addressable. Dropping the
+                    // steer here lost attachment steers on every external
+                    // session.
+                    if let Some(ref tx) = self.follow_up_tx {
+                        let mut follow_up = FollowUpMessage::steer(
+                            text.clone(),
+                            Default::default(),
+                            steer_id.clone(),
+                        );
+                        follow_up.unresolved_attachment_ids = attachments;
+                        follow_up.target_session_id = session_id.clone();
+                        if tx.try_send(follow_up).is_ok() {
                             bus.send(AppEvent::SteerQueued {
                                 session_id,
                                 id: steer_id,
@@ -300,11 +389,18 @@ impl Dispatcher {
         });
     }
 
-    fn handles_target_session(&self, session_id: &str) -> bool {
-        self.primary_session_id
-            .as_deref()
-            .map(|primary| primary == session_id)
-            .unwrap_or(true)
+    fn handles_target_session_in(
+        &self,
+        session_id: &str,
+        accepted: &RwLock<HashSet<String>>,
+    ) -> bool {
+        if self.primary_session_id.is_none() {
+            return true;
+        }
+        accepted
+            .read()
+            .expect("dispatcher alias lock")
+            .contains(session_id)
     }
 }
 
@@ -363,6 +459,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -402,6 +499,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
@@ -436,6 +534,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -529,7 +628,66 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(follow_up_rx.try_recv().is_err());
+    }
+
+    /// External backends re-key their session to the backend-native id
+    /// mid-flight; frontends then target that id. The dispatcher must treat
+    /// every id in the primary session's identity group as primary — an
+    /// exact match silently dropped every post-upgrade dashboard command.
+    #[tokio::test]
+    async fn native_id_alias_joins_primary_after_identity_upgrade() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+        let bus = make_test_bus();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: Some("wrapper-id".to_string()),
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-id".into(),
+            source: "claude-code".into(),
+            backend_session_id: "native-id".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        let start_task = |session_id: &str, task: &str| {
+            AppEvent::ControlCommand(ControlMsg::StartTask {
+                session_id: Some(session_id.into()),
+                task: task.into(),
+                orchestrate: None,
+                direct: Some(true),
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachments: vec![],
+                follow_up_id: None,
+                delegation_id: None,
+            })
+        };
+
+        bus.send(start_task("native-id", "via native id"));
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.text, "via native id");
+
+        // A foreign session's native id must not leak into the group.
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "other-wrapper".into(),
+            source: "codex".into(),
+            backend_session_id: "other-native".into(),
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        bus.send(start_task("other-native", "foreign session"));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(follow_up_rx.try_recv().is_err());
     }
@@ -558,6 +716,7 @@ mod tests {
             display_target: None,
             attachments: vec![],
             follow_up_id: None,
+            delegation_id: None,
         }));
 
         let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
@@ -714,6 +873,120 @@ mod tests {
             }
         }
         assert_eq!(seen_id.as_deref(), Some(""));
+    }
+
+    /// External `--agent` shape: no task channel, but the follow-up lane is
+    /// real (run_external_agent_mode consumes it) — the attachment steer
+    /// rides it with its steer id and unresolved frame ids intact.
+    #[tokio::test]
+    async fn steer_with_attachments_falls_back_to_follow_up_lane() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("ext-sess".into()),
+            text: "see the attached frame".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s3".into()),
+        }));
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.text, "see the attached frame");
+        assert_eq!(msg.steer_id.as_deref(), Some("s3"));
+        assert_eq!(msg.unresolved_attachment_ids, vec!["frame:latest"]);
+        assert_eq!(msg.target_session_id.as_deref(), Some("ext-sess"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_queued = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { id, .. })) => {
+                    assert_eq!(id, "s3");
+                    saw_queued = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_queued, "expected SteerQueued for follow-up-lane steer");
+    }
+
+    /// Presence shape: the headless wiring hands the dispatcher NO
+    /// follow_up_tx (nothing reads that channel under run_with_presence), so
+    /// when the task lane is unavailable the steer reaches the explicit
+    /// warn+drop — never a phantom `SteerQueued` receipt for a message
+    /// sitting in a channel nothing drains.
+    #[tokio::test]
+    async fn steer_with_attachments_without_consumer_drops_honestly() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        // Task lane exists but is FULL (capacity 1, pre-filled) — the
+        // presence loop is busy and try_send fails.
+        let (task_tx, _task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(1);
+        task_tx
+            .try_send(presence_core::TaskEnvelope {
+                task: "occupies the only slot".into(),
+                force_direct: true,
+                context_hints: vec![],
+                reference_frame_ids: vec![],
+                display_target: None,
+                attachment_frame_ids: vec![],
+                steer_id: None,
+            })
+            .unwrap();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: Some(task_tx),
+            follow_up_tx: None,
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: None,
+            text: "attachment steer with nowhere to go".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s4".into()),
+        }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_drop_warning = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { .. })) => {
+                    panic!("phantom SteerQueued for an undeliverable steer");
+                }
+                Ok(Ok(AppEvent::LogEntry { content, level, .. }))
+                    if level == "warn" && content.contains("Steer dropped") =>
+                {
+                    saw_drop_warning = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_drop_warning, "expected the explicit warn+drop");
     }
 
     #[tokio::test]
