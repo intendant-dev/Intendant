@@ -25,7 +25,16 @@ const STORE_DIR: &str = "external-agent-compatibility";
 const MAX_DISTINCT_FINDINGS_PER_PROCESS: usize = 64;
 const MAX_PERSISTED_FINDINGS_PER_CONTRACT: usize = 32;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
-const STORE_QUEUE_CAPACITY: usize = MAX_DISTINCT_FINDINGS_PER_PROCESS + 2;
+// The queue is shared by every watch in the process. Each handle can enqueue
+// at most its in-memory dedup cap plus one handshake marker, so this holds
+// the full output of well over a dozen concurrent drifting sessions before
+// overflow degrades (visibly) to a noted storage failure.
+const STORE_QUEUE_CAPACITY: usize = 1024;
+// Every external-CLI upgrade changes the executable fingerprint and thereby
+// mints a fresh artifact directory; without a bound the profile directory
+// grows by one dead directory per upgrade forever. Newest-N keeps enough
+// history to compare a regression against recent artifacts.
+const MAX_ARTIFACT_DIRS_PER_PROFILE: usize = 4;
 
 const CLAUDE_ENVELOPE_TYPES: &[&str] = &[
     "system",
@@ -1065,6 +1074,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn manifest_digest(backend: &AgentBackend) -> String {
+    // Pure function of compile-time vocabulary and revision constants, so
+    // cache it: the status endpoint recomputes it per request otherwise.
+    static CLAUDE_DIGEST: OnceLock<String> = OnceLock::new();
+    static CODEX_DIGEST: OnceLock<String> = OnceLock::new();
+    let cache = match backend {
+        AgentBackend::ClaudeCode => &CLAUDE_DIGEST,
+        AgentBackend::Codex => &CODEX_DIGEST,
+    };
+    cache
+        .get_or_init(|| compute_manifest_digest(backend))
+        .clone()
+}
+
+fn compute_manifest_digest(backend: &AgentBackend) -> String {
     let groups: &[(&str, &[&str])] = match backend {
         AgentBackend::ClaudeCode => &[
             ("envelope", CLAUDE_ENVELOPE_TYPES),
@@ -1147,11 +1170,15 @@ enum StoreCommand {
     Flush(std::sync::mpsc::Sender<()>),
 }
 
+/// One unit of work for the shared store worker: the contract store the
+/// command applies to, plus the command itself.
+type StoreJob = (Arc<ProtocolWatchStore>, StoreCommand);
+
 struct ProtocolWatchInner {
     store: Arc<ProtocolWatchStore>,
     seen: StdMutex<HashSet<ProtocolFinding>>,
     observation_queued: AtomicBool,
-    store_tx: SyncSender<StoreCommand>,
+    store_tx: SyncSender<StoreJob>,
 }
 
 /// Cloneable passive watch attached to one supervised backend process.
@@ -1186,16 +1213,10 @@ impl ProtocolWatchHandle {
             artifact,
             write_lock,
         });
-        let (store_tx, store_rx) = sync_channel(STORE_QUEUE_CAPACITY);
-        let worker_store = Arc::clone(&store);
-        if std::thread::Builder::new()
-            .name("intendant-protocol-watch".to_string())
-            .spawn(move || protocol_store_worker(worker_store, store_rx))
-            .is_err()
-        {
+        let Some(store_tx) = shared_store_tx() else {
             note_storage_failure(&contract_path);
             return None;
-        }
+        };
         Some(Self {
             inner: Arc::new(ProtocolWatchInner {
                 store,
@@ -1228,14 +1249,17 @@ impl ProtocolWatchHandle {
             }
         };
 
-        // Never let a diagnostics write stall either protocol reader. The
-        // queue is sized above the per-process finding cap plus the one
-        // handshake marker, so `try_send` remains nonblocking even if disk is
-        // temporarily slow.
+        // Never let a diagnostics write stall either protocol reader:
+        // `try_send` stays nonblocking, and losing a record to a full shared
+        // queue degrades to the same visible storage-failure note as a
+        // failed disk write.
         if self
             .inner
             .store_tx
-            .try_send(StoreCommand::Finding(finding.clone()))
+            .try_send((
+                Arc::clone(&self.inner.store),
+                StoreCommand::Finding(finding.clone()),
+            ))
             .is_err()
         {
             note_storage_failure(&self.inner.store.contract_dir());
@@ -1268,7 +1292,10 @@ impl ProtocolWatchHandle {
         if self
             .inner
             .store_tx
-            .try_send(StoreCommand::MarkObserved(reported_version))
+            .try_send((
+                Arc::clone(&self.inner.store),
+                StoreCommand::MarkObserved(reported_version),
+            ))
             .is_err()
         {
             note_storage_failure(&self.inner.store.contract_dir());
@@ -1300,7 +1327,7 @@ impl ProtocolWatchHandle {
     fn flush_with_timeout(&self, timeout: std::time::Duration) {
         let (tx, rx) = std::sync::mpsc::channel();
         let deadline = std::time::Instant::now() + timeout;
-        let mut command = StoreCommand::Flush(tx);
+        let mut command = (Arc::clone(&self.inner.store), StoreCommand::Flush(tx));
         loop {
             match self.inner.store_tx.try_send(command) {
                 Ok(()) => break,
@@ -1441,14 +1468,75 @@ impl ProtocolWatchStore {
             note_storage_failure(&self.contract_dir());
         }
     }
+
+    /// Bounded store: keep the live artifact plus the most recently used
+    /// sibling artifact directories, delete the rest. Only 64-hex directory
+    /// names are candidates (that is the only shape this store creates), a
+    /// symlink is never followed, and the live artifact is never a
+    /// candidate. A concurrent daemon still running a pruned artifact loses
+    /// only diagnostics history — its next write recreates the directory —
+    /// and recency ranking makes that overlap effectively unreachable: a
+    /// live artifact's observation keeps it newest.
+    fn prune_stale_artifact_dirs(&self) {
+        let profile_dir = profile_dir(&self.state_root, &self.backend, &self.profile);
+        let Ok(entries) = std::fs::read_dir(&profile_dir) else {
+            return;
+        };
+        let mut stale: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.len() != 64
+                || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || name == self.artifact.digest
+            {
+                continue;
+            }
+            let path = entry.path();
+            let is_real_dir = std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.file_type().is_dir());
+            if !is_real_dir {
+                continue;
+            }
+            stale.push((artifact_dir_recency_secs(&path), path));
+        }
+        let keep_stale = MAX_ARTIFACT_DIRS_PER_PROFILE.saturating_sub(1);
+        if stale.len() <= keep_stale {
+            return;
+        }
+        stale.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in stale.drain(keep_stale..) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
-fn protocol_store_worker(store: Arc<ProtocolWatchStore>, commands: Receiver<StoreCommand>) {
-    while let Ok(command) = commands.recv() {
+/// The single shared persistence worker. Sessions come and go; one lazily
+/// spawned, process-lifetime thread drains every watch's bounded record
+/// stream instead of each session parking a thread of its own. Returns
+/// `None` (once, sticky) if the thread could not be spawned.
+fn shared_store_tx() -> Option<SyncSender<StoreJob>> {
+    static TX: OnceLock<Option<SyncSender<StoreJob>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = sync_channel(STORE_QUEUE_CAPACITY);
+        std::thread::Builder::new()
+            .name("intendant-protocol-watch".to_string())
+            .spawn(move || protocol_store_worker(rx))
+            .ok()
+            .map(|_| tx)
+    })
+    .clone()
+}
+
+fn protocol_store_worker(commands: Receiver<StoreJob>) {
+    while let Ok((store, command)) = commands.recv() {
         match command {
             StoreCommand::Finding(finding) => store.persist_finding(finding),
             StoreCommand::MarkObserved(reported_version) => {
-                store.persist_observation(reported_version)
+                store.persist_observation(reported_version);
+                // A handshake is the once-per-session moment, so piggyback
+                // the bounded store prune here rather than on the hot path.
+                store.prune_stale_artifact_dirs();
             }
             StoreCommand::Flush(done) => {
                 let _ = done.send(());
@@ -1498,6 +1586,14 @@ fn lock_unpoison<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
     }
 }
 
+fn profile_dir(state_root: &Path, backend: &AgentBackend, profile: &str) -> PathBuf {
+    state_root
+        .join("diagnostics")
+        .join(STORE_DIR)
+        .join(backend.as_short_str())
+        .join(profile_key(profile))
+}
+
 fn contract_dir(
     state_root: &Path,
     backend: &AgentBackend,
@@ -1505,13 +1601,32 @@ fn contract_dir(
     artifact_digest: &str,
     contract_digest: &str,
 ) -> PathBuf {
-    state_root
-        .join("diagnostics")
-        .join(STORE_DIR)
-        .join(backend.as_short_str())
-        .join(profile_key(profile))
+    profile_dir(state_root, backend, profile)
         .join(artifact_digest)
         .join(contract_digest)
+}
+
+/// Newest observation mtime under an artifact directory, as seconds since
+/// the epoch: every session rewrites its observation record at handshake,
+/// so this tracks "last time any session used this artifact" without
+/// parsing records. An artifact directory that never reached a handshake
+/// (findings only) ranks oldest, which is the right prune order — it holds
+/// the least evidence.
+fn artifact_dir_recency_secs(artifact_dir: &Path) -> u64 {
+    let mut newest = 0u64;
+    let Ok(entries) = std::fs::read_dir(artifact_dir) else {
+        return newest;
+    };
+    for manifest in entries.flatten() {
+        let observed = std::fs::metadata(manifest.path().join("observation.json"))
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        newest = newest.max(observed);
+    }
+    newest
 }
 
 fn read_observation(path: &Path) -> Option<ObservationRecord> {
@@ -1979,6 +2094,75 @@ mod tests {
             .state,
             PassiveCompatibilityState::Unobserved
         );
+    }
+
+    #[test]
+    fn observation_prunes_only_stale_artifact_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let command = tmp.path().join("codex-fixture");
+        executable(&command, b"live-artifact");
+        let state_root = tmp.path().join("state");
+        let profile = profile_dir(&state_root, &AgentBackend::Codex, "vanilla");
+        let manifest = manifest_digest(&AgentBackend::Codex);
+
+        // Five stale artifact dirs whose observation mtimes rise with index.
+        let base = SystemTime::now() - std::time::Duration::from_secs(3_600);
+        let stale: Vec<PathBuf> = (0..5u8)
+            .map(|index| {
+                let artifact_dir = profile.join(sha256_hex(&[index]));
+                let contract = artifact_dir.join(&manifest);
+                std::fs::create_dir_all(&contract).unwrap();
+                let observation = contract.join("observation.json");
+                std::fs::write(&observation, b"{}").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&observation)
+                    .unwrap()
+                    .set_modified(base + std::time::Duration::from_secs(60 * u64::from(index)))
+                    .unwrap();
+                artifact_dir
+            })
+            .collect();
+
+        // Residents the prune must never touch: a non-digest name, a
+        // 64-hex regular file, and (on Unix) a 64-hex symlink to a dir.
+        let foreign_dir = profile.join("not-an-artifact-digest");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let hex_file = profile.join(sha256_hex(b"file-shaped"));
+        std::fs::write(&hex_file, b"not a directory").unwrap();
+        #[cfg(unix)]
+        let hex_symlink = profile.join(sha256_hex(b"symlinked"));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&foreign_dir, &hex_symlink).unwrap();
+
+        let watch = ProtocolWatchHandle::new_in(
+            state_root.clone(),
+            AgentBackend::Codex,
+            "vanilla",
+            command.to_str().unwrap(),
+        )
+        .unwrap();
+        watch.mark_observed(None);
+        watch.flush_for_test();
+
+        // Live artifact plus the three newest stale dirs survive; the two
+        // oldest are gone; non-candidates are untouched.
+        assert!(watch.contract_dir().is_dir());
+        assert!(!stale[0].exists());
+        assert!(!stale[1].exists());
+        for kept in &stale[2..] {
+            assert!(kept.is_dir(), "expected {} to survive", kept.display());
+        }
+        assert!(foreign_dir.is_dir());
+        assert!(hex_file.is_file());
+        #[cfg(unix)]
+        {
+            assert!(std::fs::symlink_metadata(&hex_symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(foreign_dir.is_dir());
+        }
     }
 
     #[test]
