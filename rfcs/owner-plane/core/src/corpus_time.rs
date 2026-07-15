@@ -35,6 +35,7 @@ use crate::cbor;
 use crate::keyschedule::{item_addr, seal_item};
 use crate::shapes::control::KeyFeedCutoff;
 use crate::shapes::envelope::Signedop;
+use crate::shapes::identity::Grant;
 use crate::shapes::{DeadlineFallback, Frontierclose, Strictness, TimeWitness, Verb, Zonepolicy};
 use crate::suite;
 use crate::tranche::{items, Device, PlaneRig, TenantOverrides, T0_MS};
@@ -164,6 +165,9 @@ struct DeadlineArc {
     ops: Vec<(&'static str, Signedop)>,
     addr: [u8; 32],
     claim_hash: [u8; 32],
+    /// The minted deadline/lease grant (the lifecycle re-proposal
+    /// cites it — re-minting would collide the rig's draw names).
+    grant: Grant,
 }
 
 fn deadline_arc(name: &str, online_lease: bool) -> DeadlineArc {
@@ -211,6 +215,7 @@ fn deadline_arc(name: &str, online_lease: bool) -> DeadlineArc {
         ops,
         addr,
         claim_hash,
+        grant: g,
     }
 }
 
@@ -483,6 +488,134 @@ pub fn f9_lease_late_then_timely_receipt_admits() -> Vector {
     )
 }
 
+/// The D-202 lifecycle, executable end to end (review R7, the
+/// owner's alternative-(ii) ruling): receipts are DELIVERED
+/// evidence, arrival order is the lane's semantic input.
+///
+/// 1. `i` evaluates with only the LATE receipt held → the issued
+///    `lease-stale` is terminal (sticky);
+/// 2. the timely-at-first-evaluation world is the endpoint sibling
+///    `lease-late-then-timely-receipt-admits`;
+/// 3. `timely_i` (a qualified in-window receipt for `i` itself) then
+///    arrives — the lifecycle re-evaluates revivable rejections and
+///    `i` REMAINS stale (the stickiness registry is load-bearing:
+///    without it this vector fails);
+/// 4. the re-proposed `i2` — a fresh op re-asserting the claim under
+///    the same lease — admits under its own timely receipt: the
+///    ruled convergence carrier.
+pub fn f9_lease_lifecycle_sticky_reproposal() -> Vector {
+    let mut a = deadline_arc("f9-lease-lifecycle", true);
+    let gid = grant_id_of(&a.ops[3].1);
+    let (d1, d2, lineage) = (a.d1.clone(), a.d2.clone(), a.d1.lineage);
+    let lease = a
+        .rig
+        .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 86_400_000);
+    // The re-proposal: the same statement re-signed as a FRESH op at
+    // the freed position (quarantine-reproposal, D-112), citing the
+    // arc's own lease grant.
+    let g = a.grant.clone();
+    let i2 = a.rig.claim_over(
+        &d1,
+        &g,
+        "i2",
+        "the tide gauge reads four feet at the north pier",
+        1,
+        None,
+        TenantOverrides {
+            actor_id: None,
+            capability_epoch: 2,
+            authored_kek_epoch: 1,
+            attested_by: None,
+            writer_gen: None,
+        },
+    );
+    let addr2 = claim_addr(&a.rig, &i2);
+    let late = a
+        .rig
+        .accept_receipt(&d2, a.addr, T0_MS + 86_400_000 + 300_000 + 100_000);
+    let timely_i = a.rig.accept_receipt(&d2, a.addr, T0_MS + 43_200_000);
+    let timely_i2 = a.rig.accept_receipt(&d2, addr2, T0_MS + 43_200_000);
+
+    let mut inputs = JsonMap::new();
+    let mut item_map = JsonMap::new();
+    for (n, op) in &a.ops {
+        item_map.insert((*n).into(), json!(hex_of(&op.encode())));
+    }
+    item_map.insert("late".into(), json!(hex_of(&late.encode())));
+    item_map.insert("timely_i".into(), json!(hex_of(&timely_i.encode())));
+    item_map.insert("timely_i2".into(), json!(hex_of(&timely_i2.encode())));
+    item_map.insert("i2".into(), json!(hex_of(&i2.encode())));
+    inputs.insert("items".into(), Json::Object(item_map));
+    // Both listed orders share the declared arrival structure: the
+    // late receipt precedes i's first evaluation; both timely
+    // receipts and the re-proposal follow it.
+    inputs.insert(
+        "deliveries".into(),
+        json!([
+            [
+                "c1",
+                "c2",
+                "c3",
+                "c4",
+                "late",
+                "i",
+                "timely_i",
+                "timely_i2",
+                "i2"
+            ],
+            [
+                "c2",
+                "c1",
+                "c3",
+                "c4",
+                "late",
+                "i",
+                "timely_i2",
+                "timely_i",
+                "i2"
+            ]
+        ]),
+    );
+    let mut aux_map = JsonMap::new();
+    aux_map.insert(
+        "index".into(),
+        json!(hex_of(&index_aux(&[
+            (a.addr, a.claim_hash),
+            (addr2, i2.op_hash())
+        ]))),
+    );
+    aux_map.insert("lease.d2".into(), json!(hex_of(&lease.encode())));
+    inputs.insert("aux".into(), Json::Object(aux_map));
+
+    Vector {
+        family: 9,
+        name: "lease-lifecycle-sticky-reproposal".into(),
+        case_kind: "evidence-lifecycle".into(),
+        source: "4.7".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(a.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [
+                { "item": "c1" },
+                { "item": "c2" },
+                { "item": "c3" },
+                { "item": "c4" },
+                { "item": "late" },
+                { "item": "i", "outcome": "lease-stale", "disposition": "quarantine-reproposal" },
+                { "item": "timely_i" },
+                { "item": "timely_i2" },
+                { "item": "i2" },
+            ],
+            "arrival_is_semantic": true,
+        })),
+    }
+}
+
+fn hex_of(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 /// The c.grant op's grant_id (the body's `grant.grant_id`).
 fn grant_id_of(grant_op: &Signedop) -> [u8; 16] {
     let cbor::Value::Map(entries) = &grant_op.body else {
@@ -567,6 +700,7 @@ pub fn corpus_time() -> Vec<Vector> {
         f9_lease_missing_pends(),
         f9_lease_stale_quarantines(),
         f9_lease_late_then_timely_receipt_admits(),
+        f9_lease_lifecycle_sticky_reproposal(),
         f9_lease_present_no_receipt_pends(),
         f9_lease_overlong_window_invalid(),
     ]

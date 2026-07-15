@@ -353,6 +353,7 @@ pub async fn run_semantics_with<C: crate::crypto::Crypto>(c: &C, vector: &Json) 
         "crash-replay" => crate::edge::crash_replay(vector),
         "erase-crash-matrix" => crate::erase::erase_crash_matrix(vector),
         "lock-matrix" => crate::edge::lock_matrix(vector),
+        "evidence-lifecycle" => run_evidence_lifecycle(vector),
         _ => crate::kat::run(c, vector).await,
     };
     match run {
@@ -696,6 +697,95 @@ fn run_journal_vector(vector: &Json) -> Result<SemStatus, String> {
         }
     }
 
+    Ok(SemStatus::Pass)
+}
+
+/// The D-202 evidence-lifecycle lane: arrival order is SEMANTIC
+/// INPUT (the ruled per-replica stickiness), so no fresh-fold or
+/// metamorphic convergence applies — instead every LISTED delivery
+/// must agree on the final per-item verdicts (the vector lists only
+/// orders with the same declared evidence-arrival structure), and
+/// they must match the expectation. The re-proposal's admission in
+/// every order is the ruled convergence carrier.
+fn run_evidence_lifecycle(vector: &Json) -> Result<SemStatus, String> {
+    use std::collections::BTreeMap;
+    let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for (name, hv) in vector["inputs"]["items"]
+        .as_object()
+        .ok_or("items missing")?
+    {
+        items.insert(
+            name.clone(),
+            unhex(hv.as_str().ok_or("item not a string")?)?,
+        );
+    }
+    let aux = parse_aux(vector)?;
+    let deliveries: Vec<Vec<String>> = vector["inputs"]["deliveries"]
+        .as_array()
+        .ok_or("deliveries missing")?
+        .iter()
+        .map(|d| {
+            d.as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .ok_or("delivery not an array")
+        })
+        .collect::<Result<_, _>>()?;
+    if deliveries.len() < 2 {
+        return Ok(SemStatus::Fail(
+            "evidence-lifecycle needs at least two listed orders".into(),
+        ));
+    }
+    let mut runs = Vec::new();
+    for order in &deliveries {
+        match crate::fold::run_lifecycle(&items, &aux, order) {
+            Ok(run) => runs.push(run),
+            Err(u) => return Ok(SemStatus::Unimplemented(u.0)),
+        }
+    }
+    for (i, run) in runs.iter().enumerate().skip(1) {
+        if run.final_verdicts != runs[0].final_verdicts {
+            return Ok(SemStatus::Fail(format!(
+                "listed delivery {i} diverges from delivery 0 — the listed orders must share \
+                 the declared evidence-arrival structure"
+            )));
+        }
+    }
+    let rows = vector["expected"]["result"]["per_item"]
+        .as_array()
+        .ok_or("per_item missing")?;
+    let final_v = &runs[0].final_verdicts;
+    if rows.len() != final_v.len() {
+        return Ok(SemStatus::Fail(format!(
+            "per_item rows {} != delivered items {}",
+            rows.len(),
+            final_v.len()
+        )));
+    }
+    for row in rows {
+        let name = row["item"].as_str().ok_or("row.item")?;
+        let Some(verdict) = final_v.get(name) else {
+            return Ok(SemStatus::Fail(format!(
+                "per_item names unknown item {name}"
+            )));
+        };
+        let want = match (row.get("outcome"), row.get("disposition")) {
+            (Some(o), Some(d)) => Some((
+                o.as_str().ok_or("row.outcome")?,
+                d.as_str().ok_or("row.disposition")?,
+            )),
+            _ => None,
+        };
+        if verdict.pair() != want {
+            return Ok(SemStatus::Fail(format!(
+                "{name}: expected {want:?}, reducer derived {:?}",
+                verdict.pair()
+            )));
+        }
+    }
     Ok(SemStatus::Pass)
 }
 
@@ -1090,7 +1180,7 @@ mod tests {
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
-        assert_eq!(reports.len(), 164, "the corpus through the repair tranche");
+        assert_eq!(reports.len(), 165, "the corpus through the repair tranche");
         for r in &reports {
             assert!(
                 r.structural_ok(),

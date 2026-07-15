@@ -19,8 +19,17 @@
 //!    real `std::fs::File` advisory locks (`try_lock`/`unlock`) on
 //!    per-target files, and the denial steps must match the
 //!    vector's outcome rows exactly.
-//! 4. **Semantics** — the unmodified harness dispatch must report
-//!    PASS on the read-back-substituted vector.
+//! 4. **Flush + atomic replacement (review R6)** — the §13.2 cell
+//!    names `framing, flush, locks, crash/corruption`, and the
+//!    funded plan names portable `open/write/rename`: every stream
+//!    materialization goes write-temp → `sync_all` (fsync /
+//!    FlushFileBuffers) → `rename` onto the final path, so BOTH
+//!    primitives are load-bearing (bypass the rename and the final
+//!    path never exists — the read fails red), and end-of-run
+//!    invocation counters additionally fail the lane if either
+//!    primitive executed zero times.
+//! 5. **Semantics** — the unmodified harness dispatch must report
+//!    PASS on the vector.
 //!
 //! Hermetic: everything lives under a `tempfile`-style unique dir in
 //! the OS temp root, removed on exit. Exit is nonzero on ANY
@@ -83,9 +92,27 @@ fn roundtrip_inputs(node: &Json, dir: &Path, n: &mut u32, bytes: &mut u64) -> Re
     Ok(())
 }
 
-/// Real truncation per cut: copy, `set_len`, read back, compare to
-/// the in-memory prefix.
-fn truncate_cuts(vector: &Json, dir: &Path) -> Result<u32, String> {
+/// Durably materialize `bytes` at `path` through the PORTABLE
+/// flush + atomic-replacement pair: write a temp sibling, fsync it
+/// (`File::sync_all` — fsync on Unix, FlushFileBuffers on Windows),
+/// then `rename` onto the final path. The rename is load-bearing:
+/// callers read the FINAL path, so a bypassed rename fails red.
+fn durable_write(path: &Path, bytes: &[u8], counters: &mut (u64, u64)) -> Result<(), String> {
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
+    std::io::Write::write_all(&mut f, bytes).map_err(|e| format!("write tmp: {e}"))?;
+    f.sync_all().map_err(|e| format!("sync_all: {e}"))?;
+    counters.0 += 1;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    counters.1 += 1;
+    Ok(())
+}
+
+/// Real truncation per cut: the stream lands via the durable
+/// write-sync-rename path, then each cut is a `set_len` on a fresh
+/// copy, read back against the in-memory prefix.
+fn truncate_cuts(vector: &Json, dir: &Path, counters: &mut (u64, u64)) -> Result<u32, String> {
     let Some(stream_hex) = vector["inputs"]["stream"].as_str() else {
         return Ok(0);
     };
@@ -94,7 +121,11 @@ fn truncate_cuts(vector: &Json, dir: &Path) -> Result<u32, String> {
     };
     let stream = unhex(stream_hex).ok_or("stream hex")?;
     let full = dir.join("stream.bin");
-    std::fs::write(&full, &stream).map_err(|e| format!("write: {e}"))?;
+    durable_write(&full, &stream, counters)?;
+    let back = std::fs::read(&full).map_err(|e| format!("read after rename: {e}"))?;
+    if back != stream {
+        return Err("durable stream read-back differs".into());
+    }
     let mut done = 0;
     for (i, c) in cuts.iter().enumerate() {
         let cut = c.as_u64().ok_or("cut")? as usize;
@@ -313,6 +344,24 @@ fn main() {
 
     let mut ran = 0u32;
     let mut red = 0u32;
+    // (sync_all invocations, rename invocations) — the R6 proof that
+    // both primitives actually executed.
+    let mut durable = (0u64, 0u64);
+    // The R5 manifest pin: the run set must equal the committed
+    // lane manifest exactly — an annotation edit cannot silently
+    // shrink this lane.
+    let manifest: Json = serde_json::from_str(
+        &std::fs::read_to_string(plane_root().join("coverage").join("lane-manifests.json"))
+            .expect("lane-manifests.json"),
+    )
+    .expect("lane manifests parse");
+    let required: Vec<String> = manifest["storage"]
+        .as_array()
+        .expect("manifest.storage")
+        .iter()
+        .map(|v| v.as_str().expect("manifest name").to_string())
+        .collect();
+    let mut executed: Vec<String> = Vec::new();
     for path in files {
         let v: Json = serde_json::from_str(&std::fs::read_to_string(&path).expect("vector read"))
             .expect("vector parse");
@@ -325,6 +374,7 @@ fn main() {
         }
         ran += 1;
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+        executed.push(name.clone());
         let vdir = dir.join(format!("v{ran}"));
         std::fs::create_dir_all(&vdir).expect("vector dir");
 
@@ -333,7 +383,7 @@ fn main() {
         if let Err(e) = roundtrip_inputs(&v["inputs"], &vdir, &mut nfiles, &mut nbytes) {
             fails.push(format!("roundtrip: {e}"));
         }
-        let cuts = match truncate_cuts(&v, &vdir) {
+        let cuts = match truncate_cuts(&v, &vdir, &mut durable) {
             Ok(n) => n,
             Err(e) => {
                 fails.push(format!("cuts: {e}"));
@@ -379,9 +429,33 @@ fn main() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
-    println!("storage lane: {ran} vector(s) executed on real files");
+    println!(
+        "storage lane: {ran} vector(s) executed on real files (sync_all={} rename={})",
+        durable.0, durable.1
+    );
     if red > 0 || ran == 0 {
         eprintln!("STORAGE LANE RED: {red} failing vector(s)");
+        std::process::exit(1);
+    }
+    // R6 invocation proof: a run in which either portable primitive
+    // never executed is red — flush and atomic replacement are part
+    // of the §13.2 cell, not decoration.
+    if durable.0 == 0 || durable.1 == 0 {
+        eprintln!(
+            "STORAGE LANE RED: flush/replacement never executed (sync_all={} rename={})",
+            durable.0, durable.1
+        );
+        std::process::exit(1);
+    }
+    // R5 manifest equality, both directions.
+    executed.sort();
+    if executed != required {
+        eprintln!(
+            "STORAGE LANE RED: executed set != coverage/lane-manifests.json storage list \
+             (executed {} vs required {})",
+            executed.len(),
+            required.len()
+        );
         std::process::exit(1);
     }
 }

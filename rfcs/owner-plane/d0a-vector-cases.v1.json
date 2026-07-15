@@ -452,7 +452,8 @@
               "case_kind": {
                 "enum": [
                   "fold",
-                  "admission-negative"
+                  "admission-negative",
+                  "evidence-lifecycle"
                 ]
               }
             }
@@ -2701,6 +2702,49 @@
               }
             },
             "$comment": "family 14: the umbrella RFC App C #2 offline confirmation — the run's result is recorded in spec §15 when performed"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "evidence-lifecycle"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "per_item",
+                      "arrival_is_semantic"
+                    ],
+                    "properties": {
+                      "per_item": {
+                        "$ref": "#/$defs/per_item_result"
+                      },
+                      "arrival_is_semantic": {
+                        "const": true,
+                        "$comment": "amendment #6 (review R7, the D-202 ruling): evidence-arrival order is this lane's SEMANTIC INPUT — an issued lease-stale is terminal where issued and later timely evidence revives nothing; per-replica divergence on the original op is ruled, convergence rides the re-proposed op. The listed deliveries share one declared arrival structure and must agree; no fresh-fold or generated-order convergence applies."
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
           }
         }
       ]

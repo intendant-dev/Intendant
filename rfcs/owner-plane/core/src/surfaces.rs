@@ -1,14 +1,18 @@
 //! §13.2 surface matrix — the family → Gate-A required-surface sets,
 //! pinned to the spec table and enforced over every minted vector.
 //!
-//! The rule: a vector's `surfaces` array is a NON-EMPTY subset of
-//! its family's R-set — a fixture never claims a lane its family
-//! does not require, and full-set coverage is the norm. Two
-//! deliberate subsets exist: family-3 sign-then-verify cases exclude
-//! `browser` (WebCrypto cannot inject signing randomness — the
-//! companion's in-schema guard), and family-14's
-//! `offline-confirmation` documentation fixture runs on `core`
-//! alone.
+//! The rule (hardened per the 2026-07-15 review's R5 — the earlier
+//! ANY-nonempty-SUBSET rule let a vector silently drop a required
+//! lane): a vector's `surfaces` array EQUALS its family's R-set
+//! exactly, minus exactly two named exceptions — family-3
+//! sign-then-verify cases exclude `browser` (WebCrypto cannot
+//! inject signing randomness — the companion's in-schema guard),
+//! and family-14's `offline-confirmation` documentation fixture
+//! runs on `core` alone. The derived per-lane manifests are minted
+//! to `coverage/lane-manifests.json` (drift-gated), and BOTH
+//! execution-lane drivers pin their run sets to it — a vector
+//! losing a surface, gaining one it must not, or disappearing
+//! changes the manifest and fails the gate.
 
 /// The §13.2 "Family × required surfaces" R-columns; `storage
 /// per-OS` expands to the three `storage-*` names.
@@ -28,6 +32,18 @@ pub fn family_surfaces(family: u8) -> &'static [&'static str] {
         14 => &["core", "storage-macos", "storage-linux", "storage-windows"],
         _ => &[],
     }
+}
+
+/// The EXACT required surface set for one vector (family R-set with
+/// the two named exceptions).
+pub fn required_surfaces(family: u8, case_kind: &str) -> Vec<&'static str> {
+    if family == 3 && case_kind == "sign-then-verify" {
+        return vec!["native-crypto"];
+    }
+    if family == 14 && case_kind == "offline-confirmation" {
+        return vec!["core"];
+    }
+    family_surfaces(family).to_vec()
 }
 
 #[cfg(test)]
@@ -82,18 +98,17 @@ mod tests {
         all.extend(crate::corpus_ctrl::corpus_ctrl());
         all.extend(crate::corpus_budget::corpus_budget());
         all.extend(crate::corpus_audit::corpus_audit());
-        assert_eq!(all.len(), 164, "the full vector inventory");
+        assert_eq!(all.len(), 165, "the full vector inventory");
         for v in &all {
-            let allowed = family_surfaces(v.family);
-            assert!(!v.surfaces.is_empty(), "{}: empty surfaces", v.name);
-            for s in &v.surfaces {
-                assert!(
-                    allowed.contains(&s.as_str()),
-                    "{} (family {}): surface {s:?} outside the §13.2 R-set {allowed:?}",
-                    v.name,
-                    v.family
-                );
-            }
+            let mut required = required_surfaces(v.family, &v.case_kind);
+            required.sort_unstable();
+            let mut got: Vec<&str> = v.surfaces.iter().map(String::as_str).collect();
+            got.sort_unstable();
+            assert_eq!(
+                got, required,
+                "{} (family {}, {}): surfaces must EQUAL the §13.2 requirement",
+                v.name, v.family, v.case_kind
+            );
         }
     }
 }

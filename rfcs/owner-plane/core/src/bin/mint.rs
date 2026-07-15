@@ -46,5 +46,12 @@ fn main() {
     let map_path = cov_dir.join("outcomes-map.json");
     std::fs::write(&map_path, owner_plane_core::coverage::outcomes_map_file())
         .expect("write outcomes map");
+    let manifests_path = map_path.with_file_name("lane-manifests.json");
+    std::fs::write(
+        &manifests_path,
+        owner_plane_core::coverage::lane_manifests_file(),
+    )
+    .expect("write lane manifests");
+    println!("minted {}", manifests_path.display());
     println!("minted {}", map_path.display());
 }

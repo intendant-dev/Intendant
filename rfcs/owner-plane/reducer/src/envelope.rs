@@ -448,7 +448,7 @@ mod tests {
         // 68 plus txn-internal-order, keeps-basis, and the two new
         // R3 arms (forged, unadmitted). Only the stmt basis-typing
         // and unheld-pends journal fixtures remain frame/aux-only.
-        assert_eq!(geneses, 77);
+        assert_eq!(geneses, 78);
     }
 
     /// Tampering any byte of the header breaks the signature; the

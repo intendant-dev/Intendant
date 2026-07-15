@@ -456,6 +456,12 @@ pub struct State {
     /// it; a later boundary naming a different variant there is
     /// `body-invariant`.
     fork_selected: BTreeMap<TenantCoord, [u8; 32]>,
+    /// D-202 evidence-history: operations whose `lease-stale` was
+    /// ISSUED — terminal where issued; later timely evidence never
+    /// revives them (convergence rides the writer's re-proposed op).
+    /// Like fork evidence, an issue is a fact about this replica's
+    /// evaluation history and persists on the real state.
+    stale_issued: std::collections::BTreeSet<[u8; 32]>,
 }
 
 /// A tenant chain coordinate: (zone, lineage, gen, seq).
@@ -2929,6 +2935,17 @@ impl State {
                 }
             }
             if grant.online_lease {
+                // D-202 stickiness: an issued `lease-stale` is
+                // terminal on this replica — re-evaluation under
+                // later-arriving timely evidence returns it
+                // unchanged (the re-proposed op is the convergence
+                // carrier).
+                if false && self.stale_issued.contains(&op.op_hash()) {
+                    return ok(Err(Verdict::Rejected(
+                        "lease-stale",
+                        "quarantine-reproposal",
+                    )));
+                }
                 let max_age = grant.max_age_ms.unwrap_or(0);
                 let windows = self.qualified_lease_windows(op, &held_cert, &grant, max_age);
                 if windows.is_empty() {
@@ -3418,6 +3435,22 @@ impl State {
                 }
                 continue;
             }
+            if node.get("stmt").is_some() && node.get("sig").is_some() {
+                self.hold_statement(&node)?;
+                continue;
+            }
+            return Err(Unimplemented(format!("aux {name}: unrecognized shape")));
+        }
+        Ok(())
+    }
+
+    /// Hold one signed statement — `{stmt, sig}` — as §4.7 evidence:
+    /// accept receipts and leases enter their registries; other
+    /// statement kinds are held inert. Shared by aux installation
+    /// and DELIVERED evidence (the D-202 lifecycle lane).
+    pub(crate) fn hold_statement(&mut self, node: &Node) -> Result<(), Unimplemented> {
+        {
+            let name = "statement";
             let (Some(stmt), Some(sig)) = (node.get("stmt"), node.get("sig")) else {
                 return Err(Unimplemented(format!("aux {name}: unrecognized shape")));
             };
@@ -4772,6 +4805,80 @@ fn canonical_fold(
     Ok((out, state))
 }
 
+/// The D-202 evidence-lifecycle runner: POSITIONAL evolution —
+/// arrival order is the lane's semantic INPUT (the owner's ruling
+/// sanctions per-replica divergence on the original operation;
+/// convergence rides the re-proposed one), so unlike the canonical
+/// fold this loop evolves one state across delivery positions.
+/// After every arrival the non-final set re-evaluates — INCLUDING
+/// revivable (quarantine-reproposal) rejections, so stickiness is
+/// demonstrated, never assumed: without the `stale_issued` registry
+/// a stale op would revive the moment timely evidence lands, and
+/// the lifecycle vector would fail.
+pub fn run_lifecycle(
+    items: &BTreeMap<String, Vec<u8>>,
+    aux: &BTreeMap<String, Vec<u8>>,
+    order: &[String],
+) -> Result<Run, Unimplemented> {
+    let mut state = State::default();
+    state.install_aux(aux)?;
+    let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
+    let mut hashes: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    let mut snapshots = Vec::new();
+    let mut arrived: Vec<String> = Vec::new();
+    for name in order {
+        if let Ok(op) = parse_op(&items[name]) {
+            hashes.insert(name.clone(), op.op_hash());
+        }
+        arrived.push(name.clone());
+        let v = classify(&mut state, &items[name])?;
+        verdicts.insert(name.clone(), v);
+        let rounds_cap = arrived.len() * 2 + 4;
+        let mut stabilized = false;
+        for _ in 0..rounds_cap {
+            let mut changed = false;
+            for n in &arrived {
+                match verdicts.get(n) {
+                    Some(Verdict::Admitted) => continue,
+                    // Revivable rejections re-evaluate (the sticky
+                    // registry is what keeps an issued stale stale);
+                    // permanent ones are final.
+                    Some(Verdict::Rejected(_, d)) if *d != "quarantine-reproposal" => continue,
+                    _ => {}
+                }
+                let v = classify(&mut state, &items[n])?;
+                if verdicts.get(n) != Some(&v) {
+                    changed = true;
+                    verdicts.insert(n.clone(), v);
+                }
+            }
+            if !changed {
+                stabilized = true;
+                break;
+            }
+        }
+        if !stabilized {
+            return Err(Unimplemented(
+                "lifecycle evaluation did not stabilize within the round cap".into(),
+            ));
+        }
+        let derived = state.derived_tenant_verdicts()?;
+        for (n, h) in &hashes {
+            if let Some(v) = derived.get(h) {
+                verdicts.insert(n.clone(), *v);
+            }
+            if let Some(v) = state.ctrl_overlay.get(h) {
+                verdicts.insert(n.clone(), *v);
+            }
+        }
+        snapshots.push(verdicts.clone());
+    }
+    Ok(Run {
+        final_verdicts: verdicts,
+        snapshots,
+    })
+}
+
 /// Classify one operation against the state — the §7.2/§10.2
 /// arm-indexed pipeline: parse → arm → sig → body → replay →
 /// precedence/placement → state, with the D-112 transition-last
@@ -4786,22 +4893,47 @@ fn canonical_fold(
 pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimplemented> {
     let op = match parse_op(bytes) {
         Ok(op) => op,
-        Err(crate::envelope::OpError::Parse(e)) => {
-            use crate::cbor::DecodeError as D;
-            let outcome = match e {
-                D::Depth => "depth",
-                D::NonCanonical | D::UintRange => "non-canonical",
-                D::Malformed | D::TrailingBytes => "malformed",
-            };
-            return Ok(Verdict::Rejected(outcome, "reject-permanent"));
-        }
-        Err(crate::envelope::OpError::Version) => {
-            return Ok(Verdict::Rejected("unknown-version", "reject-permanent"));
-        }
-        Err(crate::envelope::OpError::Shape(_)) => {
-            return Ok(Verdict::Rejected("malformed", "reject-permanent"));
+        Err(err) => {
+            // Delivered EVIDENCE (§4.7): a signed statement arriving
+            // on the wire — `{stmt, sig}` exactly — enters the held
+            // context like its aux twin (the D-202 lifecycle lane
+            // delivers receipts as events; the review's R7 asked for
+            // exactly this executable form).
+            if let Ok(node) = crate::cbor::decode(bytes) {
+                if keys_are_map(&node, &["stmt", "sig"]) {
+                    state.hold_statement(&node)?;
+                    return Ok(Verdict::Admitted);
+                }
+            }
+            match err {
+                crate::envelope::OpError::Parse(e) => {
+                    use crate::cbor::DecodeError as D;
+                    let outcome = match e {
+                        D::Depth => "depth",
+                        D::NonCanonical | D::UintRange => "non-canonical",
+                        D::Malformed | D::TrailingBytes => "malformed",
+                    };
+                    return Ok(Verdict::Rejected(outcome, "reject-permanent"));
+                }
+                crate::envelope::OpError::Version => {
+                    return Ok(Verdict::Rejected("unknown-version", "reject-permanent"));
+                }
+                crate::envelope::OpError::Shape(_) => {
+                    return Ok(Verdict::Rejected("malformed", "reject-permanent"));
+                }
+            }
         }
     };
+
+    // D-202 stickiness: an issued `lease-stale` is TERMINAL on this
+    // replica — the memoized verdict answers every re-evaluation
+    // before any pipeline stage runs (were the pipeline re-entered,
+    // the re-proposal now holding the freed position would read as
+    // fork evidence; the issue decided this op for good, and the
+    // re-proposed op is the convergence carrier).
+    if state.stale_issued.contains(&op.op_hash()) {
+        return Ok(Verdict::Rejected("lease-stale", "quarantine-reproposal"));
+    }
 
     if op.header.operation_type.starts_with("c.") {
         // arm + sig (genesis is self-contained — admit_genesis
@@ -4866,13 +4998,18 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
         }
         Err(v) => {
             // Rejected: the staged state is discarded — no failed
-            // operation exerts precedence (D-112). Fork evidence is
-            // the one persistent fact: the preamble's chain stage
-            // fired only after the validity stages passed.
+            // operation exerts precedence (D-112). Two evaluation-
+            // history facts persist on the real state: fork evidence
+            // (the preamble's chain stage fired only after the
+            // validity stages passed) and a D-202 lease-stale ISSUE
+            // (terminal where issued).
             if v == Verdict::Rejected("fork", "freeze-writer")
                 && !op.header.operation_type.starts_with("c.")
             {
                 state.register_tenant_fork(&op);
+            }
+            if v == Verdict::Rejected("lease-stale", "quarantine-reproposal") {
+                state.stale_issued.insert(op.op_hash());
             }
             v
         }

@@ -117,6 +117,26 @@ function loadManifest() {
       throw new Error(`no browser-annotated family-${fam} vectors — annotation filter broken?`);
     }
   }
+  // The R5 manifest pin: the served set must equal the committed
+  // lane manifest exactly, both directions — a vector losing its
+  // browser annotation (or disappearing) turns this lane red
+  // instead of silently shrinking the run. Negative-control corpora
+  // (LANE_VECTORS_DIR) skip the pin: their point is deliberate
+  // divergence from the committed corpus.
+  if (!process.env.LANE_VECTORS_DIR) {
+    const committed = JSON.parse(
+      fs.readFileSync(path.join(LANE_DIR, '..', 'coverage', 'lane-manifests.json'), 'utf8'),
+    ).browser;
+    const served = entries.map((e) => e.file);
+    const missing = committed.filter((n) => !served.includes(n));
+    const extra = served.filter((n) => !committed.includes(n));
+    if (missing.length || extra.length) {
+      throw new Error(
+        `browser run set != coverage/lane-manifests.json (missing: ${missing.join(', ') || 'none'}; `
+        + `extra: ${extra.join(', ') || 'none'})`,
+      );
+    }
+  }
   return entries;
 }
 
