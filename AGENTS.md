@@ -71,6 +71,15 @@ settings, and overriding them opts your build out of the machine's
 RAM-protecting compile ceiling (the 2026-07-10 OOM-spiral class).
 Permitted only when deliberately diagnosing the wrapper chain itself.
 
+**Avoid needless final links** — they are the expensive step (a debug
+`intendant` link peaks ~2GiB linker RSS; concurrent final links are what
+swap-storm the box, and the governor serializes them machine-wide, so
+extra links also queue everyone else's): `cargo check` while iterating;
+when you need binaries, name them — `cargo build --bin intendant --bin
+intendant-runtime` covers running the controller (`intendant-connect`
+matters only for Connect work) — and save the all-binaries `cargo build`
+for validation that genuinely needs all three.
+
 **WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build`. wasm-pack is **version-pinned** by `.wasm-pack-version` (releases emit byte-different artifacts, and the artifacts are committed — cross-version rebuilds churn them and conflict concurrent landings): build.rs skips the rebuild under any other version, and the setup scripts install the pin. Manual fallback only if the auto-rebuild fails: `bash scripts/build-wasm.sh`
 (the canonical builder — it carries the registry-path remap that makes
 artifact bytes account-independent; the CI drift gate rebuilds through the
