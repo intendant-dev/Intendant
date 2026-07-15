@@ -849,7 +849,7 @@ impl Agent {
         let call_start = session.read_offset;
         let marker_bytes = marker.as_bytes();
         let mut scanned_to = call_start;
-        let mut marker_found = false;
+        let mut marker_found;
 
         loop {
             {
