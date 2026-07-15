@@ -553,8 +553,7 @@ impl Indexer {
                         ) {
                             Ok(Some((shard, new_main_cursor))) => {
                                 stats.parsed += 1;
-                                let mut cursors =
-                                    Vec::with_capacity(1 + transcript_agents.len());
+                                let mut cursors = Vec::with_capacity(1 + transcript_agents.len());
                                 cursors.push(new_main_cursor);
                                 cursors.extend(transcript_agents.iter().map(|path| {
                                     cursor_by_path

@@ -527,9 +527,7 @@ pub(crate) enum DashboardControlSessionMutation {
 ///   semantics): a grant expiring between two events is caught even though
 ///   the state snapshot never changed.
 #[derive(Clone, Debug, Default)]
-pub struct OpeningAuthorityMemo(
-    Arc<std::sync::Mutex<Option<OpeningAuthorityMemoEntry>>>,
-);
+pub struct OpeningAuthorityMemo(Arc<std::sync::Mutex<Option<OpeningAuthorityMemoEntry>>>);
 
 #[derive(Debug)]
 struct OpeningAuthorityMemoEntry {
@@ -566,10 +564,7 @@ impl OpeningAuthorityMemo {
 
     #[cfg(test)]
     fn is_primed(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 }
 
@@ -690,10 +685,7 @@ impl DashboardControlGrant {
                 if records_current {
                     // Everything except the expiry instant validated true
                     // for this snapshot; hits re-run only the expiry check.
-                    authority_memo.store(
-                        Arc::clone(&current),
-                        current_grant.expires_at_unix_ms,
-                    );
+                    authority_memo.store(Arc::clone(&current), current_grant.expires_at_unix_ms);
                 }
                 // `records_current` covers the grant-status half of
                 // `is_active_at`; the expiry half stays live.

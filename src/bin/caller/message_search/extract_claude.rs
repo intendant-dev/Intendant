@@ -167,8 +167,7 @@ pub(crate) fn fold_claude_main_append(
     let Some(cursor) = SourceCursor::capture(main_path, consumed) else {
         return Ok(None);
     };
-    let mut records =
-        Vec::with_capacity(prior.records.len().saturating_add(suffix_records.len()));
+    let mut records = Vec::with_capacity(prior.records.len().saturating_add(suffix_records.len()));
     records.extend_from_slice(&prior.records[..main_block_end]);
     records.append(&mut suffix_records);
     records.extend_from_slice(&prior.records[main_block_end..]);
@@ -852,7 +851,10 @@ mod tests {
 
         // Append two records to the MAIN transcript only.
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&main).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&main)
+            .unwrap();
         writeln!(
             file,
             "{}",

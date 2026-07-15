@@ -653,7 +653,10 @@ impl ClaudeRowAccumulator {
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
-        self.created_at = self.created_at.take().or_else(|| value_str(&obj, "timestamp"));
+        self.created_at = self
+            .created_at
+            .take()
+            .or_else(|| value_str(&obj, "timestamp"));
         self.updated_at = value_str(&obj, "timestamp").or(self.updated_at.take());
         if let Some(value) = value_str(&obj, "cwd") {
             if self.session_cwd.is_none() {
@@ -739,8 +742,10 @@ impl ClaudeRowAccumulator {
         if current_len < self.consumed_len {
             return false;
         }
-        let identity_ok = match (self.identity, crate::platform::FileIdentity::from_path(path).ok())
-        {
+        let identity_ok = match (
+            self.identity,
+            crate::platform::FileIdentity::from_path(path).ok(),
+        ) {
             (Some(saved), Some(current)) => {
                 saved.is_reliable() && current.is_reliable() && saved == current
             }
@@ -749,16 +754,14 @@ impl ClaudeRowAccumulator {
         if !identity_ok {
             return false;
         }
-        crate::message_search::cursor::prefix_hash16_bytes(path, self.prefix_hash_bytes)
-            .as_deref()
+        crate::message_search::cursor::prefix_hash16_bytes(path, self.prefix_hash_bytes).as_deref()
             == Some(self.prefix_hash16.as_str())
     }
 
     fn render(self, path: &Path, session_id: String) -> serde_json::Value {
         let effective_cwd = self.cwd.or_else(|| self.session_cwd.clone());
-        let project_root = derive_project_root_from_cwd(
-            self.session_cwd.as_deref().or(effective_cwd.as_deref()),
-        );
+        let project_root =
+            derive_project_root_from_cwd(self.session_cwd.as_deref().or(effective_cwd.as_deref()));
         let mut session = external_session_json(
             "claude-code",
             "Claude Code",
@@ -2596,7 +2599,11 @@ mod tests {
     #[test]
     fn claude_row_fold_resumes_on_append_instead_of_reparsing() {
         let home = tempfile::tempdir().unwrap();
-        let project_dir = home.path().join(".claude").join("projects").join("-tmp-inc");
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-tmp-inc");
         std::fs::create_dir_all(&project_dir).unwrap();
         let path = project_dir.join("fold-resume-abc.jsonl");
 
@@ -2627,7 +2634,10 @@ mod tests {
         });
         {
             use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(file, "{second}").unwrap();
         }
         let row = claude_session_list_row_from_file(&path).unwrap();
@@ -2641,7 +2651,11 @@ mod tests {
     #[test]
     fn claude_row_fold_matches_a_full_parse_and_detects_rewrites() {
         let home = tempfile::tempdir().unwrap();
-        let project_dir = home.path().join(".claude").join("projects").join("-tmp-par");
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-tmp-par");
         std::fs::create_dir_all(&project_dir).unwrap();
         let incremental = project_dir.join("fold-parity-abc.jsonl");
         let fresh = project_dir.join("fold-parity-fresh.jsonl");

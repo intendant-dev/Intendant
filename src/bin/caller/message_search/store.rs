@@ -175,7 +175,8 @@ impl Store {
     ) -> std::io::Result<PublishOutcome> {
         let _lock = WriterLock::acquire(&self.root)?;
         let mut manifest = self.read_manifest();
-        let outcome = self.apply_publish(&mut manifest, session_key, shard, cursors, source_gone)?;
+        let outcome =
+            self.apply_publish(&mut manifest, session_key, shard, cursors, source_gone)?;
         if matches!(outcome, PublishOutcome::Published) {
             self.write_published_manifest(&mut manifest)?;
         }

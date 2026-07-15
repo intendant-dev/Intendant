@@ -1780,10 +1780,7 @@ pub(crate) fn fleet_access_origin_allowed(
                 crate::peer::card::TransportSpec::IntendantWs { url } => Some(url.as_str()),
                 _ => None,
             });
-            for candidate in [ws_url, handle.browser_tcp_via_url()]
-                .into_iter()
-                .flatten()
-            {
+            for candidate in [ws_url, handle.browser_tcp_via_url()].into_iter().flatten() {
                 if normalized_origin(candidate).as_deref() == Some(&normalized) {
                     return true;
                 }
