@@ -414,8 +414,23 @@ body.context-focus-active {
   display: block;
 }
 
-/* Stop button — interrupt the current agent turn. Lives in the Activity
-   toolbar and is shown only while a turn is in flight. */
+/* ── Global Task Bar ──
+   Base layout for the composer dock: html.ui-v2 .global-task-bar
+   (ui2-chrome.css) restyles the floating card but deliberately re-declares
+   no display/gap/align — the dock's row layout (flex textarea, content-sized
+   Direct toggle) lives here. */
+.global-task-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight);
+  flex-shrink: 0;
+}
 .task-target-chip {
   display: inline-flex;
   align-items: center;
