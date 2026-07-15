@@ -518,6 +518,9 @@ fn normalize_permission_mode(mode: &str) -> Option<String> {
 struct CcLineOutcome {
     events: Vec<AgentEvent>,
     outbound: Vec<String>,
+    protocol_findings: Vec<super::protocol_watch::ProtocolFinding>,
+    protocol_observed: bool,
+    reported_version: Option<String>,
 }
 
 impl CcLineOutcome {
@@ -801,9 +804,16 @@ impl CcReader {
 
     fn process_line(&mut self, line: &str) -> CcLineOutcome {
         let mut out = CcLineOutcome::default();
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
-            return out;
+        let msg = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(msg) => msg,
+            Err(_) => {
+                out.protocol_findings
+                    .push(super::protocol_watch::ProtocolFinding::malformed());
+                return out;
+            }
         };
+        out.protocol_findings
+            .extend(super::protocol_watch::claude_findings(&msg));
         self.capture_session_id(&msg, &mut out);
         let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
@@ -1030,7 +1040,10 @@ impl CcReader {
 
     fn handle_system(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         match msg.get("subtype").and_then(|s| s.as_str()) {
-            Some("init") => {}
+            Some("init") => {
+                out.protocol_observed = true;
+                out.reported_version = super::protocol_watch::claude_reported_version(msg);
+            }
             // General status channel (2.1.201): compaction progress and
             // permission-mode echoes arrive here.
             Some("status") => {
@@ -1662,6 +1675,7 @@ impl CcReader {
             .get("subtype")
             .and_then(|s| s.as_str())
             .unwrap_or("success");
+        let safe_subtype = super::protocol_watch::claude_result_identifier(subtype);
         let is_error = msg
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -1689,8 +1703,8 @@ impl CcReader {
                     message: message
                         .clone()
                         .filter(|m| !m.trim().is_empty())
-                        .unwrap_or_else(|| format!("Claude Code turn failed: {subtype}")),
-                    code: Some(subtype.to_string()),
+                        .unwrap_or_else(|| format!("Claude Code turn failed: {safe_subtype}")),
+                    code: Some(safe_subtype),
                     details: None,
                     will_retry: false,
                     likely_generation_starvation: false,
@@ -1763,9 +1777,12 @@ impl CcReader {
             // doesn't understand (a future permission-shaped subtype must
             // not slip through as an implicit allow). The error response
             // unblocks the CLI's pending promise.
+            let safe_subtype = super::protocol_watch::redact_protocol_identifier(subtype);
             out.log(
                 "warn",
-                format!("Rejecting unsupported Claude Code control request subtype '{subtype}'"),
+                format!(
+                    "Rejecting unsupported Claude Code control request subtype '{safe_subtype}'"
+                ),
             );
             let response = CcControlResponse {
                 msg_type: "control_response".into(),
@@ -1774,7 +1791,7 @@ impl CcReader {
                     request_id: cc_request_id,
                     response: None,
                     error: Some(format!(
-                        "control request subtype '{subtype}' is not supported by the Intendant supervisor"
+                        "control request subtype '{safe_subtype}' is not supported by the Intendant supervisor"
                     )),
                 },
             };
@@ -1880,6 +1897,7 @@ async fn reader_task(
     event_tx: mpsc::UnboundedSender<AgentEvent>,
     writer: SharedWriter,
     mut reader_state: CcReader,
+    protocol_watch: Option<super::protocol_watch::ProtocolWatchHandle>,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -1888,6 +1906,9 @@ async fn reader_task(
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
+                if let Some(watch) = protocol_watch.as_ref() {
+                    watch.flush_async().await;
+                }
                 let mut cleanup = CcLineOutcome::default();
                 reader_state.close_open_task_children(&mut cleanup);
                 for event in cleanup.events {
@@ -1900,6 +1921,9 @@ async fn reader_task(
                 break;
             }
             Err(e) => {
+                if let Some(watch) = protocol_watch.as_ref() {
+                    watch.flush_async().await;
+                }
                 let mut cleanup = CcLineOutcome::default();
                 reader_state.close_open_task_children(&mut cleanup);
                 for event in cleanup.events {
@@ -1914,6 +1938,17 @@ async fn reader_task(
         };
 
         let outcome = reader_state.process_line(&line);
+        if let Some(watch) = protocol_watch.as_ref() {
+            for message in watch.observe_all(outcome.protocol_findings) {
+                let _ = event_tx.send(AgentEvent::Log {
+                    level: "warn".to_string(),
+                    message,
+                });
+            }
+            if outcome.protocol_observed {
+                watch.mark_observed(outcome.reported_version);
+            }
+        }
         for event in outcome.events {
             let _ = event_tx.send(event);
         }
@@ -1955,6 +1990,7 @@ pub struct ClaudeCodeAgent {
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     pending_approvals: PendingApprovals,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    protocol_watch: Option<super::protocol_watch::ProtocolWatchHandle>,
     /// Backend session id to resume via `--resume`. Claude Code keeps the
     /// same id across resumed processes, so this doubles as the known
     /// native id until the stream confirms it.
@@ -2003,6 +2039,7 @@ impl ClaudeCodeAgent {
             event_tx: None,
             pending_approvals: Arc::new(StdMutex::new(HashMap::new())),
             reader_handle: None,
+            protocol_watch: None,
             resume_session: None,
             fork_resume: false,
             pending_goal_notice: None,
@@ -2246,6 +2283,8 @@ impl ExternalAgent for ClaudeCodeAgent {
         self.fork_resume = config.fork_resume && self.resume_session.is_some();
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
+        let protocol_watch = config.protocol_watch;
+        self.protocol_watch = protocol_watch.clone();
         // In fork mode the resume id is the PARENT thread, not this
         // session's identity — seed nothing and let the stream announce the
         // forked child's own id.
@@ -2379,7 +2418,13 @@ impl ExternalAgent for ClaudeCodeAgent {
             Arc::clone(&self.pending_approvals),
             web_port.is_some(),
         );
-        let handle = tokio::spawn(reader_task(stdout, event_tx, writer, reader_state));
+        let handle = tokio::spawn(reader_task(
+            stdout,
+            event_tx,
+            writer,
+            reader_state,
+            protocol_watch,
+        ));
         self.reader_handle = Some(handle);
 
         // No handshake needed — Claude Code starts immediately.
@@ -2601,6 +2646,10 @@ impl ExternalAgent for ClaudeCodeAgent {
     async fn shutdown(&mut self) -> Result<(), CallerError> {
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(watch) = self.protocol_watch.take() {
+            watch.flush_async().await;
         }
 
         if let Some(ref mut child) = self.child {
@@ -4179,9 +4228,9 @@ mod tests {
     }
 
     #[test]
-    fn reader_rejects_unknown_control_request_subtypes() {
-        // Fail closed: an unrecognized control request must never be
-        // auto-approved (it could be a future permission-shaped subtype).
+    fn reader_rejects_known_but_unsupported_control_request_subtypes() {
+        // Fail closed: a known protocol request without an exact Intendant
+        // response implementation must never be auto-approved.
         let mut reader = test_reader();
         let out = reader.process_line(
             r#"{"type":"control_request","request_id":"cc-9","request":{"subtype":"hook_callback","data":{}},"session_id":"s1"}"#,
@@ -4194,11 +4243,69 @@ mod tests {
         assert!(response["response"]["error"]
             .as_str()
             .unwrap()
+            .contains("<unknown:"));
+        assert!(!response["response"]["error"]
+            .as_str()
+            .unwrap()
             .contains("hook_callback"));
         assert!(out
             .events
             .iter()
             .any(|e| matches!(e, AgentEvent::Log { level, .. } if level == "warn")));
+        assert!(out.protocol_findings.iter().any(|finding| {
+            finding.surface
+                == crate::external_agent::protocol_watch::ProtocolSurface::ClaudeUnsupportedControlRequest
+                && finding.identifier.starts_with("<unknown:")
+        }));
+    }
+
+    #[test]
+    fn reader_reports_protocol_handshake_and_redacted_shape_drift() {
+        let mut reader = test_reader();
+        let init = reader.process_line(
+            r#"{"type":"system","subtype":"init","claude_code_version":"2.1.207","model":"m","tools":[],"mcp_servers":[],"session_id":"s1"}"#,
+        );
+        assert!(init.protocol_observed);
+        assert_eq!(init.reported_version.as_deref(), Some("2.1.207"));
+        assert!(init.protocol_findings.is_empty());
+
+        let drift = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"future_block","text":"SENTINEL_MESSAGE_SECRET"}]},"session_id":"s1"}"#,
+        );
+        assert!(drift.protocol_findings.iter().any(|finding| {
+            finding.surface
+                == crate::external_agent::protocol_watch::ProtocolSurface::ClaudeContentBlock
+                && finding.identifier.starts_with("<unknown:")
+        }));
+        let serialized = serde_json::to_string(&drift.protocol_findings).unwrap();
+        assert!(!serialized.contains("SENTINEL_MESSAGE_SECRET"));
+
+        let malformed = reader.process_line("SENTINEL_MALFORMED_SECRET {");
+        assert_eq!(malformed.protocol_findings.len(), 1);
+        assert_eq!(
+            malformed.protocol_findings[0].surface,
+            crate::external_agent::protocol_watch::ProtocolSurface::MalformedMessage
+        );
+        assert!(!serde_json::to_string(&malformed.protocol_findings)
+            .unwrap()
+            .contains("SENTINEL_MALFORMED_SECRET"));
+    }
+
+    #[test]
+    fn unknown_control_subtype_cannot_escape_into_logs_or_response() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"control_request","request_id":"cc-10","request":{"subtype":"SECRET value with spaces","data":{}},"session_id":"s1"}"#,
+        );
+        let mut rendered = out.outbound.join("\n");
+        for event in out.events {
+            if let AgentEvent::Log { message, .. } = event {
+                rendered.push_str(&message);
+            }
+        }
+        rendered.push_str(&serde_json::to_string(&out.protocol_findings).unwrap());
+        assert!(!rendered.contains("SECRET value with spaces"));
+        assert!(rendered.contains("<unknown:"));
     }
 
     #[test]

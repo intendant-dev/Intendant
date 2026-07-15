@@ -737,8 +737,10 @@ pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String 
 }
 
 /// Availability of the external-agent backends (Codex, Claude Code):
-/// the configured command, whether it resolves to an executable, and
-/// when this daemon last ran a session with it. Deliberately independent
+/// the configured command, whether it resolves to an executable, when this
+/// daemon last ran a session with it, and passive protocol-compatibility
+/// evidence for that exact artifact. The status path remains stat/read-only
+/// and never launches either CLI. Deliberately independent
 /// of provider fueling — external agents bring their own credentials, so
 /// the dashboard pairs this with the `fueled` flag instead of letting the
 /// first-run nudge claim an unfueled daemon can't do anything. `home`

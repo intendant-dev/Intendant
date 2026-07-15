@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
+pub(crate) mod protocol_watch;
 pub(crate) mod transcript_text;
 
 /// Backend-neutral side-conversation contract: what a `/side`/`/btw` child
@@ -730,6 +731,9 @@ pub struct BackendAvailability {
     /// the platform stores credentials out of stat's reach (Claude Code
     /// keeps them in the keychain on macOS), so absence proves nothing.
     pub local_login: Option<bool>,
+    /// Passive, zero-additional-quota compatibility evidence for the exact
+    /// configured executable artifact and current adapter contract.
+    pub compatibility: protocol_watch::PassiveCompatibilityStatus,
 }
 
 fn codex_local_login(home: &Path) -> Option<bool> {
@@ -765,6 +769,7 @@ pub fn backend_availability(
     agent_config: &crate::project::ExternalAgentConfig,
     home: &Path,
 ) -> Vec<BackendAvailability> {
+    let state_root = crate::platform::intendant_home_in(home);
     [AgentBackend::Codex, AgentBackend::ClaudeCode]
         .into_iter()
         .map(|backend| {
@@ -796,6 +801,24 @@ pub fn backend_availability(
                 AgentBackend::Codex => codex_local_login(home),
                 AgentBackend::ClaudeCode => claude_code_local_login(home),
             };
+            let (compatibility_command, compatibility_profile) = match backend {
+                AgentBackend::Codex => {
+                    let managed = crate::project::codex_managed_context_enabled(
+                        &agent_config.codex.managed_context,
+                    );
+                    (
+                        agent_config.codex.effective_command(managed),
+                        if managed { "managed" } else { "vanilla" },
+                    )
+                }
+                AgentBackend::ClaudeCode => (command.clone(), "default"),
+            };
+            let compatibility = protocol_watch::passive_status_in(
+                &state_root,
+                &backend,
+                compatibility_profile,
+                &compatibility_command,
+            );
             BackendAvailability {
                 backend,
                 command,
@@ -803,6 +826,7 @@ pub fn backend_availability(
                 last_used_secs,
                 leased,
                 local_login,
+                compatibility,
             }
         })
         .collect()
@@ -826,6 +850,7 @@ pub fn backend_availability_json(
                     "last_used_secs": info.last_used_secs,
                     "leased": info.leased,
                     "local_login": info.local_login,
+                    "compatibility": info.compatibility,
                 })
             })
             .collect(),
@@ -1114,6 +1139,10 @@ pub struct AgentConfig {
     /// Codex state directory to use for this session's app-server process.
     /// Codex-only; other backends ignore.
     pub codex_home: Option<PathBuf>,
+    /// Passive protocol compatibility watch. It records only redacted wire
+    /// discriminants observed inside this user-started session and never
+    /// launches a probe or contacts a provider.
+    pub protocol_watch: Option<protocol_watch::ProtocolWatchHandle>,
 }
 
 /// Handle to a conversation thread within an external agent.
@@ -1725,7 +1754,10 @@ mod tests {
     #[test]
     fn backend_availability_json_uses_picker_ids() {
         let home = tempfile::tempdir().unwrap();
-        let config = crate::project::ExternalAgentConfig::default();
+        let mut config = crate::project::ExternalAgentConfig::default();
+        config.codex.command = "intendant-test-absent-codex".to_string();
+        config.codex.managed_command = None;
+        config.claude_code.command = "intendant-test-absent-claude".to_string();
         let value = backend_availability_json(&config, home.path());
         let entries = value.as_array().unwrap();
         let ids: Vec<&str> = entries
@@ -1747,6 +1779,21 @@ mod tests {
             assert!(
                 entry.get("local_login").is_some(),
                 "local_login must be present (bool or null)"
+            );
+            let compatibility = entry
+                .get("compatibility")
+                .and_then(serde_json::Value::as_object)
+                .expect("passive compatibility status");
+            assert_eq!(
+                compatibility.get("coverage").and_then(|v| v.as_str()),
+                Some("passive")
+            );
+            assert!(compatibility
+                .get("manifest_digest")
+                .is_some_and(serde_json::Value::is_string));
+            assert_eq!(
+                compatibility.get("state").and_then(|v| v.as_str()),
+                Some("unobserved")
             );
         }
     }

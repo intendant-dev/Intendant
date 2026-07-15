@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -101,6 +101,68 @@ const CODEX_DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
 const CODEX_NEVER_APPROVAL_POLICY: &str = "never";
 const CODEX_INHERIT_MCP_SERVERS_ENV: &str = "INTENDANT_CODEX_INHERIT_MCP_SERVERS";
 
+pub(crate) type SharedCodexWriter = Arc<Mutex<BufWriter<ChildStdin>>>;
+
+pub(crate) async fn write_codex_line<W>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    line: &str,
+) -> Result<(), CallerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut writer = writer.lock().await;
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+pub(crate) async fn send_codex_error_response<W>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    id: u64,
+    code: i64,
+    message: &str,
+) -> Result<(), CallerError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = JsonRpcErrorResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        error: JsonRpcResponseError {
+            code,
+            message: message.to_string(),
+        },
+    };
+    write_codex_line(writer, &serde_json::to_string(&response)?).await
+}
+
+pub(crate) async fn reject_unsupported_server_request<W>(
+    writer: &Arc<Mutex<BufWriter<W>>>,
+    event_tx: &mpsc::UnboundedSender<AgentEvent>,
+    method: &str,
+    id: u64,
+) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    if super::protocol_watch::codex_server_request_is_supported(method) {
+        return false;
+    }
+    let result =
+        send_codex_error_response(writer, id, -32601, "Unsupported server request method").await;
+    let message = if result.is_ok() {
+        "Rejected unsupported Codex protocol request"
+    } else {
+        "Failed to reject unsupported Codex protocol request"
+    };
+    let _ = event_tx.send(AgentEvent::Log {
+        level: "warn".to_string(),
+        message: message.to_string(),
+    });
+    true
+}
+
 pub(super) use super::{normalize_goal_status, parse_goal_token_budget, validate_goal_objective};
 
 pub struct CodexAgent {
@@ -153,12 +215,13 @@ pub struct CodexAgent {
     context_seen_request_ids: HashSet<String>,
     context_trace_fingerprint: Option<CodexTraceFingerprint>,
     child: Option<Child>,
-    writer: Option<BufWriter<ChildStdin>>,
+    writer: Option<SharedCodexWriter>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     next_id: AtomicU64,
     pending_requests: PendingRequests,
     pending_approvals: PendingApprovals,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    protocol_watch: Option<super::protocol_watch::ProtocolWatchHandle>,
     /// Thread id from the most recent `thread/start`. Used by `interrupt_turn`
     /// to build the `turn/interrupt` params without needing a thread handle.
     active_thread_id: Arc<Mutex<Option<String>>>,
@@ -661,6 +724,7 @@ impl CodexAgent {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
+            protocol_watch: None,
             active_thread_id: Arc::new(Mutex::new(None)),
             active_turn_id: Arc::new(Mutex::new(None)),
             active_turns: Arc::new(Mutex::new(HashMap::new())),
@@ -707,16 +771,19 @@ impl CodexAgent {
         let line = serde_json::to_string(&request)?;
         let (tx, rx) = oneshot::channel();
 
-        if self.writer.is_none() {
-            return Err(CallerError::ExternalAgent("Not initialized".into()));
-        }
+        let writer = self
+            .writer
+            .clone()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
         self.pending_requests.lock().await.insert(id, tx);
         let (result, remove_pending) = {
-            let writer = self.writer.as_mut().expect("writer checked above");
             let request_fut = async {
-                writer.write_all(line.as_bytes()).await?;
-                writer.write_all(b"\n").await?;
-                writer.flush().await?;
+                {
+                    let mut writer = writer.lock().await;
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.write_all(b"\n").await?;
+                    writer.flush().await?;
+                }
                 let result = rx
                     .await
                     .map_err(|_| CallerError::ExternalAgent("Request channel closed".into()))?;
@@ -757,8 +824,9 @@ impl CodexAgent {
 
         let writer = self
             .writer
-            .as_mut()
+            .clone()
             .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut writer = writer.lock().await;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -781,12 +849,26 @@ impl CodexAgent {
 
         let writer = self
             .writer
-            .as_mut()
+            .clone()
             .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        let mut writer = writer.lock().await;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
+    }
+
+    async fn send_error_response(
+        &mut self,
+        id: u64,
+        code: i64,
+        message: &str,
+    ) -> Result<(), CallerError> {
+        let writer = self
+            .writer
+            .clone()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
+        send_codex_error_response(&writer, id, code, message).await
     }
 
     fn capture_turn_descendant_baseline(&mut self) {
@@ -1134,6 +1216,8 @@ impl ExternalAgent for CodexAgent {
         self.resume_session = config.resume_session;
         self.codex_home = config.codex_home;
         self.working_dir = Some(config.working_dir.clone());
+        let protocol_watch = config.protocol_watch;
+        self.protocol_watch = protocol_watch.clone();
 
         // The Intendant MCP server is wired exclusively via per-process
         // `-c mcp_servers.intendant.{type,url}` overrides (see
@@ -1197,7 +1281,8 @@ impl ExternalAgent for CodexAgent {
             super::register_child_process(pid);
         }
         self.child = Some(child);
-        self.writer = Some(BufWriter::new(stdin));
+        let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        self.writer = Some(Arc::clone(&writer));
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_tx = Some(event_tx.clone());
@@ -1228,6 +1313,8 @@ impl ExternalAgent for CodexAgent {
             latest_token_usage,
             context_pressure_floor,
             model,
+            protocol_watch.clone(),
+            writer,
         ));
         self.reader_handle = Some(handle);
 
@@ -1251,8 +1338,8 @@ impl ExternalAgent for CodexAgent {
         )
         .await;
 
-        match result {
-            Ok(Ok(_)) => {}
+        let initialize_result = match result {
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 return Err(CallerError::ExternalAgent(format!(
                     "initialize request failed: {}",
@@ -1264,6 +1351,11 @@ impl ExternalAgent for CodexAgent {
                     "initialize request timed out ({CODEX_INITIALIZE_TIMEOUT_SECS}s)"
                 )));
             }
+        };
+        if let Some(watch) = protocol_watch.as_ref() {
+            watch.mark_observed(super::protocol_watch::codex_reported_version(
+                &initialize_result,
+            ));
         }
 
         // Send initialized notification
@@ -1528,6 +1620,16 @@ impl ExternalAgent for CodexAgent {
                     request_id
                 ))
             })?;
+
+        if !super::protocol_watch::codex_server_request_is_supported(&pending.method) {
+            return self
+                .send_error_response(
+                    pending.jsonrpc_id,
+                    -32601,
+                    "Unsupported server request method",
+                )
+                .await;
+        }
 
         // MCP tool-call / elicitation requests use the
         // {"action": "accept"/"decline"} shape. Permissions requests use a
@@ -1899,6 +2001,10 @@ impl ExternalAgent for CodexAgent {
         // Abort reader task
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(watch) = self.protocol_watch.take() {
+            watch.flush_async().await;
         }
 
         // Kill child process
@@ -1980,6 +2086,32 @@ impl Drop for CodexAgent {
 mod tests {
     use super::*;
     use crate::external_agent::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
+
+    #[tokio::test]
+    async fn unsupported_server_request_error_is_written_immediately() {
+        let (stdin, peer) = tokio::io::duplex(4096);
+        let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        assert!(
+            reject_unsupported_server_request(&writer, &event_tx, "currentTime/read", 41).await
+        );
+
+        let mut line = String::new();
+        BufReader::new(peer).read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], 41);
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(
+            response["error"]["message"],
+            "Unsupported server request method"
+        );
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(AgentEvent::Log { level, message })
+                if level == "warn" && message == "Rejected unsupported Codex protocol request"
+        ));
+    }
 
     #[tokio::test]
     async fn resumed_thread_context_baseline_suppresses_old_trace_snapshots() {
@@ -2452,7 +2584,7 @@ mod tests {
         let stdin = child.stdin.take().expect("child stdin");
 
         let mut agent = test_agent();
-        agent.writer = Some(BufWriter::new(stdin));
+        agent.writer = Some(Arc::new(Mutex::new(BufWriter::new(stdin))));
         agent.child = Some(child);
 
         let err = agent
@@ -3317,6 +3449,7 @@ enabled = true
             resume_session: None,
             fork_resume: false,
             codex_home: None,
+            protocol_watch: None,
         };
 
         let _events = agent.initialize(config).await.unwrap();

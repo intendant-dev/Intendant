@@ -122,6 +122,54 @@ forwarded into the session activity log line-by-line
 (`spawn_stderr_forwarder` in `external_agent/mod.rs`), so transport/auth
 failures are visible from every frontend.
 
+### Passive protocol compatibility watch
+
+Every supervised Codex or Claude Code process carries a passive compatibility
+watch. It fingerprints the resolved executable with filesystem metadata and,
+while a user-started session is already running, compares fixed wire
+discriminants against the adapter's embedded vocabulary. Unknown message
+types, methods, subtypes, item types, and critical root-field type changes are
+persisted under `<state-root>/diagnostics/external-agent-compatibility/` and
+surfaced in the session log. Observation records include the resolved and
+canonical executable paths, their filesystem fingerprint, and a strictly
+allowlisted numeric release string when the handshake supplies one. Finding
+records contain only fixed field names, JSON value kinds, and opaque SHA-256
+fingerprints for protocol identifiers; raw identifiers, messages, prompts,
+tool arguments, stderr, and model output are never retained.
+
+The initial vocabulary baseline is Claude Code 2.1.210 and Codex app-server
+0.144.1. Known-but-intentionally-ignored notifications are included so the
+watch reports new protocol surface, not ordinary traffic the adapter already
+chose to ignore. Structural-check changes bump a separate contract revision,
+which is folded into the manifest digest.
+
+`GET /api/external-agents` reports the matching artifact fingerprint,
+contract-manifest digest, in-band reported version when available, finding
+counts, and one of `unobserved`, `no_drift_observed`, or `drift`. An executable
+replacement naturally returns to `unobserved` until an ordinary supervised
+session reaches its protocol handshake. `no_drift_observed` is deliberately
+not called “verified”: passive evidence cannot prove semantic behaviors such
+as steering or interruption. A diagnostics write failure is logged and held
+as an in-memory error finding for the daemon lifetime, so storage trouble
+cannot turn observed drift into a misleading `no_drift_observed` status.
+
+The artifact fingerprint covers the resolved executable itself. A custom,
+stable wrapper can change what it launches without changing its own filesystem
+identity; in that case the status remains historical until the next ordinary
+session handshake, and `last_observed_secs` is the staleness signal. The watch
+does not claim to identify opaque targets hidden behind wrappers.
+
+The watch consumes **no additional model quota**. Neither the status path nor
+session setup runs `--version`, starts a probe conversation, or contacts a
+provider. Configured commands may be arbitrary wrappers, so even apparently
+harmless command-line probes are reserved for a future explicit,
+budget-authorized verification action. Unknown or known-but-unsupported
+Claude control requests and Codex server requests fail closed; they are never
+eligible for autonomy or a session-wide approve-all grant. Each watch keeps
+upstream-known request vocabulary separate from the narrower set for which
+Intendant has an exact request classification and response shape; observing a
+known-but-unsupported request is itself a compatibility finding.
+
 ### Capability plumbing per backend
 
 What each supervised backend actually receives:
