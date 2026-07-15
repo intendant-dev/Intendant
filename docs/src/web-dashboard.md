@@ -510,8 +510,13 @@ directory is safe to delete; it rebuilds on the next scan.
   (read-only cards; clicking one hands off to the peer's own dashboard,
   where the peer's own auth applies).
 - **Deep Search** — search across session history.
-- **Worktrees** — the git worktrees in use by sub-agents (same card +
-  Show-more treatment).
+- **Worktrees** — the git worktree inventory (same card + Show-more
+  treatment): per-checkout size, merge/dirty state, and safety verdicts;
+  aggregate tiles including **free disk** on the tightest worktree-hosting
+  volume (amber under 10% free, rose under 5%); and **related-session
+  chips** — the sessions observed inside each checkout, supervised and raw
+  codex/claude alike. Clicking a chip focuses the live session window when
+  one exists, otherwise it lands on Recent with the ID prefilled.
 - **New Session** — start a fresh session from the dashboard.
   Internal-agent launches get an **Execution** control — *Auto* (the
   task-size heuristic decides), *Orchestrate* (delegates to supervised

@@ -1088,6 +1088,131 @@ pub fn metadata_on_disk_bytes(metadata: &std::fs::Metadata) -> u64 {
     }
 }
 
+/// Free/total capacity of the filesystem volume that contains a path.
+///
+/// `free_bytes` is the space available to the calling (unprivileged) user —
+/// `df`'s "Avail", not the superuser-inclusive free count — because callers
+/// surface it to answer "how much can still be written here?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeSpace {
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Query the volume containing `path` (which must exist). Returns `None` on
+/// any query failure — callers treat volume capacity as optional telemetry,
+/// never a correctness input.
+///
+/// - **Apple**: `statfs`, whose block counts are 64-bit on Darwin
+///   (`statvfs`'s `fsblkcnt_t` is 32-bit there and overflows on >16 TiB
+///   volumes).
+/// - **Other Unix**: `statvfs`, sized by `f_frsize` per POSIX.
+/// - **Windows**: `GetDiskFreeSpaceExW` (quota-aware caller-available bytes).
+pub fn volume_space(path: &std::path::Path) -> Option<VolumeSpace> {
+    // The Win32 query only accepts directories; normalize file paths to
+    // their parent so every platform accepts any existing path.
+    let parent_storage;
+    let query_path = match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_dir() => {
+            parent_storage = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())?
+                .to_path_buf();
+            &parent_storage
+        }
+        _ => path,
+    };
+    volume_space_of_dir(query_path)
+}
+
+fn volume_space_of_dir(path: &std::path::Path) -> Option<VolumeSpace> {
+    #[cfg(target_os = "macos")]
+    {
+        let c_path = std::ffi::CString::new({
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes()
+        })
+        .ok()?;
+        // SAFETY: `statfs` is a plain POD out-struct for which the all-zero
+        // bit pattern is a valid value.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the
+        // call, and `stat` is a live writable out-pointer of the exact type
+        // the API fills in.
+        if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        let block = u64::from(stat.f_bsize);
+        Some(VolumeSpace {
+            free_bytes: stat.f_bavail.saturating_mul(block),
+            total_bytes: stat.f_blocks.saturating_mul(block),
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let c_path = std::ffi::CString::new({
+            use std::os::unix::ffi::OsStrExt;
+            path.as_os_str().as_bytes()
+        })
+        .ok()?;
+        // SAFETY: `statvfs` is a plain POD out-struct for which the all-zero
+        // bit pattern is a valid value.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c_path` is a valid NUL-terminated path that outlives the
+        // call, and `stat` is a live writable out-pointer of the exact type
+        // the API fills in.
+        if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        // Field widths vary across libc targets (u32 on some 32-bit ABIs,
+        // u64 on glibc LP64), so the widening casts are load-bearing on some
+        // targets and no-ops on others.
+        #[allow(clippy::unnecessary_cast)]
+        let frag = if stat.f_frsize > 0 {
+            stat.f_frsize as u64
+        } else {
+            stat.f_bsize as u64
+        };
+        #[allow(clippy::unnecessary_cast)]
+        Some(VolumeSpace {
+            free_bytes: (stat.f_bavail as u64).saturating_mul(frag),
+            total_bytes: (stat.f_blocks as u64).saturating_mul(frag),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut caller_free: u64 = 0;
+        let mut total: u64 = 0;
+        // SAFETY: `wide` is a NUL-terminated wide string that outlives the
+        // call, the two u64 out-pointers are live and writable
+        // (ULARGE_INTEGER-sized), and the final out-param is documented as
+        // optional so null is permitted.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut caller_free,
+                &mut total,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some(VolumeSpace {
+            free_bytes: caller_free,
+            total_bytes: total,
+        })
+    }
+}
+
 /// Stable on-disk identity of a file, independent of its path: the pair the
 /// OS uses to name the underlying object. Two paths with an equal
 /// `FileIdentity` refer to the same file — hardlinks compare equal, a
@@ -1691,6 +1816,31 @@ mod tests {
             (from_meta.volume, from_meta.file_index),
             metadata_dev_ino(&metadata)
         );
+    }
+
+    #[test]
+    fn volume_space_reports_plausible_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let space = volume_space(dir.path()).expect("tempdir volume must be queryable");
+        assert!(space.total_bytes > 0, "total capacity must be nonzero");
+        assert!(
+            space.free_bytes <= space.total_bytes,
+            "free ({}) cannot exceed total ({})",
+            space.free_bytes,
+            space.total_bytes
+        );
+        // Files and directories on one volume agree on its identity-free
+        // capacity figure (free space may drift between calls; total not).
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let file_space = volume_space(&file).expect("file path must resolve to its volume");
+        assert_eq!(file_space.total_bytes, space.total_bytes);
+    }
+
+    #[test]
+    fn volume_space_missing_path_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(volume_space(&dir.path().join("no-such-entry")), None);
     }
 
     // Windows leg: the handle query must yield a real NTFS identity, shared
