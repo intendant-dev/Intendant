@@ -1064,6 +1064,68 @@ pub fn update_branch_work(
     Ok(updated)
 }
 
+/// One branch's changed-file delta for [`update_branches_changed_files`].
+#[derive(Debug, Clone)]
+pub struct BranchChangedFiles {
+    pub group_id: String,
+    pub branch_session_id: String,
+    pub changed_files: Vec<String>,
+}
+
+/// Batched changed-file accumulation for the lifecycle watcher: apply every
+/// branch's delta in ONE read→modify→write cycle — one parse and one
+/// atomic (fsync'd) write for the whole batch instead of one per branch per
+/// file. Unknown groups/branches are skipped (stale watcher routes), and
+/// nothing is written when no delta adds a new path — matching the
+/// watcher's ignore-stale, dedup-first behavior around
+/// [`update_branch_work`].
+pub fn update_branches_changed_files(
+    log_dir: &Path,
+    updates: &[BranchChangedFiles],
+) -> io::Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let _guard = ledger_write_lock();
+    let mut document = read_fission_ledger_document(log_dir)?.unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut changed = false;
+    for update in updates {
+        let group_id = clean_string(&update.group_id).unwrap_or_default();
+        let branch_session_id = clean_string(&update.branch_session_id).unwrap_or_default();
+        let Some(group) = document
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id == group_id)
+        else {
+            continue;
+        };
+        let Some(branch) = group
+            .branches
+            .iter_mut()
+            .find(|branch| branch.session_id == branch_session_id)
+        else {
+            continue;
+        };
+        let branch_ext = document
+            .ext
+            .group_mut_or_insert(&group_id)
+            .branch_mut_or_insert(&branch_session_id);
+        let before = branch_ext.changed_files.len();
+        merge_unique(&mut branch_ext.changed_files, &update.changed_files);
+        if branch_ext.changed_files.len() == before {
+            continue;
+        }
+        changed = true;
+        branch.updated_at = now.clone();
+        group.updated_at = now.clone();
+    }
+    if !changed {
+        return Ok(());
+    }
+    persist_fission_ledger_document(log_dir, &document)
+}
+
 /// Register a model-driven fission branch at its exact spawn anchor. Called by
 /// the spawn MCP tool (added in a later stage) immediately after launching a
 /// sibling/fork on the model's behalf, before any collab observation can
@@ -2081,6 +2143,91 @@ mod tests {
 
         let err = update_branch_work(dir.path(), &gid, "nope", &[], &[], None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn update_branches_changed_files_applies_whole_batch_in_one_write() {
+        let dir = tempdir().unwrap();
+        record_fission_observation(dir.path(), observation("running")).unwrap();
+        record_fission_observation(
+            dir.path(),
+            FissionObservation {
+                branches: vec![FissionBranchObservation {
+                    session_id: "child-2".to_string(),
+                    status: "running".to_string(),
+                    summary: None,
+                }],
+                ..observation("running")
+            },
+        )
+        .unwrap();
+        let gid = group_id("parent", "call-123");
+
+        update_branches_changed_files(
+            dir.path(),
+            &[
+                BranchChangedFiles {
+                    group_id: gid.clone(),
+                    branch_session_id: "child".to_string(),
+                    changed_files: vec!["a.rs".to_string(), "b.rs".to_string()],
+                },
+                BranchChangedFiles {
+                    group_id: gid.clone(),
+                    branch_session_id: "child-2".to_string(),
+                    changed_files: vec!["c.rs".to_string()],
+                },
+                // Stale watcher route: skipped, not an error.
+                BranchChangedFiles {
+                    group_id: "missing-group".to_string(),
+                    branch_session_id: "child".to_string(),
+                    changed_files: vec!["d.rs".to_string()],
+                },
+            ],
+        )
+        .unwrap();
+
+        let document = read_fission_ledger_document(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            document
+                .branch_ext(&gid, "child")
+                .expect("branch ext")
+                .changed_files,
+            vec!["a.rs", "b.rs"]
+        );
+        assert_eq!(
+            document
+                .branch_ext(&gid, "child-2")
+                .expect("branch-2 ext")
+                .changed_files,
+            vec!["c.rs"]
+        );
+
+        // A batch that adds nothing new leaves the document untouched
+        // (no rewrite: same mtime-visible contents, deduped lists).
+        update_branches_changed_files(
+            dir.path(),
+            &[BranchChangedFiles {
+                group_id: gid.clone(),
+                branch_session_id: "child".to_string(),
+                changed_files: vec!["a.rs".to_string()],
+            }],
+        )
+        .unwrap();
+        let document = read_fission_ledger_document(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            document
+                .branch_ext(&gid, "child")
+                .expect("branch ext")
+                .changed_files,
+            vec!["a.rs", "b.rs"]
+        );
+
+        // Empty batch: no ledger required, no write attempted.
+        let empty = tempdir().unwrap();
+        update_branches_changed_files(empty.path(), &[]).unwrap();
+        assert!(read_fission_ledger_document(empty.path())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
