@@ -229,6 +229,8 @@ pub struct TenantOverrides {
     /// `actor.attested_by` — the audit rows attest by the writing
     /// device's own certificate (§11.1 m.audit).
     pub attested_by: Option<Bytes32>,
+    /// `writer.gen` override (the fail-closed generation negative).
+    pub writer_gen: Option<u64>,
 }
 
 impl Default for TenantOverrides {
@@ -238,6 +240,7 @@ impl Default for TenantOverrides {
             capability_epoch: 1,
             authored_kek_epoch: 1,
             attested_by: None,
+            writer_gen: None,
         }
     }
 }
@@ -993,7 +996,7 @@ impl PlaneRig {
             signer_key_id: suite::key_id("ed25519", &dev.sig_pk),
             writer: Writer {
                 lineage: dev.lineage,
-                gen: 1,
+                gen: over.writer_gen.unwrap_or(1),
             },
             actor: Actor {
                 kind: actor_kind,
@@ -1007,7 +1010,7 @@ impl PlaneRig {
             request_id,
             writer_sequence,
             previous_writer_hash: previous_writer_hash
-                .unwrap_or_else(|| gen_start(&dev.lineage, 1)),
+                .unwrap_or_else(|| gen_start(&dev.lineage, over.writer_gen.unwrap_or(1))),
             causal_references: vec![],
             created_hlc: hlc,
             operation_type: op_type.into(),

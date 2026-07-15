@@ -767,6 +767,54 @@ pub fn f7_revoke_cutoff_empty_heads_history() -> Vector {
     )
 }
 
+/// The §10.4 parse-row `unknown-version` (D-203 cheap-gap batch): a
+/// grant op whose header `v` is 2 — the version check precedes every
+/// other stage, so the (now-unverifiable) signature never matters.
+/// The surgery flips the canonical header's leading `"v": 1` entry
+/// (the 1-byte key sorts first) to 2, keeping the bytes canonical.
+pub fn f7_header_unknown_version() -> Vector {
+    let name = "f7-unknown-version";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let g = rig.grant_op(grant2);
+    let mut bytes = g.encode();
+    // map(20) ‖ text(1) "v" ‖ uint 1 — the header map's first entry.
+    let pat: [u8; 4] = [0xb4, 0x61, 0x76, 0x01];
+    let at = bytes
+        .windows(4)
+        .position(|w| w == pat)
+        .expect("the canonical header opens with v: 1");
+    bytes[at + 3] = 0x02;
+    let c1 = rig.genesis_op.clone();
+    let c1_bytes = c1.encode();
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        crate::tranche::items_raw(&[("c1", &c1_bytes), ("x", &bytes)]),
+    );
+    inputs.insert("deliveries".into(), json!([["c1", "x"], ["x", "c1"]]));
+    let mut result = JsonMap::new();
+    result.insert(
+        "per_item".into(),
+        json!([
+            { "item": "c1" },
+            { "item": "x", "outcome": "unknown-version", "disposition": "reject-permanent" },
+        ]),
+    );
+    result.insert("converge".into(), json!(true));
+    Vector {
+        family: 7,
+        name: "header-unknown-version-rejects".into(),
+        case_kind: "fold".into(),
+        source: "4.5".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(Json::Object(result)),
+    }
+}
+
 pub fn corpus_ctrl() -> Vec<Vector> {
     vec![
         f7_hosted_solo_boot(),
@@ -784,6 +832,7 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_revoke_cutoff_carried_head(),
         f7_revoke_cutoff_head_mismatch(),
         f7_revoke_cutoff_empty_heads_history(),
+        f7_header_unknown_version(),
     ]
 }
 

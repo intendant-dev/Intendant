@@ -89,6 +89,9 @@
     "lease-stale": [
       "lease-stale-quarantines"
     ],
+    "lineage-gen": [
+      "second-generation-fail-closed"
+    ],
     "lock-denied": [
       "lock-exclusive-loser-read-only"
     ],
@@ -111,6 +114,12 @@
     "no-cert": [
       "shape1-unenrolled-no-cert"
     ],
+    "no-flow": [
+      "scope-negatives-per-axis"
+    ],
+    "no-grant": [
+      "scope-negatives-per-axis"
+    ],
     "no-session": [
       "shape2-missing-session"
     ],
@@ -124,6 +133,9 @@
       "uint-above-2p53",
       "unsorted-heads",
       "unsorted-map-keys"
+    ],
+    "op-unknown": [
+      "scope-negatives-per-axis"
     ],
     "oversized": [
       "frontierclose-sixty-six-heads",
@@ -149,6 +161,21 @@
     "request-fork": [
       "consumed-request-id-fork"
     ],
+    "scope-kind": [
+      "scope-negatives-per-axis"
+    ],
+    "scope-op": [
+      "scope-negatives-per-axis"
+    ],
+    "scope-space": [
+      "scope-negatives-per-axis"
+    ],
+    "scope-tenant": [
+      "scope-negatives-per-axis"
+    ],
+    "scope-zone": [
+      "scope-negatives-per-axis"
+    ],
     "session-ended": [
       "shape2-ended-session",
       "shape3-token-session-ended"
@@ -162,6 +189,9 @@
     ],
     "token-scope": [
       "shape3-token-out-of-scope"
+    ],
+    "unknown-version": [
+      "header-unknown-version-rejects"
     ],
     "wrapper-mismatch": [
       "wrapper-address-mismatch"
@@ -180,20 +210,10 @@
     "gen-first-op",
     "issuer-fork",
     "issuer-gap",
-    "lineage-gen",
-    "no-flow",
-    "no-grant",
-    "op-unknown",
     "provenance-ceiling",
     "recovery-competition",
-    "scope-kind",
-    "scope-op",
-    "scope-space",
-    "scope-tenant",
-    "scope-zone",
     "source-erased",
     "storage-io",
-    "storage-orphaned",
-    "unknown-version"
+    "storage-orphaned"
   ]
 }

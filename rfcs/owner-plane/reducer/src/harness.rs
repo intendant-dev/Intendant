@@ -889,11 +889,7 @@ mod tests {
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
-        assert_eq!(
-            reports.len(),
-            154,
-            "the corpus through the carried-head triple"
-        );
+        assert_eq!(reports.len(), 157, "the corpus through the cheap-gap batch");
         for r in &reports {
             assert!(
                 r.structural_ok(),

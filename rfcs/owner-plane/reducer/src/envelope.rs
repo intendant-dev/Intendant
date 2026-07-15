@@ -400,6 +400,7 @@ mod tests {
         let mut ops = 0;
         let mut geneses = 0;
         let mut bad_body = Vec::new();
+        let mut bad_version = Vec::new();
         for (file, name, bytes) in tranche_items() {
             let Ok(node) = decode(&bytes) else {
                 // The family-1 canonical-reject corpus deliberately
@@ -410,7 +411,16 @@ mod tests {
             if node.get("header").is_none() {
                 continue; // journal Txns, signed statements
             }
-            let op = parse_op(&bytes).unwrap_or_else(|e| panic!("{file}/{name}: {e:?}"));
+            let op = match parse_op(&bytes) {
+                Ok(op) => op,
+                Err(OpError::Version) => {
+                    // The deliberate v=2 negative (§10.4
+                    // unknown-version) — pinned below.
+                    bad_version.push(format!("{file}/{name}"));
+                    continue;
+                }
+                Err(e) => panic!("{file}/{name}: {e:?}"),
+            };
             if !op.body_hash_ok() {
                 bad_body.push(format!("{file}/{name}"));
             }
@@ -426,12 +436,18 @@ mod tests {
             vec!["f07-control-body-tamper.json/c2".to_string()],
             "unexpected body-hash failures"
         );
-        // Every fold fixture folds its genesis (6 tranche + 12
+        // And exactly ONE deliberate unknown-version negative.
+        assert_eq!(
+            bad_version,
+            vec!["f07-header-unknown-version-rejects.json/x".to_string()],
+            "unexpected version failures"
+        );
+        // Every fold fixture folds its genesis (6 tranche + 14
         // fold-lane + 1 export-import + 9 status + 7 time/lease +
-        // 13 control-fold + 3 budget + 8 audit + 11 time corpus minus
+        // 14 control-fold + 3 budget + 8 audit + 11 time corpus minus
         // the journal four; every fold fixture delivers c1); the
         // four journal fixtures deliver Txn frames only.
-        assert_eq!(geneses, 65);
+        assert_eq!(geneses, 68);
     }
 
     /// Tampering any byte of the header breaks the signature; the

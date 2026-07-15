@@ -6,6 +6,30 @@
  ],
  "surface_annotation_note": "A vector's surfaces array declares §13.2 applicability; it is NOT execution. See execution-lanes-plan.md for the browser and per-OS storage lanes.",
  "section_lines": 492,
+ "gate_b_deferrals": {
+  "$comment": "The owner's ratified scope line (D-203, 2026-07-14): the cheap single-op §10.4 negatives are closed pre-Gate-A; everything below is EXPLICITLY deferred to Gate B - a decision, not drift. The outcomes list must equal core coverage::UNCOVERED_10_4 exactly (test-enforced).",
+  "outcomes": [
+   "audit-unavailable",
+   "cert-superseded",
+   "class-ceiling",
+   "class-excluded",
+   "gen-first-op",
+   "issuer-fork",
+   "issuer-gap",
+   "provenance-ceiling",
+   "recovery-competition",
+   "source-erased",
+   "storage-io",
+   "storage-orphaned"
+  ],
+  "sagas": [
+   "f7 ratify/snapshot cutoff-algebra + checkpoint-machine ceremonies",
+   "f9 issuer feed chains (gap/fork/ancestry/cross-carrier registry)",
+   "f10 generation machine (gen >= 2 histories; fail-closed as lineage-gen in P1 v1)",
+   "f11 transfer composites (mimport battery, monotone-cause, adopted-erasure, effect keys)",
+   "f13 checkpoint/fence storage shapes + renewal custody predicates"
+  ]
+ },
  "obligations": [
   {
    "id": "s-header",
@@ -206,10 +230,16 @@
     "control-body-tamper",
     "control-signature-tamper",
     "control-wrong-proof-arm",
+    "header-unknown-version-rejects",
+    "revoke-cutoff-carried-head-completes",
+    "revoke-cutoff-empty-heads-with-history-rejects",
+    "revoke-cutoff-head-hash-mismatch-rejects",
+    "revoke-refs-post-wrap-exclusion-completes",
+    "revoke-refs-stale-rotation-rejects",
     "second-live-compound-rejects"
    ],
    "status": "partial",
-   "note": "cutoff algebra and the authored-but-unwrapped revocation are unvectored; the D-99/D4 stage order is the post-freeze pair."
+   "note": "post-C.1: the D-71 rotation-refs linkage pair, the D-93 carried-head/mismatch/D-143-exactness triple, and the unknown-version parse negative are vectored; the ratify/snapshot cutoff-algebra ceremonies and authored-but-unwrapped revocation remain deferred sagas (D-203)."
   },
   {
    "id": "f7-revocation-constructibility",
@@ -556,6 +586,7 @@
    "quote": "T5 window binding",
    "obligation": "T5 window binding; issuer-fork recovery; GC-fence hardening; service-key resolution; per-posture issuance; witnessless-zone unusability.",
    "vectors": [
+    "lease-late-then-timely-receipt-admits",
     "lease-missing-pends",
     "lease-online-grant-admits",
     "lease-overlong-window-invalid",
@@ -587,8 +618,11 @@
    ],
    "quote": "chained feeds",
    "obligation": "Chained feeds: issuer-gap, backfill issuer-fork, boundary ancestry gating, min-merge, compromise cutoffs over leases (D-87/D-95).",
-   "vectors": [],
-   "status": "pending"
+   "vectors": [
+    "compromise-cutoff-retro-disqualifies"
+   ],
+   "status": "partial",
+   "note": "post-C.1: the T4 compromise receipt-cutoff retro-disqualification is vectored (min-merge at the registry, through=0 boundary); the issuer chain machinery (gap/fork/ancestry) remains a deferred saga (D-203)."
   },
   {
    "id": "f9-reauth-freeze",
@@ -747,6 +781,8 @@
    "vectors": [
     "erase-deferral-nonterminal-journal",
     "status-author-retract",
+    "status-bare-daemon-retract-inert",
+    "status-bare-daemon-supersede-inert",
     "status-dispute-recorded-not-counting",
     "status-owner-accept",
     "status-revival-on-replacement-loss",
@@ -794,10 +830,12 @@
    "obligation": "Typed-erase recovery: manifest to derived tombstones to erased status; target_op membership.",
    "vectors": [
     "erase-crash-state5-tombstone-rederivation",
-    "erase-crash-state6-complete"
+    "erase-crash-state6-complete",
+    "kek-rotate-manifest-admits",
+    "kek-rotate-manifest-target-outside-rejects"
    ],
    "status": "partial",
-   "note": "the storage-lane manifest binding is vectored (post-D6); the fold-side erased-status projection is not."
+   "note": "the storage-lane manifest binding (D6) and the §5.4 fold-admission face incl. target_op membership (C.1 item 1) are vectored; the fold-side erased-status projection is not."
   },
   {
    "id": "f11-actor-id",
@@ -1041,6 +1079,9 @@
    "quote": "12 IAM",
    "obligation": "IAM: outcome-member coverage, six allow paths across four shapes, audit lane, enumerated fold outcomes, multi-fault precedence.",
    "vectors": [
+    "header-unknown-version-rejects",
+    "scope-negatives-per-axis",
+    "second-generation-fail-closed",
     "shape1-enrolled-device-read",
     "shape1-revoked-device",
     "shape1-second-device-search",
@@ -1058,7 +1099,7 @@
     "shape4-mediated-grant-plus-token"
    ],
    "status": "partial",
-   "note": "the four shapes and their deny paths are vectored; per-outcome completeness is quantified by coverage/outcomes-map.json (22 of 59 uncovered), and the audit lane plus multi-fault precedence are unvectored."
+   "note": "the four shapes, their deny paths, and the D-203 cheap-gap batch (five scope axes, no-grant, no-flow, op-unknown, unknown-version, lineage-gen fail-close) are vectored; the remaining per-outcome debt is 12/59, every entry an explicit Gate-B deferral (gate_b_deferrals + the core pin); the audit lane and multi-fault precedence ride it."
   },
   {
    "id": "f13-framing",

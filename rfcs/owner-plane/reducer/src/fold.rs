@@ -2655,7 +2655,14 @@ impl State {
             .copied()
             .unwrap_or((1, [0u8; 32]));
         if h.writer_gen != 1 {
-            return Err(Unimplemented("w.gen generations".into()));
+            // The generation machine is fail-closed in the ratified
+            // P1 v1 profile: second generations quarantine
+            // `lineage-gen` (revivable if a later profile implements
+            // them — the D-140 below-bound reading).
+            return ok(Err(Verdict::Rejected(
+                "lineage-gen",
+                "quarantine-reproposal",
+            )));
         }
         match h.writer_sequence.cmp(&expect_seq) {
             std::cmp::Ordering::Less => return ok(Err(Verdict::Rejected("fork", "freeze-writer"))),
@@ -4254,10 +4261,52 @@ impl State {
             "m.export.release" => self.admit_release(op),
             "m.import.claim" => self.admit_import(op),
             "m.erase_request" => self.admit_erase_request(op),
-            other => Err(Unimplemented(format!("op_type {other}"))),
+            // Registry-known types whose mechanisms are Unimplemented
+            // or fail-closed stay honest markers; a type OUTSIDE the
+            // closed §7.1/§11.1 registry is `op-unknown`.
+            other if REGISTRY_OP_TYPES.contains(&other) => {
+                Err(Unimplemented(format!("op_type {other}")))
+            }
+            _ => ok(Err(Verdict::Rejected("op-unknown", "reject-permanent"))),
         }
     }
 }
+
+/// The closed §7.1/§11.1 operation-type registry (dispatch-known
+/// types plus registry rows whose mechanisms are not yet dispatched).
+const REGISTRY_OP_TYPES: &[&str] = &[
+    "c.abandon_writer",
+    "c.admin_succession",
+    "c.cap_epoch_bump",
+    "c.checkpoint",
+    "c.cutoff",
+    "c.drill",
+    "c.enroll",
+    "c.enroll_renew",
+    "c.genesis",
+    "c.grant",
+    "c.kek_rotate",
+    "c.lineage_reauth",
+    "c.recovery_succession",
+    "c.revoke_device",
+    "c.revoke_grant",
+    "c.revoke_zones",
+    "c.service_key",
+    "c.space_create",
+    "c.space_policy_set",
+    "c.space_retire",
+    "c.wrap_add",
+    "c.zone_create",
+    "c.zone_policy",
+    "m.audit",
+    "m.claim",
+    "m.erase_request",
+    "m.export.release",
+    "m.import.claim",
+    "m.judge",
+    "m.pin",
+    "m.unpin",
+];
 
 /// One fold run over a delivery order. Returns the per-item verdict
 /// history: `snapshots[i]` = every item's verdict immediately after

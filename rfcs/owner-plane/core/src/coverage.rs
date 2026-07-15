@@ -109,33 +109,43 @@ pub fn outcomes_map_file() -> String {
     s
 }
 
-/// §10.4 outcomes with NO exercising vector (22 of 59 — the honest
-/// debt the Gate-A audit carries) — shrink-only: adding coverage
-/// must delete the entry here, and a covered outcome regressing to
-/// uncovered fails. Sorted; the pin test compares exactly.
+/// §10.4 outcomes with NO exercising vector — 12 of 59 after the
+/// D-203 cheap-gap batch closed ten (the five scope axes, no-grant,
+/// no-flow, op-unknown, unknown-version, lineage-gen). Every entry
+/// is an EXPLICIT Gate-B deferral under the ratified scope line
+/// (D-203): the reason names the machinery it waits on, and the
+/// inventory's `gate_b_deferrals` section must list exactly this
+/// set (`obligations_ledger_is_sound` ties them). Shrink-only:
+/// adding coverage deletes the entry here AND there; a regression
+/// fails.
 pub const UNCOVERED_10_4: &[&str] = &[
+    // The f12 edge audit lane (lock-loser audited read, audit-budget
+    // exhaustion).
     "audit-unavailable",
+    // Certificate renewal is fail-closed in P1 v1 — the superseding
+    // path cannot arise until the renewal machinery lands.
     "cert-superseded",
+    // The §7.6 class table + sensitivity-ceiling machinery.
     "class-ceiling",
     "class-excluded",
+    // The generation machine (gen ≠ 1 is fail-closed wholesale as
+    // `lineage-gen`; the gen-opening arithmetic never runs in v1).
     "gen-first-op",
+    // Issuer feed chains (the f9 sagas).
     "issuer-fork",
     "issuer-gap",
-    "lineage-gen",
-    "no-flow",
-    "no-grant",
-    "op-unknown",
+    // The provenance-ceiling tenant axis (hosted-plane machinery
+    // beyond the vectored control ceiling).
     "provenance-ceiling",
+    // The C3-prime competition arm (recovery sagas).
     "recovery-competition",
-    "scope-kind",
-    "scope-op",
-    "scope-space",
-    "scope-tenant",
-    "scope-zone",
+    // The journal adopted-erasure composite (f11 transfer sagas).
     "source-erased",
+    // Fault injection — the execution lanes' Gate-B tail.
     "storage-io",
+    // Recovery storage adoption is fail-closed in P1 v1 —
+    // storage-orphaned is unreachable until it lands.
     "storage-orphaned",
-    "unknown-version",
 ];
 
 #[cfg(test)]
@@ -277,6 +287,25 @@ mod tests {
             ledger["executed_surfaces"],
             json!(["rust-core", "rust-reducer"]),
             "the ledger must state the honest executed surfaces"
+        );
+        // The D-203 Gate-B deferral record must exist and must list
+        // EXACTLY the uncovered §10.4 outcomes (deferral is a
+        // decision, not drift).
+        let def = &ledger["gate_b_deferrals"];
+        let listed: Vec<&str> = def["outcomes"]
+            .as_array()
+            .expect("gate_b_deferrals.outcomes")
+            .iter()
+            .map(|v| v.as_str().expect("outcome name"))
+            .collect();
+        assert_eq!(
+            listed,
+            UNCOVERED_10_4.to_vec(),
+            "the deferral record must match the uncovered set exactly"
+        );
+        assert!(
+            def["sagas"].as_array().is_some_and(|a| !a.is_empty()),
+            "the deferred ceremony sagas must be named"
         );
     }
 }

@@ -133,6 +133,7 @@ pub fn f10_budget_window_reset_on_bump() -> Vector {
         capability_epoch: 2,
         authored_kek_epoch: 1,
         attested_by: None,
+        writer_gen: None,
     };
     let i2 = rig.claim_over(
         &d1,
@@ -148,6 +149,7 @@ pub fn f10_budget_window_reset_on_bump() -> Vector {
         capability_epoch: 2,
         authored_kek_epoch: 1,
         attested_by: None,
+        writer_gen: None,
     };
     let i3 = rig.claim_over(
         &d1,
@@ -213,6 +215,7 @@ pub fn f10_budget_zone_policy_rearms_nothing() -> Vector {
         capability_epoch: 2,
         authored_kek_epoch: 1,
         attested_by: None,
+        writer_gen: None,
     };
     let i2 = rig.claim_over(
         &d1,

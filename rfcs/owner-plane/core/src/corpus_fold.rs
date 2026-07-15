@@ -9,8 +9,8 @@
 use crate::cbor;
 use crate::shapes::control::Cgrant;
 use crate::shapes::envelope::ActorKind;
-use crate::shapes::identity::Authproof;
-use crate::shapes::memory::Mclaim;
+use crate::shapes::identity::{Authproof, GrantTenant};
+use crate::shapes::memory::{Mclaim, Merasereq};
 use crate::shapes::{Class, Kind, ToValue, Verb};
 use crate::tranche::{admits, draw_id, h_cert, h_grant, items, PlaneRig, TenantOverrides};
 use crate::vector::{Expected, Vector};
@@ -42,6 +42,240 @@ fn fold_vector(
 
 fn rejected(item: &str, outcome: &str, disposition: &str) -> Json {
     json!({ "item": item, "outcome": outcome, "disposition": disposition })
+}
+
+/// The §10.4 authorization-scope negatives, one per axis (the
+/// D-203-ratified cheap-gap batch): every rejected item is a dev2
+/// gen-1/seq-1 op with a distinct request_id — rejected ops never
+/// advance the chain, so the axes probe independently. `xu` is a
+/// type outside the closed §7.1/§11.1 registry (`op-unknown`); `xf`
+/// is a release under a flowless grant (`no-flow`, the D-76/§11.8
+/// flow match).
+pub fn f11_scope_negatives() -> Vector {
+    let name = "f11-scope-negatives";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let dev3 = rig.mint_device("dev3");
+    let grant3 = rig.simple_grant("grant3", &dev3, vec![Verb::Propose]);
+    let c3 = rig.enroll_new(&dev3, vec![grant3.clone()], "wrap.dev3.eph");
+    // A kinds-restricted and a tenant-restricted grant for dev2.
+    let mut grant2k = rig.simple_grant("grant2k", &dev2, vec![Verb::Propose]);
+    grant2k.kinds = Some(vec![Kind::Decision]);
+    let g4 = rig.grant_op(grant2k.clone());
+    let mut grant2t = rig.simple_grant("grant2t", &dev2, vec![Verb::Propose]);
+    grant2t.tenants = vec![GrantTenant::Agenda];
+    let g5 = rig.grant_op(grant2t.clone());
+    // An export-verbed grant WITHOUT a flow (the §11.8/D-76 match
+    // needs the verb to pass first — scope-op precedes no-flow).
+    let grant2f = rig.simple_grant("grant2f", &dev2, vec![Verb::Export]);
+    let g6 = rig.grant_op(grant2f.clone());
+
+    // The one ADMITTED dev2 claim (seq 1): the chain-stage anchor for
+    // the post-preamble negatives and the release's held source.
+    let i0 = rig.claim(&dev2, &grant2, "i0", "the exportable source", 1, None);
+    // scope-zone: the op's header zone is outside the grant's.
+    let other_zone = draw_id(&mut rig.rng, "other.zone_id");
+    let home = rig.home_space;
+    let xz = rig.tenant_op_in(
+        other_zone,
+        home,
+        ActorKind::Daemon,
+        &dev2,
+        &grant2,
+        "xz",
+        Mclaim::OP_TYPE,
+        claim_body("the zone axis"),
+        1,
+        None,
+    );
+    // scope-space: the audit space is outside grant2's [home].
+    let audit = rig.audit_space;
+    let xs = rig.claim_in_space(&dev2, &grant2, audit, "xs", "the space axis", 1, None);
+    // scope-op: an erase request under a propose-only grant.
+    let xo = rig.tenant_op_as(
+        ActorKind::Human,
+        &dev2,
+        &grant2,
+        "xo",
+        Merasereq::OP_TYPE,
+        Merasereq {
+            targets: vec![[0x11; 32]],
+        }
+        .to_value(),
+        1,
+        None,
+    );
+    // scope-kind: an observation under the Decision-kinded grant —
+    // the kind check is post-preamble, so xk signs the advanced
+    // chain position atop i0.
+    let xk = rig.claim(
+        &dev2,
+        &grant2k,
+        "xk",
+        "the kind axis",
+        2,
+        Some(i0.op_hash()),
+    );
+    // scope-tenant: a memory op under the agenda-tenant grant.
+    let xt = rig.claim(&dev2, &grant2t, "xt", "the tenant axis", 1, None);
+    // no-grant: dev2 cites dev3's (held) grant.
+    let xg = rig.claim(&dev2, &grant3, "xg", "the subject axis", 1, None);
+    // op-unknown: a type outside the registry.
+    let xu = rig.tenant_op_as(
+        ActorKind::Daemon,
+        &dev2,
+        &grant2,
+        "xu",
+        "m.frobnicate",
+        cbor::map(vec![]),
+        1,
+        None,
+    );
+    // no-flow: a release citing a HELD claim (sources must resolve
+    // before the flow match) under the export-verbed flowless grant.
+    let export_id = draw_id(&mut rig.rng, "rel.export_id");
+    let digest = rig.rng.draw32("rel.content_digest");
+    let dz = draw_id(&mut rig.rng, "dest.zone_id");
+    let ds = draw_id(&mut rig.rng, "dest.space_id");
+    let df = rig.rng.draw32("rel.data_frontier");
+    let xf = rig.release_op_signed(
+        &dev2,
+        &grant2f,
+        "xf",
+        export_id,
+        vec![i0.op_hash()],
+        digest,
+        dz,
+        ds,
+        df,
+        2,
+        Some(i0.op_hash()),
+    );
+
+    let c1 = rig.genesis_op.clone();
+    let item_list: Vec<(&str, &crate::shapes::envelope::Signedop)> = vec![
+        ("c1", &c1),
+        ("c2", &c2),
+        ("c3", &c3),
+        ("g4", &g4),
+        ("g5", &g5),
+        ("g6", &g6),
+        ("i0", &i0),
+        ("xz", &xz),
+        ("xs", &xs),
+        ("xo", &xo),
+        ("xk", &xk),
+        ("xt", &xt),
+        ("xg", &xg),
+        ("xu", &xu),
+        ("xf", &xf),
+    ];
+    let forward = json!([
+        "c1", "c2", "c3", "g4", "g5", "g6", "i0", "xz", "xs", "xo", "xk", "xt", "xg", "xu", "xf"
+    ]);
+    let reversed = json!([
+        "xf", "xu", "xg", "xt", "xk", "xo", "xs", "xz", "i0", "g6", "g5", "g4", "c3", "c2", "c1"
+    ]);
+    fold_vector(
+        11,
+        "scope-negatives-per-axis",
+        "10.4",
+        rig,
+        &item_list,
+        json!([forward, reversed]),
+        json!({
+            "per_item": [
+                admits("c1"),
+                admits("c2"),
+                admits("c3"),
+                admits("g4"),
+                admits("g5"),
+                admits("g6"),
+                admits("i0"),
+                rejected("xz", "scope-zone", "reject-permanent"),
+                rejected("xs", "scope-space", "reject-permanent"),
+                rejected("xo", "scope-op", "reject-permanent"),
+                rejected("xk", "scope-kind", "reject-permanent"),
+                rejected("xt", "scope-tenant", "reject-permanent"),
+                rejected("xg", "no-grant", "reject-permanent"),
+                rejected("xu", "op-unknown", "reject-permanent"),
+                rejected("xf", "no-flow", "reject-permanent"),
+            ],
+            "converge": true,
+        }),
+    )
+}
+
+/// The ratified P1 profile's generation fail-close: a gen-2 writer
+/// quarantines `lineage-gen` (revivable if a later profile
+/// implements the generation machine — the D-140 below-bound
+/// reading).
+pub fn f11_second_generation_fail_closed() -> Vector {
+    let name = "f11-gen2-fail-closed";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let home = rig.home_space;
+    let gz = rig.zone_id;
+    let x = rig.tenant_op_over(
+        gz,
+        home,
+        ActorKind::Daemon,
+        &dev2,
+        &grant2,
+        "x",
+        Mclaim::OP_TYPE,
+        claim_body("a second-generation write"),
+        1,
+        None,
+        TenantOverrides {
+            actor_id: None,
+            capability_epoch: 1,
+            authored_kek_epoch: 1,
+            attested_by: None,
+            writer_gen: Some(2),
+        },
+    );
+    let c1 = rig.genesis_op.clone();
+    fold_vector(
+        11,
+        "second-generation-fail-closed",
+        "9.3",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("x", &x)],
+        json!([["c1", "c2", "x"], ["x", "c2", "c1"]]),
+        json!({
+            "per_item": [
+                admits("c1"),
+                admits("c2"),
+                rejected("x", "lineage-gen", "quarantine-reproposal"),
+            ],
+            "converge": true,
+        }),
+    )
+}
+
+/// A minimal claim body for the negative axes.
+fn claim_body(statement: &str) -> cbor::Value {
+    Mclaim {
+        kind: Kind::Observation,
+        statement: statement.into(),
+        sensitivity: Class::Private,
+        observed_at_ms: None,
+        valid_from_ms: None,
+        valid_until_ms: None,
+        expires_at_ms: None,
+        session: None,
+        project: None,
+        model: None,
+        evidence: vec![],
+        supersedes: None,
+        labels: None,
+    }
+    .to_value()
 }
 
 // --------------------------------------------------------- family 7
@@ -535,6 +769,8 @@ pub fn corpus_fold() -> Vec<Vector> {
         f10_tenant_fork(),
         f10_causal_missing_converges(),
         f11_actor_id_mint(),
+        f11_scope_negatives(),
+        f11_second_generation_fail_closed(),
     ]
 }
 
