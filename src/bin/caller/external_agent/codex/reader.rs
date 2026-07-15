@@ -644,11 +644,19 @@ pub(crate) fn codex_terminal_observation_keys(
 }
 
 /// Upper bound on retained terminal-observation keys. Turn/item ids never
-/// recur, so an unbounded set grew for the app-server's whole life; dedup
-/// only needs to suppress late duplicates of recent terminal events, and
-/// each turn contributes at most two keys, so this covers far more history
-/// than any duplicate horizon.
-const CODEX_TERMINAL_OBSERVED_CAP: usize = 256;
+/// recur, so an unbounded set grew for the app-server's whole life.
+///
+/// Why eviction is safe for the turnId-less replay shape
+/// (`final_answer_item_id_dedupes_stale_completion_without_turn_id`): the
+/// known replay source is Codex re-emitting the thread's LATEST final
+/// answer around thread/resume — its `item:` key is at most a couple of
+/// turns old (each turn marks ≤ 2 keys), while this cap covers thousands of
+/// turns. No in-process mechanism replays items old enough to be evicted;
+/// and across an app-server restart the set was ALWAYS empty (it is
+/// reader-task state), so pre-eviction code never suppressed ancient
+/// replays either — that case is owned by the stale-turn drop for
+/// turnId-carrying events and was never this set's contract.
+const CODEX_TERMINAL_OBSERVED_CAP: usize = 4096;
 
 /// Insertion-ordered set of observed terminal-event keys, bounded by
 /// [`CODEX_TERMINAL_OBSERVED_CAP`]: inserting past the cap evicts the oldest
@@ -5378,6 +5386,49 @@ error: build failed
         assert!(codex_terminal_notification_already_observed(
             "turn/completed",
             false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn turnid_less_replay_dedupe_survives_heavy_turn_churn() {
+        // The replay-without-turnId shape is suppressed via its `item:` key.
+        // The known replay source re-emits the thread's LATEST final answer
+        // (a couple of turns deep at most); the eviction cap must sit far
+        // beyond that horizon, so heavy churn between the original terminal
+        // and its replay must not re-enable the event.
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "item": {
+                "id": "msg-final-replay",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "done"
+            }
+        });
+        let mut observed = CodexTerminalObserved::default();
+        let original_keys = codex_terminal_observation_keys(
+            &params,
+            Some("turn-original"),
+            Some("turn-original"),
+            Some("parent-thread"),
+            true,
+        );
+        codex_mark_terminal_observed(&mut observed, &original_keys);
+        for i in 0..1_000 {
+            codex_mark_terminal_observed(&mut observed, &[format!("turn:churn-{i}")]);
+        }
+        let replayed_keys = codex_terminal_observation_keys(
+            &params,
+            None,
+            Some("turn-current"),
+            Some("parent-thread"),
+            true,
+        );
+        assert!(codex_any_terminal_observed(&observed, &replayed_keys));
+        assert!(codex_terminal_notification_already_observed(
+            "item/completed",
+            true,
             true,
         ));
     }

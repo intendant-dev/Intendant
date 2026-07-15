@@ -204,7 +204,13 @@ pub(crate) fn codex_context_payload_snapshot_sync(
 
 /// Total order over request refs: trace timestamp, then line index, with the
 /// stable path/call-id tie-breaks. Comparator form (no per-comparison String
-/// allocations — the old tuple sort key allocated three per call).
+/// allocations — the old tuple sort key allocated three per call). Note
+/// `Path::cmp` compares component-wise, which can order exotic paths
+/// differently than the old lossy-string byte-wise key; the tie-break only
+/// needs a deterministic total order, which both provide. Line indices from
+/// incremental folds match a from-scratch enumerate except for a bounded +1
+/// drift when a `\r\n` writer's final line was consumed before its line
+/// ending arrived.
 pub(crate) fn codex_request_order_cmp(
     a: &CodexRequestPayloadRef,
     b: &CodexRequestPayloadRef,
@@ -601,28 +607,67 @@ pub(crate) fn codex_context_archive_payload(
 // Incremental trace-index cache
 // ---------------------------------------------------------------------------
 
+/// Bytes of already-consumed content re-read and verified on every append
+/// read ([`read_trace_tail`]): a file that was recreated shorter and regrew
+/// past the cursor between polls presents as pure growth to (len, mtime),
+/// but its bytes at the cursor no longer match.
+const TRACE_CURSOR_TAIL_WINDOW: usize = 32;
+
 /// Byte/line cursor into one `trace.jsonl`: how much of the file has already
-/// been folded into the cached index. `bytes` only ever advances past
-/// COMPLETE lines — a trailing partial line the writer is still flushing is
-/// left for the next refresh, exactly like the historical full re-scan
-/// picked it up once complete.
-#[derive(Debug, Default, Clone, Copy)]
+/// been folded into the cached index, plus the evidence used to detect
+/// rewrites. The contract:
+/// - `bytes` only ever advances past consumable content
+///   ([`consumable_jsonl_prefix`] — complete lines, or a valid-JSON
+///   unterminated final line); a partially flushed tail is left for the next
+///   refresh.
+/// - A rewrite is detected (and triggers a full rebuild) when the file
+///   shrinks below `bytes`, when its length equals `bytes` but its mtime is
+///   not `modified`, or when the [`TRACE_CURSOR_TAIL_WINDOW`] bytes before
+///   the cursor no longer equal `tail` on an append read. The residual
+///   blind spot is a rewrite that preserves the window's bytes at the
+///   cursor (and, when it does not grow the file, its length and mtime
+///   too); earlier content covered by neither check can change undetected —
+///   best-effort hardening for a writer that is append-only by contract.
+#[derive(Debug, Default, Clone)]
 struct CodexTraceFileCursor {
     bytes: u64,
     lines: u64,
+    /// File mtime paired with `bytes` at the last fold (reads are clamped to
+    /// the stat snapshot, so the pair is consistent).
+    modified: Option<SystemTime>,
+    /// The last ≤ [`TRACE_CURSOR_TAIL_WINDOW`] consumed bytes.
+    tail: Vec<u8>,
+    /// True when the consumed region ended without a newline (a valid
+    /// unterminated JSON tail was folded as one line). The next read then
+    /// swallows exactly one leading newline without counting a line, keeping
+    /// line indices identical to a from-scratch enumerate.
+    mid_line: bool,
 }
 
-/// Cross-session auxiliary bundle dirs (other sessions' trace roots whose
-/// bundle names match the thread), cached against the logs root's directory
-/// mtime so the exact-archive fingerprint tick doesn't re-enumerate every
-/// historical session directory at 1 Hz. Session dirs are created and
-/// removed directly under the logs root, so those events bump its mtime and
-/// invalidate the sweep; bundles for the LIVE session land under the primary
-/// root, which is always enumerated fresh.
+/// One other-session trace root in the auxiliary sweep: its directory mtime
+/// at the last enumeration (`None` = absent) and the thread-matching bundle
+/// dirs found inside. Re-validated with one stat per collect and
+/// re-enumerated only when the mtime moves — so a `model-request-traces`
+/// dir (or a bundle inside one) created after the sweep is still discovered
+/// without re-walking the whole logs root.
+struct CodexAuxTraceRoot {
+    trace_root: PathBuf,
+    modified: Option<SystemTime>,
+    bundle_dirs: Vec<PathBuf>,
+}
+
+/// Cross-session auxiliary trace roots (other sessions' dirs under the logs
+/// root), cached so the exact-archive fingerprint tick doesn't re-enumerate
+/// every historical session directory at 1 Hz. The ROOT LIST re-sweeps when
+/// the logs root's mtime moves (session dirs are created/removed directly
+/// under it); each known root is then stat-probed per collect and
+/// re-enumerated only on change ([`CodexAuxTraceRoot`]). Bundles for the
+/// LIVE session land under the primary root, which is always enumerated
+/// fresh.
 struct CodexAuxBundleDirs {
     logs_root: PathBuf,
     modified: Option<SystemTime>,
-    bundle_dirs: Vec<PathBuf>,
+    roots: Vec<CodexAuxTraceRoot>,
 }
 
 /// Resolved `previous_response_id` chain for the most recently resolved
@@ -637,17 +682,17 @@ pub(crate) struct CodexResolvedChain {
     /// pair plus the cached request's own input items.
     resolved_input: Vec<serde_json::Value>,
     /// Unresolved-tail marker inherited by any resolution built on this
-    /// prefix.
+    /// prefix. A cached entry with an unresolved tail is only served while
+    /// that tail is STILL unresolvable ([`codex_resolved_chain_current`]).
     unresolved_previous_response_id: Option<String>,
 }
 
 /// Incrementally maintained view of a Codex trace archive for one
 /// `(trace root, thread)`: parsed request/response refs plus the resolved
 /// chain of the newest request. A refresh stats the known `trace.jsonl`
-/// files and parses only appended lines; a shrunk or vanished file (trace
-/// rewrite, temporary-root cleanup) triggers a full rebuild — the safe
-/// fallback. Same-length in-place rewrites are undetectable here, the same
-/// blind spot the (len, mtime) fingerprint gate has always had.
+/// files and parses only appended lines; any detected rewrite (see
+/// [`CodexTraceFileCursor`]) or vanished file (temporary-root cleanup)
+/// triggers a full rebuild — the safe fallback.
 #[derive(Default)]
 pub(crate) struct CodexTraceIndexCache {
     key: Option<(PathBuf, Option<String>)>,
@@ -707,61 +752,107 @@ impl CodexTraceIndexCache {
         Ok(CodexTraceFingerprint { files })
     }
 
+    fn clear_folded_state(&mut self) {
+        self.cursors.clear();
+        self.index = CodexTraceIndex::default();
+        self.aux_bundles = None;
+        self.resolved_chain = None;
+    }
+
     /// Bring the cached index up to date with the archive: stat every
-    /// bundle's `trace.jsonl`, tail-read files that grew, rebuild from
-    /// scratch if any known file shrank or vanished.
+    /// bundle's `trace.jsonl`, tail-read files that grew, and rebuild from
+    /// scratch on any detected rewrite ([`CodexTraceFileCursor`]) or
+    /// vanished file.
     pub(crate) async fn refresh(
         &mut self,
         root: &Path,
         thread_id: Option<&str>,
     ) -> Result<(), CallerError> {
         self.reset_for_key(root, thread_id);
-        let mut files = self.stat_trace_files(root, thread_id).await?;
+        // At most two passes: the first may detect a rewrite and clear the
+        // folded state; the second folds everything from zero (empty cursors
+        // cannot be stale or overlap-mismatch again).
+        for _attempt in 0..2 {
+            let files = self.stat_trace_files(root, thread_id).await?;
 
-        // A shrunk or vanished file means lines already folded into the
-        // index can no longer be attributed; drop everything and rescan.
-        let lens: HashMap<&Path, u64> = files
-            .iter()
-            .map(|(_, path, len)| (path.as_path(), *len))
-            .collect();
-        let stale = self.cursors.iter().any(|(path, cursor)| {
-            lens.get(path.as_path())
-                .map_or(cursor.bytes > 0, |len| *len < cursor.bytes)
-        });
-        drop(lens);
-        if stale {
-            self.cursors.clear();
-            self.index = CodexTraceIndex::default();
-            self.aux_bundles = None;
-            self.resolved_chain = None;
-            files = self.stat_trace_files(root, thread_id).await?;
-        }
-
-        let mut appended = false;
-        for (bundle_dir, path, len) in files {
-            let start = self.cursors.get(&path).copied().unwrap_or_default();
-            if len == start.bytes {
+            // Rewrite/vanish detection against the stat snapshot: content
+            // already folded into the index can no longer be attributed.
+            let stats: HashMap<&Path, (u64, Option<SystemTime>)> = files
+                .iter()
+                .map(|(_, path, len, modified)| (path.as_path(), (*len, *modified)))
+                .collect();
+            let stale = self.cursors.iter().any(|(path, cursor)| {
+                if cursor.bytes == 0 {
+                    return false;
+                }
+                match stats.get(path.as_path()) {
+                    None => true,
+                    Some((len, modified)) => {
+                        *len < cursor.bytes
+                            || (*len == cursor.bytes && *modified != cursor.modified)
+                    }
+                }
+            });
+            drop(stats);
+            if stale {
+                self.clear_folded_state();
                 continue;
             }
-            let Some((text, consumed)) = read_new_complete_lines(&path, start.bytes).await else {
-                // No complete new line yet (partial flush) or unreadable —
-                // leave the cursor alone and retry on the next refresh.
+
+            let mut appended = false;
+            let mut rewritten = false;
+            for (bundle_dir, path, len, modified) in files {
+                let start = self.cursors.get(&path).cloned().unwrap_or_default();
+                if len <= start.bytes {
+                    continue;
+                }
+                match read_trace_tail(&path, &start, len).await {
+                    TraceTailRead::Appended {
+                        text,
+                        consumed,
+                        tail,
+                        ends_mid_line,
+                    } => {
+                        let next_line = fold_codex_trace_lines(
+                            &mut self.index,
+                            &bundle_dir,
+                            thread_id,
+                            &text,
+                            start.lines,
+                        );
+                        self.cursors.insert(
+                            path,
+                            CodexTraceFileCursor {
+                                bytes: start.bytes + consumed,
+                                lines: next_line,
+                                modified,
+                                tail,
+                                mid_line: ends_mid_line,
+                            },
+                        );
+                        appended = true;
+                    }
+                    TraceTailRead::Pending => {
+                        // No consumable new content yet (partial flush) or
+                        // unreadable — keep the cursor and retry next poll.
+                    }
+                    TraceTailRead::Rewritten => {
+                        rewritten = true;
+                        break;
+                    }
+                }
+            }
+            if rewritten {
+                self.clear_folded_state();
                 continue;
-            };
-            let next_line =
-                fold_codex_trace_lines(&mut self.index, &bundle_dir, thread_id, &text, start.lines);
-            self.cursors.insert(
-                path,
-                CodexTraceFileCursor {
-                    bytes: start.bytes + consumed,
-                    lines: next_line,
-                },
-            );
-            appended = true;
+            }
+            if appended {
+                self.index.requests.sort_by(codex_request_order_cmp);
+            }
+            return Ok(());
         }
-        if appended {
-            self.index.requests.sort_by(codex_request_order_cmp);
-        }
+        // Both passes bailed — only possible under an actively concurrent
+        // rewriter; the folded state is cleared and the next poll settles.
         Ok(())
     }
 
@@ -769,7 +860,7 @@ impl CodexTraceIndexCache {
         &mut self,
         root: &Path,
         thread_id: Option<&str>,
-    ) -> Result<Vec<(PathBuf, PathBuf, u64)>, CallerError> {
+    ) -> Result<Vec<(PathBuf, PathBuf, u64, Option<SystemTime>)>, CallerError> {
         let bundle_dirs = self.collect_bundle_dirs(root, thread_id).await?;
         let mut files = Vec::with_capacity(bundle_dirs.len());
         for bundle_dir in bundle_dirs {
@@ -777,14 +868,16 @@ impl CodexTraceIndexCache {
             let Ok(metadata) = tokio::fs::metadata(&path).await else {
                 continue;
             };
-            files.push((bundle_dir, path, metadata.len()));
+            let modified = metadata.modified().ok();
+            files.push((bundle_dir, path, metadata.len(), modified));
         }
         Ok(files)
     }
 
     /// Enumerate the archive's bundle dirs: the primary root fresh every
-    /// call (the live session's bundles land there), the cross-session
-    /// auxiliary sweep from cache unless the logs root's mtime moved.
+    /// call (the live session's bundles land there); auxiliary roots from
+    /// the cached sweep, each re-validated with one stat and re-enumerated
+    /// only when its own mtime moved ([`CodexAuxBundleDirs`]).
     async fn collect_bundle_dirs(
         &mut self,
         root: &Path,
@@ -793,30 +886,88 @@ impl CodexTraceIndexCache {
         let mut bundle_dirs = Vec::new();
         let mut seen = HashSet::new();
         collect_codex_bundle_dirs_in(root, thread_id, true, &mut bundle_dirs, &mut seen).await?;
-        if thread_id.is_some() {
-            if let Some(logs_root) = codex_logs_root_for_trace_root(root) {
-                let modified = tokio::fs::metadata(&logs_root)
+        let Some(thread_id_present) = thread_id else {
+            return Ok(bundle_dirs);
+        };
+        let Some(logs_root) = codex_logs_root_for_trace_root(root) else {
+            return Ok(bundle_dirs);
+        };
+
+        let logs_modified = tokio::fs::metadata(&logs_root)
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        let root_list_current = self
+            .aux_bundles
+            .as_ref()
+            .is_some_and(|aux| aux.logs_root == logs_root && aux.modified == logs_modified);
+        if !root_list_current {
+            // Session dirs changed (or first sweep): rebuild the ROOT LIST,
+            // carrying over per-root state so unchanged roots keep their
+            // enumeration.
+            let mut previous: HashMap<PathBuf, CodexAuxTraceRoot> = self
+                .aux_bundles
+                .take()
+                .map(|aux| {
+                    aux.roots
+                        .into_iter()
+                        .map(|root| (root.trace_root.clone(), root))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut roots = Vec::new();
+            if let Ok(mut sessions) = tokio::fs::read_dir(&logs_root).await {
+                while let Ok(Some(entry)) = sessions.next_entry().await {
+                    let file_type = match entry.file_type().await {
+                        Ok(file_type) => file_type,
+                        Err(_) => continue,
+                    };
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let trace_root = entry.path().join("model-request-traces");
+                    if trace_root == root {
+                        continue;
+                    }
+                    roots.push(previous.remove(&trace_root).unwrap_or(CodexAuxTraceRoot {
+                        trace_root,
+                        modified: None,
+                        bundle_dirs: Vec::new(),
+                    }));
+                }
+            }
+            self.aux_bundles = Some(CodexAuxBundleDirs {
+                logs_root,
+                modified: logs_modified,
+                roots,
+            });
+        }
+
+        if let Some(aux) = self.aux_bundles.as_mut() {
+            for aux_root in aux.roots.iter_mut() {
+                // One stat per known root: absent stays absent cheaply; a
+                // trace root (or bundle inside it) created after the sweep
+                // moves the mtime and re-enumerates just that root.
+                let modified = tokio::fs::metadata(&aux_root.trace_root)
                     .await
                     .ok()
                     .and_then(|metadata| metadata.modified().ok());
-                let cached = self
-                    .aux_bundles
-                    .as_ref()
-                    .is_some_and(|aux| aux.logs_root == logs_root && aux.modified == modified);
-                if !cached {
-                    let aux_dirs =
-                        collect_codex_aux_bundle_dirs(&logs_root, root, thread_id).await?;
-                    self.aux_bundles = Some(CodexAuxBundleDirs {
-                        logs_root,
-                        modified,
-                        bundle_dirs: aux_dirs,
-                    });
+                if modified != aux_root.modified {
+                    aux_root.bundle_dirs.clear();
+                    let mut root_seen = HashSet::new();
+                    collect_codex_bundle_dirs_in(
+                        &aux_root.trace_root,
+                        Some(thread_id_present),
+                        false,
+                        &mut aux_root.bundle_dirs,
+                        &mut root_seen,
+                    )
+                    .await?;
+                    aux_root.modified = modified;
                 }
-                if let Some(aux) = self.aux_bundles.as_ref() {
-                    for bundle_dir in &aux.bundle_dirs {
-                        if seen.insert(bundle_dir.clone()) {
-                            bundle_dirs.push(bundle_dir.clone());
-                        }
+                for bundle_dir in &aux_root.bundle_dirs {
+                    if seen.insert(bundle_dir.clone()) {
+                        bundle_dirs.push(bundle_dir.clone());
                     }
                 }
             }
@@ -878,26 +1029,90 @@ impl CodexTraceIndexCache {
     }
 }
 
-/// Read the consumable lines appended to `path` past `offset`
-/// ([`consumable_jsonl_prefix`]). Returns the consumed text and its byte
-/// length; `None` when nothing consumable arrived (or the file cannot be
-/// read). Never consumes a partially flushed trailing line.
-async fn read_new_complete_lines(path: &Path, offset: u64) -> Option<(String, u64)> {
+/// Outcome of one append read against a cursor.
+enum TraceTailRead {
+    /// New consumable content: the text to fold, the bytes consumed past the
+    /// cursor, the new trailing verification window, and whether the region
+    /// ended without a newline.
+    Appended {
+        text: String,
+        consumed: u64,
+        tail: Vec<u8>,
+        ends_mid_line: bool,
+    },
+    /// Nothing consumable yet (partial flush, unreadable, or a non-UTF-8
+    /// tail): keep the cursor and retry next poll. The historical full scan
+    /// skipped a non-UTF-8 file wholesale; not advancing lands in the same
+    /// place.
+    Pending,
+    /// The bytes before the cursor no longer match — the file was rewritten
+    /// (recreated shorter and regrown past the cursor between polls).
+    Rewritten,
+}
+
+/// Read the consumable content appended to `path` past `cursor`, verifying
+/// the cursor's trailing window first and clamping the read to the caller's
+/// stat snapshot (`stat_len`) so the recorded mtime stays paired with the
+/// consumed length.
+async fn read_trace_tail(
+    path: &Path,
+    cursor: &CodexTraceFileCursor,
+    stat_len: u64,
+) -> TraceTailRead {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    if offset > 0 {
-        file.seek(std::io::SeekFrom::Start(offset)).await.ok()?;
+    let overlap = cursor.tail.len();
+    let seek_to = cursor.bytes - overlap as u64;
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return TraceTailRead::Pending;
+    };
+    let mut file = file;
+    if seek_to > 0 && file.seek(std::io::SeekFrom::Start(seek_to)).await.is_err() {
+        return TraceTailRead::Pending;
     }
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await.ok()?;
-    let consumed = consumable_jsonl_prefix(&buf)?;
-    buf.truncate(consumed);
-    // Trace files are serde-written JSON and therefore valid UTF-8; on the
-    // pathological non-UTF-8 file the historical full scan skipped the whole
-    // file, and skipping without advancing the cursor lands in the same
-    // place.
-    let text = String::from_utf8(buf).ok()?;
-    Some((text, consumed as u64))
+    if (&mut file)
+        .take(stat_len - seek_to)
+        .read_to_end(&mut buf)
+        .await
+        .is_err()
+    {
+        return TraceTailRead::Pending;
+    }
+    if buf.len() < overlap {
+        return TraceTailRead::Rewritten;
+    }
+    if buf[..overlap] != cursor.tail[..] {
+        return TraceTailRead::Rewritten;
+    }
+
+    let mut new = &buf[overlap..];
+    // A previously consumed unterminated JSON tail was folded as one
+    // complete line; when its newline finally lands, swallow it without
+    // counting a line so order indices match a from-scratch enumerate.
+    let mut skipped_newline = 0usize;
+    if cursor.mid_line {
+        if let Some((b'\n', rest)) = new.split_first() {
+            new = rest;
+            skipped_newline = 1;
+        }
+    }
+    let consumed_new = consumable_jsonl_prefix(new).unwrap_or(0);
+    if consumed_new == 0 && skipped_newline == 0 {
+        return TraceTailRead::Pending;
+    }
+    let region = &new[..consumed_new];
+    let ends_mid_line = consumed_new > 0 && region.last() != Some(&b'\n');
+    let Ok(text) = std::str::from_utf8(region) else {
+        return TraceTailRead::Pending;
+    };
+    let consumed_in_buf = overlap + skipped_newline + consumed_new;
+    let window_start = consumed_in_buf.saturating_sub(TRACE_CURSOR_TAIL_WINDOW);
+    TraceTailRead::Appended {
+        text: text.to_string(),
+        consumed: (skipped_newline + consumed_new) as u64,
+        tail: buf[window_start..consumed_in_buf].to_vec(),
+        ends_mid_line,
+    }
 }
 
 /// The byte length of the foldable JSONL prefix of `buf`: every complete
@@ -1018,38 +1233,28 @@ async fn collect_codex_bundle_dirs_in(
     Ok(())
 }
 
-/// Sweep every OTHER session's `model-request-traces` root under the logs
-/// root for bundle dirs matching the thread. Expensive against a large
-/// permanent history — callers cache the result behind the logs root's
-/// mtime ([`CodexAuxBundleDirs`]).
-async fn collect_codex_aux_bundle_dirs(
-    logs_root: &Path,
-    primary_root: &Path,
-    thread_id: Option<&str>,
-) -> Result<Vec<PathBuf>, CallerError> {
-    let mut trace_roots = Vec::new();
-    if let Ok(mut sessions) = tokio::fs::read_dir(logs_root).await {
-        while let Ok(Some(entry)) = sessions.next_entry().await {
-            let file_type = match entry.file_type().await {
-                Ok(file_type) => file_type,
-                Err(_) => continue,
-            };
-            if file_type.is_dir() {
-                let trace_root = entry.path().join("model-request-traces");
-                if trace_root != primary_root {
-                    trace_roots.push(trace_root);
-                }
+/// True when the cached resolved chain may serve resolutions against the
+/// current index: it is complete, or its unresolved tail is STILL
+/// unresolvable. A tail that became resolvable (the response/request events
+/// arrived after the cache was built) must not be served — the caller
+/// re-walks so the newly available history is included. A cycle-truncated
+/// chain keeps re-walking (its repeated id is resolvable by construction);
+/// cycles only occur in corrupt traces and the walk stays cycle-bounded.
+fn codex_resolved_chain_current(index: &CodexTraceIndex, cached: &CodexResolvedChain) -> bool {
+    match cached.unresolved_previous_response_id.as_deref() {
+        None => true,
+        Some(response_id) => match index.responses_by_id.get(response_id) {
+            None => true,
+            Some(response_ref) => {
+                !index
+                    .requests_by_call
+                    .contains_key(&codex_trace_call_key_parts(
+                        &response_ref.bundle_dir,
+                        &response_ref.inference_call_id,
+                    ))
             }
-        }
+        },
     }
-
-    let mut bundle_dirs = Vec::new();
-    let mut seen = HashSet::new();
-    for trace_root in trace_roots {
-        collect_codex_bundle_dirs_in(&trace_root, thread_id, false, &mut bundle_dirs, &mut seen)
-            .await?;
-    }
-    Ok(bundle_dirs)
 }
 
 pub(crate) fn read_codex_trace_index_sync(
@@ -1193,9 +1398,9 @@ pub(crate) async fn resolve_openai_responses_context_payload(
     chain_cache: &mut Option<CodexResolvedChain>,
 ) -> Result<serde_json::Value, CallerError> {
     let latest_call_key = codex_trace_call_key(latest_ref);
-    let cache_hit = chain_cache
-        .as_ref()
-        .is_some_and(|cached| cached.call_key == latest_call_key);
+    let cache_hit = chain_cache.as_ref().is_some_and(|cached| {
+        cached.call_key == latest_call_key && codex_resolved_chain_current(index, cached)
+    });
 
     let (resolved_input, unresolved_previous_response_id) = if cache_hit {
         // Unchanged latest request: reuse the cached resolution outright —
@@ -1230,10 +1435,9 @@ pub(crate) async fn resolve_openai_responses_context_payload(
                 walk_unresolved = Some(response_id);
                 break;
             }
-            if let Some(cached) = chain_cache
-                .as_ref()
-                .filter(|cached| cached.call_key == request_key)
-            {
+            if let Some(cached) = chain_cache.as_ref().filter(|cached| {
+                cached.call_key == request_key && codex_resolved_chain_current(index, cached)
+            }) {
                 // Append-only chain: the cached resolution already contains
                 // everything up to and including this request's own input;
                 // only its response payload is new to this walk.
@@ -2440,6 +2644,257 @@ mod tests {
         cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
         assert_eq!(cache.requests().len(), 2);
         assert_eq!(cache.requests()[1].inference_call_id, "inference:2");
+    }
+
+    fn set_mtime(path: &Path, secs_since_epoch: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_index_cache_rebuilds_on_same_length_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line_a = write_trace_request_line(
+            &trace,
+            10,
+            "inference:a",
+            "payloads/request-a.json",
+            &user_request_payload("first"),
+            None,
+        );
+        let line_b = write_trace_request_line(
+            &trace,
+            10,
+            "inference:b",
+            "payloads/request-b.json",
+            &user_request_payload("first"),
+            None,
+        );
+        assert_eq!(line_a.len(), line_b.len(), "test needs equal-length lines");
+        let trace_path = trace.join("trace.jsonl");
+        std::fs::write(&trace_path, format!("{line_a}\n")).unwrap();
+        set_mtime(&trace_path, 1_000);
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:a");
+
+        // Same length, different content, different mtime: an in-place
+        // rewrite the pure (len >= cursor) model would swallow forever.
+        std::fs::write(&trace_path, format!("{line_b}\n")).unwrap();
+        set_mtime(&trace_path, 2_000);
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:b");
+    }
+
+    #[tokio::test]
+    async fn trace_index_cache_detects_regrown_rewrite_via_tail_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line_a = write_trace_request_line(
+            &trace,
+            10,
+            "inference:a",
+            "payloads/request-a.json",
+            &user_request_payload("first"),
+            None,
+        );
+        // Same length as line_a but a different timestamp: serde_json
+        // serializes keys alphabetically, so `wall_time_unix_ms` is the
+        // line's trailing field — the difference lands inside the cursor's
+        // tail window, which is what the window verifies.
+        let line_b = write_trace_request_line(
+            &trace,
+            15,
+            "inference:b",
+            "payloads/request-b.json",
+            &user_request_payload("first"),
+            None,
+        );
+        let line_c = write_trace_request_line(
+            &trace,
+            20,
+            "inference:c",
+            "payloads/request-c.json",
+            &user_request_payload("second"),
+            None,
+        );
+        let trace_path = trace.join("trace.jsonl");
+        std::fs::write(&trace_path, format!("{line_a}\n")).unwrap();
+        set_mtime(&trace_path, 1_000);
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:a");
+
+        // Recreated with different content and regrown PAST the old cursor
+        // between polls: (len, mtime) alone reads as a pure append, but the
+        // bytes at the cursor no longer match the cursor's tail window.
+        std::fs::write(&trace_path, format!("{line_b}\n{line_c}\n")).unwrap();
+        set_mtime(&trace_path, 2_000);
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        let call_ids: Vec<&str> = cache
+            .requests()
+            .iter()
+            .map(|request| request.inference_call_id.as_str())
+            .collect();
+        assert_eq!(call_ids, vec!["inference:b", "inference:c"]);
+    }
+
+    #[tokio::test]
+    async fn aux_root_probe_discovers_bundle_created_after_sweep() {
+        let logs = tempfile::tempdir().unwrap();
+        let primary = logs
+            .path()
+            .join("session-current")
+            .join("model-request-traces");
+        std::fs::create_dir_all(&primary).unwrap();
+        let bundle = primary.join("trace-thread-abc");
+        let line = write_trace_request_line(
+            &bundle,
+            10,
+            "inference:1",
+            "payloads/request-1.json",
+            &user_request_payload("current"),
+            None,
+        );
+        std::fs::write(bundle.join("trace.jsonl"), format!("{line}\n")).unwrap();
+        // Another session dir exists but has no traces yet.
+        let old_session = logs.path().join("session-old");
+        std::fs::create_dir_all(&old_session).unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(&primary, Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 1);
+
+        // The old session gains a matching bundle WITHOUT any change to the
+        // logs root's own entry list — the per-root probe must find it.
+        let old_bundle = old_session
+            .join("model-request-traces")
+            .join("trace-thread-abc");
+        let old_line = write_trace_request_line(
+            &old_bundle,
+            5,
+            "inference:0",
+            "payloads/request-0.json",
+            &user_request_payload("earlier"),
+            None,
+        );
+        std::fs::write(old_bundle.join("trace.jsonl"), format!("{old_line}\n")).unwrap();
+
+        cache.refresh(&primary, Some("thread-abc")).await.unwrap();
+        let call_ids: Vec<&str> = cache
+            .requests()
+            .iter()
+            .map(|request| request.inference_call_id.as_str())
+            .collect();
+        assert_eq!(call_ids, vec!["inference:0", "inference:1"]);
+    }
+
+    #[tokio::test]
+    async fn chain_cache_retries_once_unresolved_tail_becomes_resolvable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line1 = write_trace_request_line(
+            &trace,
+            10,
+            "inference:1",
+            "payloads/request-1.json",
+            &user_request_payload("first user message"),
+            None,
+        );
+        let line2 = write_trace_request_line(
+            &trace,
+            30,
+            "inference:2",
+            "payloads/request-2.json",
+            &user_request_payload("second user message"),
+            Some("resp_1"),
+        );
+        // The response completion event for resp_1 has not landed yet.
+        std::fs::write(trace.join("trace.jsonl"), format!("{line1}\n{line2}\n")).unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        let snapshot = cache
+            .latest_snapshot(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["unresolved_previous_response_id"],
+            serde_json::json!("resp_1")
+        );
+
+        // The completion event (and payload) arrive: the cached partial
+        // chain must not be served — the tail is resolvable now.
+        let response_line = write_trace_response_line(
+            &trace,
+            20,
+            "inference:1",
+            "resp_1",
+            "payloads/response-1.json",
+            "first assistant reply",
+        );
+        let mut contents = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+        contents.push_str(&format!("{response_line}\n"));
+        std::fs::write(trace.join("trace.jsonl"), &contents).unwrap();
+
+        let snapshot = cache
+            .latest_snapshot(tmp.path(), Some("thread-abc"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.payload["input"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            snapshot.payload["_intendant_context"]["unresolved_previous_response_id"],
+            serde_json::Value::Null
+        );
+        let rendered = serde_json::to_string(&snapshot.payload).unwrap();
+        assert!(rendered.contains("first user message"));
+        assert!(rendered.contains("first assistant reply"));
+    }
+
+    #[tokio::test]
+    async fn consumed_unterminated_tail_keeps_line_indices_aligned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line_a = write_trace_request_line(
+            &trace,
+            10,
+            "inference:a",
+            "payloads/request-a.json",
+            &user_request_payload("first"),
+            None,
+        );
+        let line_b = write_trace_request_line(
+            &trace,
+            10,
+            "inference:b",
+            "payloads/request-b.json",
+            &user_request_payload("second"),
+            None,
+        );
+        // Valid-JSON unterminated tail: consumed as line 0.
+        std::fs::write(trace.join("trace.jsonl"), &line_a).unwrap();
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests()[0].order, (10, 0));
+
+        // The newline lands together with the next line. A from-scratch
+        // enumerate gives line_b index 1; the incremental fold must swallow
+        // the deferred newline without counting a line. Identical
+        // timestamps make the assertion bite through the sort tie-break.
+        let mut contents = std::fs::read_to_string(trace.join("trace.jsonl")).unwrap();
+        contents.push_str(&format!("\n{line_b}\n"));
+        std::fs::write(trace.join("trace.jsonl"), &contents).unwrap();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests().len(), 2);
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:a");
+        assert_eq!(cache.requests()[1].inference_call_id, "inference:b");
+        assert_eq!(cache.requests()[1].order, (10, 1));
     }
 
     #[tokio::test]
