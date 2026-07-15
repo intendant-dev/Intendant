@@ -225,7 +225,7 @@ fn check_decode(vector: &Json) -> Result<(), String> {
 /// engine's fixpoint re-evaluation makes arrival order immaterial,
 /// which is exactly what the standard asserts), identical final
 /// state required, then per_item and trace comparison.
-fn run_semantics(vector: &Json) -> SemStatus {
+pub fn run_semantics(vector: &Json) -> SemStatus {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
     let run = match kind {
         "fold" => run_fold_vector(vector),

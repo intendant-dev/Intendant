@@ -57,3 +57,25 @@ jobs:
         run: |
           cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null
           git diff --exit-code -- rfcs/owner-plane/vectors rfcs/owner-plane/coverage
+
+  # The D-203-funded per-OS portable-storage execution lane
+  # (execution-lanes-plan.md, lane 2): every storage-annotated vector
+  # byte-round-trips through real files, crash cuts run as real
+  # truncations, and the lock matrix runs across two REAL processes
+  # holding OS advisory locks — on all three OSes. Portable subset
+  # only: the Gate-B production concerns (fsync ordering, keystores,
+  # IndexedDB failure/eviction, engine matrices) stay out by design.
+  storage-lane:
+    name: portable storage execution (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: storage lane (real files, truncations, cross-process locks)
+        run: cargo run --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin storage_lane
