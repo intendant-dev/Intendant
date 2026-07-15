@@ -704,6 +704,16 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::WorktreesClean => {
+                return handle_worktrees_clean(
+                    stream,
+                    route_body,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::WorktreesMerge => {
                 return handle_worktrees_merge(stream, route_body, worktree_inventory_cache).await;
             }

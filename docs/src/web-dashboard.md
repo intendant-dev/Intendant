@@ -510,8 +510,17 @@ directory is safe to delete; it rebuilds on the next scan.
   (read-only cards; clicking one hands off to the peer's own dashboard,
   where the peer's own auth applies).
 - **Deep Search** — search across session history.
-- **Worktrees** — the git worktrees in use by sub-agents (same card +
-  Show-more treatment).
+- **Worktrees** — the git worktree inventory (same card + Show-more
+  treatment): per-checkout size, merge/dirty state, and safety verdicts;
+  aggregate tiles including **free disk** on the tightest worktree-hosting
+  volume (amber under 10% free, rose under 5%) and **reclaimable** build
+  output; and **related-session chips** — the sessions observed inside
+  each checkout, supervised and raw codex/claude alike. Clicking a chip
+  focuses the live session window when one exists, otherwise it lands on
+  Recent with the ID prefilled. Checkouts with a CACHEDIR.TAG-marked Cargo
+  `target/` offer **Clean target/** — delete the build directory to
+  reclaim its bytes without removing the worktree (sources and git state
+  untouched; a warning notes active sessions first).
 - **New Session** — start a fresh session from the dashboard.
   Internal-agent launches get an **Execution** control — *Auto* (the
   task-size heuristic decides), *Orchestrate* (delegates to supervised
@@ -1549,7 +1558,7 @@ family (sub-routes elided where the family is uniform):
 | `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
-| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,merge}` | Agent worktree inventory and lifecycle (merge = session-linked worktree finish card) |
+| `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,clean,merge}` | Agent worktree inventory and lifecycle (clean = reclaim a checkout's Cargo target/; merge = session-linked worktree finish card) |
 | `GET /connect/{bootstrap,status}`, `POST /connect/dashboard/{offer,ice,close}` | Daemon-origin WebRTC control bootstrap: certless only on loopback, remote callers require direct mTLS; fleet SNI and hosted Connect browser APIs cannot open it |
 
 ### Declared API routes
@@ -1625,6 +1634,7 @@ shell only.
 | GET | `/api/managed-context/fission` | SessionInspect | own origin | none | Managed-context fission state |
 | POST | `/api/worktrees/inspect` | SessionInspect | own origin | bounded | Inspect one worktree (branch, ahead/behind, dirty state) |
 | POST | `/api/worktrees/remove` | SessionManage | own origin | bounded | Remove a worktree from the inventory |
+| POST | `/api/worktrees/clean` | SessionManage | own origin | bounded | Delete a worktree's Cargo target/ dir (CACHEDIR.TAG-gated) to reclaim disk, keeping the checkout |
 | POST | `/api/worktrees/merge` | SessionManage | own origin | bounded | Merge a session's linked worktree branch into its base checkout, then remove the checkout |
 | POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |

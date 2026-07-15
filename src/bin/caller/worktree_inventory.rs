@@ -51,6 +51,13 @@ pub struct WorktreeScanRoot {
     pub repo_count: usize,
     pub truncated: bool,
     pub error: Option<String>,
+    /// Free/total capacity of the volume holding this root (existing roots
+    /// only) — the "can I still write here?" signal next to the worktree
+    /// sizes. `None` when the root is missing or the volume query fails.
+    #[serde(default)]
+    pub volume_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -64,6 +71,18 @@ pub struct WorktreeSummary {
     pub stale: usize,
     pub cleanup_candidates: usize,
     pub truncated_sizes: usize,
+    /// Sum of the entries' `reclaimable_bytes`: disk the clean endpoint
+    /// could free without removing any checkout.
+    #[serde(default)]
+    pub reclaimable_bytes: u64,
+    /// The tightest volume hosting the scanned worktrees: free/total of
+    /// whichever such volume has the least free space (what a full disk
+    /// hits first). Worktrees usually share one volume, in which case this
+    /// is simply that volume's capacity.
+    #[serde(default)]
+    pub volume_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub volume_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +122,11 @@ pub struct WorktreeEntry {
     pub file_count: u64,
     pub dir_count: u64,
     pub size_truncated: bool,
+    /// Bytes under the worktree's top-level `target/` when it is a real
+    /// directory carrying Cargo's `CACHEDIR.TAG` marker — build output the
+    /// clean endpoint can delete without touching sources. 0 otherwise.
+    #[serde(default)]
+    pub reclaimable_bytes: u64,
     pub active_sessions: usize,
     pub related_session_count: usize,
     pub related_sessions: Vec<RelatedSession>,
@@ -132,6 +156,27 @@ pub struct WorktreeInspectRequest {
     pub repo_root: PathBuf,
     pub path: PathBuf,
     pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeCleanRequest {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+    pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeCleanResponse {
+    pub ok: bool,
+    pub path: PathBuf,
+    pub repo_root: PathBuf,
+    pub branch: Option<String>,
+    /// Bytes actually reclaimed (re-measured on partial deletion).
+    pub freed_bytes: u64,
+    /// True when some entries survived the delete (Windows file locks,
+    /// permissions); the survivors and cause are described in `detail`.
+    pub partial: bool,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,8 +254,29 @@ struct TreeMeasure {
     bytes: u64,
     files: u64,
     dirs: u64,
+    /// Bytes attributed to the tree's top-level `target/` dir when it is a
+    /// CACHEDIR.TAG-marked Cargo build dir (see `cargo_target_dir`).
+    target_bytes: u64,
     latest_mtime: Option<SystemTime>,
     truncated: bool,
+}
+
+/// The worktree's top-level `target/` when it is deletable build output: a
+/// real directory (never a symlink — deleting through one would reach
+/// outside the checkout) carrying the `CACHEDIR.TAG` marker Cargo writes
+/// into every target dir it creates. The marker distinguishes Cargo build
+/// output from a source directory that merely happens to be named
+/// `target/` (e.g. Maven's).
+fn cargo_target_dir(worktree_root: &Path) -> Option<PathBuf> {
+    let target = worktree_root.join("target");
+    let meta = std::fs::symlink_metadata(&target).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    if !target.join("CACHEDIR.TAG").is_file() {
+        return None;
+    }
+    Some(target)
 }
 
 #[derive(Debug)]
@@ -597,8 +663,45 @@ fn scan_worktrees_with_size_budget(
         repos: repo_count,
         ..WorktreeSummary::default()
     };
+    // Headline capacity = the tightest volume actually hosting scanned
+    // worktrees. (A roots-based figure would let a session-cwd scan root on
+    // an unrelated, nearly-full mount skew the headline red.) Volumes are
+    // deduped by device id where Metadata exposes one, else by path prefix
+    // (Windows drive letters), so the query runs once per volume, not per
+    // worktree.
+    let mut seen_volumes: HashSet<String> = HashSet::new();
+    for wt in &worktrees {
+        let volume_key = std::fs::symlink_metadata(&wt.path)
+            .ok()
+            .map(|meta| crate::platform::metadata_dev_ino(&meta).0)
+            .filter(|dev| *dev != 0)
+            .map(|dev| format!("dev:{dev}"))
+            .unwrap_or_else(|| {
+                wt.path
+                    .components()
+                    .next()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_else(|| wt.path.to_string_lossy().into_owned())
+            });
+        if !seen_volumes.insert(volume_key) {
+            continue;
+        }
+        let Some(volume) = crate::platform::volume_space(&wt.path) else {
+            continue;
+        };
+        if summary
+            .volume_free_bytes
+            .is_none_or(|current| volume.free_bytes < current)
+        {
+            summary.volume_free_bytes = Some(volume.free_bytes);
+            summary.volume_total_bytes = Some(volume.total_bytes);
+        }
+    }
     for wt in &worktrees {
         summary.total_bytes = summary.total_bytes.saturating_add(wt.size_bytes);
+        summary.reclaimable_bytes = summary
+            .reclaimable_bytes
+            .saturating_add(wt.reclaimable_bytes);
         if wt.dirty {
             summary.dirty += 1;
         }
@@ -726,6 +829,115 @@ pub fn remove_worktree_if_safe(
     })
 }
 
+/// Dashboard reclaim path: delete a worktree's Cargo `target/` directory —
+/// keep the checkout, free the build output. Deliberately deletes the
+/// measured directory itself rather than spawning `cargo clean`: the
+/// daemon's environment may carry `CARGO_TARGET_DIR`, under which
+/// `cargo clean` would wipe a shared external build dir instead of this
+/// worktree's, so direct deletion is what frees exactly the bytes the
+/// inventory advertised.
+///
+/// Verification mirrors `remove_worktree_if_safe` (registered worktree of
+/// the claimed repo, optional HEAD pin), then requires the target dir to be
+/// a real, CACHEDIR.TAG-marked Cargo build dir (`cargo_target_dir`).
+/// Activity is intentionally NOT a refusal: cleaning under a live build
+/// only wastes that build — the frontend warns instead.
+pub fn clean_worktree_target_if_safe(
+    request: WorktreeCleanRequest,
+    session_hints: &[WorktreeSessionHint],
+) -> Result<WorktreeCleanResponse, String> {
+    if !request.repo_root.is_absolute() {
+        return Err("repo_root must be an absolute path".to_string());
+    }
+    if !request.path.is_absolute() {
+        return Err("worktree path must be an absolute path".to_string());
+    }
+
+    let repo_root = git_repo_root(&request.repo_root).ok_or_else(|| {
+        format!(
+            "{} is not the root of a Git repository",
+            request.repo_root.display()
+        )
+    })?;
+    if !same_path(&repo_root, &request.repo_root) {
+        return Err(format!(
+            "repo_root resolves to {}; scan again before cleaning",
+            repo_root.display()
+        ));
+    }
+
+    let (listed_root, listed) = list_repo_worktrees(&repo_root)?;
+    let raw = listed
+        .into_iter()
+        .find(|raw| same_path(&raw.path, &request.path))
+        .ok_or_else(|| {
+            format!(
+                "{} is not registered as a worktree for {}",
+                request.path.display(),
+                repo_root.display()
+            )
+        })?;
+
+    let repo_ctx = RepoContext::new(listed_root);
+    if let Some(head) = raw.head.clone() {
+        repo_ctx.prefill_head_times(std::slice::from_ref(&head));
+    }
+    let size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    let hint_index = HintIndex::new(session_hints);
+    let entry = enrich_worktree(raw, &repo_ctx, &hint_index, &size_budget)?;
+
+    if let Some(expected) = request
+        .expected_head
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if entry.head.as_deref() != Some(expected) {
+            return Err(
+                "worktree HEAD changed since the last scan; scan again before cleaning".to_string(),
+            );
+        }
+    }
+
+    let target = cargo_target_dir(&entry.path).ok_or_else(|| {
+        format!(
+            "{} has no deletable Cargo target dir (needs a real target/ directory carrying CACHEDIR.TAG)",
+            entry.path.display()
+        )
+    })?;
+
+    let before = measure_tree(&target);
+    let delete_error = std::fs::remove_dir_all(&target).err();
+    let (freed_bytes, partial, detail) = match delete_error {
+        None => (before.bytes, false, None),
+        Some(e) => {
+            // Windows file locks (a live build, rust-analyzer) abort
+            // remove_dir_all partway; report what actually got freed and
+            // leave the survivors for a later pass.
+            let after = if target.exists() {
+                measure_tree(&target)
+            } else {
+                TreeMeasure::default()
+            };
+            (
+                before.bytes.saturating_sub(after.bytes),
+                target.exists(),
+                Some(format!("some entries were not deleted: {e}")),
+            )
+        }
+    };
+
+    Ok(WorktreeCleanResponse {
+        ok: true,
+        path: entry.path,
+        repo_root: entry.repo_root,
+        branch: entry.branch,
+        freed_bytes,
+        partial,
+        detail,
+    })
+}
+
 fn default_scan_roots(
     home: &Path,
     project_root: Option<&Path>,
@@ -745,6 +957,11 @@ fn default_scan_roots(
             return;
         }
         let exists = path.exists();
+        let volume = if exists {
+            crate::platform::volume_space(&path)
+        } else {
+            None
+        };
         roots.push(WorktreeScanRoot {
             path,
             kind: kind.to_string(),
@@ -752,6 +969,8 @@ fn default_scan_roots(
             repo_count: 0,
             truncated: false,
             error: None,
+            volume_free_bytes: volume.map(|v| v.free_bytes),
+            volume_total_bytes: volume.map(|v| v.total_bytes),
         });
     };
 
@@ -1110,6 +1329,7 @@ fn enrich_worktree(
         file_count: tree.files,
         dir_count: tree.dirs,
         size_truncated: tree.truncated,
+        reclaimable_bytes: tree.target_bytes,
         active_sessions,
         related_session_count: related.len(),
         related_sessions: related.into_iter().take(8).collect(),
@@ -1556,7 +1776,6 @@ fn git_string(path: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-#[cfg(test)]
 fn measure_tree(root: &Path) -> TreeMeasure {
     let budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
     measure_tree_with_budget(root, &budget)
@@ -1568,6 +1787,10 @@ fn measure_tree_with_budget(root: &Path, size_budget: &SizeBudget) -> TreeMeasur
     let mut visited = 0usize;
     // Track inodes of multiply-linked files so each is counted once.
     let mut seen_inodes: HashSet<(u64, u64)> = HashSet::new();
+    // Attribute bytes under a CACHEDIR.TAG-marked top-level `target/` as
+    // reclaimable build output — same walk, no extra I/O beyond the one
+    // marker probe.
+    let target_dir = cargo_target_dir(root);
     while let Some(path) = stack.pop() {
         if visited >= MAX_SIZE_ENTRIES_PER_WORKTREE || !size_budget.take_entry() {
             measure.truncated = true;
@@ -1609,9 +1832,14 @@ fn measure_tree_with_budget(root: &Path, size_budget: &SizeBudget) -> TreeMeasur
             {
                 continue;
             }
-            measure.bytes = measure
-                .bytes
-                .saturating_add(crate::platform::metadata_on_disk_bytes(&meta));
+            let file_bytes = crate::platform::metadata_on_disk_bytes(&meta);
+            measure.bytes = measure.bytes.saturating_add(file_bytes);
+            if target_dir
+                .as_deref()
+                .is_some_and(|target| path.starts_with(target))
+            {
+                measure.target_bytes = measure.target_bytes.saturating_add(file_bytes);
+            }
         }
     }
     measure
@@ -1787,6 +2015,258 @@ mod tests {
         assert!(!found.dirty);
         assert!(found.safe_to_remove);
         assert!(found.labels.iter().any(|l| l == "cleanup-candidate"));
+    }
+
+    #[test]
+    fn scan_reports_volume_capacity_for_existing_roots() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+
+        let project_root = scan
+            .roots
+            .iter()
+            .find(|root| root.kind == "current-project")
+            .expect("current-project root present");
+        assert!(project_root.exists);
+        let free = project_root
+            .volume_free_bytes
+            .expect("existing root reports volume free space");
+        let total = project_root
+            .volume_total_bytes
+            .expect("existing root reports volume capacity");
+        assert!(total > 0);
+        assert!(free <= total);
+
+        // Missing roots stay None rather than reporting a random volume.
+        for root in scan.roots.iter().filter(|root| !root.exists) {
+            assert_eq!(root.volume_free_bytes, None);
+            assert_eq!(root.volume_total_bytes, None);
+        }
+
+        // The summary carries the tightest volume hosting scanned worktrees;
+        // the fixture repo guarantees at least one worktree exists.
+        assert!(!scan.worktrees.is_empty());
+        let summary_free = scan
+            .summary
+            .volume_free_bytes
+            .expect("summary reports free space when any worktree exists");
+        let summary_total = scan
+            .summary
+            .volume_total_bytes
+            .expect("summary reports capacity when any worktree exists");
+        assert!(summary_total > 0);
+        assert!(summary_free <= summary_total);
+    }
+
+    fn write_cargo_target(worktree: &Path, payload_bytes: usize) {
+        let target = worktree.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target.join("debug").join("blob.bin"),
+            vec![7u8; payload_bytes],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scan_attributes_marked_cargo_target_as_reclaimable() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let marked = tmp.path().join("marked-worktree");
+        let unmarked = tmp.path().join("unmarked-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "marked",
+                &marked.to_string_lossy(),
+                "main",
+            ],
+        );
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "unmarked",
+                &unmarked.to_string_lossy(),
+                "main",
+            ],
+        );
+        write_cargo_target(&marked, 64 * 1024);
+        // A directory merely named target/ (no CACHEDIR.TAG) is not build
+        // output and must not be counted reclaimable.
+        std::fs::create_dir_all(unmarked.join("target")).unwrap();
+        std::fs::write(unmarked.join("target").join("data.txt"), "source\n").unwrap();
+
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        let find = |branch: &str| {
+            scan.worktrees
+                .iter()
+                .find(|entry| entry.branch.as_deref() == Some(branch))
+                .unwrap_or_else(|| panic!("{branch} worktree found"))
+        };
+        let marked_entry = find("marked");
+        assert!(marked_entry.reclaimable_bytes >= 64 * 1024);
+        assert!(marked_entry.reclaimable_bytes <= marked_entry.size_bytes);
+        assert_eq!(find("unmarked").reclaimable_bytes, 0);
+        assert!(scan.summary.reclaimable_bytes >= marked_entry.reclaimable_bytes);
+    }
+
+    #[test]
+    fn clean_deletes_marked_target_and_keeps_sources() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("clean-target-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "clean-target",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        write_cargo_target(&wt, 32 * 1024);
+
+        let response = clean_worktree_target_if_safe(
+            WorktreeCleanRequest {
+                repo_root: canonical_child_path(&repo),
+                path: canonical_child_path(&wt),
+                expected_head: None,
+            },
+            &[],
+        )
+        .expect("clean succeeds");
+
+        assert!(response.ok);
+        assert!(!response.partial);
+        assert!(response.freed_bytes >= 32 * 1024);
+        assert!(!wt.join("target").exists(), "target dir is gone");
+        assert!(wt.join("README.md").exists(), "sources are untouched");
+        // The checkout is still a registered worktree afterwards.
+        let scan = scan_worktrees(tmp.path(), Some(&repo), &[]);
+        assert!(scan
+            .worktrees
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some("clean-target")));
+    }
+
+    #[test]
+    fn clean_refuses_unmarked_target() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("unmarked-clean-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "unmarked-clean",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target").join("data.txt"), "source\n").unwrap();
+
+        let err = clean_worktree_target_if_safe(
+            WorktreeCleanRequest {
+                repo_root: canonical_child_path(&repo),
+                path: canonical_child_path(&wt),
+                expected_head: None,
+            },
+            &[],
+        )
+        .expect_err("unmarked target must be refused");
+        assert!(err.contains("CACHEDIR.TAG"), "unexpected error: {err}");
+        assert!(wt.join("target").join("data.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clean_refuses_symlinked_target() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("symlink-clean-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "symlink-clean",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        let outside = tmp.path().join("outside-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("target")).unwrap();
+
+        let err = clean_worktree_target_if_safe(
+            WorktreeCleanRequest {
+                repo_root: canonical_child_path(&repo),
+                path: canonical_child_path(&wt),
+                expected_head: None,
+            },
+            &[],
+        )
+        .expect_err("symlinked target must be refused");
+        assert!(err.contains("CACHEDIR.TAG"), "unexpected error: {err}");
+        assert!(
+            outside.join("CACHEDIR.TAG").exists(),
+            "link target untouched"
+        );
+    }
+
+    #[test]
+    fn clean_refuses_stale_head_pin() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("stale-head-clean-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "stale-head-clean",
+                &wt.to_string_lossy(),
+                "main",
+            ],
+        );
+        write_cargo_target(&wt, 1024);
+
+        let err = clean_worktree_target_if_safe(
+            WorktreeCleanRequest {
+                repo_root: canonical_child_path(&repo),
+                path: canonical_child_path(&wt),
+                expected_head: Some("0000000000000000000000000000000000000000".to_string()),
+            },
+            &[],
+        )
+        .expect_err("stale head pin must be refused");
+        assert!(err.contains("HEAD changed"), "unexpected error: {err}");
+        assert!(wt.join("target").exists());
     }
 
     #[test]

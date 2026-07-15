@@ -241,6 +241,7 @@ pub(crate) enum RouteHandlerId {
     McFission,
     WorktreesInspect,
     WorktreesRemove,
+    WorktreesClean,
     WorktreesMerge,
     WorktreesScan,
     WorktreesList,
@@ -1114,6 +1115,15 @@ pub(crate) static ROUTES: &[Route] = &[
         "Remove a worktree from the inventory",
     )
     .with_tunnel(tunnel_method("api_worktrees_remove")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/worktrees/clean"),
+        PeerOperation::SessionManage,
+        BodyPolicy::Default,
+        RouteHandlerId::WorktreesClean,
+        "Delete a worktree's Cargo target/ dir (CACHEDIR.TAG-gated) to reclaim disk, keeping the checkout",
+    )
+    .with_tunnel(tunnel_method("api_worktrees_clean")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/worktrees/merge"),

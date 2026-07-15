@@ -7679,6 +7679,8 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sessions-aggregate .agg-value.v-yellow { color: var(--yellow); }
+.sessions-aggregate .agg-value.v-red { color: var(--red); }
 .sessions-aggregate .agg-card.loading {
   border-color: rgba(137, 180, 250, 0.22);
 }
@@ -7841,6 +7843,46 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--peach) 15%, transparent);
   color: var(--peach);
 }
+.worktree-card .wt-sessions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 0;
+}
+.worktree-card .wt-session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--surface2) 60%, transparent);
+  background: color-mix(in srgb, var(--surface1) 35%, transparent);
+  color: var(--subtext0);
+  font-family: inherit;
+}
+button.wt-session-chip { cursor: pointer; }
+button.wt-session-chip:hover,
+button.wt-session-chip:focus-visible {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.worktree-card .wt-session-chip.active {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+.worktree-card .wt-session-source {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+.worktree-card .wt-session-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.worktree-card .wt-session-status { color: var(--overlay1); }
+.worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 .worktree-card .wt-command {
   flex: 1 1 auto;
   min-width: 0;
@@ -16754,6 +16796,8 @@ html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value {
   letter-spacing: -.01em;
   color: var(--text);
 }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-yellow { color: var(--amber); }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-red { color: var(--rose); }
 html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-sub {
   margin-top: 3px;
   font-size: 10.5px;
@@ -17314,6 +17358,33 @@ html.ui-v2 #tab-sessions .worktree-card .wt-label.unknown-merge {
   background: rgba(var(--amber-rgb), .1);
   color: var(--amber);
 }
+html.ui-v2 #tab-sessions .worktree-card .wt-sessions { gap: 5px; margin: 8px 0 0; }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip {
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 10.5px;
+}
+html.ui-v2 #tab-sessions button.wt-session-chip:hover,
+html.ui-v2 #tab-sessions button.wt-session-chip:focus-visible {
+  border-color: var(--iris);
+  color: var(--text);
+  background: var(--surface-3);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active {
+  border-color: rgba(var(--amber-rgb), .5);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-source {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-id { font-family: var(--mono); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 html.ui-v2 #tab-sessions .worktree-card .wt-safety {
   margin: 8px 0;
   padding: 7px 10px;
@@ -27336,7 +27407,13 @@ function ui2WireComposerState() {
     const origSwitchTab = switchTab;
     switchTab = function (tabId) {
       const r = origSwitchTab.apply(this, arguments);
-      if (r !== false) applyForTab(tabId);
+      if (r !== false) {
+        applyForTab(tabId);
+        // Navigation seam for the composer satellites: tab context changes
+        // (the peek's Open-in-Activity label, future context-sensitive
+        // affordances) derive from this instead of each polling the DOM.
+        window.dispatchEvent(new CustomEvent('ui2:tab-changed', { detail: { tab: String(tabId || '') } }));
+      }
       return r;
     };
   }
@@ -27951,7 +28028,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '31871a386f03e4c3';
+const INTENDANT_APP_BUILD = 'c9799413fe5b0e7e';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -97092,7 +97169,7 @@ function renderAggregateStatTiles(el, cards) {
     labelEl.className = 'ui-stat-label agg-label';
     labelEl.textContent = c.label;
     const valueEl = document.createElement('div');
-    valueEl.className = 'ui-stat-value agg-value';
+    valueEl.className = 'ui-stat-value agg-value' + (c.valueClass ? ` ${c.valueClass}` : '');
     valueEl.textContent = c.value;
     card.appendChild(labelEl);
     card.appendChild(valueEl);
@@ -98204,12 +98281,44 @@ function renderWorktreesAggregate(scan, el) {
   const cards = [
     { label: 'Worktrees', value: Number(summary.worktrees || 0).toLocaleString() },
     { label: 'Disk', value: _fmtBytes(summary.total_bytes || 0) },
+  ];
+  const freeDisk = worktreeFreeDiskCard(summary);
+  if (freeDisk) cards.push(freeDisk);
+  if ((summary.reclaimable_bytes || 0) > 0) {
+    cards.push({
+      label: 'Reclaimable',
+      value: _fmtBytes(summary.reclaimable_bytes),
+      sub: 'cargo target/ dirs',
+      title: 'Build output the per-worktree Clean button can delete without removing any checkout',
+    });
+  }
+  cards.push(
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
     { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
     { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString(), sub: summary.cleanup_candidates > 0 ? 'safe to remove' : '' },
-  ];
+  );
   renderAggregateStatTiles(el, cards);
+}
+
+// Free-space tile for the tightest scanned volume. Tones follow proximity to
+// full: amber under 10% free, rose under 5% — the answer to "will the next
+// build fit?", not just how much the worktrees already consume.
+function worktreeFreeDiskCard(summary) {
+  const free = Number(summary?.volume_free_bytes);
+  const total = Number(summary?.volume_total_bytes);
+  if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) return null;
+  const ratio = free / total;
+  let valueClass = '';
+  if (ratio < 0.05) valueClass = 'v-red';
+  else if (ratio < 0.10) valueClass = 'v-yellow';
+  return {
+    label: 'Free disk',
+    value: _fmtBytes(free),
+    sub: `${Math.round(ratio * 100)}% of ${_fmtBytes(total)}`,
+    valueClass,
+    title: 'Free space on the volume hosting the scanned worktrees with the least room (what a full disk hits first)',
+  };
 }
 
 function worktreeDate(value) {
@@ -98276,6 +98385,102 @@ function shellQuote(value) {
 
 function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
+}
+
+// ── Related-session chips on worktree cards. The scan already ties each
+// worktree to the sessions observed inside it (supervised AND raw
+// codex/claude sessions, via the session catalog's observed-path hints);
+// the chips make that linkage navigable instead of a bare count.
+
+const WORKTREE_ACTIVE_SESSION_STATUSES = new Set(['running', 'in_progress', 'thinking']);
+
+// Gemini hints are project-level pseudo-entries, not sessions — nothing to
+// navigate to.
+function worktreeRelatedSessionNavigable(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  return !!sid && !sid.startsWith('gemini-project:');
+}
+
+function openWorktreeRelatedSession(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  if (!sid) return;
+  if (sessionWindows.has(sid)) {
+    focusSessionWindow(sid);
+    return;
+  }
+  // No live window: land on Sessions -> Recent with the ID in the search
+  // box — the catalog lists raw external sessions there too, so the row
+  // offers open/resume for supervised and unsupervised sessions alike.
+  routeTo('sessions', 'recent');
+  const search = document.getElementById('sessions-search');
+  if (search) {
+    search.value = sid;
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    search.focus();
+  }
+}
+
+function worktreeSessionChip(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  const status = String(rel?.status || '').trim();
+  const navigable = worktreeRelatedSessionNavigable(rel);
+  const active = WORKTREE_ACTIVE_SESSION_STATUSES.has(status);
+  const chip = document.createElement(navigable ? 'button' : 'span');
+  if (navigable) chip.type = 'button';
+  chip.className = 'wt-session-chip'
+    + (active ? ' active' : '')
+    + (navigable ? '' : ' static');
+
+  const source = normalizeAgentId(rel?.source || '') || String(rel?.source || '');
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'wt-session-source';
+  sourceEl.textContent = prettyAgentName(source) || source || 'session';
+  chip.appendChild(sourceEl);
+
+  const idEl = document.createElement('span');
+  idEl.className = 'wt-session-id';
+  idEl.textContent = sid.startsWith('gemini-project:')
+    ? sid.slice('gemini-project:'.length)
+    : (sid.length > 10 ? `${shortSessionId(sid)}…` : sid);
+  chip.appendChild(idEl);
+
+  if (status) {
+    const statusEl = document.createElement('span');
+    statusEl.className = 'wt-session-status';
+    statusEl.textContent = status;
+    chip.appendChild(statusEl);
+  }
+
+  const when = rel?.updated_at ? ` · ${fmtWorktreeMinute(rel.updated_at)}` : '';
+  chip.title = navigable
+    ? `Open session ${sid}${status ? ` (${status}${when})` : ''}`
+    : `${sid}${status ? ` (${status}${when})` : ''}`;
+  if (navigable) {
+    chip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openWorktreeRelatedSession(rel);
+    });
+  }
+  return chip;
+}
+
+function renderWorktreeSessionChips(wt) {
+  const related = Array.isArray(wt?.related_sessions) ? wt.related_sessions : [];
+  if (related.length === 0) return null;
+  const row = document.createElement('div');
+  row.className = 'wt-sessions';
+  for (const rel of related) {
+    row.appendChild(worktreeSessionChip(rel));
+  }
+  const total = Number(wt.related_session_count || 0);
+  if (total > related.length) {
+    const rest = document.createElement('span');
+    rest.className = 'wt-session-chip static wt-session-rest';
+    rest.textContent = `+${(total - related.length).toLocaleString()} more`;
+    rest.title = `${total.toLocaleString()} related sessions total; the inventory ships ${related.length} per worktree`;
+    row.appendChild(rest);
+  }
+  return row;
 }
 
 let worktreeInspectContext = null;
@@ -98540,6 +98745,26 @@ window.closeWorktreeInspectModal = closeWorktreeInspectModal;
 window.worktreeInspectOpenShell = worktreeInspectOpenShell;
 window.worktreeInspectOpenFiles = worktreeInspectOpenFiles;
 
+// QA readback (window.qa convention) + one explicit test hook: headless
+// probes can't ride the control tunnel (the first-visit forced scan is a
+// tunnel-only POST twin), so the worktrees pane exposes its rendered state
+// and a scan-injection hook that runs the exact production render path on
+// caller-supplied data.
+window.qa = Object.assign(window.qa || {}, {
+  worktreesPane: () => ({
+    tiles: [...document.querySelectorAll('#worktrees-aggregate .agg-card')]
+      .map(card => card.textContent.trim().replace(/\s+/g, ' ')),
+    chips: [...document.querySelectorAll('#worktrees-list .wt-session-chip')]
+      .map(chip => ({ tag: chip.tagName, text: chip.textContent.trim().replace(/\s+/g, ' ') })),
+    status: document.getElementById('worktrees-status')?.textContent || '',
+  }),
+  worktreesRenderScan: (scan) => {
+    _cachedWorktreeScan = scan;
+    renderWorktrees(scan);
+    return window.qa.worktreesPane();
+  },
+});
+
 function formatWorktreeDivergence(target, ahead, behind) {
   const label = target ? `${target} ` : '';
   return `${label}+${Number(ahead || 0).toLocaleString()} / -${Number(behind || 0).toLocaleString()}`;
@@ -98557,9 +98782,16 @@ function recomputeWorktreeSummary(scan) {
     stale: 0,
     cleanup_candidates: 0,
     truncated_sizes: 0,
+    reclaimable_bytes: 0,
+    // Volume capacity comes from the scan, not the rows; carry it through
+    // (it only goes stale by the removal that just freed space, in the
+    // conservative direction — the next scan refreshes it).
+    volume_free_bytes: scan?.summary?.volume_free_bytes,
+    volume_total_bytes: scan?.summary?.volume_total_bytes,
   };
   for (const wt of rows) {
     summary.total_bytes += Number(wt.size_bytes || 0);
+    summary.reclaimable_bytes += Number(wt.reclaimable_bytes || 0);
     if (wt.dirty) summary.dirty += 1;
     if (wt.merge_status === 'unmerged') summary.unmerged += 1;
     if ((wt.active_sessions || 0) > 0) summary.active += 1;
@@ -98588,6 +98820,75 @@ function setWorktreeRemoveButtonPending(button, state) {
     : mode === 'removing'
     ? 'Removing...'
     : 'Remove worktree...';
+}
+
+// Reclaim a worktree's Cargo target/ without removing the checkout — the
+// middle ground between keeping a fat worktree and deleting it. Cleans are
+// independent per-directory fs deletes, so a per-path pending set suffices
+// (no serialization queue like removals, which contend on git locks).
+const pendingWorktreeCleans = new Set();
+
+async function cleanWorktreeTarget(wt, button) {
+  const pathKey = String(wt.path || '');
+  if (!pathKey || pendingWorktreeCleans.has(pathKey)) return;
+  const activeWarning = (wt.active_sessions || 0) > 0
+    ? `\n\n${wt.active_sessions} session(s) look active in this worktree — a build running there will lose its progress and start over.`
+    : '';
+  const ok = await showDashboardConfirm({
+    title: 'Clean target/',
+    message:
+      `Delete the Cargo build directory of ${wt.branch || wt.head_short || wt.path}?\n\n` +
+      `Path: ${wt.path}/target\n` +
+      `Reclaims about ${_fmtBytes(wt.reclaimable_bytes || 0)}.`,
+    warning:
+      'Sources and git state are untouched; the next build recreates target/ from scratch.' +
+      activeWarning,
+    confirmLabel: 'Clean',
+  });
+  if (!ok) return;
+
+  pendingWorktreeCleans.add(pathKey);
+  if (button) {
+    button.disabled = true;
+    button.classList.add('pending');
+    button.textContent = 'Cleaning...';
+  }
+  setWorktreesActivityNotice('pending', `Cleaning ${wt.path}/target...`);
+  try {
+    const payload = { repo_root: wt.repo_root, path: wt.path, expected_head: wt.head || null };
+    // daemonApi (transport F2): a POST twin — no HTTP replay after an
+    // attempted tunnel send, matching the remove call above.
+    const r = await daemonApi.request('api_worktrees_clean', payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `worktree clean returned ${r.status}`);
+    }
+    const freed = Number(result.freed_bytes || 0);
+    if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+      const entry = _cachedWorktreeScan.worktrees.find(e => e.path === wt.path);
+      if (entry) {
+        entry.size_bytes = Math.max(0, Number(entry.size_bytes || 0) - freed);
+        entry.reclaimable_bytes = result.partial
+          ? Math.max(0, Number(entry.reclaimable_bytes || 0) - freed)
+          : 0;
+      }
+      recomputeWorktreeSummary(_cachedWorktreeScan);
+    }
+    const message = result.partial
+      ? `Cleaned ${_fmtBytes(freed)} from ${wt.path}/target; some entries survived (${result.detail || 'locked files'}).`
+      : `Cleaned ${wt.path}/target. Freed about ${_fmtBytes(freed)}.`;
+    setWorktreesStatus(message, result.partial ? 'error' : '');
+    setWorktreesActivityNotice(result.partial ? 'error' : 'ok', message, result.partial ? 0 : 3500);
+    showControlToast(result.partial ? 'error' : 'success', result.partial ? 'Target partially cleaned.' : 'Target cleaned.');
+  } catch (err) {
+    const message = err.message || 'Worktree clean failed';
+    setWorktreesStatus(message, 'error');
+    setWorktreesActivityNotice('error', message);
+    showControlToast('error', message);
+  } finally {
+    pendingWorktreeCleans.delete(pathKey);
+    if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+  }
 }
 
 async function removeWorktree(wt, button) {
@@ -98829,6 +99130,9 @@ function renderWorktreesList(scan, el) {
     };
     addMeta('repo', wt.repo_name);
     addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'v-green' : null);
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      addMeta('target/', _fmtBytes(wt.reclaimable_bytes), null, 'Cargo build output the Clean button can reclaim');
+    }
     addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
     addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
     addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'v-green' : (wt.merge_status === 'unmerged' ? 'v-red' : null));
@@ -98839,11 +99143,11 @@ function renderWorktreesList(scan, el) {
       addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
     }
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'v-red');
-    if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
-      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'v-yellow' : null);
-    }
     addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
     card.appendChild(meta);
+
+    const sessionsRow = renderWorktreeSessionChips(wt);
+    if (sessionsRow) card.appendChild(sessionsRow);
 
     const actions = document.createElement('div');
     actions.className = 'sc-actions';
@@ -98868,6 +99172,21 @@ function renderWorktreesList(scan, el) {
       openWorktreeInspect(wt);
     });
     actions.appendChild(inspectBtn);
+
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      const cleaning = pendingWorktreeCleans.has(pathKey);
+      const cleanBtn = document.createElement('button');
+      cleanBtn.className = 'ui-btn wt-clean-btn';
+      cleanBtn.textContent = cleaning ? 'Cleaning...' : `Clean target/ (${_fmtBytes(wt.reclaimable_bytes)})`;
+      cleanBtn.title = 'Delete the Cargo build directory to reclaim disk without removing the worktree. Sources and git state are untouched; the next build recreates it.';
+      cleanBtn.disabled = cleaning || !!removalState;
+      cleanBtn.classList.toggle('pending', cleaning);
+      cleanBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        cleanWorktreeTarget(wt, cleanBtn);
+      });
+      actions.appendChild(cleanBtn);
+    }
 
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);
@@ -102435,6 +102754,9 @@ function handleDisplayRequestResolved(d) {
   let peekBadge = null;
   let peekPhaseDot = null;
   let peekPhaseText = null;
+  let peekHeaderEl = null;
+  let peekOpenBtn = null;
+  let peekOpenLabelEl = null;
 
   let peekBoundSid = '';
   let peekBoundLog = null;
@@ -102631,6 +102953,7 @@ function handleDisplayRequestResolved(d) {
     if (!sid) return;
     peekFollow = true;
     peekRoot.hidden = false;
+    peekSyncOpenLabel();
     peekBind(sid);
     peekRenderTail();
   }
@@ -102652,11 +102975,47 @@ function handleDisplayRequestResolved(d) {
     if (peekList) peekList.replaceChildren();
   }
 
+  // "Open in Activity" is a lie when the user is ALREADY on Activity —
+  // there the action is really "reveal the target window in the crowd"
+  // (routeTo is a near-no-op; the scroll-into-view is the payload).
+  // Same action, honest words per context.
+  function peekSyncOpenLabel() {
+    if (!peekOpenBtn || !peekOpenLabelEl) return;
+    const pane = document.querySelector('.tab-pane.active');
+    const onActivity = !!pane && pane.id === 'tab-activity';
+    const label = onActivity ? 'Show session' : 'Open in Activity';
+    const title = onActivity
+      ? 'Scroll the target session window into view'
+      : 'Open the full transcript in Activity';
+    peekOpenLabelEl.textContent = label;
+    peekOpenBtn.title = title;
+    peekOpenBtn.setAttribute('aria-label', label);
+    if (peekHeaderEl) peekHeaderEl.title = title;
+  }
+
   function peekOpenInActivity() {
-    peekClose(false);
+    const sid = peekBoundSid;
+    // Dismissal latch on purpose: the user chose the full transcript
+    // surface — a live working edge must not reopen the peek over it
+    // (the latch clears when the streak ends or the target changes).
+    peekClose(true);
     if (typeof routeTo === 'function') routeTo('activity', 'log');
     if (typeof window.focusForegroundSessionWindow === 'function') {
       window.focusForegroundSessionWindow();
+    }
+    // Landing pulse: in a full grid the jump needs an unmistakable "here"
+    // — the target chip's element.animate idiom, sized for a window.
+    const win = (sid && typeof sessionWindows !== 'undefined') ? sessionWindows.get(sid) : null;
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (win && win.el && win.el.animate && !reduced) {
+      const iris = (getComputedStyle(document.documentElement).getPropertyValue('--iris-rgb') || '148, 130, 238').trim();
+      try {
+        win.el.animate([
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+          { boxShadow: `0 0 0 4px rgba(${iris}, .45)`, offset: 0.3 },
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+        ], { duration: 900, easing: 'ease-in-out' });
+      } catch (_) { /* Web Animations unavailable — the focus ring suffices */ }
     }
   }
 
@@ -102738,6 +103097,9 @@ function handleDisplayRequestResolved(d) {
     openBtn.title = 'Open the full transcript in Activity';
     openBtn.setAttribute('aria-label', 'Open in Activity');
     openBtn.innerHTML = icon('external', 12) + '<span class="ui2-peek-open-label">Open in Activity</span>';
+    peekHeaderEl = header;
+    peekOpenBtn = openBtn;
+    peekOpenLabelEl = openBtn.querySelector('.ui2-peek-open-label');
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -102843,6 +103205,12 @@ function handleDisplayRequestResolved(d) {
 
     window.addEventListener('ui2:composer-state', (e) => {
       if (((e && e.detail && e.detail.state) || '') === 'pill') peekClose(false);
+    });
+
+    // The peek survives expanded→expanded tab switches; keep the
+    // Open-in-Activity label honest for wherever the user now is.
+    window.addEventListener('ui2:tab-changed', () => {
+      if (peekIsOpen()) peekSyncOpenLabel();
     });
 
     if (typeof ui2Mirror === 'function') {

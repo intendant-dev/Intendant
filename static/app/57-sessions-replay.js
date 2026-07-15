@@ -163,12 +163,44 @@ function renderWorktreesAggregate(scan, el) {
   const cards = [
     { label: 'Worktrees', value: Number(summary.worktrees || 0).toLocaleString() },
     { label: 'Disk', value: _fmtBytes(summary.total_bytes || 0) },
+  ];
+  const freeDisk = worktreeFreeDiskCard(summary);
+  if (freeDisk) cards.push(freeDisk);
+  if ((summary.reclaimable_bytes || 0) > 0) {
+    cards.push({
+      label: 'Reclaimable',
+      value: _fmtBytes(summary.reclaimable_bytes),
+      sub: 'cargo target/ dirs',
+      title: 'Build output the per-worktree Clean button can delete without removing any checkout',
+    });
+  }
+  cards.push(
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
     { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
     { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString(), sub: summary.cleanup_candidates > 0 ? 'safe to remove' : '' },
-  ];
+  );
   renderAggregateStatTiles(el, cards);
+}
+
+// Free-space tile for the tightest scanned volume. Tones follow proximity to
+// full: amber under 10% free, rose under 5% — the answer to "will the next
+// build fit?", not just how much the worktrees already consume.
+function worktreeFreeDiskCard(summary) {
+  const free = Number(summary?.volume_free_bytes);
+  const total = Number(summary?.volume_total_bytes);
+  if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) return null;
+  const ratio = free / total;
+  let valueClass = '';
+  if (ratio < 0.05) valueClass = 'v-red';
+  else if (ratio < 0.10) valueClass = 'v-yellow';
+  return {
+    label: 'Free disk',
+    value: _fmtBytes(free),
+    sub: `${Math.round(ratio * 100)}% of ${_fmtBytes(total)}`,
+    valueClass,
+    title: 'Free space on the volume hosting the scanned worktrees with the least room (what a full disk hits first)',
+  };
 }
 
 function worktreeDate(value) {
@@ -235,6 +267,102 @@ function shellQuote(value) {
 
 function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
+}
+
+// ── Related-session chips on worktree cards. The scan already ties each
+// worktree to the sessions observed inside it (supervised AND raw
+// codex/claude sessions, via the session catalog's observed-path hints);
+// the chips make that linkage navigable instead of a bare count.
+
+const WORKTREE_ACTIVE_SESSION_STATUSES = new Set(['running', 'in_progress', 'thinking']);
+
+// Gemini hints are project-level pseudo-entries, not sessions — nothing to
+// navigate to.
+function worktreeRelatedSessionNavigable(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  return !!sid && !sid.startsWith('gemini-project:');
+}
+
+function openWorktreeRelatedSession(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  if (!sid) return;
+  if (sessionWindows.has(sid)) {
+    focusSessionWindow(sid);
+    return;
+  }
+  // No live window: land on Sessions -> Recent with the ID in the search
+  // box — the catalog lists raw external sessions there too, so the row
+  // offers open/resume for supervised and unsupervised sessions alike.
+  routeTo('sessions', 'recent');
+  const search = document.getElementById('sessions-search');
+  if (search) {
+    search.value = sid;
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    search.focus();
+  }
+}
+
+function worktreeSessionChip(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  const status = String(rel?.status || '').trim();
+  const navigable = worktreeRelatedSessionNavigable(rel);
+  const active = WORKTREE_ACTIVE_SESSION_STATUSES.has(status);
+  const chip = document.createElement(navigable ? 'button' : 'span');
+  if (navigable) chip.type = 'button';
+  chip.className = 'wt-session-chip'
+    + (active ? ' active' : '')
+    + (navigable ? '' : ' static');
+
+  const source = normalizeAgentId(rel?.source || '') || String(rel?.source || '');
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'wt-session-source';
+  sourceEl.textContent = prettyAgentName(source) || source || 'session';
+  chip.appendChild(sourceEl);
+
+  const idEl = document.createElement('span');
+  idEl.className = 'wt-session-id';
+  idEl.textContent = sid.startsWith('gemini-project:')
+    ? sid.slice('gemini-project:'.length)
+    : (sid.length > 10 ? `${shortSessionId(sid)}…` : sid);
+  chip.appendChild(idEl);
+
+  if (status) {
+    const statusEl = document.createElement('span');
+    statusEl.className = 'wt-session-status';
+    statusEl.textContent = status;
+    chip.appendChild(statusEl);
+  }
+
+  const when = rel?.updated_at ? ` · ${fmtWorktreeMinute(rel.updated_at)}` : '';
+  chip.title = navigable
+    ? `Open session ${sid}${status ? ` (${status}${when})` : ''}`
+    : `${sid}${status ? ` (${status}${when})` : ''}`;
+  if (navigable) {
+    chip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openWorktreeRelatedSession(rel);
+    });
+  }
+  return chip;
+}
+
+function renderWorktreeSessionChips(wt) {
+  const related = Array.isArray(wt?.related_sessions) ? wt.related_sessions : [];
+  if (related.length === 0) return null;
+  const row = document.createElement('div');
+  row.className = 'wt-sessions';
+  for (const rel of related) {
+    row.appendChild(worktreeSessionChip(rel));
+  }
+  const total = Number(wt.related_session_count || 0);
+  if (total > related.length) {
+    const rest = document.createElement('span');
+    rest.className = 'wt-session-chip static wt-session-rest';
+    rest.textContent = `+${(total - related.length).toLocaleString()} more`;
+    rest.title = `${total.toLocaleString()} related sessions total; the inventory ships ${related.length} per worktree`;
+    row.appendChild(rest);
+  }
+  return row;
 }
 
 let worktreeInspectContext = null;
@@ -499,6 +627,26 @@ window.closeWorktreeInspectModal = closeWorktreeInspectModal;
 window.worktreeInspectOpenShell = worktreeInspectOpenShell;
 window.worktreeInspectOpenFiles = worktreeInspectOpenFiles;
 
+// QA readback (window.qa convention) + one explicit test hook: headless
+// probes can't ride the control tunnel (the first-visit forced scan is a
+// tunnel-only POST twin), so the worktrees pane exposes its rendered state
+// and a scan-injection hook that runs the exact production render path on
+// caller-supplied data.
+window.qa = Object.assign(window.qa || {}, {
+  worktreesPane: () => ({
+    tiles: [...document.querySelectorAll('#worktrees-aggregate .agg-card')]
+      .map(card => card.textContent.trim().replace(/\s+/g, ' ')),
+    chips: [...document.querySelectorAll('#worktrees-list .wt-session-chip')]
+      .map(chip => ({ tag: chip.tagName, text: chip.textContent.trim().replace(/\s+/g, ' ') })),
+    status: document.getElementById('worktrees-status')?.textContent || '',
+  }),
+  worktreesRenderScan: (scan) => {
+    _cachedWorktreeScan = scan;
+    renderWorktrees(scan);
+    return window.qa.worktreesPane();
+  },
+});
+
 function formatWorktreeDivergence(target, ahead, behind) {
   const label = target ? `${target} ` : '';
   return `${label}+${Number(ahead || 0).toLocaleString()} / -${Number(behind || 0).toLocaleString()}`;
@@ -516,9 +664,16 @@ function recomputeWorktreeSummary(scan) {
     stale: 0,
     cleanup_candidates: 0,
     truncated_sizes: 0,
+    reclaimable_bytes: 0,
+    // Volume capacity comes from the scan, not the rows; carry it through
+    // (it only goes stale by the removal that just freed space, in the
+    // conservative direction — the next scan refreshes it).
+    volume_free_bytes: scan?.summary?.volume_free_bytes,
+    volume_total_bytes: scan?.summary?.volume_total_bytes,
   };
   for (const wt of rows) {
     summary.total_bytes += Number(wt.size_bytes || 0);
+    summary.reclaimable_bytes += Number(wt.reclaimable_bytes || 0);
     if (wt.dirty) summary.dirty += 1;
     if (wt.merge_status === 'unmerged') summary.unmerged += 1;
     if ((wt.active_sessions || 0) > 0) summary.active += 1;
@@ -547,6 +702,75 @@ function setWorktreeRemoveButtonPending(button, state) {
     : mode === 'removing'
     ? 'Removing...'
     : 'Remove worktree...';
+}
+
+// Reclaim a worktree's Cargo target/ without removing the checkout — the
+// middle ground between keeping a fat worktree and deleting it. Cleans are
+// independent per-directory fs deletes, so a per-path pending set suffices
+// (no serialization queue like removals, which contend on git locks).
+const pendingWorktreeCleans = new Set();
+
+async function cleanWorktreeTarget(wt, button) {
+  const pathKey = String(wt.path || '');
+  if (!pathKey || pendingWorktreeCleans.has(pathKey)) return;
+  const activeWarning = (wt.active_sessions || 0) > 0
+    ? `\n\n${wt.active_sessions} session(s) look active in this worktree — a build running there will lose its progress and start over.`
+    : '';
+  const ok = await showDashboardConfirm({
+    title: 'Clean target/',
+    message:
+      `Delete the Cargo build directory of ${wt.branch || wt.head_short || wt.path}?\n\n` +
+      `Path: ${wt.path}/target\n` +
+      `Reclaims about ${_fmtBytes(wt.reclaimable_bytes || 0)}.`,
+    warning:
+      'Sources and git state are untouched; the next build recreates target/ from scratch.' +
+      activeWarning,
+    confirmLabel: 'Clean',
+  });
+  if (!ok) return;
+
+  pendingWorktreeCleans.add(pathKey);
+  if (button) {
+    button.disabled = true;
+    button.classList.add('pending');
+    button.textContent = 'Cleaning...';
+  }
+  setWorktreesActivityNotice('pending', `Cleaning ${wt.path}/target...`);
+  try {
+    const payload = { repo_root: wt.repo_root, path: wt.path, expected_head: wt.head || null };
+    // daemonApi (transport F2): a POST twin — no HTTP replay after an
+    // attempted tunnel send, matching the remove call above.
+    const r = await daemonApi.request('api_worktrees_clean', payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `worktree clean returned ${r.status}`);
+    }
+    const freed = Number(result.freed_bytes || 0);
+    if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+      const entry = _cachedWorktreeScan.worktrees.find(e => e.path === wt.path);
+      if (entry) {
+        entry.size_bytes = Math.max(0, Number(entry.size_bytes || 0) - freed);
+        entry.reclaimable_bytes = result.partial
+          ? Math.max(0, Number(entry.reclaimable_bytes || 0) - freed)
+          : 0;
+      }
+      recomputeWorktreeSummary(_cachedWorktreeScan);
+    }
+    const message = result.partial
+      ? `Cleaned ${_fmtBytes(freed)} from ${wt.path}/target; some entries survived (${result.detail || 'locked files'}).`
+      : `Cleaned ${wt.path}/target. Freed about ${_fmtBytes(freed)}.`;
+    setWorktreesStatus(message, result.partial ? 'error' : '');
+    setWorktreesActivityNotice(result.partial ? 'error' : 'ok', message, result.partial ? 0 : 3500);
+    showControlToast(result.partial ? 'error' : 'success', result.partial ? 'Target partially cleaned.' : 'Target cleaned.');
+  } catch (err) {
+    const message = err.message || 'Worktree clean failed';
+    setWorktreesStatus(message, 'error');
+    setWorktreesActivityNotice('error', message);
+    showControlToast('error', message);
+  } finally {
+    pendingWorktreeCleans.delete(pathKey);
+    if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+  }
 }
 
 async function removeWorktree(wt, button) {
@@ -788,6 +1012,9 @@ function renderWorktreesList(scan, el) {
     };
     addMeta('repo', wt.repo_name);
     addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'v-green' : null);
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      addMeta('target/', _fmtBytes(wt.reclaimable_bytes), null, 'Cargo build output the Clean button can reclaim');
+    }
     addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
     addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
     addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'v-green' : (wt.merge_status === 'unmerged' ? 'v-red' : null));
@@ -798,11 +1025,11 @@ function renderWorktreesList(scan, el) {
       addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
     }
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'v-red');
-    if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
-      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'v-yellow' : null);
-    }
     addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
     card.appendChild(meta);
+
+    const sessionsRow = renderWorktreeSessionChips(wt);
+    if (sessionsRow) card.appendChild(sessionsRow);
 
     const actions = document.createElement('div');
     actions.className = 'sc-actions';
@@ -827,6 +1054,21 @@ function renderWorktreesList(scan, el) {
       openWorktreeInspect(wt);
     });
     actions.appendChild(inspectBtn);
+
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      const cleaning = pendingWorktreeCleans.has(pathKey);
+      const cleanBtn = document.createElement('button');
+      cleanBtn.className = 'ui-btn wt-clean-btn';
+      cleanBtn.textContent = cleaning ? 'Cleaning...' : `Clean target/ (${_fmtBytes(wt.reclaimable_bytes)})`;
+      cleanBtn.title = 'Delete the Cargo build directory to reclaim disk without removing the worktree. Sources and git state are untouched; the next build recreates it.';
+      cleanBtn.disabled = cleaning || !!removalState;
+      cleanBtn.classList.toggle('pending', cleaning);
+      cleanBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        cleanWorktreeTarget(wt, cleanBtn);
+      });
+      actions.appendChild(cleanBtn);
+    }
 
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);
