@@ -71,6 +71,37 @@ jobs:
           cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null
           git diff --exit-code -- rfcs/owner-plane/vectors rfcs/owner-plane/coverage
 
+  # The D-203-funded browser execution lane (execution-lanes-plan.md,
+  # lane 1): driver.cjs builds the wasm package (the schema-less
+  # reducer + the WebCrypto backend), serves the corpus to a fixture
+  # page, and runs EVERY browser-annotated vector in headless
+  # Chromium over raw CDP — semantics through crypto.subtle, gated on
+  # the harness's all_green shape (any FAIL/Unimplemented row exits
+  # nonzero; a tampered-corpus negative control was exercised at
+  # birth). The job name carries the standing caveat: family 13's
+  # §13.2 browser cell is the IndexedDB Txn subset, and until that
+  # shim (work item 3) lands, f13 rows execute the engine lanes
+  # in-memory inside Chromium — real wasm execution, not yet the
+  # IndexedDB substrate.
+  browser-execution:
+    name: browser execution (Chromium; f13 in-memory, IndexedDB shim pending)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: wasm toolchain (wasm32 target + pinned wasm-pack)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          want="$(cat .wasm-pack-version)"
+          have="$(wasm-pack --version 2>/dev/null | cut -d' ' -f2 || true)"
+          if [ "$have" != "$want" ]; then
+            cargo install wasm-pack --version "$want" --locked
+          fi
+      - name: browser lane (every browser-annotated vector in headless Chromium)
+        run: node rfcs/owner-plane/browser-lane/driver.cjs
+
   # The D-203-funded per-OS portable-storage execution lane
   # (execution-lanes-plan.md, lane 2): every storage-annotated vector
   # byte-round-trips through real files, crash cuts run as real

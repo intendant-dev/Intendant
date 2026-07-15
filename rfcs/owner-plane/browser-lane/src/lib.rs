@@ -1,97 +1,28 @@
 //! The browser execution lane (§13.2 `browser` column) — the
 //! reducer's lane code compiled to `wasm32-unknown-unknown`, crypto
-//! routed through the [`owner_plane_reducer::crypto::Crypto`] seam.
+//! routed through the [`owner_plane_reducer::crypto::Crypto`] seam
+//! into WebCrypto ([`webcrypto::WebCryptoBackend`]).
 //!
-//! SCAFFOLD STATUS (execution-lanes-plan lane 1): this crate
-//! currently pins the wasm dependency story (schema-less reducer,
-//! `getrandom/js` unification) and exposes the per-vector entry
-//! point. The WebCrypto backend is DELIBERATELY unwired — every
-//! primitive returns a "not wired" error, so a browser-annotated
-//! crypto vector reports FAIL, never a false PASS; engine-lane
-//! vectors (whose §13.2 browser requirement is the IndexedDB Txn
-//! subset, not WebCrypto) already execute for real. Work items 2–3
-//! (the SubtleCrypto backend, the fixture page + CDP driver, the
-//! IndexedDB Txn shim) land next; the advisory CI job arrives only
-//! WITH the driver, so no green can be misread before the lane
-//! actually runs.
+//! Execution shape (execution-lanes-plan lane 1): the fixture page
+//! fetches the corpus manifest, calls [`run_vector`] per
+//! browser-annotated vector, and publishes a report the CDP driver
+//! (`driver.cjs`) polls; the driver exits nonzero unless EVERY
+//! browser-annotated vector reports `semantics=PASS` with clean
+//! structural layers — the same `all_green` shape the CLI harness
+//! gates on.
+//!
+//! Honesty note on family 13: its §13.2 browser cell is the
+//! IndexedDB Txn subset. Until that shim (work item 3) lands, the
+//! f13 vectors here execute the reducer's engine lanes IN-MEMORY
+//! inside Chromium — real wasm execution of the same lane code, but
+//! NOT yet the IndexedDB substrate; the driver prints that caveat on
+//! every run and the CI job name carries it.
 
-use owner_plane_reducer::crypto::Crypto;
+mod webcrypto;
+
 use owner_plane_reducer::harness::{self, SemStatus};
 use wasm_bindgen::prelude::*;
-
-/// The WebCrypto (SubtleCrypto) backend — unwired scaffold. Each
-/// method will await the corresponding `crypto.subtle` call
-/// (`digest`, `importKey`+`verify`, ECDH `deriveBits` composed into
-/// HPKE, `encrypt`/`decrypt`, HKDF/PBKDF2 `deriveBits`).
-struct WebCryptoBackend;
-
-const UNWIRED: &str = "WebCrypto backend not wired yet (browser-lane scaffold)";
-
-impl Crypto for WebCryptoBackend {
-    async fn sha256(&self, _data: &[u8]) -> Result<[u8; 32], String> {
-        Err(UNWIRED.into())
-    }
-    async fn ed25519_verify(&self, _pk: &[u8], _msg: &[u8], _sig: &[u8]) -> Result<bool, String> {
-        Err(UNWIRED.into())
-    }
-    async fn p256_verify(&self, _pk: &[u8], _msg: &[u8], _sig: &[u8]) -> Result<bool, String> {
-        Err(UNWIRED.into())
-    }
-    async fn p256_point_valid(&self, _sec1: &[u8]) -> Result<bool, String> {
-        Err(UNWIRED.into())
-    }
-    async fn p256_pk_of(&self, _sk: &[u8; 32]) -> Result<Option<[u8; 65]>, String> {
-        Err(UNWIRED.into())
-    }
-    async fn hpke_open(
-        &self,
-        _sk: &[u8; 32],
-        _enc: &[u8],
-        _info: &[u8],
-        _aad: &[u8],
-        _ct: &[u8],
-    ) -> Result<Option<Vec<u8>>, String> {
-        Err(UNWIRED.into())
-    }
-    async fn aes_gcm_seal(
-        &self,
-        _key: &[u8; 32],
-        _nonce: &[u8; 12],
-        _aad: &[u8],
-        _pt: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        Err(UNWIRED.into())
-    }
-    async fn aes_gcm_open(
-        &self,
-        _key: &[u8; 32],
-        _nonce: &[u8; 12],
-        _aad: &[u8],
-        _ct: &[u8],
-    ) -> Result<Option<Vec<u8>>, String> {
-        Err(UNWIRED.into())
-    }
-    async fn hkdf_sha256(
-        &self,
-        _salt: &[u8],
-        _ikm: &[u8],
-        _info: &[u8],
-        _out_len: usize,
-    ) -> Result<Vec<u8>, String> {
-        Err(UNWIRED.into())
-    }
-    async fn pbkdf2_hmac_sha512(
-        &self,
-        _password: &[u8],
-        _salt: &[u8],
-        _iterations: u32,
-    ) -> Result<[u8; 64], String> {
-        Err(UNWIRED.into())
-    }
-    async fn ed25519_pk_of_seed(&self, _seed: &[u8; 32]) -> Result<[u8; 32], String> {
-        Err(UNWIRED.into())
-    }
-}
+use webcrypto::WebCryptoBackend;
 
 /// Run one vector in the browser: the dep-free structural layers
 /// (§10.4×§10.5 pair cross-validation, the strict-decode

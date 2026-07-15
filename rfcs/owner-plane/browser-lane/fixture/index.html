@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>owner-plane browser lane</title>
+<!--
+  The fixture the CDP driver (../driver.cjs) navigates headless
+  Chromium to: loads the wasm lane, fetches the browser-annotated
+  corpus manifest from the driver's local server, runs every vector
+  through run_vector (WebCrypto-backed semantics + the dep-free
+  structural layers), and publishes window.__laneReport for the
+  driver to poll. Per-vector console lines are observability only —
+  the report object is the contract.
+-->
+<pre id="log">owner-plane browser lane</pre>
+<script type="module">
+  const logEl = document.getElementById('log');
+  const log = (line) => {
+    logEl.textContent += `\n${line}`;
+    console.log(`[lane] ${line}`);
+  };
+  const report = {
+    ua: navigator.userAgent,
+    total: 0,
+    rows: [],
+    done: false,
+    error: null,
+  };
+  window.__laneReport = report;
+  (async () => {
+    try {
+      const { default: init, run_vector } = await import('/pkg/owner_plane_browser_lane.js');
+      await init();
+      const manifest = await (await fetch('/manifest.json')).json();
+      report.total = manifest.length;
+      log(`corpus: ${manifest.length} browser-annotated vector(s)`);
+      for (const { file, vector } of manifest) {
+        let row;
+        try {
+          row = JSON.parse(await run_vector(JSON.stringify(vector)));
+        } catch (e) {
+          row = { pairs: 'ok', decode: 'ok', convergence: 'ok', semantics: `FAIL: run_vector threw: ${e}` };
+        }
+        report.rows.push({ file, ...row });
+        log(`${file} semantics=${row.semantics}`);
+      }
+      report.done = true;
+      log('done');
+    } catch (e) {
+      report.error = String((e && e.stack) || e);
+      report.done = true;
+      log(`fatal: ${report.error}`);
+    }
+  })();
+</script>

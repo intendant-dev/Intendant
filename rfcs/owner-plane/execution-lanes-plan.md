@@ -61,9 +61,30 @@ identical report rows the Rust harness prints.
    encrypt/decrypt, HKDF/PBKDF2 deriveBits; WebCrypto ECDSA does not
    enforce low-S, so the wasm side pre-checks `s ≤ n/2` on the raw
    signature bytes before verifying).
+   **DONE (2026-07-15), first green run 56/56:** `browser-lane/src/
+   webcrypto.rs` implements the whole backend on `crypto.subtle`
+   (labeled HKDF for the RFC 9180 schedule built on `sign(HMAC)`;
+   PKCS#8-wrapped scalar/seed imports with JWK-export public-key
+   recovery; the low-S pre-check against ⌊n/2⌋; an RFC 8032 TEST-1
+   probe distinguishing "no Ed25519 in this browser" = backend `Err`
+   from "malformed key" = semantic `false`). `fixture/index.html` +
+   `driver.cjs` (launch/WebSocket mechanics after the CI-proven
+   scripts/smoke-dashboard-boot.cjs; no npm deps) serve the corpus
+   over loopback, run every browser-annotated vector in
+   `--headless=new` Chromium over raw CDP, and gate on the all_green
+   shape; verified green (56/56 under HeadlessChrome 150 — the
+   high-S rejection vector passing proves the low-S pre-check fires)
+   AND red (a tampered-corpus negative control via `LANE_VECTORS_DIR`
+   exits 1 naming the row). The advisory workflow carries the job as
+   `browser execution (Chromium; f13 in-memory, IndexedDB shim
+   pending)` — the name keeps item 3's gap visible.
 3. IndexedDB Txn-subset shim for the family-13 journal lane
    (transaction boundaries mapped to the Txn frames; L1 truncation
-   simulated at the fixture layer) (~1–2 sessions).
+   simulated at the fixture layer) (~1–2 sessions). **The lane's sole
+   open item**: until it lands, the f13 rows in the browser job
+   execute the engine lanes in-memory inside Chromium (real wasm
+   execution of the same lane code, NOT yet the IndexedDB substrate),
+   and the driver prints that caveat on every run.
 
 **Estimate.** 2–4 working sessions. **Exit criterion.** The CDP
 driver exits nonzero unless every browser-annotated vector reports
