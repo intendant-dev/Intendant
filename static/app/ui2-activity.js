@@ -263,27 +263,59 @@ function ui2TagRawEntries() {
 // a pass (their addedNodes are text nodes), and a container insertion
 // (replay fragment, re-rendered window range) scans only its own subtree.
 // Clones inherit the source entry's classes, so re-tagging is a no-op skip.
+// Bounded: MutationObservers keep firing in hidden tabs while rAF does not,
+// so an unbounded queue would retain every appended node overnight —
+// including entries the 10k prune already detached, pinned with their full
+// subtrees. Past the cap the queue collapses to one "rescan everything"
+// flag (the flush then runs ui2TagRawEntries, whose class guard makes the
+// sweep idempotent), and hidden tabs flush via setTimeout since their rAF
+// never fires (background timer throttling only delays it; the cap is the
+// memory guarantee either way).
+const UI2_TAG_QUEUE_CAP = 2048;
 let ui2PendingTagNodes = new Set();
 let ui2TagPassQueued = false;
+let ui2TagQueueOverflowed = false;
+function ui2RunEntryTagPass() {
+  ui2TagPassQueued = false;
+  const nodes = ui2PendingTagNodes;
+  ui2PendingTagNodes = new Set();
+  if (ui2TagQueueOverflowed) {
+    ui2TagQueueOverflowed = false;
+    ui2TagRawEntries();
+    return;
+  }
+  for (const node of nodes) {
+    if (!node.isConnected) continue;
+    if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
+    else ui2TagEntriesIn(node);
+  }
+}
 function ui2QueueEntryTagging(records) {
-  for (const record of records) {
-    for (const node of record.addedNodes) {
-      if (node.nodeType === 1) ui2PendingTagNodes.add(node);
+  if (!ui2TagQueueOverflowed) {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (ui2PendingTagNodes.size >= UI2_TAG_QUEUE_CAP) {
+          ui2PendingTagNodes.clear();
+          ui2TagQueueOverflowed = true;
+          break;
+        }
+        ui2PendingTagNodes.add(node);
+      }
+      if (ui2TagQueueOverflowed) break;
     }
   }
-  if (!ui2PendingTagNodes.size || ui2TagPassQueued) return;
+  if ((!ui2PendingTagNodes.size && !ui2TagQueueOverflowed) || ui2TagPassQueued) return;
   ui2TagPassQueued = true;
-  requestAnimationFrame(() => {
-    ui2TagPassQueued = false;
-    const nodes = ui2PendingTagNodes;
-    ui2PendingTagNodes = new Set();
-    for (const node of nodes) {
-      if (!node.isConnected) continue;
-      if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
-      else ui2TagEntriesIn(node);
-    }
-  });
+  if (document.hidden) setTimeout(ui2RunEntryTagPass, 250);
+  else requestAnimationFrame(ui2RunEntryTagPass);
 }
+// A pass scheduled on rAF while visible never fires once the tab hides —
+// convert it to a timer flush (ui2RunEntryTagPass tolerates the stale rAF
+// firing later on an already-drained queue).
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && ui2TagPassQueued) setTimeout(ui2RunEntryTagPass, 250);
+});
 
 // The approval hero names its session — with several agents running,
 // "Approval needed" alone is ambiguous.

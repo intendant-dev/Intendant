@@ -251,6 +251,10 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
+    // Monotonic per-start stream generation: a late async encode from
+    // generation N must never emit into (or clobber the pending flag of)
+    // generation N+1 after a quick stop→start.
+    this._streamGeneration = 0;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -1440,6 +1444,12 @@ class DisplaySlot {
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
+    // New generation: late completions from a previous run compare against
+    // this and drop; the pending flag belongs to the new run (a leftover
+    // true from a stopped run must not eat the first ticks).
+    this._streamGeneration += 1;
+    this._streamEncodePending = false;
+    const gen = this._streamGeneration;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
@@ -1472,19 +1482,29 @@ class DisplaySlot {
         DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
         DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
       ]).then(([liveB64, hqB64]) => {
-        if (!this.streaming) return;
+        // Restarted since capture: these pixels belong to the retired
+        // sequence — never emit them into the new one.
+        if (gen !== this._streamGeneration) return;
+        // Stopped (not restarted): the frame captured pre-stop pixels —
+        // still deliver it (it is the stream's final frame), but leave the
+        // torn-down chrome (frame-id chip) alone.
+        const chromeLive = this.streaming;
         // Skip duplicate frames for voice model — still send HQ to server for archival
         const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
         const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
         if (!frameDup) {
           this._lastFrameLen = liveB64.length;
           app.send_frame(liveB64, frameId);
-          this.frameIdEl.textContent = frameId.split('-').pop();
-          this.frameIdEl.style.color = 'var(--overlay0)';
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop();
+            this.frameIdEl.style.color = 'var(--overlay0)';
+          }
           tickerFramesSent++;
         } else {
-          this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
-          this.frameIdEl.style.color = 'var(--yellow)';
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+            this.frameIdEl.style.color = 'var(--yellow)';
+          }
           tickerFramesDropped++;
           sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
         }
@@ -1492,13 +1512,18 @@ class DisplaySlot {
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
       }).finally(() => {
-        this._streamEncodePending = false;
+        // Only this generation may clear its own pending flag — a late
+        // completion must not unblock (or race) a restarted stream's ticks.
+        if (gen === this._streamGeneration) this._streamEncodePending = false;
       });
     }, 1000);
   }
   stopStreaming() {
     this.streaming = false;
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
+    // The in-flight encode (if any) still delivers its final frame above;
+    // the flag itself must not leak into a subsequent start.
+    this._streamEncodePending = false;
     this.streamBtn.classList.remove('active');
     this.streamBtn.setAttribute('aria-pressed', 'false');
     this.streamBtn.innerHTML = '&#x1F441; Stream';

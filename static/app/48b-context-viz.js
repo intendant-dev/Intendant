@@ -1165,6 +1165,24 @@ function contextPressureColor(pct) {
   return CONTEXT_VIZ_THEME.pressure.ok;
 }
 
+// Per-object token for the scene key: replaceStoredContextSnapshot swaps a
+// compact snapshot for its exact-replay twin while DELIBERATELY preserving
+// __context_key, so the key alone cannot distinguish old from new data —
+// the replacement mints a NEW object, and this token tracks object
+// identity (the analysis memo is likewise object-keyed).
+let contextSceneObjectSeq = 0;
+const contextSceneObjectTokens = new WeakMap();
+function contextSceneObjectToken(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return '0';
+  let token = contextSceneObjectTokens.get(snapshot);
+  if (!token) {
+    contextSceneObjectSeq += 1;
+    token = String(contextSceneObjectSeq);
+    contextSceneObjectTokens.set(snapshot, token);
+  }
+  return token;
+}
+
 function contextBuildThree(analysis, snapshot) {
   const empty = document.getElementById('context-scene-empty');
   if (empty) empty.style.display = analysis && analysis.parts.length ? 'none' : 'flex';
@@ -1175,11 +1193,13 @@ function contextBuildThree(analysis, snapshot) {
   // this pane is visible, detail-pane churn, selection changes — used to
   // tear down and rebuild every geometry, material, and label texture.
   // Selection highlighting mutates in place (contextUpdateMeshSelection),
-  // so it deliberately stays out of the key.
+  // so it deliberately stays out of the key. The object token catches
+  // exact-replay replacement, which keeps the key but swaps the data.
   const { timeline } = contextTimelineForForegroundSession();
   const sceneKey = analysis && analysis.parts.length
     ? [
         contextRawRenderKey(snapshot),
+        contextSceneObjectToken(snapshot),
         timeline.length,
         timeline.indexOf(snapshot),
         CONTEXT_VIZ_THEME.labelBg,

@@ -1905,11 +1905,20 @@ async function stationOpenTranscript(sessionId, opts = {}) {
     console.warn('station set_transcript rejected:', err);
   }
   if (accepted) {
+    // Seed the settle-edge tracker from the phase at open, so a session
+    // that goes inactive before the first poll evaluation still gets its
+    // one final refetch (stationMaybeRefreshTranscript maintains it from
+    // here on).
+    const phaseAtOpen = String(
+      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
+    );
     stationTranscriptLive = {
       sessionId: sid,
       source,
       fetchedAt: Date.now(),
       lastEventKey: stationLatestEventKeyForSession(sid),
+      lastActivePhaseSeen: Boolean(phaseAtOpen) &&
+        !['idle', 'done', 'interrupted'].includes(phaseAtOpen),
     };
     if (!opts.refresh) stationStatus(`Transcript ${shortSessionId(sid)} loaded`);
   } else if (opts.refresh && stationTranscriptLive?.sessionId === sid) {
@@ -1933,14 +1942,22 @@ function stationMaybeRefreshTranscript(force = false) {
   // Idle-arm gate: the ~8 s fallback exists for sessions whose output
   // never surfaces in the activity stream — but when the stream key is
   // UNCHANGED and the session itself reports an inactive phase, there is
-  // nothing new to fetch. Skipping here parks the 300-row refetch+rebuild
-  // instead of re-running it forever under an idle open viewer; an
-  // unknown phase keeps the old fallback cadence (fail open).
-  if (!force && key === live.lastEventKey) {
-    const phase = String(
-      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
-    );
-    if (phase === 'idle' || phase === 'done' || phase === 'interrupted') return;
+  // nothing new to fetch. One exception, tracked via lastActivePhaseSeen:
+  // output that lands transcript-only just before the phase settles would
+  // otherwise never be fetched (key unchanged forever + phase now
+  // inactive), so the active→inactive TRANSITION grants exactly one final
+  // refetch before the gate parks. Unknown phase keeps the old fallback
+  // cadence (fail open).
+  const phase = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+  );
+  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  if (inactive) {
+    const settleEdge = live.lastActivePhaseSeen === true;
+    live.lastActivePhaseSeen = false;
+    if (!force && !settleEdge && key === live.lastEventKey) return;
+  } else if (phase) {
+    live.lastActivePhaseSeen = true;
   }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;

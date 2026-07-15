@@ -27837,27 +27837,59 @@ function ui2TagRawEntries() {
 // a pass (their addedNodes are text nodes), and a container insertion
 // (replay fragment, re-rendered window range) scans only its own subtree.
 // Clones inherit the source entry's classes, so re-tagging is a no-op skip.
+// Bounded: MutationObservers keep firing in hidden tabs while rAF does not,
+// so an unbounded queue would retain every appended node overnight —
+// including entries the 10k prune already detached, pinned with their full
+// subtrees. Past the cap the queue collapses to one "rescan everything"
+// flag (the flush then runs ui2TagRawEntries, whose class guard makes the
+// sweep idempotent), and hidden tabs flush via setTimeout since their rAF
+// never fires (background timer throttling only delays it; the cap is the
+// memory guarantee either way).
+const UI2_TAG_QUEUE_CAP = 2048;
 let ui2PendingTagNodes = new Set();
 let ui2TagPassQueued = false;
+let ui2TagQueueOverflowed = false;
+function ui2RunEntryTagPass() {
+  ui2TagPassQueued = false;
+  const nodes = ui2PendingTagNodes;
+  ui2PendingTagNodes = new Set();
+  if (ui2TagQueueOverflowed) {
+    ui2TagQueueOverflowed = false;
+    ui2TagRawEntries();
+    return;
+  }
+  for (const node of nodes) {
+    if (!node.isConnected) continue;
+    if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
+    else ui2TagEntriesIn(node);
+  }
+}
 function ui2QueueEntryTagging(records) {
-  for (const record of records) {
-    for (const node of record.addedNodes) {
-      if (node.nodeType === 1) ui2PendingTagNodes.add(node);
+  if (!ui2TagQueueOverflowed) {
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (ui2PendingTagNodes.size >= UI2_TAG_QUEUE_CAP) {
+          ui2PendingTagNodes.clear();
+          ui2TagQueueOverflowed = true;
+          break;
+        }
+        ui2PendingTagNodes.add(node);
+      }
+      if (ui2TagQueueOverflowed) break;
     }
   }
-  if (!ui2PendingTagNodes.size || ui2TagPassQueued) return;
+  if ((!ui2PendingTagNodes.size && !ui2TagQueueOverflowed) || ui2TagPassQueued) return;
   ui2TagPassQueued = true;
-  requestAnimationFrame(() => {
-    ui2TagPassQueued = false;
-    const nodes = ui2PendingTagNodes;
-    ui2PendingTagNodes = new Set();
-    for (const node of nodes) {
-      if (!node.isConnected) continue;
-      if (node.classList && node.classList.contains('log-entry')) ui2TagEntry(node);
-      else ui2TagEntriesIn(node);
-    }
-  });
+  if (document.hidden) setTimeout(ui2RunEntryTagPass, 250);
+  else requestAnimationFrame(ui2RunEntryTagPass);
 }
+// A pass scheduled on rAF while visible never fires once the tab hides —
+// convert it to a timer flush (ui2RunEntryTagPass tolerates the stale rAF
+// firing later on an already-drained queue).
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && ui2TagPassQueued) setTimeout(ui2RunEntryTagPass, 250);
+});
 
 // The approval hero names its session — with several agents running,
 // "Approval needed" alone is ambiguous.
@@ -28073,7 +28105,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '79868a67bb6b6b5b';
+const INTENDANT_APP_BUILD = '01176a9b40d476e2';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -38600,11 +38632,20 @@ async function stationOpenTranscript(sessionId, opts = {}) {
     console.warn('station set_transcript rejected:', err);
   }
   if (accepted) {
+    // Seed the settle-edge tracker from the phase at open, so a session
+    // that goes inactive before the first poll evaluation still gets its
+    // one final refetch (stationMaybeRefreshTranscript maintains it from
+    // here on).
+    const phaseAtOpen = String(
+      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(sid)?.phase) || ''
+    );
     stationTranscriptLive = {
       sessionId: sid,
       source,
       fetchedAt: Date.now(),
       lastEventKey: stationLatestEventKeyForSession(sid),
+      lastActivePhaseSeen: Boolean(phaseAtOpen) &&
+        !['idle', 'done', 'interrupted'].includes(phaseAtOpen),
     };
     if (!opts.refresh) stationStatus(`Transcript ${shortSessionId(sid)} loaded`);
   } else if (opts.refresh && stationTranscriptLive?.sessionId === sid) {
@@ -38628,14 +38669,22 @@ function stationMaybeRefreshTranscript(force = false) {
   // Idle-arm gate: the ~8 s fallback exists for sessions whose output
   // never surfaces in the activity stream — but when the stream key is
   // UNCHANGED and the session itself reports an inactive phase, there is
-  // nothing new to fetch. Skipping here parks the 300-row refetch+rebuild
-  // instead of re-running it forever under an idle open viewer; an
-  // unknown phase keeps the old fallback cadence (fail open).
-  if (!force && key === live.lastEventKey) {
-    const phase = String(
-      (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
-    );
-    if (phase === 'idle' || phase === 'done' || phase === 'interrupted') return;
+  // nothing new to fetch. One exception, tracked via lastActivePhaseSeen:
+  // output that lands transcript-only just before the phase settles would
+  // otherwise never be fetched (key unchanged forever + phase now
+  // inactive), so the active→inactive TRANSITION grants exactly one final
+  // refetch before the gate parks. Unknown phase keeps the old fallback
+  // cadence (fail open).
+  const phase = String(
+    (typeof sessionMetadataById !== 'undefined' && sessionMetadataById.get(live.sessionId)?.phase) || ''
+  );
+  const inactive = phase === 'idle' || phase === 'done' || phase === 'interrupted';
+  if (inactive) {
+    const settleEdge = live.lastActivePhaseSeen === true;
+    live.lastActivePhaseSeen = false;
+    if (!force && !settleEdge && key === live.lastEventKey) return;
+  } else if (phase) {
+    live.lastActivePhaseSeen = true;
   }
   live.fetchedAt = Date.now();
   live.lastEventKey = key;
@@ -48413,7 +48462,6 @@ function renderSessionWindowVitals(win, vitals) {
     win.vitals.replaceChildren();
     win.vitals.removeAttribute('title');
     delete win.vitals.dataset.vitSig;
-    win.vitalsRowTicking = false;
     return false;
   }
   wireVitalsChipRow(win);
@@ -48430,8 +48478,7 @@ function renderSessionWindowVitals(win, vitals) {
       ttlChip.textContent = ttl.text;
       ttlChip.title = ttl.explainLines[0] || ttl.label;
     }
-    win.vitalsRowTicking = models.some((m) => m.ticking);
-    return win.vitalsRowTicking;
+    return models.some((m) => m.ticking);
   }
   win.vitals.dataset.vitSig = signature;
   win.vitals.className = 'session-window-vitals';
@@ -48466,8 +48513,7 @@ function renderSessionWindowVitals(win, vitals) {
     nodes.push(more);
   }
   win.vitals.replaceChildren(...nodes);
-  win.vitalsRowTicking = models.some((m) => m.ticking);
-  return win.vitalsRowTicking;
+  return models.some((m) => m.ticking);
 }
 
 // One delegated listener per window (chips are rebuilt every render).
@@ -48862,11 +48908,17 @@ function refreshSessionVitalsTicker() {
   for (const [sid, win] of sessionWindows) {
     const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
     const needsTick = sessionVitalsNeedsTick(vitals);
-    // One trailing render after ticking stops (win.vitalsRowTicking is
-    // maintained by renderSessionWindowVitals on every render path) flips
-    // the countdown chip to its cold glyph instead of freezing mid-count.
-    if (!needsTick && !win.vitalsRowTicking) continue;
-    if (renderSessionWindowVitals(win, vitals)) ticking = true;
+    // One trailing render after ticking stops (win.vitalsNeededTick holds
+    // the previous pass's verdict) settles the row — the cache chip flips
+    // to its cold glyph and a passed limit-reset drops its "↻~Xm" text —
+    // instead of freezing mid-count.
+    if (!needsTick && !win.vitalsNeededTick) continue;
+    win.vitalsNeededTick = needsTick;
+    renderSessionWindowVitals(win, vitals);
+    // Arm from the predicate, not the render result: the render reports
+    // only cache-ttl models as ticking, which left percentless limit-reset
+    // countdowns frozen because nothing kept the interval alive for them.
+    if (needsTick) ticking = true;
     maybeAlertCacheExpiry(sid, win, vitals);
   }
   if (ticking && !sessionVitalsTicker) {
@@ -54234,7 +54286,18 @@ function updateSessionWindow(sessionId, meta = {}) {
   win.metadataSignature = signature;
   win.metadataSignatureNoPhase = signatureNoPhase;
   if (phaseOnly) {
+    // Relationship badges derive from phases: a parent's "N sub" chip
+    // counts children through sessionRelationshipSubagentIsActive, which
+    // reads the child's win.phase — so a phase change that crosses the
+    // active boundary (running→done, idle→thinking) must refresh this
+    // window's badge AND the parent's. Same-side alternations
+    // (thinking↔running) change no badge-visible state and skip it.
+    const activeBefore = sessionRelationshipSubagentIsActive(sid);
     if (meta.phase) applySessionWindowPhase(win, sid, meta.phase);
+    if (sessionRelationshipSubagentIsActive(sid) !== activeBefore) {
+      updateSessionRelationshipBadges(sid);
+      if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
+    }
     schedulePersistSessionWindowState();
     return;
   }
@@ -65379,6 +65442,10 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
+    // Monotonic per-start stream generation: a late async encode from
+    // generation N must never emit into (or clobber the pending flag of)
+    // generation N+1 after a quick stop→start.
+    this._streamGeneration = 0;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -66568,6 +66635,12 @@ class DisplaySlot {
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
+    // New generation: late completions from a previous run compare against
+    // this and drop; the pending flag belongs to the new run (a leftover
+    // true from a stopped run must not eat the first ticks).
+    this._streamGeneration += 1;
+    this._streamEncodePending = false;
+    const gen = this._streamGeneration;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
@@ -66600,19 +66673,29 @@ class DisplaySlot {
         DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
         DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
       ]).then(([liveB64, hqB64]) => {
-        if (!this.streaming) return;
+        // Restarted since capture: these pixels belong to the retired
+        // sequence — never emit them into the new one.
+        if (gen !== this._streamGeneration) return;
+        // Stopped (not restarted): the frame captured pre-stop pixels —
+        // still deliver it (it is the stream's final frame), but leave the
+        // torn-down chrome (frame-id chip) alone.
+        const chromeLive = this.streaming;
         // Skip duplicate frames for voice model — still send HQ to server for archival
         const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
         const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
         if (!frameDup) {
           this._lastFrameLen = liveB64.length;
           app.send_frame(liveB64, frameId);
-          this.frameIdEl.textContent = frameId.split('-').pop();
-          this.frameIdEl.style.color = 'var(--overlay0)';
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop();
+            this.frameIdEl.style.color = 'var(--overlay0)';
+          }
           tickerFramesSent++;
         } else {
-          this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
-          this.frameIdEl.style.color = 'var(--yellow)';
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+            this.frameIdEl.style.color = 'var(--yellow)';
+          }
           tickerFramesDropped++;
           sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
         }
@@ -66620,13 +66703,18 @@ class DisplaySlot {
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
       }).finally(() => {
-        this._streamEncodePending = false;
+        // Only this generation may clear its own pending flag — a late
+        // completion must not unblock (or race) a restarted stream's ticks.
+        if (gen === this._streamGeneration) this._streamEncodePending = false;
       });
     }, 1000);
   }
   stopStreaming() {
     this.streaming = false;
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
+    // The in-flight encode (if any) still delivers its final frame above;
+    // the flag itself must not leak into a subsequent start.
+    this._streamEncodePending = false;
     this.streamBtn.classList.remove('active');
     this.streamBtn.setAttribute('aria-pressed', 'false');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
@@ -74739,6 +74827,24 @@ function contextPressureColor(pct) {
   return CONTEXT_VIZ_THEME.pressure.ok;
 }
 
+// Per-object token for the scene key: replaceStoredContextSnapshot swaps a
+// compact snapshot for its exact-replay twin while DELIBERATELY preserving
+// __context_key, so the key alone cannot distinguish old from new data —
+// the replacement mints a NEW object, and this token tracks object
+// identity (the analysis memo is likewise object-keyed).
+let contextSceneObjectSeq = 0;
+const contextSceneObjectTokens = new WeakMap();
+function contextSceneObjectToken(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return '0';
+  let token = contextSceneObjectTokens.get(snapshot);
+  if (!token) {
+    contextSceneObjectSeq += 1;
+    token = String(contextSceneObjectSeq);
+    contextSceneObjectTokens.set(snapshot, token);
+  }
+  return token;
+}
+
 function contextBuildThree(analysis, snapshot) {
   const empty = document.getElementById('context-scene-empty');
   if (empty) empty.style.display = analysis && analysis.parts.length ? 'none' : 'flex';
@@ -74749,11 +74855,13 @@ function contextBuildThree(analysis, snapshot) {
   // this pane is visible, detail-pane churn, selection changes — used to
   // tear down and rebuild every geometry, material, and label texture.
   // Selection highlighting mutates in place (contextUpdateMeshSelection),
-  // so it deliberately stays out of the key.
+  // so it deliberately stays out of the key. The object token catches
+  // exact-replay replacement, which keeps the key but swaps the data.
   const { timeline } = contextTimelineForForegroundSession();
   const sceneKey = analysis && analysis.parts.length
     ? [
         contextRawRenderKey(snapshot),
+        contextSceneObjectToken(snapshot),
         timeline.length,
         timeline.indexOf(snapshot),
         CONTEXT_VIZ_THEME.labelBg,

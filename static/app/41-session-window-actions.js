@@ -470,7 +470,18 @@ function updateSessionWindow(sessionId, meta = {}) {
   win.metadataSignature = signature;
   win.metadataSignatureNoPhase = signatureNoPhase;
   if (phaseOnly) {
+    // Relationship badges derive from phases: a parent's "N sub" chip
+    // counts children through sessionRelationshipSubagentIsActive, which
+    // reads the child's win.phase — so a phase change that crosses the
+    // active boundary (running→done, idle→thinking) must refresh this
+    // window's badge AND the parent's. Same-side alternations
+    // (thinking↔running) change no badge-visible state and skip it.
+    const activeBefore = sessionRelationshipSubagentIsActive(sid);
     if (meta.phase) applySessionWindowPhase(win, sid, meta.phase);
+    if (sessionRelationshipSubagentIsActive(sid) !== activeBefore) {
+      updateSessionRelationshipBadges(sid);
+      if (meta.parentId) updateSessionRelationshipBadges(meta.parentId);
+    }
     schedulePersistSessionWindowState();
     return;
   }

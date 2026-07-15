@@ -1161,7 +1161,6 @@ function renderSessionWindowVitals(win, vitals) {
     win.vitals.replaceChildren();
     win.vitals.removeAttribute('title');
     delete win.vitals.dataset.vitSig;
-    win.vitalsRowTicking = false;
     return false;
   }
   wireVitalsChipRow(win);
@@ -1178,8 +1177,7 @@ function renderSessionWindowVitals(win, vitals) {
       ttlChip.textContent = ttl.text;
       ttlChip.title = ttl.explainLines[0] || ttl.label;
     }
-    win.vitalsRowTicking = models.some((m) => m.ticking);
-    return win.vitalsRowTicking;
+    return models.some((m) => m.ticking);
   }
   win.vitals.dataset.vitSig = signature;
   win.vitals.className = 'session-window-vitals';
@@ -1214,8 +1212,7 @@ function renderSessionWindowVitals(win, vitals) {
     nodes.push(more);
   }
   win.vitals.replaceChildren(...nodes);
-  win.vitalsRowTicking = models.some((m) => m.ticking);
-  return win.vitalsRowTicking;
+  return models.some((m) => m.ticking);
 }
 
 // One delegated listener per window (chips are rebuilt every render).
@@ -1610,11 +1607,17 @@ function refreshSessionVitalsTicker() {
   for (const [sid, win] of sessionWindows) {
     const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
     const needsTick = sessionVitalsNeedsTick(vitals);
-    // One trailing render after ticking stops (win.vitalsRowTicking is
-    // maintained by renderSessionWindowVitals on every render path) flips
-    // the countdown chip to its cold glyph instead of freezing mid-count.
-    if (!needsTick && !win.vitalsRowTicking) continue;
-    if (renderSessionWindowVitals(win, vitals)) ticking = true;
+    // One trailing render after ticking stops (win.vitalsNeededTick holds
+    // the previous pass's verdict) settles the row — the cache chip flips
+    // to its cold glyph and a passed limit-reset drops its "↻~Xm" text —
+    // instead of freezing mid-count.
+    if (!needsTick && !win.vitalsNeededTick) continue;
+    win.vitalsNeededTick = needsTick;
+    renderSessionWindowVitals(win, vitals);
+    // Arm from the predicate, not the render result: the render reports
+    // only cache-ttl models as ticking, which left percentless limit-reset
+    // countdowns frozen because nothing kept the interval alive for them.
+    if (needsTick) ticking = true;
     maybeAlertCacheExpiry(sid, win, vitals);
   }
   if (ticking && !sessionVitalsTicker) {
