@@ -630,7 +630,14 @@ function initShell() {
     // instruction to assistive tech via aria-describedby on xterm's input
     // textarea.
     shellTerm.attachCustomKeyEventHandler((ev) => {
-      if (ev.key === 'Tab' && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey) {
+      // Ctrl+M is the browser-safe alias: browsers reserve Ctrl+Shift+Tab
+      // for tab switching, and Ctrl+M costs nothing in the PTY — its byte
+      // is CR, identical to the Enter key (the trade VS Code's tab-focus
+      // toggle makes for the same reason).
+      const escapeCombo =
+        (ev.key === 'Tab' && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey) ||
+        (ev.key === 'm' && ev.ctrlKey && !ev.shiftKey && !ev.altKey && !ev.metaKey);
+      if (escapeCombo) {
         if (ev.type === 'keydown') {
           ev.preventDefault();
           focusShellKeybar();
