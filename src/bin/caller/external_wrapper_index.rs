@@ -220,16 +220,62 @@ pub fn upsert(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut index = with_index_unlocked(home, |index| index.clone());
     let log_path = log_dir.to_string_lossy().to_string();
     let updated_at_secs =
         file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir));
     let project_root = project_root.map(|path| path.to_string_lossy().to_string());
 
+    // The shared predicates between the read-only dirty pass and the
+    // mutation pass below — keep them in one place so the two passes cannot
+    // drift.
+    let conflicts_backend = |record: &ExternalWrapperRecord| {
+        record.source == source
+            && record.backend_session_id == backend_session_id
+            && record.intendant_session_id != stored_intendant_session_id
+    };
+    let conflicts_wrapper = |record: &ExternalWrapperRecord| {
+        record.source == source
+            && record.intendant_session_id == stored_intendant_session_id
+            && record.backend_session_id != backend_session_id
+    };
+    let is_exact_identity = |record: &ExternalWrapperRecord| {
+        record.source == source
+            && record.backend_session_id == backend_session_id
+            && record.intendant_session_id == stored_intendant_session_id
+    };
+    let needs_demotion = |record: &ExternalWrapperRecord| {
+        record.updated_at_secs != 0 || record.state != WrapperState::Superseded
+    };
+
     // Session-list scans upsert every external row on every pass; rewriting
-    // the whole index per unchanged row made listing quadratic. Track
-    // whether anything actually changed and skip the write when not.
-    let mut dirty = false;
+    // the whole index per unchanged row made listing quadratic, and cloning
+    // it per unchanged row still churned every record's strings. Decide
+    // against the cached index in place and clone only when a write will
+    // follow.
+    let dirty = with_index_unlocked(home, |index| {
+        let any_demotion = index.wrappers.iter().any(|record| {
+            (conflicts_backend(record) || conflicts_wrapper(record)) && needs_demotion(record)
+        });
+        let upsert_changes = match index
+            .wrappers
+            .iter()
+            .find(|record| is_exact_identity(record))
+        {
+            Some(existing) => {
+                existing.log_path != log_path
+                    || existing.project_root != project_root
+                    || existing.updated_at_secs != updated_at_secs
+                    || existing.state != WrapperState::Active
+            }
+            None => true,
+        };
+        any_demotion || upsert_changes
+    });
+    if !dirty {
+        return Ok(());
+    }
+
+    let mut index = with_index_unlocked(home, |index| index.clone());
 
     // Demotion, not deletion: rows that conflict with the upserted identity
     // (same backend session under another wrapper; same wrapper now bound to
@@ -240,35 +286,20 @@ pub fn upsert(
     // Do not "repair" the zero with a real mtime; only a fresh upsert of the
     // row's exact identity triple (the branch below) may make it current
     // again.
-    for record in index.wrappers.iter_mut().filter(|record| {
-        record.source == source
-            && record.backend_session_id == backend_session_id
-            && record.intendant_session_id != stored_intendant_session_id
-    }) {
-        dirty |= record.updated_at_secs != 0 || record.state != WrapperState::Superseded;
+    for record in index
+        .wrappers
+        .iter_mut()
+        .filter(|record| conflicts_backend(record) || conflicts_wrapper(record))
+    {
         record.updated_at_secs = 0;
         record.state = WrapperState::Superseded;
     }
 
-    for record in index.wrappers.iter_mut().filter(|record| {
-        record.source == source
-            && record.intendant_session_id == stored_intendant_session_id
-            && record.backend_session_id != backend_session_id
-    }) {
-        dirty |= record.updated_at_secs != 0 || record.state != WrapperState::Superseded;
-        record.updated_at_secs = 0;
-        record.state = WrapperState::Superseded;
-    }
-
-    if let Some(existing) = index.wrappers.iter_mut().find(|record| {
-        record.source == source
-            && record.backend_session_id == backend_session_id
-            && record.intendant_session_id == stored_intendant_session_id
-    }) {
-        dirty |= existing.log_path != log_path
-            || existing.project_root != project_root
-            || existing.updated_at_secs != updated_at_secs
-            || existing.state != WrapperState::Active;
+    if let Some(existing) = index
+        .wrappers
+        .iter_mut()
+        .find(|record| is_exact_identity(record))
+    {
         existing.log_path = log_path;
         existing.project_root = project_root;
         // Reactivation: an upsert of this exact identity triple makes the
@@ -277,7 +308,6 @@ pub fn upsert(
         existing.updated_at_secs = updated_at_secs;
         existing.state = WrapperState::Active;
     } else {
-        dirty = true;
         index.wrappers.push(ExternalWrapperRecord {
             source,
             backend_session_id: backend_session_id.to_string(),
@@ -290,9 +320,6 @@ pub fn upsert(
         });
     }
 
-    if !dirty {
-        return Ok(());
-    }
     write_index_unlocked(home, &index)?;
     note_index_written(home, &index);
     Ok(())
@@ -413,18 +440,25 @@ pub fn record_rollout_path(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Decide against the cached index in place; clone only when a write
+    // will follow (mirrors `upsert`).
+    let dirty = with_index_unlocked(home, |index| {
+        index.wrappers.iter().any(|record| {
+            record.source == source
+                && record.backend_session_id == backend_session_id
+                && record.rollout_path.as_deref() != Some(rollout_path.as_str())
+        })
+    });
+    if !dirty {
+        return Ok(());
+    }
     let mut index = with_index_unlocked(home, |index| index.clone());
-    let mut dirty = false;
     for record in index
         .wrappers
         .iter_mut()
         .filter(|record| record.source == source && record.backend_session_id == backend_session_id)
     {
-        dirty |= record.rollout_path.as_deref() != Some(rollout_path.as_str());
         record.rollout_path = Some(rollout_path.clone());
-    }
-    if !dirty {
-        return Ok(());
     }
     write_index_unlocked(home, &index)?;
     note_index_written(home, &index);
