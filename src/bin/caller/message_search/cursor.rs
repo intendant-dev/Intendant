@@ -24,6 +24,15 @@ pub(crate) struct SourceCursor {
     pub identity: Option<FileIdentity>,
     pub len: u64,
     pub mtime_ms: i64,
+    /// Full-precision mtime for the cheap-facts short-circuit: two writes
+    /// inside one millisecond are indistinguishable at `mtime_ms`
+    /// precision, and a same-length rewrite hiding there must not skip
+    /// the hash windows. `0` on cursors persisted before the field —
+    /// those never short-circuit (they hash every sweep, the historical
+    /// behavior). Residual: filesystems with coarse stamps (FAT/exFAT:
+    /// 2 s) keep a same-granule blind spot; nil on APFS/ext4/NTFS.
+    #[serde(default)]
+    pub mtime_ns: u64,
     /// Offset just past the last COMPLETE line consumed — a partial
     /// trailing line (no newline yet) stays unread until it completes.
     pub last_complete_line_offset: u64,
@@ -63,6 +72,15 @@ fn file_mtime_ms(metadata: &std::fs::Metadata) -> i64 {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn file_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
 }
 
@@ -134,6 +152,7 @@ impl SourceCursor {
             identity: FileIdentity::from_path(path).ok(),
             len: metadata.len(),
             mtime_ms: file_mtime_ms(&metadata),
+            mtime_ns: file_mtime_ns(&metadata),
             last_complete_line_offset,
             prefix_hash16: prefix_hash16(path)?,
             consumed_tail_hash16: tail_hash16_ending_at(path, last_complete_line_offset)?,
@@ -170,22 +189,30 @@ impl SourceCursor {
             }
             _ => false,
         };
-        let mtime_ms = file_mtime_ms(&metadata);
+        // Full-precision when both sides carry it; ms for legacy cursors.
+        let mtime_moved = if self.mtime_ns != 0 {
+            file_mtime_ns(&metadata) != self.mtime_ns
+        } else {
+            file_mtime_ms(&metadata) != self.mtime_ms
+        };
         // Same length, moved mtime: an in-place rewrite whose changed bytes
         // lie past the hashed prefix window would otherwise read as
         // Unchanged forever (the module doc's "folds len + timestamps"
         // promise). A benign touch(1) costs one idempotent rebuild.
-        if metadata.len() == self.len && mtime_ms != self.mtime_ms {
+        if metadata.len() == self.len && mtime_moved {
             return CursorCheck::Rewritten;
         }
         // Cheap-facts short-circuit: a reliable identity match with
-        // unchanged len + mtime is the steady state of nearly every
-        // in-retention file on every 30s sweep — skip the open + 4 KiB
-        // read + SHA-256 that used to run merely to confirm it. Any
-        // rewrite these facts can miss (same-length mtime-preserving
-        // writer) was equally invisible to the prefix hash past 4 KiB.
-        let hash_needed =
-            !(identity_reliably_same && metadata.len() == self.len && mtime_ms == self.mtime_ms);
+        // unchanged len + FULL-PRECISION mtime is the steady state of
+        // nearly every in-retention file on every 30s sweep — skip the
+        // open + 4 KiB read + SHA-256 that used to run merely to confirm
+        // it. Millisecond precision is NOT enough here (two writes inside
+        // one ms hid a same-length rewrite from an earlier draft), so
+        // legacy cursors without `mtime_ns` never short-circuit.
+        let hash_needed = !(identity_reliably_same
+            && metadata.len() == self.len
+            && self.mtime_ns != 0
+            && !mtime_moved);
         if hash_needed {
             match prefix_hash16(&self.path) {
                 Some(hash) => {
