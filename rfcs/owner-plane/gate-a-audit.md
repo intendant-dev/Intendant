@@ -7,28 +7,23 @@
 **Corpus:** 165 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×27, f08×4, f09×12, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated from the vectors directory after the repair tranche; the pre-tranche histogram miscount was review R8.4)
 **Suites at this amendment:** core 141/141 · reducer 36/36 (incl. the metamorphic-convergence corpus test and the arrival-order restoration control) · the strict harness 165/165 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files with flush+replacement invocation proof · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
 
-> **VERDICT: FAIL.** Gate A is **not** stamped. The interim
-> 2026-07-15 amendment claimed the twelve-clause predicate
-> satisfied; the reconciled verification review
-> (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`)
-> refuted that claim with executable evidence, and this audit's own
-> reproduction confirms its central findings: the reducer is NOT
-> order-convergent (legal unlisted delivery orders drive six
-> committed vectors to different durable final states — reproduced
-> here 3/3 sampled before this re-amendment), the control pipeline
-> places placement before body validation against D-99's express
-> resolution (the reducer comment cites D-99 for its opposite), a
-> signature-invalid recovery operation verifies a Journal reopen
-> kill, audit-partition "exactness" is compared against the
-> vector's own answer sheet, both execution lanes' required-run
-> sets derive from mutable self-annotations, the storage lane never
-> executes the §13.2-named flush/replacement primitives, and
-> D-202's ruled lifecycle is recorded but not executable. The
-> committed 157-vector corpus remains green on both implementations
-> — the failures are properties BEYOND the listed corpus, which is
-> exactly what the three-run standard could not see. §5 restates
-> the predicate with the reconciled adjudication; the repair
-> tranche (review §"Bounded repair tranche") is in progress.
+> **VERDICT: FAIL — repair tranche executed; awaiting the fresh
+> independent review the acceptance criteria require.** Gate A is
+> **not** stamped. The interim 2026-07-15 amendment claimed the
+> twelve-clause predicate satisfied; the reconciled verification
+> review (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`)
+> refuted that claim with executable evidence (a non-order-convergent
+> reducer, a D-99-inverted control pipeline, shape-verified Journal
+> kills, answer-sheet audit exactness, shrinkable lane manifests,
+> unexecuted flush/replacement, an unexecuted D-202 lifecycle), and
+> this audit's own reproduction confirmed its central findings. The
+> owner-directed repair tranche then landed in full — §4 records the
+> per-criterion state, including the tranche's own ninth
+> order-sensitive fixture finding — but the review's twelfth
+> acceptance criterion (a FRESH independent reviewer rerunning the
+> gate and the order suite from a pinned commit) is not satisfiable
+> from inside this repository, and this document never self-stamps:
+> the verdict remains FAIL until that review reports.
 
 ## 0. Scope and method
 
@@ -453,24 +448,65 @@ audit may say PASS:
 The execution lanes DID deliver (the browser lane 56/56 with the
 f13 IndexedDB/Web-Locks substrate; the storage lane 19/19 on real
 files, 3-OS) and that work stands — but delivery of the lanes did
-not make the predicate hold. Open at this re-amendment, per the
-reconciled review's findings R1–R8: (R1) six committed vectors
-reach different durable states under legal unlisted orders — the
-fold engine needs set-derived/canonical pending resolution, not
-eight more fixture orders; (R2) the D-99 control pipeline order
-(body before placement; request-ID consumption transition-last);
-(R3) authenticated/admitted invalidation facts for Journal reopen
-kills; (R4) independent released-result inputs for audit-partition
-exactness; (R5) pinned lane manifests immune to annotation drift;
-(R6) real flush + atomic-replacement execution in the storage lane
-(owner: build, 2026-07-15); (R7) the D-202 receipt-arrival
-lifecycle made executable (owner: build, 2026-07-15); (R8) gate
-hygiene (empty corpus, permutation validation, convergence output)
-and the documentation corrections. The review's twelve acceptance
-criteria (§"Acceptance criteria for the next review") bind the
-next amendment; the owner directed the repair tranche 2026-07-15.
-No prose/protocol reopening is required — the repairs conform the
-implementation to already-ratified semantics.
+not make the predicate hold. The owner directed the bounded repair
+tranche 2026-07-15 (both optional items funded to build), and it is
+now EXECUTED. The tranche's state against the review's twelve
+acceptance criteria (§"Acceptance criteria for the next review" —
+which bind the NEXT review, not this self-report):
+
+1. *All suites green at one pinned commit* — core 141/141, reducer
+   36/36, the strict gate 165/165, browser 56/56, the 3-OS storage
+   lane; the delivering commits are in this branch's history and CI
+   runs every lane per push.
+2. *The eight orders committed + a generated convergence suite* —
+   all eight ride their vectors as regression deliveries; the
+   metamorphic sweep (exhaustive permutations through five items;
+   reversal, rotations, and adjacent transpositions of every base
+   above) runs inside the fold, journal, status-derive, and
+   audit-partition lanes on every harness run.
+3. *The suite discriminates* — the pre-repair arrival-ordered loop
+   is retained test-only and the control test proves it diverges on
+   the review's r2 order while the canonical engine converges
+   (`convergence_standard_fails_under_arrival_order_restoration`).
+4. *Body-hash-mismatched control ops exert no precedence* — the
+   pipeline validates body before placement (classify), and the
+   D-99-inverted comment is corrected at `ctrl_prevalidate`.
+5. *Forged/unadmitted recoveries cannot verify a kill* — admission
+   is the authentication; both arms are committed vectors
+   (`f11-reopen-forged-recovery-log-corrupt`,
+   `f11-reopen-unadmitted-recovery-pends`), and the basis must be
+   genuinely dead on the fold.
+6. *Incomplete partitions cannot release* — the independent
+   read-release event (companion amendment #5) with completeness,
+   exact-union, and one-Txn derivation; five refusal negatives.
+7. *Annotation loss reddens the lane* — the surfaces suite requires
+   EXACT equality with the §13.2 R-set, and both drivers pin their
+   run sets to `coverage/lane-manifests.json` bidirectionally.
+8. *Storage flush/replacement proven* — every stream materializes
+   through write-temp → `sync_all` → `rename` (load-bearing: reads
+   target the final path) with end-of-run invocation counters that
+   redden a zero count, on all three OSes.
+9. *The D-202 lifecycle executable* — the evidence-lifecycle lane
+   (companion amendment #6) walks all four ruled propositions in
+   `f09-lease-lifecycle-sticky-reproposal`; the stickiness registry
+   was probed non-vacuous (disabling it reddens the gate).
+10. *Empty-corpus and non-permutation controls red* — the bin exits
+    2 on an empty directory; every delivery must be a true
+    permutation of the item set.
+11. *Ledgers, comments, counts, prose match* — this amendment plus
+    the documentation-correction record above.
+12. *A fresh independent reviewer reruns the gate* — OUTSTANDING by
+    construction: this document cannot satisfy it, and the verdict
+    below therefore stands FAIL until that review reports.
+
+No prose/protocol reopening was required — the repairs conform the
+implementation to already-ratified semantics. One review finding
+was extended by the tranche itself: implementing D-130 honestly
+exposed a NINTH order-sensitive fixture the reviews did not flag
+(`f07-revoke-cutoff-head-hash-mismatch-rejects` encoded the v0.5.9
+differing-hash rejection D-93's own rider records as superseded);
+it is re-authored as `f07-revoke-cutoff-head-mismatch-selects` with
+the committing boundary selecting its named variant.
 
 Nothing in this verdict stamps the spec, opens P1, or amends the
 Gate-A predicate silently; P1 writes stay barred until Gate B and
