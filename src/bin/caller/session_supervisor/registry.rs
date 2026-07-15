@@ -102,9 +102,19 @@ impl SessionSupervisor {
     pub(crate) async fn update_session_phase(&self, session_id: Option<&str>, phase: &str) {
         let phase = normalize_supervisor_phase(phase);
         let mut state = self.state.lock().await;
-        let target_id = session_id
-            .and_then(|id| state.resolve_session_id(id))
-            .or_else(|| state.active_session_id.clone());
+        // An explicitly targeted event only updates the session it names
+        // (resolved through aliases). Falling back to the active session for
+        // an id that resolves to NOTHING re-attributed foreign events — the
+        // Interrupted ack for a session this daemon does not manage, or a
+        // foreground session's status events under the headless resume
+        // listener — and poisoned an unrelated session's phase (a phase of
+        // "interrupted" makes managed_session_accepts_external_input drop
+        // that session's follow-ups). Only id-less events may still mean
+        // "the active session" (the legacy single-session shape).
+        let target_id = match session_id {
+            Some(id) => state.resolve_session_id(id),
+            None => state.active_session_id.clone(),
+        };
         let Some(target_id) = target_id else {
             return;
         };
@@ -495,6 +505,53 @@ pub(crate) fn load_related_sessions_from_log(session_dir: &Path) -> Vec<RelatedS
 mod tests {
     use super::*;
     use crate::session_supervisor::tests::{managed_session, test_supervisor};
+
+    /// An explicitly-targeted phase event for an id this supervisor cannot
+    /// resolve must NOT re-attribute to the active session: the Interrupted
+    /// ack for an unmanaged session (and foreground events under the
+    /// headless resume listener) otherwise flip an unrelated session's
+    /// phase — and an "interrupted" phase makes it drop follow-ups as
+    /// "not accepting input".
+    #[tokio::test]
+    async fn targeted_phase_update_for_unknown_session_does_not_poison_active() {
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("active-a", "codex");
+            session.phase = "running".to_string();
+            state.sessions.insert("active-a".to_string(), session);
+            state.active_session_id = Some("active-a".to_string());
+        }
+
+        supervisor
+            .observe_lifecycle_event(&AppEvent::Interrupted {
+                session_id: Some("ghost-x".to_string()),
+                reason: "session is not attached to this daemon".to_string(),
+            })
+            .await;
+
+        {
+            let state = supervisor.state.lock().await;
+            assert_eq!(
+                state.sessions.get("active-a").map(|s| s.phase.as_str()),
+                Some("running"),
+                "unknown-id events must not re-attribute to the active session"
+            );
+        }
+
+        // Id-less events keep the legacy single-session meaning.
+        supervisor
+            .observe_lifecycle_event(&AppEvent::Interrupted {
+                session_id: None,
+                reason: "user requested".to_string(),
+            })
+            .await;
+        let state = supervisor.state.lock().await;
+        assert_eq!(
+            state.sessions.get("active-a").map(|s| s.phase.as_str()),
+            Some("interrupted")
+        );
+    }
 
     #[tokio::test]
     async fn session_ended_marks_managed_session_done() {

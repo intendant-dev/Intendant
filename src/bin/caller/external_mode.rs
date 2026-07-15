@@ -45,6 +45,14 @@ pub(crate) async fn run_external_agent_mode(
 
     // Construct, initialize, and start a thread for the external agent
     let resumed_external_session = resume_session.clone();
+    // Supervisor-spawned sessions (launch.rs) hold this loop's follow-up
+    // sender in their ManagedSession entry; the supervisor dropping it is
+    // the authoritative "session was stopped/removed" signal. The
+    // foreground/MCP shapes pass None and manage the sender lifecycle
+    // differently (it may be dropped while a one-shot task legitimately
+    // runs), so the queued-turn stop guard below only applies when
+    // supervised.
+    let supervised_by_session_supervisor = control_session_id.is_some();
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
     let effective_codex_home = if backend == external_agent::AgentBackend::Codex {
@@ -270,6 +278,24 @@ pub(crate) async fn run_external_agent_mode(
     }
 
     'outer: loop {
+        // A supervised session signals stop/removal by dropping the
+        // follow-up sender held in its ManagedSession entry. The idle wait
+        // below already exits on that closure, but a queued `next_turn`
+        // (the resume/start task, a managed-context replay) bypasses the
+        // idle wait entirely — a StopSession that won the startup race
+        // against this loop then ran the very turn it was meant to abort.
+        // Together with the pre-spawn control subscription above this
+        // closes the attach-window stop completely: a stop before the
+        // subscription implies the sender is already gone (caught here); a
+        // stop after it is buffered on the control receiver (caught by the
+        // idle select / turn drain).
+        if supervised_by_session_supervisor && next_turn.is_some() && follow_up_rx.is_closed() {
+            slog(&session_log, |l| {
+                l.info("Session was stopped before its queued turn started; exiting")
+            });
+            stats.terminal_outcome = Some("stopped before the queued turn started".to_string());
+            break 'outer;
+        }
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
