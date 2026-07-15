@@ -1648,8 +1648,9 @@ fn changes_list_summaries_full_scan(
 }
 
 /// Watcher-state fast path: `None` when no live watcher matches this
-/// target (or its lock is contended right now) — the caller falls back to
-/// the full scan, so correctness never depends on the fast path.
+/// target, its lock is contended right now, or its live index is degraded
+/// (notify not yet confirmed running, or a notify error) — the caller falls
+/// back to the full scan, so correctness never depends on the fast path.
 fn changes_list_summaries_via_live_watcher(
     snapshot_dir: &Path,
     baseline_dir: &Path,
@@ -1659,7 +1660,7 @@ fn changes_list_summaries_via_live_watcher(
     // This runs on sync paths (HTTP handler inline, tunnel twin inside
     // spawn_blocking), so it must not await; try_lock keeps the fast path
     // opportunistic and contention falls back to the scan.
-    let index = watcher.try_lock().ok()?.changes_index_snapshot();
+    let index = watcher.try_lock().ok()?.changes_index_snapshot()?;
     Some(changes_list_summaries_from_index(
         baseline_dir,
         project_root,
@@ -5856,7 +5857,8 @@ mod tests {
         );
 
         let baseline_dir = snapshot.path().join("baseline");
-        let index = watcher.changes_index_snapshot();
+        watcher.mark_live_index_healthy_for_tests();
+        let index = watcher.changes_index_snapshot().expect("healthy index");
         let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);
         let full = changes_list_summaries_full_scan(&baseline_dir, root);
         assert_eq!(
@@ -5889,6 +5891,51 @@ mod tests {
         let created_bin = fast.iter().find(|v| v["path"] == "new.dat").unwrap();
         assert_eq!(created_bin["kind"], "created");
         assert_eq!(created_bin["diff_available"], false);
+    }
+
+    /// Resume-after-delete: a file baselined by a previous run and deleted
+    /// before this one must not surface as a phantom "deleted" row — the
+    /// stale `baseline/` copy is reconciled away at watcher construction,
+    /// keeping the full scan and the watcher-index fast path in agreement.
+    #[test]
+    fn resume_after_delete_reconciles_stale_baselines() {
+        let project = tempfile::TempDir::new().unwrap();
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("keep.rs"), "kept\n").unwrap();
+        std::fs::write(root.join("stale.rs"), "left over\n").unwrap();
+        let first = crate::file_watcher::FileWatcher::new(
+            root.to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("first watcher");
+        drop(first);
+
+        // The file disappears between runs.
+        std::fs::remove_file(root.join("stale.rs")).unwrap();
+
+        let mut resumed = crate::file_watcher::FileWatcher::new(
+            root.to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("resumed watcher");
+        resumed.mark_live_index_healthy_for_tests();
+
+        let baseline_dir = snapshot.path().join("baseline");
+        let full = changes_list_summaries_full_scan(&baseline_dir, root);
+        let index = resumed.changes_index_snapshot().expect("healthy index");
+        let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);
+        assert_eq!(
+            serde_json::to_string(&fast).unwrap(),
+            serde_json::to_string(&full).unwrap(),
+            "fast path and full scan must agree after a resume-after-delete"
+        );
+        assert!(
+            full.iter().all(|row| row["path"] != "stale.rs"),
+            "no phantom deleted row for a file this session never had: {full:?}"
+        );
     }
 
     /// GET /api/session/current/history serves the slim timeline: round
