@@ -20,6 +20,8 @@ pub(crate) async fn reader_task(
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
     context_pressure_floor: Arc<Mutex<Option<CodexContextPressureFloor>>>,
     model: Option<String>,
+    protocol_watch: Option<crate::external_agent::protocol_watch::ProtocolWatchHandle>,
+    writer: SharedCodexWriter,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
@@ -32,6 +34,9 @@ pub(crate) async fn reader_task(
             Ok(None) => {
                 // EOF — clear any active turn so a later interrupt_turn
                 // doesn't fire against a dead process.
+                if let Some(watch) = protocol_watch.as_ref() {
+                    watch.flush_async().await;
+                }
                 active_turn_id.lock().await.take();
                 active_turns.lock().await.clear();
                 let _ = event_tx.send(AgentEvent::Terminated {
@@ -41,6 +46,9 @@ pub(crate) async fn reader_task(
                 return;
             }
             Err(e) => {
+                if let Some(watch) = protocol_watch.as_ref() {
+                    watch.flush_async().await;
+                }
                 active_turn_id.lock().await.take();
                 active_turns.lock().await.clear();
                 let _ = event_tx.send(AgentEvent::Terminated {
@@ -56,13 +64,37 @@ pub(crate) async fn reader_task(
             continue;
         }
 
-        let msg: JsonRpcMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
+        let raw: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
             Err(e) => {
-                eprintln!(
-                    "[codex] failed to parse JSON-RPC message: {}: {:?}",
-                    e, line
-                );
+                if let Some(watch) = protocol_watch.as_ref() {
+                    if let Some(message) = watch.observe(
+                        crate::external_agent::protocol_watch::ProtocolFinding::malformed(),
+                    ) {
+                        let _ = event_tx.send(AgentEvent::Log {
+                            level: "warn".to_string(),
+                            message,
+                        });
+                    }
+                }
+                eprintln!("[codex] failed to parse JSON-RPC message: {e}");
+                continue;
+            }
+        };
+        if let Some(watch) = protocol_watch.as_ref() {
+            for message in
+                watch.observe_all(crate::external_agent::protocol_watch::codex_findings(&raw))
+            {
+                let _ = event_tx.send(AgentEvent::Log {
+                    level: "warn".to_string(),
+                    message,
+                });
+            }
+        }
+        let msg: JsonRpcMessage = match serde_json::from_value(raw) {
+            Ok(message) => message,
+            Err(_) => {
+                eprintln!("[codex] failed to decode JSON-RPC message shape");
                 continue;
             }
         };
@@ -87,12 +119,20 @@ pub(crate) async fn reader_task(
 
         // 2. Server-to-client request (has method AND id) -- approval requests
         if let Some(jsonrpc_id) = msg.id {
+            let params = msg.params.unwrap_or(serde_json::Value::Null);
+            if reject_unsupported_server_request(&writer, &event_tx, method, jsonrpc_id).await {
+                // Reject on the reader path itself. During initialize the
+                // event receiver has not been returned to the supervisor yet,
+                // so routing this through the approval drain can deadlock an
+                // upgraded app-server that waits for our response.
+                continue;
+            }
+
             let request_id = format!(
                 "approval-{}",
                 approval_counter.fetch_add(1, Ordering::Relaxed)
             );
 
-            let params = msg.params.unwrap_or(serde_json::Value::Null);
             pending_approvals.lock().await.insert(
                 request_id.clone(),
                 PendingApproval {
@@ -2232,7 +2272,7 @@ pub(crate) fn translate_notification_with_scope(
                     }
                 }
                 other => {
-                    eprintln!("[codex] unknown item type in item/started: {:?}", other);
+                    let _ = other;
                 }
             }
         }
@@ -2688,11 +2728,7 @@ pub(crate) fn translate_notification_with_scope(
         "skills/changed" => {}
 
         other => {
-            eprintln!(
-                "[codex] unknown notification method: {:?} params: {}",
-                other,
-                serde_json::to_string(params).unwrap_or_default()
-            );
+            let _ = other;
         }
     }
 }
