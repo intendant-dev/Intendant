@@ -27,6 +27,65 @@ fn apply_user_display_grant_env(cmd: &mut Command, user_display_granted: bool) {
     }
 }
 
+/// Provider-credential env names scrubbed from the runtime child beyond the
+/// authoritative `provider::PROVIDER_KEY_ENV_VARS` list: adjacent
+/// conventional spellings of the same secrets that a user `.env` (loaded
+/// into the controller's process env at startup) may carry, plus the bare
+/// vendor names `exec_as_agent` has always scrubbed from its shells.
+const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI",
+    "ANTHROPIC",
+    "GEMINI",
+];
+
+/// True when `name` names a provider/model-API credential that must not
+/// reach the runtime. `INTENDANT_*` names are the controller→runtime
+/// control channel (the mock-provider e2e rig rides `PROVIDER` +
+/// `INTENDANT_MOCK_*` into children) and are never treated as credentials.
+fn is_provider_credential_env(name: &str) -> bool {
+    if name.starts_with("INTENDANT_") {
+        return false;
+    }
+    crate::provider::PROVIDER_KEY_ENV_VARS.contains(&name)
+        || EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.contains(&name)
+        || name.ends_with("_API_KEY")
+        || name.ends_with("_API_TOKEN")
+}
+
+/// Scrub provider credentials from the runtime child's environment.
+///
+/// The controller loads `.env` provider keys into its own process env at
+/// startup, and a spawned child inherits that env wholesale — without this
+/// scrub the sandboxed runtime (and every exec/PTY shell it spawns) holds
+/// the model API keys, violating the founding runtime/controller boundary
+/// ("the runtime never holds API keys"): a model-invoked
+/// `echo $ANTHROPIC_API_KEY` in a PTY shell would exfiltrate the key into
+/// the conversation. This spawn boundary is the single enforcement point;
+/// `exec_as_agent`'s per-shell env_removes remain as defense in depth.
+/// `inherited_names` is the parent-process env view (injected by the caller
+/// so tests stay hermetic).
+fn scrub_provider_credential_env<'a>(
+    cmd: &mut Command,
+    inherited_names: impl IntoIterator<Item = &'a str>,
+) {
+    // The canonical names are removed unconditionally — even when absent
+    // from the inherited env view — so an explicit `.env()` set can never
+    // reintroduce them.
+    for name in crate::provider::PROVIDER_KEY_ENV_VARS
+        .iter()
+        .chain(EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.iter())
+    {
+        cmd.env_remove(name);
+    }
+    for name in inherited_names {
+        if is_provider_credential_env(name) {
+            cmd.env_remove(name);
+        }
+    }
+}
+
 pub struct AgentOutput {
     pub stdout: String,
     pub stderr: String,
@@ -235,6 +294,13 @@ async fn run_agent_inner(
     #[cfg(target_os = "linux")]
     crate::linux_display_env::apply_to_tokio_command(&mut cmd);
 
+    // The runtime never holds API keys (see the scrub's doc): strip provider
+    // credentials from the child env as the last step before spawn.
+    let inherited_env_names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .collect();
+    scrub_provider_credential_env(&mut cmd, inherited_env_names.iter().map(String::as_str));
+
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
     })?;
@@ -336,6 +402,93 @@ mod tests {
             br#"{"type":"result","data":"missing nonce"}"#
         ));
         assert!(!has_parseable_runtime_output(b"panic before json"));
+    }
+
+    #[test]
+    fn provider_credential_env_predicate_covers_keys_not_control_vars() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "MISTRAL_API_KEY",
+            "SOME_SERVICE_API_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+        ] {
+            assert!(is_provider_credential_env(name), "{name} must be scrubbed");
+        }
+        for name in [
+            "PROVIDER",
+            "PATH",
+            "HOME",
+            "DISPLAY",
+            "INTENDANT_MOCK_SCRIPT",
+            "INTENDANT_MOCK_DISPLAY",
+            "INTENDANT_LOG_DIR",
+            "INTENDANT_FAKE_API_KEY", // the INTENDANT_* namespace is never scrubbed
+            "OPENAI_BASE_URL",
+        ] {
+            assert!(!is_provider_credential_env(name), "{name} must survive");
+        }
+    }
+
+    /// The founding invariant: the runtime child's env never carries
+    /// provider API keys, while the mock-provider e2e control vars and the
+    /// runtime's own INTENDANT_* channel survive. Hermetic — the
+    /// inherited-env view is injected; no real keys, no process env.
+    #[test]
+    fn runtime_child_env_scrubs_provider_credentials() {
+        use std::ffi::{OsStr, OsString};
+
+        let mut cmd = Command::new("true");
+        cmd.env("INTENDANT_LOG_DIR", "/tmp/logs");
+        scrub_provider_credential_env(
+            &mut cmd,
+            [
+                "ANTHROPIC_API_KEY",
+                "OPENAI_API_KEY",
+                "GEMINI_API_KEY",
+                "MISTRAL_API_KEY",
+                "CUSTOM_API_TOKEN",
+                "PATH",
+                "HOME",
+                "PROVIDER",
+                "INTENDANT_MOCK_SCRIPT",
+            ],
+        );
+        let envs: std::collections::HashMap<OsString, Option<OsString>> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+
+        // Removed vars appear as explicit (name, None) child-env entries.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "MISTRAL_API_KEY",
+            "CUSTOM_API_TOKEN",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(name)),
+                Some(&None),
+                "{name} must be removed from the child env"
+            );
+        }
+        // Preserved vars have no explicit entry at all: they inherit.
+        for name in ["PATH", "HOME", "PROVIDER", "INTENDANT_MOCK_SCRIPT"] {
+            assert!(
+                !envs.contains_key(OsStr::new(name)),
+                "{name} must inherit untouched (no explicit entry)"
+            );
+        }
+        assert_eq!(
+            envs.get(OsStr::new("INTENDANT_LOG_DIR")),
+            Some(&Some(OsString::from("/tmp/logs"))),
+            "runtime control vars set at the spawn boundary must survive the scrub"
+        );
     }
 
     /// The spawn boundary is the only place the user-display grant becomes
