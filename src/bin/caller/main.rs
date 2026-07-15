@@ -1146,6 +1146,16 @@ async fn maybe_auto_launch_xvfb(
     if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
         return;
     }
+    // Memoized accessible-display verdict: this function runs on every
+    // exec/captureScreen batch, `is_display_accessible()` forks `xdpyinfo`
+    // per call on Linux, and the probe result feeds only the one-time log
+    // line below. Only the accessible outcome is sticky — while no display
+    // exists we keep probing, so a machine that gains an X server later (or
+    // retries after a failed Xvfb launch) is still picked up.
+    static EXISTING_DISPLAY: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+    if EXISTING_DISPLAY.get().is_some() {
+        return;
+    }
     // If a display is already accessible (e.g. DISPLAY was set before launch,
     // or on macOS where the native display is always available), skip Xvfb.
     // Don't emit DisplayReady — no DisplaySession exists, so the web dashboard
@@ -1158,6 +1168,7 @@ async fn maybe_auto_launch_xvfb(
             .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
             .unwrap_or(default_display);
         let (width, height) = query_display_resolution(display_id);
+        let _ = EXISTING_DISPLAY.set((display_id, width, height));
         slog(session_log, |l| {
             l.info(&format!(
                 "Using existing display :{} ({}x{}) — no web slot (no DisplaySession)",
@@ -1202,25 +1213,19 @@ async fn maybe_auto_launch_xvfb(
     }
 }
 
-/// Query the resolution of the native display via system_profiler.
-/// Returns the logical (point) resolution, not device pixels.
-/// Uses CoreGraphics via swift, which returns logical resolution directly
+/// Query the resolution of the native display.
+/// Returns the logical (point) resolution, not device pixels
 /// (e.g. 1339x837 on a Retina display, not the 2x device pixel size).
-/// Falls back to system_profiler, then a default.
+/// Primary method is an in-process CoreGraphics query; falls back to
+/// system_profiler, then a default.
 #[cfg(target_os = "macos")]
 pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
-    // Primary method: CoreGraphics (works in VMs where system_profiler is empty)
-    if let Ok(out) = std::process::Command::new("swift")
-        .args(["-e", "import CoreGraphics; let d = CGMainDisplayID(); print(\"\\(CGDisplayPixelsWide(d))x\\(CGDisplayPixelsHigh(d))\")"])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let parts: Vec<&str> = text.split('x').collect();
-        if parts.len() == 2 {
-            if let (Ok(w), Ok(h)) = (parts[0].parse(), parts[1].parse()) {
-                return (w, h);
-            }
-        }
+    // Primary method: in-process CoreGraphics (works in VMs where
+    // system_profiler is empty). Same CGDisplayPixels* calls the retired
+    // `swift -e` subprocess made — that spawn JIT-compiled a Swift snippet
+    // (~0.5-2s) per query; the FFI call is microseconds and topology-fresh.
+    if let Some((w, h)) = platform::main_display_pixel_size() {
+        return (w, h);
     }
     // Fallback: system_profiler (may be empty in VMs)
     if let Ok(out) = std::process::Command::new("system_profiler")
