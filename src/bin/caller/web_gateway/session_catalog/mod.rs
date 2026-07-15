@@ -1544,7 +1544,7 @@ pub(crate) fn push_session_file_fingerprint_with_metadata(
         .unwrap_or(path)
         .to_string_lossy()
         .to_string();
-    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    let (dev, ino) = crate::platform::metadata_dev_ino(metadata);
     entries.push(SessionFileFingerprint {
         rel,
         len: metadata.len(),
