@@ -196,3 +196,22 @@ Open the Intendant dashboard, select **Sessions** in the left rail, open session
 5. Remove verification interference and context bloat (CU-06/CU-07).
 6. Define non-destructive clipboard semantics for paste (CU-08).
 7. Improve evidence retrieval and build provenance for future E2E runs (EV-01/EV-02).
+
+## Verification and disposition addendum — 2026-07-15
+
+Every finding above was triaged into the 2026-07-13/14 CU program (PRs #302–#307) and re-verified live against a release build of merged `main` (`b9169990`) on a macOS user session on 2026-07-14, following `tests/skills/cu-type-injection/SKILL.md`.
+
+| Finding | Disposition |
+|---|---|
+| CU-01 `type` unreliable / false ok | **Fixed and live-verified 9/9** (#303). Root cause: 20-UTF-16-unit `CGEventKeyboardSetUnicodeString` chunks posted back-to-back with mispaired keyUps — the observed `ant CU ✓` suffix was exactly chunk 2 of 2. All three skill legs (already-focused field, zero-wait click→type batch, Safari address bar) passed 3/3 repeats with AX read-back confirmation of the full phrase. |
+| CU-02 grant ≠ readiness | **Fixed** (#305): five independent readiness layers via the `display_readiness` tool / `ctl display status`, plus `os_readiness` gap blocks on grant answers. Live-verified against real TCC state. |
+| CU-03 injection conflated with effect | **Fixed** (#303): `ok` / `injected` / `failed` result vocabulary, with AX read-back where the platform allows. Proven in live use — misdirected batches surfaced as `injected` rather than false `ok`. |
+| CU-04 capture failure not actionable | **Fixed** (#305): preflight-confirmed denials name Screen Recording, the affected binary, and the System Settings destination. Denial path is unit-tested; not exercised live (the test host holds the grant). |
+| CU-05 stale shared-focus annotation | **Fixed** (#302): idempotent `shared focus clear`, plus auto-clear on view hide, display revocation, and owning-session end. |
+| CU-06 markers obscure verified state | **Fixed** (#304 + #306): model-facing screenshots are clean by default (`annotate` is opt-in); live visual feedback moved to transient dashboard overlays (cursor halo, click ripples). |
+| CU-07 URL bloat in `read_screen` | **Fixed** (#305): 80-char value/title cap with a stable `… [N chars total, #hash]` marker and a `full_values` escape hatch. Live-verified on a 532-char URL. |
+| CU-08 clipboard residue | **Fixed** (#303): clipboard save/restore around paste on macOS and Windows; X11/Wayland state their no-restore semantics in the result. Live-verified by sentinel round-trip. |
+| EV-01 notes not discoverable | **Deferred by design — not built.** Session notes (landed 2026-07-09) are session-log-plane replay evidence anchored to one transcript. The workflow EV-01 asks for — an owner retrieving agent-left findings later, across sessions — belongs to the planned owner-plane attention/agenda surface, and a notes-browsing CLI now would duplicate that design. Durable findings remain repo files (this document is the pattern). |
+| EV-02 no version provenance | **Fixed** (#302): `--version`/`-V` on both binaries (version, commit, build timestamp, target triple) and `daemon_version` in `ctl status`. |
+
+The same program also landed the architecture-comparison items that sat behind these findings: `observe: pixels|ax|auto|none` on `execute_cu_actions`, lazy single-encode screenshots, bounded `settle` quiescence reporting, and per-batch CU metrics (#306, #307).
