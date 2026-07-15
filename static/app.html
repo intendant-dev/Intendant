@@ -28028,7 +28028,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '526eab3df8ca45c3';
+const INTENDANT_APP_BUILD = '5c960eaf3016e839';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -98255,6 +98255,14 @@ function renderWorktreesAggregate(scan, el) {
   ];
   const freeDisk = worktreeFreeDiskCard(summary);
   if (freeDisk) cards.push(freeDisk);
+  if ((summary.reclaimable_bytes || 0) > 0) {
+    cards.push({
+      label: 'Reclaimable',
+      value: _fmtBytes(summary.reclaimable_bytes),
+      sub: 'cargo target/ dirs',
+      title: 'Build output the per-worktree Clean button can delete without removing any checkout',
+    });
+  }
   cards.push(
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
@@ -98745,6 +98753,7 @@ function recomputeWorktreeSummary(scan) {
     stale: 0,
     cleanup_candidates: 0,
     truncated_sizes: 0,
+    reclaimable_bytes: 0,
     // Volume capacity comes from the scan, not the rows; carry it through
     // (it only goes stale by the removal that just freed space, in the
     // conservative direction — the next scan refreshes it).
@@ -98753,6 +98762,7 @@ function recomputeWorktreeSummary(scan) {
   };
   for (const wt of rows) {
     summary.total_bytes += Number(wt.size_bytes || 0);
+    summary.reclaimable_bytes += Number(wt.reclaimable_bytes || 0);
     if (wt.dirty) summary.dirty += 1;
     if (wt.merge_status === 'unmerged') summary.unmerged += 1;
     if ((wt.active_sessions || 0) > 0) summary.active += 1;
@@ -98781,6 +98791,75 @@ function setWorktreeRemoveButtonPending(button, state) {
     : mode === 'removing'
     ? 'Removing...'
     : 'Remove worktree...';
+}
+
+// Reclaim a worktree's Cargo target/ without removing the checkout — the
+// middle ground between keeping a fat worktree and deleting it. Cleans are
+// independent per-directory fs deletes, so a per-path pending set suffices
+// (no serialization queue like removals, which contend on git locks).
+const pendingWorktreeCleans = new Set();
+
+async function cleanWorktreeTarget(wt, button) {
+  const pathKey = String(wt.path || '');
+  if (!pathKey || pendingWorktreeCleans.has(pathKey)) return;
+  const activeWarning = (wt.active_sessions || 0) > 0
+    ? `\n\n${wt.active_sessions} session(s) look active in this worktree — a build running there will lose its progress and start over.`
+    : '';
+  const ok = await showDashboardConfirm({
+    title: 'Clean target/',
+    message:
+      `Delete the Cargo build directory of ${wt.branch || wt.head_short || wt.path}?\n\n` +
+      `Path: ${wt.path}/target\n` +
+      `Reclaims about ${_fmtBytes(wt.reclaimable_bytes || 0)}.`,
+    warning:
+      'Sources and git state are untouched; the next build recreates target/ from scratch.' +
+      activeWarning,
+    confirmLabel: 'Clean',
+  });
+  if (!ok) return;
+
+  pendingWorktreeCleans.add(pathKey);
+  if (button) {
+    button.disabled = true;
+    button.classList.add('pending');
+    button.textContent = 'Cleaning...';
+  }
+  setWorktreesActivityNotice('pending', `Cleaning ${wt.path}/target...`);
+  try {
+    const payload = { repo_root: wt.repo_root, path: wt.path, expected_head: wt.head || null };
+    // daemonApi (transport F2): a POST twin — no HTTP replay after an
+    // attempted tunnel send, matching the remove call above.
+    const r = await daemonApi.request('api_worktrees_clean', payload);
+    const result = (r.body && typeof r.body === 'object') ? r.body : {};
+    if (!r.ok || result.ok === false) {
+      throw new Error(result.error || `worktree clean returned ${r.status}`);
+    }
+    const freed = Number(result.freed_bytes || 0);
+    if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+      const entry = _cachedWorktreeScan.worktrees.find(e => e.path === wt.path);
+      if (entry) {
+        entry.size_bytes = Math.max(0, Number(entry.size_bytes || 0) - freed);
+        entry.reclaimable_bytes = result.partial
+          ? Math.max(0, Number(entry.reclaimable_bytes || 0) - freed)
+          : 0;
+      }
+      recomputeWorktreeSummary(_cachedWorktreeScan);
+    }
+    const message = result.partial
+      ? `Cleaned ${_fmtBytes(freed)} from ${wt.path}/target; some entries survived (${result.detail || 'locked files'}).`
+      : `Cleaned ${wt.path}/target. Freed about ${_fmtBytes(freed)}.`;
+    setWorktreesStatus(message, result.partial ? 'error' : '');
+    setWorktreesActivityNotice(result.partial ? 'error' : 'ok', message, result.partial ? 0 : 3500);
+    showControlToast(result.partial ? 'error' : 'success', result.partial ? 'Target partially cleaned.' : 'Target cleaned.');
+  } catch (err) {
+    const message = err.message || 'Worktree clean failed';
+    setWorktreesStatus(message, 'error');
+    setWorktreesActivityNotice('error', message);
+    showControlToast('error', message);
+  } finally {
+    pendingWorktreeCleans.delete(pathKey);
+    if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+  }
 }
 
 async function removeWorktree(wt, button) {
@@ -99022,6 +99101,9 @@ function renderWorktreesList(scan, el) {
     };
     addMeta('repo', wt.repo_name);
     addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'v-green' : null);
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      addMeta('target/', _fmtBytes(wt.reclaimable_bytes), null, 'Cargo build output the Clean button can reclaim');
+    }
     addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
     addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
     addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'v-green' : (wt.merge_status === 'unmerged' ? 'v-red' : null));
@@ -99061,6 +99143,21 @@ function renderWorktreesList(scan, el) {
       openWorktreeInspect(wt);
     });
     actions.appendChild(inspectBtn);
+
+    if ((wt.reclaimable_bytes || 0) > 0) {
+      const cleaning = pendingWorktreeCleans.has(pathKey);
+      const cleanBtn = document.createElement('button');
+      cleanBtn.className = 'ui-btn wt-clean-btn';
+      cleanBtn.textContent = cleaning ? 'Cleaning...' : `Clean target/ (${_fmtBytes(wt.reclaimable_bytes)})`;
+      cleanBtn.title = 'Delete the Cargo build directory to reclaim disk without removing the worktree. Sources and git state are untouched; the next build recreates it.';
+      cleanBtn.disabled = cleaning || !!removalState;
+      cleanBtn.classList.toggle('pending', cleaning);
+      cleanBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        cleanWorktreeTarget(wt, cleanBtn);
+      });
+      actions.appendChild(cleanBtn);
+    }
 
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);

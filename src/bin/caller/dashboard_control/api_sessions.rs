@@ -317,6 +317,7 @@ pub(crate) async fn control_request_frame(
         "api_worktrees_remove" => {
             api_worktrees_remove_response(id, params.as_ref(), &runtime).await
         }
+        "api_worktrees_clean" => api_worktrees_clean_response(id, params.as_ref(), &runtime).await,
         "api_worktrees_merge" => api_worktrees_merge_response(id, params.as_ref(), &runtime).await,
         "api_managed_context_records" => {
             api_managed_context_response(id, "records", params.as_ref(), &runtime).await

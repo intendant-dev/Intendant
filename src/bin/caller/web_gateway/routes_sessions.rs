@@ -417,6 +417,55 @@ pub(crate) fn worktrees_remove_api_response(
     ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
 }
 
+pub(crate) fn worktrees_clean_api_response(
+    home: &Path,
+    body_text: &str,
+    cache: &Arc<Mutex<Option<String>>>,
+) -> ApiResponse {
+    let (status_line, body) = clean_worktree_inventory_response(home, body_text);
+    if status_line == "200 OK" {
+        if let Ok(mut guard) = cache.lock() {
+            *guard = None;
+        }
+    }
+    ApiResponse::json(status_line_code(status_line), JsonBody::PreSerialized(body))
+}
+
+pub(crate) fn clean_worktree_inventory_response(
+    home: &Path,
+    body_text: &str,
+) -> (&'static str, String) {
+    let request =
+        match serde_json::from_str::<crate::worktree_inventory::WorktreeCleanRequest>(body_text) {
+            Ok(request) => request,
+            Err(e) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid worktree clean request: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        };
+    let hints = worktree_session_hints_from_home(home);
+    match crate::worktree_inventory::clean_worktree_target_if_safe(request, &hints) {
+        Ok(response) => (
+            "200 OK",
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        Err(e) => (
+            "409 Conflict",
+            serde_json::json!({
+                "ok": false,
+                "error": e
+            })
+            .to_string(),
+        ),
+    }
+}
+
 pub(crate) fn inspect_worktree_inventory_response(
     home: &Path,
     body_text: &str,
@@ -3759,6 +3808,34 @@ pub(crate) async fn handle_worktrees_remove(
                 serde_json::json!({
                     "ok": false,
                     "error": format!("worktree removal task failed: {e}")
+                })
+                .to_string(),
+            ),
+        ),
+    };
+    write_api_response(stream, response, cors, fleet_origin).await;
+}
+
+pub(crate) async fn handle_worktrees_clean(
+    stream: DemuxStream,
+    body_text: String,
+    worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let home = crate::platform::home_dir();
+    let response = match tokio::task::spawn_blocking(move || {
+        worktrees_clean_api_response(&home, &body_text, &worktree_inventory_cache)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) => ApiResponse::json(
+            500,
+            JsonBody::PreSerialized(
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("worktree clean task failed: {e}")
                 })
                 .to_string(),
             ),
