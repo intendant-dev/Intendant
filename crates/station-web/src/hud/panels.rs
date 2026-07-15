@@ -26,10 +26,10 @@ impl StationInner {
     pub(crate) fn sessions_panel_surface(&self) -> PanelSurface {
         let mut surface = PanelSurface {
             header: vec![
-                HeaderPill::new("new", C_TEAL_CSS, HitAction::Composer { op: "open-launch" }),
+                HeaderPill::new("new", C_SKY_CSS, HitAction::Composer { op: "open-launch" }),
                 HeaderPill::new(
                     "refresh",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::SessionAction {
                         action: "refresh".into(),
                         id: String::new(),
@@ -37,7 +37,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "worktrees",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::Select("system:worktrees".into()),
                 ),
             ],
@@ -58,7 +58,7 @@ impl StationInner {
             if target.can_focus {
                 row = row.pill(
                     "focus",
-                    C_PEACH_CSS,
+                    C_AMBER_CSS,
                     HitAction::SessionAction {
                         action: "focus".into(),
                         id: sid.clone(),
@@ -68,7 +68,7 @@ impl StationInner {
             if target.can_attach {
                 row = row.pill(
                     "attach",
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                     HitAction::SessionAction {
                         action: "attach".into(),
                         id: sid.clone(),
@@ -78,7 +78,7 @@ impl StationInner {
             if target.can_stop {
                 row = row.pill(
                     "stop",
-                    C_RED_CSS,
+                    C_ROSE_CSS,
                     HitAction::SessionAction {
                         action: "stop".into(),
                         id: sid.clone(),
@@ -101,7 +101,7 @@ impl StationInner {
             if session.can_focus {
                 row = row.pill(
                     "focus",
-                    C_PEACH_CSS,
+                    C_AMBER_CSS,
                     HitAction::SessionAction {
                         action: "focus".into(),
                         id: sid.clone(),
@@ -124,7 +124,7 @@ impl StationInner {
             if session.can_interrupt {
                 row = row.pill(
                     "halt",
-                    C_YELLOW_CSS,
+                    C_AMBER_CSS,
                     HitAction::SessionAction {
                         action: "interrupt".into(),
                         id: sid.clone(),
@@ -134,7 +134,7 @@ impl StationInner {
             if session.can_stop {
                 row = row.pill(
                     "stop",
-                    C_RED_CSS,
+                    C_ROSE_CSS,
                     HitAction::SessionAction {
                         action: "stop".into(),
                         id: sid.clone(),
@@ -146,7 +146,7 @@ impl StationInner {
                 // them).
                 row = row.pill(
                     "fork",
-                    C_MAUVE_CSS,
+                    C_VIOLET_CSS,
                     HitAction::SessionAction {
                         action: "fork".into(),
                         id: sid.clone(),
@@ -163,7 +163,7 @@ impl StationInner {
             header: vec![
                 HeaderPill::new(
                     "scan",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::SessionAction {
                         action: "worktrees-scan".into(),
                         id: String::new(),
@@ -171,7 +171,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "sessions",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::Select("system:sessions".into()),
                 ),
             ],
@@ -192,7 +192,7 @@ impl StationInner {
                 })
                 .pill(
                     "copy",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::SessionAction {
                         action: "worktree-copy".into(),
                         id: path,
@@ -216,7 +216,7 @@ impl StationInner {
             header: vec![
                 HeaderPill::new_owned(
                     format!("lvl {}", truncate(&level, 6)),
-                    C_YELLOW_CSS,
+                    C_AMBER_CSS,
                     HitAction::ActivityAction {
                         action: format!("level:{next_level}"),
                         id: String::new(),
@@ -224,7 +224,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "copy",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ActivityAction {
                         action: "copy-visible".into(),
                         id: String::new(),
@@ -232,7 +232,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "clear",
-                    C_RED_CSS,
+                    C_ROSE_CSS,
                     HitAction::ActivityAction {
                         action: "clear-log".into(),
                         id: String::new(),
@@ -255,7 +255,7 @@ impl StationInner {
             )
             .pill(
                 "copy",
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 HitAction::ActivityAction {
                     action: "copy-event".into(),
                     id: event.id.clone(),
@@ -269,7 +269,7 @@ impl StationInner {
                     })
                     .pill(
                         "log",
-                        C_TEAL_CSS,
+                        C_SKY_CSS,
                         HitAction::SessionAction {
                             action: "station-log".into(),
                             id: event.session_id.clone(),
@@ -295,7 +295,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "replay",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ContextAction {
                         action: "replay".into(),
                         id: String::new(),
@@ -303,7 +303,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "prev",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::ContextAction {
                         action: "replay-prev".into(),
                         id: String::new(),
@@ -311,7 +311,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "next",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::ContextAction {
                         action: "replay-next".into(),
                         id: String::new(),
@@ -319,7 +319,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "copy",
-                    C_LAVENDER_CSS,
+                    C_IRIS2_CSS,
                     HitAction::ContextAction {
                         action: "copy-snapshot".into(),
                         id: String::new(),
@@ -339,7 +339,7 @@ impl StationInner {
                     context.replay_count,
                     nonempty(&context.replay_time, "-")
                 ),
-                C_BLUE_CSS,
+                C_IRIS_CSS,
             ));
         }
         for cat in context.top_categories.iter() {
@@ -351,7 +351,7 @@ impl StationInner {
                     cat.count,
                     cat.detail
                 ),
-                C_BLUE_CSS,
+                C_IRIS_CSS,
             ));
         }
         for item in context.top_items.iter() {
@@ -363,7 +363,7 @@ impl StationInner {
                 )
                 .pill(
                     "copy",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ContextAction {
                         action: "copy-part".into(),
                         id: item.id.clone(),
@@ -379,7 +379,7 @@ impl StationInner {
         let state = &managed.action_state;
         let mut header = vec![HeaderPill::new(
             "seed",
-            C_BLUE_CSS,
+            C_IRIS_CSS,
             HitAction::ManagedAction {
                 action: "seed-context".into(),
                 id: String::new(),
@@ -388,7 +388,7 @@ impl StationInner {
         if state.can_rewind {
             header.push(HeaderPill::new(
                 "rewind",
-                C_YELLOW_CSS,
+                C_AMBER_CSS,
                 HitAction::ManagedAction {
                     action: "dispatch-rewind".into(),
                     id: String::new(),
@@ -398,7 +398,7 @@ impl StationInner {
         if state.can_backout {
             header.push(HeaderPill::new(
                 "backout",
-                C_RED_CSS,
+                C_ROSE_CSS,
                 HitAction::ManagedAction {
                     action: "run-backout".into(),
                     id: String::new(),
@@ -407,7 +407,7 @@ impl StationInner {
         }
         header.push(HeaderPill::new(
             "status",
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
             HitAction::ManagedAction {
                 action: "copy-status".into(),
                 id: String::new(),
@@ -430,7 +430,7 @@ impl StationInner {
                         format!(" / {}", state.result.trim())
                     }
                 ),
-                C_LAVENDER_CSS,
+                C_IRIS2_CSS,
             ));
         }
         for record in managed.recent_records.iter() {
@@ -447,7 +447,7 @@ impl StationInner {
                 })
                 .pill(
                     "fork",
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                     HitAction::ManagedAction {
                         action: "record-fork".into(),
                         id: rid.clone(),
@@ -455,7 +455,7 @@ impl StationInner {
                 )
                 .pill(
                     "restore",
-                    C_YELLOW_CSS,
+                    C_AMBER_CSS,
                     HitAction::ManagedAction {
                         action: "record-restore".into(),
                         id: rid,
@@ -471,7 +471,7 @@ impl StationInner {
             header: vec![
                 HeaderPill::new(
                     "refresh",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ChangesAction {
                         action: "refresh".into(),
                         path: String::new(),
@@ -479,7 +479,7 @@ impl StationInner {
                 ),
                 HeaderPill::new(
                     "copy paths",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::ChangesAction {
                         action: "copy-paths".into(),
                         path: String::new(),
@@ -503,7 +503,7 @@ impl StationInner {
                 })
                 .pill(
                     "diff",
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                     HitAction::ChangesAction {
                         action: "station-diff".into(),
                         path: path.clone(),
@@ -511,7 +511,7 @@ impl StationInner {
                 )
                 .pill(
                     "copy",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ChangesAction {
                         action: "copy-diff".into(),
                         path,
@@ -528,14 +528,14 @@ impl StationInner {
             header: vec![
                 HeaderPill::new(
                     "refresh",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::ControlsAction {
                         action: "peer-refresh".into(),
                     },
                 ),
                 HeaderPill::new(
                     "open",
-                    C_PEACH_CSS,
+                    C_AMBER_CSS,
                     HitAction::ControlsAction {
                         action: "peer-open-selected".into(),
                     },
@@ -555,7 +555,7 @@ impl StationInner {
             surface.rows.push(PanelRow::new(
                 "status".to_string(),
                 runway.peer_status.trim().to_string(),
-                C_OVERLAY1_CSS,
+                C_TEXT3_CSS,
             ));
         }
         for lane in runway.lanes.iter() {
@@ -576,9 +576,9 @@ impl StationInner {
                 tag.to_string(),
                 format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
                 if lane.selected {
-                    C_BLUE_CSS
+                    C_IRIS_CSS
                 } else {
-                    C_PEACH_CSS
+                    C_AMBER_CSS
                 },
             );
             if !lane.id.is_empty() {
@@ -589,7 +589,7 @@ impl StationInner {
                     })
                     .pill(
                         "open",
-                        C_PEACH_CSS,
+                        C_AMBER_CSS,
                         HitAction::RunwayAction {
                             action: "open".into(),
                             lane_id: lane.id.clone(),
@@ -597,7 +597,7 @@ impl StationInner {
                     )
                     .pill(
                         "copy",
-                        C_BLUE_CSS,
+                        C_IRIS_CSS,
                         HitAction::RunwayAction {
                             action: "copy".into(),
                             lane_id: lane.id.clone(),
@@ -606,7 +606,7 @@ impl StationInner {
                 if !lane.session_id.is_empty() {
                     row = row.pill(
                         "log",
-                        C_TEAL_CSS,
+                        C_SKY_CSS,
                         HitAction::SessionAction {
                             action: "station-log".into(),
                             id: lane.session_id.clone(),
@@ -626,12 +626,12 @@ impl StationInner {
             header: vec![
                 HeaderPill::new(
                     "compose",
-                    C_BLUE_CSS,
+                    C_IRIS_CSS,
                     HitAction::Composer { op: "open-send" },
                 ),
                 HeaderPill::new(
                     "launch",
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                     HitAction::Composer { op: "open-launch" },
                 ),
             ],
@@ -647,9 +647,9 @@ impl StationInner {
                 queue.blocked, queue.warn, queue.ready
             ),
             if queue.blocked > 0 {
-                C_RED_CSS
+                C_ROSE_CSS
             } else if queue.warn > 0 {
-                C_YELLOW_CSS
+                C_AMBER_CSS
             } else {
                 C_GREEN_CSS
             },
@@ -676,7 +676,7 @@ impl StationInner {
         // Autonomy + backend selection as choice pill rows.
         surface.rows.push(PanelRow::choices(
             "autonomy",
-            C_LAVENDER_CSS,
+            C_IRIS2_CSS,
             ["low", "medium", "high", "full"]
                 .into_iter()
                 .map(|level| {
@@ -692,7 +692,7 @@ impl StationInner {
         ));
         surface.rows.push(PanelRow::choices(
             "backend",
-            C_MAUVE_CSS,
+            C_VIOLET_CSS,
             [
                 ("intendant", "internal"),
                 ("codex", "codex"),
@@ -721,7 +721,7 @@ impl StationInner {
         if controls.backend == "codex" || controls.launch_agent == "codex" {
             surface.rows.push(PanelRow::choices(
                 "approval",
-                C_YELLOW_CSS,
+                C_AMBER_CSS,
                 ["untrusted", "on-request", "never"]
                     .into_iter()
                     .map(|policy| {
@@ -737,7 +737,7 @@ impl StationInner {
             ));
             surface.rows.push(PanelRow::choices(
                 "managed ctx",
-                C_MAUVE_CSS,
+                C_VIOLET_CSS,
                 ["vanilla", "managed"]
                     .into_iter()
                     .map(|mode| {
@@ -764,7 +764,7 @@ impl StationInner {
                             "no managed fork set — using {} (must be the Intendant-aware fork)",
                             nonempty(&controls.command, "codex")
                         ),
-                        C_YELLOW_CSS,
+                        C_AMBER_CSS,
                     ));
                 } else {
                     surface.rows.push(PanelRow::new(
@@ -785,7 +785,7 @@ impl StationInner {
             const MODEL_ALIASES: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
             surface.rows.push(PanelRow::choices(
                 "model",
-                C_YELLOW_CSS,
+                C_AMBER_CSS,
                 std::iter::once((
                     "default".to_string(),
                     model.is_empty(),
@@ -809,12 +809,12 @@ impl StationInner {
                 surface.rows.push(PanelRow::new(
                     "model".to_string(),
                     format!("custom: {model}"),
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                 ));
             }
             surface.rows.push(PanelRow::choices(
                 "permissions",
-                C_MAUVE_CSS,
+                C_VIOLET_CSS,
                 [
                     ("default", "default"),
                     ("edits", "acceptEdits"),
@@ -841,7 +841,7 @@ impl StationInner {
         // Voice / video / display sharing toggles.
         surface.rows.push(PanelRow::choices(
             "av",
-            C_TEAL_CSS,
+            C_SKY_CSS,
             vec![
                 (
                     if controls.mic_active {
@@ -880,18 +880,18 @@ impl StationInner {
             PanelRow::new(
                 "display".to_string(),
                 format!("share: {}", nonempty(&controls.display_access, "off")),
-                C_PEACH_CSS,
+                C_AMBER_CSS,
             )
             .pill(
                 "toggle",
-                C_PEACH_CSS,
+                C_AMBER_CSS,
                 HitAction::ControlsAction {
                     action: "display-toggle".into(),
                 },
             )
             .pill(
                 "list",
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 HitAction::ControlsAction {
                     action: "display-list".into(),
                 },
@@ -911,7 +911,7 @@ impl StationInner {
                 },
                 nonempty(&controls.browser_workspace_status, "idle")
             ),
-            C_BLUE_CSS,
+            C_IRIS_CSS,
         );
         if controls.browser_workspace_can_create {
             browser_row = browser_row.pill(
@@ -925,7 +925,7 @@ impl StationInner {
         if controls.browser_workspace_can_acquire {
             browser_row = browser_row.pill(
                 "acquire",
-                C_TEAL_CSS,
+                C_SKY_CSS,
                 HitAction::ControlsAction {
                     action: "browser-acquire".into(),
                 },
@@ -934,7 +934,7 @@ impl StationInner {
         if controls.browser_workspace_can_close {
             browser_row = browser_row.pill(
                 "close",
-                C_RED_CSS,
+                C_ROSE_CSS,
                 HitAction::ControlsAction {
                     action: "browser-close".into(),
                 },
@@ -943,7 +943,7 @@ impl StationInner {
         if !controls.browser_workspace_url.is_empty() {
             browser_row = browser_row.pill(
                 "copy",
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 HitAction::ControlsAction {
                     action: "browser-copy".into(),
                 },
@@ -964,9 +964,9 @@ impl StationInner {
                     )
                 },
                 if controls.debug_recording {
-                    C_RED_CSS
+                    C_ROSE_CSS
                 } else {
-                    C_OVERLAY1_CSS
+                    C_TEXT3_CSS
                 },
             )
             .pill(
@@ -975,14 +975,14 @@ impl StationInner {
                 } else {
                     "record"
                 },
-                C_RED_CSS,
+                C_ROSE_CSS,
                 HitAction::ControlsAction {
                     action: "debug-record".into(),
                 },
             )
             .pill(
                 "screen",
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 HitAction::ControlsAction {
                     action: "debug-screen".into(),
                 },
@@ -994,14 +994,14 @@ impl StationInner {
                 PanelRow::new(
                     truncate(&stream.label, 16),
                     format!("{} / {}", stream.value, stream.detail),
-                    C_LAVENDER_CSS,
+                    C_IRIS2_CSS,
                 )
                 .click(HitAction::ControlsAction {
                     action: format!("recording-open:{name}"),
                 })
                 .pill(
                     "play",
-                    C_TEAL_CSS,
+                    C_SKY_CSS,
                     HitAction::ControlsAction {
                         action: format!("recording-open:{name}"),
                     },
@@ -1018,7 +1018,7 @@ impl StationInner {
                 nonempty(&controls.cu_provider, "provider"),
                 nonempty(&controls.cu_validation_state, "unvalidated")
             ),
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
         ));
         surface
     }

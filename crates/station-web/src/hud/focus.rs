@@ -22,13 +22,13 @@ impl StationInner {
             w,
             h,
             10.0,
-            hex_color(color).unwrap_or(C_BLUE),
+            hex_color(color).unwrap_or(C_IRIS),
             1.5,
             1.1,
         );
         self.hit_zones
             .push(HitZone::new(x, y, w, h, HitAction::Noop));
-        self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
+        self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_TEXT3_CSS, "bold");
         self.text(
             &truncate(title, 34),
             x + 16.0,
@@ -43,7 +43,7 @@ impl StationInner {
             50.0,
             23.0,
             "close",
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
             false,
         );
         self.hit_zones.push(HitZone::new(
@@ -80,7 +80,7 @@ impl StationInner {
             x + 16.0,
             y + 84.0,
             9.0,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
 
@@ -123,7 +123,7 @@ impl StationInner {
                     x + 16.0,
                     y0 + 22.0,
                     10.0,
-                    C_SUBTEXT0_CSS,
+                    C_TEXT2_CSS,
                     "normal",
                 );
             }
@@ -154,7 +154,7 @@ impl StationInner {
                     PANEL_ROW_H - 3.0,
                     6.0,
                 );
-                self.hud.set_fill("rgba(137,180,250,0.10)");
+                self.hud.set_fill("rgba(126,140,250,0.10)");
                 ctx.fill();
             }
             // Label column.
@@ -208,7 +208,7 @@ impl StationInner {
                         cw,
                         21.0,
                         label,
-                        if *selected { row.color } else { C_OVERLAY1_CSS },
+                        if *selected { row.color } else { C_TEXT3_CSS },
                         *selected,
                     );
                     self.hit_zones
@@ -246,7 +246,7 @@ impl StationInner {
                 x + 16.0,
                 y + h - 9.0,
                 8.5,
-                C_SUBTEXT0_CSS,
+                C_TEXT2_CSS,
                 "normal",
             );
         }
@@ -261,12 +261,12 @@ impl StationInner {
         content_h: f32,
         offset: f32,
     ) {
-        self.hud.set_fill("rgba(49,50,68,0.65)");
+        self.hud.set_fill("rgba(26,30,40,0.65)");
         self.rounded_path(x, y + 2.0, 6.0, viewport_h - 4.0, 3.0);
         self.hud.ctx.fill();
         let (thumb_h, thumb_off) =
             crate::input::scrollbar_thumb(viewport_h - 4.0, content_h, viewport_h, offset);
-        self.hud.set_fill("rgba(137,180,250,0.55)");
+        self.hud.set_fill("rgba(126,140,250,0.55)");
         self.rounded_path(x, y + 2.0 + thumb_off, 6.0, thumb_h, 3.0);
         self.hud.ctx.fill();
     }
@@ -292,7 +292,7 @@ impl StationInner {
         let (x, y, sw, sh) = self.composer_rect(w, h);
         let controls = &self.snapshot.controls;
         let launch = self.composer_mode == "launch";
-        self.glass_panel(x, y, sw, sh, 12.0, C_BLUE, 1.8, 1.08);
+        self.glass_panel(x, y, sw, sh, 12.0, C_IRIS, 1.8, 1.08);
         self.hit_zones
             .push(HitZone::new(x, y, sw, sh, HitAction::Noop));
 
@@ -306,13 +306,13 @@ impl StationInner {
         } else {
             format!("COMPOSE → {}", truncate(&self.station_target_label(), 36))
         };
-        self.text(&kicker, x + 16.0, y + 16.0, 8.0, C_BLUE_CSS, "bold");
+        self.text(&kicker, x + 16.0, y + 16.0, 8.0, C_IRIS_CSS, "bold");
         self.text(
             "enter sends / esc closes",
             x + sw - 150.0,
             y + 16.0,
             7.5,
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
             "normal",
         );
 
@@ -325,7 +325,7 @@ impl StationInner {
         self.hud.set_fill("rgba(9,10,18,0.78)");
         self.hud.ctx.fill();
         self.rounded_path(slot_x, slot_y, slot_w, 24.0, 7.0);
-        self.hud.set_stroke("rgba(137,180,250,0.35)");
+        self.hud.set_stroke("rgba(126,140,250,0.35)");
         self.hud.ctx.stroke();
         self.composer_input_rect = Some((slot_x + 6.0, slot_y + 2.0, slot_w - 12.0, 20.0));
 
@@ -337,7 +337,7 @@ impl StationInner {
                 action_w,
                 22.0,
                 "launch",
-                C_TEAL_CSS,
+                C_SKY_CSS,
                 true,
             );
             self.hit_zones.push(HitZone::new(
@@ -359,7 +359,7 @@ impl StationInner {
                 action_w,
                 22.0,
                 label,
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 true,
             );
             self.hit_zones.push(HitZone::new(
@@ -375,12 +375,12 @@ impl StationInner {
             // Agent choice pills + execution shape pills. An empty
             // launch_mode means execution does not apply (external agent
             // selected); the agent pills then reclaim the full row.
-            self.text("agent", x + 16.0, y + 70.0, 8.0, C_TEAL_CSS, "bold");
+            self.text("agent", x + 16.0, y + 70.0, 8.0, C_SKY_CSS, "bold");
             let execution = controls.launch_mode.as_str();
             let exec_pills = [
-                ("auto", "auto", C_TEAL_CSS),
-                ("orch", "orchestrate", C_LAVENDER_CSS),
-                ("direct", "direct", C_PEACH_CSS),
+                ("auto", "auto", C_SKY_CSS),
+                ("orch", "orchestrate", C_IRIS2_CSS),
+                ("direct", "direct", C_AMBER_CSS),
             ];
             let exec_w = exec_pills
                 .iter()
@@ -411,7 +411,7 @@ impl StationInner {
                     cw,
                     21.0,
                     label,
-                    if active { C_TEAL_CSS } else { C_OVERLAY1_CSS },
+                    if active { C_SKY_CSS } else { C_TEXT3_CSS },
                     active,
                 );
                 self.hit_zones.push(HitZone::new(
@@ -436,7 +436,7 @@ impl StationInner {
                         cw,
                         21.0,
                         label,
-                        if active { accent } else { C_OVERLAY1_CSS },
+                        if active { accent } else { C_TEXT3_CSS },
                         active,
                     );
                     self.hit_zones.push(HitZone::new(
@@ -460,7 +460,7 @@ impl StationInner {
                 chip_w,
                 18.0,
                 "target",
-                C_PEACH_CSS,
+                C_AMBER_CSS,
                 false,
             );
             self.hit_zones.push(HitZone::new(
@@ -491,7 +491,7 @@ impl StationInner {
         };
         let th = (bottom - top).max(180.0);
         let diff = transcript.mode == "diff";
-        let accent = if diff { C_YELLOW_CSS } else { C_TEAL_CSS };
+        let accent = if diff { C_AMBER_CSS } else { C_SKY_CSS };
 
         self.glass_panel(
             x,
@@ -499,7 +499,7 @@ impl StationInner {
             tw,
             th,
             12.0,
-            hex_color(accent).unwrap_or(C_TEAL),
+            hex_color(accent).unwrap_or(C_SKY),
             1.4,
             1.06,
         );
@@ -510,7 +510,7 @@ impl StationInner {
             x + 16.0,
             top + 21.0,
             10.0,
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
             "bold",
         );
         self.text(
@@ -527,7 +527,7 @@ impl StationInner {
             50.0,
             22.0,
             "close",
-            C_OVERLAY1_CSS,
+            C_TEXT3_CSS,
             false,
         );
         self.hit_zones.push(HitZone::new(
@@ -542,7 +542,7 @@ impl StationInner {
         let header_pills: Vec<(&str, &str, HitAction)> = if diff {
             vec![(
                 "copy diff",
-                C_BLUE_CSS,
+                C_IRIS_CSS,
                 HitAction::ChangesAction {
                     action: "copy-diff".into(),
                     path: transcript.session_id.clone(),
@@ -550,10 +550,10 @@ impl StationInner {
             )]
         } else {
             vec![
-                ("steer", C_BLUE_CSS, HitAction::Composer { op: "open-send" }),
+                ("steer", C_IRIS_CSS, HitAction::Composer { op: "open-send" }),
                 (
                     "focus",
-                    C_PEACH_CSS,
+                    C_AMBER_CSS,
                     HitAction::SessionAction {
                         action: "focus".into(),
                         id: transcript.session_id.clone(),
@@ -561,7 +561,7 @@ impl StationInner {
                 ),
                 (
                     "copy id",
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     HitAction::SessionAction {
                         action: "copy".into(),
                         id: transcript.session_id.clone(),
@@ -585,7 +585,7 @@ impl StationInner {
             x + tw - 190.0,
             top + 66.0,
             8.5,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
 
@@ -599,7 +599,7 @@ impl StationInner {
                 x + 16.0,
                 y0 + 18.0,
                 10.0,
-                C_RED_CSS,
+                C_ROSE_CSS,
                 "normal",
             );
             return;
@@ -610,7 +610,7 @@ impl StationInner {
                 x + 16.0,
                 y0 + 18.0,
                 10.0,
-                C_SUBTEXT0_CSS,
+                C_TEXT2_CSS,
                 "normal",
             );
             return;
@@ -664,7 +664,7 @@ impl StationInner {
                         x + 16.0,
                         ly + 9.0,
                         6.5,
-                        C_OVERLAY1_CSS,
+                        C_TEXT3_CSS,
                         "normal",
                     );
                 }
@@ -753,7 +753,7 @@ impl StationInner {
             x + 96.0,
             y + 23.0,
             9.0,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
         // Direct line to the worker: open the composer targeted at the
@@ -764,7 +764,7 @@ impl StationInner {
             54.0,
             23.0,
             "steer",
-            C_BLUE_CSS,
+            C_IRIS_CSS,
             false,
         );
         self.hit_zones.push(HitZone::new(
@@ -831,7 +831,7 @@ impl StationInner {
                     decision: "approve",
                 },
             ));
-            self.pill_at(x + 182.0, py, 58.0, 23.0, "deny", C_RED_CSS, false);
+            self.pill_at(x + 182.0, py, 58.0, 23.0, "deny", C_ROSE_CSS, false);
             self.hit_zones.push(HitZone::new(
                 x + 182.0,
                 py,
@@ -853,18 +853,18 @@ impl StationInner {
     pub(crate) fn draw_view_focus(&mut self, x: f32, panel_w: f32, activity_lane_y: f32) {
         let panel_h = 74.0 + 30.0 + 4.0 * 26.0 + 12.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        self.focus_panel_frame(x, y, panel_w, panel_h, "View", C_LAVENDER_CSS);
+        self.focus_panel_frame(x, y, panel_w, panel_h, "View", C_IRIS2_CSS);
         self.text(
             &format!("{} layout", self.layout.label()),
             x + 96.0,
             y + 23.0,
             9.0,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
 
         let mut row_y = y + 72.0;
-        self.text("mood", x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        self.text("mood", x + 16.0, row_y, 9.0, C_IRIS2_CSS, "bold");
         for (idx, mood) in [Mood::Cockpit, Mood::Calm].into_iter().enumerate() {
             let px = x + 96.0 + idx as f32 * 86.0;
             let label = mood.label();
@@ -875,9 +875,9 @@ impl StationInner {
                 23.0,
                 label,
                 if self.mood == mood {
-                    C_LAVENDER_CSS
+                    C_IRIS2_CSS
                 } else {
-                    C_OVERLAY1_CSS
+                    C_TEXT3_CSS
                 },
                 self.mood == mood,
             );
@@ -933,15 +933,15 @@ impl StationInner {
         label: &str,
         value_label: &str,
     ) -> f32 {
-        self.text(label, x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        self.text(label, x + 16.0, row_y, 9.0, C_IRIS2_CSS, "bold");
         let track_x = x + 96.0;
         let track_w = w - 96.0 - 72.0;
         let t = key.t_of(self.view_slider_value(key));
-        self.hud.set_fill("rgba(49,50,68,0.92)");
+        self.hud.set_fill("rgba(26,30,40,0.92)");
         self.hud
             .ctx
             .fill_rect(track_x as f64, (row_y - 7.0) as f64, track_w as f64, 4.0);
-        self.hud.set_fill(C_LAVENDER_CSS);
+        self.hud.set_fill(C_IRIS2_CSS);
         self.hud.ctx.fill_rect(
             track_x as f64,
             (row_y - 7.0) as f64,
@@ -957,7 +957,7 @@ impl StationInner {
             std::f64::consts::TAU,
         );
         self.hud.ctx.fill();
-        self.hud.set_stroke("rgba(17,17,27,0.9)");
+        self.hud.set_stroke("rgba(11,13,18,0.9)");
         self.hud.ctx.stroke();
         self.text(value_label, x + w - 62.0, row_y, 9.0, C_TEXT_CSS, "normal");
         self.hit_zones.push(HitZone::new(
@@ -982,9 +982,9 @@ impl StationInner {
         let panel_h = 74.0 + 4.0 * 17.0 + 6.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let color = if host.connected {
-            C_PEACH_CSS
+            C_AMBER_CSS
         } else {
-            C_RED_CSS
+            C_ROSE_CSS
         };
         self.focus_panel_frame(x, y, panel_w, panel_h, &host.name, color);
         self.text(
@@ -999,7 +999,7 @@ impl StationInner {
             if host.connected {
                 C_GREEN_CSS
             } else {
-                C_RED_CSS
+                C_ROSE_CSS
             },
             "bold",
         );
@@ -1014,7 +1014,7 @@ impl StationInner {
                 nonempty(&host.platform, "unknown"),
                 nonempty(&host.region, "local")
             ),
-            C_BLUE_CSS,
+            C_IRIS_CSS,
         );
         let cpu_pct = (host.cpu / 100.0).clamp(0.0, 1.0);
         row_y = self.focus_row(
@@ -1080,7 +1080,7 @@ impl StationInner {
                     String::new()
                 }
             ),
-            C_TEAL_CSS,
+            C_SKY_CSS,
         );
     }
 }

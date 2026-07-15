@@ -10,8 +10,8 @@ use crate::input::HitAction;
 use crate::model::StationAgent;
 use crate::util::{
     fmt_compact, fmt_countdown, goal_status_color_css, nonempty, pct_label, percent,
-    phase_color_css, pressure_color, truncate, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER_CSS,
-    C_MAUVE_CSS, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL_CSS, C_YELLOW_CSS,
+    phase_color_css, pressure_color, truncate, C_AMBER_CSS, C_GREEN_CSS, C_IRIS2_CSS, C_IRIS_CSS,
+    C_ROSE_CSS, C_SKY_CSS, C_TEXT2_CSS, C_VIOLET_CSS,
 };
 
 /// One labeled row: label column, value text, label color.
@@ -77,7 +77,7 @@ pub(crate) fn agent_focus_content(
             nonempty(&agent.provider, "provider"),
             nonempty(&agent.model, "model")
         ),
-        color_css: C_BLUE_CSS,
+        color_css: C_IRIS_CSS,
         meter: None,
     });
     rows.push(AgentFocusRow {
@@ -98,7 +98,7 @@ pub(crate) fn agent_focus_content(
     rows.push(AgentFocusRow {
         label: "task",
         value: nonempty(&agent.task, "idle"),
-        color_css: C_TEAL_CSS,
+        color_css: C_SKY_CSS,
         meter: None,
     });
     if !agent.relationship_kind.trim().is_empty() {
@@ -118,7 +118,7 @@ pub(crate) fn agent_focus_content(
         rows.push(AgentFocusRow {
             label: "lineage",
             value: lineage,
-            color_css: C_MAUVE_CSS,
+            color_css: C_VIOLET_CSS,
             meter: None,
         });
     }
@@ -170,7 +170,7 @@ pub(crate) fn agent_focus_content(
     rows.push(AgentFocusRow {
         label: "usage",
         value: usage,
-        color_css: C_LAVENDER_CSS,
+        color_css: C_IRIS2_CSS,
         meter: None,
     });
     if !agent.vitals_git.trim().is_empty() {
@@ -178,27 +178,30 @@ pub(crate) fn agent_focus_content(
             label: "git",
             value: agent.vitals_git.trim().to_string(),
             color_css: if agent.vitals_git_conflict {
-                C_RED_CSS
+                C_ROSE_CSS
             } else {
-                C_TEAL_CSS
+                C_SKY_CSS
             },
             meter: None,
         });
     }
     if agent.cache_hit_pct >= 0.0 || agent.cache_ttl_seconds > 0.0 {
-        // Same tiers as the dashboard chip (fragment 39): hit green ≥90 /
-        // yellow ≥50 / red, countdown red in its final minute, cold dimmed.
+        // Same tiers as the dashboard chip (fragment 39, tones ok/warn/
+        // crit): hit green ≥90 / amber ≥50 / rose below — the old peach
+        // bottom tier collapsed into amber under the Iris palette, so the
+        // crit tier moves to rose, which is also what the chip's crit tone
+        // renders. Countdown rose in its final minute, cold dimmed.
         let mut text = String::new();
-        let mut color = C_SUBTEXT0_CSS;
+        let mut color = C_TEXT2_CSS;
         if agent.cache_hit_pct >= 0.0 {
             let hit = agent.cache_hit_pct.clamp(0.0, 100.0);
             text.push_str(&format!("⚡{}%", hit.round() as u32));
             color = if hit >= 90.0 {
                 C_GREEN_CSS
             } else if hit >= 50.0 {
-                C_YELLOW_CSS
+                C_AMBER_CSS
             } else {
-                C_PEACH_CSS
+                C_ROSE_CSS
             };
         }
         if agent.cache_ttl_seconds > 0.0 && agent.cache_last_activity_epoch > 0.0 && now_epoch > 0.0
@@ -210,11 +213,11 @@ pub(crate) fn agent_focus_content(
             if remaining > 0.0 {
                 text.push_str(&format!("⏳{}", fmt_countdown(remaining)));
                 if remaining <= 60.0 {
-                    color = C_RED_CSS;
+                    color = C_ROSE_CSS;
                 }
             } else {
                 text.push_str("✗ cold");
-                color = C_SUBTEXT0_CSS;
+                color = C_TEXT2_CSS;
             }
         }
         if !text.is_empty() {
@@ -231,9 +234,9 @@ pub(crate) fn agent_focus_content(
             label: "limits",
             value: agent.vitals_limits.trim().to_string(),
             color_css: match agent.vitals_limits_state.trim() {
-                "crit" => C_RED_CSS,
-                "warn" => C_YELLOW_CSS,
-                _ => C_SUBTEXT0_CSS,
+                "crit" => C_ROSE_CSS,
+                "warn" => C_AMBER_CSS,
+                _ => C_TEXT2_CSS,
             },
             meter: None,
         });
@@ -242,7 +245,7 @@ pub(crate) fn agent_focus_content(
         rows.push(AgentFocusRow {
             label: "worktree",
             value: agent.worktree.trim().to_string(),
-            color_css: C_MAUVE_CSS,
+            color_css: C_VIOLET_CSS,
             meter: None,
         });
     }
@@ -261,22 +264,22 @@ pub(crate) fn agent_focus_content(
                 id: sid.clone(),
             },
         };
-        pills.push(pill("log", C_BLUE_CSS, "station-log"));
+        pills.push(pill("log", C_IRIS_CSS, "station-log"));
         if agent.recent {
             // A closed session can be read or brought back — nothing else
             // applies to it.
             pills.push(pill("resume", C_GREEN_CSS, "resume"));
         } else {
-            pills.push(pill("target", C_TEAL_CSS, "target"));
-            pills.push(pill("steer", C_LAVENDER_CSS, "steer"));
+            pills.push(pill("target", C_SKY_CSS, "target"));
+            pills.push(pill("steer", C_IRIS2_CSS, "steer"));
             if agent.can_interrupt {
-                pills.push(pill("stop", C_RED_CSS, "interrupt"));
+                pills.push(pill("stop", C_ROSE_CSS, "interrupt"));
             }
             if agent.thread_actions.iter().any(|op| op == "compact") {
-                pills.push(pill("compact", C_MAUVE_CSS, "thread-compact"));
+                pills.push(pill("compact", C_VIOLET_CSS, "thread-compact"));
             }
             if agent.thread_actions.iter().any(|op| op == "fork") {
-                pills.push(pill("fork", C_PEACH_CSS, "thread-fork"));
+                pills.push(pill("fork", C_AMBER_CSS, "thread-fork"));
             }
         }
     }
@@ -302,7 +305,7 @@ pub(crate) fn agent_focus_content(
                     format!(" ({})", agent.approval_category.trim())
                 }
             ),
-            color_css: C_YELLOW_CSS,
+            color_css: C_AMBER_CSS,
             meter: None,
         },
         host_id: agent.host_id.clone(),
@@ -385,7 +388,7 @@ mod tests {
         assert_eq!(cache.value, "⚡95%");
         assert_eq!(cache.color_css, C_GREEN_CSS);
         let limits = &content.rows[9];
-        assert_eq!(limits.color_css, C_YELLOW_CSS);
+        assert_eq!(limits.color_css, C_AMBER_CSS);
     }
 
     #[test]
@@ -398,12 +401,12 @@ mod tests {
         let cache = content.rows.iter().find(|r| r.label == "cache").unwrap();
         assert!(cache.value.starts_with("⚡60%"), "{}", cache.value);
         assert!(cache.value.contains('⏳'), "{}", cache.value);
-        assert_eq!(cache.color_css, C_RED_CSS);
+        assert_eq!(cache.color_css, C_ROSE_CSS);
         // Expired TTL reads cold and dims.
         let cold = agent_focus_content(&agent, None, 2_000.0);
         let row = cold.rows.iter().find(|r| r.label == "cache").unwrap();
         assert!(row.value.ends_with("✗ cold"), "{}", row.value);
-        assert_eq!(row.color_css, C_SUBTEXT0_CSS);
+        assert_eq!(row.color_css, C_TEXT2_CSS);
     }
 
     #[test]

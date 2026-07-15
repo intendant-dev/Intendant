@@ -11,8 +11,8 @@ use crate::model::{StationAgent, StationHost, StationSnapshot};
 use crate::util::phase_color;
 use crate::util::{
     css_color, css_rgba, epoch_seconds_now, goal_status_color, pressure_color, relationship_color,
-    role_color, stable_angle, stable_unit, Color, C_BLUE, C_GREEN, C_PEACH, C_RED, C_SAPPHIRE,
-    C_SUBTEXT0, C_SURFACE0, C_TEAL, C_TEXT, C_YELLOW,
+    role_color, stable_angle, stable_unit, Color, C_AMBER, C_GREEN, C_IRIS, C_ROSE, C_SKY,
+    C_SURFACE2, C_TEXT, C_TEXT2,
 };
 use crate::StationInner;
 
@@ -101,7 +101,7 @@ impl StationInner {
         for host in &self.snapshot.hosts {
             let id = format!("host:{}", host.id);
             if let Some(pos) = layout.get(&id).copied() {
-                frame.add_line_projected(&mut project, Vec3::ZERO, pos, C_BLUE.with_alpha(0.26));
+                frame.add_line_projected(&mut project, Vec3::ZERO, pos, C_IRIS.with_alpha(0.26));
             }
         }
 
@@ -189,7 +189,7 @@ impl StationInner {
         // Colors come from the same CSS palette the screen pills use.
         let mut pills: Vec<(&str, Color, HitAction)> = Vec::new();
         if !content.pills.iter().any(|p| p.label == "steer") {
-            pills.push(("steer", C_BLUE, HitAction::Composer { op: "open-send" }));
+            pills.push(("steer", C_IRIS, HitAction::Composer { op: "open-send" }));
         }
         for pill in &content.pills {
             pills.push((pill.label, css_color(pill.color_css), pill.action.clone()));
@@ -269,7 +269,7 @@ impl StationInner {
             cursor,
             PANE_ROW_H * s,
             &atlas.fit_to_width(&content.subtitle, PANE_ROW_H * s, inner_w),
-            C_SUBTEXT0,
+            C_TEXT2,
         );
         cursor = cursor - up * (PANE_ROW_H * 1.25 * s);
 
@@ -288,7 +288,7 @@ impl StationInner {
             };
             let pills = [
                 ("approve", C_GREEN, decide("approve")),
-                ("deny", C_RED, decide("deny")),
+                ("deny", C_ROSE, decide("deny")),
             ];
             self.pane_pill_rows(frame, atlas, project, right, up, &mut cursor, &pills, s);
         }
@@ -461,13 +461,13 @@ impl StationInner {
                 project,
                 Vec3::new(-9.0, -1.8, v),
                 Vec3::new(9.0, -1.8, v),
-                C_SURFACE0.with_alpha(alpha),
+                C_SURFACE2.with_alpha(alpha),
             );
             frame.add_line_projected(
                 project,
                 Vec3::new(v, -1.8, -9.0),
                 Vec3::new(v, -1.8, 9.0),
-                C_SURFACE0.with_alpha(alpha),
+                C_SURFACE2.with_alpha(alpha),
             );
         }
     }
@@ -481,14 +481,14 @@ impl StationInner {
         let pos = self.layout_cache.get("op").copied().unwrap_or(Vec3::ZERO);
         let spin = time_ms as f32 * 0.00032 * self.motion;
         let glow = self.mood.glow();
-        frame.add_wire_octa(project, pos, 0.48, spin, C_BLUE.with_alpha(0.95));
+        frame.add_wire_octa(project, pos, 0.48, spin, C_IRIS.with_alpha(0.95));
         // The operator core is the scene's anchor: give its inner ring the
         // cheap two-pass glow (thick faint quad under a thin bright line).
         frame.add_glow_ring(
             project,
             pos,
             0.82,
-            C_SAPPHIRE.with_alpha(0.55 * glow),
+            C_IRIS.with_alpha(0.55 * glow),
             Plane::XZ,
             GLOW_WIDTH,
         );
@@ -496,7 +496,7 @@ impl StationInner {
             project,
             pos,
             1.18,
-            C_BLUE.with_alpha(0.18 * glow),
+            C_IRIS.with_alpha(0.18 * glow),
             Plane::XZ,
         );
         if self.selected_id.as_deref() == Some("op") {
@@ -526,7 +526,7 @@ impl StationInner {
             project,
             pos,
             radius,
-            C_BLUE.with_alpha(0.88),
+            C_IRIS.with_alpha(0.88),
             Plane::XY,
             GLOW_WIDTH * 1.4,
         );
@@ -548,13 +548,13 @@ impl StationInner {
             0.58,
             0.28,
             spin,
-            C_PEACH.with_alpha(if host.connected { 0.9 } else { 0.38 }),
+            C_AMBER.with_alpha(if host.connected { 0.9 } else { 0.38 }),
         );
         frame.add_ring(
             project,
             pos + Vec3::new(0.0, -0.17, 0.0),
             0.82 + (time_ms as f32 * 0.003).sin() * 0.035 * self.mood.pulse(),
-            C_PEACH.with_alpha(0.28 * self.mood.glow()),
+            C_AMBER.with_alpha(0.28 * self.mood.glow()),
             Plane::XZ,
         );
         if self.selected_id.as_deref() == Some(&id) {
@@ -603,9 +603,9 @@ impl StationInner {
             let budget = if pct < 0.5 {
                 C_GREEN
             } else if pct < 0.85 {
-                C_YELLOW
+                C_AMBER
             } else {
-                C_RED
+                C_ROSE
             };
             frame.add_ring(project, pos, 0.56, budget.with_alpha(0.66), Plane::XY);
             frame.add_ring(project, pos, 0.38, phase.with_alpha(0.2), Plane::YZ);
@@ -627,7 +627,7 @@ impl StationInner {
                 project,
                 pos,
                 0.72 + (time_ms as f32 * 0.004).sin() * 0.05 * self.mood.pulse(),
-                C_TEAL.with_alpha(0.22 * self.mood.glow()),
+                C_SKY.with_alpha(0.22 * self.mood.glow()),
                 Plane::XY,
             );
         }
@@ -637,7 +637,7 @@ impl StationInner {
                 project,
                 pos,
                 0.84 + (time_ms as f32 * 0.006).sin() * 0.07 * self.mood.pulse(),
-                C_YELLOW.with_alpha(0.58),
+                C_AMBER.with_alpha(0.58),
                 Plane::XY,
                 GLOW_WIDTH,
             );
@@ -671,7 +671,7 @@ impl StationInner {
     /// same-color segments share one path, and the stroke style is only
     /// touched when the color changes.
     pub(crate) fn draw_scene_lines(&self, ctx: &CanvasRenderingContext2d) {
-        ctx.set_fill_style_str("rgba(17,17,27,0.94)");
+        ctx.set_fill_style_str("rgba(11,13,18,0.94)");
         ctx.fill_rect(0.0, 0.0, self.width as f64, self.height as f64);
         let mut current: Option<[f32; 4]> = None;
         let mut open = false;
@@ -799,13 +799,13 @@ impl Mood {
     pub(crate) fn vignette_stops(self) -> [(f64, &'static str); 3] {
         match self {
             Self::Cockpit => [
-                (0.0, "rgba(30,30,46,0.04)"),
-                (0.75, "rgba(17,17,27,0.16)"),
+                (0.0, "rgba(11,12,16,0.04)"),
+                (0.75, "rgba(11,13,18,0.16)"),
                 (1.0, "rgba(4,4,9,0.48)"),
             ],
             Self::Calm => [
-                (0.0, "rgba(30,30,46,0.03)"),
-                (0.75, "rgba(17,17,27,0.10)"),
+                (0.0, "rgba(11,12,16,0.03)"),
+                (0.75, "rgba(11,13,18,0.10)"),
                 (1.0, "rgba(4,4,9,0.36)"),
             ],
         }
@@ -1115,7 +1115,7 @@ fn pane_focus_row(
             track_center,
             track_w * 0.5,
             mh * 0.5,
-            C_SURFACE0.with_alpha(0.92),
+            C_SURFACE2.with_alpha(0.92),
             crate::panes::PANE_LAYER1_BIAS,
         );
         let frac = pct.clamp(0.0, 1.0);
