@@ -350,8 +350,10 @@ committed):
   hermeticity signal clean). Two macOS realities, verified live: staff
   membership is *computed* for every local account (not removable —
   the boundary is 700 operator homes + no admin), and sysadminctl
-  mints ShadowHashData even with no password argument (the script
-  deletes it; verification fails if it ever reappears). Provisions the
+  mints ShadowHashData even with no password argument — and, since
+  Darwin 26, a ShadowHash `AuthenticationAuthority` alongside it (the
+  script deletes both and re-converges them on every run; verification
+  fails only if either survives deletion). Provisions the
   per-user toolchain **as that account**: rustup pinned to the invoking
   host's current `rustc -V` (printed; the workflows key their cargo
   target caches by it), `~/.cargo/config.toml` with the jobs cap above
@@ -365,6 +367,17 @@ committed):
   that the account **cannot traverse any human `/Users/<home>`**
   (expects 700; reports, never chmods — that fix is the operator's
   call).
+- **`enroll-runner-macos.sh <name> <token> <version> [labels] [url]`** —
+  FRESH enrollment: creates a listener where none exists (a new host,
+  extra capacity) directly as the CI account + system-domain
+  LaunchDaemon; `migrate-runner-macos.sh` is for moving an existing
+  operator-account listener instead. Same `.env`/`.path` wiring and
+  template-rendered plist as migrate (change them together). Mind the
+  runner-release gotcha it encodes: the tarball ships `runsvc.sh` only
+  under `bin/` (`svc.sh install` copies it up as a side effect, but the
+  daemon path doesn't use svc.sh) — without the copy the daemon
+  spawn-loops with `EX_CONFIG` (78) and empty runner logs. Registration
+  tokens: `gh api -X POST repos/<org>/<repo>/actions/runners/registration-token --jq .token`.
 - **`migrate-runner-macos.sh <listener-name>`** — one listener per
   invocation. Stops the operator-account LaunchAgent, waits for the
   service tree to exit, moves the runner dir into `/var/ci` (the
@@ -501,11 +514,40 @@ several accounts, so a half-migrated host stays fully supervised. The
 migrate/rollback scripts edit `watchdog.conf` themselves; the
 before-images land in `/etc/intendant-ci/migration/` for audit.
 
+### PF egress policy for the CI account (applied 2026-07-15)
+
+Deny-by-default outbound for `_intendant-ci` (uid 450), allowing only
+DNS + web — the runner long-poll, actions downloads, crates.io, and
+git-over-HTTPS are all 443, and the supervised sccache server is
+loopback. Blocks the noisy exfil/probe class (reverse shells on odd
+ports, LAN scans from PR-shaped code); HTTPS-side exfil is out of
+scope (domain-level control needs a proxy). `/etc/pf.anchors/intendant-ci`:
+
+```
+pass out quick on lo0 all
+pass out quick proto { tcp, udp } to any port { 53, 80, 443 } user 450 keep state
+block return out quick proto { tcp, udp } all user 450
+```
+
+referenced from `/etc/pf.conf` as `anchor "intendant-ci"` + `load
+anchor`. pf user/group rules match tcp/udp sockets only, so kernel and
+forwarded traffic are untouched.
+
+**The vmnet trap, paid for live (2026-07-15):** on a host that carries
+Virtualization.framework guests, the guests' NAT lives in a
+*dynamically attached* top-level pf anchor (`com.apple.internet-sharing`
+— inserted at VM start, never present in the stock `/etc/pf.conf`). A
+bare `pfctl -f /etc/pf.conf` rebuilds the main ruleset WITHOUT that
+attach point: the anchor's rules survive orphaned, established flows
+keep working on their state entries, and every NEW guest connection
+blackholes — a delayed-fuse breakage. The stock file's header warns
+about exactly this. Fix that keeps reloads safe forever: reference the
+anchor explicitly in `/etc/pf.conf` (`nat-anchor`/`rdr-anchor`/`anchor
+"com.apple.internet-sharing"` in the translation/filter sections), so
+reloading re-attaches instead of orphaning.
+
 ### Deliberately deferred
 
-- **PF / private-LAN egress deny for the CI account** (packet-filter
-  rules keyed to `_intendant-ci`'s uid, so PR code can't probe the
-  LAN): needs operator sign-off at apply time — not part of this kit.
 - **Windows host equivalent** of the hooks + migration ergonomics (the
   Windows runner already runs as a dedicated non-admin user; see the
   watchdog "Windows" note above).

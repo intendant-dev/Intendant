@@ -383,7 +383,7 @@ flow. The remaining push triggers (repo-integrity, app.html, audit, docs
 deploy) are cheap and paths-filtered.
 
 Trusted refs (pushes, merge-queue refs, same-repo PRs) run on the
-**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-vm` =
+**self-hosted fleet** (`dell-206` = `intendant-linux`, `macbook-host` =
 `intendant-macos`, `samsung-win` = `intendant-windows`) with build state
 in **external per-listener cargo target caches** (`CARGO_TARGET_DIR`
 under the runner account's `~/.cache/intendant-ci/`, keyed by `rustc -V`
@@ -394,10 +394,12 @@ not half-hours.
 `matrix.os` doubles as the hosted label): external code never executes on
 our hardware, yet its required checks really run. Fork-PR workflows also
 need maintainer approval before anything runs (all outside collaborators,
-not just first-timers). The Dell and Windows runners run as dedicated
-non-admin `ci` users — the Mac joins them as the `scripts/ci` service-account
-kit (`_intendant-ci`: hidden role account, LaunchDaemon listeners, job hooks)
-is cut over — and the check *names* stay pinned to the
+not just first-timers). All three platforms' runners run as dedicated
+non-admin `ci` users (the Mac's `scripts/ci` service-account kit —
+`_intendant-ci`: hidden role account, LaunchDaemon listeners, job hooks,
+PF egress deny — now lives on the physical Mac rather than inside the
+Vortex guest, so CI load no longer competes with the agents' VM), and
+the check *names* stay pinned to the
 `test (ubuntu-latest)`-style contexts the ruleset requires (matrix `os` is
 the name key, `runner` is the fleet placement):
 - **`windows.yml`** — cross-platform `cargo test` (the `intendant` bins + the `intendant-core`/`intendant-display`/`intendant-platform` lib crates) + the headless mock-provider e2e on Windows + macOS + Linux (catches platform-specific build breaks *and* Unix-only test/path assumptions; excludes the WASM crates). Full suites run in exactly two places: the **merge group** (all three platforms — the actual gate) and the **Linux `pull_request` leg** (the pre-queue runtime signal); the non-Linux PR legs are `cargo check` only, and there is no push trigger. The Linux leg is the **whole Linux gate**: after unit tests + e2e it runs the keyless smokes (session-vitals, native-goal, peer-sessions — real binaries under the mock provider) and the dashboard-boot probe (SPA booted in headless Chromium over CDP; promoted from advisory on its 40/40 soak) as tail steps reusing the same checkout and warm tree — these were smokes.yml's jobs until 2026-07-11. The Windows and Linux legs build with debuginfo off (`CARGO_PROFILE_DEV_DEBUG=0` — the Linux leg measured ~95% compile+link vs ~12s of test execution; repro locally with default debuginfo when a CI backtrace is too thin). Jobs are bounded by `timeout-minutes: 60` (no per-test timeout exists under plain `cargo test`, so a single hung test otherwise holds a queue slot indefinitely). Headless-safe: needs no display or API keys. **Required check.**
