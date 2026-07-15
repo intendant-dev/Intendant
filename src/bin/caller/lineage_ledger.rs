@@ -90,12 +90,16 @@ struct SessionFacts {
 /// past the cap the map is cleared and the active dirs re-fold once.
 const LINEAGE_FACTS_CACHE_CAP: usize = 64;
 
-/// Folded `session.jsonl` facts plus the byte/mtime cursor they were folded
-/// through. `consumed_bytes` only ever advances past COMPLETE lines — the
-/// writer newline-terminates every event, so a trailing partial line is a
-/// mid-flush artifact folded once complete.
+/// Folded `session.jsonl` facts plus the cursor they were folded through.
+/// `consumed_bytes` only ever advances past consumable content — the writer
+/// newline-terminates every event, so a trailing partial line is a
+/// mid-flush artifact folded once complete. `(stat_len, mtime_nanos)`
+/// record the file stat at the last evaluation (consumed can lag stat_len
+/// while a partial tail is pending): an mtime change without growth is a
+/// rewrite and re-folds, growth is an append.
 struct CachedLineageFacts {
     consumed_bytes: u64,
+    stat_len: u64,
     mtime_nanos: u128,
     facts: SessionFacts,
 }
@@ -156,12 +160,15 @@ pub fn read_lineage_ledger(
         .cloned();
 
     let entry = match cached {
-        // Unchanged file: derive straight from the cached facts.
-        Some(entry) if entry.consumed_bytes == len && entry.mtime_nanos == mtime_nanos => entry,
-        // Grown file: fold only the appended complete lines. (Strictly
-        // greater — an mtime change at unchanged length is a rewrite and
-        // falls through to the full refold below.)
-        Some(entry) if entry.consumed_bytes < len => {
+        // Stat unchanged since the last evaluation: derive straight from the
+        // cached facts (also covers an unchanged pending partial tail — no
+        // re-read until the file actually moves).
+        Some(entry) if entry.stat_len == len && entry.mtime_nanos == mtime_nanos => entry,
+        // Grown file: fold only the appended consumable lines. (Strictly
+        // greater than the last observed stat length — an mtime change
+        // without growth, even while a partial tail left consumed < len, is
+        // a rewrite and falls through to the full refold below.)
+        Some(entry) if len > entry.stat_len => {
             match read_new_complete_lines_sync(&path, entry.consumed_bytes, len)? {
                 Some((text, consumed)) => {
                     let mut facts = entry.facts.clone();
@@ -170,20 +177,31 @@ pub fn read_lineage_ledger(
                     }
                     let entry = Arc::new(CachedLineageFacts {
                         consumed_bytes: entry.consumed_bytes + consumed,
+                        stat_len: len,
                         mtime_nanos,
                         facts,
                     });
                     store_lineage_facts(&path, entry.clone());
                     entry
                 }
-                // No complete new line yet — evaluate the cached facts and
-                // leave the cursor (including its recorded mtime) for the
-                // next call to retry.
-                None => entry,
+                // No consumable new content yet — record the observed stat
+                // (so an untouched file serves from cache and a later
+                // no-growth mtime change still reads as a rewrite) and
+                // evaluate the cached facts.
+                None => {
+                    let entry = Arc::new(CachedLineageFacts {
+                        consumed_bytes: entry.consumed_bytes,
+                        stat_len: len,
+                        mtime_nanos,
+                        facts: entry.facts.clone(),
+                    });
+                    store_lineage_facts(&path, entry.clone());
+                    entry
+                }
             }
         }
-        // Cold cache, a shrunk file, or a same-length rewrite (mtime moved
-        // with no growth): fold from scratch.
+        // Cold cache, a shrunk file, or a rewrite without growth (mtime
+        // moved at the same stat length): fold from scratch.
         _ => {
             let contents = match fs::read_to_string(&path) {
                 Ok(contents) => contents,
@@ -193,6 +211,7 @@ pub fn read_lineage_ledger(
             let (complete, consumed) = complete_lines_prefix(&contents);
             let entry = Arc::new(CachedLineageFacts {
                 consumed_bytes: consumed,
+                stat_len: len,
                 mtime_nanos,
                 facts: session_facts_from_jsonl(complete),
             });
@@ -955,16 +974,43 @@ mod tests {
         assert_eq!(ledger.groups[0].branches[0].status, "running");
     }
 
+    fn set_mtime(path: &Path, secs_since_epoch: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn read_lineage_ledger_refolds_same_length_rewrite_while_partial_tail_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let rel_a = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child-a","relationship":"subagent","ephemeral":false}}"#;
+        let rel_b = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child-b","relationship":"subagent","ephemeral":false}}"#;
+        assert_eq!(rel_a.len(), rel_b.len(), "test needs equal-length lines");
+        let done = r#"{"event":"task_complete","data":{"session_id":"child-a","summary":"ok"}}"#;
+        let (partial, _rest) = done.split_at(done.len() / 2);
+
+        // Cached state with a pending partial tail: consumed < stat len.
+        std::fs::write(&path, format!("{rel_a}\n{partial}")).unwrap();
+        set_mtime(&path, 1_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].session_id, "child-a");
+
+        // Same TOTAL length, different content and mtime: a pure
+        // consumed<=len append model would tail-read from the stale cursor;
+        // the recorded stat length classifies it as a rewrite instead.
+        std::fs::write(&path, format!("{rel_b}\n{partial}")).unwrap();
+        set_mtime(&path, 2_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].session_id, "child-b");
+    }
+
     #[test]
     fn read_lineage_ledger_refolds_on_same_length_rewrite() {
-        fn set_mtime(path: &Path, secs_since_epoch: u64) {
-            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-            file.set_modified(
-                std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch),
-            )
-            .unwrap();
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
         let rel_line = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child","relationship":"subagent","ephemeral":false}}"#;
