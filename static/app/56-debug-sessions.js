@@ -2258,7 +2258,7 @@ function renderAggregateStatTiles(el, cards) {
     labelEl.className = 'ui-stat-label agg-label';
     labelEl.textContent = c.label;
     const valueEl = document.createElement('div');
-    valueEl.className = 'ui-stat-value agg-value';
+    valueEl.className = 'ui-stat-value agg-value' + (c.valueClass ? ` ${c.valueClass}` : '');
     valueEl.textContent = c.value;
     card.appendChild(labelEl);
     card.appendChild(valueEl);

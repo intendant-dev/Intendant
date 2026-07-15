@@ -7679,6 +7679,8 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sessions-aggregate .agg-value.v-yellow { color: var(--yellow); }
+.sessions-aggregate .agg-value.v-red { color: var(--red); }
 .sessions-aggregate .agg-card.loading {
   border-color: rgba(137, 180, 250, 0.22);
 }
@@ -7841,6 +7843,46 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--peach) 15%, transparent);
   color: var(--peach);
 }
+.worktree-card .wt-sessions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 0;
+}
+.worktree-card .wt-session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--surface2) 60%, transparent);
+  background: color-mix(in srgb, var(--surface1) 35%, transparent);
+  color: var(--subtext0);
+  font-family: inherit;
+}
+button.wt-session-chip { cursor: pointer; }
+button.wt-session-chip:hover,
+button.wt-session-chip:focus-visible {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.worktree-card .wt-session-chip.active {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+.worktree-card .wt-session-source {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+.worktree-card .wt-session-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.worktree-card .wt-session-status { color: var(--overlay1); }
+.worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 .worktree-card .wt-command {
   flex: 1 1 auto;
   min-width: 0;
@@ -16754,6 +16796,8 @@ html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value {
   letter-spacing: -.01em;
   color: var(--text);
 }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-yellow { color: var(--amber); }
+html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-value.v-red { color: var(--rose); }
 html.ui-v2 #tab-sessions .sessions-aggregate .ui-stat-sub {
   margin-top: 3px;
   font-size: 10.5px;
@@ -17314,6 +17358,33 @@ html.ui-v2 #tab-sessions .worktree-card .wt-label.unknown-merge {
   background: rgba(var(--amber-rgb), .1);
   color: var(--amber);
 }
+html.ui-v2 #tab-sessions .worktree-card .wt-sessions { gap: 5px; margin: 8px 0 0; }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip {
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 10.5px;
+}
+html.ui-v2 #tab-sessions button.wt-session-chip:hover,
+html.ui-v2 #tab-sessions button.wt-session-chip:focus-visible {
+  border-color: var(--iris);
+  color: var(--text);
+  background: var(--surface-3);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active {
+  border-color: rgba(var(--amber-rgb), .5);
+  color: var(--amber);
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-source {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .05em;
+}
+html.ui-v2 #tab-sessions .worktree-card .wt-session-id { font-family: var(--mono); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-status { color: var(--text-3); }
+html.ui-v2 #tab-sessions .worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 html.ui-v2 #tab-sessions .worktree-card .wt-safety {
   margin: 8px 0;
   padding: 7px 10px;
@@ -27951,7 +28022,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c5e6718315bccaf7';
+const INTENDANT_APP_BUILD = 'ac074f7638cef9ef';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -97063,7 +97134,7 @@ function renderAggregateStatTiles(el, cards) {
     labelEl.className = 'ui-stat-label agg-label';
     labelEl.textContent = c.label;
     const valueEl = document.createElement('div');
-    valueEl.className = 'ui-stat-value agg-value';
+    valueEl.className = 'ui-stat-value agg-value' + (c.valueClass ? ` ${c.valueClass}` : '');
     valueEl.textContent = c.value;
     card.appendChild(labelEl);
     card.appendChild(valueEl);
@@ -98175,12 +98246,36 @@ function renderWorktreesAggregate(scan, el) {
   const cards = [
     { label: 'Worktrees', value: Number(summary.worktrees || 0).toLocaleString() },
     { label: 'Disk', value: _fmtBytes(summary.total_bytes || 0) },
+  ];
+  const freeDisk = worktreeFreeDiskCard(summary);
+  if (freeDisk) cards.push(freeDisk);
+  cards.push(
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
     { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
     { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString(), sub: summary.cleanup_candidates > 0 ? 'safe to remove' : '' },
-  ];
+  );
   renderAggregateStatTiles(el, cards);
+}
+
+// Free-space tile for the tightest scanned volume. Tones follow proximity to
+// full: amber under 10% free, rose under 5% — the answer to "will the next
+// build fit?", not just how much the worktrees already consume.
+function worktreeFreeDiskCard(summary) {
+  const free = Number(summary?.volume_free_bytes);
+  const total = Number(summary?.volume_total_bytes);
+  if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) return null;
+  const ratio = free / total;
+  let valueClass = '';
+  if (ratio < 0.05) valueClass = 'v-red';
+  else if (ratio < 0.10) valueClass = 'v-yellow';
+  return {
+    label: 'Free disk',
+    value: _fmtBytes(free),
+    sub: `${Math.round(ratio * 100)}% of ${_fmtBytes(total)}`,
+    valueClass,
+    title: 'Free space on the volume hosting the scanned worktrees with the least room (what a full disk hits first)',
+  };
 }
 
 function worktreeDate(value) {
@@ -98247,6 +98342,102 @@ function shellQuote(value) {
 
 function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
+}
+
+// ── Related-session chips on worktree cards. The scan already ties each
+// worktree to the sessions observed inside it (supervised AND raw
+// codex/claude sessions, via the session catalog's observed-path hints);
+// the chips make that linkage navigable instead of a bare count.
+
+const WORKTREE_ACTIVE_SESSION_STATUSES = new Set(['running', 'in_progress', 'thinking']);
+
+// Gemini hints are project-level pseudo-entries, not sessions — nothing to
+// navigate to.
+function worktreeRelatedSessionNavigable(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  return !!sid && !sid.startsWith('gemini-project:');
+}
+
+function openWorktreeRelatedSession(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  if (!sid) return;
+  if (sessionWindows.has(sid)) {
+    focusSessionWindow(sid);
+    return;
+  }
+  // No live window: land on Sessions -> Recent with the ID in the search
+  // box — the catalog lists raw external sessions there too, so the row
+  // offers open/resume for supervised and unsupervised sessions alike.
+  routeTo('sessions', 'recent');
+  const search = document.getElementById('sessions-search');
+  if (search) {
+    search.value = sid;
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    search.focus();
+  }
+}
+
+function worktreeSessionChip(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  const status = String(rel?.status || '').trim();
+  const navigable = worktreeRelatedSessionNavigable(rel);
+  const active = WORKTREE_ACTIVE_SESSION_STATUSES.has(status);
+  const chip = document.createElement(navigable ? 'button' : 'span');
+  if (navigable) chip.type = 'button';
+  chip.className = 'wt-session-chip'
+    + (active ? ' active' : '')
+    + (navigable ? '' : ' static');
+
+  const source = normalizeAgentId(rel?.source || '') || String(rel?.source || '');
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'wt-session-source';
+  sourceEl.textContent = prettyAgentName(source) || source || 'session';
+  chip.appendChild(sourceEl);
+
+  const idEl = document.createElement('span');
+  idEl.className = 'wt-session-id';
+  idEl.textContent = sid.startsWith('gemini-project:')
+    ? sid.slice('gemini-project:'.length)
+    : (sid.length > 10 ? `${shortSessionId(sid)}…` : sid);
+  chip.appendChild(idEl);
+
+  if (status) {
+    const statusEl = document.createElement('span');
+    statusEl.className = 'wt-session-status';
+    statusEl.textContent = status;
+    chip.appendChild(statusEl);
+  }
+
+  const when = rel?.updated_at ? ` · ${fmtWorktreeMinute(rel.updated_at)}` : '';
+  chip.title = navigable
+    ? `Open session ${sid}${status ? ` (${status}${when})` : ''}`
+    : `${sid}${status ? ` (${status}${when})` : ''}`;
+  if (navigable) {
+    chip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openWorktreeRelatedSession(rel);
+    });
+  }
+  return chip;
+}
+
+function renderWorktreeSessionChips(wt) {
+  const related = Array.isArray(wt?.related_sessions) ? wt.related_sessions : [];
+  if (related.length === 0) return null;
+  const row = document.createElement('div');
+  row.className = 'wt-sessions';
+  for (const rel of related) {
+    row.appendChild(worktreeSessionChip(rel));
+  }
+  const total = Number(wt.related_session_count || 0);
+  if (total > related.length) {
+    const rest = document.createElement('span');
+    rest.className = 'wt-session-chip static wt-session-rest';
+    rest.textContent = `+${(total - related.length).toLocaleString()} more`;
+    rest.title = `${total.toLocaleString()} related sessions total; the inventory ships ${related.length} per worktree`;
+    row.appendChild(rest);
+  }
+  return row;
 }
 
 let worktreeInspectContext = null;
@@ -98528,6 +98719,11 @@ function recomputeWorktreeSummary(scan) {
     stale: 0,
     cleanup_candidates: 0,
     truncated_sizes: 0,
+    // Volume capacity comes from the scan, not the rows; carry it through
+    // (it only goes stale by the removal that just freed space, in the
+    // conservative direction — the next scan refreshes it).
+    volume_free_bytes: scan?.summary?.volume_free_bytes,
+    volume_total_bytes: scan?.summary?.volume_total_bytes,
   };
   for (const wt of rows) {
     summary.total_bytes += Number(wt.size_bytes || 0);
@@ -98810,11 +99006,11 @@ function renderWorktreesList(scan, el) {
       addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
     }
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'v-red');
-    if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
-      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'v-yellow' : null);
-    }
     addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
     card.appendChild(meta);
+
+    const sessionsRow = renderWorktreeSessionChips(wt);
+    if (sessionsRow) card.appendChild(sessionsRow);
 
     const actions = document.createElement('div');
     actions.className = 'sc-actions';

@@ -851,6 +851,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.sessions-aggregate .agg-value.v-yellow { color: var(--yellow); }
+.sessions-aggregate .agg-value.v-red { color: var(--red); }
 .sessions-aggregate .agg-card.loading {
   border-color: rgba(137, 180, 250, 0.22);
 }
@@ -1013,6 +1015,46 @@
   background: color-mix(in srgb, var(--peach) 15%, transparent);
   color: var(--peach);
 }
+.worktree-card .wt-sessions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 6px 0 0;
+}
+.worktree-card .wt-session-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--surface2) 60%, transparent);
+  background: color-mix(in srgb, var(--surface1) 35%, transparent);
+  color: var(--subtext0);
+  font-family: inherit;
+}
+button.wt-session-chip { cursor: pointer; }
+button.wt-session-chip:hover,
+button.wt-session-chip:focus-visible {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.worktree-card .wt-session-chip.active {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+.worktree-card .wt-session-source {
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+.worktree-card .wt-session-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.worktree-card .wt-session-status { color: var(--overlay1); }
+.worktree-card .wt-session-chip.active .wt-session-status { color: inherit; }
 .worktree-card .wt-command {
   flex: 1 1 auto;
   min-width: 0;

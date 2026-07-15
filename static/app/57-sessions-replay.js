@@ -163,12 +163,36 @@ function renderWorktreesAggregate(scan, el) {
   const cards = [
     { label: 'Worktrees', value: Number(summary.worktrees || 0).toLocaleString() },
     { label: 'Disk', value: _fmtBytes(summary.total_bytes || 0) },
+  ];
+  const freeDisk = worktreeFreeDiskCard(summary);
+  if (freeDisk) cards.push(freeDisk);
+  cards.push(
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
     { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
     { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString(), sub: summary.cleanup_candidates > 0 ? 'safe to remove' : '' },
-  ];
+  );
   renderAggregateStatTiles(el, cards);
+}
+
+// Free-space tile for the tightest scanned volume. Tones follow proximity to
+// full: amber under 10% free, rose under 5% — the answer to "will the next
+// build fit?", not just how much the worktrees already consume.
+function worktreeFreeDiskCard(summary) {
+  const free = Number(summary?.volume_free_bytes);
+  const total = Number(summary?.volume_total_bytes);
+  if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) return null;
+  const ratio = free / total;
+  let valueClass = '';
+  if (ratio < 0.05) valueClass = 'v-red';
+  else if (ratio < 0.10) valueClass = 'v-yellow';
+  return {
+    label: 'Free disk',
+    value: _fmtBytes(free),
+    sub: `${Math.round(ratio * 100)}% of ${_fmtBytes(total)}`,
+    valueClass,
+    title: 'Free space on the volume hosting the scanned worktrees with the least room (what a full disk hits first)',
+  };
 }
 
 function worktreeDate(value) {
@@ -235,6 +259,102 @@ function shellQuote(value) {
 
 function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
+}
+
+// ── Related-session chips on worktree cards. The scan already ties each
+// worktree to the sessions observed inside it (supervised AND raw
+// codex/claude sessions, via the session catalog's observed-path hints);
+// the chips make that linkage navigable instead of a bare count.
+
+const WORKTREE_ACTIVE_SESSION_STATUSES = new Set(['running', 'in_progress', 'thinking']);
+
+// Gemini hints are project-level pseudo-entries, not sessions — nothing to
+// navigate to.
+function worktreeRelatedSessionNavigable(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  return !!sid && !sid.startsWith('gemini-project:');
+}
+
+function openWorktreeRelatedSession(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  if (!sid) return;
+  if (sessionWindows.has(sid)) {
+    focusSessionWindow(sid);
+    return;
+  }
+  // No live window: land on Sessions -> Recent with the ID in the search
+  // box — the catalog lists raw external sessions there too, so the row
+  // offers open/resume for supervised and unsupervised sessions alike.
+  routeTo('sessions', 'recent');
+  const search = document.getElementById('sessions-search');
+  if (search) {
+    search.value = sid;
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    search.focus();
+  }
+}
+
+function worktreeSessionChip(rel) {
+  const sid = String(rel?.session_id || '').trim();
+  const status = String(rel?.status || '').trim();
+  const navigable = worktreeRelatedSessionNavigable(rel);
+  const active = WORKTREE_ACTIVE_SESSION_STATUSES.has(status);
+  const chip = document.createElement(navigable ? 'button' : 'span');
+  if (navigable) chip.type = 'button';
+  chip.className = 'wt-session-chip'
+    + (active ? ' active' : '')
+    + (navigable ? '' : ' static');
+
+  const source = normalizeAgentId(rel?.source || '') || String(rel?.source || '');
+  const sourceEl = document.createElement('span');
+  sourceEl.className = 'wt-session-source';
+  sourceEl.textContent = prettyAgentName(source) || source || 'session';
+  chip.appendChild(sourceEl);
+
+  const idEl = document.createElement('span');
+  idEl.className = 'wt-session-id';
+  idEl.textContent = sid.startsWith('gemini-project:')
+    ? sid.slice('gemini-project:'.length)
+    : (sid.length > 10 ? `${shortSessionId(sid)}…` : sid);
+  chip.appendChild(idEl);
+
+  if (status) {
+    const statusEl = document.createElement('span');
+    statusEl.className = 'wt-session-status';
+    statusEl.textContent = status;
+    chip.appendChild(statusEl);
+  }
+
+  const when = rel?.updated_at ? ` · ${fmtWorktreeMinute(rel.updated_at)}` : '';
+  chip.title = navigable
+    ? `Open session ${sid}${status ? ` (${status}${when})` : ''}`
+    : `${sid}${status ? ` (${status}${when})` : ''}`;
+  if (navigable) {
+    chip.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openWorktreeRelatedSession(rel);
+    });
+  }
+  return chip;
+}
+
+function renderWorktreeSessionChips(wt) {
+  const related = Array.isArray(wt?.related_sessions) ? wt.related_sessions : [];
+  if (related.length === 0) return null;
+  const row = document.createElement('div');
+  row.className = 'wt-sessions';
+  for (const rel of related) {
+    row.appendChild(worktreeSessionChip(rel));
+  }
+  const total = Number(wt.related_session_count || 0);
+  if (total > related.length) {
+    const rest = document.createElement('span');
+    rest.className = 'wt-session-chip static wt-session-rest';
+    rest.textContent = `+${(total - related.length).toLocaleString()} more`;
+    rest.title = `${total.toLocaleString()} related sessions total; the inventory ships ${related.length} per worktree`;
+    row.appendChild(rest);
+  }
+  return row;
 }
 
 let worktreeInspectContext = null;
@@ -516,6 +636,11 @@ function recomputeWorktreeSummary(scan) {
     stale: 0,
     cleanup_candidates: 0,
     truncated_sizes: 0,
+    // Volume capacity comes from the scan, not the rows; carry it through
+    // (it only goes stale by the removal that just freed space, in the
+    // conservative direction — the next scan refreshes it).
+    volume_free_bytes: scan?.summary?.volume_free_bytes,
+    volume_total_bytes: scan?.summary?.volume_total_bytes,
   };
   for (const wt of rows) {
     summary.total_bytes += Number(wt.size_bytes || 0);
@@ -798,11 +923,11 @@ function renderWorktreesList(scan, el) {
       addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
     }
     if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'v-red');
-    if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
-      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'v-yellow' : null);
-    }
     addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
     card.appendChild(meta);
+
+    const sessionsRow = renderWorktreeSessionChips(wt);
+    if (sessionsRow) card.appendChild(sessionsRow);
 
     const actions = document.createElement('div');
     actions.className = 'sc-actions';
