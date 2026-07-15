@@ -1106,18 +1106,20 @@ pub(crate) fn extend_codex_observed_worktree_session_hints(
     );
     if files.is_empty() {
         let codex = codex_dir(home);
-        files = collect_recent_files(
+        let mut keyed = collect_recent_files_keyed(
             &codex.join("sessions"),
             ".jsonl",
             WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
         );
-        files.extend(collect_recent_files(
+        keyed.extend(collect_recent_files_keyed(
             &codex.join("archived_sessions"),
             ".jsonl",
             WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
         ));
-        files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
-        files.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+        // Keys carried out of the walks: no re-stat per comparison.
+        keyed.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        keyed.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+        files = keyed.into_iter().map(|(_, path)| path).collect();
     }
 
     for path in files {
@@ -1191,9 +1193,15 @@ pub(crate) fn agent_session_files_from_rows(
             files.push(path);
         }
     }
-    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
-    files.truncate(limit);
-    files
+    // Decorate once: `sort_by_key(file_mtime_secs)` re-stats per
+    // comparison.
+    let mut keyed: Vec<(u64, PathBuf)> = files
+        .into_iter()
+        .map(|path| (file_mtime_secs(&path), path))
+        .collect();
+    keyed.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    keyed.truncate(limit);
+    keyed.into_iter().map(|(_, path)| path).collect()
 }
 
 pub(crate) fn extend_gemini_observed_worktree_session_hints(

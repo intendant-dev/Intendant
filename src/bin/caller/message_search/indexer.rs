@@ -71,9 +71,15 @@ pub(crate) struct SweepStats {
 /// Cross-sweep in-process memory (see the module doc): sources that
 /// produced nothing publishable, keyed by path with the cursor that
 /// proved it, so unchanged ones are skipped without re-parsing.
+/// Publishes queued per sweep before a batched manifest flush; bounds how
+/// many derived shards sit in memory awaiting the flush.
+const PUBLISH_BATCH_MAX: usize = 16;
+
 #[derive(Default)]
 pub(crate) struct Indexer {
     unpublishable: HashMap<PathBuf, SourceCursor>,
+    /// (source path for failure attribution, queued publish).
+    pending_publishes: Vec<(PathBuf, super::store::PendingPublish)>,
     sweeps: u64,
 }
 
@@ -137,6 +143,9 @@ impl Indexer {
             horizon,
             &mut stats,
         );
+        // Everything derived this sweep persists before the coverage and
+        // drain passes below read `failed_paths` / the on-disk manifest.
+        self.flush_pending_publishes(&store, &mut failed_paths, &mut stats);
 
         // Coverage: a published session whose every source file vanished
         // (lease cleanup, manual deletion) keeps serving from the shard
@@ -473,15 +482,22 @@ impl Indexer {
                 for path in &agent_paths {
                     seen_paths.insert(path.clone());
                 }
-                let all_unchanged =
-                    std::iter::once(&main_path)
-                        .chain(agent_paths.iter())
-                        .all(|path| {
-                            cursor_by_path
-                                .get(path)
-                                .is_some_and(|(_, cursor)| cursor.check() == CursorCheck::Unchanged)
-                        });
-                if all_unchanged {
+                let main_check = cursor_by_path
+                    .get(&main_path)
+                    .map(|(_, cursor)| cursor.check());
+                // Only transcript-shaped agent files can affect the shard
+                // (the extractor filters to exactly this set), so only
+                // they participate in the skip/fold decisions — a foreign
+                // .jsonl under subagents/ no longer forces a re-parse of
+                // an otherwise-unchanged session every sweep.
+                let transcript_agents =
+                    super::extract_claude::claude_transcript_agents(&agent_paths);
+                let agents_unchanged = transcript_agents.iter().all(|path| {
+                    cursor_by_path
+                        .get(path.as_path())
+                        .is_some_and(|(_, cursor)| cursor.check() == CursorCheck::Unchanged)
+                });
+                if matches!(main_check, Some(CursorCheck::Unchanged)) && agents_unchanged {
                     stats.skipped_unchanged += 1;
                     continue;
                 }
@@ -493,6 +509,81 @@ impl Indexer {
                 let session_key = format!("{}:{}", Source::ClaudeCode.as_str(), session_id);
                 if snapshot.manifest.tombstones.contains_key(&session_key) {
                     continue;
+                }
+                // Main-only append with a byte-unchanged, set-unchanged
+                // subagent side: fold the appended suffix into the
+                // published shard (claude records are line-local) instead
+                // of re-parsing tens of MB per live session per sweep.
+                // Every guard failure falls through to the full parse.
+                if matches!(main_check, Some(CursorCheck::Appended)) && agents_unchanged {
+                    let saved_for_session = snapshot
+                        .manifest
+                        .sessions
+                        .get(&session_key)
+                        .map(|entry| entry.cursors.len())
+                        .unwrap_or(0);
+                    // Exact source-set match (no removed transcript may
+                    // linger in the fold; a removed source must shrink the
+                    // shard exactly as a full re-extract would).
+                    let sources_match = saved_for_session == 1 + transcript_agents.len()
+                        && cursor_by_path
+                            .get(&main_path)
+                            .is_some_and(|(key, _)| key == &session_key)
+                        && transcript_agents.iter().all(|path| {
+                            cursor_by_path
+                                .get(path.as_path())
+                                .is_some_and(|(key, _)| key == &session_key)
+                        });
+                    let prior = if sources_match {
+                        snapshot
+                            .read_shard(&session_key)
+                            .filter(|shard| !shard.records.is_empty())
+                    } else {
+                        None
+                    };
+                    if let Some(prior) = prior {
+                        let (_, main_cursor) = cursor_by_path
+                            .get(&main_path)
+                            .expect("main cursor checked above");
+                        match super::extract_claude::fold_claude_main_append(
+                            &session_id,
+                            &main_path,
+                            main_cursor.last_complete_line_offset,
+                            &prior,
+                        ) {
+                            Ok(Some((shard, new_main_cursor))) => {
+                                stats.parsed += 1;
+                                let mut cursors =
+                                    Vec::with_capacity(1 + transcript_agents.len());
+                                cursors.push(new_main_cursor);
+                                cursors.extend(transcript_agents.iter().map(|path| {
+                                    cursor_by_path
+                                        .get(path.as_path())
+                                        .expect("agent cursor checked above")
+                                        .1
+                                        .clone()
+                                }));
+                                self.publish(
+                                    store,
+                                    &session_key,
+                                    shard,
+                                    cursors,
+                                    &main_path,
+                                    failed_paths,
+                                    stats,
+                                );
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "[message-search] claude incremental fold {} failed \
+                                     (falling back to full parse): {err}",
+                                    main_path.display()
+                                );
+                            }
+                        }
+                    }
                 }
                 stats.parsed += 1;
                 match extract_claude_session(&session_id, &main_path, &agent_paths) {
@@ -562,6 +653,10 @@ impl Indexer {
     }
 
     #[allow(clippy::too_many_arguments)] // one sweep's shared frame, threaded to each lane
+    /// Queue a derived shard for the batched flush; publishing per session
+    /// paid one writer lock + full manifest read + full manifest rewrite
+    /// EACH. Flushes early at [`PUBLISH_BATCH_MAX`] to bound memory.
+    #[allow(clippy::too_many_arguments)] // mirrors the sweep frame it serves
     fn publish(
         &mut self,
         store: &Store,
@@ -572,16 +667,54 @@ impl Indexer {
         failed_paths: &mut Vec<PathBuf>,
         stats: &mut SweepStats,
     ) {
-        match store.publish_session(session_key, &shard, cursors, false) {
-            Ok(PublishOutcome::Published) => stats.published += 1,
-            // A concurrent daemon got there first with fresher progress;
-            // ours was derived from the same sources — nothing lost.
-            Ok(PublishOutcome::RejectedStale) => {}
-            Ok(PublishOutcome::RejectedTombstoned) => {}
-            Err(err) => {
-                eprintln!("[message-search] publish {session_key} failed: {err}");
-                failed_paths.push(source_path.to_path_buf());
-                stats.failures += 1;
+        self.pending_publishes.push((
+            source_path.to_path_buf(),
+            super::store::PendingPublish {
+                session_key: session_key.to_string(),
+                shard,
+                cursors,
+                source_gone: false,
+            },
+        ));
+        if self.pending_publishes.len() >= PUBLISH_BATCH_MAX {
+            self.flush_pending_publishes(store, failed_paths, stats);
+        }
+    }
+
+    fn flush_pending_publishes(
+        &mut self,
+        store: &Store,
+        failed_paths: &mut Vec<PathBuf>,
+        stats: &mut SweepStats,
+    ) {
+        if self.pending_publishes.is_empty() {
+            return;
+        }
+        let staged = std::mem::take(&mut self.pending_publishes);
+        let (source_paths, batch): (Vec<PathBuf>, Vec<super::store::PendingPublish>) =
+            staged.into_iter().unzip();
+        let session_keys: Vec<String> = batch
+            .iter()
+            .map(|pending| pending.session_key.clone())
+            .collect();
+        for ((outcome, source_path), session_key) in store
+            .publish_sessions(batch)
+            .into_iter()
+            .zip(source_paths)
+            .zip(session_keys)
+        {
+            match outcome {
+                Ok(PublishOutcome::Published) => stats.published += 1,
+                // A concurrent daemon got there first with fresher
+                // progress; ours was derived from the same sources —
+                // nothing lost.
+                Ok(PublishOutcome::RejectedStale) => {}
+                Ok(PublishOutcome::RejectedTombstoned) => {}
+                Err(err) => {
+                    eprintln!("[message-search] publish {session_key} failed: {err}");
+                    failed_paths.push(source_path);
+                    stats.failures += 1;
+                }
             }
         }
     }

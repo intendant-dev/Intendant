@@ -17,7 +17,7 @@
 //! cursor check means a full re-extract, never a generation bump — record
 //! identity is the duplicate-free record `uuid`.
 
-use super::cursor::{read_complete_lines_from, SourceCursor};
+use super::cursor::{for_each_complete_line_from, SourceCursor};
 use super::record::{cap_text, Locator, MessageRecord, Role, Source};
 use super::store::SessionShard;
 use crate::external_agent::transcript_text::{is_injected_external_user_text, message_prose_text};
@@ -71,16 +71,24 @@ pub(crate) fn extract_claude_session(
         &mut shard.records,
         &mut cursors,
     )?;
+    for path in claude_transcript_agents(subagent_paths) {
+        walk_transcript(path, session_id, true, &mut shard.records, &mut cursors)?;
+    }
+    Ok((shard, cursors))
+}
+
+/// The subagent paths [`extract_claude_session`] actually consumes, in its
+/// consumption order (transcript-shaped only, sorted, deduped). The
+/// incremental fold matches saved cursors against exactly this set, and
+/// only files in this set can ever change the shard.
+pub(crate) fn claude_transcript_agents(subagent_paths: &[PathBuf]) -> Vec<&PathBuf> {
     let mut agents: Vec<&PathBuf> = subagent_paths
         .iter()
         .filter(|path| is_subagent_transcript(path))
         .collect();
     agents.sort();
     agents.dedup();
-    for path in agents {
-        walk_transcript(path, session_id, true, &mut shard.records, &mut cursors)?;
-    }
-    Ok((shard, cursors))
+    agents
 }
 
 /// Consume every complete line of one transcript file, appending its
@@ -92,12 +100,11 @@ fn walk_transcript(
     records: &mut Vec<MessageRecord>,
     cursors: &mut Vec<SourceCursor>,
 ) -> std::io::Result<()> {
-    let (lines, consumed) = read_complete_lines_from(path, 0)?;
-    for line in &lines {
+    let consumed = for_each_complete_line_from(path, 0, |line| {
         if let Some(record) = record_from_line(line, session_id, subagent) {
             records.push(record);
         }
-    }
+    })?;
     let cursor = SourceCursor::capture(path, consumed).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -106,6 +113,72 @@ fn walk_transcript(
     })?;
     cursors.push(cursor);
     Ok(())
+}
+
+/// Fold a MAIN-transcript append into the session's previously published
+/// shard, without re-reading the whole corpus. Sound only in the narrow
+/// case the caller verified with cursors: the main file APPENDED (same
+/// identity/prefix), every subagent transcript is byte-unchanged, and the
+/// subagent set itself did not change. Claude records are line-local
+/// ([`record_from_line`] holds no cross-line state), and full extraction
+/// orders records [main lines..., agents by path...], so splicing the
+/// suffix records at the end of the prior MAIN block reproduces the full
+/// re-extraction byte-for-byte — the store's content-named shard files
+/// keep deduping across passes.
+///
+/// Returns `Ok(None)` when the prior shard does not have the expected
+/// main-then-agents partition (never produced by this extractor, but a
+/// foreign store must fall back to the full parse, never mis-splice).
+pub(crate) fn fold_claude_main_append(
+    session_id: &str,
+    main_path: &Path,
+    resume_offset: u64,
+    prior: &SessionShard,
+) -> std::io::Result<Option<(SessionShard, SourceCursor)>> {
+    if !is_strict_jsonl(main_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "not a .jsonl transcript (backup/sidecar artifacts are excluded): {}",
+                main_path.display()
+            ),
+        ));
+    }
+    // The prior records must be one main block followed by one agents
+    // block for the splice below to reproduce full-extraction order.
+    let main_block_end = prior
+        .records
+        .iter()
+        .rposition(|record| !record.subagent)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    if prior.records[..main_block_end]
+        .iter()
+        .any(|record| record.subagent)
+    {
+        return Ok(None);
+    }
+    let mut suffix_records = Vec::new();
+    let consumed = for_each_complete_line_from(main_path, resume_offset, |line| {
+        if let Some(record) = record_from_line(line, session_id, false) {
+            suffix_records.push(record);
+        }
+    })?;
+    let Some(cursor) = SourceCursor::capture(main_path, consumed) else {
+        return Ok(None);
+    };
+    let mut records =
+        Vec::with_capacity(prior.records.len().saturating_add(suffix_records.len()));
+    records.extend_from_slice(&prior.records[..main_block_end]);
+    records.append(&mut suffix_records);
+    records.extend_from_slice(&prior.records[main_block_end..]);
+    Ok(Some((
+        SessionShard {
+            records,
+            marks: prior.marks.clone(),
+        },
+        cursor,
+    )))
 }
 
 /// Parse one transcript line into a [`MessageRecord`], or `None` for
@@ -193,7 +266,7 @@ fn is_subagent_transcript(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cursor::CursorCheck;
+    use super::super::cursor::{read_complete_lines_from, CursorCheck};
     use super::super::record::MESSAGE_TEXT_CAP_BYTES;
     use super::super::store::{PublishOutcome, Store};
     use super::*;
@@ -728,5 +801,110 @@ mod tests {
         assert_eq!(read.records.len(), 1);
         assert_eq!(read.records[0].text, "index me");
         assert!(read.marks.is_empty());
+    }
+
+    /// The incremental fold's soundness invariant: for a main-only append
+    /// with an unchanged subagent set, the folded shard and cursor are
+    /// exactly what a full re-extraction would produce.
+    #[test]
+    fn fold_of_main_append_matches_full_reextraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join(format!("{SESSION}.jsonl"));
+        let subagent_dir = dir.path().join(SESSION).join("subagents");
+        std::fs::create_dir_all(&subagent_dir).unwrap();
+        let agent = subagent_dir.join("agent-a1.jsonl");
+        write_transcript(
+            &main,
+            &[
+                message_line(
+                    "user",
+                    "u-1",
+                    "2026-07-10T10:00:00.000Z",
+                    serde_json::json!("first question"),
+                    &[],
+                ),
+                message_line(
+                    "assistant",
+                    "a-1",
+                    "2026-07-10T10:00:05.000Z",
+                    serde_json::json!("first answer"),
+                    &[],
+                ),
+            ],
+        );
+        write_transcript(
+            &agent,
+            &[sidechain_line(
+                "assistant",
+                "s-1",
+                "2026-07-10T10:00:06.000Z",
+                "subagent prose",
+                "a1",
+            )],
+        );
+        let agents = vec![agent.clone()];
+        let (prior, prior_cursors) = extract_claude_session(SESSION, &main, &agents).unwrap();
+        let main_cursor = prior_cursors
+            .iter()
+            .find(|cursor| cursor.path == main)
+            .unwrap()
+            .clone();
+
+        // Append two records to the MAIN transcript only.
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&main).unwrap();
+        writeln!(
+            file,
+            "{}",
+            message_line(
+                "user",
+                "u-2",
+                "2026-07-10T10:01:00.000Z",
+                serde_json::json!("second question"),
+                &[],
+            )
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            message_line(
+                "assistant",
+                "a-2",
+                "2026-07-10T10:01:05.000Z",
+                serde_json::json!("second answer"),
+                &[],
+            )
+        )
+        .unwrap();
+        drop(file);
+        assert_eq!(main_cursor.check(), CursorCheck::Appended);
+
+        let (folded, folded_cursor) = fold_claude_main_append(
+            SESSION,
+            &main,
+            main_cursor.last_complete_line_offset,
+            &prior,
+        )
+        .unwrap()
+        .expect("main-only append is foldable");
+        let (full, full_cursors) = extract_claude_session(SESSION, &main, &agents).unwrap();
+        assert_eq!(folded.records, full.records);
+        assert_eq!(folded.marks, full.marks);
+        assert_eq!(
+            Some(&folded_cursor),
+            full_cursors.iter().find(|cursor| cursor.path == main)
+        );
+        let texts: Vec<&str> = folded.records.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "first question",
+                "first answer",
+                "second question",
+                "second answer",
+                "subagent prose",
+            ]
+        );
     }
 }

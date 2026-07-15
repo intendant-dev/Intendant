@@ -56,7 +56,7 @@ pub(crate) const SESSION_PREVIEW_MAX_BYTES: usize = 500;
 /// (Intendant rows version through the fingerprint digest byte instead.)
 pub(crate) const SESSION_ROW_PREVIEW_FORMAT: &str = "p1";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SessionPreviewBuilder {
     entries: Vec<(&'static str, String)>, // chronological (role, text)
     user: usize,

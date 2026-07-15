@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Bytes hashed from the file head for the prefix fingerprint.
-const PREFIX_HASH_BYTES: usize = 4096;
+/// Bytes hashed from the file head for the prefix fingerprint. Shared
+/// with the session catalog's incremental row accumulators, which use the
+/// same head-hash to distinguish appends from rewrites.
+pub(crate) const PREFIX_HASH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SourceCursor {
@@ -54,17 +56,22 @@ fn file_mtime_ms(metadata: &std::fs::Metadata) -> i64 {
 }
 
 fn prefix_hash16(path: &Path) -> Option<String> {
+    prefix_hash16_bytes(path, PREFIX_HASH_BYTES)
+}
+
+/// Hash16 over the first `max_bytes` of `path` (fewer at EOF).
+pub(crate) fn prefix_hash16_bytes(path: &Path, max_bytes: usize) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; PREFIX_HASH_BYTES];
+    let mut buf = vec![0u8; max_bytes];
     let mut read = 0usize;
     loop {
+        if read == buf.len() {
+            break;
+        }
         match file.read(&mut buf[read..]) {
             Ok(0) => break,
             Ok(n) => read += n,
             Err(_) => return None,
-        }
-        if read == buf.len() {
-            break;
         }
     }
     buf.truncate(read);
@@ -107,25 +114,48 @@ impl SourceCursor {
         if metadata.len() < self.len {
             return CursorCheck::Rewritten;
         }
-        if let (Some(saved), Ok(current)) = (self.identity, FileIdentity::from_path(&self.path)) {
-            if saved.is_reliable() && current.is_reliable() && saved != current {
-                return CursorCheck::Rewritten;
-            }
-        }
-        match prefix_hash16(&self.path) {
-            Some(hash) => {
-                // The saved and fresh hashes cover the same byte window
-                // only when the saved file already filled the window, or
-                // the length hasn't changed — an append to a small file
-                // widens the hashed window and is NOT comparable (and is
-                // exactly the benign case the offset check below handles).
-                let comparable =
-                    self.len as usize >= PREFIX_HASH_BYTES || metadata.len() == self.len;
-                if comparable && hash != self.prefix_hash16 {
+        let current_identity = FileIdentity::from_path(&self.path).ok();
+        let identity_reliably_same = match (self.identity, current_identity) {
+            (Some(saved), Some(current)) if saved.is_reliable() && current.is_reliable() => {
+                if saved != current {
                     return CursorCheck::Rewritten;
                 }
+                true
             }
-            None => return CursorCheck::Gone,
+            _ => false,
+        };
+        let mtime_ms = file_mtime_ms(&metadata);
+        // Same length, moved mtime: an in-place rewrite whose changed bytes
+        // lie past the hashed prefix window would otherwise read as
+        // Unchanged forever (the module doc's "folds len + timestamps"
+        // promise). A benign touch(1) costs one idempotent rebuild.
+        if metadata.len() == self.len && mtime_ms != self.mtime_ms {
+            return CursorCheck::Rewritten;
+        }
+        // Cheap-facts short-circuit: a reliable identity match with
+        // unchanged len + mtime is the steady state of nearly every
+        // in-retention file on every 30s sweep — skip the open + 4 KiB
+        // read + SHA-256 that used to run merely to confirm it. Any
+        // rewrite these facts can miss (same-length mtime-preserving
+        // writer) was equally invisible to the prefix hash past 4 KiB.
+        let hash_needed =
+            !(identity_reliably_same && metadata.len() == self.len && mtime_ms == self.mtime_ms);
+        if hash_needed {
+            match prefix_hash16(&self.path) {
+                Some(hash) => {
+                    // The saved and fresh hashes cover the same byte window
+                    // only when the saved file already filled the window, or
+                    // the length hasn't changed — an append to a small file
+                    // widens the hashed window and is NOT comparable (and is
+                    // exactly the benign case the offset check below handles).
+                    let comparable =
+                        self.len as usize >= PREFIX_HASH_BYTES || metadata.len() == self.len;
+                    if comparable && hash != self.prefix_hash16 {
+                        return CursorCheck::Rewritten;
+                    }
+                }
+                None => return CursorCheck::Gone,
+            }
         }
         if metadata.len() > self.last_complete_line_offset {
             CursorCheck::Appended
@@ -135,17 +165,22 @@ impl SourceCursor {
     }
 }
 
-/// Read complete lines from `path` starting at `offset`; returns the
-/// lines and the offset just past the last complete line (a trailing
-/// partial line is left for the next pass — plan §6).
-pub(crate) fn read_complete_lines_from(
+/// Stream complete lines from `path` starting at `offset` through
+/// `consume`; returns the offset just past the last complete line (a
+/// trailing partial line is left for the next pass — plan §6).
+///
+/// Streaming, not collecting: extraction runs on every changed
+/// in-retention source every sweep, and materializing a multi-hundred-MB
+/// rollout as an owned `Vec<String>` was a file-sized allocation spike
+/// per parse. One reused line buffer serves the whole read.
+pub(crate) fn for_each_complete_line_from(
     path: &Path,
     offset: u64,
-) -> std::io::Result<(Vec<String>, u64)> {
+    mut consume: impl FnMut(&str),
+) -> std::io::Result<u64> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = std::io::BufReader::new(file);
-    let mut lines = Vec::new();
     let mut consumed = offset;
     let mut buf = Vec::new();
     loop {
@@ -160,9 +195,20 @@ pub(crate) fn read_complete_lines_from(
         }
         consumed += bytes as u64;
         let line = String::from_utf8_lossy(&buf);
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        lines.push(trimmed.to_string());
+        consume(line.trim_end_matches(['\n', '\r']));
     }
+    Ok(consumed)
+}
+
+/// Collected form of [`for_each_complete_line_from`] — tests and small
+/// bounded reads only; extraction paths must stream.
+#[cfg(test)]
+pub(crate) fn read_complete_lines_from(
+    path: &Path,
+    offset: u64,
+) -> std::io::Result<(Vec<String>, u64)> {
+    let mut lines = Vec::new();
+    let consumed = for_each_complete_line_from(path, offset, |line| lines.push(line.to_string()))?;
     Ok((lines, consumed))
 }
 

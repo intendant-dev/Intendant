@@ -24,7 +24,7 @@
 //! published shard and a generation number on rewrite detection);
 //! nothing here resolves homes or the environment.
 
-use super::cursor::{read_complete_lines_from, SourceCursor};
+use super::cursor::{for_each_complete_line_from, SourceCursor};
 use super::record::{cap_text, Locator, MessageRecord, Role, Source, SupersessionMark};
 use super::store::SessionShard;
 use crate::external_agent::codex::rollout::{
@@ -60,8 +60,6 @@ pub(crate) fn extract_codex_session(
     prior: Option<&SessionShard>,
     generation: u32,
 ) -> std::io::Result<(SessionShard, Vec<SourceCursor>)> {
-    let (lines, consumed) = read_complete_lines_from(rollout_path, 0)?;
-
     let mut session_id: Option<String> = None;
     let mut records: Vec<MessageRecord> = Vec::new();
     let mut marks: Vec<SupersessionMark> = Vec::new();
@@ -75,20 +73,21 @@ pub(crate) fn extract_codex_session(
     // parseable one forward for (rare) lines missing their own.
     let mut ts_ms: i64 = 0;
 
-    for (index, line) in lines.iter().enumerate() {
-        let line_no = index as u64 + 1;
+    let mut line_no: u64 = 0;
+    let consumed = for_each_complete_line_from(rollout_path, 0, |line| {
+        line_no += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            continue;
+            return;
         }
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
+            return;
         };
         if let Some(parsed) = value_str(&obj, "timestamp").as_deref().and_then(rfc3339_ms) {
             ts_ms = parsed;
         }
         let Some(payload) = obj.get("payload") else {
-            continue;
+            return;
         };
         match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "session_meta" => {
@@ -125,10 +124,10 @@ pub(crate) fn extract_codex_session(
                 "user_message" => {
                     user_turn = user_turn.saturating_add(1);
                     let Some((_, text)) = codex_event_message_text(payload) else {
-                        continue;
+                        return;
                     };
                     if text.trim().is_empty() || is_codex_injected_user_text(&text) {
-                        continue;
+                        return;
                     }
                     records.push(message_record(
                         Role::User,
@@ -144,12 +143,12 @@ pub(crate) fn extract_codex_session(
             },
             "response_item" => {
                 let Some((role, text)) = codex_payload_text(payload) else {
-                    continue;
+                    return;
                 };
                 // role "user" is the event_msg twin lane (dedup) plus the
                 // machine injections; "developer" is harness config.
                 if role != "assistant" || text.trim().is_empty() {
-                    continue;
+                    return;
                 }
                 let item_id = codex_response_item_id(&obj);
                 // Assistant records carry the ordinal of the user turn
@@ -169,7 +168,7 @@ pub(crate) fn extract_codex_session(
             }
             _ => {}
         }
-    }
+    })?;
 
     let session_id = session_id.unwrap_or_else(|| {
         // Degenerate rollout with no session_meta line: fall back to the

@@ -16,7 +16,7 @@
 //! ([`record::derive_active`]) — never stored — because Codex restores
 //! can reactivate messages (plan D2).
 
-mod cursor;
+pub(crate) mod cursor;
 mod extract_claude;
 mod extract_codex;
 mod extract_intendant;

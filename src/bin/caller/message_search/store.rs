@@ -105,6 +105,14 @@ pub(crate) enum PublishOutcome {
     RejectedTombstoned,
 }
 
+/// One queued session publish for [`Store::publish_sessions`].
+pub(crate) struct PendingPublish {
+    pub session_key: String,
+    pub shard: SessionShard,
+    pub cursors: Vec<SourceCursor>,
+    pub source_gone: bool,
+}
+
 impl Store {
     pub(crate) fn open(root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(root.join("generations"))?;
@@ -155,6 +163,9 @@ impl Store {
 
     /// Publish one session's freshly derived shard. `watermark` is the
     /// publisher's consumed-source progress (sum of cursor offsets).
+    /// Production publishes ride [`Self::publish_sessions`] (one manifest
+    /// write per batch); this single-session form serves the tests.
+    #[cfg(test)]
     pub(crate) fn publish_session(
         &self,
         session_key: &str,
@@ -164,6 +175,81 @@ impl Store {
     ) -> std::io::Result<PublishOutcome> {
         let _lock = WriterLock::acquire(&self.root)?;
         let mut manifest = self.read_manifest();
+        let outcome = self.apply_publish(&mut manifest, session_key, shard, cursors, source_gone)?;
+        if matches!(outcome, PublishOutcome::Published) {
+            self.write_published_manifest(&mut manifest)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Publish a whole batch under ONE writer lock, ONE manifest read and
+    /// (at most) ONE manifest write. The per-session publish used to
+    /// read + parse and pretty-serialize + rewrite the whole manifest for
+    /// every published session, every sweep — measured ~7 GB/day of
+    /// manifest write traffic on a busy box. Staleness/tombstone checks
+    /// run per session against the same locked view they always ran under.
+    pub(crate) fn publish_sessions(
+        &self,
+        batch: Vec<PendingPublish>,
+    ) -> Vec<std::io::Result<PublishOutcome>> {
+        fn replicate_error(error: &std::io::Error) -> std::io::Error {
+            std::io::Error::new(error.kind(), error.to_string())
+        }
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        let _lock = match WriterLock::acquire(&self.root) {
+            Ok(lock) => lock,
+            Err(error) => return batch.iter().map(|_| Err(replicate_error(&error))).collect(),
+        };
+        let mut manifest = self.read_manifest();
+        let mut published_any = false;
+        let outcomes: Vec<std::io::Result<PublishOutcome>> = batch
+            .into_iter()
+            .map(|pending| {
+                let outcome = self.apply_publish(
+                    &mut manifest,
+                    &pending.session_key,
+                    &pending.shard,
+                    pending.cursors,
+                    pending.source_gone,
+                );
+                if matches!(outcome, Ok(PublishOutcome::Published)) {
+                    published_any = true;
+                }
+                outcome
+            })
+            .collect();
+        if published_any {
+            if let Err(error) = self.write_published_manifest(&mut manifest) {
+                // Nothing persisted: report the write failure for every
+                // entry (orphaned generation files are GC'd as
+                // unreferenced).
+                return outcomes
+                    .iter()
+                    .map(|_| Err(replicate_error(&error)))
+                    .collect();
+            }
+        }
+        outcomes
+    }
+
+    fn write_published_manifest(&self, manifest: &mut Manifest) -> std::io::Result<()> {
+        manifest.schema = 1;
+        manifest.parser_version = PARSER_VERSION;
+        manifest.updated_at_ms = now_ms();
+        self.write_manifest(manifest)
+    }
+
+    /// The caller holds the writer lock and owns writing `manifest` back.
+    fn apply_publish(
+        &self,
+        manifest: &mut Manifest,
+        session_key: &str,
+        shard: &SessionShard,
+        cursors: Vec<SourceCursor>,
+        source_gone: bool,
+    ) -> std::io::Result<PublishOutcome> {
         if manifest.tombstones.contains_key(session_key) {
             return Ok(PublishOutcome::RejectedTombstoned);
         }
@@ -227,10 +313,6 @@ impl Store {
                 source_gone,
             },
         );
-        manifest.schema = 1;
-        manifest.parser_version = PARSER_VERSION;
-        manifest.updated_at_ms = now_ms();
-        self.write_manifest(&mut manifest)?;
         Ok(PublishOutcome::Published)
     }
 
@@ -301,7 +383,11 @@ impl Store {
 
     fn write_manifest(&self, manifest: &mut Manifest) -> std::io::Result<()> {
         manifest.revision += 1;
-        let body = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
+        // Compact, not pretty: the manifest is machine-read only, grows
+        // with session count (1.2 MB at ~1,600 sessions), and is rewritten
+        // on every publish flush — indentation was pure write
+        // amplification.
+        let body = serde_json::to_string(manifest).map_err(std::io::Error::other)?;
         crate::file_watcher::atomic_write(&self.manifest_path(), body.as_bytes())
     }
 }

@@ -9,7 +9,16 @@ pub(crate) fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        // `DirEntry::file_type` rides the readdir data on the major
+        // platforms — the old `path.is_dir()` re-stat'd every entry of
+        // every scan. Symlinks keep the historical follow semantics
+        // through the (rare) explicit stat.
+        let is_dir = match entry.file_type() {
+            Ok(file_type) if file_type.is_symlink() => path.is_dir(),
+            Ok(file_type) => file_type.is_dir(),
+            Err(_) => continue,
+        };
+        if is_dir {
             collect_files(&path, suffix, out);
         } else if path
             .file_name()
@@ -18,6 +27,50 @@ pub(crate) fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
             .unwrap_or(false)
         {
             out.push(path);
+        }
+    }
+}
+
+/// [`collect_files`] carrying each match's metadata out of the walk, so
+/// recency sorts and identity dedups don't re-stat (or canonicalize)
+/// every file per rebuild.
+fn collect_files_with_metadata(
+    root: &Path,
+    suffix: &str,
+    out: &mut Vec<(PathBuf, std::fs::Metadata)>,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        let is_dir = if file_type.is_symlink() {
+            path.is_dir()
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
+            collect_files_with_metadata(&path, suffix, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(suffix))
+            .unwrap_or(false)
+        {
+            // Follow symlinked files (the historical `fs::metadata`
+            // semantics); direct entries reuse the readdir-adjacent stat.
+            let metadata = if file_type.is_symlink() {
+                std::fs::metadata(&path).ok()
+            } else {
+                entry.metadata().ok()
+            };
+            if let Some(metadata) = metadata {
+                out.push((path, metadata));
+            }
         }
     }
 }
@@ -756,15 +809,45 @@ pub(crate) fn store_intendant_session_list_row(
 }
 
 pub(crate) fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect_files(root, suffix, &mut files);
-    let mut seen = HashSet::new();
-    files.retain(|path| {
-        std::fs::canonicalize(path)
-            .map(|canonical| seen.insert(canonical))
-            .unwrap_or(true)
+    collect_recent_files_keyed(root, suffix, limit)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// [`collect_recent_files`] keeping each survivor's mtime key, so callers
+/// merging several roots can re-sort without re-stat'ing every path.
+pub(crate) fn collect_recent_files_keyed(
+    root: &Path,
+    suffix: &str,
+    limit: usize,
+) -> Vec<(u64, PathBuf)> {
+    let mut files: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
+    collect_files_with_metadata(root, suffix, &mut files);
+    // Dedup path aliases to one file. On Unix, `(dev, ino)` from the
+    // already-held metadata replaces the old canonicalize-per-file storm
+    // (and additionally collapses hardlinked twins, exactly like the
+    // message-search identity dedup); elsewhere `(dev, ino)` is a
+    // constant (0, 0), so the historical realpath dedup stays.
+    let mut seen_identities: HashSet<(u64, u64)> = HashSet::new();
+    let mut seen_canonical: HashSet<PathBuf> = HashSet::new();
+    files.retain(|(path, metadata)| {
+        let identity = crate::platform::metadata_dev_ino(metadata);
+        if identity == (0, 0) {
+            std::fs::canonicalize(path)
+                .map(|canonical| seen_canonical.insert(canonical))
+                .unwrap_or(true)
+        } else {
+            seen_identities.insert(identity)
+        }
     });
-    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
+    // Decorate-sort-strip: the old `sort_by_key(file_mtime_secs)`
+    // re-stat'd per comparison — O(n log n) metadata syscalls per rebuild.
+    let mut files: Vec<(u64, PathBuf)> = files
+        .into_iter()
+        .map(|(path, metadata)| (metadata_mtime_secs(&metadata), path))
+        .collect();
+    files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
     files.truncate(limit);
     files
 }
