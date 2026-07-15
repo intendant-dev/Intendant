@@ -115,8 +115,17 @@ fn truncate_cuts(vector: &Json, dir: &Path) -> Result<u32, String> {
     Ok(done)
 }
 
+/// The guarded store sibling of a lock file (`lock-X` → `data-X`).
+fn data_sibling(lock_path: &str) -> PathBuf {
+    let p = Path::new(lock_path);
+    let name = p.file_name().unwrap_or_default().to_string_lossy();
+    let data = name.replacen("lock-", "data-", 1);
+    p.with_file_name(data)
+}
+
 /// One lock agent (a second real process): lines `acquire <file>` /
-/// `release <file>` on stdin; replies `ok` / `denied`.
+/// `release <file>` on stdin; replies `ok` / `denied` /
+/// `readfail` (a denied loser that could NOT read the store).
 fn lock_agent() -> ! {
     use std::collections::BTreeMap;
     let stdin = std::io::stdin();
@@ -138,12 +147,21 @@ fn lock_agent() -> ! {
                         "ok"
                     }
                     Err(_) => {
-                        // Loser stays read-only: prove the read.
+                        // The loser stays read-only: prove the read
+                        // against the guarded DATA sibling — Windows
+                        // exclusive locks deny reads on the locked
+                        // file itself, and the semantic is about the
+                        // STORE staying readable, not the lock file.
                         let mut buf = Vec::new();
-                        std::fs::File::open(path)
+                        let ok = std::fs::File::open(data_sibling(path))
                             .and_then(|mut r| r.read_to_end(&mut buf))
-                            .expect("loser read");
-                        "denied"
+                            .is_ok()
+                            && buf == b"store data";
+                        if ok {
+                            "denied"
+                        } else {
+                            "readfail"
+                        }
                     }
                 }
             }
@@ -213,6 +231,8 @@ fn run_lock_script(vector: &Json, dir: &Path) -> Result<Vec<usize>, String> {
         let lock_path = dir.join(format!("lock-{target}"));
         if !lock_path.exists() {
             std::fs::write(&lock_path, b"lock target").map_err(|e| format!("lock file: {e}"))?;
+            std::fs::write(dir.join(format!("data-{target}")), b"store data")
+                .map_err(|e| format!("data file: {e}"))?;
         }
         let path_s = lock_path.to_string_lossy().to_string();
         let denied = if actor == actors[0] {
@@ -229,9 +249,9 @@ fn run_lock_script(vector: &Json, dir: &Path) -> Result<Vec<usize>, String> {
                             false
                         }
                         Err(_) => {
-                            let back =
-                                std::fs::read(&lock_path).map_err(|e| format!("read: {e}"))?;
-                            if back != b"lock target" {
+                            let back = std::fs::read(data_sibling(&path_s))
+                                .map_err(|e| format!("loser store read: {e}"))?;
+                            if back != b"store data" {
                                 return Err("loser read-only readback differs".into());
                             }
                             true
@@ -247,7 +267,11 @@ fn run_lock_script(vector: &Json, dir: &Path) -> Result<Vec<usize>, String> {
         } else {
             let agent = agents.get_mut(actor).ok_or("unknown actor")?;
             match action {
-                "acquire" => agent.ask(&format!("acquire {path_s}"))? == "denied",
+                "acquire" => match agent.ask(&format!("acquire {path_s}"))?.as_str() {
+                    "ok" => false,
+                    "denied" => true,
+                    other => return Err(format!("agent acquire: {other}")),
+                },
                 "release" => {
                     agent.ask(&format!("release {path_s}"))?;
                     false
