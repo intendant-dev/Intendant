@@ -72,19 +72,22 @@ jobs:
           git diff --exit-code -- rfcs/owner-plane/vectors rfcs/owner-plane/coverage
 
   # The D-203-funded browser execution lane (execution-lanes-plan.md,
-  # lane 1): driver.cjs builds the wasm package (the schema-less
-  # reducer + the WebCrypto backend), serves the corpus to a fixture
-  # page, and runs EVERY browser-annotated vector in headless
-  # Chromium over raw CDP — semantics through crypto.subtle, gated on
-  # the harness's all_green shape (any FAIL/Unimplemented row exits
-  # nonzero; a tampered-corpus negative control was exercised at
-  # birth). The job name carries the standing caveat: family 13's
-  # §13.2 browser cell is the IndexedDB Txn subset, and until that
-  # shim (work item 3) lands, f13 rows execute the engine lanes
-  # in-memory inside Chromium — real wasm execution, not yet the
-  # IndexedDB substrate.
+  # lane 1, all three work items): driver.cjs builds the wasm package
+  # (the schema-less reducer + the WebCrypto backend), serves the
+  # corpus to a fixture page, and runs EVERY browser-annotated vector
+  # in headless Chromium over raw CDP — semantics through
+  # crypto.subtle, and the family-13 §13.2 substrate (the IndexedDB
+  # Txn subset + Web Locks: per-transaction record round-trips,
+  # frame-mapped stream storage, fixture-layer crash cuts, the lock
+  # matrix with worker actors) executed per vector. Gated on the
+  # harness's all_green shape plus green substrate rows (any
+  # FAIL/Unimplemented row exits nonzero; tampered-corpus negative
+  # controls — a flipped verify expectation and a flipped lock-denial
+  # step — were exercised at birth). Gate-B concerns (IndexedDB
+  # failure injection/eviction, Firefox/Safari, quota pressure) stay
+  # out by design.
   browser-execution:
-    name: browser execution (Chromium; f13 in-memory, IndexedDB shim pending)
+    name: browser execution (Chromium)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

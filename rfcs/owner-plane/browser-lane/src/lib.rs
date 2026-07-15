@@ -11,12 +11,20 @@
 //! structural layers — the same `all_green` shape the CLI harness
 //! gates on.
 //!
-//! Honesty note on family 13: its §13.2 browser cell is the
-//! IndexedDB Txn subset. Until that shim (work item 3) lands, the
-//! f13 vectors here execute the reducer's engine lanes IN-MEMORY
-//! inside Chromium — real wasm execution of the same lane code, but
-//! NOT yet the IndexedDB substrate; the driver prints that caveat on
-//! every run and the CI job name carries it.
+//! Family 13's §13.2 browser cell (the IndexedDB Txn subset +
+//! Web Locks) is the fixture's substrate layer: every f13 vector's
+//! byte inputs round-trip through real IndexedDB records (one record
+//! per put, each in its OWN transaction — the journal's atomic
+//! append unit mapped onto IDB's atomic unit), streams are stored
+//! frame-per-record at the REAL frame boundaries [`frame_spans`]
+//! reports, crash cuts are simulated at the fixture layer as
+//! row-level truncation (full frames below the cut + the torn tail
+//! slice) with ordered read-back equality against the in-memory
+//! prefix, and the lock matrix runs over `navigator.locks` with Web
+//! Workers as the other actors — the storage lane's shape
+//! (`reducer --bin storage_lane`), transposed to the browser
+//! substrate. Semantics then run unmodified, exactly like the CLI
+//! harness.
 
 mod webcrypto;
 
@@ -51,4 +59,35 @@ pub async fn run_vector(vector_json: String) -> Result<String, JsValue> {
         "semantics": sem,
     });
     Ok(row.to_string())
+}
+
+/// The zone-log frame map of a hex stream, for the fixture's
+/// IndexedDB substrate layer: `{header, frames: [[start, end]…],
+/// durable}` per the reducer's strict walker, or `null` when the
+/// stream has no valid frame structure (the fixture then falls back
+/// to whole-value storage — a corrupt stream has no boundaries to
+/// map).
+#[wasm_bindgen]
+pub fn frame_spans(stream_hex: String) -> Option<String> {
+    let s = stream_hex;
+    if !s.len().is_multiple_of(2)
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex checked"))
+        .collect();
+    let (frames, durable) = owner_plane_reducer::edge::walk(&bytes)?;
+    Some(
+        serde_json::json!({
+            "header": owner_plane_reducer::edge::HEADER_LEN,
+            "frames": frames,
+            "durable": durable,
+        })
+        .to_string(),
+    )
 }

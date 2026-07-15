@@ -156,7 +156,7 @@ fn crc32c(data: &[u8]) -> u32 {
 }
 
 const SYNC: &[u8; 4] = b"IPLR";
-pub(crate) const HEADER_LEN: usize = 6 + 1 + 1 + 32 + 16;
+pub const HEADER_LEN: usize = 6 + 1 + 1 + 32 + 16;
 
 /// One walk step: a complete valid frame, a torn tail (EOF inside a
 /// frame — everything present is prefix-consistent), or corruption.
@@ -203,8 +203,10 @@ fn step(stream: &[u8], at: usize) -> Step {
 }
 
 /// Validate the header, walk every frame. Returns the frame slices
-/// and the durable prefix length, or `None` = corruption.
-pub(crate) fn walk(stream: &[u8]) -> Option<(Vec<(usize, usize)>, usize)> {
+/// and the durable prefix length, or `None` = corruption. Public:
+/// the browser lane maps IndexedDB transaction boundaries onto the
+/// REAL frame boundaries this walker reports.
+pub fn walk(stream: &[u8]) -> Option<(Vec<(usize, usize)>, usize)> {
     if stream.len() < HEADER_LEN || &stream[..6] != b"IPLOG2" || stream[6] != 2 || stream[7] > 1 {
         return None;
     }

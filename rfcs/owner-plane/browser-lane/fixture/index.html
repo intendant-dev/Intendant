@@ -6,9 +6,26 @@
   Chromium to: loads the wasm lane, fetches the browser-annotated
   corpus manifest from the driver's local server, runs every vector
   through run_vector (WebCrypto-backed semantics + the dep-free
-  structural layers), and publishes window.__laneReport for the
-  driver to poll. Per-vector console lines are observability only —
-  the report object is the contract.
+  structural layers), and — for family 13, whose §13.2 browser cell
+  is the IndexedDB Txn subset + Web Locks — executes the SUBSTRATE
+  layer mirroring reducer --bin storage_lane:
+
+    1. every hex byte input round-trips through a real IndexedDB
+       record, ONE put per transaction (the journal's atomic append
+       unit mapped onto IDB's atomic unit), read back byte-exact;
+    2. streams are stored frame-per-record at the REAL frame
+       boundaries the wasm walker reports, with ordered read-back
+       equality against the whole stream;
+    3. crash cuts are simulated at the fixture layer as row-level
+       truncation (full frames below the cut + the torn tail slice),
+       ordered read-back equal to the in-memory prefix;
+    4. the lock matrix runs over navigator.locks with Web Workers as
+       the other actors — exclusive acquires, immediate denial via
+       ifAvailable, and the denied loser proves the STORE stays
+       readable by reading the data record from IndexedDB.
+
+  Semantics then run unmodified. window.__laneReport is the contract
+  the driver polls; console lines are observability only.
 -->
 <pre id="log">owner-plane browser lane</pre>
 <script type="module">
@@ -25,9 +42,278 @@
     error: null,
   };
   window.__laneReport = report;
+
+  // ------------------------------------------------------- helpers
+
+  const unhex = (s) => {
+    const out = new Uint8Array(s.length / 2);
+    for (let i = 0; i < out.length; i += 1) out[i] = parseInt(s.substr(i * 2, 2), 16);
+    return out;
+  };
+  const bytesEq = (a, b) => {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+    return true;
+  };
+  const concatAll = (parts) => {
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const p of parts) { out.set(p, at); at += p.length; }
+    return out;
+  };
+  const isHex = (s) => typeof s === 'string' && s.length > 0 && s.length % 2 === 0
+    && /^[0-9a-f]+$/.test(s);
+  const collectHex = (node, out) => {
+    if (typeof node === 'string') { if (isHex(node)) out.push(node); }
+    else if (Array.isArray(node)) for (const v of node) collectHex(v, out);
+    else if (node && typeof node === 'object') for (const v of Object.values(node)) collectHex(v, out);
+  };
+
+  // ------------------------------------------------ IndexedDB layer
+
+  const idbDelete = (name) => new Promise((res, rej) => {
+    const rq = indexedDB.deleteDatabase(name);
+    rq.onsuccess = () => res();
+    rq.onerror = () => rej(rq.error);
+  });
+  const idbOpen = (name) => new Promise((res, rej) => {
+    const rq = indexedDB.open(name, 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('rows');
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+  // ONE put per transaction, awaited to COMMIT — the substantive
+  // Txn-boundary mapping (a frame/record is atomic iff its
+  // transaction is).
+  const put = (db, key, value) => new Promise((res, rej) => {
+    const tx = db.transaction('rows', 'readwrite');
+    tx.objectStore('rows').put(value, key);
+    tx.oncomplete = () => res();
+    tx.onabort = () => rej(tx.error || new Error('txn aborted'));
+    tx.onerror = () => rej(tx.error || new Error('txn error'));
+  });
+  const get = (db, key) => new Promise((res, rej) => {
+    const rq = db.transaction('rows', 'readonly').objectStore('rows').get(key);
+    rq.onsuccess = () => res(rq.result);
+    rq.onerror = () => rej(rq.error);
+  });
+  // Ordered read-back of a key prefix (IDB cursors ascend by key;
+  // fixed-width numeric suffixes keep lexicographic == append order).
+  const getPrefix = (db, prefix) => new Promise((res, rej) => {
+    const out = [];
+    const range = IDBKeyRange.bound(prefix, prefix + '\uffff');
+    const rq = db.transaction('rows', 'readonly').objectStore('rows').openCursor(range);
+    rq.onsuccess = () => {
+      const c = rq.result;
+      if (c) { out.push(c.value); c.continue(); } else res(out);
+    };
+    rq.onerror = () => rej(rq.error);
+  });
+  const k = (prefix, i) => `${prefix}-${String(i).padStart(4, '0')}`;
+
+  // ------------------------------------------- Web Locks lock rig
+
+  // A worker actor speaking the storage lane's agent protocol
+  // (acquire/release → ok/denied/readfail); the denied loser proves
+  // the STORE read against the IndexedDB data record, mirroring the
+  // data-sibling read of the native lane.
+  const WORKER_SRC = `
+    const held = new Map();
+    const readStore = (dbName, key) => new Promise((res, rej) => {
+      const orq = indexedDB.open(dbName, 1);
+      orq.onsuccess = () => {
+        const db = orq.result;
+        const rq = db.transaction('rows', 'readonly').objectStore('rows').get(key);
+        rq.onsuccess = () => { db.close(); res(rq.result); };
+        rq.onerror = () => { db.close(); rej(rq.error); };
+      };
+      orq.onerror = () => rej(orq.error);
+    });
+    onmessage = async (e) => {
+      const { cmd, name, dbName, dataKey } = e.data;
+      if (cmd === 'acquire') {
+        let request;
+        const verdict = await new Promise((resolve) => {
+          request = navigator.locks.request(name, { mode: 'exclusive', ifAvailable: true }, (lock) => {
+            if (!lock) { resolve('denied'); return undefined; }
+            resolve('ok');
+            return new Promise((rel) => { held.set(name, { rel, request }); });
+          }).catch(() => resolve('error'));
+        });
+        if (verdict === 'denied') {
+          const back = await readStore(dbName, dataKey).catch(() => null);
+          const ok = back && new TextDecoder().decode(back) === 'store data';
+          postMessage({ reply: ok ? 'denied' : 'readfail' });
+        } else {
+          postMessage({ reply: verdict });
+        }
+      } else if (cmd === 'release') {
+        const h = held.get(name);
+        held.delete(name);
+        if (h) { h.rel(); await h.request; }
+        postMessage({ reply: 'ok' });
+      }
+    };
+  `;
+
+  const spawnAgent = () => {
+    const url = URL.createObjectURL(new Blob([WORKER_SRC], { type: 'text/javascript' }));
+    const worker = new Worker(url);
+    const ask = (msg) => new Promise((res, rej) => {
+      worker.onmessage = (e) => res(e.data.reply);
+      worker.onerror = (e) => rej(new Error(e.message || 'worker error'));
+      worker.postMessage(msg);
+    });
+    return { ask, terminate: () => { worker.terminate(); URL.revokeObjectURL(url); } };
+  };
+
+  // The page-side first actor (same protocol, in-context).
+  const pageActor = (db) => {
+    const held = new Map();
+    return {
+      async acquire(name, dataKey) {
+        let request;
+        const verdict = await new Promise((resolve) => {
+          request = navigator.locks.request(name, { mode: 'exclusive', ifAvailable: true }, (lock) => {
+            if (!lock) { resolve('denied'); return undefined; }
+            resolve('ok');
+            return new Promise((rel) => { held.set(name, { rel, request }); });
+          }).catch(() => resolve('error'));
+        });
+        if (verdict === 'denied') {
+          const back = await get(db, dataKey).catch(() => null);
+          const ok = back && new TextDecoder().decode(back) === 'store data';
+          return ok ? 'denied' : 'readfail';
+        }
+        return verdict;
+      },
+      async release(name) {
+        const h = held.get(name);
+        held.delete(name);
+        // Await the original request promise: it settles only once
+        // the lock manager has PROCESSED the release, so the next
+        // script step cannot race a stale hold.
+        if (h) { h.rel(); await h.request; }
+        return 'ok';
+      },
+    };
+  };
+
+  const runLockScript = async (vector, db, dbName) => {
+    const script = vector.inputs.script;
+    const actors = [];
+    for (const s of script) if (!actors.includes(s.actor)) actors.push(s.actor);
+    const seeded = new Set();
+    const agents = new Map();
+    for (const a of actors.slice(1)) agents.set(a, spawnAgent());
+    const page = pageActor(db);
+    const denials = [];
+    try {
+      for (let i = 0; i < script.length; i += 1) {
+        const { actor, action } = script[i];
+        const target = script[i].target || 'plane-store';
+        const dataKey = `data-${target}`;
+        if (!seeded.has(target)) {
+          await put(db, dataKey, new TextEncoder().encode('store data'));
+          seeded.add(target);
+        }
+        const lockName = `${dbName}:lock-${target}`;
+        let reply;
+        if (actor === actors[0]) {
+          reply = action === 'acquire' ? await page.acquire(lockName, dataKey) : await page.release(lockName);
+        } else {
+          reply = await agents.get(actor).ask({ cmd: action, name: lockName, dbName, dataKey });
+        }
+        if (action === 'acquire') {
+          if (reply === 'denied') denials.push(i);
+          else if (reply !== 'ok') throw new Error(`step ${i}: agent replied ${reply}`);
+        }
+      }
+    } finally {
+      for (const [, a] of agents) a.terminate();
+    }
+    return denials;
+  };
+
+  // ------------------------------------- the family-13 substrate
+
+  const substrate = async (vector, frameSpans) => {
+    const dbName = `lane-${vector.name}`;
+    await idbDelete(dbName);
+    const db = await idbOpen(dbName);
+    try {
+      // 1. Round-trip every hex input, one record per transaction.
+      const hexes = [];
+      collectHex(vector.inputs, hexes);
+      let nbytes = 0;
+      for (let i = 0; i < hexes.length; i += 1) {
+        const bytes = unhex(hexes[i]);
+        await put(db, k('rt', i), bytes);
+        const back = await get(db, k('rt', i));
+        if (!bytesEq(back, bytes)) throw new Error(`roundtrip rt-${i}: read-back differs`);
+        nbytes += bytes.length;
+      }
+
+      // 2 + 3. Frame-mapped stream storage and fixture-layer cuts.
+      let frames = 0;
+      let cutsDone = 0;
+      if (isHex(vector.inputs.stream)) {
+        const stream = unhex(vector.inputs.stream);
+        const spansJson = frameSpans(vector.inputs.stream);
+        const spans = spansJson ? JSON.parse(spansJson) : null;
+        const rowsFor = (limit) => {
+          // Rows covering stream[..limit] at real frame boundaries:
+          // header, whole frames below the cut, then the torn slice.
+          if (!spans || limit < spans.header) return limit >= stream.length ? [stream] : [stream.slice(0, limit)];
+          const rows = [stream.slice(0, spans.header)];
+          let covered = spans.header;
+          for (const [a, b] of spans.frames) {
+            if (b <= limit) { rows.push(stream.slice(a, b)); covered = b; }
+          }
+          if (covered < limit) rows.push(stream.slice(covered, limit));
+          return rows;
+        };
+        const whole = rowsFor(stream.length);
+        for (let i = 0; i < whole.length; i += 1) await put(db, k('stream', i), whole[i]);
+        const back = concatAll(await getPrefix(db, 'stream-'));
+        if (!bytesEq(back, stream)) throw new Error('stream: ordered read-back differs');
+        frames = spans ? spans.frames.length : 0;
+
+        const cuts = Array.isArray(vector.inputs.cuts) ? vector.inputs.cuts : [];
+        for (let ci = 0; ci < cuts.length; ci += 1) {
+          const rows = rowsFor(cuts[ci]);
+          for (let i = 0; i < rows.length; i += 1) await put(db, k(`cut${ci}`, i), rows[i]);
+          const cutBack = concatAll(await getPrefix(db, `cut${ci}-`));
+          if (!bytesEq(cutBack, stream.slice(0, cuts[ci]))) {
+            throw new Error(`cut ${ci}: truncated read-back differs from the in-memory prefix`);
+          }
+          cutsDone += 1;
+        }
+      }
+
+      // 4. The lock matrix over navigator.locks + worker actors.
+      let lockNote = '';
+      if (vector.case_kind === 'lock-matrix') {
+        const denials = await runLockScript(vector, db, dbName);
+        const want = ((vector.expected || {}).result || {}).outcomes || [];
+        const wantSteps = want.map((r) => r.step);
+        if (JSON.stringify(denials) !== JSON.stringify(wantSteps)) {
+          throw new Error(`locks: denials ${JSON.stringify(denials)} != expected ${JSON.stringify(wantSteps)}`);
+        }
+        lockNote = ` locks=REAL(${denials.length} denial(s))`;
+      }
+      return `ok (records=${hexes.length} bytes=${nbytes} frames=${frames} cuts=${cutsDone}${lockNote})`;
+    } finally {
+      db.close();
+    }
+  };
+
+  // ------------------------------------------------------ the run
+
   (async () => {
     try {
-      const { default: init, run_vector } = await import('/pkg/owner_plane_browser_lane.js');
+      const { default: init, run_vector, frame_spans } = await import('/pkg/owner_plane_browser_lane.js');
       await init();
       const manifest = await (await fetch('/manifest.json')).json();
       report.total = manifest.length;
@@ -39,8 +325,15 @@
         } catch (e) {
           row = { pairs: 'ok', decode: 'ok', convergence: 'ok', semantics: `FAIL: run_vector threw: ${e}` };
         }
+        if (vector.family === 13) {
+          try {
+            row.substrate = await substrate(vector, frame_spans);
+          } catch (e) {
+            row.substrate = `FAIL: ${(e && e.message) || e}`;
+          }
+        }
         report.rows.push({ file, ...row });
-        log(`${file} semantics=${row.semantics}`);
+        log(`${file} semantics=${row.semantics}${row.substrate ? ` substrate=${row.substrate}` : ''}`);
       }
       report.done = true;
       log('done');

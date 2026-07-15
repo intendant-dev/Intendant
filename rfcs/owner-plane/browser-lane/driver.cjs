@@ -8,13 +8,11 @@
 // scripts/smoke-dashboard-boot.cjs — the CI-proven minimal recipe,
 // no npm deps), and gates on the harness's all_green shape: EVERY
 // browser-annotated vector must report clean structural layers AND
-// semantics=PASS, or the driver exits 1.
-//
-// Honesty caveat printed on every run: family 13's §13.2 browser
-// cell is the IndexedDB Txn subset; until that shim (work item 3)
-// lands, f13 vectors execute the reducer's engine lanes IN-MEMORY
-// inside Chromium — real wasm execution, not yet the IndexedDB
-// substrate.
+// semantics=PASS — and every family-13 vector a green SUBSTRATE row
+// (the §13.2 IndexedDB Txn subset + Web Locks, executed by the
+// fixture: per-transaction record round-trips, frame-mapped stream
+// storage, fixture-layer crash cuts, the lock matrix over
+// navigator.locks with worker actors) — or the driver exits 1.
 //
 // Usage:  node driver.cjs [--dev] [--skip-build] [--browser PATH]
 //                         [--timeout MS] [--artifact-dir DIR]
@@ -484,7 +482,8 @@ class Cdp extends EventEmitter {
 
 function rowGreen(row) {
   return row.pairs === 'ok' && row.decode === 'ok' && row.convergence === 'ok'
-    && row.semantics === 'PASS';
+    && row.semantics === 'PASS'
+    && (row.substrate === undefined || String(row.substrate).startsWith('ok'));
 }
 
 async function main() {
@@ -542,11 +541,28 @@ async function main() {
       );
     }
     const red = report.rows.filter((row) => !rowGreen(row));
+    const substrateRows = report.rows.filter((row) => row.substrate !== undefined);
     console.log(`[driver] ${report.rows.length - red.length}/${report.rows.length} green under ${report.ua}`);
-    console.log('[driver] caveat: f13 rows ran the engine lanes in-memory in Chromium; the IndexedDB Txn substrate is execution-lanes work item 3.');
+    const substrateSum = (field) => substrateRows.reduce((n, row) => {
+      const m = String(row.substrate).match(new RegExp(`${field}=(\\d+)`));
+      return n + (m ? Number(m[1]) : 0);
+    }, 0);
+    console.log(
+      `[driver] f13 substrate: ${substrateRows.length} vector(s) over IndexedDB transactions + Web Locks `
+      + `(records=${substrateSum('records')} bytes=${substrateSum('bytes')} frames=${substrateSum('frames')} cuts=${substrateSum('cuts')})`,
+    );
+    if (substrateRows.length === 0) {
+      throw new Error('no substrate rows — the family-13 IndexedDB layer did not run');
+    }
+    // The substrate must have actually mapped frames and performed
+    // cuts somewhere in the corpus — an all-zero aggregate means the
+    // frame walker or the cut path silently disengaged.
+    if (substrateSum('frames') === 0 || substrateSum('cuts') === 0) {
+      throw new Error('substrate aggregate has zero frames or cuts — the mapping disengaged');
+    }
     if (red.length) {
       for (const row of red) {
-        console.error(`[driver] RED ${row.file}: pairs=${row.pairs} decode=${row.decode} convergence=${row.convergence} semantics=${row.semantics}`);
+        console.error(`[driver] RED ${row.file}: pairs=${row.pairs} decode=${row.decode} convergence=${row.convergence} semantics=${row.semantics}${row.substrate ? ` substrate=${row.substrate}` : ''}`);
       }
     } else {
       exitCode = 0;

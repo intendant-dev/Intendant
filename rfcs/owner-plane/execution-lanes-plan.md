@@ -80,11 +80,32 @@ identical report rows the Rust harness prints.
    pending)` — the name keeps item 3's gap visible.
 3. IndexedDB Txn-subset shim for the family-13 journal lane
    (transaction boundaries mapped to the Txn frames; L1 truncation
-   simulated at the fixture layer) (~1–2 sessions). **The lane's sole
-   open item**: until it lands, the f13 rows in the browser job
-   execute the engine lanes in-memory inside Chromium (real wasm
-   execution of the same lane code, NOT yet the IndexedDB substrate),
-   and the driver prints that caveat on every run.
+   simulated at the fixture layer) (~1–2 sessions).
+   **DONE (2026-07-15):** the fixture's substrate layer mirrors the
+   storage lane's shape on the browser substrate — every f13 hex
+   input round-trips through a real IndexedDB record with ONE put
+   per transaction (the journal's atomic unit mapped onto IDB's);
+   streams are stored frame-per-record at the REAL frame boundaries
+   the reducer's walker reports (exported to the fixture as
+   `frame_spans`), with ordered read-back equality; crash cuts are
+   simulated at the fixture layer as row-level truncation (whole
+   frames below the cut + the torn tail slice) and the ordered
+   read-back must equal the in-memory prefix; the lock matrix runs
+   over `navigator.locks` (exclusive + `ifAvailable` denial) with
+   Web Workers as the other actors, the denied loser proving the
+   STORE stays readable via an IndexedDB read, and the releaser
+   awaiting its request promise so a release can never race the next
+   acquire. The driver gates substrate rows alongside semantics and
+   fails on a zero frames/cuts aggregate (a disengaged mapping
+   cannot green-wash); a flipped lock-denial-step negative control
+   goes red in BOTH layers independently (the reducer's in-memory
+   lane and the real Web Locks denial). Clean run: 56/56 with 16
+   substrate vectors (records=37, bytes=30 781, frames=72, cuts=11).
+
+**STATUS: DELIVERED (2026-07-15) — all three work items.** The
+advisory job is now plainly `browser execution (Chromium)`; the
+Gate-B concerns (IndexedDB failure injection/eviction, engine
+matrices, quota) remain out by design, per the section below.
 
 **Estimate.** 2–4 working sessions. **Exit criterion.** The CDP
 driver exits nonzero unless every browser-annotated vector reports
