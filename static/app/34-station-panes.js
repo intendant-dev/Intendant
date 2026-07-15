@@ -1020,8 +1020,14 @@ function stationHandleSessionAction(action) {
   if (op === 'interrupt') {
     // Target the session's own turn; the daemon supervisor routes by id
     // (a bare interrupt would broadcast to the foreground turn instead).
+    // The stop also disarms any pending auto-attach escalation for the
+    // session (see haltPendingFollowUpEscalations) — under both the window
+    // id and the live action id frontends may have queued against.
+    const actionId = live?.actionId || sessionId;
+    haltPendingFollowUpEscalations(sessionId);
+    if (actionId !== sessionId) haltPendingFollowUpEscalations(actionId);
     const msg = { action: 'interrupt' };
-    if (sessionId) msg.session_id = live?.actionId || sessionId;
+    if (sessionId) msg.session_id = actionId;
     dispatchSessionControlMsg(msg);
     showControlToast?.('info', `Interrupt sent to ${shortSessionId(sessionId)}`);
     return;

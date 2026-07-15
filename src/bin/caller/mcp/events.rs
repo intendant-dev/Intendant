@@ -1880,6 +1880,7 @@ mod tests {
                     resume_id,
                     relationship_kind: _,
                     fork: _,
+                    auto_attach: _,
                     project_root: resumed_project_root,
                     task,
                     direct,

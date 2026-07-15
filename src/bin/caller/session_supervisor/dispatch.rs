@@ -306,6 +306,7 @@ impl SessionSupervisor {
                 attachments,
                 fork,
                 relationship_kind,
+                auto_attach,
                 agent_command,
                 codex_sandbox,
                 codex_approval_policy,
@@ -331,6 +332,7 @@ impl SessionSupervisor {
                         ..Default::default()
                     },
                     false,
+                    auto_attach,
                 )
                 .await;
             }
