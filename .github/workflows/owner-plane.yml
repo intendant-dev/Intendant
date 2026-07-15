@@ -46,14 +46,19 @@ jobs:
           cargo fmt --check --manifest-path rfcs/owner-plane/reducer/Cargo.toml
       - name: core suite (drift gates, §13.2 surfaces, coverage inventory)
         run: cargo test --manifest-path rfcs/owner-plane/core/Cargo.toml
+      # Release profile: the metamorphic convergence sweep (review R1)
+      # runs inside the corpus tests and the strict gate — in debug on
+      # the 2-core hosted runner the suite alone took 19 minutes and
+      # the job hit its timeout (observed 2026-07-15); release absorbs
+      # the sweep and the gate step reuses the same build.
       - name: reducer suite (differential lanes, envelope sweep, journal machine)
-        run: cargo test --manifest-path rfcs/owner-plane/reducer/Cargo.toml
+        run: cargo test --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml
       - name: clippy
         run: |
           cargo clippy --manifest-path rfcs/owner-plane/core/Cargo.toml -- -D warnings
           cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml -- -D warnings
       - name: strict harness gate (every vector; nonzero exit on any red)
-        run: cargo run --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin harness
+        run: cargo run --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin harness
       # The browser lane's build shapes (execution-lanes-plan lane 1):
       # the schema-less reducer config the wasm wrapper consumes, and
       # the wrapper's wasm32 compile. COMPILE CHECKS ONLY — browser
@@ -126,4 +131,4 @@ jobs:
         with:
           persist-credentials: false
       - name: storage lane (real files, truncations, cross-process locks)
-        run: cargo run --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin storage_lane
+        run: cargo run --release --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin storage_lane
