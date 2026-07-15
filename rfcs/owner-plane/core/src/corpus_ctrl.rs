@@ -46,6 +46,16 @@ fn probe(name: &str, value: &Value) -> Json {
 }
 
 /// A family-7 fold-or-walkthrough vector over two delivery orders.
+/// Append one of the 2026-07-15 verification review's R1 regression
+/// orders to a built vector's deliveries.
+fn push_review_order(v: &mut Vector, order: &[&str]) {
+    v.inputs
+        .get_mut("deliveries")
+        .and_then(|d| d.as_array_mut())
+        .expect("deliveries array")
+        .push(serde_json::json!(order));
+}
+
 fn ctrl_vector(
     name: &str,
     case_kind: &str,
@@ -344,7 +354,7 @@ fn post_freeze_fixture(
 pub fn f7_post_freeze_valid_op_frozen() -> Vector {
     let (rig, ops) = post_freeze_fixture("f7-post-freeze-valid", false);
     let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
-    ctrl_vector(
+    let mut v = ctrl_vector(
         "c2-post-freeze-valid-op-frozen",
         "fold",
         "7.4",
@@ -357,7 +367,9 @@ pub fn f7_post_freeze_valid_op_frozen() -> Vector {
             { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
         ]),
         None,
-    )
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
 }
 
 /// D4 (b): a SIGNATURE-INVALID post-freeze operation keeps its
@@ -366,7 +378,7 @@ pub fn f7_post_freeze_valid_op_frozen() -> Vector {
 pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
     let (rig, ops) = post_freeze_fixture("f7-post-freeze-sig", true);
     let refs: Vec<(&str, &Signedop)> = ops.iter().map(|(n, o)| (*n, o)).collect();
-    ctrl_vector(
+    let mut v = ctrl_vector(
         "c2-post-freeze-sig-invalid-kept",
         "fold",
         "7.4",
@@ -379,7 +391,9 @@ pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
             { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
         ]),
         None,
-    )
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
 }
 
 /// The §5.4 manifest-admission face (D-203 ratified the P1 profile;
@@ -680,10 +694,16 @@ pub fn f7_revoke_cutoff_carried_head() -> Vector {
     )
 }
 
-/// D-93's mismatched-hash reject: the carried head names the held
-/// coordinate (gen 1, seq 1) with the WRONG op hash —
-/// `(body-invariant, reject-permanent)` once the coordinate is held,
-/// in both orders.
+/// D-130 committed-boundary selection: the carried head names the
+/// held coordinate (gen 1, seq 1) with a DIFFERENT op hash — fork
+/// evidence the committing revoke RESOLVES as the coordinate's first
+/// committed selector: the revoke admits selecting its named
+/// (unheld) variant, and the held variant `i` quarantines as the
+/// losing branch. The original expectation rejected the revoke
+/// `body-invariant` — the v0.5.9 differing-hash rejection D-93's own
+/// rider records as superseded by D-130 (an arrival-relative rule;
+/// found while implementing the review's R1 repair; the reviews did
+/// not flag this fixture).
 pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
     let name = "f7-revoke-head-mismatch";
     let mut rig = PlaneRig::new(name);
@@ -715,7 +735,7 @@ pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
     );
     let c1 = rig.genesis_op.clone();
     ctrl_vector(
-        "revoke-cutoff-head-hash-mismatch-rejects",
+        "revoke-cutoff-head-mismatch-selects",
         "fold",
         "7.1",
         rig,
@@ -723,9 +743,9 @@ pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
         json!([
             { "item": "c1" },
             { "item": "c2" },
-            { "item": "i" },
+            { "item": "i", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
             { "item": "k1" },
-            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+            { "item": "r" },
         ]),
         None,
     )

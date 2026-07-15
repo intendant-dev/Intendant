@@ -11,7 +11,9 @@
           "item": "c2"
         },
         {
-          "item": "i1"
+          "disposition": "freeze-writer",
+          "item": "i1",
+          "outcome": "fork"
         },
         {
           "disposition": "freeze-writer",
@@ -35,6 +37,12 @@
         "c1",
         "i1",
         "i2"
+      ],
+      [
+        "c1",
+        "c2",
+        "i2",
+        "i1"
       ]
     ],
     "items": {

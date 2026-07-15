@@ -445,7 +445,25 @@ pub struct State {
     zone_windows: BTreeMap<([u8; 16], u64), u64>,
     /// Accepted `m.audit` rows (§11.1/D-74): the partition registry.
     audit_rows: Vec<AuditRow>,
+    /// D-130 same-coordinate fork evidence: equal `(zone, lineage,
+    /// gen, seq)` with differing op hashes are NEVER ordered — every
+    /// byte-variant seen at the coordinate (held or boundary-named)
+    /// registers here, and the coordinate's suffix is inert until a
+    /// committed boundary selects a variant.
+    tenant_forks: BTreeMap<TenantCoord, Vec<[u8; 32]>>,
+    /// D-130 committed selections: the FIRST committed boundary in
+    /// control order naming one of a coordinate's variants selects
+    /// it; a later boundary naming a different variant there is
+    /// `body-invariant`.
+    fork_selected: BTreeMap<TenantCoord, [u8; 32]>,
 }
+
+/// A tenant chain coordinate: (zone, lineage, gen, seq).
+type TenantCoord = ([u8; 16], [u8; 16], u64, u64);
+
+/// A validated frontierclose Head set: the `(gen, seq)` caps plus
+/// any D-130 selections the boundary commits AT ITS TRANSITION.
+type HeadsView = (Vec<(u64, u64)>, Vec<(TenantCoord, [u8; 32])>);
 
 /// One accepted audit row's partition facts (D-74/D-83).
 #[derive(Debug, Clone)]
@@ -569,6 +587,25 @@ fn keys_are_map(n: &Node, want: &[&str]) -> bool {
 }
 
 impl State {
+    /// O5 replay consult (§11.1) — read-only; consumption happens at
+    /// the ACCEPTING transition only (D-112). Byte-identical
+    /// redelivery is the delivery-edge duplicate; differing bytes
+    /// under a consumed request_id is `request-fork`.
+    fn request_check(&self, op: &SignedOp) -> Option<Verdict> {
+        let key = (
+            op.header.zone_id,
+            op.header.writer_lineage,
+            op.header.request_id,
+        );
+        match self.request_seen.get(&key) {
+            Some(&seen) if seen == op.op_hash() => {
+                Some(Verdict::Rejected("duplicate", "duplicate-idempotent"))
+            }
+            Some(_) => Some(Verdict::Rejected("request-fork", "reject-permanent")),
+            None => None,
+        }
+    }
+
     /// O7 pins common to every control operation.
     fn ctrl_header_pins(op: &SignedOp) -> Result<(), Verdict> {
         let h = &op.header;
@@ -1282,6 +1319,7 @@ impl State {
             .any(|v| OP_AUTHORING.contains(&v.as_str()));
         let cutoff = body.get("cutoff");
         let mut caps: Vec<(u64, u64)> = Vec::new();
+        let mut selections = Vec::new();
         if op_authoring {
             let Some(cn) = cutoff else {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
@@ -1296,7 +1334,10 @@ impl State {
                 self.grants[idx].zone.unwrap_or_default(),
                 self.grants[idx].lineage.unwrap_or_default(),
             )? {
-                Ok(h) => caps = h,
+                Ok((h, sels)) => {
+                    caps = h;
+                    selections = sels;
+                }
                 Err(v) => return ok(Err(v)),
             }
         } else if cutoff.is_some() {
@@ -1305,7 +1346,9 @@ impl State {
             ));
         }
 
-        // Accept: deactivate the grant, install the revoke boundary
+        // Accept: the boundary commits — D-130 selections first.
+        self.apply_selections(&selections);
+        // Deactivate the grant, install the revoke boundary
         // (selector = the revoked grant — its operations at or below
         // the carried heads stand, beyond them quarantine), and mark
         // the freeze frontier (an at-or-below preserved claimant is
@@ -1341,11 +1384,12 @@ impl State {
         cn: &Node,
         zone: [u8; 16],
         lineage: [u8; 16],
-    ) -> Result<Result<Vec<(u64, u64)>, Verdict>, Unimplemented> {
+    ) -> Result<Result<HeadsView, Verdict>, Unimplemented> {
         let Some(heads) = cn.get("heads").and_then(|h| h.as_array()) else {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         };
         let mut caps = Vec::new();
+        let mut selections: Vec<(TenantCoord, [u8; 32])> = Vec::new();
         for hn in heads {
             let (Some(hl), Some(gen), Some(seq), Some(hop)) = (
                 b16_field(hn, "lineage"),
@@ -1358,6 +1402,7 @@ impl State {
             if hl != lineage {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             }
+            let coord = (zone, lineage, gen, seq);
             match self
                 .held_tenant
                 .iter()
@@ -1369,18 +1414,100 @@ impl State {
                         "pending-dependency",
                     )))
                 }
-                Some(r) if r.op_hash != hop => {
-                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
+                Some(r) => {
+                    // D-130: bytes at the coordinate differing from
+                    // the named hash are fork evidence resolved by
+                    // SELECTION — the committing boundary selects its
+                    // named variant when it is the coordinate's first
+                    // committed selector; `body-invariant` only
+                    // against a PRIOR committed selection of a
+                    // different variant (the v0.5.9 differing-hash
+                    // rejection is superseded — D-93's own rider).
+                    match self.fork_selected.get(&coord) {
+                        Some(&sel) if sel != hop => {
+                            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
+                        }
+                        Some(_) => {}
+                        None => {
+                            if r.op_hash != hop || self.tenant_forks.contains_key(&coord) {
+                                selections.push((coord, hop));
+                            }
+                        }
+                    }
+                    caps.push((gen, seq));
                 }
-                Some(_) => caps.push((gen, seq)),
             }
         }
-        ok(Ok(caps))
+        ok(Ok((caps, selections)))
     }
 
     /// Is `(gen, seq)` at or below one of the carried caps?
     fn at_or_below(caps: &[(u64, u64)], gen: u64, seq: u64) -> bool {
         caps.iter().any(|&(g, s)| g == gen && seq <= s)
+    }
+
+    /// Register D-130 fork evidence for an operation whose staged
+    /// admission returned the fork pair — the preamble's chain stage
+    /// fires only AFTER the validity stages (cert, sig, body, actor,
+    /// proof scopes) pass, so reaching it proves evidence-worthiness
+    /// (D-99: a failed earlier stage keeps its own outcome and exerts
+    /// no precedence). Runs on the REAL state: fork evidence
+    /// persists like a C2 freeze while the failed op's other effects
+    /// roll back with its clone.
+    fn register_tenant_fork(&mut self, op: &SignedOp) {
+        let h = &op.header;
+        let coord = (h.zone_id, h.writer_lineage, h.writer_gen, h.writer_sequence);
+        let incumbent = self
+            .held_tenant
+            .iter()
+            .find(|r| {
+                r.zone == h.zone_id
+                    && r.lineage == h.writer_lineage
+                    && r.gen == h.writer_gen
+                    && r.seq == h.writer_sequence
+            })
+            .map(|r| r.op_hash);
+        let entry = self.tenant_forks.entry(coord).or_default();
+        for v in [incumbent, Some(op.op_hash())].into_iter().flatten() {
+            if !entry.contains(&v) {
+                entry.push(v);
+            }
+        }
+    }
+
+    /// The derived D-130 lane for a HELD op: `Some(verdict)` when its
+    /// coordinate (or an ancestor coordinate on the same chain) holds
+    /// unresolved fork evidence, or when a committed selection chose
+    /// a different variant (the losing branch quarantines).
+    fn fork_verdict(&self, rec: &HeldTenantOp) -> Option<Verdict> {
+        for (&(z, l, g, s), _) in &self.tenant_forks {
+            if z != rec.zone || l != rec.lineage || g != rec.gen || s > rec.seq {
+                continue;
+            }
+            match self.fork_selected.get(&(z, l, g, s)) {
+                None => return Some(Verdict::Rejected("fork", "freeze-writer")),
+                Some(&sel) => {
+                    if s == rec.seq && sel != rec.op_hash {
+                        // The losing branch quarantines (D-130).
+                        return Some(Verdict::Rejected("cutoff", "quarantine-reproposal"));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply a committed boundary's D-130 selections (at the
+    /// boundary's TRANSITION only — a pending compound's reservation
+    /// never selects).
+    fn apply_selections(&mut self, sels: &[(TenantCoord, [u8; 32])]) {
+        for &(coord, hop) in sels {
+            let entry = self.tenant_forks.entry(coord).or_default();
+            if !entry.contains(&hop) {
+                entry.push(hop);
+            }
+            self.fork_selected.entry(coord).or_insert(hop);
+        }
     }
 
     /// Does the held op stand against every boundary — the revoke
@@ -1465,6 +1592,11 @@ impl State {
                 // lane; D-138 — everything a cut fact derived
                 // re-evaluates).
                 Verdict::Pending("ref-unresolved", "pending-dependency")
+            } else if let Some(fv) = self.fork_verdict(rec) {
+                // D-130: an unresolved same-coordinate fork freezes
+                // the coordinate and its suffix; a committed
+                // selection quarantines the losing branch.
+                fv
             } else if !self.op_standing(rec) {
                 Verdict::Rejected("cutoff", "quarantine-reproposal")
             } else if let Some(tv) = self.time_requalify(rec) {
@@ -1552,17 +1684,22 @@ impl State {
 
     /// Parse a compound's `cutoffs` into `(zone, lineage)` pairs
     /// with D-143 exactness: carried heads validate against the held
-    /// chain (unheld pends, mismatch rejects — D-93), and EMPTY
-    /// heads are legal only for a lineage with NO accepted ops (a
-    /// lineage with history must commit its boundary). The heads'
-    /// beyond-boundary retirement effect on tenant history rides the
-    /// Gate-B retirement sagas (D-203-recorded deferral) — this
-    /// slice validates the commitment.
+    /// chain (unheld pends; a differing hash at the coordinate is
+    /// D-130 fork evidence the COMMITTING boundary selects), and
+    /// EMPTY heads are legal only for a lineage with NO accepted ops
+    /// (a lineage with history must commit its boundary). Returned
+    /// selections apply at the compound's COMPLETION transition —
+    /// never at reservation (a pending compound has not committed).
+    /// The heads' beyond-boundary retirement effect on tenant
+    /// history rides the Gate-B retirement sagas (D-203-recorded
+    /// deferral) — this slice validates the commitment.
     fn compound_cutoffs(
         &self,
         body: &Node,
-    ) -> Result<Result<Vec<ZoneLineage>, Verdict>, Unimplemented> {
+    ) -> Result<Result<(Vec<ZoneLineage>, Vec<(TenantCoord, [u8; 32])>), Verdict>, Unimplemented>
+    {
         let mut out = Vec::new();
+        let mut selections = Vec::new();
         let Some(cs) = body.get("cutoffs").and_then(|c| c.as_array()) else {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         };
@@ -1571,7 +1708,10 @@ impl State {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             };
             let caps = match self.parse_heads(cn, z, l)? {
-                Ok(c) => c,
+                Ok((c, sels)) => {
+                    selections.extend(sels);
+                    c
+                }
                 Err(v) => return ok(Err(v)),
             };
             let has_history = self
@@ -1583,7 +1723,7 @@ impl State {
             }
             out.push((z, l));
         }
-        ok(Ok(out))
+        ok(Ok((out, selections)))
     }
 
     /// Re-read a reserved compound's `rotation_refs` (bytes were
@@ -1791,7 +1931,7 @@ impl State {
             // Reserved re-evaluation: the position is already held
             // and the bytes were validated at reservation — only the
             // completion question remains.
-            let cutoffs = match self.compound_cutoffs(&op.body)? {
+            let (cutoffs, selections) = match self.compound_cutoffs(&op.body)? {
                 Ok(c) => c,
                 Err(v) => return ok(Err(v)),
             };
@@ -1802,6 +1942,11 @@ impl State {
             };
             let refs = Self::compound_rotation_refs(&op.body);
             let out = self.try_complete_compound(oh, rid, &cutoffs, &rcuts, &refs);
+            if out.is_ok() {
+                // The compound COMPLETED — its boundary commits, and
+                // with it any D-130 selections (never at reservation).
+                self.apply_selections(&selections);
+            }
             if matches!(out, Err(Verdict::Rejected(..))) {
                 // A held-invalid reference kills the reserved
                 // compound; the reservation releases (the position
@@ -1872,7 +2017,7 @@ impl State {
             return Err(Unimplemented("compound target not enrolled".into()));
         }
         // Cutoffs name the target's lineage exactly, in a known zone.
-        let cutoffs = match self.compound_cutoffs(body)? {
+        let (cutoffs, selections) = match self.compound_cutoffs(body)? {
             Ok(c) => c,
             Err(v) => return ok(Err(v)),
         };
@@ -1891,6 +2036,11 @@ impl State {
         self.ctrl_head = oh;
         self.pending_compounds.insert(oh, rid);
         let out = self.try_complete_compound(oh, rid, &cutoffs, &receipt_cuts, &ref_hashes);
+        if out.is_ok() {
+            // Immediate completion commits the boundary's selections;
+            // a mere reservation selects nothing (D-130).
+            self.apply_selections(&selections);
+        }
         if matches!(out, Err(Verdict::Rejected(..))) {
             self.pending_compounds.remove(&oh);
         }
@@ -1918,6 +2068,7 @@ impl State {
         }
         // "an operation with neither entries nor closes nor requester
         // is body-invariant".
+        let mut selections = Vec::new();
         let closes = match body.get("closes").and_then(|c| c.as_array()) {
             Some(a) if !a.is_empty() => a,
             _ => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
@@ -1931,12 +2082,16 @@ impl State {
             // mismatch rejects); their consumption semantics ride
             // the Gate-B staging sagas.
             match self.parse_heads(cn, z, l)? {
-                Ok(_caps) => staged.push((z, l)),
+                Ok((_caps, sels)) => {
+                    selections.extend(sels);
+                    staged.push((z, l));
+                }
                 Err(v) => return ok(Err(v)),
             }
         }
 
         // Accept: the stages exist from acceptance on (D-160), inert.
+        self.apply_selections(&selections);
         self.staged_closes.extend(staged);
         self.ctrl_next_seq += 1;
         self.ctrl_head = op.op_hash();
@@ -1978,6 +2133,7 @@ impl State {
         // (D-151); only the empty-heads shape is minted so far.
         let live = self.live_lineages(zone);
         let mut entries: Vec<[u8; 16]> = Vec::new();
+        let mut selections = Vec::new();
         if let Some(cs) = body.get("cutoffs") {
             let Some(cs) = cs.as_array() else {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
@@ -1991,7 +2147,10 @@ impl State {
                     return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
                 }
                 match self.parse_heads(cn, cz, cl)? {
-                    Ok(_caps) => entries.push(cl),
+                    Ok((_caps, sels)) => {
+                        selections.extend(sels);
+                        entries.push(cl);
+                    }
                     Err(v) => return ok(Err(v)),
                 }
             }
@@ -2008,7 +2167,9 @@ impl State {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
 
-        // Accept: advance the capability epoch; the consuming advance
+        // Accept: the boundary commits — D-130 selections first.
+        self.apply_selections(&selections);
+        // Advance the capability epoch; the consuming advance
         // spends EVERY unconsumed stage for this zone (D-153 one-shot
         // — a prior advance's materialized entries never satisfy
         // later coverage). Budget-window state (D-79) has no consumer
@@ -2078,6 +2239,7 @@ impl State {
         // Closure entries + union coverage — the bump's rule (D-153).
         let live = self.live_lineages(zone);
         let mut entries: Vec<[u8; 16]> = Vec::new();
+        let mut selections = Vec::new();
         if let Some(cs) = body.get("cutoffs") {
             let Some(cs) = cs.as_array() else {
                 return ok(Err(bad()));
@@ -2091,7 +2253,10 @@ impl State {
                     return ok(Err(bad()));
                 }
                 match self.parse_heads(cn, cz, cl)? {
-                    Ok(_caps) => entries.push(cl),
+                    Ok((_caps, sels)) => {
+                        selections.extend(sels);
+                        entries.push(cl);
+                    }
                     Err(v) => return ok(Err(v)),
                 }
             }
@@ -2107,8 +2272,10 @@ impl State {
             return ok(Err(bad()));
         }
 
-        // Accept: advance the epoch, consume the zone's stages
-        // one-shot, and anchor the NEW policy at the new epoch.
+        // Accept: the boundary commits — D-130 selections first;
+        // advance the epoch, consume the zone's stages one-shot, and
+        // anchor the NEW policy at the new epoch.
+        self.apply_selections(&selections);
         self.cap_epochs.insert(zone, cur + 1);
         // D-79: a policy advance re-arms NO budget window.
         let w = self.zone_windows.get(&(zone, cur)).copied().unwrap_or(0);
@@ -2508,6 +2675,7 @@ impl State {
         }
         // Named tenant cutoffs: recover-purpose frontiercloses whose
         // carried heads resolve against the held chains.
+        let mut selections = Vec::new();
         let Some(cutoffs) = body.get("tenant_cutoffs").and_then(|c| c.as_array()) else {
             return ok(Err(bad()));
         };
@@ -2517,17 +2685,23 @@ impl State {
                 return ok(Err(bad()));
             };
             match self.parse_heads(cn, cz, cl)? {
-                Ok(caps) => named.push(TenantBoundary {
-                    zone: cz,
-                    lineage: cl,
-                    selector_grant: None,
-                    caps,
-                }),
+                Ok((caps, sels)) => {
+                    selections.extend(sels);
+                    named.push(TenantBoundary {
+                        zone: cz,
+                        lineage: cl,
+                        selector_grant: None,
+                        caps,
+                    });
+                }
                 Err(v) => return ok(Err(v)),
             }
         }
 
-        // Accept. A below-head base first cuts the branch above it:
+        // Accept: the recovery's named boundaries commit — D-130
+        // selections first.
+        self.apply_selections(&selections);
+        // A below-head base first cuts the branch above it:
         // the control re-fold rebuilds every control-derived fact
         // from the surviving prefix, and the cut ops classify
         // (cutoff, quarantine-reproposal) — the D-140 recover
@@ -2647,6 +2821,13 @@ impl State {
             return ok(Err(Verdict::Rejected("no-grant", "reject-permanent")));
         }
 
+        // O5 replay (§11.1), consulted AFTER the validity stages:
+        // request-ID consumption is scoped to accepted operations, so
+        // a signature- or scope-invalid reuse keeps its own outcome.
+        if let Some(v) = self.request_check(op) {
+            return ok(Err(v));
+        }
+
         // Chain: within (zone, lineage, gen), dense from 1.
         let key = (h.zone_id, h.writer_lineage, h.writer_gen);
         let (expect_seq, head) = self
@@ -2665,7 +2846,20 @@ impl State {
             )));
         }
         match h.writer_sequence.cmp(&expect_seq) {
-            std::cmp::Ordering::Less => return ok(Err(Verdict::Rejected("fork", "freeze-writer"))),
+            std::cmp::Ordering::Less => {
+                // An occupied coordinate with differing bytes is
+                // D-130 fork evidence — never ordered, both variants
+                // inert until a committed boundary selects one
+                // (classify registers the evidence on the real
+                // state). A byte-variant a boundary already SELECTED
+                // re-arriving here would be the revival lane — no
+                // vector pins it yet.
+                let coord = (h.zone_id, h.writer_lineage, h.writer_gen, h.writer_sequence);
+                if self.fork_selected.get(&coord) == Some(&op.op_hash()) {
+                    return Err(Unimplemented("D-130 selected-variant revival".into()));
+                }
+                return ok(Err(Verdict::Rejected("fork", "freeze-writer")));
+            }
             std::cmp::Ordering::Greater => {
                 return ok(Err(Verdict::Pending(
                     "causal-missing",
@@ -3023,14 +3217,15 @@ impl State {
         Ok(())
     }
 
-    /// Arm-general pin + signature validation WITHOUT the chain gate
-    /// or body stage — what the freeze/placement classifications may
-    /// presuppose. D-76/D-99 stage order: a FORGED operation keeps
-    /// its signature outcome and never freezes the plane (anyone can
-    /// send bytes at an old position; only an authentically SIGNED
-    /// header is fork evidence), while the body stage stays BEHIND
-    /// placement (the header-only signature makes a signed header
-    /// over garbage bytes real evidence — D-99's carve-out).
+    /// Arm-general pin + signature validation — the pipeline's `arm`
+    /// + `sig` stages (§7.2/D-91). D-76/D-99 stage order: parse →
+    /// arm → sig → BODY → precedence/placement → state. A forged
+    /// operation keeps its signature outcome and never freezes the
+    /// plane, and a validly signed header over malformed or
+    /// body-hash-mismatched bytes exerts NO precedence effect either
+    /// (D-99 — v0.5.4 granted precedence before authenticating the
+    /// body; the earlier comment here cited D-99 for the opposite of
+    /// its resolution, the defect review finding R2 reproduced).
     fn ctrl_prevalidate(&self, op: &SignedOp) -> Result<(), Verdict> {
         Self::ctrl_header_pins(op)?;
         let pk = match op.header.proof {
@@ -3067,10 +3262,10 @@ impl State {
     /// SIGNATURE stage precede every placement classification here
     /// (D-76 first-failing-stage; the D4 repair).
     fn ctrl_fork_gate(&mut self, op: &SignedOp) -> Result<Option<Verdict>, Unimplemented> {
+        // The pipeline (classify) already ran arm/signature and body
+        // validation — only sig- AND body-valid operations reach the
+        // placement gate, so everything here is fork evidence (D-99).
         if self.ctrl_frozen {
-            if let Err(v) = self.ctrl_prevalidate(op) {
-                return Ok(Some(v));
-            }
             return Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")));
         }
         let seq = op.header.writer_sequence;
@@ -3084,11 +3279,7 @@ impl State {
             return Ok(None);
         }
         // Byte-identical replay was consumed by the replay registry;
-        // this op DIFFERS at a held position. A forgery keeps its
-        // signature outcome and exerts no precedence.
-        if let Err(v) = self.ctrl_prevalidate(op) {
-            return Ok(Some(v));
-        }
+        // this op DIFFERS at a held position.
         if self
             .cut_chain
             .get(&seq)
@@ -4335,79 +4526,180 @@ pub fn run_delivery_with_state(
 
 /// The full fold entry: `aux` = the vector's HELD context (§5.6
 /// index, §4.7 receipts/leases) — installed before anything folds.
+///
+/// **Order convergence is structural here (review finding R1):** the
+/// state after delivery position `i` is `canonical_fold(the SET of
+/// items delivered through i)` — recomputed from scratch against a
+/// content-derived canonical processing order, so the final state is
+/// a pure function of the delivered set and CANNOT depend on arrival
+/// order. The earlier engine resolved pending operations in arrival
+/// order with a mutating classifier, and eight committed vectors
+/// reached different durable states under legal unlisted orders.
+///
+/// Byte-identical items fold ONCE: the lexicographically first name
+/// in a byte-group carries the operation's verdict; every other name
+/// reports the delivery-edge `duplicate` — a canonical assignment,
+/// so the label too is arrival-independent (the review's comparator
+/// normalization).
 pub fn run_delivery_full(
     items: &BTreeMap<String, Vec<u8>>,
     aux: &BTreeMap<String, Vec<u8>>,
     order: &[String],
 ) -> Result<(Run, State), Unimplemented> {
-    let mut state = State::default();
-    state.install_aux(aux)?;
-    let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
-    let mut snapshots = Vec::new();
-    // Pending queue in arrival order.
-    let mut pending: Vec<String> = Vec::new();
-    // name → op hash, for the derived-lane overlay.
-    let mut hashes: BTreeMap<String, [u8; 32]> = BTreeMap::new();
-
-    for name in order {
-        let bytes = &items[name];
-        if let Ok(op) = parse_op(bytes) {
-            hashes.insert(name.clone(), op.op_hash());
+    // name → its byte-group's canonical (lexicographically first) name.
+    let mut group_of: BTreeMap<&String, &String> = BTreeMap::new();
+    {
+        let mut by_bytes: BTreeMap<&[u8], &String> = BTreeMap::new();
+        let mut names: Vec<&String> = items.keys().collect();
+        names.sort();
+        for name in names {
+            let canon = by_bytes.entry(items[name].as_slice()).or_insert(name);
+            group_of.insert(name, canon);
         }
-        let verdict = classify(&mut state, bytes)?;
-        verdicts.insert(name.clone(), verdict);
-        if matches!(verdict, Verdict::Pending(..)) {
-            pending.push(name.clone());
-        }
-        // Re-evaluate the pending set to fixpoint after any
-        // acceptance (arrival order preserved).
-        loop {
-            let mut progressed = false;
-            let mut still_pending = Vec::new();
-            for pname in pending.drain(..) {
-                let v = classify(&mut state, &items[&pname])?;
-                verdicts.insert(pname.clone(), v);
-                match v {
-                    Verdict::Pending(..) => still_pending.push(pname),
-                    Verdict::Admitted => progressed = true,
-                    Verdict::Rejected(..) => {}
-                }
-            }
-            pending = still_pending;
-            if !progressed {
-                break;
-            }
-        }
-        // The derived lanes (§10.5): a held tenant op's fold verdict
-        // is a projection of current state — recompute after every
-        // delivery's fixpoint (retro-quarantine, claimant
-        // re-derivation) and overlay.
-        let derived = state.derived_tenant_verdicts()?;
-        for (n, h) in &hashes {
-            // A duplicate delivery is an edge fact about THAT
-            // delivery — never overlaid by the shared op's fold state.
-            if verdicts.get(n) == Some(&Verdict::Rejected("duplicate", "duplicate-idempotent")) {
-                continue;
-            }
-            if let Some(v) = derived.get(h) {
-                verdicts.insert(n.clone(), *v);
-            }
-            // Control ops re-classified by a freeze or a cut (§7.4).
-            if let Some(v) = state.ctrl_overlay.get(h) {
-                verdicts.insert(n.clone(), *v);
-            }
-        }
-        snapshots.push(verdicts.clone());
     }
+
+    let mut snapshots = Vec::new();
+    let mut last: Option<(BTreeMap<String, Verdict>, State)> = None;
+    for i in 0..order.len() {
+        let folded = canonical_fold(items, aux, &order[..=i], &group_of)?;
+        snapshots.push(folded.0.clone());
+        last = Some(folded);
+    }
+    let (final_verdicts, state) = match last {
+        Some(v) => v,
+        None => {
+            let mut state = State::default();
+            state.install_aux(aux)?;
+            (BTreeMap::new(), state)
+        }
+    };
     Ok((
         Run {
-            final_verdicts: verdicts,
+            final_verdicts,
             snapshots,
         },
         state,
     ))
 }
 
+/// The content-derived canonical processing key: control operations
+/// by chain position, tenant operations by their (zone, lineage,
+/// gen, seq) coordinate, hash-tied last — NEVER the fixture name or
+/// the arrival position.
+type CanonicalKey = (u8, [u8; 16], [u8; 16], u64, u64, [u8; 32]);
+
+fn canonical_key(bytes: &[u8]) -> CanonicalKey {
+    match parse_op(bytes) {
+        Ok(op) => {
+            let h = &op.header;
+            let class = u8::from(!h.operation_type.starts_with("c."));
+            (
+                class,
+                h.zone_id,
+                h.writer_lineage,
+                h.writer_gen,
+                h.writer_sequence,
+                op.op_hash(),
+            )
+        }
+        Err(_) => (2, [0; 16], [0; 16], 0, 0, domains::h("op", bytes)),
+    }
+}
+
+/// One canonical fold of a delivered subset: classify every unique
+/// operation in canonical order, retrying the pending set to a
+/// verdict fixpoint, then overlay the derived lanes (§10.5). The
+/// round cap makes non-stabilization an honest error instead of a
+/// hang (verdicts can only flip while state grows; growth is bounded
+/// by the subset).
+fn canonical_fold(
+    items: &BTreeMap<String, Vec<u8>>,
+    aux: &BTreeMap<String, Vec<u8>>,
+    subset: &[String],
+    group_of: &BTreeMap<&String, &String>,
+) -> Result<(BTreeMap<String, Verdict>, State), Unimplemented> {
+    let mut state = State::default();
+    state.install_aux(aux)?;
+
+    // Unique canonical names in the subset, content-ordered.
+    let mut uniq: Vec<&String> = subset
+        .iter()
+        .map(|n| *group_of.get(n).expect("delivered names exist"))
+        .collect();
+    uniq.sort();
+    uniq.dedup();
+    uniq.sort_by_key(|n| canonical_key(&items[*n]));
+
+    let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
+    let rounds_cap = uniq.len() * 2 + 4;
+    let mut stabilized = false;
+    for _ in 0..rounds_cap {
+        let mut changed = false;
+        for name in &uniq {
+            match verdicts.get(*name) {
+                Some(Verdict::Admitted) | Some(Verdict::Rejected(..)) => continue,
+                _ => {}
+            }
+            let v = classify(&mut state, &items[*name])?;
+            if verdicts.get(*name) != Some(&v) {
+                changed = true;
+                verdicts.insert((*name).clone(), v);
+            }
+        }
+        if !changed {
+            stabilized = true;
+            break;
+        }
+    }
+    if !stabilized {
+        return Err(Unimplemented(
+            "canonical fold did not stabilize within the round cap".into(),
+        ));
+    }
+
+    // The derived lanes (§10.5): a held tenant op's fold verdict is a
+    // projection of current state; control ops re-classified by a
+    // freeze or a cut overlay from §7.4.
+    let derived = state.derived_tenant_verdicts()?;
+    for name in &uniq {
+        if let Ok(op) = parse_op(&items[*name]) {
+            let h = op.op_hash();
+            if let Some(v) = derived.get(&h) {
+                verdicts.insert((*name).clone(), *v);
+            }
+            if let Some(v) = state.ctrl_overlay.get(&h) {
+                verdicts.insert((*name).clone(), *v);
+            }
+        }
+    }
+
+    // Delivery-edge duplicates: canonical, never arrival-relative.
+    let mut out = BTreeMap::new();
+    for name in subset {
+        let canon = *group_of.get(name).expect("delivered names exist");
+        if *name == *canon {
+            out.insert(name.clone(), verdicts[canon]);
+        } else {
+            out.insert(
+                name.clone(),
+                Verdict::Rejected("duplicate", "duplicate-idempotent"),
+            );
+        }
+    }
+    Ok((out, state))
+}
+
+/// Classify one operation against the state — the §7.2/§10.2
+/// arm-indexed pipeline: parse → arm → sig → body → replay →
+/// precedence/placement → state, with the D-112 transition-last
+/// discipline made STRUCTURAL: the admission stages run against a
+/// staged clone that commits only when the operation is accepted or
+/// deliberately pends (a reservation); a REJECTED operation exerts
+/// no state effect. The two deliberate real-state effects before the
+/// clone are evidence semantics, not transitions: a C2 freeze and
+/// D-130 fork-evidence registration both persist because valid
+/// conflicting SIGNATURES are facts about the plane, not about
+/// either operation's acceptance.
 pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimplemented> {
     let op = match parse_op(bytes) {
         Ok(op) => op,
@@ -4427,44 +4719,167 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
             return Ok(Verdict::Rejected("malformed", "reject-permanent"));
         }
     };
+
+    if op.header.operation_type.starts_with("c.") {
+        // arm + sig (genesis is self-contained — admit_genesis
+        // verifies under the descriptor's own root key).
+        if op.header.operation_type != "c.genesis" {
+            if let Err(v) = state.ctrl_prevalidate(&op) {
+                return Ok(v);
+            }
+        }
+        // body: the hash binding precedes EVERY precedence effect
+        // (D-99 — a validly signed header over mismatched bytes
+        // never suppresses C2); the arm's registry row precedes
+        // placement too.
+        if !op.body_hash_ok() {
+            return Ok(Verdict::Rejected("body-hash", "reject-permanent"));
+        }
+        if !REGISTRY_OP_TYPES.contains(&op.header.operation_type) {
+            return Ok(Verdict::Rejected("op-unknown", "reject-permanent"));
+        }
+        // replay: consulted post-validity; consumed at acceptance.
+        if let Some(v) = state.request_check(&op) {
+            return Ok(v);
+        }
+        // placement (C2/C5) — recovery carries its own placement
+        // rules (the §7.4 precedence exception). The freeze is an
+        // evidence effect and commits on the real state.
+        if op.header.operation_type != "c.genesis"
+            && op.header.operation_type != "c.recovery_succession"
+        {
+            if let Some(v) = state.ctrl_fork_gate(&op)? {
+                return Ok(v);
+            }
+        }
+    }
+
+    // state: the transactional admission (tenant validity stages and
+    // the replay consult live inside tenant_preamble, in pipeline
+    // order).
     let replay_key = (
         op.header.zone_id,
         op.header.writer_lineage,
         op.header.request_id,
     );
-    if let Some(&seen) = state.request_seen.get(&replay_key) {
-        return Ok(if seen == op.op_hash() {
-            Verdict::Rejected("duplicate", "duplicate-idempotent")
-        } else {
-            Verdict::Rejected("request-fork", "reject-permanent")
-        });
-    }
-    // The control fork/freeze gate (C2/C5) — recovery carries its
-    // own placement rules (the §7.4 precedence exception).
-    if op.header.operation_type.starts_with("c.")
-        && op.header.operation_type != "c.recovery_succession"
-    {
-        if let Some(v) = state.ctrl_fork_gate(&op)? {
-            return Ok(v);
-        }
-    }
-    state.admit(&op).map(|r| match r {
+    let mut staged = state.clone();
+    let r = staged.admit(&op)?;
+    Ok(match r {
         Ok(()) => {
-            state.request_seen.insert(replay_key, op.op_hash());
+            staged.request_seen.insert(replay_key, op.op_hash());
             if op.header.operation_type.starts_with("c.") {
-                state
+                staged
                     .ctrl_log
                     .push((op.header.writer_sequence, bytes.to_vec()));
             }
+            *state = staged;
             Verdict::Admitted
         }
-        Err(v) => v,
+        Err(v @ Verdict::Pending(..)) => {
+            // Deliberate pending effects commit (a compound's
+            // reservation holds its chain position, D-195).
+            *state = staged;
+            v
+        }
+        Err(v) => {
+            // Rejected: the staged state is discarded — no failed
+            // operation exerts precedence (D-112). Fork evidence is
+            // the one persistent fact: the preamble's chain stage
+            // fired only after the validity stages passed.
+            if v == Verdict::Rejected("fork", "freeze-writer")
+                && !op.header.operation_type.starts_with("c.")
+            {
+                state.register_tenant_fork(&op);
+            }
+            v
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The PRE-REPAIR engine, kept test-only as the review's
+    /// acceptance-criterion-3 control: per-arrival classification
+    /// with the pending set retried in ARRIVAL order until no new
+    /// ADMISSION (reservation progress invisible — exactly the
+    /// mechanism behind the r2 pending/rejected flip the review
+    /// reproduced). The discrimination test proves the convergence
+    /// standard fails under a deliberate restoration of this loop.
+    fn arrival_ordered_delivery(
+        items: &BTreeMap<String, Vec<u8>>,
+        order: &[&str],
+    ) -> BTreeMap<String, Verdict> {
+        let mut state = State::default();
+        let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
+        let mut pending: Vec<String> = Vec::new();
+        let mut hashes: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+        for name in order {
+            let bytes = &items[*name];
+            if let Ok(op) = parse_op(bytes) {
+                hashes.insert(name.to_string(), op.op_hash());
+            }
+            let v = classify(&mut state, bytes).unwrap();
+            verdicts.insert(name.to_string(), v);
+            if matches!(v, Verdict::Pending(..)) {
+                pending.push(name.to_string());
+            }
+            loop {
+                let mut progressed = false;
+                let mut still = Vec::new();
+                for pname in pending.drain(..) {
+                    let v = classify(&mut state, &items[&pname]).unwrap();
+                    verdicts.insert(pname.clone(), v);
+                    match v {
+                        Verdict::Pending(..) => still.push(pname),
+                        Verdict::Admitted => progressed = true,
+                        Verdict::Rejected(..) => {}
+                    }
+                }
+                pending = still;
+                if !progressed {
+                    break;
+                }
+            }
+            let derived = state.derived_tenant_verdicts().unwrap();
+            for (n, h) in &hashes {
+                if verdicts.get(n) == Some(&Verdict::Rejected("duplicate", "duplicate-idempotent"))
+                {
+                    continue;
+                }
+                if let Some(v) = derived.get(h) {
+                    verdicts.insert(n.clone(), *v);
+                }
+                if let Some(v) = state.ctrl_overlay.get(h) {
+                    verdicts.insert(n.clone(), *v);
+                }
+            }
+        }
+        verdicts
+    }
+
+    /// Acceptance criterion 3: the convergence standard DISCRIMINATES
+    /// — the restored arrival-ordered loop diverges on the review's
+    /// R1 order while the canonical engine converges on it.
+    #[test]
+    fn convergence_standard_fails_under_arrival_order_restoration() {
+        let (items, _) = load("f07-second-live-compound-rejects.json");
+        let review_order = ["r2", "r1", "c1", "c2"];
+        let restored = arrival_ordered_delivery(&items, &review_order);
+
+        let sorted: Vec<String> = items.keys().cloned().collect();
+        let (fresh, _) = run_delivery_full(&items, &BTreeMap::new(), &sorted).unwrap();
+        assert_ne!(
+            restored, fresh.final_verdicts,
+            "the restored engine must diverge on the review order — otherwise the \
+             metamorphic suite tests nothing"
+        );
+
+        let order: Vec<String> = review_order.iter().map(|s| s.to_string()).collect();
+        let (run, _) = run_delivery_full(&items, &BTreeMap::new(), &order).unwrap();
+        assert_eq!(run.final_verdicts, fresh.final_verdicts);
+    }
 
     fn load(name: &str) -> (BTreeMap<String, Vec<u8>>, serde_json::Value) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -233,7 +233,7 @@
     "header-unknown-version-rejects",
     "revoke-cutoff-carried-head-completes",
     "revoke-cutoff-empty-heads-with-history-rejects",
-    "revoke-cutoff-head-hash-mismatch-rejects",
+    "revoke-cutoff-head-mismatch-selects",
     "revoke-refs-post-wrap-exclusion-completes",
     "revoke-refs-stale-rotation-rejects",
     "second-live-compound-rejects"

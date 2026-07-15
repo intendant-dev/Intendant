@@ -336,7 +336,13 @@ pub fn f7_second_live_compound() -> Vector {
         "7.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("r1", &r1), ("r2", &r2)],
-        json!([["c1", "c2", "r1", "r2"], ["c1", "c2", "r2", "r1"]]),
+        // The third order is the review's R1 regression (r2 flipped
+        // between rejection and pending under arrival-order retries).
+        json!([
+            ["c1", "c2", "r1", "r2"],
+            ["c1", "c2", "r2", "r1"],
+            ["r2", "r1", "c1", "c2"]
+        ]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -493,7 +499,13 @@ pub fn f7_duplicate_idempotent() -> Vector {
         "11.1",
         rig,
         &[("c1", &c1), ("c2", &c2), ("c2dup", &c2)],
-        json!([["c1", "c2", "c2dup"], ["c2", "c1", "c2dup"]]),
+        // The third order is the review's R1 regression (the duplicate
+        // label is canonical now, never arrival-relative).
+        json!([
+            ["c1", "c2", "c2dup"],
+            ["c2", "c1", "c2dup"],
+            ["c1", "c2dup", "c2"]
+        ]),
         json!({
             "per_item": [
                 admits("c1"),
@@ -680,8 +692,14 @@ pub fn f10_epoch_unopened_converges() -> Vector {
     )
 }
 
-/// §9.3 fork: two different operations at one tenant chain position
-/// — the second is fork evidence, `freeze-writer`.
+/// §9.3/D-130 fork: two different operations at one tenant chain
+/// position are fork evidence — equal coordinates with differing op
+/// hashes are NEVER ordered, so BOTH variants freeze inert until a
+/// committed boundary selects one (none does here). The original
+/// expectation admitted the first-delivered variant — first-
+/// accepted-wins, an arrival-relative divergence the 2026-07-15
+/// verification review reproduced (R1: order [c1,c2,i2,i1] flipped
+/// the winner); re-authored to the ruled D-130 semantics.
 pub fn f10_tenant_fork() -> Vector {
     let name = "tenant-same-seq-fork";
     let mut rig = PlaneRig::new(name);
@@ -697,12 +715,18 @@ pub fn f10_tenant_fork() -> Vector {
         "9.3",
         rig,
         &[("c1", &c1), ("c2", &c2), ("i1", &i1), ("i2", &i2)],
-        json!([["c1", "c2", "i1", "i2"], ["c2", "c1", "i1", "i2"]]),
+        // The third order is the 2026-07-15 review's R1 regression
+        // (it flipped the winner under first-accepted-wins).
+        json!([
+            ["c1", "c2", "i1", "i2"],
+            ["c2", "c1", "i1", "i2"],
+            ["c1", "c2", "i2", "i1"]
+        ]),
         json!({
             "per_item": [
                 admits("c1"),
                 admits("c2"),
-                admits("i1"),
+                rejected("i1", "fork", "freeze-writer"),
                 rejected("i2", "fork", "freeze-writer"),
             ],
             "converge": true,

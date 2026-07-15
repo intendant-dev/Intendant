@@ -294,13 +294,21 @@ pub fn f9_compromise_cutoff_retro_disqualifies() -> Vector {
         ("receipt.accept.d2", rcpt.encode()),
     ];
     let per_item = rows(&a.ops, Some(("deadline-unreceipted", "pending-dependency")));
-    time_vector(
+    let mut v = time_vector(
         "compromise-cutoff-retro-disqualifies",
         a.rig,
         &refs(&a.ops),
         &aux,
         per_item,
-    )
+    );
+    // The 2026-07-15 review's R1 regression order (durable control
+    // sequence and cutoff state diverged under it).
+    v.inputs
+        .get_mut("deliveries")
+        .and_then(|d| d.as_array_mut())
+        .expect("deliveries array")
+        .push(serde_json::json!(["k", "r", "c4", "i", "c3", "c2", "c1"]));
+    v
 }
 
 /// No receipt at all: (deadline-unreceipted, pending-dependency).

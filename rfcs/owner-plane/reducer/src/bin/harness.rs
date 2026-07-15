@@ -48,13 +48,14 @@ fn main() {
             SemStatus::Fail(e) => format!("FAIL: {e}"),
         };
         println!(
-            "f{:02} {:56} container={} companion={} pairs={} decode={} semantics={}",
+            "f{:02} {:56} container={} companion={} pairs={} decode={} convergence={} semantics={}",
             r.family,
             r.file,
             s(&r.container_ok),
             s(&r.companion_ok),
             s(&r.pairs_ok),
             s(&r.decode_ok),
+            s(&r.convergence_ok),
             sem
         );
         if !r.structural_ok() {
@@ -64,6 +65,7 @@ fn main() {
                 ("companion", &r.companion_ok),
                 ("pairs", &r.pairs_ok),
                 ("decode", &r.decode_ok),
+                ("convergence", &r.convergence_ok),
             ] {
                 if let Err(e) = res {
                     eprintln!("  {label}: {e}");

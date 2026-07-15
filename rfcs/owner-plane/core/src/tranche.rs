@@ -1583,7 +1583,13 @@ pub fn f7_pending_revocation_window_grant() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["c1", "c2", "r", "g", "k"], ["c1", "c2", "g", "k", "r"],]),
+        // The third order is the review's R1 regression (durable
+        // frontier/revocation state diverged under it).
+        json!([
+            ["c1", "c2", "r", "g", "k"],
+            ["c1", "c2", "g", "k", "r"],
+            ["k", "g", "r", "c2", "c1"],
+        ]),
     );
 
     Vector {
@@ -2206,9 +2212,12 @@ pub fn f7_staged_frontier_consumed() -> Vector {
     );
     inputs.insert(
         "deliveries".into(),
+        // The third order is the review's R1 regression (durable
+        // frozen/frontier state diverged under it).
         json!([
             ["c1", "c2", "s", "rg", "g4", "k1", "k2"],
-            ["c2", "c1", "s", "rg", "g4", "k1", "k2"]
+            ["c2", "c1", "s", "rg", "g4", "k1", "k2"],
+            ["k2", "k1", "g4", "rg", "s", "c1", "c2"]
         ]),
     );
 

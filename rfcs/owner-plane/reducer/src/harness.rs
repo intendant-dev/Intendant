@@ -164,6 +164,29 @@ pub fn check_convergence_orders(vector: &Json) -> Result<(), String> {
     let deliveries = vector["inputs"]["deliveries"]
         .as_array()
         .ok_or("deliveries missing")?;
+    // Every delivery must be a TRUE permutation of the item set —
+    // set equality with multiplicity one (review R8.2: byte-distinct
+    // arrays with a duplicated or missing item satisfied the old
+    // rule and degenerated the converge assertion).
+    let mut want: Vec<&str> = vector["inputs"]["items"]
+        .as_object()
+        .map(|m| m.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    want.sort_unstable();
+    for (i, d) in deliveries.iter().enumerate() {
+        let mut got: Vec<&str> = d
+            .as_array()
+            .ok_or("delivery not an array")?
+            .iter()
+            .filter_map(|s| s.as_str())
+            .collect();
+        got.sort_unstable();
+        if got != want {
+            return Err(format!(
+                "delivery {i} is not a permutation of the item set (each item exactly once)"
+            ));
+        }
+    }
     let mut distinct: Vec<String> = deliveries.iter().map(|d| d.to_string()).collect();
     distinct.sort();
     distinct.dedup();
@@ -175,6 +198,89 @@ pub fn check_convergence_orders(vector: &Json) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The metamorphic convergence sweep (review R1): generated legal
+/// orders beyond the listed deliveries. With the canonical engine
+/// the final state is structurally a function of the delivered SET;
+/// this sweep is the CI-visible tripwire that makes any future
+/// return to arrival-ordered processing fail loudly (the fold unit
+/// suite proves it discriminates against a deliberate restoration).
+/// ≤ 5 items: every permutation; above: the reversal, every
+/// rotation, and every adjacent transposition of each listed
+/// delivery and of the sorted order, deduped.
+pub fn metamorphic_orders(names: &[String], listed: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut seen: std::collections::BTreeSet<Vec<String>> = listed.iter().cloned().collect();
+    let mut push = |o: Vec<String>, seen: &mut std::collections::BTreeSet<Vec<String>>| {
+        if seen.insert(o.clone()) {
+            out.push(o);
+        }
+    };
+    if names.len() <= 5 {
+        let mut perm: Vec<String> = names.to_vec();
+        permute(&mut perm, 0, &mut |p| push(p.to_vec(), &mut seen));
+        return out;
+    }
+    let mut bases: Vec<Vec<String>> = listed.to_vec();
+    bases.push(names.to_vec());
+    for base in bases {
+        let mut rev = base.clone();
+        rev.reverse();
+        push(rev, &mut seen);
+        for r in 1..base.len() {
+            let mut rot = base.clone();
+            rot.rotate_left(r);
+            push(rot, &mut seen);
+        }
+        for i in 0..base.len() - 1 {
+            let mut t = base.clone();
+            t.swap(i, i + 1);
+            push(t, &mut seen);
+        }
+    }
+    out
+}
+
+/// Run the metamorphic sweep against the fresh fold's final state;
+/// `Some(reason)` on the first divergent generated order.
+fn metamorphic_divergence(
+    items: &std::collections::BTreeMap<String, Vec<u8>>,
+    aux: &std::collections::BTreeMap<String, Vec<u8>>,
+    listed: &[Vec<String>],
+    fresh: &crate::fold::Run,
+) -> Result<Option<String>, String> {
+    let names: Vec<String> = items.keys().cloned().collect();
+    for order in metamorphic_orders(&names, listed) {
+        let (run, _) = match crate::fold::run_delivery_full(items, aux, &order) {
+            Ok(v) => v,
+            Err(u) => {
+                return Ok(Some(format!(
+                    "metamorphic order {order:?} hit Unimplemented ({}) where the listed \
+                     orders ran",
+                    u.0
+                )))
+            }
+        };
+        if run.final_verdicts != fresh.final_verdicts {
+            return Ok(Some(format!(
+                "metamorphic order {order:?} final state diverges from the fresh fold"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn permute(items: &mut [String], at: usize, emit: &mut impl FnMut(&[String])) {
+    if at == items.len() {
+        emit(items);
+        return;
+    }
+    for i in at..items.len() {
+        items.swap(at, i);
+        permute(items, at + 1, emit);
+        items.swap(at, i);
+    }
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
@@ -401,6 +507,9 @@ fn run_status_derive(vector: &Json) -> Result<SemStatus, String> {
             )));
         }
     }
+    if let Some(msg) = metamorphic_divergence(&items, &aux, &deliveries, &fresh)? {
+        return Ok(SemStatus::Fail(msg));
+    }
 
     let rows = vector["expected"]["result"]["derived"]
         .as_array()
@@ -485,6 +594,28 @@ fn run_journal_vector(vector: &Json) -> Result<SemStatus, String> {
             return Ok(SemStatus::Fail(format!(
                 "delivery {i} diverges from the fresh replay"
             )));
+        }
+    }
+    let names: Vec<String> = items.keys().cloned().collect();
+    for order in metamorphic_orders(&names, &deliveries) {
+        match crate::journal::run_journal(&items, &aux, &order) {
+            Ok(run) => {
+                if run.final_verdicts != fresh.final_verdicts
+                    || run.intervals != fresh.intervals
+                    || run.probes != fresh.probes
+                {
+                    return Ok(SemStatus::Fail(format!(
+                        "metamorphic order {order:?} diverges from the fresh replay"
+                    )));
+                }
+            }
+            Err(u) => {
+                return Ok(SemStatus::Fail(format!(
+                    "metamorphic order {order:?} hit Unimplemented ({}) where the listed \
+                     orders ran",
+                    u.0
+                )))
+            }
         }
     }
     let run = &runs[0];
@@ -629,6 +760,9 @@ fn run_audit_partition(vector: &Json) -> Result<SemStatus, String> {
             )));
         }
     }
+    if let Some(msg) = metamorphic_divergence(&items, &aux, &deliveries, &fresh)? {
+        return Ok(SemStatus::Fail(msg));
+    }
     for (name, v) in &fresh.final_verdicts {
         if v.pair().is_some() {
             return Ok(SemStatus::Fail(format!(
@@ -749,6 +883,9 @@ fn run_fold_vector(vector: &Json) -> Result<SemStatus, String> {
                 "delivery {i} final state diverges from the fresh fold"
             )));
         }
+    }
+    if let Some(msg) = metamorphic_divergence(&items, &aux, &deliveries, &fresh)? {
+        return Ok(SemStatus::Fail(msg));
     }
 
     // per_item: exactly one row per delivered item; absent pair =

@@ -21,7 +21,6 @@
       "merkle-leftover-sibling-rejects",
       "projection-stamp-incomplete-rejects",
       "revoke-cutoff-empty-heads-with-history-rejects",
-      "revoke-cutoff-head-hash-mismatch-rejects",
       "revoke-refs-stale-rotation-rejects",
       "second-live-compound-rejects",
       "staged-frontier-consumed-no-resurrection"
@@ -48,6 +47,7 @@
     ],
     "cutoff": [
       "collision-loser-reenters-on-winner-death",
+      "revoke-cutoff-head-mismatch-selects",
       "walkthrough-c3-branch-cut-below-head"
     ],
     "deadline-unreceipted": [
