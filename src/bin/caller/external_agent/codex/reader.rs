@@ -25,7 +25,7 @@ pub(crate) async fn reader_task(
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
-    let mut terminal_turns_observed: HashSet<String> = HashSet::new();
+    let mut terminal_turns_observed = CodexTerminalObserved::default();
     let mut notification_state = CodexNotificationState::default();
 
     loop {
@@ -59,12 +59,14 @@ pub(crate) async fn reader_task(
             }
         };
 
-        let line = line.trim().to_string();
+        // Borrow the trimmed view — re-allocating the line (including
+        // multi-hundred-KB aggregatedOutput payloads) doubled every read.
+        let line = line.trim();
         if line.is_empty() {
             continue;
         }
 
-        let raw: serde_json::Value = match serde_json::from_str(&line) {
+        let raw: serde_json::Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(e) => {
                 if let Some(watch) = protocol_watch.as_ref() {
@@ -91,9 +93,12 @@ pub(crate) async fn reader_task(
                 });
             }
         }
-        let msg: JsonRpcMessage = match serde_json::from_value(raw) {
-            Ok(message) => message,
-            Err(_) => {
+        // Second pass of the settled two-pass protocol-watch design: extract
+        // the five envelope fields directly instead of round-tripping the
+        // whole parsed tree through serde again (O(fields), not O(tree)).
+        let msg = match decode_jsonrpc_message(raw) {
+            Some(message) => message,
+            None => {
                 eprintln!("[codex] failed to decode JSON-RPC message shape");
                 continue;
             }
@@ -638,15 +643,61 @@ pub(crate) fn codex_terminal_observation_keys(
     keys
 }
 
-pub(crate) fn codex_any_terminal_observed(observed: &HashSet<String>, keys: &[String]) -> bool {
+/// Upper bound on retained terminal-observation keys. Turn/item ids never
+/// recur, so an unbounded set grew for the app-server's whole life; dedup
+/// only needs to suppress late duplicates of recent terminal events, and
+/// each turn contributes at most two keys, so this covers far more history
+/// than any duplicate horizon.
+const CODEX_TERMINAL_OBSERVED_CAP: usize = 256;
+
+/// Insertion-ordered set of observed terminal-event keys, bounded by
+/// [`CODEX_TERMINAL_OBSERVED_CAP`]: inserting past the cap evicts the oldest
+/// key.
+#[derive(Default)]
+pub(crate) struct CodexTerminalObserved {
+    set: HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl CodexTerminalObserved {
+    fn contains(&self, key: &str) -> bool {
+        self.set.contains(key)
+    }
+
+    fn insert(&mut self, key: &str) {
+        if self.set.contains(key) {
+            return;
+        }
+        while self.order.len() >= CODEX_TERMINAL_OBSERVED_CAP {
+            if let Some(evicted) = self.order.pop_front() {
+                self.set.remove(&evicted);
+            }
+        }
+        self.set.insert(key.to_string());
+        self.order.push_back(key.to_string());
+    }
+
+    fn remove(&mut self, key: &str) {
+        if self.set.remove(key) {
+            self.order.retain(|existing| existing != key);
+        }
+    }
+}
+
+pub(crate) fn codex_any_terminal_observed(
+    observed: &CodexTerminalObserved,
+    keys: &[String],
+) -> bool {
     keys.iter().any(|key| observed.contains(key))
 }
 
-pub(crate) fn codex_mark_terminal_observed(observed: &mut HashSet<String>, keys: &[String]) {
-    observed.extend(keys.iter().cloned());
+pub(crate) fn codex_mark_terminal_observed(observed: &mut CodexTerminalObserved, keys: &[String]) {
+    for key in keys {
+        observed.insert(key);
+    }
 }
 
-pub(crate) fn codex_clear_terminal_observed(observed: &mut HashSet<String>, keys: &[String]) {
+pub(crate) fn codex_clear_terminal_observed(observed: &mut CodexTerminalObserved, keys: &[String]) {
     for key in keys {
         observed.remove(key);
     }
@@ -5264,7 +5315,7 @@ error: build failed
                 "text": "previous checkpoint summary"
             }
         });
-        let mut observed = HashSet::new();
+        let mut observed = CodexTerminalObserved::default();
         let first_keys = codex_terminal_observation_keys(
             &params,
             None,
@@ -5305,7 +5356,7 @@ error: build failed
                 "text": "done"
             }
         });
-        let mut observed = HashSet::new();
+        let mut observed = CodexTerminalObserved::default();
         let final_answer_keys = codex_terminal_observation_keys(
             &params,
             Some("turn-1"),
@@ -5329,6 +5380,34 @@ error: build failed
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn terminal_observed_set_is_bounded_and_evicts_oldest() {
+        let mut observed = CodexTerminalObserved::default();
+        for i in 0..(CODEX_TERMINAL_OBSERVED_CAP + 10) {
+            codex_mark_terminal_observed(&mut observed, &[format!("turn:turn-{i}")]);
+        }
+        assert_eq!(observed.set.len(), CODEX_TERMINAL_OBSERVED_CAP);
+        assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP);
+        // The oldest keys were evicted; the most recent are retained.
+        assert!(!codex_any_terminal_observed(
+            &observed,
+            &["turn:turn-0".to_string()]
+        ));
+        let newest = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 9);
+        assert!(codex_any_terminal_observed(&observed, &[newest]));
+
+        // Re-marking an already observed key neither duplicates nor evicts.
+        let repeat = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 9);
+        codex_mark_terminal_observed(&mut observed, &[repeat]);
+        assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP);
+
+        // Clearing (the turn/started path) removes from both set and order.
+        let cleared = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 8);
+        codex_clear_terminal_observed(&mut observed, std::slice::from_ref(&cleared));
+        assert!(!codex_any_terminal_observed(&observed, &[cleared]));
+        assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP - 1);
     }
 
     #[test]
