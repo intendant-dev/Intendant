@@ -12,9 +12,9 @@ use tokio::sync::{mpsc, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    normalize_plan_status, AgentConfig, AgentEvent, AgentThread, AgentUsageSnapshot,
-    ApprovalCategory, ApprovalDecision, ExternalAgent, GoalActionOutcome, GoalEngine,
-    SubAgentState, ToolCompletionStatus,
+    normalize_plan_status, AgentConfig, AgentEvent, AgentImageAttachment, AgentThread,
+    AgentUsageSnapshot, ApprovalCategory, ApprovalDecision, ExternalAgent, GoalActionOutcome,
+    GoalEngine, SubAgentState, ToolCompletionStatus,
 };
 
 /// Appended to the first user message when an Intendant web port is
@@ -77,11 +77,41 @@ struct CcMessageContent {
     content: Vec<CcContentBlock>,
 }
 
+/// One content block in an outbound user message. Claude Code's stream-json
+/// stdin takes the Anthropic Messages content-block shapes, so images travel
+/// natively as base64 blocks alongside the text (parse acceptance probed
+/// live on 2.1.2xx with the adapter's exact spawn flags).
 #[derive(Serialize)]
-struct CcContentBlock {
+#[serde(tag = "type", rename_all = "lowercase")]
+enum CcContentBlock {
+    Text { text: String },
+    Image { source: CcImageSource },
+}
+
+/// Anthropic-style base64 image source:
+/// `{"type":"base64","media_type":…,"data":…}`.
+#[derive(Serialize)]
+struct CcImageSource {
     #[serde(rename = "type")]
-    block_type: String,
-    text: String,
+    source_type: String,
+    media_type: String,
+    data: String,
+}
+
+impl CcContentBlock {
+    fn text(text: impl Into<String>) -> Self {
+        CcContentBlock::Text { text: text.into() }
+    }
+
+    fn image(img: &AgentImageAttachment) -> Self {
+        CcContentBlock::Image {
+            source: CcImageSource {
+                source_type: "base64".into(),
+                media_type: img.mime_type.clone(),
+                data: img.base64.clone(),
+            },
+        }
+    }
 }
 
 /// Control response written to stdin, answering a CLI→client
@@ -2306,14 +2336,21 @@ impl ClaudeCodeAgent {
     }
 
     async fn write_user_message(&self, text: &str) -> Result<(), CallerError> {
+        self.write_user_message_blocks(vec![CcContentBlock::text(text)])
+            .await
+    }
+
+    /// Write a user message with an explicit content-block list (the text
+    /// prompt plus any base64 image blocks).
+    async fn write_user_message_blocks(
+        &self,
+        content: Vec<CcContentBlock>,
+    ) -> Result<(), CallerError> {
         let user_msg = CcUserMessage {
             msg_type: "user".into(),
             message: CcMessageContent {
                 role: "user".into(),
-                content: vec![CcContentBlock {
-                    block_type: "text".into(),
-                    text: text.to_string(),
-                }],
+                content,
             },
             parent_tool_use_id: None,
         };
@@ -2582,8 +2619,17 @@ impl ExternalAgent for ClaudeCodeAgent {
 
     async fn send_message(
         &mut self,
+        thread: &AgentThread,
+        message: &str,
+    ) -> Result<(), CallerError> {
+        self.send_message_with_images(thread, message, &[]).await
+    }
+
+    async fn send_message_with_images(
+        &mut self,
         _thread: &AgentThread,
         message: &str,
+        images: &[AgentImageAttachment],
     ) -> Result<(), CallerError> {
         // A goal update made while idle rides the next prompt instead of
         // paying for its own turn.
@@ -2605,7 +2651,14 @@ impl ExternalAgent for ClaudeCodeAgent {
         // when a "result" message appears. No deadlock risk because the
         // approval flow uses the same stdout stream (control_request), not
         // a blocking request/response pair.
-        self.write_user_message(&augmented).await
+        let mut content = Vec::with_capacity(images.len() + 1);
+        content.push(CcContentBlock::text(augmented));
+        content.extend(images.iter().map(CcContentBlock::image));
+        self.write_user_message_blocks(content).await
+    }
+
+    fn supports_image_input(&self) -> bool {
+        true
     }
 
     async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
@@ -2942,10 +2995,7 @@ mod tests {
             msg_type: "user".into(),
             message: CcMessageContent {
                 role: "user".into(),
-                content: vec![CcContentBlock {
-                    block_type: "text".into(),
-                    text: "fix the bug".into(),
-                }],
+                content: vec![CcContentBlock::text("fix the bug")],
             },
             parent_tool_use_id: None,
         };
@@ -2956,6 +3006,39 @@ mod tests {
         assert_eq!(json["message"]["content"][0]["text"], "fix the bug");
         // The field must serialize (as null) — the CLI expects its presence.
         assert!(json.as_object().unwrap().contains_key("parent_tool_use_id"));
+    }
+
+    #[test]
+    fn user_message_with_image_blocks_serialization() {
+        let img = AgentImageAttachment {
+            local_path: None,
+            base64: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        };
+        let msg = CcUserMessage {
+            msg_type: "user".into(),
+            message: CcMessageContent {
+                role: "user".into(),
+                content: vec![
+                    CcContentBlock::text("what color?"),
+                    CcContentBlock::image(&img),
+                ],
+            },
+            parent_tool_use_id: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["message"]["content"][0]["type"], "text");
+        assert_eq!(json["message"]["content"][0]["text"], "what color?");
+        // Anthropic Messages image-block shape, exactly.
+        assert_eq!(json["message"]["content"][1]["type"], "image");
+        assert_eq!(json["message"]["content"][1]["source"]["type"], "base64");
+        assert_eq!(
+            json["message"]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(json["message"]["content"][1]["source"]["data"], "aGVsbG8=");
+        // Tagged-enum shape: image blocks must not leak a stray `text` field.
+        assert!(json["message"]["content"][1].get("text").is_none());
     }
 
     #[test]

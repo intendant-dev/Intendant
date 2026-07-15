@@ -1460,6 +1460,10 @@ impl ExternalAgent for CodexAgent {
         self.send_message_with_images(thread, message, &[]).await
     }
 
+    fn supports_image_input(&self) -> bool {
+        true
+    }
+
     async fn send_message_with_images(
         &mut self,
         thread: &AgentThread,
