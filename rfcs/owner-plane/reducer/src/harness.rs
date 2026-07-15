@@ -788,6 +788,50 @@ fn run_audit_partition(vector: &Json) -> Result<SemStatus, String> {
             "chunks: expected {want:?}, reducer derived {got:?}"
         )));
     }
+    // The D-74 release evaluation (review R4): when the vector
+    // carries the independent read-release event, the reducer's
+    // derived verdict must match — an incomplete partition, an
+    // inexact union, or a split Txn refuses the release.
+    if let Some(rel) = vector["inputs"]["release"].as_object() {
+        let read_id: [u8; 16] = unhex(rel["read_id"].as_str().ok_or("release.read_id")?)?
+            .try_into()
+            .map_err(|_| "read_id is 16 bytes")?;
+        let mut released: Vec<[u8; 32]> = Vec::new();
+        for r in rel["result_ids"].as_array().ok_or("release.result_ids")? {
+            released.push(
+                unhex(r.as_str().ok_or("result id")?)?
+                    .try_into()
+                    .map_err(|_| "result id is 32 bytes")?,
+            );
+        }
+        let mut txn_rows: Vec<[u8; 32]> = Vec::new();
+        for n in rel["txn_rows"].as_array().ok_or("release.txn_rows")? {
+            let name = n.as_str().ok_or("txn row name")?;
+            let bytes = items.get(name).ok_or("txn row names unknown item")?;
+            txn_rows.push(crate::domains::h("op", bytes));
+        }
+        let derived = state.audit_release_check(read_id, &released, &txn_rows);
+        let want_released = vector["expected"]["result"]["released"]
+            .as_bool()
+            .ok_or("result.released required with inputs.release")?;
+        match (derived, want_released) {
+            (Ok(()), true) | (Err(_), false) => {}
+            (Ok(()), false) => {
+                return Ok(SemStatus::Fail(
+                    "reducer released a partition the vector expects refused".into(),
+                ))
+            }
+            (Err(e), true) => {
+                return Ok(SemStatus::Fail(format!(
+                    "reducer refused a release the vector expects: {e}"
+                )))
+            }
+        }
+    } else if vector["expected"]["result"]["released"].is_boolean() {
+        return Ok(SemStatus::Fail(
+            "result.released without inputs.release".into(),
+        ));
+    }
     Ok(SemStatus::Pass)
 }
 
@@ -1046,7 +1090,7 @@ mod tests {
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
-        assert_eq!(reports.len(), 157, "the corpus through the cheap-gap batch");
+        assert_eq!(reports.len(), 164, "the corpus through the repair tranche");
         for r in &reports {
             assert!(
                 r.structural_ok(),

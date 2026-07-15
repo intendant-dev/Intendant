@@ -48,6 +48,7 @@
     "cutoff": [
       "collision-loser-reenters-on-winner-death",
       "revoke-cutoff-head-mismatch-selects",
+      "txn-internal-order-and-competing-terminals",
       "walkthrough-c3-branch-cut-below-head"
     ],
     "deadline-unreceipted": [
@@ -102,6 +103,7 @@
       "framing-final-frame-bad-crc-quarantines",
       "framing-nlen-mismatch-quarantines",
       "reopen-basis-op-kind-and-unheld-invalidation",
+      "reopen-forged-recovery-log-corrupt",
       "reopen-recovery-keeps-basis-rejects",
       "txn-internal-order-and-competing-terminals"
     ],
@@ -155,6 +157,7 @@
       "pending-revocation-window-grant-completing-rotation",
       "reopen-basis-op-kind-and-unheld-invalidation",
       "reopen-recovery-invalidation-unheld-pends",
+      "reopen-unadmitted-recovery-pends",
       "second-live-compound-rejects",
       "walkthrough-c3-branch-cut-below-head"
     ],
@@ -182,7 +185,8 @@
     ],
     "sig-invalid": [
       "c2-post-freeze-sig-invalid-kept",
-      "control-signature-tamper"
+      "control-signature-tamper",
+      "reopen-forged-recovery-log-corrupt"
     ],
     "token-revoked": [
       "shape3-revoked-token"

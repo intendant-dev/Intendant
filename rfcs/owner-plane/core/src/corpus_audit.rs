@@ -15,6 +15,10 @@
 use crate::shapes::envelope::Signedop;
 use crate::shapes::memory::{Auditprin, Maudit};
 use crate::tranche::{draw_id, items, PlaneRig, T0_MS};
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 use crate::vector::{Expected, Vector};
 use serde_json::{json, Map as JsonMap, Value as Json};
 
@@ -25,12 +29,39 @@ fn audit_vector(
     item_list: &[(&str, &Signedop)],
     result: Json,
 ) -> Vector {
+    audit_vector_release(name, case_kind, rig, item_list, None, result)
+}
+
+/// The amendment-#5 independent read-release event (review R4):
+/// `(read_id, released result ids, the one-Txn row item names)`.
+type ReleaseEvent<'a> = ([u8; 16], Vec<[u8; 32]>, Vec<&'a str>);
+
+/// [`audit_vector`] with the release event — the reducer must
+/// DERIVE `released` from held rows against it.
+fn audit_vector_release(
+    name: &str,
+    case_kind: &str,
+    rig: PlaneRig,
+    item_list: &[(&str, &Signedop)],
+    release: Option<ReleaseEvent<'_>>,
+    result: Json,
+) -> Vector {
     let mut inputs = JsonMap::new();
     inputs.insert("items".into(), items(item_list));
     let forward: Vec<&str> = item_list.iter().map(|(n, _)| *n).collect();
     let mut reversed = forward.clone();
     reversed.reverse();
     inputs.insert("deliveries".into(), json!([forward, reversed]));
+    if let Some((read_id, ids, rows)) = release {
+        inputs.insert(
+            "release".into(),
+            json!({
+                "read_id": hex(&read_id),
+                "result_ids": ids.iter().map(|i| hex(i)).collect::<Vec<_>>(),
+                "txn_rows": rows,
+            }),
+        );
+    }
     Vector {
         family: 11,
         name: name.into(),
@@ -95,7 +126,7 @@ pub fn f11_audit_partition_two_chunks() -> Vector {
     let b1 = row_body(&mut rig, read_id, 1, 2, vec![i2.op_hash()]);
     let a1 = rig.audit_row(&d1, &ga, "a1", b1, 4, Some(a0.op_hash()));
     let c1 = rig.genesis_op.clone();
-    audit_vector(
+    audit_vector_release(
         "audit-partition-two-chunks",
         "audit-partition",
         rig,
@@ -106,9 +137,11 @@ pub fn f11_audit_partition_two_chunks() -> Vector {
             ("a0", &a0),
             ("a1", &a1),
         ],
+        Some((read_id, vec![i1.op_hash(), i2.op_hash()], vec!["a0", "a1"])),
         json!({
             "chunks": [ { "index": 0, "count": 2 }, { "index": 1, "count": 2 } ],
             "converge": true,
+            "released": true,
         }),
     )
 }
@@ -124,14 +157,16 @@ pub fn f11_audit_zero_result_single_chunk() -> Vector {
     let b0 = row_body(&mut rig, read_id, 0, 1, vec![]);
     let a0 = rig.audit_row(&d1, &ga, "a0", b0, 1, None);
     let c1 = rig.genesis_op.clone();
-    audit_vector(
+    audit_vector_release(
         "audit-zero-result-single-chunk",
         "audit-partition",
         rig,
         &[("c1", &c1), ("a0", &a0)],
+        Some((read_id, vec![], vec!["a0"])),
         json!({
             "chunks": [ { "index": 0, "count": 1 } ],
             "converge": true,
+            "released": true,
         }),
     )
 }
@@ -244,10 +279,168 @@ pub fn f11_audit_conflicts() -> Vec<Vector> {
     ]
 }
 
+/// Review R4 negatives: the release evaluation refuses inexact
+/// partitions. Every ROW admits (the partition invariants hold row
+/// by row); what fails is the READ-level release derivation against
+/// the independent release event.
+///
+/// missing-middle: count 3, rows 0 and 2 held — completeness fails.
+pub fn f11_audit_release_missing_middle() -> Vector {
+    let name = "f11-audit-rel-miss-mid";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "the ledger of moth wings", 1, None);
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 3, vec![i1.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 2, Some(i1.op_hash()));
+    let b2 = row_body(&mut rig, read_id, 2, 3, vec![]);
+    let a2 = rig.audit_row(&d1, &ga, "a2", b2, 3, Some(a0.op_hash()));
+    let c1 = rig.genesis_op.clone();
+    audit_vector_release(
+        "audit-release-missing-middle-refused",
+        "audit-partition",
+        rig,
+        &[("c1", &c1), ("i1", &i1), ("a0", &a0), ("a2", &a2)],
+        Some((read_id, vec![i1.op_hash()], vec!["a0", "a2"])),
+        json!({
+            "chunks": [ { "index": 0, "count": 3 }, { "index": 2, "count": 3 } ],
+            "converge": true,
+            "released": false,
+        }),
+    )
+}
+
+/// missing-last: count 2, only row 0 held — completeness fails.
+pub fn f11_audit_release_missing_last() -> Vector {
+    let name = "f11-audit-rel-miss-last";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "the half-charted reef", 1, None);
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 2, vec![i1.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 2, Some(i1.op_hash()));
+    let c1 = rig.genesis_op.clone();
+    audit_vector_release(
+        "audit-release-missing-last-refused",
+        "audit-partition",
+        rig,
+        &[("c1", &c1), ("i1", &i1), ("a0", &a0)],
+        Some((read_id, vec![i1.op_hash()], vec!["a0"])),
+        json!({
+            "chunks": [ { "index": 0, "count": 2 } ],
+            "converge": true,
+            "released": false,
+        }),
+    )
+}
+
+/// omitted-result: the rows carry an id the release omitted — the
+/// union exceeds the released set.
+pub fn f11_audit_release_omitted_result() -> Vector {
+    let name = "f11-audit-rel-omit";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "two lanterns, one listed", 1, None);
+    let i2 = rig.claim(&d1, &g1, "i2", "the second lantern", 2, Some(i1.op_hash()));
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 1, vec![i1.op_hash(), i2.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 3, Some(i2.op_hash()));
+    let c1 = rig.genesis_op.clone();
+    audit_vector_release(
+        "audit-release-omitted-result-refused",
+        "audit-partition",
+        rig,
+        &[("c1", &c1), ("i1", &i1), ("i2", &i2), ("a0", &a0)],
+        Some((read_id, vec![i1.op_hash()], vec!["a0"])),
+        json!({
+            "chunks": [ { "index": 0, "count": 1 } ],
+            "converge": true,
+            "released": false,
+        }),
+    )
+}
+
+/// extra-result: the release names an id no row audited — the
+/// released set exceeds the union.
+pub fn f11_audit_release_extra_result() -> Vector {
+    let name = "f11-audit-rel-extra";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "one lantern, two listed", 1, None);
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 1, vec![i1.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 2, Some(i1.op_hash()));
+    let phantom = rig.rng.draw32("phantom.result_id");
+    let c1 = rig.genesis_op.clone();
+    audit_vector_release(
+        "audit-release-extra-result-refused",
+        "audit-partition",
+        rig,
+        &[("c1", &c1), ("i1", &i1), ("a0", &a0)],
+        Some((read_id, vec![i1.op_hash(), phantom], vec!["a0"])),
+        json!({
+            "chunks": [ { "index": 0, "count": 1 } ],
+            "converge": true,
+            "released": false,
+        }),
+    )
+}
+
+/// split-transaction: both rows held and the partition complete, but
+/// the declared one-Txn row set names only the first — one-Txn
+/// membership fails (the physical rule: one read's rows ride one
+/// Txn).
+pub fn f11_audit_release_split_txn() -> Vector {
+    let name = "f11-audit-rel-split";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let g1 = rig.genesis_grant.clone();
+    let ga = rig.genesis_audit_grant.clone();
+    let i1 = rig.claim(&d1, &g1, "i1", "a partition true but torn", 1, None);
+    let i2 = rig.claim(&d1, &g1, "i2", "across two commits", 2, Some(i1.op_hash()));
+    let read_id = draw_id(&mut rig.rng, "audit.read_id");
+    let b0 = row_body(&mut rig, read_id, 0, 2, vec![i1.op_hash()]);
+    let a0 = rig.audit_row(&d1, &ga, "a0", b0, 3, Some(i2.op_hash()));
+    let b1 = row_body(&mut rig, read_id, 1, 2, vec![i2.op_hash()]);
+    let a1 = rig.audit_row(&d1, &ga, "a1", b1, 4, Some(a0.op_hash()));
+    let c1 = rig.genesis_op.clone();
+    audit_vector_release(
+        "audit-release-split-txn-refused",
+        "audit-partition",
+        rig,
+        &[
+            ("c1", &c1),
+            ("i1", &i1),
+            ("i2", &i2),
+            ("a0", &a0),
+            ("a1", &a1),
+        ],
+        Some((read_id, vec![i1.op_hash(), i2.op_hash()], vec!["a0"])),
+        json!({
+            "chunks": [ { "index": 0, "count": 2 }, { "index": 1, "count": 2 } ],
+            "converge": true,
+            "released": false,
+        }),
+    )
+}
+
 pub fn corpus_audit() -> Vec<Vector> {
     let mut out = vec![
         f11_audit_partition_two_chunks(),
         f11_audit_zero_result_single_chunk(),
+        f11_audit_release_missing_middle(),
+        f11_audit_release_missing_last(),
+        f11_audit_release_omitted_result(),
+        f11_audit_release_extra_result(),
+        f11_audit_release_split_txn(),
         f11_audit_chunk_index_out_of_range(),
     ];
     out.extend(f11_audit_conflicts());

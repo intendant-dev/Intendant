@@ -461,13 +461,18 @@ pub struct State {
 /// A tenant chain coordinate: (zone, lineage, gen, seq).
 type TenantCoord = ([u8; 16], [u8; 16], u64, u64);
 
+/// D-130 selections a committing boundary carries: (coordinate,
+/// selected byte-variant).
+type Selections = Vec<(TenantCoord, [u8; 32])>;
+
 /// A validated frontierclose Head set: the `(gen, seq)` caps plus
 /// any D-130 selections the boundary commits AT ITS TRANSITION.
-type HeadsView = (Vec<(u64, u64)>, Vec<(TenantCoord, [u8; 32])>);
+type HeadsView = (Vec<(u64, u64)>, Selections);
 
 /// One accepted audit row's partition facts (D-74/D-83).
 #[derive(Debug, Clone)]
 struct AuditRow {
+    op_hash: [u8; 32],
     read_id: [u8; 16],
     principal_raw: Vec<u8>,
     scope_raw: Vec<u8>,
@@ -1480,7 +1485,7 @@ impl State {
     /// unresolved fork evidence, or when a committed selection chose
     /// a different variant (the losing branch quarantines).
     fn fork_verdict(&self, rec: &HeldTenantOp) -> Option<Verdict> {
-        for (&(z, l, g, s), _) in &self.tenant_forks {
+        for &(z, l, g, s) in self.tenant_forks.keys() {
             if z != rec.zone || l != rec.lineage || g != rec.gen || s > rec.seq {
                 continue;
             }
@@ -1696,8 +1701,7 @@ impl State {
     fn compound_cutoffs(
         &self,
         body: &Node,
-    ) -> Result<Result<(Vec<ZoneLineage>, Vec<(TenantCoord, [u8; 32])>), Verdict>, Unimplemented>
-    {
+    ) -> Result<Result<(Vec<ZoneLineage>, Selections), Verdict>, Unimplemented> {
         let mut out = Vec::new();
         let mut selections = Vec::new();
         let Some(cs) = body.get("cutoffs").and_then(|c| c.as_array()) else {
@@ -3217,9 +3221,9 @@ impl State {
         Ok(())
     }
 
-    /// Arm-general pin + signature validation — the pipeline's `arm`
-    /// + `sig` stages (§7.2/D-91). D-76/D-99 stage order: parse →
-    /// arm → sig → BODY → precedence/placement → state. A forged
+    /// Arm-general pin and signature validation — the pipeline's
+    /// `arm` and `sig` stages (§7.2/D-91). D-76/D-99 stage order:
+    /// parse, arm, sig, BODY, precedence/placement, state. A forged
     /// operation keeps its signature outcome and never freezes the
     /// plane, and a validly signed header over malformed or
     /// body-hash-mismatched bytes exerts NO precedence effect either
@@ -3292,6 +3296,69 @@ impl State {
         }
         self.freeze_at(seq)?;
         Ok(Some(Verdict::Rejected("ctrl-fork", "freeze-control")))
+    }
+
+    /// The D-74 release evaluation over an INDEPENDENT read-release
+    /// event (review R4 — the pre-repair lane compared the reducer's
+    /// surviving chunks against the vector's own expected list, so an
+    /// incomplete partition "verified" as exact against itself). The
+    /// released result ids and the read's one-Txn row set come from
+    /// OUTSIDE the partition rows; the reducer derives:
+    ///
+    /// 1. completeness — the held rows' indexes are EXACTLY
+    ///    `0..count−1` (a missing chunk refuses the release);
+    /// 2. disjointness (re-derived, not assumed from admission);
+    /// 3. exact union — ∪ row result_ids == the released ids, both
+    ///    directions;
+    /// 4. one-Txn membership — the read's row set equals the Txn's
+    ///    row set exactly.
+    ///
+    /// `Err(reason)` = the release is REFUSED (fail-closed, D-52);
+    /// the refusal's outcome vocabulary (`audit-unavailable` under
+    /// durability failure) stays with the Gate-B edge lane — this is
+    /// the exactness predicate made executable.
+    pub(crate) fn audit_release_check(
+        &self,
+        read_id: [u8; 16],
+        released: &[[u8; 32]],
+        txn_rows: &[[u8; 32]],
+    ) -> Result<(), &'static str> {
+        let rows: Vec<&AuditRow> = self
+            .audit_rows
+            .iter()
+            .filter(|r| r.read_id == read_id)
+            .collect();
+        let Some(count) = rows.first().map(|r| r.count) else {
+            return Err("no audit rows for the read");
+        };
+        // Completeness: indexes exactly 0..count−1.
+        let mut idxs: Vec<u64> = rows.iter().map(|r| r.index).collect();
+        idxs.sort_unstable();
+        if idxs != (0..count).collect::<Vec<u64>>() {
+            return Err("partition incomplete: indexes are not exactly 0..count-1");
+        }
+        // Disjointness, re-derived.
+        let mut seen: std::collections::BTreeSet<[u8; 32]> = std::collections::BTreeSet::new();
+        for r in &rows {
+            for id in &r.result_ids {
+                if !seen.insert(*id) {
+                    return Err("result sets overlap");
+                }
+            }
+        }
+        // Exact union, both directions.
+        let released_set: std::collections::BTreeSet<[u8; 32]> = released.iter().copied().collect();
+        if seen != released_set {
+            return Err("row union differs from the released result set");
+        }
+        // One-Txn membership: the read's rows == the Txn's rows.
+        let row_set: std::collections::BTreeSet<[u8; 32]> =
+            rows.iter().map(|r| r.op_hash).collect();
+        let txn_set: std::collections::BTreeSet<[u8; 32]> = txn_rows.iter().copied().collect();
+        if row_set != txn_set {
+            return Err("the read's rows did not ride the one declared Txn");
+        }
+        Ok(())
     }
 
     /// The final audit-partition chunk table — (index, count) pairs
@@ -3918,6 +3985,21 @@ impl State {
     /// Does the fold hold this operation (control or tenant)? The
     /// journal machine's opfactref resolution consults it alongside
     /// the aux set.
+    /// Is `h` an ACCEPTED operation on the current control chain
+    /// (the D-138 log — a cut op is not)?
+    pub(crate) fn ctrl_accepted(&self, h: &[u8; 32]) -> bool {
+        self.ctrl_log
+            .iter()
+            .any(|(_, bytes)| parse_op(bytes).is_ok_and(|op| op.op_hash() == *h))
+    }
+
+    /// The §7.4 derived classification of a control op the chain
+    /// re-classified (a C2 freeze or a C3′/recovery cut) — `None`
+    /// when the chain never overlaid it.
+    pub(crate) fn ctrl_overlaid(&self, h: &[u8; 32]) -> Option<Verdict> {
+        self.ctrl_overlay.get(h).copied()
+    }
+
     pub(crate) fn holds_op(&self, h: &[u8; 32]) -> bool {
         self.held_tenant.iter().any(|r| r.op_hash == *h) || self.ctrl_head == *h
     }
@@ -4087,6 +4169,7 @@ impl State {
         // Accept.
         self.record_tenant(op, &grant, None, None, None, None);
         self.audit_rows.push(AuditRow {
+            op_hash: op.op_hash(),
             read_id,
             principal_raw,
             scope_raw,
@@ -4586,9 +4669,9 @@ pub fn run_delivery_full(
 /// by chain position, tenant operations by their (zone, lineage,
 /// gen, seq) coordinate, hash-tied last — NEVER the fixture name or
 /// the arrival position.
-type CanonicalKey = (u8, [u8; 16], [u8; 16], u64, u64, [u8; 32]);
+pub(crate) type CanonicalKey = (u8, [u8; 16], [u8; 16], u64, u64, [u8; 32]);
 
-fn canonical_key(bytes: &[u8]) -> CanonicalKey {
+pub(crate) fn canonical_key(bytes: &[u8]) -> CanonicalKey {
     match parse_op(bytes) {
         Ok(op) => {
             let h = &op.header;

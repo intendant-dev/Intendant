@@ -1653,6 +1653,9 @@ struct JournalPreamble {
     t1: Txn,
     revoke_op: Signedop,
     grant3_op: Signedop,
+    /// The import zone's creation pair — the R3 arc's z2 context.
+    zone_op: Signedop,
+    space_op: Signedop,
 }
 
 fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
@@ -1661,18 +1664,50 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
 
     // The op the abort bases cite: a real revocation of a real import
     // grant (issued to a second device, then revoked — the
-    // revoked-grant `no-grant` cause of the missing imports).
+    // revoked-grant `no-grant` cause of the missing imports). The R3
+    // re-authoring FOLDS this arc, so it must genuinely admit: the
+    // import grant lives on a second zone (one live import grant per
+    // zone — the genesis grant already holds the genesis zone's) and
+    // rides dev2's enrollment with a z2 wrap (a bare c.grant to an
+    // unenrolled device is body-invariant).
+    let z2 = draw_id(&mut rig.rng, "zone2.zone_id");
+    let kek2 = rig.rng.draw32("kek.zone2.e1");
+    let w1 = rig.wrap_in(z2, &kek2, d1.device_id, &d1.kem_pk, 1, "wrap.z2.dev1.eph");
+    let zone_op = rig.zone_create(z2, vec![w1]);
+    let z2_space = draw_id(&mut rig.rng, "zone2.space_id");
+    let z2_name_hash = rig.rng.draw32("zone2.space.name_hash");
+    let space_op = rig.space_create(Spacedef {
+        space_id: z2_space,
+        zone_id: z2,
+        name_hash: z2_name_hash,
+        space_class: Spaceclass::Project,
+        class_minimum: Class::Private,
+        status_policy: Polref {
+            id: "workflow-v1".into(),
+            version: 1,
+            hash: scenario::workflow_v1().hash(),
+        },
+    });
     let dev2 = rig.mint_device("dev2");
-    let g3 = rig.simple_grant("grant3", &dev2, vec![Verb::Import]);
+    let g3 = rig.grant_in("grant3", &dev2, vec![Verb::Import], z2, vec![z2_space]);
     let g3_id = g3.grant_id;
-    let grant3_op = rig.grant_op(g3);
+    let w2 = rig.wrap_in(
+        z2,
+        &kek2,
+        dev2.device_id,
+        &dev2.kem_pk,
+        1,
+        "wrap.z2.dev2.eph",
+    );
+    let grant3_op = rig.enroll_new_with_wraps(&dev2, vec![g3], vec![w2]);
     let pre_revoke = rig.ctrl_position();
     let revoke_op = rig.revoke_grant_op(
         g3_id,
         // import is op-authoring: the revocation carries the target
-        // lineage's (empty-heads) authorship cutoff (D-143).
+        // lineage's (empty-heads) authorship cutoff (D-143) — on the
+        // grant's own zone.
         Some(Frontierclose {
-            zone_id: rig.zone_id,
+            zone_id: z2,
             lineage: dev2.lineage,
             heads: vec![],
         }),
@@ -1727,6 +1762,8 @@ fn journal_preamble(name: &str, source_count: usize) -> JournalPreamble {
         t1,
         revoke_op,
         grant3_op,
+        zone_op,
+        space_op,
     }
 }
 
@@ -1793,11 +1830,14 @@ pub fn f13_txn_internal_order() -> Vector {
     let x = Opfactref(p.revoke_op.op_hash());
     let (r1, r2) = (p.srcs[0], p.srcs[1]);
 
-    // The reopen's invalidation: a REAL killer, held via aux — an
-    // owner recovery based below the revocation, whose §7.4 branch
-    // cut dissolves the recorded cause. The journal machine verifies
-    // the kill (base.seq < the basis's chain position) — a held
-    // citation is verifiable (D-163), never taken on faith.
+    // The reopen's invalidation: a REAL killer — an owner recovery
+    // based below the revocation, whose §7.4 branch cut dissolves
+    // the recorded cause. The control arc is DELIVERED (folded), so
+    // the recovery is an authenticated, ADMITTED fact and the basis
+    // is genuinely dead on the chain — the journal verifies the kill
+    // against that authority, never against held bytes' shape (the
+    // 2026-07-15 review's R3: the pre-repair machine accepted a
+    // signature-invalid aux recovery as kill evidence).
     let recovery = recovery_cutting_revocation(&mut p);
 
     let t2 = Txn {
@@ -1848,14 +1888,28 @@ pub fn f13_txn_internal_order() -> Vector {
         ],
     };
 
+    let c1 = p.rig.genesis_op.clone();
     let mut inputs = JsonMap::new();
     inputs.insert(
         "items".into(),
-        items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
+        items_raw(&[
+            ("c1", &c1.encode()),
+            ("cz", &p.zone_op.encode()),
+            ("cs", &p.space_op.encode()),
+            ("g3", &p.grant3_op.encode()),
+            ("rv", &p.revoke_op.encode()),
+            ("rc", &recovery.encode()),
+            ("t1", &enc(&p.t1)),
+            ("t2", &enc(&t2)),
+            ("t3", &enc(&t3)),
+        ]),
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["t1", "t2", "t3"], ["t3", "t2", "t1"]]),
+        json!([
+            ["c1", "cz", "cs", "g3", "rv", "rc", "t1", "t2", "t3"],
+            ["t3", "t2", "t1", "rc", "rv", "g3", "cs", "cz", "c1"]
+        ]),
     );
     let mut aux = JsonMap::new();
     aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
@@ -1882,6 +1936,14 @@ pub fn f13_txn_internal_order() -> Vector {
                 { "incarnation": 1, "terminal": "open" },
             ],
             "per_record": [
+                { "rec": "c1" },
+                { "rec": "cz" },
+                { "rec": "cs" },
+                { "rec": "g3" },
+                // The accepted recovery's branch cut dissolves the
+                // revocation — the D-140 recover-boundary reading.
+                { "rec": "rv", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
+                { "rec": "rc" },
                 { "rec": "t1" },
                 { "rec": "t2" },
                 { "rec": "t3", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
@@ -2073,11 +2135,13 @@ pub fn f11_reopen_recovery_invalidation_pends() -> Vector {
 }
 
 /// Family 11 journal-replay, the kill predicate's teeth: t3's reopen
-/// cites a HELD recovery that bases AT the revocation's own position
-/// — the cut keeps the basis alive, so the citation is
-/// verified-FALSE: `(log-corrupt, storage-quarantine)` (D-163's
-/// uncited/unverifiable arm — a held citation is never taken on
-/// faith). Interval 0 stays aborted across both orders.
+/// cites an ACCEPTED recovery that bases AT the revocation's own
+/// position — the cut keeps the basis alive (the revocation stays
+/// an accepted chain fact), so the citation is verified-FALSE:
+/// `(log-corrupt, storage-quarantine)` (D-163's
+/// uncited/unverifiable arm — a citation is never taken on faith).
+/// The recovery is DELIVERED and admitted: authority is real, the
+/// kill claim is what's false. Interval 0 stays aborted.
 pub fn f11_reopen_recovery_keeps_basis() -> Vector {
     let name = "reopen-recovery-keeps-basis-rejects";
     let mut p = journal_preamble(name, 1);
@@ -2111,14 +2175,28 @@ pub fn f11_reopen_recovery_keeps_basis() -> Vector {
         })],
     };
 
+    let c1 = p.rig.genesis_op.clone();
     let mut inputs = JsonMap::new();
     inputs.insert(
         "items".into(),
-        items_raw(&[("t1", &enc(&p.t1)), ("t2", &enc(&t2)), ("t3", &enc(&t3))]),
+        items_raw(&[
+            ("c1", &c1.encode()),
+            ("cz", &p.zone_op.encode()),
+            ("cs", &p.space_op.encode()),
+            ("g3", &p.grant3_op.encode()),
+            ("rv", &p.revoke_op.encode()),
+            ("rc", &recovery.encode()),
+            ("t1", &enc(&p.t1)),
+            ("t2", &enc(&t2)),
+            ("t3", &enc(&t3)),
+        ]),
     );
     inputs.insert(
         "deliveries".into(),
-        json!([["t1", "t2", "t3"], ["t3", "t2", "t1"]]),
+        json!([
+            ["c1", "cz", "cs", "g3", "rv", "rc", "t1", "t2", "t3"],
+            ["t3", "t2", "t1", "rc", "rv", "g3", "cs", "cz", "c1"]
+        ]),
     );
     let mut aux = JsonMap::new();
     aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
@@ -2139,9 +2217,204 @@ pub fn f11_reopen_recovery_keeps_basis() -> Vector {
                 { "incarnation": 0, "terminal": "abort" },
             ],
             "per_record": [
+                { "rec": "c1" },
+                { "rec": "cz" },
+                { "rec": "cs" },
+                { "rec": "g3" },
+                // Based at the head: the cut covers nothing — the
+                // revocation SURVIVES accepted.
+                { "rec": "rv" },
+                { "rec": "rc" },
                 { "rec": "t1" },
                 { "rec": "t2" },
                 { "rec": "t3", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
+/// Review R3 arm: a reopen citing a FORGED recovery — the delivered
+/// invalidation is signature-invalid, so it is REJECTED by the
+/// engine and can never become authority; the citation is
+/// unverifiable, `(log-corrupt, storage-quarantine)` (D-163). This
+/// is the review's reproduced trace made a committed negative: the
+/// pre-repair machine verified this exact kill from held bytes'
+/// shape.
+pub fn f11_reopen_forged_recovery_rejects() -> Vector {
+    let name = "reopen-forged-recovery-log-corrupt";
+    let mut p = journal_preamble(name, 1);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let r1 = p.srcs[0];
+    let mut recovery = recovery_cutting_revocation(&mut p);
+    recovery.signature[0] ^= 1;
+
+    let t2 = Txn {
+        records: vec![Txnrec::XferAbort(Xferabort {
+            export_id: eid,
+            release_op: rop,
+            reason: AbortReason::RejectPermanent,
+            incarnation: 0,
+            missing: vec![MissingRec {
+                rec: r1,
+                basis: Some(x),
+            }],
+        })],
+    };
+    let t3 = Txn {
+        records: vec![Txnrec::XferReopen(Xferreopen {
+            export_id: eid,
+            release_op: rop,
+            incarnation: 0,
+            basis: x,
+            invalidation: Factref::Op(recovery.op_hash()),
+        })],
+    };
+
+    let c1 = p.rig.genesis_op.clone();
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[
+            ("c1", &c1.encode()),
+            ("cz", &p.zone_op.encode()),
+            ("cs", &p.space_op.encode()),
+            ("g3", &p.grant3_op.encode()),
+            ("rv", &p.revoke_op.encode()),
+            ("rc", &recovery.encode()),
+            ("t1", &enc(&p.t1)),
+            ("t2", &enc(&t2)),
+            ("t3", &enc(&t3)),
+        ]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([
+            ["c1", "cz", "cs", "g3", "rv", "rc", "t1", "t2", "t3"],
+            ["t3", "t2", "t1", "rc", "rv", "g3", "cs", "cz", "c1"]
+        ]),
+    );
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    aux.insert("recovery.op".into(), json!(hex(&recovery.encode())));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+            ],
+            "per_record": [
+                { "rec": "c1" },
+                { "rec": "cz" },
+                { "rec": "cs" },
+                { "rec": "g3" },
+                { "rec": "rv" },
+                { "rec": "rc", "outcome": "sig-invalid", "disposition": "reject-permanent" },
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "log-corrupt", "disposition": "storage-quarantine" },
+            ],
+            "converge": true,
+        })),
+    }
+}
+
+/// Review R3 arm: a VALIDLY SIGNED recovery held in aux but never
+/// delivered — held bytes are not authority until the engine admits
+/// them, so the reopen PENDS `ref-unresolved`
+/// (verifiable-when-ADMITTED, the D-163/D-185 reservation extended
+/// from held to authoritative). Distinct from the unheld-pends
+/// sibling: here the bytes ARE held and well-formed; admission is
+/// what's missing.
+pub fn f11_reopen_unadmitted_recovery_pends() -> Vector {
+    let name = "reopen-unadmitted-recovery-pends";
+    let mut p = journal_preamble(name, 1);
+    let (eid, rop) = (p.export_id, p.release_op);
+    let x = Opfactref(p.revoke_op.op_hash());
+    let r1 = p.srcs[0];
+    let recovery = recovery_cutting_revocation(&mut p);
+
+    let t2 = Txn {
+        records: vec![Txnrec::XferAbort(Xferabort {
+            export_id: eid,
+            release_op: rop,
+            reason: AbortReason::RejectPermanent,
+            incarnation: 0,
+            missing: vec![MissingRec {
+                rec: r1,
+                basis: Some(x),
+            }],
+        })],
+    };
+    let t3 = Txn {
+        records: vec![Txnrec::XferReopen(Xferreopen {
+            export_id: eid,
+            release_op: rop,
+            incarnation: 0,
+            basis: x,
+            invalidation: Factref::Op(recovery.op_hash()),
+        })],
+    };
+
+    let c1 = p.rig.genesis_op.clone();
+    let mut inputs = JsonMap::new();
+    inputs.insert(
+        "items".into(),
+        items_raw(&[
+            ("c1", &c1.encode()),
+            ("cz", &p.zone_op.encode()),
+            ("cs", &p.space_op.encode()),
+            ("g3", &p.grant3_op.encode()),
+            ("rv", &p.revoke_op.encode()),
+            ("t1", &enc(&p.t1)),
+            ("t2", &enc(&t2)),
+            ("t3", &enc(&t3)),
+        ]),
+    );
+    inputs.insert(
+        "deliveries".into(),
+        json!([
+            ["c1", "cz", "cs", "g3", "rv", "t1", "t2", "t3"],
+            ["t3", "t2", "t1", "rv", "g3", "cs", "cz", "c1"]
+        ]),
+    );
+    let mut aux = JsonMap::new();
+    aux.insert("grant3.op".into(), json!(hex(&p.grant3_op.encode())));
+    aux.insert("revoke.op".into(), json!(hex(&p.revoke_op.encode())));
+    aux.insert("recovery.op".into(), json!(hex(&recovery.encode())));
+    inputs.insert("aux".into(), Json::Object(aux));
+
+    Vector {
+        family: 11,
+        name: name.into(),
+        case_kind: "journal-replay".into(),
+        source: "6.2".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(p.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "intervals": [
+                { "incarnation": 0, "terminal": "abort" },
+            ],
+            "per_record": [
+                { "rec": "c1" },
+                { "rec": "cz" },
+                { "rec": "cs" },
+                { "rec": "g3" },
+                { "rec": "rv" },
+                { "rec": "t1" },
+                { "rec": "t2" },
+                { "rec": "t3", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
             ],
             "converge": true,
         })),
@@ -2748,6 +3021,8 @@ pub fn tranche() -> Vec<Vector> {
         f11_reopen_basis_types(),
         f11_reopen_recovery_invalidation_pends(),
         f11_reopen_recovery_keeps_basis(),
+        f11_reopen_forged_recovery_rejects(),
+        f11_reopen_unadmitted_recovery_pends(),
         f13_txn_internal_order(),
     ]
 }

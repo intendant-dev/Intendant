@@ -102,7 +102,12 @@ impl JournalState {
 
     /// Replay one txn frame. `Err(inner Verdict)` semantics ride the
     /// outer `Verdict` — this returns the frame's classification.
-    fn replay_txn(&mut self, node: &Node, fold: &State) -> Result<Verdict, Unimplemented> {
+    fn replay_txn(
+        &mut self,
+        node: &Node,
+        fold: &State,
+        op_verdicts: &BTreeMap<[u8; 32], Verdict>,
+    ) -> Result<Verdict, Unimplemented> {
         let corrupt = Verdict::Rejected("log-corrupt", "storage-quarantine");
         if !keys_are(node, &["records"]) {
             return Ok(corrupt);
@@ -126,7 +131,7 @@ impl JournalState {
             } else if keys.contains(&"missing") {
                 local.apply_abort(rec, fold)?
             } else if keys.contains(&"basis") {
-                local.apply_reopen(rec, fold)?
+                local.apply_reopen(rec, fold, op_verdicts)?
             } else {
                 return Ok(corrupt);
             };
@@ -395,6 +400,7 @@ impl JournalState {
         &mut self,
         rec: &Node,
         fold: &State,
+        op_verdicts: &BTreeMap<[u8; 32], Verdict>,
     ) -> Result<Result<(), Verdict>, Unimplemented> {
         let bad = Ok(Err(Verdict::Rejected("log-corrupt", "storage-quarantine")));
         if !keys_are(
@@ -470,30 +476,59 @@ impl JournalState {
                 )))
             }
         }
-        // Kill verification (D-163/D-179): a HELD citation is
-        // verifiable — the invalidation must actually dissolve the
-        // recorded basis, never be taken on faith. The one
-        // wire-expressible killer of a control-chain fact is a
-        // recovery whose §7.4 branch cut covers it: `base.seq`
-        // strictly below the basis's chain position on the SAME
-        // writer chain. A held recovery that KEEPS the basis is a
-        // verified-false citation — log-corrupt (D-163's
-        // "uncited/unverifiable"). Statement killers
-        // (fork-discovery) have no §4.7 wire shape, and other op
-        // kinds / cross-chain cuts have no vectors — both stay
-        // honestly Unimplemented.
-        let Some(basis_bytes) = self.held_ops.get(&basis) else {
-            return Err(Unimplemented(
-                "reopen kill verification needs the basis bytes held in aux".into(),
-            ));
-        };
-        let basis_op = parse_op(basis_bytes)
-            .map_err(|e| Unimplemented(format!("held basis re-parse: {e:?}")))?;
+        // Kill verification (D-163/D-179, hardened per the 2026-07-15
+        // review's R3): a citation is verified against AUTHORITY,
+        // never taken on faith — the pre-repair check re-parsed held
+        // bytes and predicted the kill from their SHAPE, so a
+        // signature-invalid recovery verified a reopen (the review's
+        // reproduced trace). Now the invalidation must be an
+        // AUTHENTICATED, ADMITTED control fact and the kill must
+        // have actually HAPPENED:
+        //
+        // - the cited op is ACCEPTED on the fold's control chain
+        //   (admission is the plane's authentication — a forged
+        //   recovery never admits), AND the basis is DEAD there (cut
+        //   by the recovery's §7.4 branch cut) → the kill verifies;
+        // - the cited op is accepted but the basis still stands →
+        //   verified-false, `log-corrupt` (D-163);
+        // - the cited op is REJECTED by the engine or lies on a cut
+        //   branch (the fold's §7.4 overlay) → it can never be
+        //   authority: an unverifiable citation, `log-corrupt`;
+        // - otherwise (held bytes not yet admitted, or nothing held)
+        //   → pending, verifiable-when-ADMITTED (D-163/D-185's
+        //   reservation extended from held to authoritative).
+        //
+        // The retained shape checks (recovery kind, same writer
+        // chain, base strictly below the basis) bind the CITED kill
+        // to the cut the fold performed. Statement killers
+        // (fork-discovery) have no §4.7 wire shape and stay honestly
+        // Unimplemented.
         match &invalidation {
             Fact::Op(h) => {
+                if let Some(v) = op_verdicts.get(h) {
+                    if matches!(v, Verdict::Rejected(..)) {
+                        // Delivered and rejected (a forged signature,
+                        // a malformed body): the citation can never
+                        // become authority.
+                        return bad;
+                    }
+                }
+                if let Some(Verdict::Rejected(..)) = fold.ctrl_overlaid(h) {
+                    // Admitted once, then cut or frozen off the
+                    // chain: dead authority.
+                    return bad;
+                }
+                if !fold.ctrl_accepted(h) {
+                    // Held bytes are not authority until the engine
+                    // admits them (the review's unadmitted arm).
+                    return Ok(Err(Verdict::Pending(
+                        "ref-unresolved",
+                        "pending-dependency",
+                    )));
+                }
                 let Some(inv_bytes) = self.held_ops.get(h) else {
                     return Err(Unimplemented(
-                        "reopen kill verification needs the invalidation bytes held in aux".into(),
+                        "reopen kill verification needs the invalidation bytes held".into(),
                     ));
                 };
                 let inv = parse_op(inv_bytes)
@@ -504,6 +539,13 @@ impl JournalState {
                         inv.header.operation_type
                     )));
                 }
+                let Some(basis_bytes) = self.held_ops.get(&basis) else {
+                    return Err(Unimplemented(
+                        "reopen kill verification needs the basis bytes held".into(),
+                    ));
+                };
+                let basis_op = parse_op(basis_bytes)
+                    .map_err(|e| Unimplemented(format!("held basis re-parse: {e:?}")))?;
                 if inv.header.writer_lineage != basis_op.header.writer_lineage {
                     return Err(Unimplemented(
                         "recovery-cut kill for a basis outside the recovery's chain awaits \
@@ -517,12 +559,18 @@ impl JournalState {
                     .and_then(|b| b.get("seq"))
                     .and_then(|n| n.as_uint());
                 let Some(base_seq) = base_seq else {
-                    // A held recovery without a readable base cannot
-                    // verify the kill.
                     return bad;
                 };
                 if base_seq >= basis_op.header.writer_sequence {
                     // The recovery keeps the basis: verified-false.
+                    return bad;
+                }
+                // The kill must have HAPPENED: the basis is dead on
+                // the fold (cut by the accepted recovery), not
+                // merely predicted dead from the cited shape.
+                let basis_dead = matches!(fold.ctrl_overlaid(&basis), Some(Verdict::Rejected(..)))
+                    && !fold.ctrl_accepted(&basis);
+                if !basis_dead {
                     return bad;
                 }
             }
@@ -598,63 +646,74 @@ pub fn run_journal(
     aux: &BTreeMap<String, Vec<u8>>,
     order: &[String],
 ) -> Result<JournalRun, Unimplemented> {
+    // Order convergence is structural, mirroring the fold engine
+    // (review R1): the replay is recomputed from scratch over the
+    // delivered SET in a content-derived canonical order — ops by
+    // chain coordinate, frames after them by content hash — with a
+    // verdict-stable fixpoint, so the result is a pure function of
+    // the delivered set. (The pre-repair loop retried pendings in
+    // arrival order; the committed corpus never diverged, but the
+    // mechanism was the same one behind the fold lane's R1 class.)
+    let mut uniq: Vec<&String> = order.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    uniq.sort_by_key(|n| crate::fold::canonical_key(&items[*n]));
+
     let mut fold = State::default();
     let mut journal = JournalState::default();
     for bytes in aux.values() {
         journal.hold_aux(bytes)?;
     }
-
     let mut verdicts: BTreeMap<String, Verdict> = BTreeMap::new();
-    let mut pending: Vec<String> = Vec::new();
     let mut hashes: BTreeMap<String, [u8; 32]> = BTreeMap::new();
+    for name in &uniq {
+        if let Ok(op) = parse_op(&items[*name]) {
+            hashes.insert((*name).clone(), op.op_hash());
+        }
+    }
 
-    let step = |name: &String,
-                fold: &mut State,
-                journal: &mut JournalState|
-     -> Result<Verdict, Unimplemented> {
-        let bytes = &items[name];
-        let node = decode(bytes).map_err(|e| Unimplemented(format!("item decode: {e:?}")))?;
-        if node.map_keys().is_some_and(|k| k.contains(&"records")) {
-            journal.replay_txn(&node, fold)
-        } else {
-            classify(fold, bytes)
-        }
-    };
-
-    for name in order {
-        if let Ok(op) = parse_op(&items[name]) {
-            hashes.insert(name.clone(), op.op_hash());
-        }
-        let v = step(name, &mut fold, &mut journal)?;
-        verdicts.insert(name.clone(), v);
-        if matches!(v, Verdict::Pending(..)) {
-            pending.push(name.clone());
-        }
-        loop {
-            let mut progressed = false;
-            let mut still = Vec::new();
-            for pname in pending.drain(..) {
-                let v = step(&pname, &mut fold, &mut journal)?;
-                verdicts.insert(pname.clone(), v);
-                match v {
-                    Verdict::Pending(..) => still.push(pname),
-                    Verdict::Admitted => progressed = true,
-                    Verdict::Rejected(..) => {}
-                }
+    let rounds_cap = uniq.len() * 2 + 4;
+    let mut stabilized = false;
+    for _ in 0..rounds_cap {
+        let mut changed = false;
+        for name in &uniq {
+            match verdicts.get(*name) {
+                Some(Verdict::Admitted) | Some(Verdict::Rejected(..)) => continue,
+                _ => {}
             }
-            pending = still;
-            if !progressed {
-                break;
+            let bytes = &items[*name];
+            let node = decode(bytes).map_err(|e| Unimplemented(format!("item decode: {e:?}")))?;
+            let op_verdicts: BTreeMap<[u8; 32], Verdict> = hashes
+                .iter()
+                .filter_map(|(n, h)| verdicts.get(n).map(|v| (*h, *v)))
+                .collect();
+            let v = if node.map_keys().is_some_and(|k| k.contains(&"records")) {
+                journal.replay_txn(&node, &fold, &op_verdicts)?
+            } else {
+                classify(&mut fold, bytes)?
+            };
+            if verdicts.get(*name) != Some(&v) {
+                changed = true;
+                verdicts.insert((*name).clone(), v);
             }
         }
-        let derived = fold.derived_tenant_verdicts()?;
-        for (n, h) in &hashes {
-            if verdicts.get(n) == Some(&Verdict::Rejected("duplicate", "duplicate-idempotent")) {
-                continue;
-            }
-            if let Some(v) = derived.get(h) {
-                verdicts.insert(n.clone(), *v);
-            }
+        if !changed {
+            stabilized = true;
+            break;
+        }
+    }
+    if !stabilized {
+        return Err(Unimplemented(
+            "journal replay did not stabilize within the round cap".into(),
+        ));
+    }
+    let derived = fold.derived_tenant_verdicts()?;
+    for (n, h) in &hashes {
+        if let Some(v) = derived.get(h) {
+            verdicts.insert(n.clone(), *v);
+        }
+        if let Some(v) = fold.ctrl_overlaid(h) {
+            verdicts.insert(n.clone(), v);
         }
     }
 

@@ -442,12 +442,13 @@ mod tests {
             vec!["f07-header-unknown-version-rejects.json/x".to_string()],
             "unexpected version failures"
         );
-        // Every fold fixture folds its genesis (6 tranche + 14
-        // fold-lane + 1 export-import + 9 status + 7 time/lease +
-        // 14 control-fold + 3 budget + 8 audit + 11 time corpus minus
-        // the journal four; every fold fixture delivers c1); the
-        // four journal fixtures deliver Txn frames only.
-        assert_eq!(geneses, 68);
+        // Every fold fixture folds its genesis, and since the R3
+        // repair the kill-exercising journal fixtures deliver their
+        // control arc too (authority comes from admission): the old
+        // 68 plus txn-internal-order, keeps-basis, and the two new
+        // R3 arms (forged, unadmitted). Only the stmt basis-typing
+        // and unheld-pends journal fixtures remain frame/aux-only.
+        assert_eq!(geneses, 77);
     }
 
     /// Tampering any byte of the header breaks the signature; the
