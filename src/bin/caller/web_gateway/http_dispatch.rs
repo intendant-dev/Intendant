@@ -19,7 +19,9 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) session_provider: String,
     pub(crate) session_model: String,
     pub(crate) agent_card_json: String,
-    pub(crate) agent_card_value_for_targets: serde_json::Value,
+    /// Shared, not owned: rebuilt per request under keep-alive, and the
+    /// card is a multi-KB JSON tree most handlers never touch.
+    pub(crate) agent_card_value_for_targets: Arc<serde_json::Value>,
     pub(crate) app_html: Arc<String>,
     pub(crate) app_html_override: Option<Arc<std::path::Path>>,
     pub(crate) app_html_cache: Arc<OnceLock<(String, Vec<u8>)>>,
