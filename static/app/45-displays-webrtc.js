@@ -1448,7 +1448,6 @@ class DisplaySlot {
         tickerFramesDropped++;
         sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
       }
-      updateTickerFrames();
       // HQ: logical resolution — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);

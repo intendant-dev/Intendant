@@ -1537,11 +1537,11 @@ let dashboardEventGapPendingSkipped = 0;
 let dashboardEventGapToastTimer = null;
 let dashboardEventGapLastHydrateAt = 0;
 
-// Visual pulse on the status chip for the lane that reported the gap —
-// Web Animations API only, so no stylesheet dependency.
-function dashboardPulseEventLaneChip(lane) {
-  const id = lane === 'ws' ? 'sb-conn-group' : 'sb-dashboard-transport';
-  const el = document.getElementById(id) || document.getElementById('sb-conn-group');
+// Visual pulse on the oversight-bar connection chip for an event gap —
+// Web Animations API only, so no stylesheet dependency. (Both lanes pulse
+// the same chip: the oversight bar shows one transport indicator.)
+function dashboardPulseEventLaneChip(_lane) {
+  const el = document.getElementById('ui2-conn');
   if (!el || typeof el.animate !== 'function') return;
   try {
     el.animate(
@@ -2891,53 +2891,9 @@ function renderDaemonsList() {
   renderDashboardTargetSummaries();
 
   // Refresh the aggregate connection dot in the status bar.
-  updateHostsAggregateDot();
   stationScheduleUpdate();
 }
 
-// Update the always-visible status-bar dot summarizing multi-host
-// connection state. Priority: red (any disconnected) > yellow (any
-// SHA mismatch) > green. The whole group (separator + label + dot) is
-// hidden when no secondaries are configured so single-host setups
-// stay clean.
-function updateHostsAggregateDot() {
-  const group = document.getElementById('sb-hosts-group');
-  const dot = document.getElementById('sb-hosts-dot');
-  if (!dot || !group) return;
-  if (daemons.length === 0) {
-    group.classList.add('hidden');
-    return;
-  }
-  group.classList.remove('hidden');
-
-  let anyDisconnected = false;
-  let anySkewed = false;
-  const skewedHosts = [];
-  const disconnectedHosts = [];
-  for (const d of daemons) {
-    if (!d.connected) {
-      anyDisconnected = true;
-      disconnectedHosts.push(d.label || d.host_id);
-      continue;
-    }
-    if (selfGitSha && d.git_sha && d.git_sha !== selfGitSha) {
-      anySkewed = true;
-      skewedHosts.push(`${d.label || d.host_id} (${d.git_sha} vs ${selfGitSha})`);
-    }
-  }
-
-  dot.classList.remove('ok', 'warn', 'err');
-  if (anyDisconnected) {
-    dot.classList.add('err');
-    dot.title = `Disconnected: ${disconnectedHosts.join(', ')}`;
-  } else if (anySkewed) {
-    dot.classList.add('warn');
-    dot.title = `Version mismatch: ${skewedHosts.join(', ')}. Rebuild to match self (${selfGitSha}).`;
-  } else {
-    dot.classList.add('ok');
-    dot.title = `All ${daemons.length} secondary daemon${daemons.length === 1 ? '' : 's'} connected and on matching version`;
-  }
-}
 
 // Render the human-readable text for one Capability JSON value as it
 // arrives in the /api/peers response. Built-in variants serialize as

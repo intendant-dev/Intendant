@@ -12212,11 +12212,11 @@ html.ui-v2 :focus:not(:focus-visible) { outline: none; }
 /* ── static/app/ui2-chrome.css ── */
 /* ── ui-v2 chrome: nav rail + oversight bar (design-overhaul P1a) ──────
    Entirely scoped under html.ui-v2. Layout strategy: the chrome is
-   fixed-position and #app is padded under it, so the v1 DOM inside #app
-   is never restructured. The v1 .tab-bar is the one strip hidden here —
-   its role is fully replaced by the rail (same .tab-btn contract). The
-   v1 status/ticker/task strips intentionally stay visible (bridge paint)
-   until their elements are absorbed by later program phases.
+   fixed-position and #app is padded under it, so the tab-pane DOM inside
+   #app is never restructured. The v1 status/ticker/tab-bar chrome is
+   DELETED — the rail owns navigation (its items carry the .tab-btn
+   router contract), and the old bars' written/read IDs survive as the
+   hidden #sb-state data nodes in 20-shell.html.
 
    Blur discipline carried from v1: backdrop-filter only on flow chrome
    that never overlaps the Station canvases — the fixed rail and the
@@ -12251,7 +12251,6 @@ html.ui-v2 #app {
   padding-top: calc(var(--ui2-ovs-h) + var(--ui2-sa-t));
   padding-right: var(--ui2-sa-r);
 }
-html.ui-v2 .tab-bar { display: none; }
 
 /* ── nav rail ── */
 html.ui-v2 #ui2-nav {
@@ -12596,8 +12595,6 @@ html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
    duplicated the oversight bar; their unique facts (provider·model,
    turn, tok/cost) now live in #ui2-ovs-facts as mirrors. The elements
    stay in the DOM — pinned ids, v1 JS keeps writing them. ── */
-html.ui-v2 #status-bar { display: none; }
-html.ui-v2 #ticker-bar { display: none; }
 
 html.ui-v2 .ui2-ovs-facts {
   display: inline-flex;
@@ -23151,78 +23148,40 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
 <a class="ui2-skip" href="#ui2-nav">Skip to navigation</a>
 <div id="app">
 
-  <!-- Status Bar -->
-  <div class="status-bar" id="status-bar">
-    <span class="host-label" id="sb-host-label" title="This daemon's identity. Set it with `intendant access setup --name <label>` or it falls back to the system hostname.">local</span>
-    <span class="sep">|</span>
-    <span class="provider" id="sb-provider">--</span>
-    <span class="sep">/</span>
-    <span class="model" id="sb-model">--</span>
-    <span class="sep">|</span>
-    <span class="turn" id="sb-turn">T0</span>
-    <span class="sep">|</span>
-    <span class="field-label">ctx</span>
-    <div class="budget-bar">
-      <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
-      <span class="budget-pct" id="sb-budget-pct">--</span>
-    </div>
-    <span class="sep">|</span>
-    <span class="field-label">autonomy</span>
-    <span class="autonomy" id="sb-autonomy" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
-    <span class="sep">|</span>
-    <span class="display-toggle-wrap">
-      <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
-      <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
-      <div class="display-picker" id="display-picker" aria-hidden="true"></div>
-    </span>
-    <span class="sep">|</span>
-    <span class="field-label">Intendant session</span>
-    <span class="session" id="sb-session"></span>
-    <span class="sep">|</span>
-    <span class="sb-dot-group" id="sb-conn-group" title="WebSocket connection to this daemon">
-      <span class="field-label" id="sb-conn-label">ws</span>
-      <span class="conn-dot err" id="sb-conn"></span>
-    </span>
-    <span class="sb-dot-group clickable" id="sb-dashboard-transport" title="Dashboard access — click for connection diagnostics">
-      <span class="field-label" id="sb-dashboard-transport-prefix">access</span>
+  <!-- Client state cache. The v1 status bar and ticker used to render
+       these values; the visible chrome is gone, but the nodes remain the
+       shared client-side truth: shared writers (session-window actions,
+       voice/WASM callbacks, transport status, managed context) write them,
+       and the oversight-bar mirrors (ui2-chrome.js ui2Mirror
+       MutationObservers), Station debug payloads, shortcut handlers
+       (cycleAutonomy reads #sb-autonomy, setUserDisplayState writes
+       #sb-display-access), and the QA harness read them. Rewiring every
+       shared writer/reader pair is tracked follow-up work; until then
+       these are data nodes, not UI. #display-picker starts here and is
+       portaled to <body> on first open. -->
+  <div hidden id="sb-state">
+    <span id="sb-host-label">local</span>
+    <span id="sb-provider">--</span>
+    <span id="sb-model">--</span>
+    <span id="sb-turn">T0</span>
+    <span id="sb-budget-pct">--</span>
+    <span id="sb-autonomy">Medium</span>
+    <span id="sb-display-access">off</span>
+    <span id="sb-session"></span>
+    <span class="conn-dot err" id="sb-conn"></span>
+    <span id="sb-dashboard-transport">
+      <span id="sb-dashboard-transport-prefix">access</span>
       <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
       <span id="sb-dashboard-transport-label">Ready</span>
     </span>
-    <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
-      <span class="field-label">live</span>
-      <span class="voice-dot" id="sb-voice"></span>
-      <span id="sb-voice-label"></span>
-    </span>
-    <span class="sb-dot-group clickable hidden" id="sb-hosts-group" title="Aggregate state of configured secondary daemons - click to open Access targets">
-      <span class="sep">|</span>
-      <span class="field-label">hosts</span>
-      <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
-    </span>
-    <span class="sb-dot-group clickable" id="sb-access-page-link" title="Open fleet access administration">
-      <span class="sep">|</span>
-      <span class="field-label" id="sb-access-page-prefix">admin</span>
-      <span class="access-nav-link" id="sb-access-page-label">Access</span>
-    </span>
-    <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
+    <span class="voice-dot" id="sb-voice"></span>
+    <span id="sb-voice-label"></span>
+    <span class="active-badge is-active" id="sb-active-badge">Active</span>
+    <span class="badge" id="badge-activity"></span>
+    <span id="tk-tokens">-- tok</span>
+    <span id="tk-cost">$0</span>
   </div>
-
-  <!-- Token Ticker -->
-  <div class="ticker-bar" id="ticker-bar" onclick="toggleTicker()">
-    <span class="ticker-chevron" id="ticker-chevron">&#x25B8;</span>
-    <div class="ticker-collapsed" id="ticker-collapsed">
-      <span id="tk-tokens">-- tok</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-cached">-- cached</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-frames">0 frames</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-cost">$0</span>
-    </div>
-    <div class="ticker-expanded hidden" id="ticker-expanded">
-      <div id="tk-detail-1">--</div>
-      <div id="tk-detail-2">--</div>
-    </div>
-  </div>
+  <div class="display-picker" id="display-picker" aria-hidden="true"></div>
 
   <!-- Global Task Bar — always visible across tabs -->
   <div class="global-task-bar">
@@ -23260,21 +23219,9 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
     <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
   </div>
 
-  <!-- Tab Bar -->
-  <nav class="tab-bar">
-    <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
-    <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
-    <button class="tab-btn" data-tab="terminal" title="Interactive shell on this daemon">Terminal</button>
-    <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
-    <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
-    <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
-    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
-    <button class="tab-btn" data-tab="access" title="Who can reach this daemon and its fleet — people, peers, roles, and connection diagnostics">Access</button>
-    <button class="tab-btn" data-tab="debug" title="Observer display and browser workspaces">Debug</button>
-    <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
-  </nav>
-
   <!-- Tab Content -->
+  <!-- Tab navigation lives in the ui-v2 rail (ui2-shell.html); its items
+       carry the .tab-btn class the router binds. -->
   <div class="tab-content">
 
     <!-- Station Tab -->
@@ -28004,7 +27951,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '014802003d07f568';
+const INTENDANT_APP_BUILD = 'c5e6718315bccaf7';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -41240,7 +41187,6 @@ async function startVideo() {
       tickerFramesDropped++;
       sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
     }
-    updateTickerFrames();
 
     // Send HQ frame (logical resolution) to server for archival (always)
     const camMax = 1920;
@@ -55985,28 +55931,22 @@ function renderSessionWindowLogEntryOnly(c) {
 }
 
 function setContextUsagePct(pct) {
-  const fill = document.getElementById('sb-budget-fill');
+  // #sb-budget-pct is a hidden data node; the oversight bar's context
+  // meter mirrors its textContent (ui2-chrome.js) and the vitals rail
+  // reads it (ui2-activity.js). Only the text matters now.
   const label = document.getElementById('sb-budget-pct');
-  if (!fill || !label) return;
+  if (!label) return;
   if (pct === undefined || pct === null || Number.isNaN(Number(pct))) {
-    fill.style.width = '0%';
-    fill.style.background = 'var(--overlay0)';
     label.textContent = '--';
-    label.style.color = 'var(--overlay0)';
     return;
   }
   const value = Number(pct);
-  // The label clamps like the fill: a stale context window can briefly
-  // over-report (backends now clamp too, but replayed older sessions
-  // still carry raw values) and "142.3%" is a lie either way — the
-  // tooltip keeps the raw figure for the curious.
+  // Clamp: a stale context window can briefly over-report (backends now
+  // clamp too, but replayed older sessions still carry raw values) and
+  // "142.3%" is a lie either way — the title keeps the raw figure.
   const shown = Math.min(value, 100);
-  fill.style.width = shown + '%';
-  const color = shown < 50 ? 'var(--green)' : shown < 85 ? 'var(--yellow)' : 'var(--red)';
-  fill.style.background = color;
   label.textContent = shown.toFixed(1) + '%';
   label.title = value > 100 ? `raw reading ${value.toFixed(1)}% — context window estimate stale` : '';
-  label.style.color = color;
 }
 
 function parseUsageJson(raw) {
@@ -56787,34 +56727,14 @@ function updateTickerFromUsage(c) {
     } catch {}
   }
 
-  // Collapsed view
-  const tkTokens = document.getElementById('tk-tokens');
-  const tkCached = document.getElementById('tk-cached');
-  const tkCost = document.getElementById('tk-cost');
-  tkTokens.textContent = fmtK(total) + ' tok';
-  tkCached.textContent = fmtK(cached) + ' cached (' + cacheHit + '%)';
-  tkCost.textContent = liveCost == null ? '$--' : formatUsd(liveCost, 4);
-  flashEl(tkTokens);
-
-  // Expanded view
-  document.getElementById('tk-detail-1').textContent =
-    'Live: ' + total.toLocaleString() + ' tokens (in: ' + input.toLocaleString() + ' | out: ' + output.toLocaleString() + ' | think: ' + thinking.toLocaleString() + ')';
-  document.getElementById('tk-detail-2').textContent =
-    'Cache: ' + cached.toLocaleString() + ' / ' + input.toLocaleString() + ' input = ' + cacheHit + '% hit | Frames: ' + tickerFramesSent + ' sent, ' + tickerFramesDropped + ' dropped | Cost: ' + (liveCost == null ? '$--' : formatUsd(liveCost, 4));
+  // Hidden data nodes; the oversight bar's tokens-cost fact mirrors them
+  // (ui2-chrome.js factsTokens).
+  document.getElementById('tk-tokens').textContent = fmtK(total) + ' tok';
+  document.getElementById('tk-cost').textContent =
+    liveCost == null ? '$--' : formatUsd(liveCost, 4);
 }
 
-function updateTickerFrames() {
-  const el = document.getElementById('tk-frames');
-  el.textContent = tickerFramesSent + ' frames' + (tickerFramesDropped > 0 ? ' (' + tickerFramesDropped + ' dropped)' : '');
-  flashEl(el);
-}
 
-window.toggleTicker = function() {
-  tickerExpanded = !tickerExpanded;
-  document.getElementById('ticker-chevron').innerHTML = tickerExpanded ? '&#x25BE;' : '&#x25B8;';
-  document.getElementById('ticker-collapsed').classList.toggle('hidden', tickerExpanded);
-  document.getElementById('ticker-expanded').classList.toggle('hidden', !tickerExpanded);
-};
 
 function renderUsageTab(c) {
   // update_usage fires on every token tick; rebuilding the Stats region
@@ -66285,7 +66205,6 @@ class DisplaySlot {
         tickerFramesDropped++;
         sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
       }
-      updateTickerFrames();
       // HQ: logical resolution — always sent for archival
       const dpr = window.devicePixelRatio || 1;
       this._streamCanvas.width = Math.round(sw / dpr);
@@ -72667,21 +72586,6 @@ function openAccessHome() {
   }
 }
 
-function syncAccessPageNavLink() {
-  const prefix = document.getElementById('sb-access-page-prefix');
-  const label = document.getElementById('sb-access-page-label');
-  const group = document.getElementById('sb-access-page-link');
-  if (!prefix || !label || !group) return;
-  if (DASHBOARD_ACCESS_PAGE_MODE) {
-    prefix.textContent = 'back';
-    label.textContent = 'Dashboard';
-    group.title = 'Return to the daemon dashboard';
-  } else {
-    prefix.textContent = 'admin';
-    label.textContent = 'Access';
-    group.title = 'Open fleet access administration';
-  }
-}
 
 function tabDomMatches(tab) {
   const pane = document.getElementById('tab-' + tab);
@@ -78847,11 +78751,11 @@ let dashboardEventGapPendingSkipped = 0;
 let dashboardEventGapToastTimer = null;
 let dashboardEventGapLastHydrateAt = 0;
 
-// Visual pulse on the status chip for the lane that reported the gap —
-// Web Animations API only, so no stylesheet dependency.
-function dashboardPulseEventLaneChip(lane) {
-  const id = lane === 'ws' ? 'sb-conn-group' : 'sb-dashboard-transport';
-  const el = document.getElementById(id) || document.getElementById('sb-conn-group');
+// Visual pulse on the oversight-bar connection chip for an event gap —
+// Web Animations API only, so no stylesheet dependency. (Both lanes pulse
+// the same chip: the oversight bar shows one transport indicator.)
+function dashboardPulseEventLaneChip(_lane) {
+  const el = document.getElementById('ui2-conn');
   if (!el || typeof el.animate !== 'function') return;
   try {
     el.animate(
@@ -80201,53 +80105,9 @@ function renderDaemonsList() {
   renderDashboardTargetSummaries();
 
   // Refresh the aggregate connection dot in the status bar.
-  updateHostsAggregateDot();
   stationScheduleUpdate();
 }
 
-// Update the always-visible status-bar dot summarizing multi-host
-// connection state. Priority: red (any disconnected) > yellow (any
-// SHA mismatch) > green. The whole group (separator + label + dot) is
-// hidden when no secondaries are configured so single-host setups
-// stay clean.
-function updateHostsAggregateDot() {
-  const group = document.getElementById('sb-hosts-group');
-  const dot = document.getElementById('sb-hosts-dot');
-  if (!dot || !group) return;
-  if (daemons.length === 0) {
-    group.classList.add('hidden');
-    return;
-  }
-  group.classList.remove('hidden');
-
-  let anyDisconnected = false;
-  let anySkewed = false;
-  const skewedHosts = [];
-  const disconnectedHosts = [];
-  for (const d of daemons) {
-    if (!d.connected) {
-      anyDisconnected = true;
-      disconnectedHosts.push(d.label || d.host_id);
-      continue;
-    }
-    if (selfGitSha && d.git_sha && d.git_sha !== selfGitSha) {
-      anySkewed = true;
-      skewedHosts.push(`${d.label || d.host_id} (${d.git_sha} vs ${selfGitSha})`);
-    }
-  }
-
-  dot.classList.remove('ok', 'warn', 'err');
-  if (anyDisconnected) {
-    dot.classList.add('err');
-    dot.title = `Disconnected: ${disconnectedHosts.join(', ')}`;
-  } else if (anySkewed) {
-    dot.classList.add('warn');
-    dot.title = `Version mismatch: ${skewedHosts.join(', ')}. Rebuild to match self (${selfGitSha}).`;
-  } else {
-    dot.classList.add('ok');
-    dot.title = `All ${daemons.length} secondary daemon${daemons.length === 1 ? '' : 's'} connected and on matching version`;
-  }
-}
 
 // Render the human-readable text for one Capability JSON value as it
 // arrives in the /api/peers response. Built-in variants serialize as
@@ -101855,7 +101715,7 @@ function showDisplayPicker(displays, mode) {
   // to the live rail's "Your screen" card (the control that proxies the
   // grant under v2). Single-display hosts grant instantly and never open
   // the picker, which is why this only bit multi-display setups.
-  if (picker.closest('#status-bar')) {
+  if (picker.parentElement !== document.body) {
     document.body.appendChild(picker);
   }
   if (picker.parentElement === document.body) {
@@ -102216,15 +102076,6 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
   switchStatsHost(e.target.value);
 });
 
-// Hosts aggregate dot (and its surrounding label group) in the status
-// bar - click jumps to Access targets so the user can investigate
-// which host is disconnected/skewed.
-document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  if (DASHBOARD_ACCESS_PAGE_MODE) routeTo('access', 'daemons');
-  else window.location.href = accessHomeHref('daemons');
-});
-document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
-document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => openConnectionDiagnostics());
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
 
 // Join-with-an-org-grant: present the pasted document to this daemon. The
@@ -102271,7 +102122,6 @@ if (clientIdentitySupported()) {
 // Carry published org revocations to this daemon shortly after load —
 // after the control transport has had a chance to come up in connect mode.
 setTimeout(() => { orgRevocationCourier().catch(() => {}); }, 4000);
-syncAccessPageNavLink();
 
 // Auto-scroll detection
 (function() {

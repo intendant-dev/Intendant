@@ -2449,28 +2449,22 @@ function renderSessionWindowLogEntryOnly(c) {
 }
 
 function setContextUsagePct(pct) {
-  const fill = document.getElementById('sb-budget-fill');
+  // #sb-budget-pct is a hidden data node; the oversight bar's context
+  // meter mirrors its textContent (ui2-chrome.js) and the vitals rail
+  // reads it (ui2-activity.js). Only the text matters now.
   const label = document.getElementById('sb-budget-pct');
-  if (!fill || !label) return;
+  if (!label) return;
   if (pct === undefined || pct === null || Number.isNaN(Number(pct))) {
-    fill.style.width = '0%';
-    fill.style.background = 'var(--overlay0)';
     label.textContent = '--';
-    label.style.color = 'var(--overlay0)';
     return;
   }
   const value = Number(pct);
-  // The label clamps like the fill: a stale context window can briefly
-  // over-report (backends now clamp too, but replayed older sessions
-  // still carry raw values) and "142.3%" is a lie either way — the
-  // tooltip keeps the raw figure for the curious.
+  // Clamp: a stale context window can briefly over-report (backends now
+  // clamp too, but replayed older sessions still carry raw values) and
+  // "142.3%" is a lie either way — the title keeps the raw figure.
   const shown = Math.min(value, 100);
-  fill.style.width = shown + '%';
-  const color = shown < 50 ? 'var(--green)' : shown < 85 ? 'var(--yellow)' : 'var(--red)';
-  fill.style.background = color;
   label.textContent = shown.toFixed(1) + '%';
   label.title = value > 100 ? `raw reading ${value.toFixed(1)}% — context window estimate stale` : '';
-  label.style.color = color;
 }
 
 function parseUsageJson(raw) {
