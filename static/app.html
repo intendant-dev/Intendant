@@ -24240,7 +24240,7 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
           <!-- Visually hidden (see ui2-terminal-files.css); referenced by
                aria-describedby on xterm's input textarea. Documents the
                keyboard escape out of the Tab-swallowing terminal. -->
-          <span id="shell-escape-hint">Tab types into the terminal. Press Control+Shift+Tab to move keyboard focus out to the key bar.</span>
+          <span id="shell-escape-hint">Tab types into the terminal. Press Control+M (or Control+Shift+Tab) to move keyboard focus out to the key bar.</span>
           <div class="shell-keybar" id="shell-keybar">
             <button class="shell-key" data-key="esc">Esc</button>
             <button class="shell-key" data-key="tab">Tab</button>
@@ -28145,7 +28145,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '23bd4f73810d71f5';
+const INTENDANT_APP_BUILD = 'db1c9ece58c59b92';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -63721,7 +63721,14 @@ function initShell() {
     // instruction to assistive tech via aria-describedby on xterm's input
     // textarea.
     shellTerm.attachCustomKeyEventHandler((ev) => {
-      if (ev.key === 'Tab' && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey) {
+      // Ctrl+M is the browser-safe alias: browsers reserve Ctrl+Shift+Tab
+      // for tab switching, and Ctrl+M costs nothing in the PTY — its byte
+      // is CR, identical to the Enter key (the trade VS Code's tab-focus
+      // toggle makes for the same reason).
+      const escapeCombo =
+        (ev.key === 'Tab' && ev.ctrlKey && ev.shiftKey && !ev.altKey && !ev.metaKey) ||
+        (ev.key === 'm' && ev.ctrlKey && !ev.shiftKey && !ev.altKey && !ev.metaKey);
+      if (escapeCombo) {
         if (ev.type === 'keydown') {
           ev.preventDefault();
           focusShellKeybar();
