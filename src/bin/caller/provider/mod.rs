@@ -449,13 +449,20 @@ fn default_max_output_tokens(model: &str) -> u64 {
         m if m.starts_with("gpt-5") => 128_000,
         m if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") => 100_000,
         // Anthropic ceilings by family: the Claude 3 generation caps at 8K
-        // and Opus 4/4.1 at 32K, while every 4.5+ model accepts at least
-        // 64K output. The old blanket 8_192 was a Claude-3-era default that
-        // truncated long completions (or forced continuation turns, each
-        // re-billing the full prompt). `max_tokens` is a ceiling, not a
-        // target — raising it costs nothing unless output is generated.
+        // and Opus 4/4.1 at 32K (matched in dated and undated-alias forms:
+        // claude-opus-4-0, claude-opus-4-1-20250805, claude-opus-4-20250514),
+        // while Sonnet 4 and every 4.5+ model accept at least 64K output.
+        // The old blanket 8_192 was a Claude-3-era default that truncated
+        // long completions (or forced continuation turns, each re-billing
+        // the full prompt). `max_tokens` is a ceiling, not a target —
+        // raising it costs nothing unless output is generated.
         m if m.starts_with("claude-3") => 8_192,
-        m if m.starts_with("claude-opus-4-1") || m.starts_with("claude-opus-4-2") => 32_000,
+        m if m.starts_with("claude-opus-4-0")
+            || m.starts_with("claude-opus-4-1")
+            || m.starts_with("claude-opus-4-2") =>
+        {
+            32_000
+        }
         m if m.contains("claude") => 64_000,
         m if m.starts_with("gemini") => 65_536,
         _ => 16_384,
@@ -1296,7 +1303,8 @@ mod tests {
             64_000
         );
         // Older families keep their real ceilings: Claude 3 at 8K,
-        // Opus 4/4.1 at 32K.
+        // Opus 4/4.1 at 32K — in dated AND undated-alias forms (the alias
+        // `claude-opus-4-0` carries no date digits to match on).
         assert_eq!(
             default_max_output_tokens("claude-3-5-sonnet-20241022"),
             8_192
@@ -1305,7 +1313,16 @@ mod tests {
             default_max_output_tokens("claude-opus-4-1-20250805"),
             32_000
         );
+        assert_eq!(default_max_output_tokens("claude-opus-4-1"), 32_000);
         assert_eq!(default_max_output_tokens("claude-opus-4-20250514"), 32_000);
+        assert_eq!(default_max_output_tokens("claude-opus-4-0"), 32_000);
+        // Sonnet 4's real output cap is 64K — the catch-all is correct for
+        // both its dated and alias forms.
+        assert_eq!(default_max_output_tokens("claude-sonnet-4-0"), 64_000);
+        assert_eq!(
+            default_max_output_tokens("claude-sonnet-4-20250514"),
+            64_000
+        );
         assert_eq!(default_max_output_tokens("o1-preview"), 100_000);
     }
 

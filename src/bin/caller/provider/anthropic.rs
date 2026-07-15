@@ -194,6 +194,25 @@ impl AnthropicProvider {
         }
     }
 
+    /// The `max_tokens` actually sent for this request. Claude models from
+    /// before the 4.5 generation hard-400 when `input + max_tokens` exceeds
+    /// the context window instead of clamping server-side — and with the
+    /// 32K/64K family defaults that fires *below* the loop's 90%
+    /// auto-compact threshold, killing the session on a non-retryable 400
+    /// before compaction can ever run. For those models the ceiling is
+    /// clamped against a conservative input estimate; 4.5+ models pass the
+    /// configured value through untouched.
+    fn effective_max_tokens(&self, messages: &[Message]) -> u64 {
+        if !anthropic_needs_output_clamp(&self.model) {
+            return self.max_output_tokens;
+        }
+        let headroom = self
+            .context_window
+            .saturating_sub(estimated_input_tokens(messages))
+            .saturating_sub(CLAMP_MARGIN_TOKENS);
+        self.max_output_tokens.min(headroom).max(CLAMP_FLOOR_TOKENS)
+    }
+
     /// A tool-less instance forced through the client-egress relay —
     /// the probe path; normal selection converts availability into
     /// `ProviderAuth::ClientEgress` instead.
@@ -289,7 +308,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.max_output_tokens,
+            max_tokens: self.effective_max_tokens(messages),
             tools,
             stream,
         };
@@ -327,7 +346,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.max_output_tokens,
+            max_tokens: self.effective_max_tokens(messages),
             tools,
             stream: false,
         };
@@ -507,7 +526,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.max_output_tokens,
+            max_tokens: self.effective_max_tokens(messages),
             tools,
             stream: true,
         };
@@ -843,32 +862,108 @@ pub(crate) fn anthropic_duration_ms(input: &serde_json::Value, default_ms: u64) 
     }
 }
 
-/// Number of rolling `cache_control` breakpoints placed on the conversation
-/// tail. Two (not one) so the chain survives Anthropic's ~20-content-block
-/// cache lookback: the marker on the previous user turn sits exactly where
-/// last request's tail marker sat, guaranteeing a hit there even when a
-/// large tool batch pushes the newest marker more than 20 blocks forward.
-const ROLLING_CACHE_BREAKPOINTS: usize = 2;
+/// Claude models released before the 4.5 generation reject requests where
+/// `input_tokens + max_tokens` exceeds the context window (no server-side
+/// clamp; 4.5+ models cap gracefully and report
+/// `model_context_window_exceeded`). Matches the Claude 3 family plus the
+/// Opus 4/4.1 and Sonnet 4 pins, dated or aliased.
+fn anthropic_needs_output_clamp(model: &str) -> bool {
+    model.starts_with("claude-3")
+        || model.starts_with("claude-opus-4-0")
+        || model.starts_with("claude-opus-4-1")
+        || model.starts_with("claude-opus-4-2")
+        || model.starts_with("claude-sonnet-4-0")
+        || model.starts_with("claude-sonnet-4-2")
+}
 
-/// Attach `cache_control: {type: "ephemeral"}` to the final content block of
-/// the last [`ROLLING_CACHE_BREAKPOINTS`] user-side messages. Anthropic
-/// caches the prefix up to each breakpoint, so a marker that advances with
-/// the conversation makes every request re-read the previous request's
-/// prefix at ~0.1× input price instead of re-billing the whole transcript
-/// at full rate each turn. Budget: 1 breakpoint on system (which also
-/// covers tools, rendered before it) + 2 rolling here = 3 of the allowed 4.
+/// Headroom subtracted on top of the input estimate when clamping: covers
+/// the native tool schemas (~16K tokens), JSON structure, and estimator
+/// error on dense scripts where chars/4 underestimates.
+const CLAMP_MARGIN_TOKENS: u64 = 24_576;
+
+/// Clamp floor: still a useful completion, and far enough below any real
+/// pre-4.5 context window that a near-full input plus the floor stays
+/// requestable (when input alone genuinely exceeds the window, the request
+/// 400s regardless of `max_tokens` and auto-compact is the remedy).
+const CLAMP_FLOOR_TOKENS: u64 = 4_096;
+
+/// Conservative request-size estimate in tokens, ~chars/4. The compaction
+/// path's budget arithmetic rides API-reported usage held by the
+/// `Conversation`, which the provider seam never sees — so this local
+/// heuristic deliberately overestimates (base64 image bytes count at full
+/// character weight): overestimating only shrinks the output ceiling
+/// toward the floor, while underestimating would re-introduce the 400 the
+/// clamp exists to prevent.
+fn estimated_input_tokens(messages: &[Message]) -> u64 {
+    let chars: usize = messages
+        .iter()
+        .map(|m| {
+            m.content.len()
+                + m.images.as_ref().map_or(0, |imgs| {
+                    imgs.iter()
+                        .map(|i| i.data.len() + i.media_type.len())
+                        .sum::<usize>()
+                })
+                + m.tool_calls.as_ref().map_or(0, |tcs| {
+                    tcs.iter()
+                        .map(|tc| tc.name.len() + tc.arguments.len())
+                        .sum::<usize>()
+                })
+        })
+        .sum();
+    (chars / 4) as u64
+}
+
+/// Attach rolling `cache_control: {type: "ephemeral"}` breakpoints to the
+/// conversation tail. Anthropic caches the prefix up to each breakpoint, so
+/// markers that advance with the conversation make every request re-read
+/// the previous request's prefix at ~0.1× input price instead of re-billing
+/// the whole transcript at full rate each turn.
+///
+/// Placement is turn-boundary based, two markers:
+/// - the final block of the last user-side message (the current request's
+///   tail), and
+/// - the final block of the last user-side message *before the most recent
+///   assistant message* — i.e. exactly the message the previous request
+///   ended with, which is where its tail marker sat.
+///
+/// The second marker is what guarantees continuity for any batch size: a
+/// turn that appends many tool_result messages ("last two user messages"
+/// would land both markers inside the new batch, past Anthropic's
+/// ~20-content-block cache lookback, re-billing the entire history) still
+/// re-reads everything up to the previous turn at cache price; at worst the
+/// new turn's own blocks bill uncached once.
+///
+/// Budget: 1 breakpoint on system (which also covers tools, rendered
+/// before it) + 2 rolling here = 3 of the allowed 4.
 fn apply_rolling_cache_breakpoints(api_messages: &mut [AnthropicMessage]) {
-    let mut remaining = ROLLING_CACHE_BREAKPOINTS;
-    for msg in api_messages.iter_mut().rev() {
-        if remaining == 0 {
+    // Current turn tail: the last user-side message (plain user turn or
+    // tool_result carrier). Walk back over unmarkable bodies (e.g. empty
+    // text) so the marker still lands as close to the tail as possible.
+    let mut tail_marked_at: Option<usize> = None;
+    for idx in (0..api_messages.len()).rev() {
+        if api_messages[idx].role == "user" && attach_cache_control(&mut api_messages[idx].content)
+        {
+            tail_marked_at = Some(idx);
             break;
         }
-        // Anchor on user-side messages only (plain user turns and
-        // tool_result carriers): the last message of every request is
-        // user-side, and anchoring the same two positions across
-        // consecutive requests is what makes the prefix re-readable.
-        if msg.role == "user" && attach_cache_control(&mut msg.content) {
-            remaining -= 1;
+    }
+    let Some(tail_idx) = tail_marked_at else {
+        return;
+    };
+
+    // Previous turn tail: the last user-side message before the most
+    // recent assistant message that precedes the tail marker.
+    let Some(divider) = api_messages[..tail_idx]
+        .iter()
+        .rposition(|m| m.role == "assistant")
+    else {
+        return;
+    };
+    for idx in (0..divider).rev() {
+        if api_messages[idx].role == "user" && attach_cache_control(&mut api_messages[idx].content)
+        {
+            break;
         }
     }
 }
@@ -903,6 +998,43 @@ fn attach_cache_control(content: &mut serde_json::Value) -> bool {
     }
 }
 
+/// Newest image blocks kept in an outgoing Anthropic request. The API
+/// rejects requests around ~100 image blocks (and 32 MB of body) — ceilings
+/// a screenshot-heavy session can reach below the token-based auto-compact
+/// threshold now that Anthropic history is no longer image-stripped every
+/// turn. 40 keeps a comfortable margin under both limits while retaining
+/// far more visual context than the single-image OpenAI policy. Overflow
+/// elides the *oldest* images, replacing each with a fixed placeholder
+/// block — a bounded, rare prefix change (each image flips exactly once,
+/// after which the request is byte-stable again) instead of a hard 400.
+/// Below the cap this path renders identically to an uncapped build.
+const MAX_REQUEST_IMAGES: usize = 40;
+
+/// Render one image as a content block, or as the fixed elision
+/// placeholder while `elide_remaining` is being consumed (oldest first).
+fn push_image_or_placeholder(
+    parts: &mut Vec<serde_json::Value>,
+    img: &crate::conversation::ImageData,
+    elide_remaining: &mut usize,
+) {
+    if *elide_remaining > 0 {
+        *elide_remaining -= 1;
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": "[image elided: superseded by newer screenshots]",
+        }));
+    } else {
+        parts.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img.media_type,
+                "data": img.data,
+            }
+        }));
+    }
+}
+
 pub(crate) fn build_anthropic_messages(
     messages: &[Message],
 ) -> (serde_json::Value, Vec<AnthropicMessage>) {
@@ -917,6 +1049,15 @@ pub(crate) fn build_anthropic_messages(
         "cache_control": {"type": "ephemeral"}
     }]);
 
+    // Oldest-first elision budget for the image cap: only user-side
+    // messages render images (tool_result carriers and plain user turns).
+    let total_images: usize = messages
+        .iter()
+        .filter(|m| (m.role == "tool" && m.tool_call_id.is_some()) || m.role == "user")
+        .map(|m| m.images.as_ref().map_or(0, |imgs| imgs.len()))
+        .sum();
+    let mut elide_remaining = total_images.saturating_sub(MAX_REQUEST_IMAGES);
+
     let mut api_messages: Vec<AnthropicMessage> = Vec::new();
     for m in messages {
         if m.role == "system" {
@@ -930,14 +1071,7 @@ pub(crate) fn build_anthropic_messages(
                         "text": m.content,
                     })];
                     for img in images {
-                        parts.push(serde_json::json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img.media_type,
-                                "data": img.data,
-                            }
-                        }));
+                        push_image_or_placeholder(&mut parts, img, &mut elide_remaining);
                     }
                     serde_json::Value::Array(parts)
                 } else {
@@ -989,14 +1123,7 @@ pub(crate) fn build_anthropic_messages(
                         "text": m.content,
                     })];
                     for img in images {
-                        parts.push(serde_json::json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": img.media_type,
-                                "data": img.data,
-                            }
-                        }));
+                        push_image_or_placeholder(&mut parts, img, &mut elide_remaining);
                     }
                     serde_json::Value::Array(parts)
                 } else {
@@ -1457,5 +1584,140 @@ mod tests {
         // The empty tail can't carry a marker; the previous turn still does.
         assert!(api_msgs[1].content.is_string());
         assert!(has_marker(last_block(&api_msgs[0])));
+    }
+
+    #[test]
+    fn rolling_breakpoints_straddle_a_multi_result_batch() {
+        // One turn appending many tool_result messages must NOT absorb both
+        // markers into the new batch: the second marker belongs on the
+        // previous turn's tail (where the previous request's tail marker
+        // sat), or a big batch pushes both markers past Anthropic's
+        // ~20-block cache lookback and the whole history re-bills.
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: "sys".to_string(),
+                ..Default::default()
+            },
+            user_text("the task"),
+            assistant_text("running a large batch"),
+        ];
+        for i in 0..25 {
+            messages.push(tool_result_msg(
+                &format!("call_{i}"),
+                &format!("result {i}"),
+            ));
+        }
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        assert_eq!(api_msgs.len(), 27);
+
+        // Marker on the batch tail…
+        assert!(has_marker(last_block(&api_msgs[26])), "batch tail");
+        // …and on the previous turn's tail (the user task), NOT on the
+        // second-to-last batch result.
+        assert!(has_marker(last_block(&api_msgs[0])), "previous turn tail");
+        for idx in 2..26 {
+            let unmarked = api_msgs[idx]
+                .content
+                .as_array()
+                .and_then(|blocks| blocks.last())
+                .and_then(|b| b.as_object())
+                .is_some_and(|b| !b.contains_key("cache_control"));
+            assert!(unmarked, "batch interior message {idx} must stay unmarked");
+        }
+    }
+
+    // --- Pre-4.5 max_tokens clamp ---
+
+    #[test]
+    fn pre45_models_clamp_max_tokens_to_context_headroom() {
+        let provider = AnthropicProvider::new_plain(
+            "key".to_string(),
+            "claude-opus-4-1-20250805".to_string(),
+            200_000,
+            32_000,
+        );
+        // Moderate history: the family ceiling fits untouched.
+        let small = vec![user_text(&"x".repeat(40_000))]; // est ~10K tokens
+        assert_eq!(provider.effective_max_tokens(&small), 32_000);
+        // Deep history: ceiling shrinks to window − estimate − margin, so
+        // the request stays valid below the 90% auto-compact threshold.
+        let big = vec![user_text(&"x".repeat(600_000))]; // est ~150K tokens
+        assert_eq!(
+            provider.effective_max_tokens(&big),
+            200_000 - 150_000 - CLAMP_MARGIN_TOKENS
+        );
+        // Estimate at/over the window: floor keeps the request shaped.
+        let huge = vec![user_text(&"x".repeat(1_000_000))];
+        assert_eq!(provider.effective_max_tokens(&huge), CLAMP_FLOOR_TOKENS);
+    }
+
+    #[test]
+    fn post45_models_pass_configured_max_tokens_through() {
+        let provider = AnthropicProvider::new_plain(
+            "key".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            200_000,
+            64_000,
+        );
+        let huge = vec![user_text(&"x".repeat(1_000_000))];
+        assert_eq!(provider.effective_max_tokens(&huge), 64_000);
+
+        // Clamp family membership, dated and alias forms.
+        assert!(anthropic_needs_output_clamp("claude-3-5-sonnet-20241022"));
+        assert!(anthropic_needs_output_clamp("claude-opus-4-0"));
+        assert!(anthropic_needs_output_clamp("claude-opus-4-1"));
+        assert!(anthropic_needs_output_clamp("claude-opus-4-20250514"));
+        assert!(anthropic_needs_output_clamp("claude-sonnet-4-0"));
+        assert!(anthropic_needs_output_clamp("claude-sonnet-4-20250514"));
+        assert!(!anthropic_needs_output_clamp("claude-haiku-4-5-20251001"));
+        assert!(!anthropic_needs_output_clamp("claude-sonnet-4-5-20250929"));
+    }
+
+    // --- Request image cap ---
+
+    #[test]
+    fn image_cap_elides_oldest_beyond_newest_forty() {
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: "sys".to_string(),
+            ..Default::default()
+        }];
+        for i in 0..(MAX_REQUEST_IMAGES + 5) {
+            let mut m = tool_msg_with_images();
+            m.tool_call_id = Some(format!("call_{i}"));
+            messages.push(m);
+        }
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        let serialized = serde_json::to_string(&api_msgs).unwrap();
+        assert_eq!(
+            serialized.matches("\"type\":\"image\"").count(),
+            MAX_REQUEST_IMAGES
+        );
+        assert_eq!(serialized.matches("image elided").count(), 5);
+
+        // Oldest carriers hold the placeholder; the newest keeps its image.
+        let first = serde_json::to_string(&api_msgs[0]).unwrap();
+        assert!(first.contains("image elided") && !first.contains("\"type\":\"image\""));
+        let last = serde_json::to_string(api_msgs.last().unwrap()).unwrap();
+        assert!(last.contains("\"type\":\"image\"") && !last.contains("image elided"));
+    }
+
+    #[test]
+    fn image_cap_leaves_under_cap_requests_untouched() {
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: "sys".to_string(),
+            ..Default::default()
+        }];
+        for i in 0..3 {
+            let mut m = tool_msg_with_images();
+            m.tool_call_id = Some(format!("call_{i}"));
+            messages.push(m);
+        }
+        let (_system, api_msgs) = build_anthropic_messages(&messages);
+        let serialized = serde_json::to_string(&api_msgs).unwrap();
+        assert_eq!(serialized.matches("\"type\":\"image\"").count(), 3);
+        assert_eq!(serialized.matches("image elided").count(), 0);
     }
 }

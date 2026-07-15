@@ -2083,9 +2083,7 @@ pub(crate) async fn run_agent_loop(
             // whole transcript on every subsequent request) and carried no
             // extra signal for the model.
             let budget = conversation.budget_summary();
-            let last_unhandled = tool_results
-                .iter()
-                .rposition(|(call_id, _, _)| !handled_call_ids.contains(call_id));
+            let last_unhandled = budget_tail_index(&tool_results, &handled_call_ids);
             for (i, (call_id, tool_name, result_text)) in tool_results.iter().enumerate() {
                 if handled_call_ids.contains(call_id) {
                     continue;
@@ -3063,6 +3061,56 @@ pub(crate) async fn run_round_loop(
     }
 
     Ok(cumulative_stats)
+}
+
+/// Index of the batch result that carries the per-turn context-budget line:
+/// the final result not already answered out-of-band (skipped/denied).
+/// `None` — empty batch or every result already handled — means no budget
+/// line is emitted that turn. Exactly one line per turn is the contract:
+/// per-result copies were pure token filler re-billed with the transcript
+/// on every subsequent request.
+fn budget_tail_index(
+    tool_results: &[(String, String, String)],
+    handled_call_ids: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    tool_results
+        .iter()
+        .rposition(|(call_id, _, _)| !handled_call_ids.contains(call_id))
+}
+
+#[cfg(test)]
+mod budget_tail {
+    use super::budget_tail_index;
+    use std::collections::HashSet;
+
+    fn results(ids: &[&str]) -> Vec<(String, String, String)> {
+        ids.iter()
+            .map(|id| (id.to_string(), "exec_command".to_string(), "OK".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn budget_lands_on_last_unhandled_result_only() {
+        let batch = results(&["call_1", "call_2", "call_3"]);
+        let handled = HashSet::new();
+        assert_eq!(budget_tail_index(&batch, &handled), Some(2));
+
+        // A handled tail moves the budget line to the previous live result.
+        let handled: HashSet<String> = ["call_3".to_string()].into_iter().collect();
+        assert_eq!(budget_tail_index(&batch, &handled), Some(1));
+    }
+
+    #[test]
+    fn no_budget_line_for_empty_or_fully_handled_batches() {
+        let handled = HashSet::new();
+        assert_eq!(budget_tail_index(&[], &handled), None);
+
+        let batch = results(&["call_1", "call_2"]);
+        let handled: HashSet<String> = ["call_1".to_string(), "call_2".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(budget_tail_index(&batch, &handled), None);
+    }
 }
 
 #[cfg(test)]
