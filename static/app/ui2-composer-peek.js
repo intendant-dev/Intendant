@@ -22,6 +22,9 @@
   let peekBadge = null;
   let peekPhaseDot = null;
   let peekPhaseText = null;
+  let peekHeaderEl = null;
+  let peekOpenBtn = null;
+  let peekOpenLabelEl = null;
 
   let peekBoundSid = '';
   let peekBoundLog = null;
@@ -218,6 +221,7 @@
     if (!sid) return;
     peekFollow = true;
     peekRoot.hidden = false;
+    peekSyncOpenLabel();
     peekBind(sid);
     peekRenderTail();
   }
@@ -239,11 +243,47 @@
     if (peekList) peekList.replaceChildren();
   }
 
+  // "Open in Activity" is a lie when the user is ALREADY on Activity —
+  // there the action is really "reveal the target window in the crowd"
+  // (routeTo is a near-no-op; the scroll-into-view is the payload).
+  // Same action, honest words per context.
+  function peekSyncOpenLabel() {
+    if (!peekOpenBtn || !peekOpenLabelEl) return;
+    const pane = document.querySelector('.tab-pane.active');
+    const onActivity = !!pane && pane.id === 'tab-activity';
+    const label = onActivity ? 'Show session' : 'Open in Activity';
+    const title = onActivity
+      ? 'Scroll the target session window into view'
+      : 'Open the full transcript in Activity';
+    peekOpenLabelEl.textContent = label;
+    peekOpenBtn.title = title;
+    peekOpenBtn.setAttribute('aria-label', label);
+    if (peekHeaderEl) peekHeaderEl.title = title;
+  }
+
   function peekOpenInActivity() {
-    peekClose(false);
+    const sid = peekBoundSid;
+    // Dismissal latch on purpose: the user chose the full transcript
+    // surface — a live working edge must not reopen the peek over it
+    // (the latch clears when the streak ends or the target changes).
+    peekClose(true);
     if (typeof routeTo === 'function') routeTo('activity', 'log');
     if (typeof window.focusForegroundSessionWindow === 'function') {
       window.focusForegroundSessionWindow();
+    }
+    // Landing pulse: in a full grid the jump needs an unmistakable "here"
+    // — the target chip's element.animate idiom, sized for a window.
+    const win = (sid && typeof sessionWindows !== 'undefined') ? sessionWindows.get(sid) : null;
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (win && win.el && win.el.animate && !reduced) {
+      const iris = (getComputedStyle(document.documentElement).getPropertyValue('--iris-rgb') || '148, 130, 238').trim();
+      try {
+        win.el.animate([
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+          { boxShadow: `0 0 0 4px rgba(${iris}, .45)`, offset: 0.3 },
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+        ], { duration: 900, easing: 'ease-in-out' });
+      } catch (_) { /* Web Animations unavailable — the focus ring suffices */ }
     }
   }
 
@@ -325,6 +365,9 @@
     openBtn.title = 'Open the full transcript in Activity';
     openBtn.setAttribute('aria-label', 'Open in Activity');
     openBtn.innerHTML = icon('external', 12) + '<span class="ui2-peek-open-label">Open in Activity</span>';
+    peekHeaderEl = header;
+    peekOpenBtn = openBtn;
+    peekOpenLabelEl = openBtn.querySelector('.ui2-peek-open-label');
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -430,6 +473,12 @@
 
     window.addEventListener('ui2:composer-state', (e) => {
       if (((e && e.detail && e.detail.state) || '') === 'pill') peekClose(false);
+    });
+
+    // The peek survives expanded→expanded tab switches; keep the
+    // Open-in-Activity label honest for wherever the user now is.
+    window.addEventListener('ui2:tab-changed', () => {
+      if (peekIsOpen()) peekSyncOpenLabel();
     });
 
     if (typeof ui2Mirror === 'function') {

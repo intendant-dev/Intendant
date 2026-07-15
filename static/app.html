@@ -27430,7 +27430,13 @@ function ui2WireComposerState() {
     const origSwitchTab = switchTab;
     switchTab = function (tabId) {
       const r = origSwitchTab.apply(this, arguments);
-      if (r !== false) applyForTab(tabId);
+      if (r !== false) {
+        applyForTab(tabId);
+        // Navigation seam for the composer satellites: tab context changes
+        // (the peek's Open-in-Activity label, future context-sensitive
+        // affordances) derive from this instead of each polling the DOM.
+        window.dispatchEvent(new CustomEvent('ui2:tab-changed', { detail: { tab: String(tabId || '') } }));
+      }
       return r;
     };
   }
@@ -28045,7 +28051,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'eecaf6cd30987a85';
+const INTENDANT_APP_BUILD = '9760af7de361f6ff';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -102138,6 +102144,9 @@ function handleDisplayRequestResolved(d) {
   let peekBadge = null;
   let peekPhaseDot = null;
   let peekPhaseText = null;
+  let peekHeaderEl = null;
+  let peekOpenBtn = null;
+  let peekOpenLabelEl = null;
 
   let peekBoundSid = '';
   let peekBoundLog = null;
@@ -102334,6 +102343,7 @@ function handleDisplayRequestResolved(d) {
     if (!sid) return;
     peekFollow = true;
     peekRoot.hidden = false;
+    peekSyncOpenLabel();
     peekBind(sid);
     peekRenderTail();
   }
@@ -102355,11 +102365,47 @@ function handleDisplayRequestResolved(d) {
     if (peekList) peekList.replaceChildren();
   }
 
+  // "Open in Activity" is a lie when the user is ALREADY on Activity —
+  // there the action is really "reveal the target window in the crowd"
+  // (routeTo is a near-no-op; the scroll-into-view is the payload).
+  // Same action, honest words per context.
+  function peekSyncOpenLabel() {
+    if (!peekOpenBtn || !peekOpenLabelEl) return;
+    const pane = document.querySelector('.tab-pane.active');
+    const onActivity = !!pane && pane.id === 'tab-activity';
+    const label = onActivity ? 'Show session' : 'Open in Activity';
+    const title = onActivity
+      ? 'Scroll the target session window into view'
+      : 'Open the full transcript in Activity';
+    peekOpenLabelEl.textContent = label;
+    peekOpenBtn.title = title;
+    peekOpenBtn.setAttribute('aria-label', label);
+    if (peekHeaderEl) peekHeaderEl.title = title;
+  }
+
   function peekOpenInActivity() {
-    peekClose(false);
+    const sid = peekBoundSid;
+    // Dismissal latch on purpose: the user chose the full transcript
+    // surface — a live working edge must not reopen the peek over it
+    // (the latch clears when the streak ends or the target changes).
+    peekClose(true);
     if (typeof routeTo === 'function') routeTo('activity', 'log');
     if (typeof window.focusForegroundSessionWindow === 'function') {
       window.focusForegroundSessionWindow();
+    }
+    // Landing pulse: in a full grid the jump needs an unmistakable "here"
+    // — the target chip's element.animate idiom, sized for a window.
+    const win = (sid && typeof sessionWindows !== 'undefined') ? sessionWindows.get(sid) : null;
+    const reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (win && win.el && win.el.animate && !reduced) {
+      const iris = (getComputedStyle(document.documentElement).getPropertyValue('--iris-rgb') || '148, 130, 238').trim();
+      try {
+        win.el.animate([
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+          { boxShadow: `0 0 0 4px rgba(${iris}, .45)`, offset: 0.3 },
+          { boxShadow: `0 0 0 0 rgba(${iris}, 0)` },
+        ], { duration: 900, easing: 'ease-in-out' });
+      } catch (_) { /* Web Animations unavailable — the focus ring suffices */ }
     }
   }
 
@@ -102441,6 +102487,9 @@ function handleDisplayRequestResolved(d) {
     openBtn.title = 'Open the full transcript in Activity';
     openBtn.setAttribute('aria-label', 'Open in Activity');
     openBtn.innerHTML = icon('external', 12) + '<span class="ui2-peek-open-label">Open in Activity</span>';
+    peekHeaderEl = header;
+    peekOpenBtn = openBtn;
+    peekOpenLabelEl = openBtn.querySelector('.ui2-peek-open-label');
 
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
@@ -102546,6 +102595,12 @@ function handleDisplayRequestResolved(d) {
 
     window.addEventListener('ui2:composer-state', (e) => {
       if (((e && e.detail && e.detail.state) || '') === 'pill') peekClose(false);
+    });
+
+    // The peek survives expanded→expanded tab switches; keep the
+    // Open-in-Activity label honest for wherever the user now is.
+    window.addEventListener('ui2:tab-changed', () => {
+      if (peekIsOpen()) peekSyncOpenLabel();
     });
 
     if (typeof ui2Mirror === 'function') {
