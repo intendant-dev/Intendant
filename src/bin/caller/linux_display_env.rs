@@ -29,12 +29,66 @@ pub struct GuiEnvAdoption {
     pub source: Option<String>,
 }
 
+/// How often the probe may re-fork `systemctl --user show-environment`
+/// while no display variable has appeared yet (daemon started before
+/// graphical login). Bounds how stale a fresh login's env can look.
+#[cfg(target_os = "linux")]
+const PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(target_os = "linux")]
+mod probe_gate {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// Set once a probe has run while a display variable (`DISPLAY` /
+    /// `WAYLAND_DISPLAY`) was present in the process env — whether inherited
+    /// or adopted by that probe. From that point the graphical session is
+    /// up, and keys still missing (e.g. `WAYLAND_DISPLAY` on an X11
+    /// desktop) will never appear, so re-forking is pure waste.
+    pub(super) static SETTLED: AtomicBool = AtomicBool::new(false);
+    /// When the probe last forked, for rate-limiting the waiting-for-login
+    /// retry loop.
+    pub(super) static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+}
+
 #[cfg(target_os = "linux")]
 pub fn ensure_gui_session_env(context: &str) -> GuiEnvAdoption {
-    let Some(systemd_env) = read_systemd_user_environment() else {
+    use std::sync::atomic::Ordering;
+
+    // `adopt_from_map` never overwrites a variable that is already set, so
+    // re-running the probe helps only while adoptable keys are missing AND
+    // the systemd user environment could still gain them. This used to fork
+    // `systemctl --user show-environment` unconditionally — on every runtime
+    // spawn, CU action batch, and screenshot. Three tiers keep the fork off
+    // the steady-state path:
+    //
+    // 1. Complete env: every managed key is set — nothing to adopt, free.
+    // 2. Settled: see `probe_gate::SETTLED` — never fork again.
+    // 3. Waiting for login: no display variable yet — keep probing, but at
+    //    most once per `PROBE_RETRY_INTERVAL` instead of per call.
+    if probe_gate::SETTLED.load(Ordering::Relaxed) || gui_env_complete() {
         return GuiEnvAdoption::default();
+    }
+    {
+        let mut last = probe_gate::LAST_ATTEMPT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if !display_env_present() {
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < PROBE_RETRY_INTERVAL {
+                    return GuiEnvAdoption::default();
+                }
+            }
+        }
+        *last = Some(now);
+    }
+
+    let report = match read_systemd_user_environment() {
+        Some(systemd_env) => adopt_from_map(&systemd_env),
+        None => GuiEnvAdoption::default(),
     };
-    let report = adopt_from_map(&systemd_env);
     if !report.adopted.is_empty() {
         eprintln!(
             "[linux_display_env] {context}: adopted GUI env from {}: {}",
@@ -49,7 +103,30 @@ pub fn ensure_gui_session_env(context: &str) -> GuiEnvAdoption {
             report.skipped.join(", ")
         );
     }
+    if display_env_present() {
+        probe_gate::SETTLED.store(true, Ordering::Relaxed);
+    }
     report
+}
+
+/// Whether a display variable is present in the process env. Mirrors
+/// `adopt_from_map`'s skip test (`var_os(..).is_some()`): a set-but-empty
+/// value is one the probe could not replace anyway.
+#[cfg(target_os = "linux")]
+fn display_env_present() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+/// Whether every variable the probe manages is already set — including
+/// `INTENDANT_USER_DISPLAY`, which `adopt_from_map` derives from the
+/// systemd `DISPLAY`. When true the probe cannot adopt anything, by
+/// construction.
+#[cfg(target_os = "linux")]
+fn gui_env_complete() -> bool {
+    GUI_ENV_KEYS
+        .iter()
+        .all(|key| std::env::var_os(key).is_some())
+        && std::env::var_os("INTENDANT_USER_DISPLAY").is_some()
 }
 
 #[cfg(not(target_os = "linux"))]
