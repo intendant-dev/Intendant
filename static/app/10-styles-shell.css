@@ -8,15 +8,8 @@
   --log-error: var(--red);
   --log-warn: var(--yellow);
   --log-subagent: var(--mauve);
-  --log-detail: #a2a8be;
   --log-debug: var(--overlay1);
   --log-presence: var(--green);
-  --concurrent-view-bg: rgba(24, 24, 37, 0.68);
-  --concurrent-view-hover-bg: rgba(24, 24, 37, 0.78);
-  --session-window-bg: rgba(24, 24, 37, 0.72);
-  --session-window-header-bg: rgba(17, 17, 27, 0.64);
-  --session-window-hover-bg: rgba(24, 24, 37, 0.80);
-  --session-window-chip-bg: rgba(49, 50, 68, 0.64);
 
   /* Liquid-glass chrome tokens. backdrop-filter is reserved for flow-layout
      chrome that can never overlap the Station canvases (status bar, ticker,
@@ -24,20 +17,9 @@
      the canvas area (toasts, pickers, #station-status) use the translucent
      layered backgrounds WITHOUT blur so the WebGPU/canvas scene is never
      forced into constant recomposite. */
-  --glass-bg: rgba(24, 24, 37, 0.58);
-  --glass-bg-deep: linear-gradient(180deg, rgba(30, 30, 46, 0.72), rgba(17, 17, 27, 0.62));
-  --glass-hairline: rgba(205, 214, 244, 0.09);
-  --glass-hairline-bright: rgba(205, 214, 244, 0.16);
-  --glass-highlight: inset 0 1px 0 rgba(205, 214, 244, 0.05);
   --glass-blur: blur(14px) saturate(1.2);
   /* Validated viz ramps (dataviz method; ordinal blue ramp passes monotone-L,
      step-gap, and light-end checks on the Mocha surface). */
-  --viz-ramp-1: #455477;
-  --viz-ramp-2: #566c98;
-  --viz-ramp-3: #6784b8;
-  --viz-ramp-4: #789cd9;
-  --viz-ramp-5: #89b4fa;
-  --viz-empty: #313244;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -90,51 +72,6 @@ html {
 
 /* ── Tab buttons (shared contract: the ui-v2 rail stamps .tab-btn on its
    nav items so the router binds them) ── */
-.tab-btn {
-  padding: 8px 16px;
-  min-height: 36px;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  border-radius: 9px 9px 0 0;
-  color: var(--overlay1);
-  font-family: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: color 0.15s, border-color 0.15s, background 0.15s;
-  position: relative;
-}
-.tab-btn:hover {
-  color: var(--subtext1);
-  background: color-mix(in srgb, var(--text) 4.5%, transparent);
-}
-.tab-btn.active {
-  color: var(--blue);
-  border-bottom-color: var(--blue);
-}
-.tab-btn .badge {
-  position: absolute;
-  top: 4px; right: 4px;
-  min-width: 16px; height: 16px;
-  border-radius: 8px;
-  background: var(--red);
-  color: var(--crust);
-  font-size: 10px;
-  font-weight: 700;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  padding: 0 4px;
-}
-.tab-btn .badge.visible { display: flex; }
-
-/* ── Tab Content ── */
-.tab-content {
-  flex: 1;
-  position: relative;
-  overflow: hidden;
-}
 .tab-pane {
   display: none;
   flex-direction: column;

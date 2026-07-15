@@ -303,7 +303,6 @@ async function startVideo() {
       tickerFramesDropped++;
       sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
     }
-    updateTickerFrames();
 
     // Send HQ frame (logical resolution) to server for archival (always)
     const camMax = 1920;

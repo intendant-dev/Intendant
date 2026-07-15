@@ -6,78 +6,40 @@
 <a class="ui2-skip" href="#ui2-nav">Skip to navigation</a>
 <div id="app">
 
-  <!-- Status Bar -->
-  <div class="status-bar" id="status-bar">
-    <span class="host-label" id="sb-host-label" title="This daemon's identity. Set it with `intendant access setup --name <label>` or it falls back to the system hostname.">local</span>
-    <span class="sep">|</span>
-    <span class="provider" id="sb-provider">--</span>
-    <span class="sep">/</span>
-    <span class="model" id="sb-model">--</span>
-    <span class="sep">|</span>
-    <span class="turn" id="sb-turn">T0</span>
-    <span class="sep">|</span>
-    <span class="field-label">ctx</span>
-    <div class="budget-bar">
-      <div class="bar-track"><div class="bar-fill" id="sb-budget-fill"></div></div>
-      <span class="budget-pct" id="sb-budget-pct">--</span>
-    </div>
-    <span class="sep">|</span>
-    <span class="field-label">autonomy</span>
-    <span class="autonomy" id="sb-autonomy" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
-    <span class="sep">|</span>
-    <span class="display-toggle-wrap">
-      <span class="field-label" id="sb-display-label" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
-      <span id="sb-display-access" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
-      <div class="display-picker" id="display-picker" aria-hidden="true"></div>
-    </span>
-    <span class="sep">|</span>
-    <span class="field-label">Intendant session</span>
-    <span class="session" id="sb-session"></span>
-    <span class="sep">|</span>
-    <span class="sb-dot-group" id="sb-conn-group" title="WebSocket connection to this daemon">
-      <span class="field-label" id="sb-conn-label">ws</span>
-      <span class="conn-dot err" id="sb-conn"></span>
-    </span>
-    <span class="sb-dot-group clickable" id="sb-dashboard-transport" title="Dashboard access — click for connection diagnostics">
-      <span class="field-label" id="sb-dashboard-transport-prefix">access</span>
+  <!-- Client state cache. The v1 status bar and ticker used to render
+       these values; the visible chrome is gone, but the nodes remain the
+       shared client-side truth: shared writers (session-window actions,
+       voice/WASM callbacks, transport status, managed context) write them,
+       and the oversight-bar mirrors (ui2-chrome.js ui2Mirror
+       MutationObservers), Station debug payloads, shortcut handlers
+       (cycleAutonomy reads #sb-autonomy, setUserDisplayState writes
+       #sb-display-access), and the QA harness read them. Rewiring every
+       shared writer/reader pair is tracked follow-up work; until then
+       these are data nodes, not UI. #display-picker starts here and is
+       portaled to <body> on first open. -->
+  <div hidden id="sb-state">
+    <span id="sb-host-label">local</span>
+    <span id="sb-provider">--</span>
+    <span id="sb-model">--</span>
+    <span id="sb-turn">T0</span>
+    <span id="sb-budget-pct">--</span>
+    <span id="sb-autonomy">Medium</span>
+    <span id="sb-display-access">off</span>
+    <span id="sb-session"></span>
+    <span class="conn-dot err" id="sb-conn"></span>
+    <span id="sb-dashboard-transport">
+      <span id="sb-dashboard-transport-prefix">access</span>
       <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
       <span id="sb-dashboard-transport-label">Ready</span>
     </span>
-    <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
-      <span class="field-label">live</span>
-      <span class="voice-dot" id="sb-voice"></span>
-      <span id="sb-voice-label"></span>
-    </span>
-    <span class="sb-dot-group clickable hidden" id="sb-hosts-group" title="Aggregate state of configured secondary daemons - click to open Access targets">
-      <span class="sep">|</span>
-      <span class="field-label">hosts</span>
-      <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
-    </span>
-    <span class="sb-dot-group clickable" id="sb-access-page-link" title="Open fleet access administration">
-      <span class="sep">|</span>
-      <span class="field-label" id="sb-access-page-prefix">admin</span>
-      <span class="access-nav-link" id="sb-access-page-label">Access</span>
-    </span>
-    <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
+    <span class="voice-dot" id="sb-voice"></span>
+    <span id="sb-voice-label"></span>
+    <span class="active-badge is-active" id="sb-active-badge">Active</span>
+    <span class="badge" id="badge-activity"></span>
+    <span id="tk-tokens">-- tok</span>
+    <span id="tk-cost">$0</span>
   </div>
-
-  <!-- Token Ticker -->
-  <div class="ticker-bar" id="ticker-bar" onclick="toggleTicker()">
-    <span class="ticker-chevron" id="ticker-chevron">&#x25B8;</span>
-    <div class="ticker-collapsed" id="ticker-collapsed">
-      <span id="tk-tokens">-- tok</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-cached">-- cached</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-frames">0 frames</span>
-      <span class="tk-sep">|</span>
-      <span id="tk-cost">$0</span>
-    </div>
-    <div class="ticker-expanded hidden" id="ticker-expanded">
-      <div id="tk-detail-1">--</div>
-      <div id="tk-detail-2">--</div>
-    </div>
-  </div>
+  <div class="display-picker" id="display-picker" aria-hidden="true"></div>
 
   <!-- Global Task Bar — always visible across tabs -->
   <div class="global-task-bar">
@@ -115,21 +77,9 @@
     <button id="activity-submit-btn" class="global-send-btn" onclick="submitActivityOrSteer()" title="Start a new task or send a follow-up.">Send</button>
   </div>
 
-  <!-- Tab Bar -->
-  <nav class="tab-bar">
-    <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
-    <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
-    <button class="tab-btn" data-tab="terminal" title="Interactive shell on this daemon">Terminal</button>
-    <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
-    <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
-    <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
-    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
-    <button class="tab-btn" data-tab="access" title="Who can reach this daemon and its fleet — people, peers, roles, and connection diagnostics">Access</button>
-    <button class="tab-btn" data-tab="debug" title="Observer display and browser workspaces">Debug</button>
-    <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
-  </nav>
-
   <!-- Tab Content -->
+  <!-- Tab navigation lives in the ui-v2 rail (ui2-shell.html); its items
+       carry the .tab-btn class the router binds. -->
   <div class="tab-content">
 
     <!-- Station Tab -->
@@ -954,7 +904,7 @@
           <!-- Visually hidden (see ui2-terminal-files.css); referenced by
                aria-describedby on xterm's input textarea. Documents the
                keyboard escape out of the Tab-swallowing terminal. -->
-          <span id="shell-escape-hint">Tab types into the terminal. Press Control+Shift+Tab to move keyboard focus out to the key bar.</span>
+          <span id="shell-escape-hint">Tab types into the terminal. Press Control+M (or Control+Shift+Tab) to move keyboard focus out to the key bar.</span>
           <div class="shell-keybar" id="shell-keybar">
             <button class="shell-key" data-key="esc">Esc</button>
             <button class="shell-key" data-key="tab">Tab</button>

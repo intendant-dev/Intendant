@@ -309,7 +309,8 @@ client (`replay_jsonl_to_outbound_entries` in `web_gateway/session_catalog/repla
 
 - The first replayed entry is a `replay_start` marker carrying the
   provider/model/autonomy values scanned from the log (`scan_replay_status`), so
-  the dashboard seeds its status bar correctly before any live event arrives.
+  the dashboard seeds its oversight-bar facts correctly before any live event
+  arrives.
 - Each subsequent line is converted to an `OutboundEvent`-shaped object with its
   original `ts` preserved, so replay reproduces the exact event sequence the
   Activity tab would have shown live.

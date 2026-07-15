@@ -37,34 +37,14 @@ function updateTickerFromUsage(c) {
     } catch {}
   }
 
-  // Collapsed view
-  const tkTokens = document.getElementById('tk-tokens');
-  const tkCached = document.getElementById('tk-cached');
-  const tkCost = document.getElementById('tk-cost');
-  tkTokens.textContent = fmtK(total) + ' tok';
-  tkCached.textContent = fmtK(cached) + ' cached (' + cacheHit + '%)';
-  tkCost.textContent = liveCost == null ? '$--' : formatUsd(liveCost, 4);
-  flashEl(tkTokens);
-
-  // Expanded view
-  document.getElementById('tk-detail-1').textContent =
-    'Live: ' + total.toLocaleString() + ' tokens (in: ' + input.toLocaleString() + ' | out: ' + output.toLocaleString() + ' | think: ' + thinking.toLocaleString() + ')';
-  document.getElementById('tk-detail-2').textContent =
-    'Cache: ' + cached.toLocaleString() + ' / ' + input.toLocaleString() + ' input = ' + cacheHit + '% hit | Frames: ' + tickerFramesSent + ' sent, ' + tickerFramesDropped + ' dropped | Cost: ' + (liveCost == null ? '$--' : formatUsd(liveCost, 4));
+  // Hidden data nodes; the oversight bar's tokens-cost fact mirrors them
+  // (ui2-chrome.js factsTokens).
+  document.getElementById('tk-tokens').textContent = fmtK(total) + ' tok';
+  document.getElementById('tk-cost').textContent =
+    liveCost == null ? '$--' : formatUsd(liveCost, 4);
 }
 
-function updateTickerFrames() {
-  const el = document.getElementById('tk-frames');
-  el.textContent = tickerFramesSent + ' frames' + (tickerFramesDropped > 0 ? ' (' + tickerFramesDropped + ' dropped)' : '');
-  flashEl(el);
-}
 
-window.toggleTicker = function() {
-  tickerExpanded = !tickerExpanded;
-  document.getElementById('ticker-chevron').innerHTML = tickerExpanded ? '&#x25BE;' : '&#x25B8;';
-  document.getElementById('ticker-collapsed').classList.toggle('hidden', tickerExpanded);
-  document.getElementById('ticker-expanded').classList.toggle('hidden', !tickerExpanded);
-};
 
 function renderUsageTab(c) {
   // update_usage fires on every token tick; rebuilding the Stats region
