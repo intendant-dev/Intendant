@@ -136,6 +136,7 @@ pub(crate) async fn codex_context_payload_snapshot(
     request_ref: &CodexRequestPayloadRef,
     request_index: u64,
     resolved_chain: &mut Option<CodexResolvedChain>,
+    index_generation: u64,
 ) -> Result<CodexRequestPayloadSnapshot, CallerError> {
     let payload =
         read_codex_json_payload(&request_ref.bundle_dir, &request_ref.relative_path).await?;
@@ -148,6 +149,7 @@ pub(crate) async fn codex_context_payload_snapshot(
             request_index,
             payload,
             resolved_chain,
+            index_generation,
         )
         .await?;
         return Ok(CodexRequestPayloadSnapshot {
@@ -245,15 +247,21 @@ pub(crate) fn codex_request_id(request: &CodexRequestPayloadRef) -> String {
     format!("codex-request-{hash:016x}")
 }
 
-pub(crate) fn stable_context_hash(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET;
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+/// Extend a running FNV-1a hash with more bytes — the resumable form of
+/// [`stable_context_hash`], used by the trace cursor's head-window hash.
+fn fnv_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+pub(crate) fn stable_context_hash(bytes: &[u8]) -> u64 {
+    fnv_extend(FNV_OFFSET, bytes)
 }
 
 pub(crate) fn compact_context_text(text: &str, limit: usize) -> String {
@@ -613,6 +621,14 @@ pub(crate) fn codex_context_archive_payload(
 /// but its bytes at the cursor no longer match.
 const TRACE_CURSOR_TAIL_WINDOW: usize = 32;
 
+/// Bytes of the file HEAD hashed into the cursor and re-verified on every
+/// append read. The suffix window alone cannot prove consumed-prefix
+/// identity (trace lines end in the timestamp field, which an equal-length
+/// regrow can preserve); the head hash pins the leading content the same
+/// way the windowed-prefix-hash discipline does elsewhere in the repo. One
+/// extra ≤ 4 KiB read per changed-file refresh.
+const TRACE_CURSOR_HEAD_WINDOW: u64 = 4096;
+
 /// Byte/line cursor into one `trace.jsonl`: how much of the file has already
 /// been folded into the cached index, plus the evidence used to detect
 /// rewrites. The contract:
@@ -622,13 +638,14 @@ const TRACE_CURSOR_TAIL_WINDOW: usize = 32;
 ///   refresh.
 /// - A rewrite is detected (and triggers a full rebuild) when the file
 ///   shrinks below `bytes`, when its length equals `bytes` but its mtime is
-///   not `modified`, or when the [`TRACE_CURSOR_TAIL_WINDOW`] bytes before
-///   the cursor no longer equal `tail` on an append read. The residual
-///   blind spot is a rewrite that preserves the window's bytes at the
-///   cursor (and, when it does not grow the file, its length and mtime
-///   too); earlier content covered by neither check can change undetected —
-///   best-effort hardening for a writer that is append-only by contract.
-#[derive(Debug, Default, Clone)]
+///   not `modified`, or when — on an append read — either the
+///   [`TRACE_CURSOR_TAIL_WINDOW`] bytes before the cursor no longer equal
+///   `tail` or the first [`TRACE_CURSOR_HEAD_WINDOW`]-capped bytes no longer
+///   hash to `head_hash`. The residual blind spot shrinks to a rewrite that
+///   preserves length + mtime + the first 4 KiB + the last 32 bytes before
+///   the cursor — best-effort hardening for a writer that is append-only by
+///   contract.
+#[derive(Debug, Clone)]
 struct CodexTraceFileCursor {
     bytes: u64,
     lines: u64,
@@ -637,11 +654,31 @@ struct CodexTraceFileCursor {
     modified: Option<SystemTime>,
     /// The last ≤ [`TRACE_CURSOR_TAIL_WINDOW`] consumed bytes.
     tail: Vec<u8>,
+    /// Running FNV hash of the first `head_len` consumed bytes.
+    head_hash: u64,
+    /// How many leading bytes `head_hash` covers:
+    /// `min(bytes, TRACE_CURSOR_HEAD_WINDOW)`. Grows with the cursor until
+    /// the window is full, then stays fixed.
+    head_len: u64,
     /// True when the consumed region ended without a newline (a valid
     /// unterminated JSON tail was folded as one line). The next read then
     /// swallows exactly one leading newline without counting a line, keeping
     /// line indices identical to a from-scratch enumerate.
     mid_line: bool,
+}
+
+impl Default for CodexTraceFileCursor {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            lines: 0,
+            modified: None,
+            tail: Vec::new(),
+            head_hash: FNV_OFFSET,
+            head_len: 0,
+            mid_line: false,
+        }
+    }
 }
 
 /// One other-session trace root in the auxiliary sweep: its directory mtime
@@ -656,18 +693,45 @@ struct CodexAuxTraceRoot {
     bundle_dirs: Vec<PathBuf>,
 }
 
+/// How often the known auxiliary roots are stat-probed for change. One stat
+/// per historical session dir per probe is cheap, but at the 1 Hz
+/// fingerprint cadence a large history still meant hundreds of stats per
+/// second — so probes run on this coarser cadence, with an immediate probe
+/// whenever the logs root's mtime moves (new session dirs stay promptly
+/// discovered). Aux bundle discovery latency is bounded by this interval;
+/// aux roots are PAST sessions, so nothing on the live path waits on it.
+const AUX_ROOT_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Cross-session auxiliary trace roots (other sessions' dirs under the logs
 /// root), cached so the exact-archive fingerprint tick doesn't re-enumerate
 /// every historical session directory at 1 Hz. The ROOT LIST re-sweeps when
 /// the logs root's mtime moves (session dirs are created/removed directly
-/// under it); each known root is then stat-probed per collect and
-/// re-enumerated only on change ([`CodexAuxTraceRoot`]). Bundles for the
-/// LIVE session land under the primary root, which is always enumerated
-/// fresh.
+/// under it); each known root is then stat-probed on the
+/// [`AUX_ROOT_PROBE_INTERVAL`] cadence (immediately after a root-list
+/// re-sweep) and re-enumerated only on change ([`CodexAuxTraceRoot`]).
+/// Bundles for the LIVE session land under the primary root, which is
+/// always enumerated fresh.
 struct CodexAuxBundleDirs {
     logs_root: PathBuf,
     modified: Option<SystemTime>,
     roots: Vec<CodexAuxTraceRoot>,
+    /// Monotonic instant of the last per-root probe pass.
+    last_probe: Option<std::time::Instant>,
+}
+
+/// Whether the per-root stat probe pass is due.
+fn aux_probe_due(
+    last_probe: Option<std::time::Instant>,
+    root_list_rebuilt: bool,
+    now: std::time::Instant,
+) -> bool {
+    if root_list_rebuilt {
+        return true;
+    }
+    match last_probe {
+        None => true,
+        Some(last) => now.duration_since(last) >= AUX_ROOT_PROBE_INTERVAL,
+    }
 }
 
 /// Resolved `previous_response_id` chain for the most recently resolved
@@ -685,6 +749,11 @@ pub(crate) struct CodexResolvedChain {
     /// prefix. A cached entry with an unresolved tail is only served while
     /// that tail is STILL unresolvable ([`codex_resolved_chain_current`]).
     unresolved_previous_response_id: Option<String>,
+    /// Index generation this resolution was built against; when the index
+    /// has not changed since, even an unresolved tail cannot have become
+    /// resolvable — a cycle-truncated chain (whose repeated id is resolvable
+    /// by construction) is then served instead of re-walked per snapshot.
+    generation: u64,
 }
 
 /// Incrementally maintained view of a Codex trace archive for one
@@ -698,6 +767,9 @@ pub(crate) struct CodexTraceIndexCache {
     key: Option<(PathBuf, Option<String>)>,
     cursors: HashMap<PathBuf, CodexTraceFileCursor>,
     index: CodexTraceIndex,
+    /// Bumped whenever the index content changes (fold or rebuild); gates
+    /// [`CodexResolvedChain`] currency for unresolved tails.
+    generation: u64,
     aux_bundles: Option<CodexAuxBundleDirs>,
     resolved_chain: Option<CodexResolvedChain>,
 }
@@ -755,6 +827,7 @@ impl CodexTraceIndexCache {
     fn clear_folded_state(&mut self) {
         self.cursors.clear();
         self.index = CodexTraceIndex::default();
+        self.generation = self.generation.wrapping_add(1);
         self.aux_bundles = None;
         self.resolved_chain = None;
     }
@@ -811,6 +884,7 @@ impl CodexTraceIndexCache {
                         text,
                         consumed,
                         tail,
+                        head_extension,
                         ends_mid_line,
                     } => {
                         let next_line = fold_codex_trace_lines(
@@ -820,6 +894,7 @@ impl CodexTraceIndexCache {
                             &text,
                             start.lines,
                         );
+                        let head_hash = fnv_extend(start.head_hash, &head_extension);
                         self.cursors.insert(
                             path,
                             CodexTraceFileCursor {
@@ -827,6 +902,8 @@ impl CodexTraceIndexCache {
                                 lines: next_line,
                                 modified,
                                 tail,
+                                head_hash,
+                                head_len: start.head_len + head_extension.len() as u64,
                                 mid_line: ends_mid_line,
                             },
                         );
@@ -848,6 +925,7 @@ impl CodexTraceIndexCache {
             }
             if appended {
                 self.index.requests.sort_by(codex_request_order_cmp);
+                self.generation = self.generation.wrapping_add(1);
             }
             return Ok(());
         }
@@ -940,31 +1018,39 @@ impl CodexTraceIndexCache {
                 logs_root,
                 modified: logs_modified,
                 roots,
+                last_probe: None,
             });
         }
 
         if let Some(aux) = self.aux_bundles.as_mut() {
-            for aux_root in aux.roots.iter_mut() {
-                // One stat per known root: absent stays absent cheaply; a
-                // trace root (or bundle inside it) created after the sweep
-                // moves the mtime and re-enumerates just that root.
-                let modified = tokio::fs::metadata(&aux_root.trace_root)
-                    .await
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok());
-                if modified != aux_root.modified {
-                    aux_root.bundle_dirs.clear();
-                    let mut root_seen = HashSet::new();
-                    collect_codex_bundle_dirs_in(
-                        &aux_root.trace_root,
-                        Some(thread_id_present),
-                        false,
-                        &mut aux_root.bundle_dirs,
-                        &mut root_seen,
-                    )
-                    .await?;
-                    aux_root.modified = modified;
+            let now = std::time::Instant::now();
+            if aux_probe_due(aux.last_probe, !root_list_current, now) {
+                for aux_root in aux.roots.iter_mut() {
+                    // One stat per known root: absent stays absent cheaply;
+                    // a trace root (or bundle inside it) created after the
+                    // sweep moves the mtime and re-enumerates just that
+                    // root.
+                    let modified = tokio::fs::metadata(&aux_root.trace_root)
+                        .await
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok());
+                    if modified != aux_root.modified {
+                        aux_root.bundle_dirs.clear();
+                        let mut root_seen = HashSet::new();
+                        collect_codex_bundle_dirs_in(
+                            &aux_root.trace_root,
+                            Some(thread_id_present),
+                            false,
+                            &mut aux_root.bundle_dirs,
+                            &mut root_seen,
+                        )
+                        .await?;
+                        aux_root.modified = modified;
+                    }
                 }
+                aux.last_probe = Some(now);
+            }
+            for aux_root in &aux.roots {
                 for bundle_dir in &aux_root.bundle_dirs {
                     if seen.insert(bundle_dir.clone()) {
                         bundle_dirs.push(bundle_dir.clone());
@@ -988,6 +1074,7 @@ impl CodexTraceIndexCache {
         let Self {
             index,
             resolved_chain,
+            generation,
             ..
         } = self;
         let Some(request_ref) = index.requests.last() else {
@@ -996,7 +1083,14 @@ impl CodexTraceIndexCache {
                 root.display()
             )));
         };
-        codex_context_payload_snapshot(index, request_ref, request_index, resolved_chain).await
+        codex_context_payload_snapshot(
+            index,
+            request_ref,
+            request_index,
+            resolved_chain,
+            *generation,
+        )
+        .await
     }
 
     /// Refresh, then snapshot every request not in `seen_request_ids`, in
@@ -1013,6 +1107,7 @@ impl CodexTraceIndexCache {
         let Self {
             index,
             resolved_chain,
+            generation,
             ..
         } = self;
         let mut snapshots = Vec::new();
@@ -1021,8 +1116,14 @@ impl CodexTraceIndexCache {
                 continue;
             }
             snapshots.push(
-                codex_context_payload_snapshot(index, request_ref, idx as u64 + 1, resolved_chain)
-                    .await?,
+                codex_context_payload_snapshot(
+                    index,
+                    request_ref,
+                    idx as u64 + 1,
+                    resolved_chain,
+                    *generation,
+                )
+                .await?,
             );
         }
         Ok(snapshots)
@@ -1032,12 +1133,14 @@ impl CodexTraceIndexCache {
 /// Outcome of one append read against a cursor.
 enum TraceTailRead {
     /// New consumable content: the text to fold, the bytes consumed past the
-    /// cursor, the new trailing verification window, and whether the region
-    /// ended without a newline.
+    /// cursor, the new trailing verification window, the consumed bytes that
+    /// extend the head-window hash, and whether the region ended without a
+    /// newline.
     Appended {
         text: String,
         consumed: u64,
         tail: Vec<u8>,
+        head_extension: Vec<u8>,
         ends_mid_line: bool,
     },
     /// Nothing consumable yet (partial flush, unreadable, or a non-UTF-8
@@ -1045,15 +1148,16 @@ enum TraceTailRead {
     /// skipped a non-UTF-8 file wholesale; not advancing lands in the same
     /// place.
     Pending,
-    /// The bytes before the cursor no longer match — the file was rewritten
-    /// (recreated shorter and regrown past the cursor between polls).
+    /// The bytes already consumed no longer match the cursor's evidence
+    /// (head-window hash or pre-cursor tail window) — the file was rewritten
+    /// (e.g. recreated shorter and regrown past the cursor between polls).
     Rewritten,
 }
 
 /// Read the consumable content appended to `path` past `cursor`, verifying
-/// the cursor's trailing window first and clamping the read to the caller's
-/// stat snapshot (`stat_len`) so the recorded mtime stays paired with the
-/// consumed length.
+/// the cursor's head-window hash and trailing window first, and clamping
+/// the read to the caller's stat snapshot (`stat_len`) so the recorded
+/// mtime stays paired with the consumed length.
 async fn read_trace_tail(
     path: &Path,
     cursor: &CodexTraceFileCursor,
@@ -1066,7 +1170,30 @@ async fn read_trace_tail(
         return TraceTailRead::Pending;
     };
     let mut file = file;
-    if seek_to > 0 && file.seek(std::io::SeekFrom::Start(seek_to)).await.is_err() {
+
+    // Head window: the first `head_len` bytes must still hash to the
+    // cursor's value — the suffix window alone cannot prove prefix identity
+    // (trace lines end in the timestamp field, which an equal-length regrow
+    // can preserve).
+    if cursor.head_len > 0 {
+        let mut head = Vec::with_capacity(cursor.head_len as usize);
+        if (&mut file)
+            .take(cursor.head_len)
+            .read_to_end(&mut head)
+            .await
+            .is_err()
+        {
+            return TraceTailRead::Pending;
+        }
+        if (head.len() as u64) < cursor.head_len {
+            return TraceTailRead::Rewritten;
+        }
+        if fnv_extend(FNV_OFFSET, &head) != cursor.head_hash {
+            return TraceTailRead::Rewritten;
+        }
+    }
+
+    if file.seek(std::io::SeekFrom::Start(seek_to)).await.is_err() {
         return TraceTailRead::Pending;
     }
     let mut buf = Vec::new();
@@ -1107,10 +1234,17 @@ async fn read_trace_tail(
     };
     let consumed_in_buf = overlap + skipped_newline + consumed_new;
     let window_start = consumed_in_buf.saturating_sub(TRACE_CURSOR_TAIL_WINDOW);
+    // Consumed bytes that extend the head-window hash: contiguous from the
+    // cursor while coverage is below TRACE_CURSOR_HEAD_WINDOW, empty once
+    // the window is full.
+    let head_room = TRACE_CURSOR_HEAD_WINDOW.saturating_sub(cursor.head_len) as usize;
+    let extension_bytes = &buf[overlap..consumed_in_buf];
+    let head_extension = extension_bytes[..extension_bytes.len().min(head_room)].to_vec();
     TraceTailRead::Appended {
         text: text.to_string(),
         consumed: (skipped_newline + consumed_new) as u64,
         tail: buf[window_start..consumed_in_buf].to_vec(),
+        head_extension,
         ends_mid_line,
     }
 }
@@ -1234,13 +1368,21 @@ async fn collect_codex_bundle_dirs_in(
 }
 
 /// True when the cached resolved chain may serve resolutions against the
-/// current index: it is complete, or its unresolved tail is STILL
+/// current index: it is complete; or the index has not changed since it was
+/// built (nothing new could have resolved its tail — which also keeps a
+/// cycle-truncated chain, whose repeated id is resolvable by construction,
+/// from re-walking on every snapshot); or its unresolved tail is STILL
 /// unresolvable. A tail that became resolvable (the response/request events
 /// arrived after the cache was built) must not be served — the caller
-/// re-walks so the newly available history is included. A cycle-truncated
-/// chain keeps re-walking (its repeated id is resolvable by construction);
-/// cycles only occur in corrupt traces and the walk stays cycle-bounded.
-fn codex_resolved_chain_current(index: &CodexTraceIndex, cached: &CodexResolvedChain) -> bool {
+/// re-walks so the newly available history is included.
+fn codex_resolved_chain_current(
+    index: &CodexTraceIndex,
+    cached: &CodexResolvedChain,
+    generation: u64,
+) -> bool {
+    if cached.generation == generation {
+        return true;
+    }
     match cached.unresolved_previous_response_id.as_deref() {
         None => true,
         Some(response_id) => match index.responses_by_id.get(response_id) {
@@ -1396,10 +1538,12 @@ pub(crate) async fn resolve_openai_responses_context_payload(
     request_index: u64,
     latest_payload: serde_json::Value,
     chain_cache: &mut Option<CodexResolvedChain>,
+    index_generation: u64,
 ) -> Result<serde_json::Value, CallerError> {
     let latest_call_key = codex_trace_call_key(latest_ref);
     let cache_hit = chain_cache.as_ref().is_some_and(|cached| {
-        cached.call_key == latest_call_key && codex_resolved_chain_current(index, cached)
+        cached.call_key == latest_call_key
+            && codex_resolved_chain_current(index, cached, index_generation)
     });
 
     let (resolved_input, unresolved_previous_response_id) = if cache_hit {
@@ -1436,7 +1580,8 @@ pub(crate) async fn resolve_openai_responses_context_payload(
                 break;
             }
             if let Some(cached) = chain_cache.as_ref().filter(|cached| {
-                cached.call_key == request_key && codex_resolved_chain_current(index, cached)
+                cached.call_key == request_key
+                    && codex_resolved_chain_current(index, cached, index_generation)
             }) {
                 // Append-only chain: the cached resolution already contains
                 // everything up to and including this request's own input;
@@ -1478,6 +1623,7 @@ pub(crate) async fn resolve_openai_responses_context_payload(
             call_key: latest_call_key,
             resolved_input: resolved_input.clone(),
             unresolved_previous_response_id: unresolved.clone(),
+            generation: index_generation,
         });
         (resolved_input, unresolved)
     };
@@ -2745,6 +2891,81 @@ mod tests {
         assert_eq!(call_ids, vec!["inference:b", "inference:c"]);
     }
 
+    #[test]
+    fn aux_probe_cadence_decision() {
+        let base = std::time::Instant::now();
+        // A rebuilt root list probes immediately, whatever the clock says.
+        assert!(aux_probe_due(Some(base), true, base));
+        // No probe yet: due.
+        assert!(aux_probe_due(None, false, base));
+        // Within the interval: throttled.
+        assert!(!aux_probe_due(
+            Some(base),
+            false,
+            base + AUX_ROOT_PROBE_INTERVAL / 2
+        ));
+        // At/after the interval: due again.
+        assert!(aux_probe_due(
+            Some(base),
+            false,
+            base + AUX_ROOT_PROBE_INTERVAL
+        ));
+    }
+
+    #[tokio::test]
+    async fn trace_index_cache_head_hash_detects_prefix_rewrite_with_identical_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trace = tmp.path().join("trace-thread-abc");
+        let line_a = write_trace_request_line(
+            &trace,
+            10,
+            "inference:a",
+            "payloads/request-a.json",
+            &user_request_payload("first"),
+            None,
+        );
+        // Same length AND same timestamp: serde_json's alphabetical key
+        // order puts `wall_time_unix_ms` last, so the suffix tail window is
+        // byte-identical — only the head hash can catch this rewrite.
+        let line_b = write_trace_request_line(
+            &trace,
+            10,
+            "inference:b",
+            "payloads/request-b.json",
+            &user_request_payload("first"),
+            None,
+        );
+        assert_eq!(line_a.len(), line_b.len());
+        assert_eq!(
+            &line_a.as_bytes()[line_a.len() - TRACE_CURSOR_TAIL_WINDOW..],
+            &line_b.as_bytes()[line_b.len() - TRACE_CURSOR_TAIL_WINDOW..],
+            "test premise: suffix window identical"
+        );
+        let line_c = write_trace_request_line(
+            &trace,
+            20,
+            "inference:c",
+            "payloads/request-c.json",
+            &user_request_payload("second"),
+            None,
+        );
+        let trace_path = trace.join("trace.jsonl");
+        std::fs::write(&trace_path, format!("{line_a}\n")).unwrap();
+
+        let mut cache = CodexTraceIndexCache::default();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        assert_eq!(cache.requests()[0].inference_call_id, "inference:a");
+
+        std::fs::write(&trace_path, format!("{line_b}\n{line_c}\n")).unwrap();
+        cache.refresh(tmp.path(), Some("thread-abc")).await.unwrap();
+        let call_ids: Vec<&str> = cache
+            .requests()
+            .iter()
+            .map(|request| request.inference_call_id.as_str())
+            .collect();
+        assert_eq!(call_ids, vec!["inference:b", "inference:c"]);
+    }
+
     #[tokio::test]
     async fn aux_root_probe_discovers_bundle_created_after_sweep() {
         let logs = tempfile::tempdir().unwrap();
@@ -2786,6 +3007,11 @@ mod tests {
         );
         std::fs::write(old_bundle.join("trace.jsonl"), format!("{old_line}\n")).unwrap();
 
+        // The per-root probe runs on the AUX_ROOT_PROBE_INTERVAL cadence;
+        // force it due rather than sleeping the interval out.
+        if let Some(aux) = cache.aux_bundles.as_mut() {
+            aux.last_probe = None;
+        }
         cache.refresh(&primary, Some("thread-abc")).await.unwrap();
         let call_ids: Vec<&str> = cache
             .requests()

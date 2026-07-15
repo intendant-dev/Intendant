@@ -655,7 +655,10 @@ pub(crate) fn codex_terminal_observation_keys(
 /// and across an app-server restart the set was ALWAYS empty (it is
 /// reader-task state), so pre-eviction code never suppressed ancient
 /// replays either — that case is owned by the stale-turn drop for
-/// turnId-carrying events and was never this set's contract.
+/// turnId-carrying events and was never this set's contract. If a replay
+/// source deeper than this horizon ever appears, a per-thread
+/// latest-final-answer map would be the structure to reach for, not a
+/// larger cap.
 const CODEX_TERMINAL_OBSERVED_CAP: usize = 4096;
 
 /// Insertion-ordered set of observed terminal-event keys, bounded by
@@ -5435,29 +5438,45 @@ error: build failed
 
     #[test]
     fn terminal_observed_set_is_bounded_and_evicts_oldest() {
+        // Two keys per turn (item + turn), enough turns to cross the cap:
+        // the realistic accumulation shape, proving eviction engages and the
+        // newest keys survive it.
         let mut observed = CodexTerminalObserved::default();
-        for i in 0..(CODEX_TERMINAL_OBSERVED_CAP + 10) {
-            codex_mark_terminal_observed(&mut observed, &[format!("turn:turn-{i}")]);
+        let turns = CODEX_TERMINAL_OBSERVED_CAP / 2 + 500;
+        for i in 0..turns {
+            codex_mark_terminal_observed(
+                &mut observed,
+                &[format!("item:item-{i}"), format!("turn:turn-{i}")],
+            );
         }
         assert_eq!(observed.set.len(), CODEX_TERMINAL_OBSERVED_CAP);
         assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP);
-        // The oldest keys were evicted; the most recent are retained.
+        // The oldest keys were evicted; the most recent survive.
         assert!(!codex_any_terminal_observed(
             &observed,
-            &["turn:turn-0".to_string()]
+            &["turn:turn-0".to_string(), "item:item-0".to_string()]
         ));
-        let newest = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 9);
-        assert!(codex_any_terminal_observed(&observed, &[newest]));
+        let newest_turn = format!("turn:turn-{}", turns - 1);
+        let newest_item = format!("item:item-{}", turns - 1);
+        assert!(codex_any_terminal_observed(
+            &observed,
+            std::slice::from_ref(&newest_turn)
+        ));
+        assert!(codex_any_terminal_observed(
+            &observed,
+            std::slice::from_ref(&newest_item)
+        ));
 
         // Re-marking an already observed key neither duplicates nor evicts.
-        let repeat = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 9);
-        codex_mark_terminal_observed(&mut observed, &[repeat]);
+        codex_mark_terminal_observed(&mut observed, std::slice::from_ref(&newest_turn));
         assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP);
 
         // Clearing (the turn/started path) removes from both set and order.
-        let cleared = format!("turn:turn-{}", CODEX_TERMINAL_OBSERVED_CAP + 8);
-        codex_clear_terminal_observed(&mut observed, std::slice::from_ref(&cleared));
-        assert!(!codex_any_terminal_observed(&observed, &[cleared]));
+        codex_clear_terminal_observed(&mut observed, std::slice::from_ref(&newest_item));
+        assert!(!codex_any_terminal_observed(
+            &observed,
+            std::slice::from_ref(&newest_item)
+        ));
         assert_eq!(observed.order.len(), CODEX_TERMINAL_OBSERVED_CAP - 1);
     }
 
