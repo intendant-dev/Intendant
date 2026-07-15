@@ -36,8 +36,31 @@ identical report rows the Rust harness prints.
 1. Extract the reducer's crypto calls behind a `Crypto` trait with a
    WebCrypto (`web-sys`) implementation — the KAT module is the only
    place raw primitives are invoked (~1 session).
+   **DONE (2026-07-15), seam + scaffold:** `reducer/src/crypto.rs`
+   carries the maybe-async trait (the §13.2 browser primitive set:
+   digest, Ed25519/P-256 verify with the low-S policy, point/scalar
+   ops, HPKE open, AES-GCM, HKDF-SHA256, PBKDF2-HMAC-SHA512, Ed25519
+   seed→pk) with `NativeCrypto` on the existing crates and
+   `block_on_ready` for the sync CLI path; the browser-required KAT
+   lanes (families 1–5, 8) are generic over it, and the engine lanes
+   stay direct per §13.2's family matrix (their browser cell is the
+   IndexedDB Txn subset, not WebCrypto). `browser-lane/` compiles the
+   schema-less reducer for wasm32-unknown-unknown (`schema` feature
+   default-on; jsonschema→ahash→getrandom-0.3 cannot build there;
+   `getrandom/js` unified for the p256/hpke stack) and exposes
+   `run_vector` (dep-free structural layers + semantics). The
+   SubtleCrypto backend is a DELIBERATE unwired stub — every
+   primitive errors, so crypto vectors report FAIL and nothing can
+   green-wash before item 2's driver actually runs a browser; the
+   backend gets written WITH that driver, which is the only honest
+   way to test it.
 2. `wasm-pack` packaging + the fixture page + CDP driver reusing the
-   validate-dashboard launch/scrape recipe (~1 session).
+   validate-dashboard launch/scrape recipe (~1 session) — plus the
+   SubtleCrypto backend the scaffold stubs (digest, importKey+verify,
+   ECDH `deriveBits` composed into HPKE per RFC 9180, AES-GCM
+   encrypt/decrypt, HKDF/PBKDF2 deriveBits; WebCrypto ECDSA does not
+   enforce low-S, so the wasm side pre-checks `s ≤ n/2` on the raw
+   signature bytes before verifying).
 3. IndexedDB Txn-subset shim for the family-13 journal lane
    (transaction boundaries mapped to the Txn frames; L1 truncation
    simulated at the fixture layer) (~1–2 sessions).

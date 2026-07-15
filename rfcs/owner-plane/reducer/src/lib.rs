@@ -13,6 +13,7 @@
 //! Spec: `../owner-plane-d0a-spec.md` (v0.5.19).
 
 pub mod cbor;
+pub mod crypto;
 pub mod domains;
 pub mod edge;
 pub mod envelope;

@@ -3,6 +3,14 @@
 //! implementations, differentially compared against the minted
 //! expectations.
 //!
+//! Crypto routing (the §13.2 seam): the browser-required lanes
+//! (families 1–5 and 8) take a [`crate::crypto::Crypto`] backend and
+//! invoke every primitive through it — the browser lane swaps in
+//! WebCrypto there. Native-only lanes keep direct crate calls by
+//! design: family-3 `sign-then-verify` (the companion schema bars
+//! `browser` there — WebCrypto cannot inject signing randomness) and
+//! the non-browser families 6, 11, and 14.
+//!
 //! This module carries the reducer's ONLY canonical-CBOR writer — a
 //! tiny sorted-map encoder used for two jobs where reading is not
 //! enough: re-deriving the family-1 cap-fit templates byte-for-byte
@@ -26,6 +34,7 @@
 use serde_json::Value as Json;
 
 use crate::cbor::{decode, DecodeError, Node};
+use crate::crypto::{item_crypto, p256_sig, Crypto};
 use crate::domains;
 use crate::harness::SemStatus;
 
@@ -147,27 +156,27 @@ fn pass_if_pair(got: (&str, &str), vector: &Json) -> Result<SemStatus, String> {
 }
 
 /// Dispatch one KAT vector. `Err` = harness-level malformation.
-pub fn run(vector: &Json) -> Result<SemStatus, String> {
+pub async fn run<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
     match kind {
         "canonical-encode" => canonical_encode(vector),
         "canonical-reject" => canonical_reject(vector),
         "cap-fit" => cap_fit(vector),
         "cap-exceed" => cap_exceed(vector),
-        "hash-domain" => hash_domain(vector),
-        "key-id-derive" => key_id_derive(vector),
-        "separation-negative" => separation(vector),
+        "hash-domain" => hash_domain(c, vector).await,
+        "key-id-derive" => key_id_derive(c, vector).await,
+        "separation-negative" => separation(c, vector).await,
         "sign-then-verify" => sign_then_verify(vector),
-        "verify-fixed" => verify_fixed(vector),
-        "hpke-seal-open" => hpke_seal_open(vector),
-        "hpke-negative" => hpke_negative(vector),
-        "item-seal-open" => item_seal_open(vector),
-        "rewrap-idempotence" => rewrap_idempotence(vector),
-        "crypto-negative" => crypto_negative(vector),
+        "verify-fixed" => verify_fixed(c, vector).await,
+        "hpke-seal-open" => hpke_seal_open(c, vector).await,
+        "hpke-negative" => hpke_negative(c, vector).await,
+        "item-seal-open" => item_seal_open(c, vector).await,
+        "rewrap-idempotence" => rewrap_idempotence(c, vector).await,
+        "crypto-negative" => crypto_negative(c, vector).await,
         "frontier-fold" => frontier_fold(vector),
         "frontier-negative" => frontier_negative(vector),
-        "phrase-derive" => phrase_derive(vector),
-        "commitment-derive" => commitment_derive(vector),
+        "phrase-derive" => phrase_derive(c, vector).await,
+        "commitment-derive" => commitment_derive(c, vector).await,
         "merkle-proof" => merkle_proof_kat(vector),
         "reencapsulation" => reencapsulation(vector),
         "projection" => projection(vector),
@@ -410,7 +419,10 @@ fn cap_exceed(vector: &Json) -> Result<SemStatus, String> {
 
 // --------------------------------------------------------- family 2
 
-fn hash_domain(vector: &Json) -> Result<SemStatus, String> {
+/// The lanes build the §2 domain framing (`msg(tag, x)` — pure
+/// bytes) themselves and route the DIGEST through the backend, so
+/// the browser lane exercises exactly WebCrypto's SHA-256.
+async fn hash_domain<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let tag = vector["inputs"]["tag"].as_str().ok_or("inputs.tag")?;
     if !domains::TAGS.contains(&tag) {
         return Ok(SemStatus::Fail(format!("unknown domain tag {tag}")));
@@ -421,22 +433,22 @@ fn hash_domain(vector: &Json) -> Result<SemStatus, String> {
             .as_str()
             .ok_or("expected.bytes")?,
     )?;
-    if domains::h(tag, &preimage).to_vec() == want {
+    if c.sha256(&domains::msg(tag, &preimage)).await?.to_vec() == want {
         Ok(SemStatus::Pass)
     } else {
         Ok(SemStatus::Fail("digest mismatch".into()))
     }
 }
 
-fn key_id_derive(vector: &Json) -> Result<SemStatus, String> {
+async fn key_id_derive<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let kind = vector["inputs"]["kind"].as_str().ok_or("inputs.kind")?;
     let pk = in_hex(vector, "pk")?;
-    let got = match kind {
+    let framed = match kind {
         "key_id" => {
             let alg = vector["inputs"]["alg"].as_str().ok_or("inputs.alg")?;
-            domains::key_id(alg, &pk)
+            domains::msg("key", &domains::key_id_preimage(alg, &pk))
         }
-        "mat_id" => domains::h("mat", &pk),
+        "mat_id" => domains::msg("mat", &pk),
         other => return Ok(SemStatus::Unimplemented(format!("key-id kind {other}"))),
     };
     let want = unhex(
@@ -444,21 +456,23 @@ fn key_id_derive(vector: &Json) -> Result<SemStatus, String> {
             .as_str()
             .ok_or("expected.bytes")?,
     )?;
-    if got.to_vec() == want {
+    if c.sha256(&framed).await?.to_vec() == want {
         Ok(SemStatus::Pass)
     } else {
         Ok(SemStatus::Fail("key-id mismatch".into()))
     }
 }
 
-fn separation(vector: &Json) -> Result<SemStatus, String> {
+async fn separation<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let a = vector["inputs"]["tag_a"].as_str().ok_or("tag_a")?;
     let b = vector["inputs"]["tag_b"].as_str().ok_or("tag_b")?;
     if !domains::TAGS.contains(&a) || !domains::TAGS.contains(&b) {
         return Ok(SemStatus::Unimplemented("tag outside the inventory".into()));
     }
     let preimage = in_hex(vector, "preimage")?;
-    let distinct = domains::h(a, &preimage) != domains::h(b, &preimage);
+    let da = c.sha256(&domains::msg(a, &preimage)).await?;
+    let db = c.sha256(&domains::msg(b, &preimage)).await?;
+    let distinct = da != db;
     let want = vector["expected"]["result"]["distinct"]
         .as_bool()
         .ok_or("result.distinct")?;
@@ -473,39 +487,9 @@ fn separation(vector: &Json) -> Result<SemStatus, String> {
 
 // --------------------------------------------------------- family 3
 
-/// P-256 sign helpers shared by the two lanes.
-mod p256_sig {
-    use p256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
-    use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-    use sha2::{Digest, Sha256};
-
-    pub fn sign_low_s(sk: &[u8; 32], msg: &[u8]) -> Option<[u8; 64]> {
-        let sk = SigningKey::from_bytes(sk.into()).ok()?;
-        let digest = Sha256::digest(msg);
-        let sig: Signature = sk.sign_prehash(&digest).ok()?;
-        let sig = sig.normalize_s().unwrap_or(sig);
-        Some(sig.to_bytes().into())
-    }
-
-    /// High-S rejected before curve math.
-    pub fn verify(pk_sec1: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-        if pk_sec1.len() != 65 || pk_sec1[0] != 0x04 {
-            return false;
-        }
-        let Ok(vk) = VerifyingKey::from_sec1_bytes(pk_sec1) else {
-            return false;
-        };
-        let Ok(sig) = Signature::from_slice(sig) else {
-            return false;
-        };
-        if sig.normalize_s().is_some() {
-            return false;
-        }
-        let digest = Sha256::digest(msg);
-        vk.verify_prehash(&digest, &sig).is_ok()
-    }
-}
-
+/// Native-only by the companion schema's surface guard (WebCrypto
+/// cannot inject signing randomness): direct crate calls via
+/// [`crate::crypto::p256_sig`], no backend parameter.
 fn sign_then_verify(vector: &Json) -> Result<SemStatus, String> {
     use ed25519_dalek::Signer;
     let name = vector["name"].as_str().unwrap_or_default();
@@ -547,23 +531,15 @@ fn sign_then_verify(vector: &Json) -> Result<SemStatus, String> {
     }
 }
 
-fn verify_fixed(vector: &Json) -> Result<SemStatus, String> {
+async fn verify_fixed<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let pk = in_hex(vector, "pk")?;
     let msg = in_hex(vector, "msg")?;
     let sig = in_hex(vector, "sig")?;
+    // Algorithm by pk length (the fixture convention); malformed
+    // keys/signatures are a semantic `false` inside the backend.
     let valid = match pk.len() {
-        32 => {
-            let pk: [u8; 32] = pk.try_into().expect("len checked");
-            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else {
-                return pass_bool(vector, false);
-            };
-            let Ok(sig64) = <[u8; 64]>::try_from(sig.as_slice()) else {
-                return pass_bool(vector, false);
-            };
-            vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&sig64))
-                .is_ok()
-        }
-        65 => p256_sig::verify(&pk, &msg, &sig),
+        32 => c.ed25519_verify(&pk, &msg, &sig).await?,
+        65 => c.p256_verify(&pk, &msg, &sig).await?,
         _ => false,
     };
     pass_bool(vector, valid)
@@ -582,41 +558,7 @@ fn pass_bool(vector: &Json, valid: bool) -> Result<SemStatus, String> {
 
 // --------------------------------------------------------- family 4
 
-mod hpke_ops {
-    use hpke::aead::AesGcm256;
-    use hpke::kdf::HkdfSha256;
-    use hpke::kem::DhP256HkdfSha256;
-    use hpke::{Deserializable, Kem as KemTrait, OpModeR};
-    type Kem = DhP256HkdfSha256;
-
-    pub fn open(sk: &[u8; 32], enc: &[u8], info: &[u8], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-        let sk = <Kem as KemTrait>::PrivateKey::from_bytes(sk).ok()?;
-        let enc = <Kem as KemTrait>::EncappedKey::from_bytes(enc).ok()?;
-        hpke::single_shot_open::<AesGcm256, HkdfSha256, Kem>(
-            &OpModeR::Base,
-            &sk,
-            &enc,
-            info,
-            ct,
-            aad,
-        )
-        .ok()
-    }
-
-    /// Is the SEC1 encoding a valid, non-identity P-256 point?
-    pub fn point_valid(enc: &[u8]) -> bool {
-        p256::PublicKey::from_sec1_bytes(enc).is_ok()
-    }
-
-    /// sk (32-byte scalar) → SEC1 uncompressed pk.
-    pub fn pk_of(sk: &[u8; 32]) -> Option<[u8; 65]> {
-        let sk = p256::SecretKey::from_slice(sk).ok()?;
-        let pk = sk.public_key().to_sec1_bytes();
-        pk.as_ref().try_into().ok()
-    }
-}
-
-fn hpke_seal_open(vector: &Json) -> Result<SemStatus, String> {
+async fn hpke_seal_open<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let sk: [u8; 32] = in_hex(vector, "recipient_sk")?
         .try_into()
         .map_err(|_| "recipient_sk is 32 bytes")?;
@@ -626,7 +568,7 @@ fn hpke_seal_open(vector: &Json) -> Result<SemStatus, String> {
     let info = in_hex(vector, "info").unwrap_or_default();
 
     // sk ↔ pk consistency.
-    if hpke_ops::pk_of(&sk).map(|p| p.to_vec()) != Some(pk) {
+    if c.p256_pk_of(&sk).await?.map(|p| p.to_vec()) != Some(pk) {
         return Ok(SemStatus::Fail(
             "recipient_pk does not match recipient_sk".into(),
         ));
@@ -649,14 +591,14 @@ fn hpke_seal_open(vector: &Json) -> Result<SemStatus, String> {
             .as_str()
             .ok_or("result.opened")?,
     )?;
-    match hpke_ops::open(&sk, &enc, &info, &aad, &ct) {
+    match c.hpke_open(&sk, &enc, &info, &aad, &ct).await? {
         Some(pt) if pt == opened && pt == plaintext => Ok(SemStatus::Pass),
         Some(_) => Ok(SemStatus::Fail("opened plaintext differs".into())),
         None => Ok(SemStatus::Fail("open failed on the minted seal".into())),
     }
 }
 
-fn hpke_negative(vector: &Json) -> Result<SemStatus, String> {
+async fn hpke_negative<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let sk: [u8; 32] = in_hex(vector, "recipient_sk")?
         .try_into()
         .map_err(|_| "recipient_sk is 32 bytes")?;
@@ -670,9 +612,9 @@ fn hpke_negative(vector: &Json) -> Result<SemStatus, String> {
     // "corpus/info". The negatives carry no info field, so the open
     // MUST fail regardless — but the OUTCOME is decided by the point
     // check, which is info-independent.
-    let got = if !hpke_ops::point_valid(&enc) {
+    let got = if !c.p256_point_valid(&enc).await? {
         ("key-malformed", "reject-permanent")
-    } else if hpke_ops::open(&sk, &enc, &[], &aad, &ct).is_none() {
+    } else if c.hpke_open(&sk, &enc, &[], &aad, &ct).await?.is_none() {
         ("aead-fail", "storage-quarantine")
     } else {
         return Ok(SemStatus::Fail("negative opened successfully".into()));
@@ -682,77 +624,13 @@ fn hpke_negative(vector: &Json) -> Result<SemStatus, String> {
 
 // --------------------------------------------------------- family 5
 
-/// The reducer's own §5.3 key schedule (context strings from the
-/// spec; HKDF-SHA256 + AES-256-GCM from third-party crates).
-mod item_crypto {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-
-    pub const F5_PLANE: [u8; 32] = [0; 32];
-    pub const F5_ZONE: [u8; 16] = [0; 16];
-
-    fn concat(parts: &[&[u8]]) -> Vec<u8> {
-        let mut v = Vec::new();
-        for p in parts {
-            v.extend_from_slice(p);
-        }
-        v
-    }
-
-    pub fn item_aad(plane: &[u8; 32], zone: &[u8; 16]) -> Vec<u8> {
-        concat(&[b"intendant/item/v1", &[0x00], plane, zone])
-    }
-
-    pub fn wrap_key(kek: &[u8; 32], item_addr: &[u8; 32]) -> [u8; 32] {
-        let hk = Hkdf::<Sha256>::new(Some(b"intendant/wrapkey/v1"), kek);
-        let mut okm = [0u8; 32];
-        hk.expand(item_addr, &mut okm).expect("32 B within bounds");
-        okm
-    }
-
-    pub fn dekwrap_aad(
-        plane: &[u8; 32],
-        zone: &[u8; 16],
-        epoch: u64,
-        item_addr: &[u8; 32],
-    ) -> Vec<u8> {
-        concat(&[
-            b"intendant/dekwrap/v1",
-            &[0x00],
-            plane,
-            zone,
-            &epoch.to_be_bytes(),
-            item_addr,
-        ])
-    }
-
-    pub fn aead_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], pt: &[u8]) -> Vec<u8> {
-        Aes256Gcm::new(key.into())
-            .encrypt(Nonce::from_slice(nonce), Payload { msg: pt, aad })
-            .expect("AES-GCM seal")
-    }
-
-    pub fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
-        Aes256Gcm::new(key.into())
-            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
-            .ok()
-    }
-
-    pub fn wrap_dek(kek: &[u8; 32], epoch: u64, item_addr: &[u8; 32], dek: &[u8; 32]) -> [u8; 48] {
-        let wk = wrap_key(kek, item_addr);
-        let aad = dekwrap_aad(&F5_PLANE, &F5_ZONE, epoch, item_addr);
-        aead_seal(&wk, &[0u8; 12], &aad, dek)
-            .as_slice()
-            .try_into()
-            .expect("48 B")
-    }
-}
-
 /// Decode + validate a family-5 `core`/`wrap` pair; run the full
-/// open chain. Returns the failure outcome or the plaintext.
-fn open_item_chain(
+/// open chain (§5.3: the item address digest, the HKDF wrap key, and
+/// both AES-GCM opens all through the backend — AAD framing is pure
+/// bytes from [`crate::crypto::item_crypto`]). Returns the failure
+/// outcome or the plaintext.
+async fn open_item_chain<C: Crypto>(
+    c: &C,
     kek: &[u8; 32],
     epoch: u64,
     core_bytes: &[u8],
@@ -760,7 +638,7 @@ fn open_item_chain(
 ) -> Result<Result<Vec<u8>, (&'static str, &'static str)>, String> {
     let core = decode(core_bytes).map_err(|e| format!("core decode: {e:?}"))?;
     let wrap = decode(wrap_bytes).map_err(|e| format!("wrap decode: {e:?}"))?;
-    let addr = domains::h("item", core_bytes);
+    let addr: [u8; 32] = c.sha256(&domains::msg("item", core_bytes)).await?;
     let named = wrap
         .get("item_addr")
         .and_then(|n| n.bytes_n::<32>())
@@ -775,9 +653,13 @@ fn open_item_chain(
         .get("wrapped_dek")
         .and_then(|n| n.bytes_n::<48>())
         .ok_or("wrap.wrapped_dek")?;
-    let wk = item_crypto::wrap_key(kek, &addr);
+    let wk: [u8; 32] = c
+        .hkdf_sha256(item_crypto::WRAPKEY_SALT, kek, &addr, 32)
+        .await?
+        .try_into()
+        .map_err(|_| "wrap key is 32 bytes")?;
     let aad = item_crypto::dekwrap_aad(&item_crypto::F5_PLANE, &item_crypto::F5_ZONE, epoch, &addr);
-    let Some(dek) = item_crypto::aead_open(&wk, &[0u8; 12], &aad, &wrapped) else {
+    let Some(dek) = c.aes_gcm_open(&wk, &[0u8; 12], &aad, &wrapped).await? else {
         return Ok(Err(("aead-fail", "storage-quarantine")));
     };
     let dek: [u8; 32] = dek.as_slice().try_into().map_err(|_| "DEK is 32 bytes")?;
@@ -787,20 +669,20 @@ fn open_item_chain(
         .ok_or("core.nonce")?;
     let ct = core.get("ct").and_then(|n| n.as_bytes()).ok_or("core.ct")?;
     let item_aad = item_crypto::item_aad(&item_crypto::F5_PLANE, &item_crypto::F5_ZONE);
-    match item_crypto::aead_open(&dek, &nonce, &item_aad, ct) {
+    match c.aes_gcm_open(&dek, &nonce, &item_aad, ct).await? {
         Some(pt) => Ok(Ok(pt)),
         None => Ok(Err(("aead-fail", "storage-quarantine"))),
     }
 }
 
-fn item_seal_open(vector: &Json) -> Result<SemStatus, String> {
+async fn item_seal_open<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let kek: [u8; 32] = in_hex(vector, "kek")?
         .try_into()
         .map_err(|_| "kek is 32 bytes")?;
     let epoch = vector["inputs"]["kek_epoch"].as_u64().ok_or("kek_epoch")?;
     let core_bytes = in_hex(vector, "core")?;
     let wrap_bytes = in_hex(vector, "wrap")?;
-    match open_item_chain(&kek, epoch, &core_bytes, &wrap_bytes)? {
+    match open_item_chain(c, &kek, epoch, &core_bytes, &wrap_bytes).await? {
         Ok(pt) => {
             let want = unhex(
                 vector["expected"]["result"]["plaintext"]
@@ -817,7 +699,7 @@ fn item_seal_open(vector: &Json) -> Result<SemStatus, String> {
     }
 }
 
-fn rewrap_idempotence(vector: &Json) -> Result<SemStatus, String> {
+async fn rewrap_idempotence<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let kek: [u8; 32] = in_hex(vector, "kek")?
         .try_into()
         .map_err(|_| "kek is 32 bytes")?;
@@ -828,13 +710,19 @@ fn rewrap_idempotence(vector: &Json) -> Result<SemStatus, String> {
         .try_into()
         .map_err(|_| "item_addr is 32 bytes")?;
     let epoch = vector["inputs"]["kek_epoch"].as_u64().ok_or("kek_epoch")?;
-    let w1 = item_crypto::wrap_dek(&kek, epoch, &addr, &dek);
-    let w2 = item_crypto::wrap_dek(&kek, epoch, &addr, &dek);
+    let wk: [u8; 32] = c
+        .hkdf_sha256(item_crypto::WRAPKEY_SALT, &kek, &addr, 32)
+        .await?
+        .try_into()
+        .map_err(|_| "wrap key is 32 bytes")?;
+    let aad = item_crypto::dekwrap_aad(&item_crypto::F5_PLANE, &item_crypto::F5_ZONE, epoch, &addr);
+    let w1 = c.aes_gcm_seal(&wk, &[0u8; 12], &aad, &dek).await?;
+    let w2 = c.aes_gcm_seal(&wk, &[0u8; 12], &aad, &dek).await?;
     if w1 != w2 {
         return Ok(SemStatus::Fail("rewrap is not byte-idempotent".into()));
     }
     if let Some(want) = vector["expected"]["result"]["wrapper"].as_str() {
-        if unhex(want)? != w1.to_vec() {
+        if unhex(want)? != w1 {
             return Ok(SemStatus::Fail("wrapper bytes differ from minted".into()));
         }
     }
@@ -845,14 +733,14 @@ fn rewrap_idempotence(vector: &Json) -> Result<SemStatus, String> {
     }
 }
 
-fn crypto_negative(vector: &Json) -> Result<SemStatus, String> {
+async fn crypto_negative<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let kek: [u8; 32] = in_hex(vector, "kek")?
         .try_into()
         .map_err(|_| "kek is 32 bytes")?;
     let epoch = vector["inputs"]["kek_epoch"].as_u64().ok_or("kek_epoch")?;
     let core_bytes = in_hex(vector, "core")?;
     let wrap_bytes = in_hex(vector, "wrap")?;
-    match open_item_chain(&kek, epoch, &core_bytes, &wrap_bytes)? {
+    match open_item_chain(c, &kek, epoch, &core_bytes, &wrap_bytes).await? {
         Ok(_) => Ok(SemStatus::Fail("negative opened successfully".into())),
         Err(got) => pass_if_pair(got, vector),
     }
@@ -1050,22 +938,25 @@ fn frontier_negative(vector: &Json) -> Result<SemStatus, String> {
 /// The reducer's OWN BIP-39 validation (§2.4): NFKD-normalize, split
 /// into exactly 24 wordlist words, rebuild the 256-bit entropy from
 /// the 11-bit indexes, and verify the 8-bit checksum = the first
-/// byte of SHA-256(entropy). The wordlist itself is standard DATA
-/// (the `bip39` crate's English table — like the CRC polynomial);
-/// the math here is independent of core's entropy→mnemonic leg.
-/// `Err` = the §2.4 rejection (checksum-invalid mnemonics are
-/// rejected BEFORE derivation).
-fn validate_bip39(normalized: &str) -> Result<[u8; 32], String> {
-    use sha2::{Digest, Sha256};
+/// byte of SHA-256(entropy) — the digest through the §13.2 backend.
+/// The wordlist itself is standard DATA (the `bip39` crate's English
+/// table — like the CRC polynomial); the math here is independent of
+/// core's entropy→mnemonic leg. Inner `Err` = the §2.4 rejection
+/// (checksum-invalid mnemonics are rejected BEFORE derivation);
+/// outer `Err` = backend failure.
+async fn validate_bip39<C: Crypto>(
+    c: &C,
+    normalized: &str,
+) -> Result<Result<[u8; 32], String>, String> {
     let list = bip39::Language::English.word_list();
     let words: Vec<&str> = normalized.split_whitespace().collect();
     if words.len() != 24 {
-        return Err(format!("{} words (24 required)", words.len()));
+        return Ok(Err(format!("{} words (24 required)", words.len())));
     }
     let mut bits: Vec<bool> = Vec::with_capacity(264);
     for w in &words {
         let Ok(idx) = list.binary_search(w) else {
-            return Err(format!("{w:?} is not a wordlist word"));
+            return Ok(Err(format!("{w:?} is not a wordlist word")));
         };
         for b in (0..11).rev() {
             bits.push(idx >> b & 1 == 1);
@@ -1078,10 +969,10 @@ fn validate_bip39(normalized: &str) -> Result<[u8; 32], String> {
     let checksum = bits[256..264]
         .iter()
         .fold(0u8, |acc, &b| acc << 1 | b as u8);
-    if checksum != Sha256::digest(entropy)[0] {
-        return Err("checksum mismatch".into());
+    if checksum != c.sha256(&entropy).await?[0] {
+        return Ok(Err("checksum mismatch".into()));
     }
-    Ok(entropy)
+    Ok(Ok(entropy))
 }
 
 /// §2.4 exact: NFKD, the reducer's own BIP-39 checksum validation
@@ -1091,9 +982,7 @@ fn validate_bip39(normalized: &str) -> Result<[u8; 32], String> {
 /// HKDF stage, and the Ed25519 keypair. When the vector carries
 /// `entropy`, the reducer's rebuilt entropy must equal it — the
 /// phrase↔entropy relationship made executable on this side too.
-fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
-    use hkdf::Hkdf;
-    use sha2::{Sha256, Sha512};
+async fn phrase_derive<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     use unicode_normalization::UnicodeNormalization;
     let Some(phrase) = vector["inputs"]["phrase"].as_str() else {
         return Ok(SemStatus::Unimplemented(
@@ -1105,7 +994,7 @@ fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
         vector["expected"]["outcome"].as_str(),
         vector["expected"]["disposition"].as_str(),
     );
-    match validate_bip39(&normalized) {
+    match validate_bip39(c, &normalized).await? {
         Err(_) => {
             return Ok(match want_pair {
                 (Some("key-malformed"), Some("reject-permanent")) => SemStatus::Pass,
@@ -1132,15 +1021,15 @@ fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
             }
         }
     }
-    let mut seed = [0u8; 64];
-    pbkdf2::pbkdf2_hmac::<Sha512>(normalized.as_bytes(), b"mnemonic", 2048, &mut seed);
-    let hk = Hkdf::<Sha256>::new(Some(b"intendant/recovery/v1"), &seed);
-    let mut ed_seed = [0u8; 32];
-    hk.expand(b"ed25519-seed", &mut ed_seed)
-        .expect("32 B within bounds");
-    let pk = ed25519_dalek::SigningKey::from_bytes(&ed_seed)
-        .verifying_key()
-        .to_bytes();
+    let seed = c
+        .pbkdf2_hmac_sha512(normalized.as_bytes(), b"mnemonic", 2048)
+        .await?;
+    let ed_seed: [u8; 32] = c
+        .hkdf_sha256(b"intendant/recovery/v1", &seed, b"ed25519-seed", 32)
+        .await?
+        .try_into()
+        .map_err(|_| "ed25519 seed is 32 bytes")?;
+    let pk = c.ed25519_pk_of_seed(&ed_seed).await?;
 
     let keys = vector["expected"]["result"]["keys"]
         .as_object()
@@ -1161,14 +1050,14 @@ fn phrase_derive(vector: &Json) -> Result<SemStatus, String> {
 }
 
 /// `commitment = H_drill(recovery_pk)`.
-fn commitment_derive(vector: &Json) -> Result<SemStatus, String> {
+async fn commitment_derive<C: Crypto>(c: &C, vector: &Json) -> Result<SemStatus, String> {
     let pk = in_hex(vector, "recovery_pk")?;
     let want = unhex(
         vector["expected"]["bytes"]
             .as_str()
             .ok_or("expected.bytes")?,
     )?;
-    if domains::h("drill", &pk).to_vec() == want {
+    if c.sha256(&domains::msg("drill", &pk)).await?.to_vec() == want {
         Ok(SemStatus::Pass)
     } else {
         Ok(SemStatus::Fail("commitment differs".into()))

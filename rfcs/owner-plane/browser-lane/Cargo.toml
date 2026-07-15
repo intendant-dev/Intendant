@@ -1,0 +1,31 @@
+[package]
+name = "owner-plane-browser-lane"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A browser execution lane (§13.2 `browser` column): the reducer's lane code compiled to wasm32 with crypto routed through WebCrypto. Work item 2 of execution-lanes-plan.md lane 1 — packaged by wasm-pack, driven headless over CDP."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The reducer WITHOUT the JSON-Schema layers: jsonschema → ahash →
+# getrandom 0.3 does not build for wasm32-unknown-unknown, and the
+# schema layers run natively on the same corpus in the same CI. The
+# browser lane's contract is SEMANTICS (plus the dep-free structural
+# checks).
+owner-plane-reducer = { path = "../reducer", default-features = false }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Transitive (rand_core via the p256/hpke stack): getrandom 0.2 needs
+# its `js` feature to compile for wasm32-unknown-unknown at all. The
+# lane never draws randomness — family-3 sign-then-verify is barred
+# from the browser surface by the companion schema — this is a
+# compile-time unification only.
+getrandom = { version = "0.2", features = ["js"] }
+
+# Standalone: NOT a member of the intendant workspace — lives and
+# versions with the spec, like core/ and reducer/.
+[workspace]

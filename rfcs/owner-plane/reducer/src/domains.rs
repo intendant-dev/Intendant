@@ -61,11 +61,18 @@ pub fn gen_start(lineage: &[u8; 16], gen: u64) -> [u8; 32] {
 }
 
 /// `key_id = H_key({alg, pk})` — the reducer builds the tiny
-/// canonical two-entry map itself. Canonical order is by ENCODED key
-/// bytes: `"pk"` encodes `62 70 6b`, `"alg"` encodes `63 61 6c 67`,
-/// and `0x62 < 0x63` — so `pk` sorts FIRST (the shorter key wins
-/// through its header byte, not alphabetically).
+/// canonical two-entry map itself.
 pub fn key_id(alg: &str, pk: &[u8]) -> [u8; 32] {
+    h("key", &key_id_preimage(alg, pk))
+}
+
+/// The canonical `{alg, pk}` map bytes key_id hashes. Canonical
+/// order is by ENCODED key bytes: `"pk"` encodes `62 70 6b`, `"alg"`
+/// encodes `63 61 6c 67`, and `0x62 < 0x63` — so `pk` sorts FIRST
+/// (the shorter key wins through its header byte, not
+/// alphabetically). Public so the family-2 KAT lane can frame the
+/// preimage and route the digest itself through its §13.2 backend.
+pub fn key_id_preimage(alg: &str, pk: &[u8]) -> Vec<u8> {
     let mut m = vec![0xa2u8];
     // "pk"
     m.push(0x62);
@@ -77,7 +84,7 @@ pub fn key_id(alg: &str, pk: &[u8]) -> [u8; 32] {
     m.extend_from_slice(b"alg");
     m.extend_from_slice(&text_header(alg.len()));
     m.extend_from_slice(alg.as_bytes());
-    h("key", &m)
+    m
 }
 
 /// §11.8 bundle leaf: `H_brec(canonical bundleleaf)` where

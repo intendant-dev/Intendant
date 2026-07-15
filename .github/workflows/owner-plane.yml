@@ -53,6 +53,19 @@ jobs:
           cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml -- -D warnings
       - name: strict harness gate (every vector; nonzero exit on any red)
         run: cargo run --manifest-path rfcs/owner-plane/reducer/Cargo.toml --bin harness
+      # The browser lane's build shapes (execution-lanes-plan lane 1):
+      # the schema-less reducer config the wasm wrapper consumes, and
+      # the wrapper's wasm32 compile. COMPILE CHECKS ONLY — browser
+      # EXECUTION arrives with the CDP driver and gets its own
+      # accurately-named job; nothing here runs a vector in Chromium.
+      - name: reducer schema-less config (the browser lane's build shape)
+        run: |
+          cargo clippy --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features --all-targets -- -D warnings
+          cargo test --manifest-path rfcs/owner-plane/reducer/Cargo.toml --no-default-features
+      - name: browser-lane wasm scaffold (compile check only, NOT browser execution)
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --manifest-path rfcs/owner-plane/browser-lane/Cargo.toml --target wasm32-unknown-unknown
       - name: mint idempotence (vectors + coverage map reproduce byte-exactly)
         run: |
           cargo run --manifest-path rfcs/owner-plane/core/Cargo.toml --bin mint >/dev/null

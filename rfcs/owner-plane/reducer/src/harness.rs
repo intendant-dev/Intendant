@@ -81,6 +81,7 @@ pub fn container_schema(spec_text: &str) -> Result<Json, String> {
     serde_json::from_str(body[..close].trim()).map_err(|e| format!("container parse: {e}"))
 }
 
+#[cfg(feature = "schema")]
 fn validate(schema: &Json, instance: &Json) -> Result<(), String> {
     let validator = jsonschema::validator_for(schema).map_err(|e| format!("compile: {e}"))?;
     let errors: Vec<String> = validator
@@ -95,8 +96,9 @@ fn validate(schema: &Json, instance: &Json) -> Result<(), String> {
 }
 
 /// §13.1: outcome/disposition stay plain strings in the schemas; the
-/// harness cross-validates every pair under `expected`.
-fn check_pairs(expected: &Json) -> Result<(), String> {
+/// harness cross-validates every pair under `expected`. Public: the
+/// browser lane runs the dep-free structural layers per vector.
+pub fn check_pairs(expected: &Json) -> Result<(), String> {
     fn walk(node: &Json, path: &str, bad: &mut Vec<String>) {
         match node {
             Json::Object(m) => {
@@ -147,7 +149,7 @@ const CONVERGENCE_KINDS: &[&str] = &[
 
 /// A convergence-bearing vector with more than one item must carry
 /// at least two byte-distinct delivery orders.
-fn check_convergence_orders(vector: &Json) -> Result<(), String> {
+pub fn check_convergence_orders(vector: &Json) -> Result<(), String> {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
     if !CONVERGENCE_KINDS.contains(&kind) {
         return Ok(());
@@ -191,7 +193,7 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
 
 /// Every named byte string in `inputs.items` and `inputs.aux` decodes
 /// under the strict reader.
-fn check_decode(vector: &Json) -> Result<(), String> {
+pub fn check_decode(vector: &Json) -> Result<(), String> {
     let mut bad = Vec::new();
     for field in ["items", "aux"] {
         if let Some(m) = vector["inputs"][field].as_object() {
@@ -225,7 +227,12 @@ fn check_decode(vector: &Json) -> Result<(), String> {
 /// engine's fixpoint re-evaluation makes arrival order immaterial,
 /// which is exactly what the standard asserts), identical final
 /// state required, then per_item and trace comparison.
-pub fn run_semantics(vector: &Json) -> SemStatus {
+///
+/// The [`crate::crypto::Crypto`] backend parameterizes the KAT
+/// lanes' primitives (the §13.2 seam — the browser lane awaits
+/// WebCrypto here); the engine lanes are backend-independent by
+/// §13.2's family matrix.
+pub async fn run_semantics_with<C: crate::crypto::Crypto>(c: &C, vector: &Json) -> SemStatus {
     let kind = vector["case_kind"].as_str().unwrap_or_default();
     let run = match kind {
         "fold" => run_fold_vector(vector),
@@ -240,12 +247,18 @@ pub fn run_semantics(vector: &Json) -> SemStatus {
         "crash-replay" => crate::edge::crash_replay(vector),
         "erase-crash-matrix" => crate::erase::erase_crash_matrix(vector),
         "lock-matrix" => crate::edge::lock_matrix(vector),
-        _ => crate::kat::run(vector),
+        _ => crate::kat::run(c, vector).await,
     };
     match run {
         Ok(status) => status,
         Err(e) => SemStatus::Fail(e),
     }
+}
+
+/// The native path: the same dispatch over [`crate::crypto::
+/// NativeCrypto`], whose futures are immediately ready.
+pub fn run_semantics(vector: &Json) -> SemStatus {
+    crate::crypto::block_on_ready(run_semantics_with(&crate::crypto::NativeCrypto, vector))
 }
 
 /// The export-import lane (D-127/D-156 construct-and-rederive): a
@@ -812,7 +825,12 @@ pub fn all_green(reports: &[VectorReport]) -> bool {
         .all(|r| r.structural_ok() && r.semantics == SemStatus::Pass)
 }
 
-/// Run the full harness over a vectors directory.
+/// Run the full harness over a vectors directory. Schema-gated: the
+/// container/companion layers need the JSON-Schema engine; the wasm
+/// browser lane builds without them and drives
+/// [`run_semantics_with`] plus the dep-free structural checks
+/// directly.
+#[cfg(feature = "schema")]
 pub fn run_all(vectors_dir: &Path) -> Result<Vec<VectorReport>, String> {
     let spec = std::fs::read_to_string(plane_root().join("owner-plane-d0a-spec.md"))
         .map_err(|e| format!("spec: {e}"))?;
@@ -855,7 +873,9 @@ pub fn run_all(vectors_dir: &Path) -> Result<Vec<VectorReport>, String> {
     Ok(reports)
 }
 
-#[cfg(test)]
+// Every harness test exercises the schema layers (run_all or the
+// validators), so the module rides the feature.
+#[cfg(all(test, feature = "schema"))]
 mod tests {
     use super::*;
 
