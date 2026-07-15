@@ -1025,7 +1025,13 @@ function ui2WireComposerState() {
     const origSwitchTab = switchTab;
     switchTab = function (tabId) {
       const r = origSwitchTab.apply(this, arguments);
-      if (r !== false) applyForTab(tabId);
+      if (r !== false) {
+        applyForTab(tabId);
+        // Navigation seam for the composer satellites: tab context changes
+        // (the peek's Open-in-Activity label, future context-sensitive
+        // affordances) derive from this instead of each polling the DOM.
+        window.dispatchEvent(new CustomEvent('ui2:tab-changed', { detail: { tab: String(tabId || '') } }));
+      }
       return r;
     };
   }

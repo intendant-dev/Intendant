@@ -135,7 +135,10 @@ canonical executable paths, their filesystem fingerprint, and a strictly
 allowlisted numeric release string when the handshake supplies one. Finding
 records contain only fixed field names, JSON value kinds, and opaque SHA-256
 fingerprints for protocol identifiers; raw identifiers, messages, prompts,
-tool arguments, stderr, and model output are never retained.
+tool arguments, stderr, and model output are never retained. The store is
+bounded: each handshake prunes the profile's artifact directories down to the
+four most recently observed fingerprints, so upgrade residue does not
+accumulate.
 
 The initial vocabulary baseline is Claude Code 2.1.210 and Codex app-server
 0.144.1. Known-but-intentionally-ignored notifications are included so the
