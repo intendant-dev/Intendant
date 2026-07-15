@@ -113,6 +113,11 @@ else
     # dsAttrTypeNative: prefix (which reads print) makes the delete a
     # silent no-op.
     dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
+    # Darwin 26 sysadminctl also mints a ShadowHash AuthenticationAuthority
+    # for role accounts (observed live 2026-07-15; Darwin 25 did not). A
+    # role account needs no authority entries at all — delete the attribute
+    # so no password path can ever be re-derived.
+    dscl . -delete "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true
 fi
 
 CI_GROUP="$(id -gn "$CI_ACCOUNT")"
@@ -185,6 +190,16 @@ ci_run "$CI_HOME/.cargo/bin/rustup" default "$PIN"
 
 echo "== cargo config"
 CARGO_CONFIG="$CI_HOME/.cargo/config.toml"
+# Detected OUTSIDE the seed-once branch: the supervised-server block below
+# needs it on every run, and under `set -u` an idempotent re-run (config
+# already present) otherwise dies on the unbound variable (live 2026-07-15).
+sccache_bin=""
+for cand in /opt/homebrew/bin/sccache /usr/local/bin/sccache; do
+    if [ -x "$cand" ]; then
+        sccache_bin="$cand"
+        break
+    fi
+done
 if [ -f "$CARGO_CONFIG" ]; then
     echo "keeping existing $CARGO_CONFIG"
 else
@@ -200,13 +215,6 @@ else
         fi
     fi
     jobs="${jobs:-6}"
-    sccache_bin=""
-    for cand in /opt/homebrew/bin/sccache /usr/local/bin/sccache; do
-        if [ -x "$cand" ]; then
-            sccache_bin="$cand"
-            break
-        fi
-    done
     {
         echo "# Account-level cargo cap — scripts/ci/README.md, \"Cargo parallelism cap\"."
         echo "[build]"
@@ -375,6 +383,13 @@ if shadow_present; then
     dscl . -delete "/Users/$CI_ACCOUNT" ShadowHashData 2>/dev/null || true
 fi
 auth_auth="$(dscl . -read "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true)"
+# Converge rather than fail: newer Darwin mints this attribute (see the
+# creation block); idempotent re-runs on hosts set up before the fix must
+# repair it, not report it.
+if echo "$auth_auth" | grep -q "ShadowHash"; then
+    dscl . -delete "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true
+    auth_auth="$(dscl . -read "/Users/$CI_ACCOUNT" AuthenticationAuthority 2>/dev/null || true)"
+fi
 if shadow_present; then
     echo "FAIL: $CI_ACCOUNT still has ShadowHashData after delete" >&2
     fail=1
