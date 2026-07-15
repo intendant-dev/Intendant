@@ -202,15 +202,27 @@ impl AnthropicProvider {
     /// before compaction can ever run. For those models the ceiling is
     /// clamped against a conservative input estimate; 4.5+ models pass the
     /// configured value through untouched.
-    fn effective_max_tokens(&self, messages: &[Message]) -> u64 {
+    ///
+    /// Shape: `min(configured, max(headroom, floor))` — the configured
+    /// value is a hard ceiling and is never raised (an explicit
+    /// `MAX_OUTPUT_TOKENS=1024` override must stay 1024), while a
+    /// sub-floor headroom is still honored up to the floor: the input
+    /// estimate overestimates, so real headroom is at least the computed
+    /// one, and a truncated completion beats a dead session.
+    fn effective_max_tokens(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+    ) -> u64 {
         if !anthropic_needs_output_clamp(&self.model) {
             return self.max_output_tokens;
         }
+        let estimated_input = estimated_input_tokens(messages) + estimated_tools_tokens(tools);
         let headroom = self
             .context_window
-            .saturating_sub(estimated_input_tokens(messages))
+            .saturating_sub(estimated_input)
             .saturating_sub(CLAMP_MARGIN_TOKENS);
-        self.max_output_tokens.min(headroom).max(CLAMP_FLOOR_TOKENS)
+        self.max_output_tokens.min(headroom.max(CLAMP_FLOOR_TOKENS))
     }
 
     /// A tool-less instance forced through the client-egress relay —
@@ -308,7 +320,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.effective_max_tokens(messages),
+            max_tokens: self.effective_max_tokens(messages, tools.as_deref()),
             tools,
             stream,
         };
@@ -346,7 +358,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.effective_max_tokens(messages),
+            max_tokens: self.effective_max_tokens(messages, tools.as_deref()),
             tools,
             stream: false,
         };
@@ -526,7 +538,7 @@ impl ChatProvider for AnthropicProvider {
             model: self.model.clone(),
             system,
             messages: api_messages,
-            max_tokens: self.effective_max_tokens(messages),
+            max_tokens: self.effective_max_tokens(messages, tools.as_deref()),
             tools,
             stream: true,
         };
@@ -877,15 +889,18 @@ fn anthropic_needs_output_clamp(model: &str) -> bool {
 }
 
 /// Headroom subtracted on top of the input estimate when clamping: covers
-/// the native tool schemas (~16K tokens), JSON structure, and estimator
-/// error on dense scripts where chars/4 underestimates.
-const CLAMP_MARGIN_TOKENS: u64 = 24_576;
+/// request JSON structure and estimator error on dense scripts where
+/// chars/4 underestimates. Tool schemas are measured directly (see
+/// [`estimated_tools_tokens`]), not covered here.
+const CLAMP_MARGIN_TOKENS: u64 = 8_192;
 
-/// Clamp floor: still a useful completion, and far enough below any real
-/// pre-4.5 context window that a near-full input plus the floor stays
-/// requestable (when input alone genuinely exceeds the window, the request
-/// 400s regardless of `max_tokens` and auto-compact is the remedy).
-const CLAMP_FLOOR_TOKENS: u64 = 4_096;
+/// Clamp floor: estimator-noise protection only. Headroom below the floor
+/// is still requested at the floor because the input estimate deliberately
+/// overestimates — real headroom is at least the computed one, so the
+/// floor can truncate but not 400. It is applied to the *headroom*, never
+/// to the configured ceiling: an explicit low `MAX_OUTPUT_TOKENS` override
+/// passes through unraised.
+const CLAMP_FLOOR_TOKENS: u64 = 1_024;
 
 /// Conservative request-size estimate in tokens, ~chars/4. The compaction
 /// path's budget arithmetic rides API-reported usage held by the
@@ -911,6 +926,22 @@ fn estimated_input_tokens(messages: &[Message]) -> u64 {
                 })
         })
         .sum();
+    (chars / 4) as u64
+}
+
+/// The tools payload counted with the same ~chars/4 overestimate
+/// discipline. Runtime-registered MCP tool schemas are unbounded, so a
+/// fixed margin can't stand in for them — a large registered tool set
+/// would silently eat the margin and re-create the overflow 400 the clamp
+/// exists to prevent. Only evaluated on the pre-4.5 clamp path.
+fn estimated_tools_tokens(tools: Option<&[serde_json::Value]>) -> u64 {
+    let chars: usize = tools
+        .map(|defs| {
+            defs.iter()
+                .map(|def| serde_json::to_string(def).map_or(0, |s| s.len()))
+                .sum()
+        })
+        .unwrap_or(0);
     (chars / 4) as u64
 }
 
@@ -999,16 +1030,55 @@ fn attach_cache_control(content: &mut serde_json::Value) -> bool {
 }
 
 /// Newest image blocks kept in an outgoing Anthropic request. The API
-/// rejects requests around ~100 image blocks (and 32 MB of body) — ceilings
-/// a screenshot-heavy session can reach below the token-based auto-compact
+/// rejects requests around ~100 image blocks — a ceiling a
+/// screenshot-heavy session can reach below the token-based auto-compact
 /// threshold now that Anthropic history is no longer image-stripped every
-/// turn. 40 keeps a comfortable margin under both limits while retaining
-/// far more visual context than the single-image OpenAI policy. Overflow
-/// elides the *oldest* images, replacing each with a fixed placeholder
-/// block — a bounded, rare prefix change (each image flips exactly once,
-/// after which the request is byte-stable again) instead of a hard 400.
-/// Below the cap this path renders identically to an uncapped build.
+/// turn. 40 keeps a comfortable margin while retaining far more visual
+/// context than the single-image OpenAI policy. Overflow elides the
+/// *oldest* images, replacing each with a fixed placeholder block instead
+/// of running into a hard 400. Below the cap this path renders identically
+/// to an uncapped build.
 const MAX_REQUEST_IMAGES: usize = 40;
+
+/// Byte budget for the kept images' base64 payload — the count cap alone
+/// doesn't bound the body (a handful of ~5 MiB screenshots base64-expand
+/// past Anthropic's ~32 MB request ceiling while staying far under 40
+/// images). 16 MiB leaves generous room for text, tool schemas, and JSON
+/// structure in the remaining half of the ceiling.
+const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Elision-boundary quantum — the hysteresis that keeps the cap from
+/// permanently defeating the rolling prompt cache. A boundary recomputed
+/// exactly per request would advance by one image every request at steady
+/// state (one new screenshot per turn), changing an early-prefix block
+/// *every* request, so the previous-tail cache marker would never hit
+/// again. Quantizing the boundary to multiples of 8 images means it only
+/// moves once a new step is actually required — the prefix then stays
+/// byte-stable for the next ~8 images (kept count oscillates in
+/// (cap−8, cap]), amortizing invalidation to roughly 1-in-8 requests. The
+/// same stepped boundary serves the byte budget, so byte-driven elision
+/// jumps in the same 8-image steps rather than sliding per request.
+const IMAGE_ELISION_STEP: usize = 8;
+
+/// How many oldest images to elide so the kept tail satisfies both the
+/// count cap and the byte budget, with the boundary quantized to
+/// [`IMAGE_ELISION_STEP`] (see there for why). Always keeps the newest
+/// image, even when it alone exceeds the byte budget — the current screen
+/// is what the model acts on, and a single image cannot realistically
+/// breach the request ceiling the budget protects.
+fn image_elision_count(image_sizes: &[usize]) -> usize {
+    let total = image_sizes.len();
+    let mut boundary = 0usize;
+    while boundary < total {
+        let kept = total - boundary;
+        let kept_bytes: usize = image_sizes[boundary..].iter().sum();
+        if kept <= MAX_REQUEST_IMAGES && kept_bytes <= MAX_REQUEST_IMAGE_BYTES {
+            return boundary;
+        }
+        boundary += IMAGE_ELISION_STEP;
+    }
+    total.saturating_sub(1)
+}
 
 /// Render one image as a content block, or as the fixed elision
 /// placeholder while `elide_remaining` is being consumed (oldest first).
@@ -1049,14 +1119,21 @@ pub(crate) fn build_anthropic_messages(
         "cache_control": {"type": "ephemeral"}
     }]);
 
-    // Oldest-first elision budget for the image cap: only user-side
-    // messages render images (tool_result carriers and plain user turns).
-    let total_images: usize = messages
+    // Oldest-first elision budget for the image cap + byte budget: only
+    // user-side messages render images (tool_result carriers and plain
+    // user turns), in conversation order.
+    let image_sizes: Vec<usize> = messages
         .iter()
         .filter(|m| (m.role == "tool" && m.tool_call_id.is_some()) || m.role == "user")
-        .map(|m| m.images.as_ref().map_or(0, |imgs| imgs.len()))
-        .sum();
-    let mut elide_remaining = total_images.saturating_sub(MAX_REQUEST_IMAGES);
+        .flat_map(|m| {
+            m.images
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(|img| img.data.len())
+        })
+        .collect();
+    let mut elide_remaining = image_elision_count(&image_sizes);
 
     let mut api_messages: Vec<AnthropicMessage> = Vec::new();
     for m in messages {
@@ -1639,17 +1716,65 @@ mod tests {
         );
         // Moderate history: the family ceiling fits untouched.
         let small = vec![user_text(&"x".repeat(40_000))]; // est ~10K tokens
-        assert_eq!(provider.effective_max_tokens(&small), 32_000);
+        assert_eq!(provider.effective_max_tokens(&small, None), 32_000);
         // Deep history: ceiling shrinks to window − estimate − margin, so
         // the request stays valid below the 90% auto-compact threshold.
-        let big = vec![user_text(&"x".repeat(600_000))]; // est ~150K tokens
+        let big = vec![user_text(&"x".repeat(700_000))]; // est ~175K tokens
         assert_eq!(
-            provider.effective_max_tokens(&big),
-            200_000 - 150_000 - CLAMP_MARGIN_TOKENS
+            provider.effective_max_tokens(&big, None),
+            200_000 - 175_000 - CLAMP_MARGIN_TOKENS
         );
-        // Estimate at/over the window: floor keeps the request shaped.
+        // Estimate at/over the window: the floor keeps the request shaped
+        // (the estimate overestimates, so the floor truncates, never 400s).
         let huge = vec![user_text(&"x".repeat(1_000_000))];
-        assert_eq!(provider.effective_max_tokens(&huge), CLAMP_FLOOR_TOKENS);
+        assert_eq!(
+            provider.effective_max_tokens(&huge, None),
+            CLAMP_FLOOR_TOKENS
+        );
+    }
+
+    #[test]
+    fn clamp_never_raises_an_explicit_low_ceiling() {
+        // An explicit MAX_OUTPUT_TOKENS override below the floor is a hard
+        // ceiling: the floor applies to headroom only, never to the
+        // configured value.
+        let provider = AnthropicProvider::new_plain(
+            "key".to_string(),
+            "claude-opus-4-1-20250805".to_string(),
+            200_000,
+            512,
+        );
+        let small = vec![user_text("hi")];
+        assert_eq!(provider.effective_max_tokens(&small, None), 512);
+        let huge = vec![user_text(&"x".repeat(1_000_000))];
+        assert_eq!(provider.effective_max_tokens(&huge, None), 512);
+    }
+
+    #[test]
+    fn clamp_counts_the_tools_payload() {
+        // Runtime-registered MCP schemas are unbounded — a giant tool set
+        // must shrink the ceiling like any other input, or it eats the
+        // fixed margin and re-creates the overflow 400.
+        let provider = AnthropicProvider::new_plain(
+            "key".to_string(),
+            "claude-opus-4-1-20250805".to_string(),
+            200_000,
+            32_000,
+        );
+        let messages = vec![user_text(&"x".repeat(40_000))]; // est ~10K tokens
+        assert_eq!(provider.effective_max_tokens(&messages, None), 32_000);
+        let giant_tool = serde_json::json!({
+            "name": "mcp_bulk",
+            "description": "y".repeat(700_000), // est ~175K tokens
+            "input_schema": {"type": "object"},
+        });
+        let with_tools =
+            provider.effective_max_tokens(&messages, Some(std::slice::from_ref(&giant_tool)));
+        assert!(
+            with_tools < 32_000,
+            "giant tool schema must shrink the ceiling (got {with_tools})"
+        );
+        assert!(with_tools >= CLAMP_FLOOR_TOKENS);
     }
 
     #[test]
@@ -1661,7 +1786,7 @@ mod tests {
             64_000,
         );
         let huge = vec![user_text(&"x".repeat(1_000_000))];
-        assert_eq!(provider.effective_max_tokens(&huge), 64_000);
+        assert_eq!(provider.effective_max_tokens(&huge, None), 64_000);
 
         // Clamp family membership, dated and alias forms.
         assert!(anthropic_needs_output_clamp("claude-3-5-sonnet-20241022"));
@@ -1677,7 +1802,10 @@ mod tests {
     // --- Request image cap ---
 
     #[test]
-    fn image_cap_elides_oldest_beyond_newest_forty() {
+    fn image_cap_elides_oldest_in_quantized_steps() {
+        // 45 single-image tool results: over the 40 cap, the boundary
+        // quantizes to the 8-image step — 8 oldest elided, 37 kept (not a
+        // per-request sliding 5).
         let mut messages = vec![Message {
             role: "system".to_string(),
             content: "sys".to_string(),
@@ -1692,15 +1820,52 @@ mod tests {
         let serialized = serde_json::to_string(&api_msgs).unwrap();
         assert_eq!(
             serialized.matches("\"type\":\"image\"").count(),
-            MAX_REQUEST_IMAGES
+            MAX_REQUEST_IMAGES - 3
         );
-        assert_eq!(serialized.matches("image elided").count(), 5);
+        assert_eq!(
+            serialized.matches("image elided").count(),
+            IMAGE_ELISION_STEP
+        );
 
         // Oldest carriers hold the placeholder; the newest keeps its image.
         let first = serde_json::to_string(&api_msgs[0]).unwrap();
         assert!(first.contains("image elided") && !first.contains("\"type\":\"image\""));
         let last = serde_json::to_string(api_msgs.last().unwrap()).unwrap();
         assert!(last.contains("\"type\":\"image\"") && !last.contains("image elided"));
+
+        // Determinism: the same over-cap conversation builds byte-identical
+        // requests — no per-request drift in the elision pattern.
+        let (_system2, api_msgs2) = build_anthropic_messages(&messages);
+        assert_eq!(serialized, serde_json::to_string(&api_msgs2).unwrap());
+    }
+
+    #[test]
+    fn image_elision_boundary_moves_in_steps_not_per_request() {
+        // Hysteresis: at one-new-image-per-request steady state the
+        // boundary must hold still across a whole step's worth of growth,
+        // then jump — otherwise an early-prefix block changes every
+        // request and the previous-tail cache marker never hits.
+        let sizes = |n: usize| vec![1usize; n];
+        assert_eq!(image_elision_count(&sizes(MAX_REQUEST_IMAGES)), 0);
+        assert_eq!(image_elision_count(&sizes(41)), IMAGE_ELISION_STEP);
+        assert_eq!(image_elision_count(&sizes(45)), IMAGE_ELISION_STEP);
+        assert_eq!(image_elision_count(&sizes(48)), IMAGE_ELISION_STEP);
+        assert_eq!(image_elision_count(&sizes(49)), 2 * IMAGE_ELISION_STEP);
+        assert_eq!(image_elision_count(&sizes(56)), 2 * IMAGE_ELISION_STEP);
+    }
+
+    #[test]
+    fn image_byte_budget_elides_few_but_huge_images() {
+        const MIB: usize = 1024 * 1024;
+        // Four ~6 MiB images: far under the count cap, over the 16 MiB
+        // byte budget → elide down (boundary quantum capped at newest-1).
+        assert_eq!(image_elision_count(&[6 * MIB; 4]), 3);
+        // Two 5 MiB images fit the budget: untouched.
+        assert_eq!(image_elision_count(&[5 * MIB; 2]), 0);
+        // A single over-budget image is still sent: the newest screenshot
+        // is what the model acts on, and one image can't realistically
+        // breach the request ceiling.
+        assert_eq!(image_elision_count(&[20 * MIB]), 0);
     }
 
     #[test]
