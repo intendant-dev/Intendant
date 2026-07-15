@@ -166,7 +166,7 @@ impl StationInner {
 
     pub(crate) fn draw_display_thumbnails(&self) {
         for (source, (x, y, tw, th)) in self.placed_display_thumbnails() {
-            self.glass_panel(x, y, tw, th, 6.0, C_PEACH, 1.2, 1.15);
+            self.glass_panel(x, y, tw, th, 6.0, C_AMBER, 1.2, 1.15);
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
                 let _ = self
@@ -180,7 +180,7 @@ impl StationInner {
                         (th - 6.0) as f64,
                     );
             } else {
-                self.hud.set_fill("rgba(49,50,68,0.55)");
+                self.hud.set_fill("rgba(26,30,40,0.55)");
                 self.hud.ctx.fill_rect(
                     (x + 3.0) as f64,
                     (y + 3.0) as f64,
@@ -192,7 +192,7 @@ impl StationInner {
                     x + 12.0,
                     y + th / 2.0,
                     10.0,
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     "normal",
                 );
             }
@@ -201,7 +201,7 @@ impl StationInner {
                 x + 7.0,
                 y + th + 12.0,
                 10.0,
-                C_PEACH_CSS,
+                C_AMBER_CSS,
                 "normal",
             );
         }
@@ -221,7 +221,7 @@ impl StationInner {
         self.hud.set_stroke(&css_rgba([0.93, 0.95, 1.0, 0.06 * a]));
         self.line(0.0, 1.0, w, 1.0);
         self.hud
-            .set_stroke(&css_rgba(C_BLUE.with_alpha(0.30 * a).into()));
+            .set_stroke(&css_rgba(C_IRIS.with_alpha(0.30 * a).into()));
         self.line(0.0, 42.0, w, 42.0);
         self.text("STATION", 24.0, 26.0, 11.0, C_TEXT_CSS, "bold");
         self.pill_button(
@@ -250,9 +250,9 @@ impl StationInner {
         let queue = &self.snapshot.attention_queue;
         if queue.count > 0 {
             let color = if queue.blocked > 0 {
-                C_RED_CSS
+                C_ROSE_CSS
             } else {
-                C_YELLOW_CSS
+                C_AMBER_CSS
             };
             let top = queue
                 .items
@@ -305,9 +305,9 @@ impl StationInner {
             26.0,
             10.0,
             if pending > 0 {
-                C_YELLOW_CSS
+                C_AMBER_CSS
             } else {
-                C_SUBTEXT0_CSS
+                C_TEXT2_CSS
             },
             "normal",
         );
@@ -333,8 +333,8 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_command_deck(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.glass_panel(x - 6.0, y - 8.0, w + 12.0, h + 14.0, 12.0, C_BLUE, 0.9, 0.9);
-        self.hud.set_fill(C_BLUE_CSS);
+        self.glass_panel(x - 6.0, y - 8.0, w + 12.0, h + 14.0, 12.0, C_IRIS, 0.9, 0.9);
+        self.hud.set_fill(C_IRIS_CSS);
         self.hud
             .ctx
             .fill_rect(x as f64, (y + 15.0) as f64, 3.0, 38.0);
@@ -343,7 +343,7 @@ impl StationInner {
             x + 18.0,
             y + 24.0,
             12.0,
-            C_BLUE_CSS,
+            C_IRIS_CSS,
             "bold",
         );
         self.text(
@@ -392,7 +392,7 @@ impl StationInner {
             x + 18.0,
             y + 68.0,
             10.0,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
         if !goal_status.is_empty() && tall_deck {
@@ -445,7 +445,7 @@ impl StationInner {
                     nonempty(&self.snapshot.changes.status, "clean")
                 },
                 if self.snapshot.changes.count > 0 {
-                    C_YELLOW_CSS
+                    C_AMBER_CSS
                 } else {
                     C_GREEN_CSS
                 },
@@ -453,14 +453,7 @@ impl StationInner {
         ];
         for (idx, (label, value, color)) in metrics.into_iter().enumerate() {
             let mx = metric_x + idx as f32 * metric_w;
-            self.text(
-                label,
-                mx + 10.0,
-                metric_y + 15.0,
-                8.5,
-                C_OVERLAY1_CSS,
-                "bold",
-            );
+            self.text(label, mx + 10.0, metric_y + 15.0, 8.5, C_TEXT3_CSS, "bold");
             self.text(
                 &truncate(&value, ((metric_w - 22.0) / 6.0).max(8.0) as usize),
                 mx + 10.0,
@@ -512,13 +505,13 @@ impl StationInner {
         let y = 64.0;
         let panel_w = w - 36.0;
         let panel_h = (h - 92.0).max(180.0);
-        self.glass_panel(x, y, panel_w, panel_h, 10.0, C_BLUE, 1.0, 1.0);
+        self.glass_panel(x, y, panel_w, panel_h, 10.0, C_IRIS, 1.0, 1.0);
         self.text(
             "CONTROL CENTER",
             x + 16.0,
             y + 24.0,
             12.0,
-            C_BLUE_CSS,
+            C_IRIS_CSS,
             "bold",
         );
         self.text(
@@ -552,10 +545,10 @@ impl StationInner {
             return;
         }
         // Clear glass: low tint so the 3D scene stays visible through it.
-        self.glass_panel(x, y, w, core_h, 12.0, C_LAVENDER, 0.5, 0.28);
+        self.glass_panel(x, y, w, core_h, 12.0, C_IRIS2, 0.5, 0.28);
         self.hud.set_stroke(match self.mood {
-            Mood::Cockpit => "rgba(137,180,250,0.28)",
-            Mood::Calm => "rgba(137,180,250,0.18)",
+            Mood::Cockpit => "rgba(126,140,250,0.28)",
+            Mood::Calm => "rgba(126,140,250,0.18)",
         });
         let breathe = (time_ms as f32 * 0.001).sin() * 2.0 * self.mood.pulse();
         for radius in [ring_scale * 0.36, ring_scale * 0.62, ring_scale] {
@@ -569,14 +562,7 @@ impl StationInner {
             );
             self.hud.ctx.stroke();
         }
-        self.text(
-            "LIVE STATE",
-            x + 18.0,
-            y + 24.0,
-            10.0,
-            C_OVERLAY1_CSS,
-            "bold",
-        );
+        self.text("LIVE STATE", x + 18.0, y + 24.0, 10.0, C_TEXT3_CSS, "bold");
         let targets = std::mem::take(&mut self.system_targets);
         let selected = self
             .selected_id
@@ -596,7 +582,7 @@ impl StationInner {
                 x + 210.0,
                 y + 24.0,
                 9.0,
-                C_SUBTEXT0_CSS,
+                C_TEXT2_CSS,
                 "normal",
             );
         }
@@ -668,7 +654,7 @@ impl StationInner {
         self.hud.set_stroke(if selected {
             target.color
         } else {
-            "rgba(137,180,250,0.22)"
+            "rgba(126,140,250,0.22)"
         });
         self.line(cx, cy, anchor_x, anchor_y);
         self.hud.set_fill(target.color);
@@ -698,7 +684,7 @@ impl StationInner {
             w + 18.0,
             h + 8.0,
             9.0,
-            hex_color(target.color).unwrap_or(C_BLUE),
+            hex_color(target.color).unwrap_or(C_IRIS),
             if selected {
                 1.6
             } else if hovered {
@@ -709,7 +695,7 @@ impl StationInner {
             if selected { 0.95 } else { 0.62 },
         );
         if is_display {
-            self.hud.set_stroke("rgba(250,179,135,0.58)");
+            self.hud.set_stroke("rgba(228,168,91,0.58)");
             let aperture_w = (w * 0.34).max(92.0);
             let aperture_cx = x + aperture_w * 0.5;
             let aperture_cy = y + 29.0;
@@ -729,7 +715,7 @@ impl StationInner {
                 x + aperture_w + 10.0,
                 y + 15.0,
                 8.0,
-                C_OVERLAY1_CSS,
+                C_TEXT3_CSS,
                 "bold",
             );
             self.text(
@@ -760,7 +746,7 @@ impl StationInner {
             ));
             return;
         }
-        self.text(target.kicker, x, y + 12.0, 8.0, C_OVERLAY1_CSS, "bold");
+        self.text(target.kicker, x, y + 12.0, 8.0, C_TEXT3_CSS, "bold");
         self.text(target.title, x, y + 30.0, 12.0, target.color, "bold");
         self.text(
             &truncate(&target.value, ((w - 10.0) / 6.2).max(18.0) as usize),
@@ -776,7 +762,7 @@ impl StationInner {
                 x,
                 y + h + 12.0,
                 9.0,
-                C_SUBTEXT0_CSS,
+                C_TEXT2_CSS,
                 "normal",
             );
         }
@@ -795,8 +781,8 @@ impl StationInner {
         // panel bottom at h − STATUS_CHIP_CLEARANCE: the strip's last row
         // and border stay out of the DOM status chip's band (ST-02).
         let y = (h - lane_h - 10.0 - STATUS_CHIP_CLEARANCE).max(282.0);
-        self.glass_panel(x - 6.0, y, w + 12.0, lane_h + 10.0, 12.0, C_TEAL, 0.9, 0.9);
-        self.hud.set_fill(C_TEAL_CSS);
+        self.glass_panel(x - 6.0, y, w + 12.0, lane_h + 10.0, 12.0, C_SKY, 0.9, 0.9);
+        self.hud.set_fill(C_SKY_CSS);
         self.hud
             .ctx
             .fill_rect((x + 1.0) as f64, (y + 18.0) as f64, 3.0, 34.0);
@@ -805,7 +791,7 @@ impl StationInner {
             x + 18.0,
             y + 24.0,
             10.0,
-            C_TEAL_CSS,
+            C_SKY_CSS,
             "bold",
         );
         let row_px = if rows > 3 { 8.5 } else { 9.0 };
@@ -822,7 +808,7 @@ impl StationInner {
                 x + 18.0,
                 y + 56.0,
                 11.0,
-                C_SUBTEXT0_CSS,
+                C_TEXT2_CSS,
                 "normal",
             );
         } else {
@@ -839,7 +825,7 @@ impl StationInner {
                     });
                 if hovered {
                     self.rounded_path(row_rect.0, row_rect.1, row_rect.2, row_rect.3, 5.0);
-                    self.hud.set_fill("rgba(148,226,213,0.10)");
+                    self.hud.set_fill("rgba(93,169,230,0.10)");
                     self.hud.ctx.fill();
                 }
                 self.hud.set_fill(color);
@@ -851,7 +837,7 @@ impl StationInner {
                     x + 33.0,
                     row_y,
                     row_px,
-                    C_OVERLAY1_CSS,
+                    C_TEXT3_CSS,
                     "normal",
                 );
                 self.text(
@@ -867,7 +853,7 @@ impl StationInner {
                     x + 154.0,
                     row_y,
                     row_px,
-                    C_SUBTEXT0_CSS,
+                    C_TEXT2_CSS,
                     "normal",
                 );
                 // Runway rows with a session open that session's transcript.
@@ -886,9 +872,9 @@ impl StationInner {
             }
         }
         let actions = [
-            LaneAction::activity("latest", "bottom", 68.0, C_TEAL_CSS),
-            LaneAction::activity("copy", "copy-visible", 56.0, C_BLUE_CSS),
-            LaneAction::select("activity", "system:activity", 76.0, C_OVERLAY1_CSS),
+            LaneAction::activity("latest", "bottom", 68.0, C_SKY_CSS),
+            LaneAction::activity("copy", "copy-visible", 56.0, C_IRIS_CSS),
+            LaneAction::select("activity", "system:activity", 76.0, C_TEXT3_CSS),
         ];
         let mut ax = x + w - 18.0;
         for action in actions.into_iter().rev() {
@@ -984,7 +970,7 @@ impl StationInner {
         }
         let panel_h = 112.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        self.focus_panel_frame(x, y, panel_w, panel_h, "Selection", C_BLUE_CSS);
+        self.focus_panel_frame(x, y, panel_w, panel_h, "Selection", C_IRIS_CSS);
         self.text(
             &truncate(id, 52),
             x + 16.0,
@@ -998,7 +984,7 @@ impl StationInner {
             x + 16.0,
             y + 88.0,
             10.0,
-            C_SUBTEXT0_CSS,
+            C_TEXT2_CSS,
             "normal",
         );
     }
