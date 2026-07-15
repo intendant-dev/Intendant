@@ -619,6 +619,26 @@ window.closeWorktreeInspectModal = closeWorktreeInspectModal;
 window.worktreeInspectOpenShell = worktreeInspectOpenShell;
 window.worktreeInspectOpenFiles = worktreeInspectOpenFiles;
 
+// QA readback (window.qa convention) + one explicit test hook: headless
+// probes can't ride the control tunnel (the first-visit forced scan is a
+// tunnel-only POST twin), so the worktrees pane exposes its rendered state
+// and a scan-injection hook that runs the exact production render path on
+// caller-supplied data.
+window.qa = Object.assign(window.qa || {}, {
+  worktreesPane: () => ({
+    tiles: [...document.querySelectorAll('#worktrees-aggregate .agg-card')]
+      .map(card => card.textContent.trim().replace(/\s+/g, ' ')),
+    chips: [...document.querySelectorAll('#worktrees-list .wt-session-chip')]
+      .map(chip => ({ tag: chip.tagName, text: chip.textContent.trim().replace(/\s+/g, ' ') })),
+    status: document.getElementById('worktrees-status')?.textContent || '',
+  }),
+  worktreesRenderScan: (scan) => {
+    _cachedWorktreeScan = scan;
+    renderWorktrees(scan);
+    return window.qa.worktreesPane();
+  },
+});
+
 function formatWorktreeDivergence(target, ahead, behind) {
   const label = target ? `${target} ` : '';
   return `${label}+${Number(ahead || 0).toLocaleString()} / -${Number(behind || 0).toLocaleString()}`;
