@@ -33,8 +33,10 @@
 
 use crate::cbor;
 use crate::keyschedule::{item_addr, seal_item};
+use crate::shapes::control::KeyFeedCutoff;
 use crate::shapes::envelope::Signedop;
 use crate::shapes::{DeadlineFallback, Frontierclose, Strictness, TimeWitness, Verb, Zonepolicy};
+use crate::suite;
 use crate::tranche::{items, Device, PlaneRig, TenantOverrides, T0_MS};
 use crate::vector::{Expected, Vector};
 use serde_json::{json, Map as JsonMap, Value as Json};
@@ -239,6 +241,60 @@ pub fn f9_deadline_receipted_admits() -> Vector {
     let per_item = rows(&a.ops, None);
     time_vector(
         "deadline-receipted-admits",
+        a.rig,
+        &refs(&a.ops),
+        &aux,
+        per_item,
+    )
+}
+
+/// T4 (D-203-ratified compromise machinery): the claim initially
+/// qualifies through d2's receipt; the compromise compound then
+/// revokes d2 with a `through = 0` receipt cutoff on its signing
+/// key, completed by the exclusion rotation — the receipt
+/// retro-disqualifies and the ADMITTED claim re-derives to
+/// `(deadline-unreceipted, pending-dependency)` in both orders
+/// (control-plane retro-disqualification; distinct from D-202's
+/// evidence-arrival stickiness).
+pub fn f9_compromise_cutoff_retro_disqualifies() -> Vector {
+    let mut a = deadline_arc("f9-compromise-retro", false);
+    let (d1, d2, addr) = (a.d1.clone(), a.d2.clone(), a.addr);
+    let rcpt = a.rig.accept_receipt(&d2, addr, T0_MS + 86_400_000);
+    // The compromise compound: d2's authorship domain is the genesis
+    // zone (grant2, propose) — one empty-heads cutoff (D-143); the
+    // receipt cutoff `through = 0` disqualifies every statement from
+    // d2's signing key.
+    let zone = a.rig.zone_id;
+    let r = a.rig.revoke_device_compromise(
+        &d2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: d2.lineage,
+            heads: vec![],
+        }],
+        vec![KeyFeedCutoff {
+            key_id: suite::key_id("ed25519", &d2.sig_pk),
+            through: 0,
+            head_hash: [0; 32],
+        }],
+    );
+    // The completing exclusion: a fresh epoch-2 KEK wrapped to d1
+    // only — d2 leaves the decryptable-wrap domain (D-173).
+    let k = {
+        let kek_e2 = a.rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = a.rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        a.rig.kek_rotate(2, vec![w])
+    };
+    a.ops.push(("r", r));
+    a.ops.push(("k", k));
+    let aux = [
+        ("index", index_aux(&[(a.addr, a.claim_hash)])),
+        ("receipt.accept.d2", rcpt.encode()),
+    ];
+    let per_item = rows(&a.ops, Some(("deadline-unreceipted", "pending-dependency")));
+    time_vector(
+        "compromise-cutoff-retro-disqualifies",
         a.rig,
         &refs(&a.ops),
         &aux,
@@ -494,6 +550,7 @@ pub fn f9_lease_overlong_window_invalid() -> Vector {
 pub fn corpus_time() -> Vec<Vector> {
     vec![
         f9_deadline_receipted_admits(),
+        f9_compromise_cutoff_retro_disqualifies(),
         f9_deadline_unreceipted_pends(),
         f9_deadline_self_receipt_nonqualifying(),
         f9_witnessless_zone_deadline_unusable(),

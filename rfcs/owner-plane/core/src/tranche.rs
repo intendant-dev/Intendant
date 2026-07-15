@@ -21,7 +21,7 @@ use crate::keyschedule;
 use crate::scenario;
 use crate::shapes::control::{
     ctrl_header, AdminKey, Ccutoff, Cdrill, Cenrollnew, Cepochbump, Cgenesis, Cgrant, Ckekrotate,
-    Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, Czonepolicy, RevokeMode,
+    Crecovsucc, Crevokedev, Crevokegrant, Czonecreate, Czonepolicy, KeyFeedCutoff, RevokeMode,
     CSPACECREATE_OP_TYPE,
 };
 use crate::shapes::envelope::{
@@ -678,6 +678,52 @@ impl PlaneRig {
             revocation_id: target.revocation_id,
             cutoffs,
             receipt_cutoffs: None,
+            rotation_refs: vec![],
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Crevokedev::OP_TYPE, proof, body.to_value())
+    }
+
+    /// [`Self::revoke_device_exclude`] carrying `rotation_refs` —
+    /// the D-71 typed linkage (each ref must be a valid
+    /// post-last-wrap exclusion of the target).
+    pub fn revoke_device_exclude_with_refs(
+        &mut self,
+        target: &Device,
+        cutoffs: Vec<Frontierclose>,
+        rotation_refs: Vec<Bytes32>,
+    ) -> Signedop {
+        let body = Crevokedev {
+            mode: RevokeMode::Exclude,
+            revocation_id: target.revocation_id,
+            cutoffs,
+            receipt_cutoffs: None,
+            rotation_refs,
+        };
+        let proof = Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: self.ctrl_head,
+        };
+        self.seal_ctrl(Crevokedev::OP_TYPE, proof, body.to_value())
+    }
+
+    /// `c.revoke_device` (compromise mode): the exclude compound
+    /// plus per-signing-key receipt cutoffs — statements beyond each
+    /// boundary retro-disqualify as time evidence at completion (T4).
+    pub fn revoke_device_compromise(
+        &mut self,
+        target: &Device,
+        cutoffs: Vec<Frontierclose>,
+        receipt_cutoffs: Vec<KeyFeedCutoff>,
+    ) -> Signedop {
+        let body = Crevokedev {
+            mode: RevokeMode::Compromise,
+            revocation_id: target.revocation_id,
+            cutoffs,
+            receipt_cutoffs: Some(receipt_cutoffs),
             rotation_refs: vec![],
         };
         let proof = Authproof::Admin {

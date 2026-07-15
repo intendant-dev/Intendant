@@ -82,7 +82,7 @@ mod tests {
         all.extend(crate::corpus_ctrl::corpus_ctrl());
         all.extend(crate::corpus_budget::corpus_budget());
         all.extend(crate::corpus_audit::corpus_audit());
-        assert_eq!(all.len(), 148, "the full vector inventory");
+        assert_eq!(all.len(), 154, "the full vector inventory");
         for v in &all {
             let allowed = family_surfaces(v.family);
             assert!(!v.surfaces.is_empty(), "{}: empty surfaces", v.name);

@@ -891,8 +891,8 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            148,
-            "the corpus through the manifest-admission pair"
+            154,
+            "the corpus through the carried-head triple"
         );
         for r in &reports {
             assert!(

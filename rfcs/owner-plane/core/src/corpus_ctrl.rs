@@ -29,8 +29,8 @@ use crate::shapes::control::{AdminKey, Crecovsucc};
 use crate::shapes::envelope::{ActorKind, Signedop};
 use crate::shapes::memory::Merasereq;
 use crate::shapes::{
-    DeadlineFallback, Erasemref, Frontierclose, Sigalg, Strictness, TimeWitness, ToValue, Verb,
-    Zonepolicy,
+    DeadlineFallback, Erasemref, Frontierclose, Head, Sigalg, Strictness, TimeWitness, ToValue,
+    Verb, Zonepolicy,
 };
 use crate::suite;
 use crate::tranche::{items, PlaneRig};
@@ -519,6 +519,254 @@ pub fn f7_kek_rotate_manifest_target_outside() -> Vector {
     )
 }
 
+/// D-71 typed linkage, the valid arm (D-203-ratified C.1 item): the
+/// exclude compound cites k1 — an accepted rotation excluding dev2,
+/// accepted strictly after dev2's last wrap (the enroll) — and
+/// completes. In the reversed order the compound arrives before its
+/// reference and pends `ref-unresolved` until k1 lands
+/// (verifiable-when-held).
+pub fn f7_revoke_refs_valid_exclusion() -> Vector {
+    let name = "f7-revoke-refs-valid";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude_with_refs(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+        vec![k1.op_hash()],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-refs-post-wrap-exclusion-completes",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "k1" },
+            { "item": "r" },
+        ]),
+        None,
+    )
+}
+
+/// D-71 typed linkage, the stale arm: k2 re-admits dev2 at epoch 3
+/// AFTER k1's exclusion, so dev2's last accepted wrap postdates k1 —
+/// a compound citing k1 is held-invalid: `(body-invariant,
+/// reject-permanent)` ("a stale rotation preceding a re-wrap
+/// excludes nothing").
+pub fn f7_revoke_refs_stale_rotation() -> Vector {
+    let name = "f7-revoke-refs-stale";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2], "wrap.dev2.eph");
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let k2 = {
+        let kek_e3 = rig.rng.draw32("kek.zone.e3");
+        let (id1, pk1) = (d1.device_id, d1.kem_pk);
+        let w1 = rig.wrap_at(id1, &pk1, 3, &kek_e3, "wrap.dev1.e3.eph");
+        let (id2, pk2) = (dev2.device_id, dev2.kem_pk);
+        let w2 = rig.wrap_at(id2, &pk2, 3, &kek_e3, "wrap.dev2.e3.eph");
+        rig.kek_rotate(3, vec![w1, w2])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude_with_refs(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+        vec![k1.op_hash()],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-refs-stale-rotation-rejects",
+        "fold",
+        "7.1",
+        rig,
+        &[
+            ("c1", &c1),
+            ("c2", &c2),
+            ("k1", &k1),
+            ("k2", &k2),
+            ("r", &r),
+        ],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "k1" },
+            { "item": "k2" },
+            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// D-143 exactness, the valid arm: the compound's cutoff CARRIES
+/// dev2's live head (gen 1, seq 1 = the claim) — the carried head
+/// validates against the held chain (D-93) and the compound
+/// completes. The reversed order delivers the compound before the
+/// claim: the carried head is unheld and the compound pends
+/// `ref-unresolved` until it lands. The head's beyond-boundary
+/// retirement effect on tenant history is Gate-B saga territory
+/// (D-203-recorded deferral) — this pair pins the commitment
+/// validation.
+pub fn f7_revoke_cutoff_carried_head() -> Vector {
+    let name = "f7-revoke-carried-head";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the boundary head names me", 1, None);
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![Head {
+                lineage: dev2.lineage,
+                gen: 1,
+                seq: 1,
+                op: i.op_hash(),
+            }],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-carried-head-completes",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "k1" },
+            { "item": "r" },
+        ]),
+        None,
+    )
+}
+
+/// D-93's mismatched-hash reject: the carried head names the held
+/// coordinate (gen 1, seq 1) with the WRONG op hash —
+/// `(body-invariant, reject-permanent)` once the coordinate is held,
+/// in both orders.
+pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
+    let name = "f7-revoke-head-mismatch";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "the head will misname me", 1, None);
+    let k1 = {
+        let kek_e2 = rig.rng.draw32("kek.zone.e2");
+        let (id, pk) = (d1.device_id, d1.kem_pk);
+        let w = rig.wrap_at(id, &pk, 2, &kek_e2, "wrap.dev1.e2.eph");
+        rig.kek_rotate(2, vec![w])
+    };
+    let wrong = rig.rng.draw32("wrong.head.op");
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![Head {
+                lineage: dev2.lineage,
+                gen: 1,
+                seq: 1,
+                op: wrong,
+            }],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-head-hash-mismatch-rejects",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("k1", &k1), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "k1" },
+            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
+/// D-143 exactness, the omission arm: dev2 HAS accepted history but
+/// the compound's cutoff carries EMPTY heads — the boundary is
+/// uncommitted: `(body-invariant, reject-permanent)`.
+pub fn f7_revoke_cutoff_empty_heads_history() -> Vector {
+    let name = "f7-revoke-empty-heads";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let grant2 = rig.simple_grant("grant2", &dev2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&dev2, vec![grant2.clone()], "wrap.dev2.eph");
+    let i = rig.claim(&dev2, &grant2, "i", "history the close ignores", 1, None);
+    let zone = rig.zone_id;
+    let r = rig.revoke_device_exclude(
+        &dev2,
+        vec![Frontierclose {
+            zone_id: zone,
+            lineage: dev2.lineage,
+            heads: vec![],
+        }],
+    );
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "revoke-cutoff-empty-heads-with-history-rejects",
+        "fold",
+        "7.1",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("i", &i), ("r", &r)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "i" },
+            { "item": "r", "outcome": "body-invariant", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
+}
+
 pub fn corpus_ctrl() -> Vec<Vector> {
     vec![
         f7_hosted_solo_boot(),
@@ -531,6 +779,11 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_post_freeze_sig_invalid_kept(),
         f7_kek_rotate_manifest_admits(),
         f7_kek_rotate_manifest_target_outside(),
+        f7_revoke_refs_valid_exclusion(),
+        f7_revoke_refs_stale_rotation(),
+        f7_revoke_cutoff_carried_head(),
+        f7_revoke_cutoff_head_mismatch(),
+        f7_revoke_cutoff_empty_heads_history(),
     ]
 }
 

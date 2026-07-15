@@ -155,6 +155,9 @@ struct HeldTenantOp {
     /// (alternative (c)): recorded where authoring verbs admit it,
     /// counts toward no status rule.
     actor_class: Option<&'static str>,
+    /// The §9.1/T5 basis when the op is deadline/lease-bearing (T4
+    /// re-evaluation input).
+    time: Option<TimeFacts>,
     /// The signed capability epoch — the §4.3 budget-window anchor.
     cap_epoch: u64,
     /// Canonical triple byte length (the §4.3 `max_bytes` charge;
@@ -389,6 +392,18 @@ pub struct State {
     /// D-66 first-manifest-wins; re-appearance is an idempotent
     /// skip.
     manifested: Vec<[u8; 32]>,
+    /// T4 (D-203-ratified compromise machinery): per signing-key
+    /// compromise cutoffs — `key_id → accepted_through issuer_seq`,
+    /// repeated cutoffs merged at the MINIMUM. Statements beyond the
+    /// boundary are retro-disqualified as time evidence.
+    receipt_cutoffs: BTreeMap<[u8; 32], u64>,
+    /// Accepted `c.kek_rotate` ops: `H_op → (zone, new_epoch,
+    /// control position)` — the `rotation_refs` linkage source.
+    rotations: BTreeMap<[u8; 32], ([u8; 16], u64, u64)>,
+    /// The control position of each device's LAST accepted wrap per
+    /// zone — the D-71 post-last-wrap linkage bound (a stale
+    /// rotation preceding a re-wrap excludes nothing).
+    last_wrap_pos: BTreeMap<([u8; 16], [u8; 16]), u64>,
     /// (zone, capability epoch) → the policy-in-force's
     /// `time_witnesses` devices (the T2 anchor, D-69). Absent epochs
     /// resolve DOWNWARD — a bare bump carries policy(e−1) forward.
@@ -443,6 +458,20 @@ struct AuditRow {
     result_ids: Vec<[u8; 32]>,
 }
 
+/// The retained §9.1/T5 basis of an admitted deadline- or
+/// lease-bearing operation — the derived lane re-runs the SAME
+/// predicates over it when compromise cutoffs land (T4
+/// retro-disqualification; control-plane, distinct from the D-202
+/// evidence-arrival stickiness).
+#[derive(Debug, Clone)]
+struct TimeFacts {
+    signer_device: [u8; 16],
+    deadlines: Vec<u64>,
+    /// `(grant_id, max_age_ms)` when the citing grant is
+    /// online-lease.
+    lease: Option<([u8; 16], u64)>,
+}
+
 /// A held Signed `accept` receipt from aux — unvalidated until an
 /// operation cites time evidence.
 #[derive(Debug, Clone)]
@@ -452,6 +481,9 @@ struct AuxReceipt {
     zone: [u8; 16],
     subject: [u8; 32],
     seen_ms: u64,
+    /// The issuer-feed position (T4: compromise cutoffs
+    /// retro-disqualify beyond it).
+    issuer_seq: u64,
     stmt_raw: Vec<u8>,
     sig: Vec<u8>,
 }
@@ -466,6 +498,8 @@ struct AuxLease {
     lineage: [u8; 16],
     issued_ms: u64,
     expires_ms: u64,
+    /// The issuer-feed position (T4).
+    issuer_seq: u64,
     stmt_raw: Vec<u8>,
     sig: Vec<u8>,
 }
@@ -840,12 +874,17 @@ impl State {
     }
 
     /// Add `device` to the `(zone, epoch)` recipient set (idempotent —
-    /// a re-wrap supersedes by `(zone, epoch, device)`).
+    /// a re-wrap supersedes by `(zone, epoch, device)`). Runs inside
+    /// the accepting op's effect block, BEFORE its chain advance, so
+    /// `ctrl_next_seq` is that op's own position — recorded as the
+    /// device's last-wrap bound (D-71 linkage).
     fn record_wrap(&mut self, zone: [u8; 16], epoch: u64, device: [u8; 16]) {
         let set = self.wrap_sets.entry((zone, epoch)).or_default();
         if !set.contains(&device) {
             set.push(device);
         }
+        self.last_wrap_pos
+            .insert((zone, device), self.ctrl_next_seq);
     }
 
     /// D-151: the zone's LIVE lineages — those with an active
@@ -1292,10 +1331,11 @@ impl State {
     }
 
     /// Parse a frontierclose's `heads` into `(gen, seq)` caps,
-    /// resolving each against the HELD chain: the named coordinate
-    /// must hold exactly the named op (an unheld head pends,
-    /// `ref-unresolved` — the c.cutoff row's rule; a held-but-
-    /// different op is unpinned).
+    /// resolving each against the HELD chain (D-93's letter): the
+    /// named coordinate must hold exactly the named op — an unheld
+    /// head pends `ref-unresolved`, a held-but-different hash is
+    /// `(body-invariant, reject-permanent)` ("unheld-Head pending →
+    /// mismatched-hash reject").
     fn parse_heads(
         &self,
         cn: &Node,
@@ -1330,7 +1370,7 @@ impl State {
                     )))
                 }
                 Some(r) if r.op_hash != hop => {
-                    return Err(Unimplemented("carried head mismatches the held op".into()))
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
                 }
                 Some(_) => caps.push((gen, seq)),
             }
@@ -1427,6 +1467,8 @@ impl State {
                 Verdict::Pending("ref-unresolved", "pending-dependency")
             } else if !self.op_standing(rec) {
                 Verdict::Rejected("cutoff", "quarantine-reproposal")
+            } else if let Some(tv) = self.time_requalify(rec) {
+                tv
             } else if let Some(imp) = &rec.import {
                 // The claimant fold: total portable order
                 // (grant control position, gen, seq); the effective
@@ -1508,10 +1550,18 @@ impl State {
         Ok(out)
     }
 
-    /// Parse a compound's `cutoffs` into `(zone, lineage)` pairs.
-    /// Only the empty-heads shape is implemented (D-143 — the shape
-    /// the tranche mints; carried heads await their consumer slice).
-    fn compound_cutoffs(body: &Node) -> Result<Result<Vec<ZoneLineage>, Verdict>, Unimplemented> {
+    /// Parse a compound's `cutoffs` into `(zone, lineage)` pairs
+    /// with D-143 exactness: carried heads validate against the held
+    /// chain (unheld pends, mismatch rejects — D-93), and EMPTY
+    /// heads are legal only for a lineage with NO accepted ops (a
+    /// lineage with history must commit its boundary). The heads'
+    /// beyond-boundary retirement effect on tenant history rides the
+    /// Gate-B retirement sagas (D-203-recorded deferral) — this
+    /// slice validates the commitment.
+    fn compound_cutoffs(
+        &self,
+        body: &Node,
+    ) -> Result<Result<Vec<ZoneLineage>, Verdict>, Unimplemented> {
         let mut out = Vec::new();
         let Some(cs) = body.get("cutoffs").and_then(|c| c.as_array()) else {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
@@ -1520,27 +1570,99 @@ impl State {
             let (Some(z), Some(l)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage")) else {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             };
-            match cn.get("heads").and_then(|h| h.as_array()) {
-                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-                Some(a) if !a.is_empty() => {
-                    return Err(Unimplemented("frontierclose heads".into()))
-                }
-                Some(_) => out.push((z, l)),
+            let caps = match self.parse_heads(cn, z, l)? {
+                Ok(c) => c,
+                Err(v) => return ok(Err(v)),
+            };
+            let has_history = self
+                .tenant_chains
+                .keys()
+                .any(|(cz, cl, _)| *cz == z && *cl == l);
+            if caps.is_empty() && has_history {
+                return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             }
+            out.push((z, l));
         }
         ok(Ok(out))
+    }
+
+    /// Re-read a reserved compound's `rotation_refs` (bytes were
+    /// validated at reservation).
+    fn compound_rotation_refs(body: &Node) -> Vec<[u8; 32]> {
+        body.get("rotation_refs")
+            .and_then(|r| r.as_array())
+            .map(|a| a.iter().filter_map(|n| n.bytes_n::<32>()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Parse a compound's `receipt_cutoffs` (T4, compromise mode):
+    /// entries `{key_id, through, head_hash}`, `head_hash` all-zero
+    /// exactly when `through = 0` (D-87); repeated cutoffs for one
+    /// key merge at the MINIMUM. The `head_hash` commitment for
+    /// `through > 0` (the stmt_id of statement #through) is
+    /// verifiable only against a held issuer feed — the fold records
+    /// the commitment; feed-side verification is audit/registry
+    /// territory, documented in the Gate-A audit.
+    fn compound_receipt_cutoffs(
+        body: &Node,
+        compromise: bool,
+    ) -> Result<Vec<([u8; 32], u64)>, Verdict> {
+        let bad = Verdict::Rejected("body-invariant", "reject-permanent");
+        let node = body.get("receipt_cutoffs");
+        if !compromise {
+            // Exclude never carries the field (§7.1: compromise
+            // ADDITIONALLY carries it).
+            return if node.is_some() {
+                Err(bad)
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let Some(node) = node else {
+            // A compromise may omit the field (CDDL `?`): the
+            // cert/grant/cutoff effects fire, no feed is cut.
+            return Ok(Vec::new());
+        };
+        let Some(entries) = node.as_array() else {
+            return Err(bad);
+        };
+        if entries.is_empty() {
+            return Err(bad); // CDDL `[+ …]`
+        }
+        let mut out: Vec<([u8; 32], u64)> = Vec::new();
+        for e in entries {
+            if !keys_are_map(e, &["key_id", "through", "head_hash"]) {
+                return Err(bad);
+            }
+            let (Some(kid), Some(through), Some(head)) = (
+                e.get("key_id").and_then(|n| n.bytes_n::<32>()),
+                e.get("through").and_then(|n| n.as_uint()),
+                e.get("head_hash").and_then(|n| n.bytes_n::<32>()),
+            ) else {
+                return Err(bad);
+            };
+            if through == 0 && head != [0u8; 32] {
+                return Err(bad); // D-87
+            }
+            out.push((kid, through));
+        }
+        Ok(out)
     }
 
     /// Evaluate the one completion law (D-180/D-186) at the current
     /// position and, when it holds, apply the compound's effects: the
     /// certificates cease HERE (D-195), grant revocation is derived
-    /// (D-85). Incomplete → `ref-unresolved` (awaiting completing
+    /// (D-85), and a compromise's receipt cutoffs land (T4 —
+    /// statements beyond them retro-disqualify, min-merged).
+    /// Incomplete → `ref-unresolved` (awaiting completing
     /// exclusions/cutoffs).
     fn try_complete_compound(
         &mut self,
         oh: [u8; 32],
         rid: [u8; 16],
         cutoffs: &[ZoneLineage],
+        receipt_cutoffs: &[([u8; 32], u64)],
+        rotation_refs: &[[u8; 32]],
     ) -> Result<(), Verdict> {
         let pend = Verdict::Pending("ref-unresolved", "pending-dependency");
         let targets: Vec<[u8; 16]> = self
@@ -1570,6 +1692,41 @@ impl State {
                 return Err(pend);
             }
         }
+        // rotation_refs (typed linkage, D-71): each reference must
+        // resolve to an ACCEPTED rotation that is a valid
+        // post-last-wrap EXCLUSION of the target — accepted strictly
+        // after the target's last accepted wrap for its zone, with
+        // the target outside the new epoch's recipient set. Unheld
+        // pends the compound (verifiable-when-held); held-invalid is
+        // body-invariant. References never discharge coverage
+        // (D-165/D-180: completion stays state-derived below). A
+        // reserved compound whose late-arriving reference proves
+        // invalid dies here with its position consumed — no vector
+        // pins that residue yet.
+        for r in rotation_refs {
+            let Some(&(zone, new_epoch, pos)) = self.rotations.get(r) else {
+                return Err(pend);
+            };
+            for d in &targets {
+                if self
+                    .wrap_sets
+                    .get(&(zone, new_epoch))
+                    .is_some_and(|set| set.contains(d))
+                {
+                    return Err(Verdict::Rejected("body-invariant", "reject-permanent"));
+                }
+                if self
+                    .last_wrap_pos
+                    .get(&(zone, *d))
+                    .is_some_and(|&wp| wp >= pos)
+                {
+                    // Stale: a rotation preceding a re-wrap excludes
+                    // nothing.
+                    return Err(Verdict::Rejected("body-invariant", "reject-permanent"));
+                }
+            }
+        }
+
         // (3) The decryptable-wrap domain (D-173) is EMPTY: no zone
         // has an accepted epoch at which a target holds an effective
         // wrap not already followed by an accepted rotation excluding
@@ -1613,6 +1770,10 @@ impl State {
         }
         // The compound's frontier is authority-ending too (D-196).
         self.consume_dead_stages(&ended);
+        for &(kid, through) in receipt_cutoffs {
+            let e = self.receipt_cutoffs.entry(kid).or_insert(through);
+            *e = (*e).min(through);
+        }
         self.revoked_ids.push(rid);
         self.pending_compounds.remove(&oh);
         Ok(())
@@ -1630,26 +1791,38 @@ impl State {
             // Reserved re-evaluation: the position is already held
             // and the bytes were validated at reservation — only the
             // completion question remains.
-            let cutoffs = match Self::compound_cutoffs(&op.body)? {
+            let cutoffs = match self.compound_cutoffs(&op.body)? {
                 Ok(c) => c,
                 Err(v) => return ok(Err(v)),
             };
-            return ok(self.try_complete_compound(oh, rid, &cutoffs));
+            let compromise = op.body.get("mode").and_then(|m| m.as_text()) == Some("compromise");
+            let rcuts = match Self::compound_receipt_cutoffs(&op.body, compromise) {
+                Ok(r) => r,
+                Err(v) => return ok(Err(v)),
+            };
+            let refs = Self::compound_rotation_refs(&op.body);
+            let out = self.try_complete_compound(oh, rid, &cutoffs, &rcuts, &refs);
+            if matches!(out, Err(Verdict::Rejected(..))) {
+                // A held-invalid reference kills the reserved
+                // compound; the reservation releases (the position
+                // stays consumed).
+                self.pending_compounds.remove(&oh);
+            }
+            return ok(out);
         }
         if let Err(v) = self.ctrl_admin_preamble(op) {
             return ok(Err(v));
         }
         let body = &op.body;
-        match body.get("mode").and_then(|m| m.as_text()) {
-            Some("exclude") => {}
-            Some("compromise") => {
-                return Err(Unimplemented("compromise mode (T4 receipt cutoffs)".into()))
-            }
+        let compromise = match body.get("mode").and_then(|m| m.as_text()) {
+            Some("exclude") => false,
+            Some("compromise") => true,
             _ => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-        }
-        if body.get("receipt_cutoffs").is_some() {
-            return Err(Unimplemented("receipt_cutoffs under exclude".into()));
-        }
+        };
+        let receipt_cuts = match Self::compound_receipt_cutoffs(body, compromise) {
+            Ok(r) => r,
+            Err(v) => return ok(Err(v)),
+        };
         let Some(rid) = b16_field(body, "revocation_id") else {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         };
@@ -1658,12 +1831,31 @@ impl State {
         if self.pending_compounds.values().any(|r| *r == rid) || self.revoked_ids.contains(&rid) {
             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
-        // rotation_refs are typed linkage, never coverage — the
-        // tranche mints none (legal: completion is state-derived).
-        match body.get("rotation_refs").and_then(|r| r.as_array()) {
+        // rotation_refs are typed linkage, never coverage (empty is
+        // legal on a trusted plane: completion is state-derived) —
+        // MANDATORY on hosted planes (§7.5). Structure here;
+        // resolution + the D-71 post-last-wrap exclusion predicate
+        // ride completion (an unheld reference pends the compound,
+        // verifiable-when-held).
+        let ref_hashes = match body.get("rotation_refs").and_then(|r| r.as_array()) {
             None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-            Some(a) if !a.is_empty() => return Err(Unimplemented("rotation_refs linkage".into())),
-            Some(_) => {}
+            Some(a) => {
+                if a.len() > 64 {
+                    // E8.
+                    return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                }
+                let mut out = Vec::new();
+                for r in a {
+                    let Some(h) = r.bytes_n::<32>() else {
+                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
+                    };
+                    out.push(h);
+                }
+                out
+            }
+        };
+        if self.provenance.as_deref() == Some("hosted") && ref_hashes.is_empty() {
+            return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
         }
         // The target: every certificate bearing the revocation_id.
         let targets: Vec<[u8; 16]> = self
@@ -1680,7 +1872,7 @@ impl State {
             return Err(Unimplemented("compound target not enrolled".into()));
         }
         // Cutoffs name the target's lineage exactly, in a known zone.
-        let cutoffs = match Self::compound_cutoffs(body)? {
+        let cutoffs = match self.compound_cutoffs(body)? {
             Ok(c) => c,
             Err(v) => return ok(Err(v)),
         };
@@ -1692,22 +1884,17 @@ impl State {
             if !names_target || !self.zones.contains(&cz) {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             }
-            // Empty heads are legal for a lineage with no accepted
-            // ops (D-143) — the only shape the tranche mints.
-            if self
-                .tenant_chains
-                .keys()
-                .any(|(z, l, _)| *z == cz && *l == cl)
-            {
-                return Err(Unimplemented("cutoff heads below accepted ops".into()));
-            }
         }
         // Reserve the position, then evaluate (the compound may
         // complete immediately).
         self.ctrl_next_seq += 1;
         self.ctrl_head = oh;
         self.pending_compounds.insert(oh, rid);
-        ok(self.try_complete_compound(oh, rid, &cutoffs))
+        let out = self.try_complete_compound(oh, rid, &cutoffs, &receipt_cuts, &ref_hashes);
+        if matches!(out, Err(Verdict::Rejected(..))) {
+            self.pending_compounds.remove(&oh);
+        }
+        ok(out)
     }
 
     /// `c.cutoff`, requesterless pure-staging form only (D-136): an
@@ -1740,12 +1927,12 @@ impl State {
             let (Some(z), Some(l)) = (b16_field(cn, "zone_id"), b16_field(cn, "lineage")) else {
                 return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
             };
-            match cn.get("heads").and_then(|h| h.as_array()) {
-                None => return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent"))),
-                Some(a) if !a.is_empty() => {
-                    return Err(Unimplemented("frontierclose heads".into()))
-                }
-                Some(_) => staged.push((z, l)),
+            // Carried heads validate per D-93 (unheld pends,
+            // mismatch rejects); their consumption semantics ride
+            // the Gate-B staging sagas.
+            match self.parse_heads(cn, z, l)? {
+                Ok(_caps) => staged.push((z, l)),
+                Err(v) => return ok(Err(v)),
             }
         }
 
@@ -1803,14 +1990,9 @@ impl State {
                 if cz != zone || !live.contains(&cl) {
                     return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")));
                 }
-                match cn.get("heads").and_then(|h| h.as_array()) {
-                    None => {
-                        return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
-                    }
-                    Some(a) if !a.is_empty() => {
-                        return Err(Unimplemented("frontierclose heads".into()))
-                    }
-                    Some(_) => entries.push(cl),
+                match self.parse_heads(cn, cz, cl)? {
+                    Ok(_caps) => entries.push(cl),
+                    Err(v) => return ok(Err(v)),
                 }
             }
         }
@@ -1908,12 +2090,9 @@ impl State {
                 if cz != zone || !live.contains(&cl) {
                     return ok(Err(bad()));
                 }
-                match cn.get("heads").and_then(|h| h.as_array()) {
-                    None => return ok(Err(bad())),
-                    Some(a) if !a.is_empty() => {
-                        return Err(Unimplemented("frontierclose heads".into()))
-                    }
-                    Some(_) => entries.push(cl),
+                match self.parse_heads(cn, cz, cl)? {
+                    Ok(_caps) => entries.push(cl),
+                    Err(v) => return ok(Err(v)),
                 }
             }
         }
@@ -2047,6 +2226,8 @@ impl State {
 
         // Accept: the new epoch's recipient set IS the wrap set.
         // Pending compounds re-evaluate through the fold's fixpoint.
+        self.rotations
+            .insert(op.op_hash(), (zone, cur + 1, self.ctrl_next_seq));
         // Manifest effects (D-66 first-manifest-wins): a fresh
         // item_addr consumes its target's erase-queue entry; a
         // re-appearing one skips idempotently.
@@ -2593,23 +2774,49 @@ impl State {
     /// anchored policy lists, signature valid. Returns `seen_ms`
     /// values.
     fn qualified_accepts(&self, op: &SignedOp, signer: &HeldCert) -> Vec<u64> {
-        let h = &op.header;
-        let witnesses = self.witnesses_at(h.zone_id, h.capability_epoch);
-        let op_hash = op.op_hash();
+        self.qualified_accepts_at(
+            op.header.zone_id,
+            op.header.capability_epoch,
+            op.op_hash(),
+            signer.device_id,
+        )
+    }
+
+    /// The T2/T4 accept-qualification predicate over RETAINED facts
+    /// (the derived lane re-runs it for held operations when
+    /// compromise cutoffs land — T4 retro-disqualification).
+    fn qualified_accepts_at(
+        &self,
+        zone: [u8; 16],
+        cap_epoch: u64,
+        op_hash: [u8; 32],
+        signer_device: [u8; 16],
+    ) -> Vec<u64> {
+        let witnesses = self.witnesses_at(zone, cap_epoch);
         self.receipts
             .iter()
             .filter_map(|r| {
-                if Some(r.plane) != self.plane_id || r.zone != h.zone_id {
+                if Some(r.plane) != self.plane_id || r.zone != zone {
                     return None;
                 }
                 if self.item_index.get(&r.subject) != Some(&op_hash) {
                     return None;
                 }
                 let cert = self.certs.iter().find(|c| c.h_cert == r.issuer_cert)?;
-                if cert.device_id == signer.device_id {
+                if cert.device_id == signer_device {
                     return None; // T2: a signer never receipts itself
                 }
                 if !witnesses.contains(&cert.device_id) {
+                    return None;
+                }
+                // T4: a compromise cutoff retro-disqualifies the
+                // issuer's statements beyond `through`.
+                let kid = domains::key_id("ed25519", &cert.sig_pk);
+                if self
+                    .receipt_cutoffs
+                    .get(&kid)
+                    .is_some_and(|&thr| r.issuer_seq > thr)
+                {
                     return None;
                 }
                 verify_stmt(&cert.sig_pk, "receipt", &r.stmt_raw, &r.sig).then_some(r.seen_ms)
@@ -2627,25 +2834,98 @@ impl State {
         grant: &HeldGrant,
         max_age: u64,
     ) -> Vec<(u64, u64)> {
-        let h = &op.header;
-        let witnesses = self.witnesses_at(h.zone_id, h.capability_epoch);
+        self.qualified_lease_windows_at(
+            op.header.zone_id,
+            op.header.capability_epoch,
+            op.header.writer_lineage,
+            grant.grant_id,
+            max_age,
+            signer.device_id,
+        )
+    }
+
+    /// T4 re-evaluation for a HELD deadline/lease-bearing op: the
+    /// §9.1/T5 predicates over the retained basis under CURRENT
+    /// compromise cutoffs. `None` = still qualified. A receipt an
+    /// accepted compromise cut no longer qualifies — control-plane
+    /// retro-disqualification (D-138 re-derivation), distinct from
+    /// the D-202 ruling, which makes `lease-stale` sticky against
+    /// new EVIDENCE only.
+    fn time_requalify(&self, rec: &HeldTenantOp) -> Option<Verdict> {
+        let tf = rec.time.as_ref()?;
+        let accepts =
+            self.qualified_accepts_at(rec.zone, rec.cap_epoch, rec.op_hash, tf.signer_device);
+        for &d in &tf.deadlines {
+            if !accepts.iter().any(|&seen| seen <= d) {
+                return Some(Verdict::Pending(
+                    "deadline-unreceipted",
+                    "pending-dependency",
+                ));
+            }
+        }
+        if let Some((grant_id, max_age)) = tf.lease {
+            let windows = self.qualified_lease_windows_at(
+                rec.zone,
+                rec.cap_epoch,
+                rec.lineage,
+                grant_id,
+                max_age,
+                tf.signer_device,
+            );
+            if windows.is_empty() {
+                return Some(Verdict::Pending("lease-missing", "pending-dependency"));
+            }
+            const SKEW_MS: u64 = 300_000;
+            let in_window = windows
+                .iter()
+                .any(|&(i, e)| accepts.iter().any(|&s| s >= i && s <= e + SKEW_MS));
+            if !in_window {
+                return Some(if accepts.is_empty() {
+                    Verdict::Pending("lease-missing", "pending-dependency")
+                } else {
+                    Verdict::Rejected("lease-stale", "quarantine-reproposal")
+                });
+            }
+        }
+        None
+    }
+
+    /// The lease twin of [`Self::qualified_accepts_at`].
+    fn qualified_lease_windows_at(
+        &self,
+        zone: [u8; 16],
+        cap_epoch: u64,
+        lineage: [u8; 16],
+        grant_id: [u8; 16],
+        max_age: u64,
+        signer_device: [u8; 16],
+    ) -> Vec<(u64, u64)> {
+        let witnesses = self.witnesses_at(zone, cap_epoch);
         self.leases
             .iter()
             .filter_map(|l| {
-                if Some(l.plane) != self.plane_id || l.zone != h.zone_id {
+                if Some(l.plane) != self.plane_id || l.zone != zone {
                     return None;
                 }
-                if l.grant_id != grant.grant_id || l.lineage != h.writer_lineage {
+                if l.grant_id != grant_id || l.lineage != lineage {
                     return None;
                 }
                 if l.expires_ms < l.issued_ms || l.expires_ms - l.issued_ms > max_age {
                     return None;
                 }
                 let cert = self.certs.iter().find(|c| c.h_cert == l.issuer_cert)?;
-                if cert.device_id == signer.device_id {
+                if cert.device_id == signer_device {
                     return None;
                 }
                 if !witnesses.contains(&cert.device_id) {
+                    return None;
+                }
+                let kid = domains::key_id("ed25519", &cert.sig_pk);
+                if self
+                    .receipt_cutoffs
+                    .get(&kid)
+                    .is_some_and(|&thr| l.issuer_seq > thr)
+                {
                     return None;
                 }
                 verify_stmt(&cert.sig_pk, "lease", &l.stmt_raw, &l.sig)
@@ -2673,6 +2953,10 @@ impl State {
             held_tenant: std::mem::take(&mut self.held_tenant),
             erase_queue: std::mem::take(&mut self.erase_queue),
             retrieval_excluded: std::mem::take(&mut self.retrieval_excluded),
+            // Accepted erase requests are tenant-side facts and carry
+            // over; `manifested` and `receipt_cutoffs` are
+            // control-derived and re-derive on the replay.
+            erase_requests: std::mem::take(&mut self.erase_requests),
             ctrl_overlay: std::mem::take(&mut self.ctrl_overlay),
             cut_chain: std::mem::take(&mut self.cut_chain),
             // Tenant replay keys survive; control ones re-derive on
@@ -2694,8 +2978,10 @@ impl State {
                 }
                 continue;
             }
-            let op = parse_op(bytes)
-                .map_err(|_| Unimplemented("re-fold parse of an accepted op".into()))?;
+            // Accepted bytes parsed once at admission; a re-parse
+            // failure is an internal-state invariant violation, not
+            // a wire mechanism (P1 profile C.1 item 5).
+            let op = parse_op(bytes).expect("accepted control bytes re-parse (D-138 replay)");
             match fresh.admit(&op)? {
                 Ok(()) => {
                     fresh.request_seen.insert(
@@ -2888,9 +3174,10 @@ impl State {
             };
             if let Some(kind) = stmt.get("kind").and_then(|k| k.as_text()) {
                 if kind == "accept" {
-                    let (Some(subject), Some(seen_ms)) = (
+                    let (Some(subject), Some(seen_ms), Some(issuer_seq)) = (
                         stmt.get("subject").and_then(|n| n.bytes_n::<32>()),
                         stmt.get("seen_ms").and_then(|n| n.as_uint()),
+                        stmt.get("issuer_seq").and_then(|n| n.as_uint()),
                     ) else {
                         return Err(Unimplemented(format!("aux {name}: accept shape")));
                     };
@@ -2900,6 +3187,7 @@ impl State {
                         zone,
                         subject,
                         seen_ms,
+                        issuer_seq,
                         stmt_raw: stmt.raw.to_vec(),
                         sig: sig.to_vec(),
                     });
@@ -2915,6 +3203,9 @@ impl State {
                 ) else {
                     return Err(Unimplemented(format!("aux {name}: lease shape")));
                 };
+                let Some(issuer_seq) = stmt.get("issuer_seq").and_then(|n| n.as_uint()) else {
+                    return Err(Unimplemented(format!("aux {name}: lease shape")));
+                };
                 self.leases.push(AuxLease {
                     issuer_cert,
                     plane,
@@ -2923,6 +3214,7 @@ impl State {
                     lineage,
                     issued_ms,
                     expires_ms,
+                    issuer_seq,
                     stmt_raw: stmt.raw.to_vec(),
                     sig: sig.to_vec(),
                 });
@@ -2982,6 +3274,26 @@ impl State {
         let key = (h.zone_id, h.writer_lineage, h.writer_gen);
         self.tenant_chains
             .insert(key, (h.writer_sequence + 1, op.op_hash()));
+        // Retain the time basis for deadline/lease-bearing ops (T4).
+        let time = {
+            let held_cert = match h.proof {
+                Proof::Dev { cert, .. } => self.certs.iter().find(|c| c.h_cert == cert),
+                _ => None,
+            };
+            let mut deadlines: Vec<u64> = Vec::new();
+            deadlines.extend(grant.expiry_deadline_ms);
+            deadlines.extend(held_cert.and_then(|c| c.expiry_deadline_ms));
+            match held_cert {
+                Some(cert) if !deadlines.is_empty() || grant.online_lease => Some(TimeFacts {
+                    signer_device: cert.device_id,
+                    deadlines,
+                    lease: grant
+                        .online_lease
+                        .then(|| (grant.grant_id, grant.max_age_ms.unwrap_or(0))),
+                }),
+                _ => None,
+            }
+        };
         self.held_tenant.push(HeldTenantOp {
             op_hash: op.op_hash(),
             zone: h.zone_id,
@@ -3000,6 +3312,7 @@ impl State {
             release,
             import,
             judge,
+            time,
         });
     }
 
