@@ -2756,6 +2756,10 @@ function renderLogEntry(c) {
     renderCommandOutputEntry(c);
     return;
   }
+  if (isReasoningLog(c)) {
+    renderReasoningLogEntry(c);
+    return;
+  }
   if (isDiffLog(c)) {
     inferSessionPhaseFromLog(c);
     renderDiffLogEntry(c);

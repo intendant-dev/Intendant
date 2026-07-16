@@ -1880,6 +1880,10 @@ function wireSessionWindowLogClone(clone, sourceEntry) {
     wireDiffLogEntry(clone);
     return;
   }
+  if (clone.classList.contains('reasoning-log-entry')) {
+    wireReasoningLogClone(clone, sourceEntry);
+    return;
+  }
   if (!clone.classList.contains('collapsible')) return;
   wireCollapsibleLogEntry(clone, clone.querySelector('.log-content'), sourceEntry);
 }

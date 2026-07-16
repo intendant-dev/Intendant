@@ -53,6 +53,7 @@ mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+mod memory;
 mod message_search;
 mod peer;
 mod peer_file_transfer;

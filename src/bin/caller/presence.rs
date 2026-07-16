@@ -1091,6 +1091,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DisplayTaken { .. }
         | AppEvent::DisplayReleased { .. }
         | AppEvent::SessionDirChanged { .. }
+        | AppEvent::SessionFileActivity { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
         | AppEvent::PresenceReady

@@ -7,8 +7,10 @@
 //! path retargeting (the stamped spec + companion live under
 //! `../owner-plane-reducer/corpus/`), and trimming to the writer-side
 //! modules the daemon consumes — the fixture-minting machinery
-//! (`corpus_*`, `tranche`, `scenario`, `surfaces`, `vector`,
-//! `coverage`, `rng`, `bin/mint`) stays on the asset branch.
+//! (`corpus_*`, `tranche`, `surfaces`, `vector`, `coverage`, `rng`,
+//! `bin/mint`) stays on the asset branch. `scenario` (the Appendix B
+//! pinned-policy prelude: B.2/B.3 policy literals + the genesis zone
+//! policy) is kept — services mint under those pinned policies.
 //!
 //! What remains is the spec's writer side: canonical CBOR (§1, E1–E10
 //! writer side), the closed hash-domain inventory (§2), suite-v1
@@ -21,5 +23,6 @@ pub mod cbor;
 pub mod domains;
 pub mod keyschedule;
 pub mod outcomes;
+pub mod scenario;
 pub mod shapes;
 pub mod suite;

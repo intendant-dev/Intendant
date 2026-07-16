@@ -2037,6 +2037,18 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     .await;
                 }
             }
+            external_agent::AgentEvent::FileActivity { paths } => {
+                // Structured write-path signal for the git-vitals
+                // activity-locus tracker. Primary-conversation activity
+                // only: a side thread's or Codex sub-agent's writes must
+                // not retarget the supervising session's git chip.
+                if event_is_primary && !paths.is_empty() {
+                    config.bus.send(AppEvent::SessionFileActivity {
+                        session_id: config.session_id.clone(),
+                        paths,
+                    });
+                }
+            }
             external_agent::AgentEvent::FileApprovalRequest {
                 request_id,
                 path,

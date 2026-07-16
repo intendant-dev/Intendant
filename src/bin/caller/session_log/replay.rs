@@ -477,13 +477,24 @@ pub fn session_log_entry_to_app_event(
             if reasoning.is_empty() {
                 return None;
             }
+            // Session/source attribution is persisted by
+            // `reasoning_content_for_session`; older rows carry neither and
+            // replay unattributed exactly as before.
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::ModelResponse {
-                session_id: None,
+                session_id,
                 turn: turn.unwrap_or(0),
                 content: String::new(),
                 usage: TokenUsage::default(),
                 reasoning: Some(reasoning),
-                source: None,
+                source,
             })
         }
 
@@ -2295,7 +2306,9 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 100_000);
-        log.reasoning_content(
+        log.reasoning_content_for_session(
+            None,
+            None,
             Some("The model is thinking about X"),
             Some("Full detailed reasoning about X and Y spanning many lines"),
         );
@@ -2318,6 +2331,41 @@ mod tests {
                     Some("Full detailed reasoning about X and Y spanning many lines")
                 );
                 assert!(source.is_none());
+            }
+            other => panic!("expected ModelResponse with reasoning, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_reasoning_event_with_session_and_source() {
+        // Session/source attribution written by reasoning_content_for_session
+        // must survive the replay roundtrip — without it a reloaded
+        // dashboard rendered reasoning unattributed (dedupe/parity gap).
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.reasoning_content_for_session(
+            Some("session-7"),
+            Some("Claude Code"),
+            Some("Thinking about the fix"),
+            None,
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "reasoning");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::ModelResponse {
+                session_id,
+                content,
+                reasoning,
+                source,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-7"));
+                assert!(content.is_empty());
+                assert_eq!(reasoning.as_deref(), Some("Thinking about the fix"));
+                assert_eq!(source.as_deref(), Some("Claude Code"));
             }
             other => panic!("expected ModelResponse with reasoning, got {:?}", other),
         }

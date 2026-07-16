@@ -292,6 +292,12 @@ pub(crate) enum RouteHandlerId {
     AgendaList,
     /// Apply one agenda command (add/patch/complete/reopen/retire).
     AgendaOp,
+    /// Bounded Memory claim search (q/limit/candidates query params).
+    MemorySearch,
+    /// Read one Memory claim by id prefix (id query param).
+    MemoryClaim,
+    /// Propose one Memory claim (the candidate lane).
+    MemoryPropose,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
     /// declarations are a deliberate follow-up, not part of the
@@ -785,6 +791,33 @@ pub(crate) static ROUTES: &[Route] = &[
         "Apply one agenda command (add, patch, complete, reopen, or retire)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/memory/search"),
+        PeerOperation::MemoryRead,
+        BodyPolicy::None,
+        RouteHandlerId::MemorySearch,
+        "Bounded Memory claim search (q, limit, candidates); results carry derived status",
+    )
+    .with_tunnel(tunnel_method("api_memory_search")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/memory/claim"),
+        PeerOperation::MemoryRead,
+        BodyPolicy::None,
+        RouteHandlerId::MemoryClaim,
+        "Read one Memory claim by id prefix (id); status derived at read time",
+    )
+    .with_tunnel(tunnel_method("api_memory_claim")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/memory/propose"),
+        PeerOperation::MemoryWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::MemoryPropose,
+        "Propose one Memory claim (candidate lane; ephemeral plane in P1.1)",
+    )
+    .with_tunnel(tunnel_method("api_memory_propose")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),

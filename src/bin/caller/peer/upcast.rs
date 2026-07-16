@@ -591,6 +591,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
             | AppEvent::FileChanged { .. }
+            | AppEvent::SessionFileActivity { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }

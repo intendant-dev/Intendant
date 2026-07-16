@@ -325,6 +325,24 @@ pub(crate) fn spawn_mode_web_gateway(
             None
         }
     };
+    // The P1 Memory service: an EPHEMERAL local plane (ratified write
+    // bar — nothing durable until Gate-B-lite custody + P0.5 + the
+    // tombed cutover). Bootstrap failure degrades to "memory
+    // unavailable" instead of failing the gateway; the plane id is
+    // logged so operators can tell incarnations apart across restarts.
+    mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap() {
+        Ok(handle) => {
+            println!(
+                "[memory] ephemeral plane {} (nothing persists across restarts)",
+                &handle.plane_id_hex()[..16]
+            );
+            Some(Arc::new(handle))
+        }
+        Err(err) => {
+            eprintln!("[memory] ephemeral plane bootstrap failed: {err}");
+            None
+        }
+    };
     let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
         Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
         bus.clone(),

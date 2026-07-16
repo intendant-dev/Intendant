@@ -12,6 +12,7 @@
 use std::{fmt, net::IpAddr, path::PathBuf};
 
 pub mod access_policy;
+pub mod actor;
 pub(crate) mod authority_store;
 pub mod backend;
 // `serve-certs` remains a Unix-only interactive server. Windows setup uses
