@@ -346,9 +346,22 @@ fn all_control_methods() -> &'static [ControlMethodSpec] {
 }
 
 fn control_method_spec(method: &str) -> Option<&'static ControlMethodSpec> {
-    all_control_methods()
-        .iter()
-        .find(|spec| spec.name == method)
+    // Indexed once: this lookup runs at least twice per tunnel request
+    // (authorizer + dispatch), and the effective table is ~150 entries.
+    // `or_insert` preserves the table's first-wins resolution order.
+    static INDEX: std::sync::OnceLock<HashMap<&'static str, &'static ControlMethodSpec>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let methods = all_control_methods();
+            let mut index = HashMap::with_capacity(methods.len());
+            for spec in methods {
+                index.entry(spec.name).or_insert(spec);
+            }
+            index
+        })
+        .get(method)
+        .copied()
 }
 
 /// Transport/frame-family features that aren't request methods (chunking,
@@ -1742,7 +1755,7 @@ impl DashboardControlPeer {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
-            config: serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
+            config: Arc::new(serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}))),
             bus,
             peer_registry,
             mcp_server,
@@ -1751,7 +1764,7 @@ impl DashboardControlPeer {
             worktree_inventory_cache,
             terminal_registry,
             task_tx,
-            agent_card,
+            agent_card: Arc::new(agent_card),
             bootstrap_caches,
             display_authority,
             presence,
@@ -1825,7 +1838,9 @@ pub(crate) struct ControlRuntime {
     events_subscribed: bool,
     events_sent: u64,
     response_credit_enabled: bool,
-    config: serde_json::Value,
+    /// Shared, not owned: `ControlRuntime` is cloned per spawned request,
+    /// and an owned tree deep-copied this multi-KB JSON every time.
+    config: Arc<serde_json::Value>,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
@@ -1834,7 +1849,9 @@ pub(crate) struct ControlRuntime {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
-    agent_card: serde_json::Value,
+    /// Shared like `config` (multi-KB tree; `ControlRuntime` is cloned
+    /// per spawned request).
+    agent_card: Arc<serde_json::Value>,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
     presence: Option<DashboardPresenceBridge>,
@@ -2916,8 +2933,12 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
 pub(crate) use crate::web_gateway::status_line_code;
 
 fn params_body_text(params: Option<&serde_json::Value>) -> String {
-    serde_json::to_string(&params.cloned().unwrap_or_else(|| serde_json::json!({})))
-        .unwrap_or_else(|_| "{}".to_string())
+    // Serialize the borrow — cloning the params subtree first cost a
+    // second deep copy of every request's params just to stringify it.
+    match params {
+        Some(params) => serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    }
 }
 
 fn missing_param_response(id: String, name: &str) -> serde_json::Value {
@@ -3404,11 +3425,11 @@ mod tests {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
-            config: serde_json::json!({"provider":"openai"}),
-            agent_card: serde_json::json!({
+            config: Arc::new(serde_json::json!({"provider":"openai"})),
+            agent_card: Arc::new(serde_json::json!({
                 "id": "intendant:test-daemon",
                 "label": "test-daemon",
-            }),
+            })),
             bus: crate::event::EventBus::new(),
             peer_registry: None,
             mcp_server: None,

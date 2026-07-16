@@ -878,13 +878,13 @@ pub(crate) fn control_frame_response(
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": runtime.config,
+                    "result": &*runtime.config,
                 })),
                 "api_agent_card" => Some(serde_json::json!({
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": runtime.agent_card,
+                    "result": &*runtime.agent_card,
                 })),
                 "api_cached_bootstrap_events" => Some(cached_bootstrap_events_response_frame(
                     id,

@@ -120,7 +120,7 @@ pub(crate) async fn api_state_snapshot_response(
             "t": "state_snapshot",
             "state": state,
             "connection_id": runtime.session_id.clone(),
-            "config": runtime.config.clone(),
+            "config": &*runtime.config,
             "session_id": bootstrap_session_id,
         },
     })
