@@ -1021,6 +1021,32 @@ impl IntendantServer {
         session_id_override: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> String {
+        // Pre-warm the controller-loop raw sample OUTSIDE the state locks:
+        // the collection spawns `ps` and scans the loop/wrapper stores, and
+        // running it under the write lock below would head-of-line-block the
+        // event-fold listener and every other MCP tool for its duration. The
+        // promote/active/stale checks then consume the warmed cache entry
+        // (one shared sample per call instead of two to three collections).
+        let needs_collect = {
+            let s = self.state.read().await;
+            let has_target = session_id_override
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_some()
+                || !s.session_id.is_empty();
+            if has_target && s.controller_loop_status_override.is_none() {
+                let loop_dir = mcp_state_controller_loop_dir(&s);
+                s.cached_controller_loop_raw_status(&loop_dir)
+                    .is_none()
+                    .then_some(loop_dir)
+            } else {
+                None
+            }
+        };
+        if let Some(loop_dir) = needs_collect {
+            let raw = collect_controller_loop_raw_status(&loop_dir);
+            self.state.read().await.store_controller_loop_raw_status(raw);
+        }
         {
             let mut s = self.state.write().await;
             if let Some(requested_session_id) = session_id_override

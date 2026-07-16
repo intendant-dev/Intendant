@@ -58,6 +58,13 @@ pub struct McpAppState {
     /// Test override for the home that anchors persisted-session lookup
     /// (path-form session ids must resolve inside `<home>/.intendant/logs`).
     pub(crate) session_logs_home_override: Option<std::path::PathBuf>,
+    /// Short-TTL cache of the raw (state-independent) controller-loop
+    /// collection — the `ps` spawn + run-dir/wrapper-index scan half of
+    /// [`collect_controller_loop_status_inner`]. Interior mutability so the
+    /// polled read paths (which only hold `&McpAppState`) can serve and
+    /// re-seed it; see [`CONTROLLER_LOOP_RAW_STATUS_TTL`].
+    controller_loop_raw_status_cache:
+        std::sync::Mutex<Option<(std::time::Instant, ControllerLoopRawStatus)>>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -209,6 +216,7 @@ impl McpAppState {
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
             session_logs_home_override: None,
+            controller_loop_raw_status_cache: std::sync::Mutex::new(None),
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -248,6 +256,41 @@ impl McpAppState {
             self.phase = phase;
             self.phase_entered_at = std::time::Instant::now();
         }
+    }
+
+    /// A still-fresh raw controller-loop sample for `loop_dir`, if one is
+    /// cached. A stale entry or one collected for a different loop dir
+    /// (dir overrides in tests) misses.
+    pub(crate) fn cached_controller_loop_raw_status(
+        &self,
+        loop_dir: &std::path::Path,
+    ) -> Option<ControllerLoopRawStatus> {
+        let cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (collected_at, raw) = cache.as_ref()?;
+        (collected_at.elapsed() < CONTROLLER_LOOP_RAW_STATUS_TTL && raw.loop_dir() == loop_dir)
+            .then(|| raw.clone())
+    }
+
+    pub(crate) fn store_controller_loop_raw_status(&self, raw: ControllerLoopRawStatus) {
+        let mut cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = Some((std::time::Instant::now(), raw));
+    }
+
+    /// Drop the cached raw controller-loop sample. Marker-mutating paths
+    /// (halt/intervene/clear) call this so a status poll right after the
+    /// mutation observes the new flags instead of a sub-TTL stale sample.
+    pub(crate) fn invalidate_controller_loop_raw_status_cache(&self) {
+        let mut cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *cache = None;
     }
 
     pub(crate) fn push_log(&mut self, level: LogLevel, content: String) {

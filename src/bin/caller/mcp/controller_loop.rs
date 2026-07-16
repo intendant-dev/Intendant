@@ -295,21 +295,56 @@ pub(crate) fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serd
     collect_controller_loop_status_inner(loop_dir, None)
 }
 
-pub(crate) fn collect_controller_loop_status_for_mcp_state(
-    loop_dir: &std::path::Path,
-    state: &McpAppState,
-) -> serde_json::Value {
-    collect_controller_loop_status_inner(loop_dir, Some((state, current_unix_timestamp_secs())))
+/// How long a [`ControllerLoopRawStatus`] snapshot stays servable from the
+/// per-state cache. The raw collection spawns `ps`, scans every historical
+/// run dir, and reads wrapper/session metadata — polled status surfaces
+/// (`get_status`, supervised phase gates) otherwise repeat that work several
+/// times per call. Enrichment against live MCP state is re-applied per
+/// consumer, so only the filesystem/process sample ages, never the folded
+/// session state.
+pub(crate) const CONTROLLER_LOOP_RAW_STATUS_TTL: std::time::Duration =
+    std::time::Duration::from_secs(1);
+
+/// The state-independent (and expensive) half of a controller-loop status
+/// collection: marker flags, lock/pid liveness, run-dir + process-tree +
+/// wrapper-index discovery, latest-run pointers, and the intervention-order
+/// report. Everything here is a pure filesystem/process sample, so it can be
+/// collected without any `McpAppState` lock and briefly cached; the
+/// state-dependent tail lives in [`finish_controller_loop_status`].
+#[derive(Clone, Debug)]
+pub(crate) struct ControllerLoopRawStatus {
+    loop_dir: std::path::PathBuf,
+    halt: bool,
+    halt_after_cycle: bool,
+    stop_requested: bool,
+    abort_requested: bool,
+    lock_present: bool,
+    lock_owner_pid: Option<u32>,
+    lock_owner_alive: bool,
+    active_wrappers: Vec<serde_json::Value>,
+    active_codex: Vec<serde_json::Value>,
+    latest_run_id: Option<String>,
+    latest_status_file: serde_json::Value,
+    latest_target: Option<String>,
+    latest_pid: Option<u32>,
+    latest_pid_alive: bool,
+    intervention_order: serde_json::Value,
 }
 
-pub(crate) fn collect_controller_loop_status_inner(
+impl ControllerLoopRawStatus {
+    /// The loop dir this sample was collected from — the cache key.
+    pub(crate) fn loop_dir(&self) -> &std::path::Path {
+        &self.loop_dir
+    }
+}
+
+pub(crate) fn collect_controller_loop_raw_status(
     loop_dir: &std::path::Path,
-    live_state: Option<(&McpAppState, u64)>,
-) -> serde_json::Value {
+) -> ControllerLoopRawStatus {
     let halt = loop_dir.join("request_halt").exists();
     let halt_after_cycle = loop_dir.join("request_halt_after_cycle").exists();
-    let mut stop_requested = loop_dir.join("request_stop").exists();
-    let mut abort_requested = loop_dir.join("request_abort").exists();
+    let stop_requested = loop_dir.join("request_stop").exists();
+    let abort_requested = loop_dir.join("request_abort").exists();
 
     let lock_dir = loop_dir.join("active.lock");
     let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
@@ -355,18 +390,9 @@ pub(crate) fn collect_controller_loop_status_inner(
         loop_dir,
         &process_tree_codex,
     ));
-    if let Some((state, now_secs)) = live_state {
-        enrich_controller_loop_wrappers_with_mcp_state(&mut active_wrappers, state, now_secs);
-        enrich_controller_loop_codex_with_mcp_state(&mut active_codex, state, now_secs);
-    }
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status_file = read_json_file(&loop_dir.join("latest.status.json"));
-    let latest_status = controller_loop_latest_status_with_codex(
-        latest_status_file,
-        &active_wrappers,
-        &active_codex,
-    );
     let latest_target_path = std::fs::read_link(loop_dir.join("latest")).ok().map(|p| {
         if p.is_absolute() {
             p
@@ -381,18 +407,6 @@ pub(crate) fn collect_controller_loop_status_inner(
     let latest_pid_alive = latest_pid
         .map(crate::platform::process_alive)
         .unwrap_or(false);
-    let stale_intervention_cleared = (stop_requested || abort_requested)
-        && controller_loop_intervention_markers_are_stale(
-            lock_owner_alive,
-            latest_pid_alive,
-            &active_wrappers,
-            &active_codex,
-        );
-    if stale_intervention_cleared {
-        clear_loop_intervention_markers(loop_dir).ok();
-        stop_requested = false;
-        abort_requested = false;
-    }
     let intervention_order = latest_target_path
         .as_ref()
         .map(|p| intervention_order_report(p))
@@ -402,6 +416,78 @@ pub(crate) fn collect_controller_loop_status_inner(
                 "order_ok": true,
             })
         });
+
+    ControllerLoopRawStatus {
+        loop_dir: loop_dir.to_path_buf(),
+        halt,
+        halt_after_cycle,
+        stop_requested,
+        abort_requested,
+        lock_present: lock_dir.exists(),
+        lock_owner_pid,
+        lock_owner_alive,
+        active_wrappers,
+        active_codex,
+        latest_run_id,
+        latest_status_file,
+        latest_target,
+        latest_pid,
+        latest_pid_alive,
+        intervention_order,
+    }
+}
+
+/// The state-dependent tail of a controller-loop status collection: enrich
+/// the discovered wrappers/codex processes with live MCP session state, fold
+/// them into the latest-run status, clear stale intervention markers, and
+/// assemble the public JSON document. Cheap (in-memory except for the rare
+/// stale-marker unlink), so consumers of a cached [`ControllerLoopRawStatus`]
+/// re-run it against current state on every read.
+pub(crate) fn finish_controller_loop_status(
+    raw: ControllerLoopRawStatus,
+    live_state: Option<(&McpAppState, u64)>,
+) -> serde_json::Value {
+    let ControllerLoopRawStatus {
+        loop_dir,
+        halt,
+        halt_after_cycle,
+        mut stop_requested,
+        mut abort_requested,
+        lock_present,
+        lock_owner_pid,
+        lock_owner_alive,
+        mut active_wrappers,
+        mut active_codex,
+        latest_run_id,
+        latest_status_file,
+        latest_target,
+        latest_pid,
+        latest_pid_alive,
+        intervention_order,
+    } = raw;
+
+    if let Some((state, now_secs)) = live_state {
+        enrich_controller_loop_wrappers_with_mcp_state(&mut active_wrappers, state, now_secs);
+        enrich_controller_loop_codex_with_mcp_state(&mut active_codex, state, now_secs);
+    }
+
+    let latest_status = controller_loop_latest_status_with_codex(
+        latest_status_file,
+        &active_wrappers,
+        &active_codex,
+    );
+    let stale_intervention_cleared = (stop_requested || abort_requested)
+        && controller_loop_intervention_markers_are_stale(
+            lock_owner_alive,
+            latest_pid_alive,
+            &active_wrappers,
+            &active_codex,
+        );
+    if stale_intervention_cleared {
+        clear_loop_intervention_markers(&loop_dir).ok();
+        stop_requested = false;
+        abort_requested = false;
+    }
 
     serde_json::json!({
         "loop_dir": loop_dir.to_string_lossy(),
@@ -413,7 +499,7 @@ pub(crate) fn collect_controller_loop_status_inner(
             "stale_intervention_cleared": stale_intervention_cleared,
         },
         "lock": {
-            "present": lock_dir.exists(),
+            "present": lock_present,
             "owner_pid": lock_owner_pid,
             "owner_alive": lock_owner_alive,
         },
@@ -432,6 +518,30 @@ pub(crate) fn collect_controller_loop_status_inner(
             "codex": active_codex,
         }
     })
+}
+
+/// Fresh collection with live-state enrichment. Callers on marker-mutating
+/// paths rely on this never serving a cached sample; it re-seeds the
+/// per-state raw cache instead, so pollers observe the post-mutation loop
+/// state immediately.
+pub(crate) fn collect_controller_loop_status_for_mcp_state(
+    loop_dir: &std::path::Path,
+    state: &McpAppState,
+) -> serde_json::Value {
+    let raw = collect_controller_loop_raw_status(loop_dir);
+    if state.controller_loop_status_override.is_none()
+        && mcp_state_controller_loop_dir(state) == loop_dir
+    {
+        state.store_controller_loop_raw_status(raw.clone());
+    }
+    finish_controller_loop_status(raw, Some((state, current_unix_timestamp_secs())))
+}
+
+pub(crate) fn collect_controller_loop_status_inner(
+    loop_dir: &std::path::Path,
+    live_state: Option<(&McpAppState, u64)>,
+) -> serde_json::Value {
+    finish_controller_loop_status(collect_controller_loop_raw_status(loop_dir), live_state)
 }
 
 pub(crate) fn controller_loop_dir_has_observable_state(loop_dir: &std::path::Path) -> bool {
@@ -498,7 +608,20 @@ pub(crate) fn mcp_state_controller_loop_status(s: &McpAppState) -> serde_json::V
         .clone()
         .unwrap_or_else(|| {
             let loop_dir = mcp_state_controller_loop_dir(s);
-            collect_controller_loop_status_for_mcp_state(&loop_dir, s)
+            // Serve the raw filesystem/process sample from the short-TTL
+            // cache when fresh — `get_status` consults this collection two
+            // to three times per call (promote + active/stale checks), and
+            // supervised gates poll it continuously. Enrichment always runs
+            // against the live state, so folded session phases are never
+            // stale even on a cache hit.
+            let raw = s
+                .cached_controller_loop_raw_status(&loop_dir)
+                .unwrap_or_else(|| {
+                    let raw = collect_controller_loop_raw_status(&loop_dir);
+                    s.store_controller_loop_raw_status(raw.clone());
+                    raw
+                });
+            finish_controller_loop_status(raw, Some((s, current_unix_timestamp_secs())))
         })
 }
 
@@ -1506,8 +1629,15 @@ pub(crate) fn controller_loop_state_is_idle(status: &str) -> bool {
 }
 
 pub(crate) fn codex_app_server_process_tree_active(pid: u32) -> bool {
-    codex_app_server_process_tree_active_with_root(
-        pid,
+    // The root-alive probe is a cheap syscall, while the descendants
+    // snapshot spawns `ps` and parses the whole system process table —
+    // and `_with_root` never reads the descendants when the root is
+    // alive (the common case on this per-wrapper status hot path). Only
+    // pay for the snapshot once the root is known dead.
+    if crate::platform::process_alive(pid) {
+        return true;
+    }
+    codex_app_server_process_tree_active_from_descendants(
         crate::platform::process_descendants(pid),
         crate::platform::process_alive,
         crate::platform::process_cmdline,
