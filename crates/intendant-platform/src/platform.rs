@@ -90,7 +90,19 @@ pub fn process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Return the main display's pixel dimensions on macOS.
+/// Return the main display's dimensions on macOS, in **points** (the
+/// logical/global display coordinate space), not backing pixels.
+///
+/// The name follows the CoreGraphics functions it wraps —
+/// `CGDisplayPixelsWide/High` — whose pre-Retina names lie on scaled
+/// displays: they track the current display *mode's* point size.
+/// Empirically pinned 2026-07-15 on a 2x display: these returned 1024x640
+/// while `CGDisplayModeGetPixelWidth/Height` reported a 2048x1280 backing
+/// store (see `main_display_size_is_points_not_backing_pixels`, the
+/// `#[ignore]` probe test below, to re-adjudicate on new hardware/OS).
+/// Every caller relies on the points contract: CU treats this as the
+/// input-injection coordinate space, the Retina downscale target, and the
+/// `screencapture -R` rect space.
 ///
 /// Other platforms return `None`; callers should use their normal fallback.
 #[cfg(target_os = "macos")]
@@ -1558,6 +1570,55 @@ pub fn kill_process_group(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Adjudication probe for the [`main_display_pixel_size`] unit contract
+    /// (points, not backing pixels): run manually on new hardware/macOS
+    /// versions with `cargo test -p intendant-platform -- --ignored
+    /// main_display_size`. `#[ignore]` because it queries the live display —
+    /// machine state — which the hermetic suite must not touch. Empirical
+    /// baseline 2026-07-15, 2x display: points 1024x640, backing 2048x1280.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn main_display_size_is_points_not_backing_pixels() {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayCopyDisplayMode(d: u32) -> *mut core::ffi::c_void;
+            fn CGDisplayModeGetWidth(mode: *mut core::ffi::c_void) -> usize;
+            fn CGDisplayModeGetHeight(mode: *mut core::ffi::c_void) -> usize;
+            fn CGDisplayModeGetPixelWidth(mode: *mut core::ffi::c_void) -> usize;
+            fn CGDisplayModeGetPixelHeight(mode: *mut core::ffi::c_void) -> usize;
+            fn CGDisplayModeRelease(mode: *mut core::ffi::c_void);
+        }
+
+        let reported = main_display_pixel_size().expect("a display is attached");
+        // SAFETY: CGMainDisplayID takes no arguments; CGDisplayCopyDisplayMode
+        // returns an owned mode reference (or null) for that display id, whose
+        // scalar getters take the mode pointer unchanged, and which is
+        // released exactly once below.
+        let (points, backing) = unsafe {
+            let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+            assert!(!mode.is_null(), "main display has a mode");
+            let points = (
+                CGDisplayModeGetWidth(mode) as u32,
+                CGDisplayModeGetHeight(mode) as u32,
+            );
+            let backing = (
+                CGDisplayModeGetPixelWidth(mode) as u32,
+                CGDisplayModeGetPixelHeight(mode) as u32,
+            );
+            CGDisplayModeRelease(mode);
+            (points, backing)
+        };
+        println!("main_display_pixel_size = {reported:?}, mode points = {points:?}, mode backing pixels = {backing:?}");
+        assert_eq!(
+            reported, points,
+            "CGDisplayPixelsWide/High must track the mode's POINT size; if this \
+             ever reports backing pixels, the CU logical coordinate space and \
+             the screencapture -R clamp are both wrong — re-adjudicate"
+        );
+    }
 
     /// Drop an executable named `name` (plus the `.exe` suffix Windows
     /// resolution probes for) into `dir` and return its path.

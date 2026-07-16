@@ -557,25 +557,44 @@ impl Conversation {
         }
     }
 
-    /// Auto-compact the conversation when usage exceeds 90% of the context window.
+    /// Auto-compact with a configurable threshold, head pin, and tail size,
+    /// for proactive compaction (e.g. threshold 0.10 for the presence
+    /// narrator, which re-sends its whole transcript on every narration).
     ///
-    /// Keeps the system message, first 2 context messages (working directory + ack),
-    /// and last 4 messages. Summarizes everything in between.
-    /// Returns `true` if compaction occurred.
-    /// Auto-compact with a configurable threshold (e.g. 0.60 for proactive compaction).
-    #[allow(dead_code)]
-    pub fn auto_compact_at(&mut self, threshold: f64) -> bool {
+    /// Keeps the first `keep_prefix` messages and the last `keep_suffix`
+    /// messages verbatim; everything in between is replaced with a summary
+    /// marker. `keep_prefix` counts from index 0 *including* the system
+    /// message, and is a positional pin, not layer-aware — pick it for the
+    /// conversation's actual shape: the worker uses 3 (system + its
+    /// working-directory/ack context pair), a system-only conversation like
+    /// presence uses 1, otherwise its first ordinary exchange would be
+    /// pinned forever as if it were context. (Index 0 survives regardless —
+    /// `summarize_turns` never removes the system message.) The suffix is
+    /// what survives a compaction unchanged — callers whose transcript
+    /// interleaves user chat pick a larger tail than the worker default (4)
+    /// so the user's recent exchange isn't swallowed by the summary.
+    ///
+    /// Deliberate design limit: the "summary" is a static marker, not an
+    /// LLM summary — `Conversation` is a data type and must not call a
+    /// model. Compacted content is therefore dropped, not condensed;
+    /// callers for whom the transcript is memory (rather than narration
+    /// context) must summarize *before* compacting or pick thresholds
+    /// accordingly. Returns `true` if compaction occurred.
+    pub fn auto_compact_at(
+        &mut self,
+        threshold: f64,
+        keep_prefix: usize,
+        keep_suffix: usize,
+    ) -> bool {
         if self.usage_fraction() < threshold {
             return false;
         }
 
         let len = self.messages.len();
-        if len < 8 {
+        if len < keep_prefix + keep_suffix + 1 {
             return false;
         }
 
-        let keep_prefix = 3;
-        let keep_suffix = 4;
         let tail_start = len - keep_suffix;
 
         if keep_prefix >= tail_start {
@@ -600,6 +619,11 @@ impl Conversation {
         true
     }
 
+    /// Auto-compact the conversation when usage exceeds 90% of the context window.
+    ///
+    /// Keeps the system message, first 2 context messages (working directory + ack),
+    /// and last 4 messages. Summarizes everything in between.
+    /// Returns `true` if compaction occurred.
     pub fn auto_compact(&mut self) -> bool {
         const COMPACTION_THRESHOLD: f64 = 0.90;
 
@@ -1647,8 +1671,82 @@ mod tests {
         assert!(!conv.auto_compact());
         let before = conv.len();
         // Custom 0.60 threshold SHOULD trigger
-        assert!(conv.auto_compact_at(0.60));
+        assert!(conv.auto_compact_at(0.60, 3, 4));
         assert!(conv.len() < before);
+    }
+
+    #[test]
+    fn auto_compact_at_custom_keep_suffix_preserves_longer_tail() {
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "ctx1".to_string());
+        conv.add_assistant("ctx1-reply".to_string());
+        for i in 0..10 {
+            conv.add_user(MessageProvenance::FollowUp, format!("middle-{}", i));
+            conv.add_assistant(format!("reply-{}", i));
+        }
+        conv.set_usage(crate::usage::TokenUsage {
+            prompt_tokens: 65_000,
+            completion_tokens: 0,
+            total_tokens: 65_000,
+            ..Default::default()
+        });
+        // 23 messages: 3 prefix + summary + last 8 = 12 expected after.
+        assert!(conv.auto_compact_at(0.60, 3, 8));
+        let msgs = conv.messages();
+        assert_eq!(msgs.len(), 12);
+        assert!(msgs[3].content.contains("[Context Summary]"));
+        // The 8-message tail survives verbatim.
+        assert_eq!(msgs[msgs.len() - 8].content, "middle-6");
+        assert_eq!(msgs[msgs.len() - 1].content, "reply-9");
+    }
+
+    /// Presence-shaped conversations start with only a system message —
+    /// `keep_prefix = 1` must pin just that, and the first ordinary
+    /// exchange (which the worker's prefix of 3 would freeze forever as if
+    /// it were context) must be summarized away like any other old content.
+    #[test]
+    fn auto_compact_at_prefix_one_pins_only_the_system_message() {
+        let mut conv = Conversation::new("presence-sys".to_string(), 100_000);
+        for i in 0..10 {
+            conv.add_user(
+                MessageProvenance::SystemInjection,
+                format!("[Event] e{}", i),
+            );
+            conv.add_assistant(format!("narration-{}", i));
+        }
+        conv.set_usage(crate::usage::TokenUsage {
+            prompt_tokens: 65_000,
+            completion_tokens: 0,
+            total_tokens: 65_000,
+            ..Default::default()
+        });
+        // 21 messages: 1 prefix (system) + summary + last 4 = 6 after.
+        assert!(conv.auto_compact_at(0.60, 1, 4));
+        let msgs = conv.messages();
+        assert_eq!(msgs.len(), 6);
+        assert_eq!(msgs[0].content, "presence-sys");
+        // The first exchange was NOT pinned — the summary sits at index 1.
+        assert!(msgs[1].content.contains("[Context Summary]"));
+        assert_eq!(msgs[2].content, "[Event] e8");
+        assert_eq!(msgs[msgs.len() - 1].content, "narration-9");
+    }
+
+    #[test]
+    fn auto_compact_at_keep_suffix_larger_than_history_noop() {
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        for i in 0..3 {
+            conv.add_user(MessageProvenance::FollowUp, format!("u{}", i));
+            conv.add_assistant(format!("a{}", i));
+        }
+        conv.set_usage(crate::usage::TokenUsage {
+            prompt_tokens: 95_000,
+            completion_tokens: 0,
+            total_tokens: 95_000,
+            ..Default::default()
+        });
+        // 7 messages, tail of 32 requested — nothing to compact.
+        assert!(!conv.auto_compact_at(0.60, 3, 32));
+        assert_eq!(conv.len(), 7);
     }
 
     #[test]
@@ -1665,7 +1763,7 @@ mod tests {
             ..Default::default()
         });
         // 50% is below 0.60 threshold
-        assert!(!conv.auto_compact_at(0.60));
+        assert!(!conv.auto_compact_at(0.60, 3, 4));
     }
 
     fn tool_call_ref(call_id: &str, name: &str) -> ToolCallRef {

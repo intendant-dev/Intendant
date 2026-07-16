@@ -101,6 +101,42 @@ pub fn presence_tools() -> Vec<crate::tools::ToolDefinition> {
 const NARRATION_DEBOUNCE: std::time::Duration =
     std::time::Duration::from_millis(NARRATION_DEBOUNCE_MS);
 
+/// Proactive compaction threshold for the presence conversation, as a
+/// fraction of the context window. Presence re-sends its entire transcript
+/// on every narration (≥1 model call per pushed event, forever, in a
+/// long-lived daemon), so the shared 90% default — ~944k tokens on the
+/// default 1M-token window — would let every narration carry a nearly full
+/// window before anything was trimmed. 10% caps the steady-state narration
+/// prompt at ~105k tokens on the default window and scales down with
+/// smaller configured windows.
+///
+/// Deliberate design limit (decided, not an oversight): compaction replaces
+/// the middle of the transcript with a static marker — no LLM summarization
+/// happens (`Conversation` is a data type and must not call a model), so
+/// presence context older than the kept tail is dropped un-summarized.
+/// That is acceptable here because presence is *narration, not memory*:
+/// the worker session's own context remains authoritative, and presence
+/// tools re-query live state. If standing user instructions to presence
+/// need to survive indefinitely, a real summarization pass before
+/// compaction is the follow-up, not a bigger window.
+const PRESENCE_COMPACT_THRESHOLD: f64 = 0.10;
+
+/// How many leading messages a presence compaction pins verbatim. The
+/// presence conversation starts with only its system message — unlike the
+/// worker (which pins 3: system + its working-directory/ack context pair),
+/// pinning more here would freeze the first user/assistant exchange
+/// forever as if it were context.
+const PRESENCE_COMPACT_KEEP_PREFIX: usize = 1;
+
+/// How many trailing messages survive a presence compaction verbatim.
+/// The worker default (4) is tuned for tool-loop transcripts whose state is
+/// re-derivable; presence interleaves *user chat* with event narrations,
+/// and the compaction summary is a generic marker, not a real summary — a
+/// 4-message tail would routinely swallow the user's last exchange
+/// mid-conversation. 32 keeps the last few minutes of narration plus any
+/// recent chat intact.
+const PRESENCE_COMPACT_KEEP_SUFFIX: usize = 32;
+
 /// The running presence layer instance (platform-specific, uses tokio + ChatProvider).
 pub struct PresenceLayer {
     provider: Box<dyn ChatProvider>,
@@ -287,8 +323,10 @@ impl PresenceLayer {
                 Some(crate::types::LogLevel::Detail),
             );
 
-            let messages = self.conversation.messages().to_vec();
-            let response = self.provider.chat(&messages).await?;
+            // Borrow the transcript directly — `chat` takes `&[Message]`,
+            // and a `to_vec()` here deep-cloned every message string per
+            // model round.
+            let response = self.provider.chat(self.conversation.messages()).await?;
 
             self.plog(
                 format!(
@@ -305,7 +343,11 @@ impl PresenceLayer {
             self.cumulative_cached += response.usage.cached_tokens;
             self.cumulative_cache_creation += response.usage.cache_creation_tokens;
             self.conversation.set_usage(response.usage.clone());
-            self.conversation.auto_compact();
+            self.conversation.auto_compact_at(
+                PRESENCE_COMPACT_THRESHOLD,
+                PRESENCE_COMPACT_KEEP_PREFIX,
+                PRESENCE_COMPACT_KEEP_SUFFIX,
+            );
 
             if response.tool_calls.is_empty() {
                 if !response.content.is_empty() {
@@ -1226,6 +1268,16 @@ pub fn is_agent_idle(phase: &str) -> bool {
     ) || phase.starts_with("done")
 }
 
+/// First `max_chars` characters of `s` as a borrowed slice (char-boundary
+/// safe). Unlike [`truncate`] this allocates nothing and never appends an
+/// ellipsis — callers pass the result through `truncate` for that.
+fn clip_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot>>) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     match event {
@@ -1248,11 +1300,16 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.pending_question = None;
         }
         AppEvent::AgentOutput { stdout, stderr, .. } => {
-            // Keep a truncated summary
+            // Keep a truncated summary. Clip each stream to the summary
+            // window before combining — command output can run to hundreds
+            // of KB per event and only the first 500 chars ever survive, so
+            // cloning the full payload was pure waste. Clipping at max+1
+            // chars preserves `truncate`'s exact output, including the
+            // ellipsis decision.
             let combined = if stderr.is_empty() {
-                stdout.clone()
+                clip_chars(stdout, 501).to_string()
             } else {
-                format!("{}\n{}", stdout, stderr)
+                format!("{}\n{}", clip_chars(stdout, 501), clip_chars(stderr, 501))
             };
             s.last_output_summary = truncate(&combined, 500);
         }
@@ -1736,6 +1793,33 @@ mod tests {
     #[test]
     fn truncate_long_string() {
         assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    /// The clip-before-combine fast path in `update_agent_state` must
+    /// produce byte-identical summaries to truncating the full combined
+    /// output, including the ellipsis decision at every boundary.
+    #[test]
+    fn clip_chars_combine_matches_full_truncate() {
+        let cases = [0usize, 1, 498, 499, 500, 501, 502, 2000];
+        for &a_len in &cases {
+            for &b_len in &cases {
+                let stdout = "a".repeat(a_len);
+                let stderr = "é".repeat(b_len); // multi-byte chars
+                let full = format!("{}\n{}", stdout, stderr);
+                let clipped = format!("{}\n{}", clip_chars(&stdout, 501), clip_chars(&stderr, 501));
+                assert_eq!(
+                    truncate(&clipped, 500),
+                    truncate(&full, 500),
+                    "a_len={a_len} b_len={b_len}"
+                );
+                // stderr-empty arm: clip alone must match too.
+                assert_eq!(
+                    truncate(clip_chars(&stdout, 501), 500),
+                    truncate(&stdout, 500),
+                    "a_len={a_len}"
+                );
+            }
+        }
     }
 
     // ── PresenceSession tests ──

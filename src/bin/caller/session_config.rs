@@ -980,11 +980,31 @@ fn find_wrapper_config_for_external_session(
     }
 
     let entries = std::fs::read_dir(logs_dir).ok()?;
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
+    // Newest first: a resumed session is almost always among the most recent
+    // stores, and the per-directory identity check below can end up reading
+    // session logs — in readdir order a hit near the end pays that cost
+    // across the whole store. The sort key is the wrapper CONFIG file's
+    // mtime, not the directory's: unrelated bookkeeping rewrites bump a
+    // store dir's mtime, while the config file only changes when the launch
+    // config itself is (re)written. Directories without a config carry
+    // `None` and sort after every configured store — even one restored with
+    // a pre-epoch mtime — but stay in the scan: the loop below skips them
+    // exactly as before, preserving exhaustive-until-exact-match semantics.
+    let mut dirs: Vec<(Option<std::time::SystemTime>, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                return None;
+            }
+            let modified = std::fs::metadata(dir.join(SESSION_AGENT_CONFIG_FILE))
+                .and_then(|meta| meta.modified())
+                .ok();
+            Some((modified, dir))
+        })
+        .collect();
+    resume_scan_order(&mut dirs);
+    for (_, dir) in dirs {
         let Some(mut config) = read_log_dir_config(&dir) else {
             continue;
         };
@@ -1004,6 +1024,16 @@ fn find_wrapper_config_for_external_session(
         }
     }
     None
+}
+
+/// Ordering for the resume scan's candidate stores: configured stores
+/// newest-first by their config file's mtime; configless stores (`None`)
+/// after every configured one — `None` orders below `Some(_)`, so under the
+/// descending `Reverse` sort it lands last even against a config restored
+/// with a pre-epoch mtime. The sort is stable, so equal keys keep readdir
+/// order.
+fn resume_scan_order(dirs: &mut [(Option<std::time::SystemTime>, PathBuf)]) {
+    dirs.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 }
 
 /// A wrapper config belongs to an external thread only when persisted
@@ -1045,6 +1075,30 @@ fn wrapper_config_matches_external_session(dir: &Path, source: &str, ids: &[Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins the resume-scan ordering invariant exactly: configured stores
+    /// newest-first, and a configless store sorts after EVERY configured
+    /// one — including a config restored with a pre-epoch mtime, which the
+    /// old epoch-sentinel key would have (wrongly) ordered behind it.
+    #[test]
+    fn resume_scan_orders_configured_newest_first_then_configless() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let recent = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let older = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(86_400);
+        let mut dirs = vec![
+            (None, PathBuf::from("configless")),
+            (Some(pre_epoch), PathBuf::from("restored-pre-epoch")),
+            (Some(recent), PathBuf::from("recent")),
+            (Some(older), PathBuf::from("older")),
+        ];
+        resume_scan_order(&mut dirs);
+        let order: Vec<&str> = dirs.iter().map(|(_, dir)| dir.to_str().unwrap()).collect();
+        assert_eq!(
+            order,
+            ["recent", "older", "restored-pre-epoch", "configless"]
+        );
+    }
 
     #[test]
     fn normalizes_codex_wire_config() {

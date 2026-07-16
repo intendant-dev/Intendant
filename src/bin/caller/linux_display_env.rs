@@ -29,12 +29,75 @@ pub struct GuiEnvAdoption {
     pub source: Option<String>,
 }
 
+/// How often the probe may re-fork `systemctl --user show-environment`
+/// while the env is not settled — i.e. until a successful probe has seen
+/// the complete managed set. This cadence-gates EVERY unsettled call: a
+/// daemon started before graphical login upgrades within one interval of
+/// the user logging in, and a host whose env can never complete (a pure
+/// X11 desktop has no `WAYLAND_DISPLAY` to adopt, however healthy its
+/// display) keeps probing at this rate forever — one fork per interval is
+/// the accepted cost of staying able to adopt late-appearing session vars.
+#[cfg(target_os = "linux")]
+const PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(target_os = "linux")]
+mod probe_gate {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// Set once a probe has run **successfully** while the post-adoption
+    /// env was complete (every managed key present). Only then is there
+    /// provably nothing left for a future probe to do. A partial env —
+    /// e.g. a daemon that inherited `DISPLAY=:0` before the user bus was
+    /// ready — must NOT settle: later probes can still adopt XAUTHORITY /
+    /// WAYLAND_DISPLAY / DBUS vars, so it stays on the retry cadence.
+    pub(super) static SETTLED: AtomicBool = AtomicBool::new(false);
+    /// When the probe last forked, for rate-limiting unsettled retries.
+    pub(super) static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
+}
+
 #[cfg(target_os = "linux")]
 pub fn ensure_gui_session_env(context: &str) -> GuiEnvAdoption {
-    let Some(systemd_env) = read_systemd_user_environment() else {
+    use std::sync::atomic::Ordering;
+
+    // `adopt_from_map` never overwrites a variable that is already set, so
+    // re-running the probe helps only while adoptable keys are missing AND
+    // the systemd user environment could still gain them. This used to fork
+    // `systemctl --user show-environment` unconditionally — on every runtime
+    // spawn, CU action batch, and screenshot. Three tiers keep the fork off
+    // the steady-state path:
+    //
+    // 1. Complete env: every managed key is set — nothing to adopt, free.
+    // 2. Settled: a successful probe already saw the complete env — never
+    //    fork again (see `probe_gate::SETTLED`).
+    // 3. Otherwise: probe at most once per `PROBE_RETRY_INTERVAL` instead
+    //    of per call. Environments that can never complete (a pure-X11
+    //    desktop has no WAYLAND_DISPLAY to adopt) keep this cadence
+    //    forever — one fork per interval is the accepted cost of staying
+    //    able to adopt late-appearing session vars.
+    if probe_gate::SETTLED.load(Ordering::Relaxed) || gui_env_complete() {
         return GuiEnvAdoption::default();
+    }
+    {
+        let mut last = probe_gate::LAST_ATTEMPT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < PROBE_RETRY_INTERVAL {
+                return GuiEnvAdoption::default();
+            }
+        }
+        *last = Some(now);
+    }
+
+    let systemd_env = read_systemd_user_environment();
+    let probe_succeeded = systemd_env.is_some();
+    let report = match systemd_env {
+        Some(env) => adopt_from_map(&env),
+        None => GuiEnvAdoption::default(),
     };
-    let report = adopt_from_map(&systemd_env);
     if !report.adopted.is_empty() {
         eprintln!(
             "[linux_display_env] {context}: adopted GUI env from {}: {}",
@@ -49,7 +112,27 @@ pub fn ensure_gui_session_env(context: &str) -> GuiEnvAdoption {
             report.skipped.join(", ")
         );
     }
+    if probe_succeeded && gui_env_complete() {
+        probe_gate::SETTLED.store(true, Ordering::Relaxed);
+    }
     report
+}
+
+/// Whether every variable the probe manages is already set — including
+/// `INTENDANT_USER_DISPLAY`, which `adopt_from_map` derives from the
+/// systemd `DISPLAY`. When true the probe cannot adopt anything, by
+/// construction (`adopt_from_map` skips keys that are set).
+#[cfg(target_os = "linux")]
+fn gui_env_complete() -> bool {
+    gui_env_complete_with(|key| std::env::var_os(key).is_some())
+}
+
+/// Pure core of [`gui_env_complete`]: `is_set` reports whether an env key
+/// is present. Split out so the completeness predicate is testable without
+/// touching the real process environment.
+#[cfg(target_os = "linux")]
+fn gui_env_complete_with(is_set: impl Fn(&str) -> bool) -> bool {
+    GUI_ENV_KEYS.iter().all(|key| is_set(key)) && is_set("INTENDANT_USER_DISPLAY")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -250,6 +333,21 @@ fn parse_local_display_number(display: &str) -> Option<u32> {
 #[cfg(target_os = "linux")]
 mod tests {
     use super::*;
+
+    /// A partial env (e.g. DISPLAY inherited before the user bus is ready)
+    /// must not read as complete — settling on it would permanently stop
+    /// the probe from adopting the still-missing session vars.
+    #[test]
+    fn gui_env_completeness_requires_every_managed_key() {
+        // Display var alone: incomplete.
+        assert!(!gui_env_complete_with(|key| key == "DISPLAY"));
+        // Everything except one managed key: still incomplete.
+        assert!(!gui_env_complete_with(|key| key != "XAUTHORITY"));
+        // The derived key counts too.
+        assert!(!gui_env_complete_with(|key| key != "INTENDANT_USER_DISPLAY"));
+        // Full set: complete.
+        assert!(gui_env_complete_with(|_| true));
+    }
 
     #[test]
     fn parses_systemd_show_environment() {

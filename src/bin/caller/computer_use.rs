@@ -1147,10 +1147,16 @@ pub async fn execute_actions(
     .await;
 
     // Attach the final screenshot to the first result if it doesn't have one
-    // (convenience for callers that just want the latest screenshot from the batch).
-    let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.clone());
-    if let (Some(screenshot), Some(first)) = (last_screenshot, results.first_mut()) {
-        if first.screenshot.is_none() {
+    // (convenience for callers that just want the latest screenshot from the
+    // batch). Check need before cloning: the clone carries a multi-MB base64
+    // payload, so a batch whose first result already captured (or a batch
+    // with no screenshot at all) must not pay for a clone it drops.
+    if results
+        .first()
+        .is_some_and(|first| first.screenshot.is_none())
+    {
+        let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.clone());
+        if let (Some(screenshot), Some(first)) = (last_screenshot, results.first_mut()) {
             first.screenshot = Some(screenshot);
         }
     }
@@ -1505,9 +1511,14 @@ async fn verify_macos_type_readback(text: &str, dispatched: CuActionResult) -> C
     }
 }
 
-/// Get the logical display size for the main display. Cached after first call.
+/// Get the logical display size for the main display.
 /// Used to map CU model coordinates (which are in a normalized 1024-wide space)
 /// to actual logical points for input injection.
+///
+/// Re-queried per call rather than cached: the CoreGraphics lookup is an
+/// in-process call measured in microseconds, and a forever-cached value goes
+/// stale on display reconfiguration (dock/undock, resolution change),
+/// desyncing model coordinates from injection space on the fallback paths.
 ///
 /// This is a platform-agnostic *fallback* used when no active capture session
 /// is available for the target display. Prefer [`target_pixel_size`] for any
@@ -1515,15 +1526,8 @@ async fn verify_macos_type_readback(text: &str, dispatched: CuActionResult) -> C
 /// true stream/display resolution from the live session registry, which on
 /// Wayland is the only way to get the portal-granted stream size.
 pub fn logical_display_size() -> (u32, u32) {
-    use std::sync::OnceLock;
-    static SIZE: OnceLock<(u32, u32)> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        if let Some(size) = crate::platform::main_display_pixel_size() {
-            return size;
-        }
-        // Fallback: assume 1:1 mapping
-        (1024, 768)
-    })
+    // Fallback when the platform query is unavailable: assume 1:1 mapping.
+    crate::platform::main_display_pixel_size().unwrap_or((1024, 768))
 }
 
 /// Resolve the reference pixel size for denormalizing 0-1000 model coordinates.
@@ -2704,35 +2708,39 @@ async fn take_screenshot(
         }
     };
 
-    let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
+    let marks = marks.to_vec();
+    offload_pixels(move || {
+        let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
 
-    // Transform only when needed — a Retina capture to downscale to logical
-    // coordinates (macOS-only; on X11 the capture resolution IS the
-    // input-injection space) or opt-in click markers. The transform decodes
-    // once and re-encodes once via `finalize_rgba_screenshot`, which also
-    // overwrites the disk artifact so disk == model payload; the common
-    // no-transform path serves the capture bytes untouched.
-    let needs_resize = cfg!(target_os = "macos") && {
-        let (logical_w, logical_h) = logical_display_size();
-        raw_w > logical_w && logical_w > 0 && logical_h > 0
-    };
-    if needs_resize || !marks.is_empty() {
-        // Best-effort: an undecodable capture is served raw rather than
-        // failing the action over a transform.
-        if let Ok(decoded) = image::load_from_memory(&raw_bytes) {
-            return finalize_rgba_screenshot(decoded.to_rgba8(), true, marks, path);
+        // Transform only when needed — a Retina capture to downscale to logical
+        // coordinates (macOS-only; on X11 the capture resolution IS the
+        // input-injection space) or opt-in click markers. The transform decodes
+        // once and re-encodes once via `finalize_rgba_screenshot`, which also
+        // overwrites the disk artifact so disk == model payload; the common
+        // no-transform path serves the capture bytes untouched.
+        let needs_resize = cfg!(target_os = "macos") && {
+            let (logical_w, logical_h) = logical_display_size();
+            raw_w > logical_w && logical_w > 0 && logical_h > 0
+        };
+        if needs_resize || !marks.is_empty() {
+            // Best-effort: an undecodable capture is served raw rather than
+            // failing the action over a transform.
+            if let Ok(decoded) = image::load_from_memory(&raw_bytes) {
+                return finalize_rgba_screenshot(decoded.to_rgba8(), true, &marks, path);
+            }
         }
-    }
 
-    use base64::Engine;
-    let base64_png = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+        use base64::Engine;
+        let base64_png = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
 
-    Ok(ScreenshotData {
-        path,
-        base64_png,
-        width: raw_w,
-        height: raw_h,
+        Ok(ScreenshotData {
+            path,
+            base64_png,
+            width: raw_w,
+            height: raw_h,
+        })
     })
+    .await
 }
 
 /// Extract width and height from a PNG file header.
@@ -2963,37 +2971,36 @@ async fn execute_via_session(
                     Some(ts) => session.fresh_frame(ts, FRESH_FRAME_TIMEOUT).await,
                     None => session.current_frame().await,
                 };
-                let result = match capture
-                    .map_err(|e| format!("Screenshot failed: {e}"))
-                    .and_then(|frame| {
-                        crate::display::frame_to_rgba_image(&frame)
-                            .map_err(|e| format!("decode capture: {e}"))
-                    })
-                    .and_then(|img| crop_rgba_region(&img, (*x, *y, *zw, *zh), (width, height)))
-                    .and_then(|cropped| {
-                        let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
-                        Ok((cropped.width(), cropped.height(), bytes))
-                    }) {
-                    Ok((w, h, cropped)) => {
-                        *action_counter += 1;
-                        let path = screenshot_dir.join(format!("cu_zoom_{}.png", action_counter));
-                        match std::fs::write(&path, &cropped) {
-                            Ok(()) => {
-                                use base64::Engine;
-                                let base64_png =
-                                    base64::engine::general_purpose::STANDARD.encode(&cropped);
-                                CuActionResult::captured(ScreenshotData {
-                                    path,
-                                    base64_png,
-                                    width: w,
-                                    height: h,
-                                })
-                            }
-                            Err(e) => CuActionResult::failed(format!(
-                                "Failed to write zoom screenshot: {e}"
-                            )),
-                        }
+                *action_counter += 1;
+                let path = screenshot_dir.join(format!("cu_zoom_{}.png", action_counter));
+                let region = (*x, *y, *zw, *zh);
+                // Decode/crop/encode/write on the blocking pool — the frame
+                // is a full stream-resolution capture.
+                let transformed = match capture.map_err(|e| format!("Screenshot failed: {e}")) {
+                    Ok(frame) => {
+                        offload_pixels(move || {
+                            let img = crate::display::frame_to_rgba_image(&frame)
+                                .map_err(|e| format!("decode capture: {e}"))?;
+                            let cropped = crop_rgba_region(&img, region, (width, height))?;
+                            let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
+                            std::fs::write(&path, &bytes)
+                                .map_err(|e| format!("Failed to write zoom screenshot: {e}"))?;
+                            use base64::Engine;
+                            let base64_png =
+                                base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            Ok(ScreenshotData {
+                                path,
+                                base64_png,
+                                width: cropped.width(),
+                                height: cropped.height(),
+                            })
+                        })
+                        .await
                     }
+                    Err(e) => Err(e),
+                };
+                let result = match transformed {
+                    Ok(shot) => CuActionResult::captured(shot),
                     Err(e) => CuActionResult::failed(e),
                 };
                 results.push(result);
@@ -3347,10 +3354,63 @@ async fn execute_via_session(
 /// poll. Either way the frame served is at most this stale.
 const FRESH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// At most this many pixel jobs run concurrently on the blocking pool.
+/// A Retina-size decode/resize/encode holds a ~30-60MB working set; without
+/// a bound, concurrent CU sessions' captures multiply peak memory and can
+/// monopolize the shared blocking pool (which also serves AX walks, type
+/// delivery, and tokio::fs). Three permits keep two busy sessions plus one
+/// straggler flowing while capping transient pixel memory under ~200MB.
+const PIXEL_OFFLOAD_PERMITS: usize = 3;
+
+/// Run CPU/disk-heavy pixel work (PNG decode/encode, resize, annotate,
+/// artifact writes, base64) on the blocking pool instead of a tokio worker:
+/// a single Retina-size decode or encode costs 50-300ms, which would
+/// otherwise stall a runtime thread that also serves the gateway, WebRTC,
+/// and the event bus. The AX and input paths in this module already use
+/// `spawn_blocking`; this gives the pixel pipeline the same treatment.
+///
+/// Await-inline semantics: the caller waits for the result either way — the
+/// permit + blocking pool only bound *whose threads* do the work and how
+/// many pixel jobs run at once ([`PIXEL_OFFLOAD_PERMITS`]).
+async fn offload_pixels<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    static GATE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(PIXEL_OFFLOAD_PERMITS))
+        });
+    // The permit must ride INSIDE the blocking closure: spawn_blocking work
+    // cannot be aborted once started, so if the permit stayed with this
+    // future, a caller cancelled mid-job would release it while the
+    // detached job kept running — repeated cancelled CU/MCP requests could
+    // then stack unbounded pixel jobs and defeat the cap. Owned by the
+    // closure, the permit lives exactly as long as the work does. The
+    // acquire is non-recursive by construction: no pixel closure calls
+    // back into `offload_pixels`. acquire only errors if the semaphore is
+    // closed, which this static never is — degrade with an error rather
+    // than unwrap regardless.
+    let permit = GATE
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("pixel gate closed: {e}"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| format!("screenshot task failed: {e}"))?
+}
+
 /// Finalize a raw RGBA capture into a [`ScreenshotData`]: optional
 /// logical-space resize (macOS Retina), optional opt-in click markers, then
 /// exactly one PNG encode, one disk write, and one base64 encode. The disk
 /// artifact and the model payload are the same bytes by construction.
+///
+/// Pixel-heavy and synchronous by design — async callers run it (and any
+/// preceding decode) inside [`offload_pixels`].
 fn finalize_rgba_screenshot(
     mut img: image::RgbaImage,
     normalize_to_logical: bool,
@@ -3427,9 +3487,13 @@ async fn session_screenshot_data(
         None => session.current_frame().await,
     }
     .map_err(|e| format!("Screenshot failed: {}", e))?;
-    let img = crate::display::frame_to_rgba_image(&frame)
-        .map_err(|e| format!("Screenshot failed: {e}"))?;
-    finalize_rgba_screenshot(img, normalize_to_logical, marks, path)
+    let marks = marks.to_vec();
+    offload_pixels(move || {
+        let img = crate::display::frame_to_rgba_image(&frame)
+            .map_err(|e| format!("Screenshot failed: {e}"))?;
+        finalize_rgba_screenshot(img, normalize_to_logical, &marks, path)
+    })
+    .await
 }
 
 /// Capture a PNG screenshot from a `DisplaySession`.
@@ -3519,24 +3583,48 @@ async fn capture_zoom_screenshot(
                 None => session.current_frame().await,
             }
             .map_err(|e| format!("Screenshot failed: {e}"))?;
-            let img = crate::display::frame_to_rgba_image(&frame)
-                .map_err(|e| format!("Screenshot failed: {e}"))?;
-            let crop_ref = (img.width(), img.height());
-            let cropped = crop_rgba_region(&img, region, crop_ref)?;
-            let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
-            return write_zoom_screenshot(bytes, screenshot_dir, counter);
+            *counter += 1;
+            let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
+            return offload_pixels(move || {
+                let img = crate::display::frame_to_rgba_image(&frame)
+                    .map_err(|e| format!("Screenshot failed: {e}"))?;
+                let crop_ref = (img.width(), img.height());
+                let cropped = crop_rgba_region(&img, region, crop_ref)?;
+                let bytes = crate::cu_observation::encode_rgba_png(&cropped)?;
+                write_zoom_screenshot(bytes, path)
+            })
+            .await;
         }
     }
 
-    // Subprocess flavor: the source is PNG bytes (one decode, one encode).
-    let raw = match backend {
-        // Raw capture, deliberately without the logical-size downscale
-        // (zoom's whole point is native detail).
+    match backend {
+        // Region capture (`screencapture -R`), deliberately without the
+        // logical-size downscale (zoom's whole point is native detail). The
+        // rect is in logical points — the same space the model's region is
+        // in — and the capture lands at native backing resolution (2x on
+        // Retina), so the artifact matches what the old flow produced by
+        // capturing the whole display (8-20MB on Retina), writing it, reading
+        // it back, decoding, cropping, and re-encoding. The region is
+        // validated/clamped up front so offscreen requests keep the crop
+        // path's actionable error instead of depending on screencapture's
+        // out-of-bounds behavior.
+        //
+        // Unit contract (empirically pinned 2026-07-15 on a 2x display —
+        // see `main_display_pixel_size`'s docs and its `#[ignore]` probe
+        // test): `logical_display_size()` returns POINTS (1024x640 while
+        // the mode's backing store was 2048x1280), `-R` consumes POINTS,
+        // and `-R0,0,100,100` produced a 200x200px artifact — exactly what
+        // the old physical-capture + scale-2 crop produced for that region.
         DisplayBackend::MacOS => {
+            let (x, y, w, h) = clamp_zoom_region_to_display(region)?;
             *counter += 1;
-            let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
+            let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
             let output = Command::new("screencapture")
-                .args(["-x", &path.to_string_lossy()])
+                .args([
+                    "-x",
+                    &format!("-R{},{},{},{}", x, y, w, h),
+                    &path.to_string_lossy(),
+                ])
                 .output()
                 .await
                 .map_err(|e| format!("screencapture exec error: {e}"))?;
@@ -3547,38 +3635,82 @@ async fn capture_zoom_screenshot(
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|e| format!("read zoom capture: {e}"))?;
-            let _ = tokio::fs::remove_file(&path).await;
-            bytes
-        }
-        _ => x11_cu::screenshot_png(display)
+            // Read + base64 on the blocking pool like every other pixel
+            // site — a large-region native-res capture is still multi-MB.
+            offload_pixels(move || {
+                let bytes = std::fs::read(&path).map_err(|e| format!("read zoom capture: {e}"))?;
+                let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
+                use base64::Engine;
+                let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Ok(ScreenshotData {
+                    path,
+                    base64_png,
+                    width,
+                    height,
+                })
+            })
             .await
-            .map_err(|e| format!("zoom capture failed: {e}"))?,
-    };
-
-    // Crop reference: on macOS the model's region is in logical points while
-    // `raw` may be a physical-resolution capture (2x Retina), so the region
-    // must be scaled up. Everywhere else the model saw the capture at native
-    // size — the region already is in capture pixels (scale = 1).
-    let crop_ref = match backend {
-        DisplayBackend::MacOS => logical_display_size(),
-        _ => png_dimensions(&raw).unwrap_or_else(logical_display_size),
-    };
-    let cropped = crop_png_region(&raw, region, crop_ref)?;
-    write_zoom_screenshot(cropped, screenshot_dir, counter)
+        }
+        // Subprocess flavor: the source is PNG bytes (one decode, one
+        // encode). The model saw the capture at native size — the region
+        // already is in capture pixels (scale = 1).
+        _ => {
+            let raw = x11_cu::screenshot_png(display)
+                .await
+                .map_err(|e| format!("zoom capture failed: {e}"))?;
+            *counter += 1;
+            let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
+            offload_pixels(move || {
+                let crop_ref = png_dimensions(&raw).unwrap_or_else(logical_display_size);
+                let cropped = crop_png_region(&raw, region, crop_ref)?;
+                write_zoom_screenshot(cropped, path)
+            })
+            .await
+        }
+    }
 }
 
-/// Write encoded zoom PNG bytes to the next `cu_zoom_N.png` artifact and
-/// package the [`ScreenshotData`].
-fn write_zoom_screenshot(
-    cropped: Vec<u8>,
-    screenshot_dir: &Path,
-    counter: &mut u64,
-) -> Result<ScreenshotData, String> {
-    *counter += 1;
-    let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
+/// Validate and clamp a zoom region (logical points) against the logical
+/// display bounds, mirroring [`crop_rgba_region`]'s rules so the macOS `-R`
+/// region capture keeps the same actionable errors the crop path produced.
+fn clamp_zoom_region_to_display(
+    region: (i32, i32, u32, u32),
+) -> Result<(i32, i32, u32, u32), String> {
+    clamp_zoom_region(region, logical_display_size())
+}
+
+/// Pure core of [`clamp_zoom_region_to_display`]: `display` is the logical
+/// display size. When the display size is unknown (`0`, platform query
+/// failed) the region is passed through and `screencapture` performs its
+/// own intersection.
+fn clamp_zoom_region(
+    region: (i32, i32, u32, u32),
+    display: (u32, u32),
+) -> Result<(i32, i32, u32, u32), String> {
+    let (x, y, w, h) = region;
+    if w == 0 || h == 0 {
+        return Err("zoom region must have a non-zero width and height".to_string());
+    }
+    let (dw, dh) = display;
+    let cx = x.max(0);
+    let cy = y.max(0);
+    if dw == 0 || dh == 0 {
+        return Ok((cx, cy, w, h));
+    }
+    if cx >= dw as i32 || cy >= dh as i32 {
+        return Err(format!(
+            "zoom region ({x},{y} {w}x{h}) lies outside the {dw}x{dh} display"
+        ));
+    }
+    let cw = w.min(dw - cx as u32).max(1);
+    let ch = h.min(dh - cy as u32).max(1);
+    Ok((cx, cy, cw, ch))
+}
+
+/// Write encoded zoom PNG bytes to the `cu_zoom_N.png` artifact at `path`
+/// and package the [`ScreenshotData`]. Synchronous (disk write + base64) —
+/// async callers run it inside [`offload_pixels`].
+fn write_zoom_screenshot(cropped: Vec<u8>, path: PathBuf) -> Result<ScreenshotData, String> {
     std::fs::write(&path, &cropped).map_err(|e| format!("write zoom screenshot: {e}"))?;
     let (width, height) = png_dimensions(&cropped).unwrap_or((0, 0));
     use base64::Engine;
@@ -3890,6 +4022,41 @@ mod tests {
         assert_eq!(normalized_to_pixels(0, 0, 1440, 900), (0, 0));
         assert_eq!(normalized_to_pixels(999, 999, 1440, 900), (1440, 900));
         assert_eq!(normalized_to_pixels(500, 500, 1440, 900), (721, 450));
+    }
+
+    #[test]
+    fn clamp_zoom_region_rejects_empty_and_offscreen() {
+        assert!(clamp_zoom_region((10, 10, 0, 40), (1440, 900)).is_err());
+        assert!(clamp_zoom_region((10, 10, 40, 0), (1440, 900)).is_err());
+        // Fully offscreen: same actionable-error class the crop path had.
+        let err = clamp_zoom_region((2000, 10, 40, 40), (1440, 900)).unwrap_err();
+        assert!(err.contains("lies outside"), "{err}");
+        assert!(clamp_zoom_region((10, 900, 40, 40), (1440, 900)).is_err());
+    }
+
+    #[test]
+    fn clamp_zoom_region_clamps_to_bounds() {
+        // In-bounds region passes through untouched.
+        assert_eq!(
+            clamp_zoom_region((10, 20, 300, 200), (1440, 900)),
+            Ok((10, 20, 300, 200))
+        );
+        // Negative origin clamps to 0 (mirrors `crop_rgba_region`'s
+        // `x.max(0)`), size clamps to the remaining span.
+        assert_eq!(
+            clamp_zoom_region((-50, -5, 300, 200), (1440, 900)),
+            Ok((0, 0, 300, 200))
+        );
+        // Overhanging region shrinks to the display edge, min 1px.
+        assert_eq!(
+            clamp_zoom_region((1400, 880, 300, 200), (1440, 900)),
+            Ok((1400, 880, 40, 20))
+        );
+        // Unknown display size: passed through for screencapture to clip.
+        assert_eq!(
+            clamp_zoom_region((10, 20, 5000, 5000), (0, 0)),
+            Ok((10, 20, 5000, 5000))
+        );
     }
 
     fn leaf(role: &str, label: Option<&str>, frame: (i32, i32, u32, u32)) -> UiElement {
