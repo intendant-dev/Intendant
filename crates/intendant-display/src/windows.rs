@@ -1935,28 +1935,36 @@ fn run_gdi_capture(
     let mut frame_count: u64 = 0;
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 60;
-    // Re-resolve the capture rect every N frames (mirrors the X11
-    // backend's GEOMETRY_CHECK_INTERVAL): resolving display topology
-    // per iteration was a per-frame syscall spent re-learning a value
-    // that changes on the order of monitor re-arranges.
+    // Re-resolve the capture rect every N healthy iterations (mirrors
+    // the X11 backend's GEOMETRY_CHECK_INTERVAL): resolving display
+    // topology per iteration was a per-frame syscall spent re-learning
+    // a value that changes on the order of monitor re-arranges.
     const GEOMETRY_CHECK_INTERVAL: u64 = 60;
     // Error-path heartbeat cadence — matches the pool bridge's 1s
     // IDLE_HEARTBEAT (see run_dxgi_capture) so a transient error storm
     // re-emits the cached frame once a second, not per retry.
     const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     let mut last_emit_at = std::time::Instant::now();
+    let mut loop_iter: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         let start = std::time::Instant::now();
+        loop_iter = loop_iter.wrapping_add(1);
 
         // Detect a primary-resolution change and rebuild the cached resources.
         // For a targeted output we re-resolve its rect too, so a monitor
-        // re-arrange / mode switch is picked up. Checked on a frame
-        // cadence, not per iteration.
-        if frame_count > 0 && frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
+        // re-arrange / mode switch is picked up. Checked on an
+        // iteration cadence while healthy — but on EVERY iteration of
+        // an error streak: a display-mode switch is exactly what makes
+        // `capture.grab()`'s BitBlt fail persistently, and errors don't
+        // advance `frame_count`, so a frame-count gate would never
+        // re-resolve and the thread would ride the streak to the
+        // 60-error give-up. Error iterations sleep 100ms, so the
+        // re-resolve syscall is off the hot path there by construction.
+        if consecutive_errors > 0 || loop_iter.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
             if let Ok((nx, ny, nw, nh)) = resolve_capture_rect(target_output) {
                 if nw != capture.width || nh != capture.height || nx != rect_x || ny != rect_y {
                     match GdiCapture::new(nx, ny, nw, nh) {
