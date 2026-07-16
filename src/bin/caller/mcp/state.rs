@@ -77,27 +77,15 @@ pub struct McpAppState {
         std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>,
     /// Set while [`hydrate_requested_session_status_from_logs`] folds a log
     /// into this state, naming the replay kind. It gates two hazards: a
-    /// FULL replay must not overwrite a live-observed session status with
-    /// older log-derived state (see `session_status_live_marks`), and a
     /// replayed `session_ended` line must not re-run the over-cap prune
     /// (the rebuild the query is performing would erase itself and record
-    /// an EOF cursor against absent state).
+    /// an EOF cursor against absent state), and replayed lifecycle rows
+    /// must not invalidate the controller-loop raw cache (historic events
+    /// do not change process reality — see
+    /// [`McpAppState::note_live_session_lifecycle_change`]). The replay
+    /// itself applies rows UNGATED: the ordering contract lives at the
+    /// hydrate fold site in `events.rs`.
     pub(crate) hydration_replay: Option<HydrationReplayKind>,
-    /// Last phase written by a LIVE observation (event listener fold,
-    /// promote) per session id — the hydration freshness watermark. The two
-    /// lanes have different loss properties: the live lane is a lossy
-    /// broadcast (a lagged listener drops events) while the persisted log
-    /// is lossless, so neither lane strictly dominates. A FULL hydration
-    /// replay therefore applies against the phase lattice (see
-    /// [`McpAppState::note_session_phase`]): replayed TERMINAL facts always
-    /// apply (the lossless log proving a session ended outranks a stale
-    /// live mark from a dropped `SessionEnded`), replayed NON-terminal
-    /// phases never overwrite a live-marked session (replaying history must
-    /// not regress a completed or newer live phase; transient non-terminal
-    /// skew self-heals through the live lane or the next terminal fact).
-    /// Appended-tail replays bypass the lattice: those lines are new
-    /// information by construction.
-    pub(crate) session_status_live_phases: std::collections::HashMap<String, Phase>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -234,20 +222,11 @@ pub(crate) enum HydrationReplayKind {
     Tail,
 }
 
-/// Terminal phases in the session-status lattice: a session that reached
-/// one of these has ended. A replayed terminal fact comes from the lossless
-/// log lane and therefore outranks any live-observed mark (the live lane is
-/// a lossy broadcast); a replayed NON-terminal phase never overwrites a
-/// live-marked session.
-pub(crate) fn phase_is_session_terminal(phase: &Phase) -> bool {
-    matches!(phase, Phase::Done | Phase::Interrupted)
-}
-
 /// RAII scope for [`McpAppState::hydration_replay`]: constructed via
 /// [`McpAppState::begin_hydration_replay`], resets the flag on drop so a
 /// panic (or early return) inside a replay can never leave the state
 /// permanently in "hydrating" mode — which would suppress live lifecycle
-/// invalidations and misgate future status writes.
+/// invalidations and the over-cap prune indefinitely.
 pub(crate) struct HydrationReplayGuard<'a> {
     state: &'a mut McpAppState,
 }
@@ -321,7 +300,6 @@ impl McpAppState {
             ),
             session_log_hydration_cursors: std::collections::HashMap::new(),
             hydration_replay: None,
-            session_status_live_phases: std::collections::HashMap::new(),
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -745,7 +723,6 @@ impl McpAppState {
             self.session_sources.remove(id);
             self.session_codex_managed_context.remove(id);
             self.session_known_non_external.remove(id);
-            self.session_status_live_phases.remove(id);
             self.session_aliases.remove(id);
         }
         // Drop ONLY the ended component's hydration cursors (log-dir
@@ -835,32 +812,6 @@ impl McpAppState {
                 related
             }
         };
-        // Freshness watermark (see `session_status_live_phases`): a FULL
-        // log replay re-applies history against a live-marked session using
-        // the phase lattice — a replayed TERMINAL fact always applies (the
-        // lossless log outranks a lossy live mark whose `SessionEnded` may
-        // have been dropped), a replayed NON-terminal phase never overwrites
-        // a live mark (flush skew: the log's mid-history phases are older
-        // than the live observation; terminal→non-terminal regressions are
-        // the classic full-replay bug). Tail replays and live observations
-        // pass through; live observations record the watermark.
-        match self.hydration_replay {
-            Some(HydrationReplayKind::Full) => {
-                let live_marked = keys
-                    .iter()
-                    .any(|key| self.session_status_live_phases.contains_key(key));
-                if live_marked && !phase_is_session_terminal(&phase) {
-                    return;
-                }
-            }
-            Some(HydrationReplayKind::Tail) => {}
-            None => {
-                for key in &keys {
-                    self.session_status_live_phases
-                        .insert(key.clone(), phase.clone());
-                }
-            }
-        }
         let existing = keys
             .iter()
             .find_map(|key| self.session_status.get(key))
@@ -925,17 +876,6 @@ impl McpAppState {
                 related
             }
         };
-        // Same full-replay watermark as note_session_phase: rounds ride the
-        // status entry, so a full replay must not regress a live-marked one.
-        // (Rounds carry no terminal lattice of their own — the terminal
-        // facts that may advance over a mark arrive via note_session_phase.)
-        if self.hydration_replay == Some(HydrationReplayKind::Full)
-            && keys
-                .iter()
-                .any(|key| self.session_status_live_phases.contains_key(key))
-        {
-            return;
-        }
         for key in &keys {
             let entry =
                 self.session_status
@@ -1931,8 +1871,6 @@ mod tests {
         // every unrelated session end.
         assert!(!s.session_log_hydration_cursors.contains_key(&ended_path));
         assert!(s.session_log_hydration_cursors.contains_key(&live_path));
-        assert!(!s.session_status_live_phases.contains_key("sess-ended"));
-        assert!(!s.session_status_live_phases.contains_key("backend-ended"));
     }
 
     #[test]

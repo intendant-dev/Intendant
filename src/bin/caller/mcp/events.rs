@@ -1624,10 +1624,29 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         let Some((tail, base)) = read_session_jsonl_tail(&path, prior) else {
             continue;
         };
+        // Ordering contract (bounded skew, self-healing): the session log
+        // is a LOSSLESS, order-preserving serialization of the same event
+        // stream the live listener folds (EventBus::send feeds both lanes
+        // the same objects; the broadcast lane may drop under lag, the log
+        // lane may not). Rows therefore apply UNGATED, and folding to the
+        // log's final state is permanently correct — including through
+        // stale terminal rows (Done/Interrupted are resumable here: a
+        // later resume row supersedes them in the fold, so suppressing
+        // "regressions" by phase kind wedges resumed sessions; proven
+        // wrong twice). The only divergence this allows is TRANSIENT: the
+        // log-sink consumer lags the live fold by its queue depth, so a
+        // replay can land on a state a few events older than live. The
+        // window is the sink lag, it self-heals on the next appended rows
+        // or live event, and it is strictly narrower than the pre-cursor
+        // semantics (which re-folded the whole log on every call).
+        // Eliminating even the transient window needs an emission-stamped
+        // ordering token on lifecycle events — a cross-lane follow-up
+        // noted on PR #343, not patchable here without one.
+        //
         // Enter the replay scope (RAII — a panic mid-fold must not leave
-        // the state stuck in "hydrating" mode): full replays apply the
-        // freshness-watermark lattice and never trigger the over-cap prune
-        // (see note_session_phase / note_session_ended).
+        // the state stuck in "hydrating" mode): replays never trigger the
+        // over-cap prune and never invalidate the controller-loop cache
+        // (see note_session_ended / note_live_session_lifecycle_change).
         let mut replay = s.begin_hydration_replay(if base.bytes == 0 {
             HydrationReplayKind::Full
         } else {
@@ -1782,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn full_replay_applies_newer_terminal_phase_over_lossy_live_mark() {
+    fn full_replay_applies_a_missed_terminal_fact_from_the_lossless_log() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1822,12 +1841,12 @@ mod tests {
 
             let state = test_state();
             let mut s = state.write().await;
-            // The live lane observed the session running (marked) but
-            // MISSED the SessionEnded — the listener is a lossy broadcast,
-            // the log is lossless. The full replay's terminal fact must
-            // apply over the stale live mark; a suppress-all watermark left
-            // the session permanently stuck at the live phase with the
-            // cursor committed at EOF.
+            // The live lane observed the session running but MISSED the
+            // SessionEnded — the listener is a lossy broadcast, the log is
+            // lossless. The ungated fold must land on the log's final state
+            // (Done); any live-favoring suppression here left the session
+            // permanently stuck at the stale live phase with the cursor
+            // committed at EOF.
             s.note_session_phase(Some(session_id), Some(1), Phase::Thinking, None);
             assert!(hydrate_requested_session_status_from_logs(
                 home.path(),
@@ -1851,21 +1870,92 @@ mod tests {
     }
 
     #[test]
-    fn full_replay_does_not_regress_live_observed_phase() {
+    fn full_replay_folds_through_stale_terminal_rows_to_the_logs_final_state() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             let home = tempdir().unwrap();
-            let session_id = "sess-watermark";
+            let session_id = "sess-resumed-after-done";
             let log_dir = home.path().join(".intendant").join("logs").join(session_id);
             let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
-            log.write_meta(None, Some("watermark task"));
+            log.write_meta(None, Some("resumed task"));
+            // Round 1 ends (a terminal row mid-log), then the session
+            // RESUMES — Done/Interrupted are resumable in this system
+            // (follow-ups are accepted in Done), so terminal rows are not
+            // monotonic.
             log.agent_started_with_session_id(
                 Some(session_id),
-                3,
-                "edit files",
+                1,
+                "round one",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "round one done",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "resumed round two",
+                None,
+                Some("Codex"),
+            );
+
+            // Live observed the resume (newest truth = RunningAgent).
+            let state = test_state();
+            let mut s = state.write().await;
+            s.note_session_phase(Some(session_id), Some(2), Phase::RunningAgent, None);
+
+            // A FULL replay must fold THROUGH the stale terminal row to the
+            // log's final state — never freeze the session at the old Done
+            // (the round-2 phase-kind lattice did exactly that).
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+        });
+    }
+
+    #[test]
+    fn delayed_tail_rows_apply_and_self_heal_when_the_log_catches_up() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-delayed-tail";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("delayed tail task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "round one",
                 None,
                 Some("Codex"),
             );
@@ -1877,25 +1967,59 @@ mod tests {
                 &mut s,
                 session_id
             ));
-            assert_eq!(
-                s.session_status_for_id(session_id)
-                    .map(|st| st.phase.clone()),
-                Some(Phase::RunningAgent)
-            );
 
-            // A LIVE observation supersedes the log (flush skew: the log's
-            // final phase lags what the listener already folded).
-            s.note_session_phase(Some(session_id), None, Phase::Interrupted, None);
+            // Live is AHEAD of the log: the listener already folded the
+            // round's end (WaitingFollowUp) while the lossless log-sink
+            // consumer still lags.
+            s.note_session_phase(Some(session_id), None, Phase::WaitingFollowUp, None);
 
-            // Force a FULL replay (cursor lost — rotation, prune of an
-            // unrelated component that shared the dir, …): the replayed
-            // history must not overwrite the live-marked status.
-            s.session_log_hydration_cursors.clear();
+            // The delayed terminal row lands: the tail replay applies it —
+            // the DOCUMENTED transient (bounded by the sink lag): the
+            // replay reports the log's latest state, a few events behind
+            // live.
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "round one done",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
             hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
             assert_eq!(
                 s.session_status_for_id(session_id)
                     .map(|st| st.phase.clone()),
-                Some(Phase::Interrupted)
+                Some(Phase::Done)
+            );
+
+            // The log catches up with the session's later activity (a
+            // session-id-carrying row — round_complete rows persist no
+            // session id, so the per-session heal rides the next round's
+            // agent_started): the next tail replay self-heals to the log's
+            // newest state.
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "round two",
+                None,
+                Some("Codex"),
+            );
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
             );
         });
     }
