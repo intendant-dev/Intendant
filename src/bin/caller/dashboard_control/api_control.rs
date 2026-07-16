@@ -1592,6 +1592,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
             | ControlMsg::ResumeSession { .. }
+            | ControlMsg::ForkSessionAtAnchor { .. }
             | ControlMsg::FollowUp { .. }
             | ControlMsg::CancelFollowUp { .. }
             | ControlMsg::EditUserMessage { .. }
@@ -1665,6 +1666,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::ForkSessionAtAnchor { .. } => "fork_session_at_anchor",
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
         ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
         ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",

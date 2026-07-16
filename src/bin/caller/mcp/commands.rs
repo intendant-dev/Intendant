@@ -1078,6 +1078,18 @@ pub(crate) async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::ForkSessionAtAnchor {
+            source, session_id, ..
+        } => {
+            emit_control_result(
+                control_tx,
+                "fork_session_at_anchor",
+                true,
+                format!("fork dispatched: {} {}", source, session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::StopSession { session_id } => {
             emit_control_result(
                 control_tx,

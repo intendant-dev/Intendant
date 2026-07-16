@@ -336,6 +336,28 @@ impl SessionSupervisor {
                 )
                 .await;
             }
+            event::ControlMsg::ForkSessionAtAnchor {
+                source,
+                session_id,
+                resume_id,
+                anchor,
+                name,
+                task,
+                project_root,
+                request_id,
+            } => {
+                self.fork_session_at_anchor(
+                    source,
+                    session_id,
+                    resume_id,
+                    anchor,
+                    name,
+                    task,
+                    project_root,
+                    request_id,
+                )
+                .await;
+            }
             event::ControlMsg::StopSession { session_id } => {
                 self.stop_managed_session(Some(session_id), "stopped by user")
                     .await;
