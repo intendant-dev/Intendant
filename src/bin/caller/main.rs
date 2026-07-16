@@ -53,6 +53,11 @@ mod live_audio;
 mod live_audio_types;
 mod mcp;
 mod mcp_client;
+// The P1 Memory service core (ephemeral). Not yet reachable from any
+// surface — the ctl/gateway/tunnel verbs land as the next P1.1 slice;
+// the allow comes off with them.
+#[allow(dead_code)]
+mod memory;
 mod message_search;
 mod peer;
 mod peer_file_transfer;
