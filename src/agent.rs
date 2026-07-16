@@ -29,6 +29,9 @@ static NONCE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\$NONCE\[(\d+)\]").unwrap());
 
 struct PtySession {
+    // Marker-emission dialect of the shell this session actually spawned
+    // (the Windows primary/fallback differ) — see `pty_marker_emit`.
+    flavor: crate::utils::PtyShellFlavor,
     // Shared with the reader thread so it can answer terminal queries (see
     // below) on the same PTY input stream that `exec_pty` writes commands to.
     writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
@@ -64,6 +67,45 @@ const DSR_CPR_REPLY: &[u8] = b"\x1b[1;1R";
 
 const HUMAN_POLL_MS: u64 = 500;
 const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
+
+// exec_pty sentinel marker pieces. The assembled per-command markers are
+// `{prefix}_{nonce}__`; the typed input only ever carries a *split* form
+// (see `pty_marker_emit`), so the assembled string is proof of execution.
+const PTY_MARKER_START_PREFIX: &str = "__PTY_START";
+const PTY_MARKER_END_PREFIX: &str = "__PTY_END";
+/// cmd.exe marker-assembly variable (see `PtyShellFlavor::Cmd`).
+const PTY_CMD_MARKER_VAR: &str = "__PTY_MVAR";
+
+/// Emit the shell line(s) that print `{prefix}{suffix}` without the typed
+/// input ever containing the assembled string. The tty driver echoes raw
+/// input bytes whenever they arrive before a line editor has turned echo
+/// off — guaranteed for bytes racing a fresh shell's startup — so a marker
+/// scanner that accepted echoed input would complete a command before it
+/// ran (observed live: `sleep 1; echo done` "completed" instantly with no
+/// `done`, and the following command captured the leftovers). Splitting the
+/// marker in the input confines the assembled form to executed output.
+fn pty_marker_emit(
+    flavor: crate::utils::PtyShellFlavor,
+    prefix: &str,
+    suffix: &str,
+    nl: &str,
+) -> String {
+    use crate::utils::PtyShellFlavor;
+    match flavor {
+        // Adjacent double-quoted strings concatenate in POSIX shells.
+        PtyShellFlavor::Posix => format!("echo \"{prefix}\"\"{suffix}\"{nl}"),
+        // PowerShell string concatenation, parenthesized so echo
+        // (Write-Output) receives one argument.
+        PtyShellFlavor::PowerShell => format!("echo (\"{prefix}\" + \"{suffix}\"){nl}"),
+        // cmd.exe cannot concatenate inline; assemble via a variable set on
+        // the *previous* line (%X% on the same line would expand at parse
+        // time, before the set runs).
+        PtyShellFlavor::Cmd => format!(
+            "set {var}={prefix}{nl}echo %{var}%{suffix}{nl}",
+            var = PTY_CMD_MARKER_VAR,
+        ),
+    }
+}
 
 #[derive(Clone)]
 pub struct Agent {
@@ -173,20 +215,102 @@ impl Agent {
         None
     }
 
-    /// True when the previously merged session Xauthority is at least as new
-    /// as every cookie source that currently exists — later runtime
-    /// invocations in the same session can then skip the merge subprocesses.
-    /// Missing sources constrain nothing (they contribute nothing to a
-    /// merge); a missing merged file is never fresh.
+    /// Sidecar manifest recording the cookie sources a *fully clean* merge
+    /// pass resolved — the freshness check's completeness proof. Written
+    /// only when a pass had no consult/merge failures, deleted otherwise,
+    /// so a partial merge (e.g. one display's `sudo -n xauth` denied) is
+    /// retried on the next runtime invocation instead of being masked by a
+    /// merged file that is mtime-fresh but incomplete.
+    #[cfg(any(test, not(target_os = "macos")))]
+    fn xauth_manifest_path(merged: &Path) -> PathBuf {
+        let mut name = merged.file_name().unwrap_or_default().to_os_string();
+        name.push(".merged");
+        merged.with_file_name(name)
+    }
+
+    /// True when the previously merged session Xauthority can be reused:
+    /// it exists, a completeness manifest from a clean pass covers every
+    /// cookie source that currently exists, and no such source is newer
+    /// than the merged file. Only a `NotFound` source stat is
+    /// unconstraining (a vanished source contributes nothing to a merge);
+    /// any other stat error means the source can't be proven stale-free,
+    /// so the pass re-runs. A missing merged file or manifest is never
+    /// fresh.
     #[cfg(any(test, not(target_os = "macos")))]
     fn merged_xauthority_is_fresh(merged: &Path, sources: &[PathBuf]) -> bool {
         let Ok(merged_mtime) = fs::metadata(merged).and_then(|m| m.modified()) else {
             return false;
         };
+        let Ok(manifest_listing) = fs::read_to_string(Self::xauth_manifest_path(merged)) else {
+            // No completeness proof (prior pass failed or predates the
+            // manifest) — re-run the pass.
+            return false;
+        };
+        let resolved: std::collections::HashSet<PathBuf> = manifest_listing
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
         sources.iter().all(|src| match fs::metadata(src) {
-            Ok(meta) => matches!(meta.modified(), Ok(mtime) if mtime <= merged_mtime),
-            Err(_) => true,
+            Ok(meta) => {
+                resolved.contains(src)
+                    && matches!(meta.modified(), Ok(mtime) if mtime <= merged_mtime)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
         })
+    }
+
+    /// Conclude a merge pass. Nothing merged → drop the merged file and
+    /// manifest (a zero-cookie or stale file must not be served later, and
+    /// a nonzero-exit `nmerge` can still have created it). Merged but with
+    /// failures → keep the file for this invocation, drop the manifest so
+    /// the next invocation retries the missing sources. Fully clean pass →
+    /// record every source that currently exists as resolved.
+    #[cfg(any(test, not(target_os = "macos")))]
+    fn finalize_xauth_merge_pass(
+        merged: &Path,
+        any_merged: bool,
+        any_failure: bool,
+        sources: &[PathBuf],
+    ) -> Option<PathBuf> {
+        let manifest = Self::xauth_manifest_path(merged);
+        if !any_merged {
+            let _ = fs::remove_file(merged);
+            let _ = fs::remove_file(&manifest);
+            return None;
+        }
+        if any_failure {
+            let _ = fs::remove_file(&manifest);
+        } else {
+            let listing: String = sources
+                .iter()
+                .filter(|src| src.exists())
+                .map(|src| format!("{}\n", src.display()))
+                .collect();
+            let _ = fs::write(&manifest, listing);
+        }
+        Some(merged.to_path_buf())
+    }
+
+    /// Merge one cookie listing into the session file; Ok(true) on success,
+    /// Ok(false) when `xauth nmerge` exits nonzero.
+    #[cfg(not(target_os = "macos"))]
+    fn xauth_nmerge(merged_path: &Path, cookies: &[u8]) -> std::io::Result<bool> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("xauth")
+            .arg("-f")
+            .arg(merged_path)
+            .arg("nmerge")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        if let Some(ref mut stdin) = child.stdin {
+            let _ = stdin.write_all(cookies);
+        }
+        Ok(child.wait()?.success())
     }
 
     /// Merge xauth cookies from all discovered displays into a session-scoped file.
@@ -218,11 +342,18 @@ impl Agent {
             return Some(merged_path);
         }
 
+        // A "failure" is a consult or merge that errored (spawn failure,
+        // nonzero exit — e.g. `sudo -n` denied): the pass may have merged
+        // some cookies but can't claim completeness, so no manifest is
+        // written and the next invocation retries. A source that consults
+        // cleanly but has no cookies for a display is a resolved outcome,
+        // not a failure — its mtime staleness triggers any needed re-merge.
+        let mut any_failure = false;
         for &disp in displays {
             let display_str = format!(":{}", disp);
             // Try user's own Xauthority
             if user_xauth.exists() {
-                if let Ok(status) = std::process::Command::new("xauth")
+                match std::process::Command::new("xauth")
                     .arg("-f")
                     .arg(&user_xauth)
                     .arg("nlist")
@@ -231,73 +362,43 @@ impl Agent {
                     .stderr(std::process::Stdio::null())
                     .output()
                 {
-                    if !status.stdout.is_empty() {
-                        if let Ok(merge_status) = std::process::Command::new("xauth")
-                            .arg("-f")
-                            .arg(&merged_path)
-                            .arg("nmerge")
-                            .arg("-")
-                            .stdin(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .spawn()
-                            .and_then(|mut child| {
-                                use std::io::Write;
-                                if let Some(ref mut stdin) = child.stdin {
-                                    let _ = stdin.write_all(&status.stdout);
+                    Ok(listing) if listing.status.success() => {
+                        if !listing.stdout.is_empty() {
+                            match Self::xauth_nmerge(&merged_path, &listing.stdout) {
+                                Ok(true) => {
+                                    any_merged = true;
+                                    continue;
                                 }
-                                child.wait()
-                            })
-                        {
-                            if merge_status.success() {
-                                any_merged = true;
-                                continue;
+                                _ => any_failure = true,
                             }
                         }
                     }
+                    _ => any_failure = true,
                 }
             }
             // Try lightdm root cookie
             let lightdm_path = format!("/var/run/lightdm/root/:{}", disp);
             if Path::new(&lightdm_path).exists() {
-                if let Ok(status) = std::process::Command::new("sudo")
+                match std::process::Command::new("sudo")
                     .args(["-n", "xauth", "-f", &lightdm_path, "nlist", &display_str])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .output()
                 {
-                    if !status.stdout.is_empty() {
-                        if let Ok(merge_status) = std::process::Command::new("xauth")
-                            .arg("-f")
-                            .arg(&merged_path)
-                            .arg("nmerge")
-                            .arg("-")
-                            .stdin(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .spawn()
-                            .and_then(|mut child| {
-                                use std::io::Write;
-                                if let Some(ref mut stdin) = child.stdin {
-                                    let _ = stdin.write_all(&status.stdout);
-                                }
-                                child.wait()
-                            })
-                        {
-                            if merge_status.success() {
-                                any_merged = true;
+                    Ok(listing) if listing.status.success() => {
+                        if !listing.stdout.is_empty() {
+                            match Self::xauth_nmerge(&merged_path, &listing.stdout) {
+                                Ok(true) => any_merged = true,
+                                _ => any_failure = true,
                             }
                         }
                     }
+                    _ => any_failure = true,
                 }
             }
         }
 
-        if any_merged {
-            Some(merged_path)
-        } else {
-            None
-        }
+        Self::finalize_xauth_merge_pass(&merged_path, any_merged, any_failure, &sources)
     }
 
     /// Return the default display number when no explicit display is given and
@@ -720,24 +821,29 @@ impl Agent {
                 }
                 c
             };
-            let (shell, shell_args) = crate::utils::pty_shell_command();
+            let (shell, shell_args, shell_flavor) = crate::utils::pty_shell_command();
             let spawn_result = pair.slave.spawn_command(build_pty_cmd(shell, &shell_args));
-            let spawn_result = match spawn_result {
-                Ok(child) => Ok(child),
+            let (spawn_result, spawned_flavor) = match spawn_result {
+                Ok(child) => (Ok(child), shell_flavor),
                 Err(primary_err) => match crate::utils::pty_shell_fallback() {
-                    Some((fb_shell, fb_args)) => pair
-                        .slave
-                        .spawn_command(build_pty_cmd(fb_shell, &fb_args))
-                        .map_err(|fb_err| {
-                            AgentError::Process(format!(
-                                "Failed to spawn PTY shell '{}' ({}) and fallback '{}' ({})",
-                                shell, primary_err, fb_shell, fb_err
-                            ))
-                        }),
-                    None => Err(AgentError::Process(format!(
-                        "Failed to spawn shell: {}",
-                        primary_err
-                    ))),
+                    Some((fb_shell, fb_args, fb_flavor)) => (
+                        pair.slave
+                            .spawn_command(build_pty_cmd(fb_shell, &fb_args))
+                            .map_err(|fb_err| {
+                                AgentError::Process(format!(
+                                    "Failed to spawn PTY shell '{}' ({}) and fallback '{}' ({})",
+                                    shell, primary_err, fb_shell, fb_err
+                                ))
+                            }),
+                        fb_flavor,
+                    ),
+                    None => (
+                        Err(AgentError::Process(format!(
+                            "Failed to spawn shell: {}",
+                            primary_err
+                        ))),
+                        shell_flavor,
+                    ),
                 },
             };
             spawn_result?;
@@ -796,6 +902,7 @@ impl Agent {
             sessions.insert(
                 shell_id.clone(),
                 PtySession {
+                    flavor: spawned_flavor,
                     writer,
                     output,
                     read_offset: 0,
@@ -808,21 +915,28 @@ impl Agent {
             .get_mut(&shell_id)
             .ok_or_else(|| AgentError::Process("PTY session not found".to_string()))?;
 
-        // Generate unique start and end markers
-        let start_marker = format!("__PTY_START_{}__", cmd.nonce);
-        let marker = format!("__PTY_END_{}__", cmd.nonce);
+        // Generate unique start and end markers (the assembled forms the
+        // scanner and extractor look for in executed output).
+        let marker_suffix = format!("_{}__", cmd.nonce);
+        let start_marker = format!("{}{}", PTY_MARKER_START_PREFIX, marker_suffix);
+        let marker = format!("{}{}", PTY_MARKER_END_PREFIX, marker_suffix);
 
-        // Write: echo start-marker, then command, then echo end-marker. The
-        // writer is shared with the reader thread (which answers DSR queries),
-        // so take the lock just for the duration of this write. Each line is
-        // terminated with the platform PTY submit byte (`\r` on Windows so
-        // ConPTY treats it as Enter; `\n` on Unix, unchanged).
+        // Write: emit start-marker, then command, then emit end-marker. The
+        // marker `echo` lines are written in a *split* form the shell joins
+        // at execution time (see `pty_marker_emit`), so the assembled marker
+        // can only ever appear in executed output — never in the tty's echo
+        // of the typed input. The writer is shared with the reader thread
+        // (which answers DSR queries), so take the lock just for the
+        // duration of this write. Each line is terminated with the platform
+        // PTY submit byte (`\r` on Windows so ConPTY treats it as Enter;
+        // `\n` on Unix, unchanged).
         let nl = crate::utils::pty_line_ending();
         let pty_input = format!(
-            "echo '{start}'{nl}{cmd}{nl}echo '{end}'{nl}",
-            start = start_marker,
+            "{start_emit}{cmd}{nl}{end_emit}",
+            start_emit =
+                pty_marker_emit(session.flavor, PTY_MARKER_START_PREFIX, &marker_suffix, nl),
             cmd = command,
-            end = marker,
+            end_emit = pty_marker_emit(session.flavor, PTY_MARKER_END_PREFIX, &marker_suffix, nl),
             nl = nl,
         );
         {
@@ -922,11 +1036,17 @@ impl Agent {
             lines.pop();
         }
 
-        // Remove lines that mention the markers — both the echoed
-        // `echo '<marker>'` input lines and the marker output lines (a line
-        // containing the echo form necessarily contains the marker itself,
-        // so these two checks subsume the old per-line `format!` pairs).
-        lines.retain(|line| !line.contains(&start_marker) && !line.contains(&marker));
+        // Remove harness lines: assembled marker output lines and the echoed
+        // split-form `echo` input lines all contain a marker prefix, and the
+        // cmd.exe assembly lines contain the marker variable. (A user
+        // command that prints these sentinel prefixes loses those lines —
+        // the pre-existing acceptance for the assembled markers, applied to
+        // the split forms too.)
+        lines.retain(|line| {
+            !line.contains(PTY_MARKER_START_PREFIX)
+                && !line.contains(PTY_MARKER_END_PREFIX)
+                && !line.contains(PTY_CMD_MARKER_VAR)
+        });
 
         let final_output = lines.join("\n");
 
@@ -1708,9 +1828,12 @@ fn cap_pty_output(final_output: String, full_log_path: &Path) -> (String, bool) 
     if final_output.len() <= tail_cap {
         return (final_output, false);
     }
+    // Be honest about data loss: if the full transcript can't be preserved
+    // (disk full, unwritable log dir), the result must say so rather than
+    // silently truncating the only copy.
     let log_note = match fs::write(full_log_path, &final_output) {
         Ok(()) => format!("; full output: {}", full_log_path.display()),
-        Err(_) => String::new(),
+        Err(e) => format!("; full transcript unavailable: {}", e),
     };
     let tail = tail_utf8_by_bytes(&final_output, tail_cap);
     let capped = format!(
@@ -2436,29 +2559,53 @@ mod tests {
         assert!(agent.exec_pty(&cmd).await.is_err());
     }
 
-    /// Run one throwaway command to absorb the fresh-shell echo race: bytes
-    /// written before the shell's line editor turns tty echo off get echoed
-    /// by the tty driver — including the harness's own end-marker line — so
-    /// the FIRST command on a new PTY shell can capture its echoed input
-    /// instead of its output (pre-existing behavior; readline serializes
-    /// echo for every later command). Returns false when PTYs aren't
-    /// available in this environment.
-    #[cfg(unix)]
-    async fn warm_up_pty_shell(agent: &Agent) -> bool {
-        let warmup = AgentCommand {
+    /// The fresh-shell echo race, fixed: bytes written before the shell's
+    /// line editor turns tty echo off get echoed raw by the tty driver — if
+    /// the harness's typed input contained the assembled end marker, the
+    /// scanner would complete the first command before it ran (the live
+    /// repro: `sleep 1; echo first_done` returned instantly with no
+    /// `first_done`). With split-form marker input, completion requires the
+    /// executed output, so the slow first command's result must contain it.
+    #[tokio::test]
+    async fn exec_pty_first_command_on_fresh_shell_waits_for_real_output() {
+        let (agent, _log) = create_test_agent();
+        let cmd = AgentCommand {
             function: "execPty".to_string(),
-            nonce: 9_000,
-            command: Some("echo warm".to_string()),
+            nonce: 1,
+            command: Some("sleep 1; echo first_done".to_string()),
             ..Default::default()
         };
-        match agent.exec_pty(&warmup).await {
-            Ok(_) => true,
-            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => false,
+        let result = match agent.exec_pty(&cmd).await {
+            Ok(r) => r,
+            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => return,
             Err(e) => panic!("unexpected exec_pty error: {}", e),
-        }
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let output = parsed["output"].as_str().unwrap();
+        assert!(
+            output.contains("first_done"),
+            "first command's real output must be captured: {output}"
+        );
+
+        // And the next command must see only its own output — pre-fix, the
+        // leftovers of the mis-completed first command poisoned it.
+        let next = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 2,
+            command: Some("echo second_done".to_string()),
+            ..Default::default()
+        };
+        let result = agent.exec_pty(&next).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let output = parsed["output"].as_str().unwrap();
+        assert!(output.contains("second_done"), "output: {output}");
+        assert!(
+            !output.contains("first_done"),
+            "second call must not inherit the first call's output: {output}"
+        );
     }
 
-    /// Sequential commands on a warmed shell must each see only their own
+    /// Sequential commands on the same shell must each see only their own
     /// output — pins the read-offset bookkeeping the incremental marker
     /// scan relies on. Unix-only: ConPTY repaints can legitimately re-emit
     /// earlier lines into later byte ranges, which would false-positive the
@@ -2467,16 +2614,17 @@ mod tests {
     #[tokio::test]
     async fn exec_pty_sequential_commands_isolate_output() {
         let (agent, _log) = create_test_agent();
-        if !warm_up_pty_shell(&agent).await {
-            return;
-        }
         let first = AgentCommand {
             function: "execPty".to_string(),
             nonce: 1,
             command: Some("echo first_out".to_string()),
             ..Default::default()
         };
-        let result = agent.exec_pty(&first).await.unwrap();
+        let result = match agent.exec_pty(&first).await {
+            Ok(r) => r,
+            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => return,
+            Err(e) => panic!("unexpected exec_pty error: {}", e),
+        };
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["output"].as_str().unwrap().contains("first_out"));
 
@@ -2496,6 +2644,43 @@ mod tests {
         );
     }
 
+    /// The split-form marker input never contains the assembled marker for
+    /// any shell flavor, while the shapes are the exact lines each shell
+    /// needs to print it.
+    #[test]
+    fn pty_marker_emit_keeps_assembled_marker_out_of_typed_input() {
+        use crate::utils::PtyShellFlavor;
+        let assembled = format!("{}_7__", PTY_MARKER_END_PREFIX);
+        for flavor in [
+            PtyShellFlavor::Posix,
+            PtyShellFlavor::PowerShell,
+            PtyShellFlavor::Cmd,
+        ] {
+            let emitted = pty_marker_emit(flavor, PTY_MARKER_END_PREFIX, "_7__", "\n");
+            assert!(
+                !emitted.contains(&assembled),
+                "{flavor:?} input must not contain the assembled marker: {emitted:?}"
+            );
+        }
+        assert_eq!(
+            pty_marker_emit(PtyShellFlavor::Posix, PTY_MARKER_END_PREFIX, "_7__", "\n"),
+            "echo \"__PTY_END\"\"_7__\"\n"
+        );
+        assert_eq!(
+            pty_marker_emit(
+                PtyShellFlavor::PowerShell,
+                PTY_MARKER_END_PREFIX,
+                "_7__",
+                "\r"
+            ),
+            "echo (\"__PTY_END\" + \"_7__\")\r"
+        );
+        assert_eq!(
+            pty_marker_emit(PtyShellFlavor::Cmd, PTY_MARKER_END_PREFIX, "_7__", "\r"),
+            "set __PTY_MVAR=__PTY_END\recho %__PTY_MVAR%_7__\r"
+        );
+    }
+
     /// Large PTY output is tail-capped for the model conversation, with the
     /// full transcript preserved on disk (mirrors exec_as_agent's 10 KB
     /// tails). Unix-only: the generator loop is bash syntax.
@@ -2503,9 +2688,6 @@ mod tests {
     #[tokio::test]
     async fn exec_pty_output_tail_capped() {
         let (agent, log_dir) = create_test_agent();
-        if !warm_up_pty_shell(&agent).await {
-            return;
-        }
         // ~13 KB across 400 lines — over the 10 KB cap, quick to produce.
         let cmd = AgentCommand {
             function: "execPty".to_string(),
@@ -2516,7 +2698,11 @@ mod tests {
             ),
             ..Default::default()
         };
-        let result = agent.exec_pty(&cmd).await.unwrap();
+        let result = match agent.exec_pty(&cmd).await {
+            Ok(r) => r,
+            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => return,
+            Err(e) => panic!("unexpected exec_pty error: {}", e),
+        };
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["truncated"], true);
@@ -2619,6 +2805,25 @@ mod tests {
         assert!(out.ends_with(&"z".repeat(LOG_TAIL_BYTES as usize)));
         assert!(out.len() < 11 * 1024, "capped len {}", out.len());
         assert_eq!(fs::read_to_string(&log_path).unwrap(), big);
+
+        // Preservation failure is surfaced, not silently swallowed: the
+        // capped result must say the untruncated copy is gone.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ro_dir = tmp.path().join("ro");
+            fs::create_dir(&ro_dir).unwrap();
+            fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let (out, truncated) = cap_pty_output("w".repeat(20_000), &ro_dir.join("1_pty.log"));
+            fs::set_permissions(&ro_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(truncated);
+            assert!(
+                out.contains("full transcript unavailable:"),
+                "write failure must be surfaced: {}",
+                &out[..out.len().min(200)]
+            );
+            assert!(out.ends_with(&"w".repeat(LOG_TAIL_BYTES as usize)));
+        }
     }
 
     // --- storeMemory / recallMemory tests ---
@@ -2981,7 +3186,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_xauthority_freshness() {
+    fn merged_xauthority_freshness_requires_manifest_and_mtimes() {
         let tmp = TempDir::new().unwrap();
         let merged = tmp.path().join("session.Xauthority");
         let source = tmp.path().join("Xauthority");
@@ -2992,6 +3197,13 @@ mod tests {
             f.set_modified(UNIX_EPOCH + Duration::from_secs(secs))
                 .unwrap();
         };
+        let write_manifest = |resolved: &[&Path]| {
+            let listing: String = resolved
+                .iter()
+                .map(|p| format!("{}\n", p.display()))
+                .collect();
+            fs::write(Agent::xauth_manifest_path(&merged), listing).unwrap();
+        };
 
         // No merged file yet: never fresh.
         fs::write(&source, "cookie").unwrap();
@@ -3000,25 +3212,102 @@ mod tests {
             &[source.clone()]
         ));
 
-        // Merged newer than every existing source: fresh (missing sources
-        // constrain nothing).
+        // Merged and mtime-fresh but NO manifest (a prior pass had a
+        // failure — the partial-merge case): not fresh, the pass retries.
         fs::write(&merged, "merged").unwrap();
         set_mtime(&source, 1_000);
         set_mtime(&merged, 2_000);
-        assert!(Agent::merged_xauthority_is_fresh(
-            &merged,
-            &[source.clone(), missing.clone()]
-        ));
-
-        // A source updated after the merge invalidates it.
-        set_mtime(&source, 3_000);
         assert!(!Agent::merged_xauthority_is_fresh(
             &merged,
             &[source.clone()]
         ));
 
+        // Clean-pass manifest covering the source: fresh (missing sources
+        // constrain nothing).
+        write_manifest(&[&source]);
+        assert!(Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone(), missing.clone()]
+        ));
+
+        // A source the manifest never resolved (appeared after the pass)
+        // forces a re-merge even though mtimes look fresh.
+        let late = tmp.path().join("late-cookie");
+        fs::write(&late, "cookie").unwrap();
+        set_mtime(&late, 1_500);
+        assert!(!Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone(), late.clone()]
+        ));
+
+        // A source updated after the merge invalidates it even when listed.
+        set_mtime(&source, 3_000);
+        assert!(!Agent::merged_xauthority_is_fresh(
+            &merged,
+            &[source.clone()]
+        ));
+        set_mtime(&source, 1_000);
+
         // Missing sources alone constrain nothing.
         assert!(Agent::merged_xauthority_is_fresh(&merged, &[missing]));
+
+        // A stat error other than NotFound is constraining: the source
+        // exists but can't be proven stale-free, so the pass re-runs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked_dir = tmp.path().join("locked");
+            fs::create_dir(&locked_dir).unwrap();
+            let hidden = locked_dir.join("Xauthority");
+            fs::write(&hidden, "cookie").unwrap();
+            set_mtime(&hidden, 1_000);
+            write_manifest(&[&source, &hidden]);
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
+            let fresh = Agent::merged_xauthority_is_fresh(&merged, &[hidden.clone()]);
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!fresh, "unreadable source stat must force a re-merge");
+        }
+    }
+
+    #[test]
+    fn finalize_xauth_merge_pass_cleanup_and_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let merged = tmp.path().join("session.Xauthority");
+        let manifest = Agent::xauth_manifest_path(&merged);
+        let source = tmp.path().join("Xauthority");
+        fs::write(&source, "cookie").unwrap();
+        let sources = vec![source.clone(), tmp.path().join("gone")];
+
+        // Nothing merged: a file left behind by a failed nmerge (or a stale
+        // earlier session) is deleted along with any manifest.
+        fs::write(&merged, "half-written").unwrap();
+        fs::write(&manifest, "stale\n").unwrap();
+        assert!(Agent::finalize_xauth_merge_pass(&merged, false, true, &sources).is_none());
+        assert!(!merged.exists(), "failed pass must not leave a merged file");
+        assert!(!manifest.exists());
+
+        // Partial merge (some source failed): the merged file is served for
+        // this invocation, but no manifest survives — the next invocation's
+        // freshness check fails and the pass retries the missing sources.
+        fs::write(&merged, "cookies").unwrap();
+        fs::write(&manifest, "stale\n").unwrap();
+        let out = Agent::finalize_xauth_merge_pass(&merged, true, true, &sources);
+        assert_eq!(out.as_deref(), Some(merged.as_path()));
+        assert!(merged.exists());
+        assert!(!manifest.exists(), "partial pass must drop the manifest");
+        assert!(!Agent::merged_xauthority_is_fresh(&merged, &sources));
+
+        // Clean pass: the manifest records existing sources (not missing
+        // ones) and freshness holds.
+        let out = Agent::finalize_xauth_merge_pass(&merged, true, false, &sources);
+        assert_eq!(out.as_deref(), Some(merged.as_path()));
+        let listing = fs::read_to_string(&manifest).unwrap();
+        assert!(listing.contains(&source.display().to_string()));
+        assert!(
+            !listing.contains("gone"),
+            "missing sources are not recorded"
+        );
+        assert!(Agent::merged_xauthority_is_fresh(&merged, &sources));
     }
 
     #[test]
