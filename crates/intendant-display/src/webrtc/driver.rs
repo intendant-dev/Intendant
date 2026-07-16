@@ -130,7 +130,6 @@ pub(crate) struct RidRtpState {
 
 pub(crate) struct RtpSendState {
     sender_id: RTCRtpSenderId,
-    mid: String,
     codec: RTCRtpCodec,
     /// Per-RID send state. Looked up by the
     /// [`OutboundEncodedFrame::rid`] of each incoming frame so the
@@ -282,7 +281,6 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
-            mid: rtp_config.mid,
             codec: rtp_config.codec,
             by_rid,
             mid_ext_id: None,
