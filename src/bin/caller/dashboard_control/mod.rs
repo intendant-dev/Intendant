@@ -4668,6 +4668,7 @@ mod tests {
             "api_worktrees_inspect",
             "api_worktrees_scan",
             "api_worktrees_remove",
+            "api_worktrees_clean",
             "api_worktrees_merge",
             "api_settings",
             "api_settings_save",

@@ -1637,6 +1637,8 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_worktrees_inspect':
     case 'api_worktrees_scan':
     case 'api_worktrees_remove':
+    case 'api_worktrees_clean':
+    case 'api_worktrees_merge':
     case 'api_fs_mkdir':
     case 'api_fs_read':
     case 'api_transfer_jobs':

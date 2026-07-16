@@ -185,6 +185,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_worktrees_inspect: { verb: 'POST', path: '/api/worktrees/inspect' },
   api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
   api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
+  api_worktrees_clean: { verb: 'POST', path: '/api/worktrees/clean' },
   api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
   api_settings: { verb: 'GET', path: '/api/settings' },
   api_settings_save: { verb: 'POST', path: '/api/settings' },
