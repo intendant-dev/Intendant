@@ -1099,6 +1099,56 @@ fn visible_levels(verbosity: &str) -> &'static [&'static str] {
 const COLLAPSE_LINE_THRESHOLD: usize = 3;
 const COLLAPSE_CHAR_THRESHOLD: usize = 300;
 const MAX_LOG_ENTRIES: usize = 10000;
+/// Turn-delta entries kept for the Usage tab's history chart. The chart is
+/// a fixed-width bar strip, so entries past ~this count add serialization
+/// cost to every UpdateUsage command without adding legibility.
+const MAX_TOKEN_HISTORY: usize = 120;
+
+/// Daemon events this reducer deliberately ignores: they are consumed by
+/// plain-JS dashboard layers (vitals chips, goal rail, transport/WebRTC
+/// signaling, display metrics, config panels, …) or carry nothing this
+/// state renders. Swallowed like the `cu_action` arm so the unknown-event
+/// catch-all doesn't serialize each one (`session_vitals` fires on a 5s
+/// cadence, `context_snapshot` per turn with payloads up to 128KB,
+/// `webrtc_signal` carries full SDP) into an invisible debug row — over
+/// hours those rows pin the buffer at cap with junk, evicting real
+/// activity.
+///
+/// Every name must be a real `OutboundEvent` wire name: a caller-side
+/// parity test (`js_handled_events_match_outbound_event_vocabulary` in
+/// `src/bin/caller/types.rs`) deserializes each one and fails on drift,
+/// so a daemon-side rename can't silently turn a swallow back into
+/// debug-row noise.
+pub const JS_HANDLED_EVENTS: &[&str] = &[
+    "session_vitals",
+    "session_goal",
+    "session_relationship",
+    "session_capabilities",
+    "session_note",
+    "session_agent_config_result",
+    "approval_resolved",
+    "user_message_edit_status",
+    "follow_up_status",
+    "webrtc_signal",
+    "peer_file_transfer_signal",
+    "peer_dashboard_control_signal",
+    "display_metrics",
+    "display_resize",
+    "display_request_raised",
+    "display_request_resolved",
+    "display_capture_lost",
+    "display_approval_pending",
+    "user_display_granted",
+    "user_display_revoked",
+    "shared_view",
+    "browser_workspace_changed",
+    "autonomy_changed",
+    "codex_thread_action_requested",
+    "context_snapshot",
+    "model_summary",
+    "task_received",
+    "user_notification",
+];
 
 // ── Log entry (stored for re-filtering) ────────────────────────────
 
@@ -1137,7 +1187,10 @@ pub struct AppState {
     pending_question_id: Option<u64>,
 
     // Logs
-    log_buffer: Vec<LogEntry>,
+    // Ring-buffered: eviction at MAX_LOG_ENTRIES pops the front, so it must
+    // be a VecDeque — a Vec::remove(0) memmoves the whole buffer (~1MB+)
+    // on every log event once a long-running dashboard reaches the cap.
+    log_buffer: std::collections::VecDeque<LogEntry>,
     verbosity: String,
     /// When set, `add_log_with_images` uses this as the timestamp for
     /// emitted entries instead of the wallclock.  Used by replay so the
@@ -1163,7 +1216,10 @@ pub struct AppState {
     usage_log_bands: std::collections::HashMap<String, u8>,
     presence_usage: Option<UsageSnapshot>,
     live_usage: Option<LiveUsageSnapshot>,
-    token_history: Vec<TokenHistoryEntry>,
+    /// Per-turn token deltas for the selected session, windowed at
+    /// `MAX_TOKEN_HISTORY` (front-evicted) and reset on session switch —
+    /// it is re-serialized into every UpdateUsage command.
+    token_history: std::collections::VecDeque<TokenHistoryEntry>,
     last_total_tokens: u64,
 
     // Active tab (for badge logic)
@@ -1205,7 +1261,7 @@ impl AppState {
             phase: "idle".to_string(),
             pending_approval_id: None,
             pending_question_id: None,
-            log_buffer: Vec::new(),
+            log_buffer: std::collections::VecDeque::new(),
             verbosity: "normal".to_string(),
             replay_ts: None,
             event_session_id: None,
@@ -1215,7 +1271,7 @@ impl AppState {
             usage_log_bands: std::collections::HashMap::new(),
             presence_usage: None,
             live_usage: None,
-            token_history: Vec::new(),
+            token_history: std::collections::VecDeque::new(),
             last_total_tokens: 0,
             active_tab: "activity".to_string(),
             known_displays: Vec::new(),
@@ -1239,26 +1295,54 @@ impl AppState {
 
     /// Select which agent session should drive session-scoped UI updates.
     pub fn select_session(&mut self, session_id: &str) -> Vec<UiCommand> {
+        if self.session_id != session_id {
+            // The history chart shows per-turn deltas of the *selected*
+            // session; carrying entries (and the delta anchor) across a
+            // switch mixes turn deltas from different sessions.
+            self.token_history.clear();
+            self.last_total_tokens = self
+                .session_main_usage
+                .get(session_id)
+                .map(|u| u.tokens_used)
+                .unwrap_or(0);
+        }
+        let switched = self.session_id != session_id;
         self.session_id = session_id.to_string();
         let mut cmds = Vec::new();
-        if let Some(usage) = self.session_main_usage.get(session_id).cloned() {
-            self.budget_pct = usage.usage_pct;
-            self.main_usage = Some(usage.clone());
-            cmds.push(UiCommand::UpdateStatusBar {
-                provider: None,
-                model: None,
-                turn: None,
-                budget_pct: Some(usage.usage_pct),
-                autonomy: None,
-                // Attributed to the selected session: the dashboard's status
-                // gate only lets the focused session drive the header meter,
-                // so an unattributed push would be dropped whenever any
-                // window is focused — exactly when selection happens.
-                session_id: Some(session_id.to_string()),
-                external_agent: None,
-            });
+        match self.session_main_usage.get(session_id).cloned() {
+            Some(usage) => {
+                self.budget_pct = usage.usage_pct;
+                self.main_usage = Some(usage.clone());
+                cmds.push(UiCommand::UpdateStatusBar {
+                    provider: None,
+                    model: None,
+                    turn: None,
+                    budget_pct: Some(usage.usage_pct),
+                    autonomy: None,
+                    // Attributed to the selected session: the dashboard's status
+                    // gate only lets the focused session drive the header meter,
+                    // so an unattributed push would be dropped whenever any
+                    // window is focused — exactly when selection happens.
+                    session_id: Some(session_id.to_string()),
+                    external_agent: None,
+                });
+            }
+            None => {
+                // Switching to a session with no cached usage must not carry
+                // the previous session's snapshot: it would be re-emitted
+                // tagged as the new session, and the next turn_started would
+                // push a giant cross-session delta against the re-based
+                // anchor. `main_usage` repopulates from the destination's
+                // first usage event. (Deselecting to the empty/global id
+                // keeps the aggregate snapshot — old behavior.)
+                if switched && !session_id.is_empty() {
+                    self.main_usage = None;
+                }
+            }
         }
-        cmds.push(self.build_usage_command_for_session(Some(session_id)));
+        cmds.push(
+            self.build_usage_command_for_session((!session_id.is_empty()).then_some(session_id)),
+        );
         cmds
     }
 
@@ -1572,10 +1656,18 @@ impl AppState {
                     if let Some(ref usage) = self.main_usage {
                         if turn > 1 {
                             let delta = usage.tokens_used.saturating_sub(self.last_total_tokens);
-                            self.token_history.push(TokenHistoryEntry {
+                            self.token_history.push_back(TokenHistoryEntry {
                                 turn: turn - 1,
                                 tokens: delta,
                             });
+                            // Window the history: it is re-serialized into
+                            // every UpdateUsage command (one per usage event),
+                            // so unbounded growth makes that serialization —
+                            // and the Usage tab's bar chart — grow linearly
+                            // for the tab's lifetime.
+                            if self.token_history.len() > MAX_TOKEN_HISTORY {
+                                self.token_history.pop_front();
+                            }
                             self.last_total_tokens = usage.tokens_used;
                         }
                     }
@@ -2927,14 +3019,34 @@ impl AppState {
                 cmds.extend(render_peer_event(&host_id, payload));
             }
 
+            // Known JS-handled/ignored daemon events — see the
+            // `JS_HANDLED_EVENTS` doc for why they must be swallowed here
+            // and how the list is pinned against the daemon vocabulary.
+            e if JS_HANDLED_EVENTS.contains(&e) => {}
+
             _ => {
-                // Unknown events at debug level
-                let text = format!(
-                    "[{}] {}",
-                    event,
-                    serde_json::to_string(msg).unwrap_or_default()
-                );
-                cmds.extend(self.add_log("debug", &text, None, "system"));
+                // Genuinely unknown events (new daemon broadcasts this build
+                // predates): only pay the full-message serialization when the
+                // current verbosity would actually show a debug row, and
+                // truncate the preview — an unbounded payload otherwise sits
+                // invisibly in the capped buffer. Entries received while
+                // verbosity is above debug are dropped rather than buffered;
+                // switching to debug surfaces unknown events from then on.
+                if visible_levels(&self.verbosity).contains(&"debug") {
+                    let preview = serde_json::to_string(msg).unwrap_or_default();
+                    const UNKNOWN_EVENT_PREVIEW_MAX: usize = 512;
+                    let mut end = preview.len().min(UNKNOWN_EVENT_PREVIEW_MAX);
+                    while end > 0 && !preview.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let suffix = if end < preview.len() {
+                        "…(truncated)"
+                    } else {
+                        ""
+                    };
+                    let text = format!("[{}] {}{}", event, &preview[..end], suffix);
+                    cmds.extend(self.add_log("debug", &text, None, "system"));
+                }
             }
         }
 
@@ -3090,11 +3202,11 @@ impl AppState {
             superseded,
             replacement_for_user_turn_index,
         };
-        self.log_buffer.push(entry);
+        self.log_buffer.push_back(entry);
 
-        // Cap buffer
+        // Cap buffer (VecDeque: O(1), vs the old Vec::remove(0) memmove)
         if self.log_buffer.len() > MAX_LOG_ENTRIES {
-            self.log_buffer.remove(0);
+            self.log_buffer.pop_front();
         }
 
         let visible = visible_levels(&self.verbosity);
@@ -3172,9 +3284,15 @@ impl AppState {
     }
 
     fn build_usage_command_for_session(&self, session_id: Option<&str>) -> UiCommand {
-        let selected_main = session_id
-            .and_then(|sid| self.session_main_usage.get(sid))
-            .or(self.main_usage.as_ref());
+        // Strict per-session resolution: an explicitly named session gets
+        // its own cached usage or nothing — falling back to the global
+        // snapshot here re-emitted the previously selected session's
+        // numbers tagged as the named one. `None` (no session context)
+        // keeps the aggregate/global snapshot for the single-session path.
+        let selected_main = match session_id {
+            Some(sid) => self.session_main_usage.get(sid),
+            None => self.main_usage.as_ref(),
+        };
         let main_json = selected_main.and_then(|u| serde_json::to_string(u).ok());
         let presence_json = self
             .presence_usage
@@ -4915,6 +5033,192 @@ mod tests {
         assert_eq!(s.token_history.len(), 1);
         assert_eq!(s.token_history[0].turn, 2);
         assert_eq!(s.token_history[0].tokens, 500);
+    }
+
+    #[test]
+    fn token_history_is_windowed() {
+        let mut s = AppState::new();
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 1000,
+            ..Default::default()
+        });
+        for turn in 2..(MAX_TOKEN_HISTORY as u64 + 52) {
+            let msg = json!({"event": "turn_started", "turn": turn, "budget_pct": 5.0});
+            s.handle_message(&msg);
+        }
+        assert_eq!(s.token_history.len(), MAX_TOKEN_HISTORY);
+        // Front-evicted: the oldest turns are gone, the newest kept.
+        assert_eq!(
+            s.token_history.back().map(|e| e.turn),
+            Some(MAX_TOKEN_HISTORY as u64 + 50)
+        );
+    }
+
+    #[test]
+    fn token_history_resets_on_session_switch() {
+        let mut s = AppState::new();
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 1000,
+            ..Default::default()
+        });
+        s.last_total_tokens = 500;
+        let msg = json!({"event": "turn_started", "turn": 3, "budget_pct": 5.0});
+        s.handle_message(&msg);
+        assert_eq!(s.token_history.len(), 1);
+
+        s.session_main_usage.insert(
+            "sess-b".to_string(),
+            UsageSnapshot {
+                tokens_used: 7777,
+                ..Default::default()
+            },
+        );
+        s.select_session("sess-b");
+        // Per-turn deltas from the previous session don't leak into the
+        // newly selected one, and the delta anchor re-bases to its total.
+        assert!(s.token_history.is_empty());
+        assert_eq!(s.last_total_tokens, 7777);
+
+        // Re-selecting the same session keeps the accumulated history.
+        s.token_history
+            .push_back(TokenHistoryEntry { turn: 1, tokens: 5 });
+        s.select_session("sess-b");
+        assert_eq!(s.token_history.len(), 1);
+    }
+
+    #[test]
+    fn uncached_session_switch_drops_previous_usage() {
+        let mut s = AppState::new();
+        // Session A's usage is live (cached + global snapshot).
+        s.handle_message(&json!({
+            "event": "usage", "session_id": "sess-a",
+            "main": {
+                "provider": "anthropic", "model": "m",
+                "tokens_used": 50_000, "context_window": 200_000, "usage_pct": 25.0
+            }
+        }));
+        s.select_session("sess-a");
+        assert!(s.main_usage.is_some());
+
+        // Switch to a session with no cached usage: A's snapshot must not
+        // ride along...
+        let cmds = s.select_session("sess-b");
+        assert!(s.main_usage.is_none());
+        // ...the emitted usage command must not present A's numbers as B's...
+        match cmds
+            .iter()
+            .find(|c| matches!(c, UiCommand::UpdateUsage { .. }))
+        {
+            Some(UiCommand::UpdateUsage {
+                session_id,
+                main_json,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("sess-b"));
+                assert!(main_json.is_none(), "must not emit A's usage as B's");
+            }
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+        // ...and B's next turn_started must not spike a cross-session
+        // delta into the history chart.
+        s.handle_message(
+            &json!({"event": "turn_started", "session_id": "sess-b", "turn": 4, "budget_pct": 1.0}),
+        );
+        assert!(
+            s.token_history.is_empty(),
+            "no delta may be derived from A's snapshot: {:?}",
+            s.token_history
+        );
+    }
+
+    #[test]
+    fn usage_command_for_uncached_session_has_no_main_payload() {
+        let mut s = AppState::new();
+        // Global snapshot exists (e.g. from the previously selected
+        // session), but the named session has no cached usage.
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 12_345,
+            ..Default::default()
+        });
+        let cmd = s.build_usage_command_for_session(Some("sess-uncached"));
+        match cmd {
+            UiCommand::UpdateUsage {
+                session_id,
+                main_json,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-uncached"));
+                assert!(
+                    main_json.is_none(),
+                    "an explicitly named session must not fall back to the global snapshot"
+                );
+            }
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+        // The no-session path keeps the global snapshot.
+        match s.build_usage_command_for_session(None) {
+            UiCommand::UpdateUsage { main_json, .. } => assert!(main_json.is_some()),
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_buffer_cap_evicts_front() {
+        let mut s = AppState::new();
+        for i in 0..(MAX_LOG_ENTRIES + 3) {
+            s.add_log("info", &format!("entry {i}"), None, "system");
+        }
+        assert_eq!(s.log_buffer.len(), MAX_LOG_ENTRIES);
+        // The oldest rows were evicted from the front.
+        assert_eq!(
+            s.log_buffer.front().map(|e| e.content.as_str()),
+            Some("entry 3")
+        );
+        assert_eq!(
+            s.log_buffer.back().map(|e| e.content.as_str()),
+            Some(&*format!("entry {}", MAX_LOG_ENTRIES + 2))
+        );
+    }
+
+    #[test]
+    fn known_ignored_events_are_swallowed() {
+        let mut s = AppState::new();
+        s.set_verbosity("debug");
+        for event in JS_HANDLED_EVENTS {
+            let cmds = s.handle_message(&json!({"event": event, "payload": "x".repeat(4096)}));
+            assert!(
+                cmds.is_empty(),
+                "{event} must not emit commands, got {cmds:?}"
+            );
+        }
+        assert!(
+            s.log_buffer.is_empty(),
+            "known JS-handled events must not buffer debug rows"
+        );
+    }
+
+    #[test]
+    fn unknown_events_buffer_only_under_debug_and_truncated() {
+        let mut s = AppState::new();
+        // Normal verbosity: an unknown event is not serialized or buffered.
+        s.handle_message(&json!({"event": "future_event", "blob": "y".repeat(4096)}));
+        assert!(s.log_buffer.is_empty());
+
+        // Debug verbosity: buffered, with the preview truncated.
+        s.set_verbosity("debug");
+        let cmds = s.handle_message(&json!({"event": "future_event", "blob": "y".repeat(4096)}));
+        assert_eq!(s.log_buffer.len(), 1);
+        let entry = s.log_buffer.front().expect("buffered debug row");
+        assert!(entry.content.starts_with("[future_event] "));
+        assert!(entry.content.ends_with("…(truncated)"));
+        assert!(
+            entry.content.len() < 600,
+            "preview must be truncated, got {}",
+            entry.content.len()
+        );
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::AddLogEntry { .. })));
     }
 
     #[test]

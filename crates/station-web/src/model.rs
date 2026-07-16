@@ -51,10 +51,13 @@ pub(crate) struct StationHost {
     pub(crate) platform: String,
     pub(crate) region: String,
     pub(crate) connected: bool,
-    #[serde(deserialize_with = "f32_or_default")]
-    pub(crate) cpu: f32,
-    #[serde(deserialize_with = "f32_or_default")]
-    pub(crate) mem: f32,
+    /// Host CPU / memory pressure in percent. `None` when the feed has no
+    /// real reading (missing/null/non-numeric) — rendered as "n/a", never
+    /// as a fabricated value.
+    #[serde(deserialize_with = "opt_f32")]
+    pub(crate) cpu: Option<f32>,
+    #[serde(deserialize_with = "opt_f32")]
+    pub(crate) mem: Option<f32>,
 }
 
 impl Default for StationHost {
@@ -65,8 +68,8 @@ impl Default for StationHost {
             platform: "unknown".into(),
             region: "local".into(),
             connected: true,
-            cpu: 0.0,
-            mem: 0.0,
+            cpu: None,
+            mem: None,
         }
     }
 }
@@ -912,6 +915,18 @@ where
     Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0) as f32)
 }
 
+/// A genuinely-optional metric: JSON null (and non-finite numbers) map to
+/// `None` instead of a fabricated 0 — absent readings must render as
+/// absent.
+pub(crate) fn opt_f32<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(deserializer)?
+        .filter(|v| v.is_finite())
+        .map(|v| v as f32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,8 +945,10 @@ mod tests {
         let host = &snapshot.hosts[0];
         assert_eq!(host.id, "h1");
         assert!(!host.connected);
-        // f32_or_default maps JSON null to 0.0 instead of failing.
-        assert_eq!(host.cpu, 0.0);
+        // A null metric is genuinely absent (renders as "n/a"), and an
+        // omitted one takes the None default — never a fabricated 0.
+        assert_eq!(host.cpu, None);
+        assert_eq!(host.mem, None);
         // Unspecified fields take their struct defaults.
         assert_eq!(host.region, "local");
 

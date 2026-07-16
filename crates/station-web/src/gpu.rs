@@ -473,10 +473,16 @@ impl GpuState {
             Self::create_depth_view(&self.device, self.config.width, self.config.height);
     }
 
+    /// Draw and present `frame`. With `upload` false the persistent vertex
+    /// buffers (and the atlas) are assumed to already hold exactly this
+    /// frame's data from a previous uploading render — the caller's
+    /// `scene_static` path, where the tick exists only to keep the WebGPU
+    /// surface presented (see `StationInner::is_animating`).
     pub(crate) fn render(
         &mut self,
         frame: &GpuFrame,
         atlas: Option<&TextAtlas>,
+        upload: bool,
     ) -> Result<(), JsValue> {
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output)
@@ -508,16 +514,18 @@ impl GpuState {
                 label: Some("Station Encoder"),
             });
 
-        self.line_buffer
-            .upload(&self.device, &self.queue, &frame.line_vertices);
-        self.tri_buffer
-            .upload(&self.device, &self.queue, &frame.tri_vertices);
-        self.pane_buffer
-            .upload(&self.device, &self.queue, &frame.pane_vertices);
-        self.text_buffer
-            .upload(&self.device, &self.queue, &frame.text_vertices);
-        if let Some(atlas) = atlas.filter(|_| !frame.text_vertices.is_empty()) {
-            self.ensure_atlas(atlas);
+        if upload {
+            self.line_buffer
+                .upload(&self.device, &self.queue, &frame.line_vertices);
+            self.tri_buffer
+                .upload(&self.device, &self.queue, &frame.tri_vertices);
+            self.pane_buffer
+                .upload(&self.device, &self.queue, &frame.pane_vertices);
+            self.text_buffer
+                .upload(&self.device, &self.queue, &frame.text_vertices);
+            if let Some(atlas) = atlas.filter(|_| !frame.text_vertices.is_empty()) {
+                self.ensure_atlas(atlas);
+            }
         }
 
         {
@@ -603,6 +611,7 @@ impl GpuState {
         &mut self,
         _frame: &GpuFrame,
         _atlas: Option<&TextAtlas>,
+        _upload: bool,
     ) -> Result<(), JsValue> {
         Ok(())
     }

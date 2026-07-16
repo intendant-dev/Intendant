@@ -191,19 +191,32 @@ impl TextAtlas {
     }
 
     /// `text` unchanged when it fits `max_w` world units at `height`;
-    /// otherwise truncated with a trailing ellipsis to fit.
+    /// otherwise truncated with a trailing ellipsis to fit. Single pass of
+    /// cumulative advances (this runs per pane text row per frame; the old
+    /// pop-one-char-and-remeasure loop was O(n²) in the overflow length).
     pub(crate) fn fit_to_width(&self, text: &str, height: f32, max_w: f32) -> String {
-        if self.measure_world(text, height) <= max_w {
+        let scale = height / CELL_H;
+        let max_advance = max_w / scale;
+        let total: f32 = self.measure(text);
+        if total <= max_advance {
             return text.to_string();
         }
-        let mut kept: Vec<char> = text.chars().collect();
-        while kept.pop().is_some() {
-            let candidate = kept.iter().collect::<String>() + "…";
-            if kept.is_empty() || self.measure_world(&candidate, height) <= max_w {
-                return candidate;
+        let ellipsis = self.measure("…");
+        // Longest prefix whose advance leaves room for the ellipsis.
+        let mut cut = 0;
+        let mut pen = 0.0f32;
+        for (idx, ch) in text.char_indices() {
+            let advance = self.lookup(ch).map(|g| g.advance).unwrap_or(0.0);
+            if pen + advance + ellipsis > max_advance {
+                break;
             }
+            pen += advance;
+            cut = idx + ch.len_utf8();
         }
-        "…".to_string()
+        let mut fitted = String::with_capacity(cut + '…'.len_utf8());
+        fitted.push_str(&text[..cut]);
+        fitted.push('…');
+        fitted
     }
 }
 
@@ -452,6 +465,26 @@ mod tests {
         assert!(fitted.ends_with('…'), "got {fitted:?}");
         assert!(atlas.measure_world(&fitted, CELL_H) <= 30.0);
         assert!(fitted.chars().count() < 4);
+    }
+
+    #[test]
+    fn fit_to_width_keeps_longest_fitting_prefix() {
+        let atlas = atlas();
+        // a=10, b=14, ellipsis ('?' fallback)=12. Budget 47: "ab"+… = 36
+        // fits, "aba"+… = 46 fits, "abab" = 48 doesn't — expect "aba…".
+        assert_eq!(atlas.fit_to_width("abab", CELL_H, 47.0), "aba…");
+        // Height scaling halves the budget in atlas px.
+        assert_eq!(atlas.fit_to_width("abab", CELL_H * 2.0, 94.0), "aba…");
+    }
+
+    #[test]
+    fn fit_to_width_degenerate_budget_yields_bare_ellipsis() {
+        let atlas = atlas();
+        // No prefix (not even one char) leaves room for the ellipsis; the
+        // bare ellipsis is returned even though it overflows — matching
+        // the drawing fallback for unknown glyphs.
+        assert_eq!(atlas.fit_to_width("abab", CELL_H, 5.0), "…");
+        assert_eq!(atlas.fit_to_width("abab", CELL_H, 0.0), "…");
     }
 
     #[test]
