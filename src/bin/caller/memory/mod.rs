@@ -29,4 +29,4 @@ pub(crate) mod service;
 pub(crate) mod types;
 
 pub(crate) use handle::MemoryHandle;
-pub(crate) use types::{MemoryError, ProposeArgs, SearchArgs};
+pub(crate) use types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};

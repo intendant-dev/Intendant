@@ -557,6 +557,10 @@ async function main() {
       serverMsgStep(d, 'agenda_changed', () => agendaObserveServerMessage(d));
       return;
     }
+    if (d.event === 'memory_changed') {
+      serverMsgStep(d, 'memory_changed', () => memoryObserveServerMessage(d));
+      return;
+    }
     if (d.event === 'session_note') {
         // Display-only transcript note: rendered end to end in JS (the
         // WASM presence layer does not know this event).
