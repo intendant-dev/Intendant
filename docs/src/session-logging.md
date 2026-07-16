@@ -49,14 +49,32 @@ environment variable, so per-command stdout/stderr land in the same place.
 │   ├── rounds/              #   per-round artifacts
 │   └── history.json         #   rounds[], abandoned_branches[], current_head_id, next_id
 └── turns/
-    ├── turn_001_messages.json    # full messages array sent to the API
+    ├── turn_001_messages.json    # full messages array sent to the API (debug-only, see below)
     ├── turn_001_model.txt        # full model response text
     ├── turn_001_reasoning.txt    # full reasoning content (when the provider returns it)
     ├── turn_001_agent_in.json    # commands sent to the runtime (pretty-printed)
     ├── turn_001_stdout.txt       # agent stdout for this turn
     ├── turn_001_stderr.txt       # agent stderr for this turn (only when non-empty)
-    └── turn_001_context_<id>.json # context snapshot, when a context directive fires
+    └── turn_001_context_<id>.json # context snapshot sidecar (latest-only, see below)
 ```
+
+Two turn artifacts are deliberately not archived per turn (per-turn
+full-context dumps measured ~47% of a real fleet log store):
+
+- **`turn_NNN_messages.json` is debug-only.** The context snapshot carries
+  the exact provider request (a superset), so the separate messages dump
+  is written only with `INTENDANT_LOG_MESSAGES_JSON=1` — with one
+  exception: when the provider cannot produce a request snapshot (the
+  mock provider, custom providers without `request_snapshot`), the dump
+  is written regardless as the turn's only exact input record.
+- **Context snapshot sidecars rotate to latest-only**, keyed per
+  (source, session id) stream: writing a new sidecar deletes the previous
+  one of the same stream. Historical `context_snapshot` rows in
+  `session.jsonl` keep all their metadata (tokens, item counts, labels,
+  the file name), and replay renders them raw-less;
+  `exact_replay_available` on replayed rows reflects whether the sidecar
+  is actually still on disk. `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1`
+  restores the archive-everything behavior.
 
 Turn files are named `turn_{NNN}_{suffix}` with `NNN` zero-padded to three digits
 (`write_turn_file` / `append_turn_file`). Per-nonce runtime logs are named

@@ -34,12 +34,12 @@ The session log writer flushes each row immediately. The event bus uses a lossle
 
 Use row file fields before assuming `message` is complete.
 
-- `messages_input`: `file` is `turns/turn_NNN_messages.json`.
+- `messages_input`: `file` is `turns/turn_NNN_messages.json`. Debug-only rows (`INTENDANT_LOG_MESSAGES_JSON=1`), except when the provider produced no context snapshot for the turn — then the dump is written unconditionally.
 - `model_response`: appends text to `turns/turn_NNN_model.txt`; exact row span is `data.model_offset` and `data.model_bytes`.
 - `reasoning`: may write `turns/turn_NNN_reasoning.txt`; summary-only rows can omit `file`.
 - `agent_input`: `file` is `turns/turn_NNN_agent_in.json`.
 - `agent_output`: stdout file in `file`, stderr file in `file2`; exact spans are `data.stdout_offset`, `data.stdout_bytes`, `data.stderr_offset`, and `data.stderr_bytes`.
-- `context_snapshot`: `file` is a raw/archive context JSON file; replay may summarize or omit large raw values.
+- `context_snapshot`: `file` is a raw/archive context JSON file; replay may summarize or omit large raw values. Sidecars rotate to latest-only per (source, session id) stream — only the newest row's `file` per stream exists on disk (`INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1` keeps all), and replayed rows carry `exact_replay_available` derived from disk truth.
 
 ## Lifecycle and Identity
 

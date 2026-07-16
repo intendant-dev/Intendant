@@ -305,6 +305,13 @@ pub(crate) fn exact_context_snapshot_from_log_entry(
     log_dir: &Path,
     contents: &str,
 ) -> Option<serde_json::Value> {
+    // Disk truth first: sidecars rotate to latest-only, and the event
+    // converter degrades a missing file to an empty `{}` raw — without
+    // this gate a rotated-away row would serve 200-with-{} instead of
+    // taking the caller's honest 404 arm.
+    if context_snapshot_raw_file_size(entry, log_dir).is_none() {
+        return None;
+    }
     let app_event = crate::session_log::session_log_entry_to_app_event(entry, log_dir)?;
     let outbound = crate::event::app_event_to_outbound(&app_event)?;
     let mut value = serde_json::to_value(&outbound).ok()?;
@@ -316,6 +323,7 @@ pub(crate) fn exact_context_snapshot_from_log_entry(
     inject_replay_entry_metadata(
         &mut value,
         entry,
+        log_dir,
         replay_session_id.as_deref(),
         external_replay_session_id.as_deref(),
         wrapper_replay_session_id.as_deref(),
@@ -1831,6 +1839,81 @@ mod tests {
         assert_eq!(
             snapshot.pointer("/raw/input/0/arguments/cmd"),
             Some(&serde_json::json!(exact_text))
+        );
+    }
+
+    #[test]
+    fn rotated_away_context_snapshot_is_unavailable_and_fetches_404() {
+        // Golden for latest-only rotation: the historical row must (a) stop
+        // advertising exact replay and (b) take the honest 404 arm on
+        // fetch — never 200 with the converter's `{}` degrade.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("rotated-session");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.set_context_snapshot_keep_all(false);
+        let snapshot_raw = |turn: usize| {
+            serde_json::json!({
+                "input": [{ "type": "message", "content": format!("turn {turn}") }]
+            })
+        };
+        for turn in 1..=2 {
+            log.turn_start(turn, 0.0, 0);
+            log.context_snapshot(
+                "native",
+                "Internal agent request payload",
+                Some(turn),
+                "test.v1",
+                None,
+                None,
+                None,
+                None,
+                Some(1),
+                &snapshot_raw(turn),
+            );
+        }
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "rotated-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let snapshots: Vec<&serde_json::Value> = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "context_snapshot")
+            .collect();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots[0]["exact_replay_available"], false,
+            "rotated-away row must not advertise exact replay"
+        );
+        assert_eq!(snapshots[1]["exact_replay_available"], true);
+
+        let fetch = |file: &str| {
+            session_context_snapshot_response_body(
+                dir.path(),
+                "rotated-session",
+                "intendant",
+                Some(file.to_string()),
+                None,
+                None,
+                None,
+            )
+        };
+        let rotated_file = snapshots[0]["snapshot_file"].as_str().unwrap();
+        let (status, body) = fetch(rotated_file);
+        assert_eq!(status, "404 Not Found", "body: {body}");
+
+        let latest_file = snapshots[1]["snapshot_file"].as_str().unwrap();
+        let (status, body) = fetch(latest_file);
+        assert_eq!(status, "200 OK", "body: {body}");
+        let loaded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            loaded["snapshot"].pointer("/raw/input/0/content"),
+            Some(&serde_json::json!("turn 2"))
         );
     }
 }

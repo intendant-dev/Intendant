@@ -9,8 +9,10 @@ use super::*;
 /// Opt-out for the latest-only context-snapshot rotation: keep every
 /// per-turn sidecar (the pre-rotation behavior) for debugging sessions
 /// where the full history of exact request payloads matters more than
-/// disk. Read once per process — a debugging aid, not a runtime toggle.
-fn context_snapshot_keep_all() -> bool {
+/// disk. Read once per process, at [`SessionLog::open`] — the resolved
+/// policy lives on the log as injected state so tests pin the policy they
+/// exercise instead of inheriting the shell's environment.
+pub(super) fn context_snapshot_keep_all() -> bool {
     static KEEP_ALL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL")
             .map(|v| {
@@ -1341,28 +1343,36 @@ impl SessionLog {
         } else {
             None
         };
-        // Latest-only rotation, keyed per (source, session id) so distinct
-        // snapshot streams folding through one log — a native and an
-        // external archive snapshot of the same wrapper session, or
-        // per-session sub-streams — never delete each other: the previous
-        // sidecar of the same stream is removed once the new one is safely
-        // on disk. Historical rows in session.jsonl keep their metadata
-        // (tokens, item counts, labels) and the dashboard replay already
-        // degrades a missing raw to a raw-less entry — it only ever
-        // eagerly loads the latest snapshot per session. Keeping every
-        // per-turn context dump was the measured majority of this fleet's
-        // log-store disk (O(turns × context) per session).
-        // INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1 opts back into the
-        // archive-everything behavior.
+        // Latest-only rotation, keyed per (source, session id) stream so
+        // distinct snapshot streams folding through one log — a native and
+        // an external archive snapshot of the same wrapper session, or
+        // per-session sub-streams — never delete each other. Historical
+        // rows in session.jsonl keep their metadata (tokens, item counts,
+        // labels) and the dashboard replay already degrades a missing raw
+        // to a raw-less entry — it only ever eagerly loads the latest
+        // snapshot per session. Keeping every per-turn context dump was
+        // the measured majority of this fleet's log-store disk (O(turns ×
+        // context) per session). INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1
+        // opts back into archive-everything (resolved once at open; see
+        // `keep_all_context_snapshots`).
+        //
+        // The predecessor is deleted only AFTER the new row is emitted
+        // (emit flushes per record): a crash between the new-file write
+        // and the row emit must strand an orphan file, never leave a
+        // persisted row pointing at a deleted sidecar.
+        let mut rotated_out: Option<String> = None;
         if let Some(ref new_file) = file {
-            if !context_snapshot_keep_all() {
-                let stream_key = format!("{}\u{1f}{}", source, session_id.unwrap_or_default());
+            if !self.keep_all_context_snapshots {
+                let stream_key = super::context_snapshot_stream_key(
+                    source,
+                    session_id.map(str::trim).filter(|s| !s.is_empty()),
+                );
                 if let Some(previous) = self
                     .last_context_snapshots
                     .insert(stream_key, new_file.clone())
                 {
                     if previous != *new_file {
-                        let _ = fs::remove_file(self.dir.join(&previous));
+                        rotated_out = Some(previous);
                     }
                 }
             }
@@ -1398,6 +1408,9 @@ impl SessionLog {
             file,
             file2: None,
         });
+        if let Some(previous) = rotated_out {
+            let _ = fs::remove_file(self.dir.join(&previous));
+        }
     }
 
     /// Log the full model response. Content is written to a per-turn file.
@@ -1958,6 +1971,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        // Hermetic: pin the policy under test; never inherit the shell's
+        // INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL.
+        log.set_context_snapshot_keep_all(false);
         log.turn_start(1, 0.0, 0);
         let raw1 = serde_json::json!({"messages": ["turn one"]});
         log.context_snapshot(
@@ -2017,6 +2033,61 @@ mod tests {
             "sidecar is compact single-line JSON"
         );
         assert!(log_dir.join(&files[2]).exists(), "other source kept");
+    }
+
+    #[test]
+    fn context_snapshot_rotation_survives_a_session_reopen() {
+        // The rotation map is seeded from persisted rows at open — without
+        // that, every restart/--continue strands the previous process's
+        // latest sidecar forever (retention O(reopenings)).
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        {
+            let mut log = SessionLog::open(log_dir.clone()).unwrap();
+            log.set_context_snapshot_keep_all(false);
+            log.turn_start(1, 0.0, 0);
+            log.context_snapshot(
+                "native",
+                "req 1",
+                Some(1),
+                "test.v1",
+                None,
+                None,
+                None,
+                None,
+                Some(1),
+                &serde_json::json!({"messages": ["first process"]}),
+            );
+        }
+        let first_files = snapshot_files(&log_dir);
+        assert_eq!(first_files.len(), 1);
+        assert!(log_dir.join(&first_files[0]).exists());
+
+        // Second process resumes the same session dir.
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.set_context_snapshot_keep_all(false);
+        log.turn_start(2, 0.0, 0);
+        log.context_snapshot(
+            "native",
+            "req 2",
+            Some(2),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(2),
+            &serde_json::json!({"messages": ["first process", "second process"]}),
+        );
+
+        let files = snapshot_files(&log_dir);
+        assert_eq!(files.len(), 2);
+        assert!(
+            !log_dir.join(&files[0]).exists(),
+            "predecessor sidecar rotated out across the reopen: {}",
+            files[0]
+        );
+        assert!(log_dir.join(&files[1]).exists(), "latest sidecar kept");
     }
 
     #[test]

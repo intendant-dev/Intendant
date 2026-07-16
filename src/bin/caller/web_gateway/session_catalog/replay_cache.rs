@@ -498,6 +498,7 @@ impl TailConvertCtx<'_> {
         inject_replay_entry_metadata(
             &mut value,
             &entry_json,
+            self.log_dir,
             self.replay_session_id.as_deref(),
             self.external_replay_session_id.as_deref(),
             self.wrapper_replay_session_id.as_deref(),

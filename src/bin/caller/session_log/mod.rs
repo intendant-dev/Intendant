@@ -337,8 +337,63 @@ pub struct SessionLog {
     /// for the rotate-on-write policy in
     /// [`Self::context_snapshot_for_session`]: writing a new snapshot
     /// deletes the previous file of the same stream, keeping per-session
-    /// context disk O(1) instead of O(turns × context).
+    /// context disk O(1) instead of O(turns × context). Seeded at open
+    /// from the rows an earlier process persisted, so a resumed session
+    /// keeps rotating instead of stranding its predecessor's sidecar.
     last_context_snapshots: std::collections::HashMap<String, String>,
+    /// Snapshot retention policy, resolved from the environment once at
+    /// open (`INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1` keeps every sidecar).
+    /// Injected as state — not read ambiently per call — so tests pin the
+    /// policy they exercise instead of inheriting the shell's.
+    keep_all_context_snapshots: bool,
+}
+
+/// The rotation-map key for one context-snapshot stream. One derivation
+/// shared by the write path and the open-time reseed, so the two can
+/// never drift.
+pub(super) fn context_snapshot_stream_key(source: &str, session_id: Option<&str>) -> String {
+    format!("{}\u{1f}{}", source, session_id.unwrap_or_default())
+}
+
+/// Rebuild the latest-sidecar-per-stream rotation state from the rows an
+/// earlier process persisted. Without this, every restart/`--continue`
+/// strands the previous process's latest sidecar forever — retention
+/// would grow O(session reopenings). One pass over session.jsonl with a
+/// substring prefilter (only `context_snapshot` rows are parsed), run
+/// once per session open.
+fn seed_context_snapshot_rotation(dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut latest = std::collections::HashMap::new();
+    let Ok(contents) = fs::read_to_string(dir.join("session.jsonl")) else {
+        return latest;
+    };
+    for line in contents.lines() {
+        if !line.contains("\"context_snapshot\"") {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+            continue;
+        }
+        let Some(file) = row.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let data = row.get("data");
+        let source = data
+            .and_then(|d| d.get("source"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let session_id = data
+            .and_then(|d| d.get("session_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        latest.insert(
+            context_snapshot_stream_key(source, session_id),
+            file.to_string(),
+        );
+    }
+    latest
 }
 
 /// Accumulates session statistics as events are logged.
@@ -445,7 +500,8 @@ impl SessionLog {
             },
             voice_utterance_buf: String::new(),
             last_approval_resolved: None,
-            last_context_snapshots: std::collections::HashMap::new(),
+            last_context_snapshots: seed_context_snapshot_rotation(&log_dir),
+            keep_all_context_snapshots: bus_events::context_snapshot_keep_all(),
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -463,6 +519,14 @@ impl SessionLog {
         });
         register_open_session_log_dir(&log_dir);
         Ok(log)
+    }
+
+    /// Test seam for the snapshot retention policy: production resolves it
+    /// from the environment once at [`Self::open`]; tests inject the policy
+    /// they exercise instead of inheriting the shell's.
+    #[cfg(test)]
+    pub(crate) fn set_context_snapshot_keep_all(&mut self, keep_all: bool) {
+        self.keep_all_context_snapshots = keep_all;
     }
 
     /// Write session metadata to `session_meta.json`.

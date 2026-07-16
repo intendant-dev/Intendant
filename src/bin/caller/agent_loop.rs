@@ -1050,14 +1050,19 @@ pub(crate) async fn run_agent_loop(
         // × context) disk with no consumer, and near-identical to the
         // context snapshot below, which carries the exact provider request
         // (a superset). Opt back in with INTENDANT_LOG_MESSAGES_JSON=1.
-        if messages_json_dump_enabled() {
+        // Exception: when the provider can't produce a request snapshot
+        // (the trait default errors — mock and custom providers), the
+        // messages dump is the turn's ONLY exact input record, so it is
+        // written regardless of the gate.
+        let request_snapshot = provider.request_snapshot(conversation.messages(), true);
+        if messages_json_dump_enabled() || request_snapshot.is_err() {
             slog(&session_log, |l| {
                 if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
                     l.messages_input(&json);
                 }
             });
         }
-        match provider.request_snapshot(conversation.messages(), true) {
+        match request_snapshot {
             Ok((context_format, raw_context)) => {
                 bus.send(AppEvent::ContextSnapshot {
                     session_id: local_session_id.clone(),

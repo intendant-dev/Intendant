@@ -186,6 +186,7 @@ fn replay_jsonl_to_outbound_entries_tracked(
             {
                 let Some(mut value) = context_snapshot_replay_entry_without_raw(
                     &entry_json,
+                    log_dir,
                     replay_session_id.as_deref(),
                 ) else {
                     continue;
@@ -193,6 +194,7 @@ fn replay_jsonl_to_outbound_entries_tracked(
                 inject_replay_entry_metadata(
                     &mut value,
                     &entry_json,
+                    log_dir,
                     replay_session_id.as_deref(),
                     external_replay_session_id.as_deref(),
                     wrapper_replay_session_id.as_deref(),
@@ -220,6 +222,7 @@ fn replay_jsonl_to_outbound_entries_tracked(
         inject_replay_entry_metadata(
             &mut value,
             &entry_json,
+            log_dir,
             replay_session_id.as_deref(),
             external_replay_session_id.as_deref(),
             wrapper_replay_session_id.as_deref(),
@@ -331,6 +334,7 @@ pub(crate) fn infer_legacy_model_response_span(
 pub(crate) fn inject_replay_entry_metadata(
     value: &mut serde_json::Value,
     entry_json: &serde_json::Value,
+    log_dir: &Path,
     replay_session_id: Option<&str>,
     external_replay_session_id: Option<&str>,
     wrapper_replay_session_id: Option<&str>,
@@ -366,16 +370,21 @@ pub(crate) fn inject_replay_entry_metadata(
     }
     if obj.get("event").and_then(|v| v.as_str()) == Some("context_snapshot") {
         if let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) {
+            // Availability derives from disk truth: sidecars rotate to
+            // latest-only, so a historical row's file is usually gone —
+            // advertising exact replay for it would send the viewer to a
+            // fetch that cannot succeed.
+            let available = context_snapshot_raw_file_size(entry_json, log_dir).is_some();
             obj.insert(
                 "snapshot_file".to_string(),
                 serde_json::Value::String(file.to_string()),
             );
             obj.insert(
                 "exact_replay_available".to_string(),
-                serde_json::Value::Bool(true),
+                serde_json::Value::Bool(available),
             );
             if let Some(raw) = obj.get_mut("raw") {
-                annotate_context_snapshot_raw_value_exact_replay(raw, file);
+                annotate_context_snapshot_raw_value_exact_replay(raw, file, available);
             }
         }
     }
@@ -630,10 +639,12 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
     wrapper_replay_session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     if context_snapshot_raw_file_too_large_for_replay(entry_json, log_dir) {
-        let mut value = context_snapshot_replay_entry_without_raw(entry_json, replay_session_id)?;
+        let mut value =
+            context_snapshot_replay_entry_without_raw(entry_json, log_dir, replay_session_id)?;
         inject_replay_entry_metadata(
             &mut value,
             entry_json,
+            log_dir,
             replay_session_id,
             external_replay_session_id,
             wrapper_replay_session_id,
@@ -648,6 +659,7 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
     inject_replay_entry_metadata(
         &mut value,
         entry_json,
+        log_dir,
         replay_session_id,
         external_replay_session_id,
         wrapper_replay_session_id,
@@ -657,6 +669,7 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
 
 pub(crate) fn context_snapshot_replay_entry_without_raw(
     entry_json: &serde_json::Value,
+    log_dir: &Path,
     replay_session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     let data = entry_json.get("data");
@@ -708,12 +721,19 @@ pub(crate) fn context_snapshot_replay_entry_without_raw(
         .get("turn")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
+    // Advertise the sidecar only while it exists on disk (latest-only
+    // rotation deletes historical ones) — `context_snapshot_omitted_raw`
+    // derives `exact_replay_available` from its presence.
+    let snapshot_file = entry_json
+        .get("file")
+        .and_then(|v| v.as_str())
+        .filter(|_| context_snapshot_raw_file_size(entry_json, log_dir).is_some());
     let raw = context_snapshot_omitted_raw(
         request_id.as_deref(),
         request_index,
         format.as_str(),
         item_count,
-        entry_json.get("file").and_then(|v| v.as_str()),
+        snapshot_file,
     );
     serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
         session_id,
@@ -1030,7 +1050,9 @@ pub(crate) fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Va
             );
         }
         if let Some(snapshot_file) = snapshot_file.as_deref() {
-            annotate_context_snapshot_raw_exact_replay(entry, snapshot_file);
+            // The raw being omitted here was just materialized from this
+            // sidecar, so its existence is current fact.
+            annotate_context_snapshot_raw_exact_replay(entry, snapshot_file, true);
         }
         return;
     }
@@ -1051,7 +1073,9 @@ pub(crate) fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Va
         false,
     );
     if let Some(snapshot_file) = snapshot_file.as_deref() {
-        annotate_context_snapshot_raw_exact_replay(entry, snapshot_file);
+        // Same fact as above: this arm summarized a raw that was loaded
+        // from the sidecar in this pass, so the file exists right now.
+        annotate_context_snapshot_raw_exact_replay(entry, snapshot_file, true);
     }
 }
 
@@ -1180,16 +1204,21 @@ pub(crate) fn prepare_websocket_bootstrap_replay_entries_ref(
 pub(crate) fn annotate_context_snapshot_raw_exact_replay(
     entry: &mut serde_json::Value,
     snapshot_file: &str,
+    available: bool,
 ) {
     let Some(raw) = entry.get_mut("raw") else {
         return;
     };
-    annotate_context_snapshot_raw_value_exact_replay(raw, snapshot_file);
+    annotate_context_snapshot_raw_value_exact_replay(raw, snapshot_file, available);
 }
 
+/// Stamp a snapshot raw with its sidecar reference and whether the exact
+/// payload can actually be fetched — `available` must come from disk truth
+/// (the sidecar rotates to latest-only), never be assumed.
 pub(crate) fn annotate_context_snapshot_raw_value_exact_replay(
     raw: &mut serde_json::Value,
     snapshot_file: &str,
+    available: bool,
 ) {
     if let Some(context) = raw
         .get_mut("_intendant_context")
@@ -1201,7 +1230,7 @@ pub(crate) fn annotate_context_snapshot_raw_value_exact_replay(
         );
         context.insert(
             "exact_replay_available".to_string(),
-            serde_json::Value::Bool(true),
+            serde_json::Value::Bool(available),
         );
     }
     if let Some(summary) = raw
@@ -1210,7 +1239,7 @@ pub(crate) fn annotate_context_snapshot_raw_value_exact_replay(
     {
         summary.insert(
             "exact_replay_available".to_string(),
-            serde_json::Value::Bool(true),
+            serde_json::Value::Bool(available),
         );
     }
 }

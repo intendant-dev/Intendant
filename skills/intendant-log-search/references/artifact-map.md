@@ -89,6 +89,10 @@ All paths in `file` and `file2` are relative to the session directory.
 
 - Full model input messages for a turn.
 - Logged by `messages_input`.
+- Debug-only since the turn-dump consolidation: written under
+  `INTENDANT_LOG_MESSAGES_JSON=1`, or automatically when the provider
+  produced no context snapshot for the turn (mock/custom providers).
+  Absent otherwise — use the `context_snapshot` file instead.
 
 `turns/turn_NNN_model.txt`
 
@@ -114,8 +118,13 @@ All paths in `file` and `file2` are relative to the session directory.
 
 `turns/turn_NNN_context_<uuid>.json` or `turns/context_<uuid>.json`
 
-- Raw or archived context snapshot payload.
+- Raw or archived context snapshot payload (compact single-line JSON).
 - `context_snapshot` rows include `data.source`, `label`, `request_id`, `request_index`, `format`, `token_count`, `token_count_kind`, `context_window`, `hard_context_window`, `item_count`, optional `session_id`, and `file`.
+- Latest-only: writing a new snapshot deletes the previous sidecar of the
+  same (source, session id) stream, so only the newest row's `file` per
+  stream exists on disk (`INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1` keeps
+  all). Historical rows keep their metadata; a dangling `file` on an old
+  row is expected, not corruption.
 
 ## Runtime Side Files
 
@@ -300,7 +309,7 @@ Important rewind fields:
 ## Artifact Selection Checklist
 
 - User-facing conversation: `transcript.jsonl`, then `session.jsonl` user/voice/model events.
-- Exact model prompt/context: `messages_input` file and `context_snapshot` file.
+- Exact model prompt/context: the LATEST `context_snapshot` file per stream (older sidecars are rotated away; `messages_input` files exist only in debug mode or for snapshot-less providers).
 - Exact assistant output: `model_response` file spans.
 - Reasoning: `reasoning` rows and `turn_NNN_reasoning.txt`.
 - Tool command/output: `agent_input`, `agent_output`, turn stdout/stderr spans, runtime `<nonce>_*.log` files.

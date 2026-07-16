@@ -222,8 +222,12 @@ delegate it. Verified against `main.rs`:
 6. Loads tagged knowledge from the project memory store and injects it.
 7. Loads `INTENDANT.md` project instructions (global then project-local) and
    injects them.
-8. Logs the full messages array to `turns/turn_NNN_messages.json` before each
-   API call.
+8. Builds the provider request snapshot for the dashboard Context tab (the
+   session log keeps only the latest snapshot sidecar per stream). The
+   full messages array is additionally dumped to
+   `turns/turn_NNN_messages.json` only under
+   `INTENDANT_LOG_MESSAGES_JSON=1`, or as a fallback when the provider
+   cannot produce a request snapshot.
 9. Sends the task via `chat_stream()` with `max_tokens`/`max_output_tokens`,
    optional reasoning, optional JSON format, and native tool definitions.
    Requests use exponential-backoff retry (up to 5 attempts) for 429 and 5xx.

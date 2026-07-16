@@ -504,6 +504,25 @@ async fn direct_mode_completes_a_scripted_task_through_the_real_stack() {
         logs.contains("auto_approved"),
         "session log missing the autonomy decision:\n{logs}"
     );
+    // The mock provider has no request_snapshot, so no context snapshot
+    // exists for any turn — the messages dump must then be written as the
+    // turn's only exact input record, debug gate or not.
+    let logs_dir = rig.home.path().join(".intendant").join("logs");
+    let messages_dump_present = std::fs::read_dir(&logs_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|session| {
+            session
+                .path()
+                .join("turns/turn_001_messages.json")
+                .is_file()
+        });
+    assert!(
+        messages_dump_present,
+        "snapshot-less provider must fall back to the messages dump"
+    );
     // The done signal fires only after the mock's expectation saw the
     // runtime's output in the transcript — the round-trip proof.
     assert!(
