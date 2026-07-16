@@ -98,7 +98,7 @@ mod tests {
         all.extend(crate::corpus_ctrl::corpus_ctrl());
         all.extend(crate::corpus_budget::corpus_budget());
         all.extend(crate::corpus_audit::corpus_audit());
-        assert_eq!(all.len(), 167, "the full vector inventory");
+        assert_eq!(all.len(), 168, "the full vector inventory");
         for v in &all {
             let mut required = required_surfaces(v.family, &v.case_kind);
             required.sort_unstable();

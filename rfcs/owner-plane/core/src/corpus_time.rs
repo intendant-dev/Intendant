@@ -494,8 +494,9 @@ pub fn f9_lease_late_then_timely_receipt_admits() -> Vector {
 ///
 /// 1. `i` evaluates with only the LATE receipt held → the issued
 ///    `lease-stale` is terminal (sticky);
-/// 2. the timely-at-first-evaluation world is the endpoint sibling
-///    `lease-late-then-timely-receipt-admits`;
+/// 2. the timely-at-first-evaluation world is the lifecycle sibling
+///    `lease-lifecycle-timely-first-forks` (and, endpoint-only,
+///    `lease-late-then-timely-receipt-admits`);
 /// 3. `timely_i` (a qualified in-window receipt for `i` itself) then
 ///    arrives — the lifecycle re-evaluates revivable rejections and
 ///    `i` REMAINS stale (the stickiness registry is load-bearing:
@@ -612,6 +613,132 @@ pub fn f9_lease_lifecycle_sticky_reproposal() -> Vector {
     }
 }
 
+/// The D-202 lifecycle's OTHER ruled world (the criterion-12 F3
+/// record): the SAME ceremony with timely evidence held at `i`'s
+/// first evaluation — `i` ADMITS at evaluation (held timely evidence
+/// beats held late evidence), so the same-coordinate re-proposal
+/// `i2` arrives at an OCCUPIED coordinate: D-130 fork evidence, and
+/// BOTH variants — the admitted original included — freeze `(fork,
+/// freeze-writer)`, inert until a committed boundary selection.
+/// Together with
+/// `lease-lifecycle-sticky-reproposal` this pins the ruled
+/// cross-structure divergence the D-204 draft narrows the D-202
+/// convergence promise to: the re-proposal carries convergence only
+/// among replicas SHARING the original's evidence-arrival structure;
+/// across structures the pair's verdicts legitimately differ (the
+/// owner-visible residual — asserted per world here, cross-world by
+/// the reducer's `d202_two_worlds_derive_ruled_states` test).
+pub fn f9_lease_lifecycle_timely_first_forks() -> Vector {
+    let mut a = deadline_arc("f9-lease-lifecycle-timely", true);
+    let gid = grant_id_of(&a.ops[3].1);
+    let (d1, d2, lineage) = (a.d1.clone(), a.d2.clone(), a.d1.lineage);
+    let lease = a
+        .rig
+        .lease_stmt(&d2, gid, lineage, T0_MS, T0_MS + 86_400_000);
+    // The same re-proposal shape as the late-first world: a fresh op
+    // re-asserting the claim at coordinate seq 1 — which THIS world's
+    // admitted `i` already occupies.
+    let g = a.grant.clone();
+    let i2 = a.rig.claim_over(
+        &d1,
+        &g,
+        "i2",
+        "the tide gauge reads four feet at the north pier",
+        1,
+        None,
+        TenantOverrides {
+            actor_id: None,
+            capability_epoch: 2,
+            authored_kek_epoch: 1,
+            attested_by: None,
+            writer_gen: None,
+        },
+    );
+    let addr2 = claim_addr(&a.rig, &i2);
+    let late = a
+        .rig
+        .accept_receipt(&d2, a.addr, T0_MS + 86_400_000 + 300_000 + 100_000);
+    let timely_i = a.rig.accept_receipt(&d2, a.addr, T0_MS + 43_200_000);
+    let timely_i2 = a.rig.accept_receipt(&d2, addr2, T0_MS + 43_200_000);
+
+    let mut inputs = JsonMap::new();
+    let mut item_map = JsonMap::new();
+    for (n, op) in &a.ops {
+        item_map.insert((*n).into(), json!(hex_of(&op.encode())));
+    }
+    item_map.insert("late".into(), json!(hex_of(&late.encode())));
+    item_map.insert("timely_i".into(), json!(hex_of(&timely_i.encode())));
+    item_map.insert("timely_i2".into(), json!(hex_of(&timely_i2.encode())));
+    item_map.insert("i2".into(), json!(hex_of(&i2.encode())));
+    inputs.insert("items".into(), Json::Object(item_map));
+    // Both listed orders share the declared arrival structure: a
+    // timely receipt is held at i's first evaluation (delivery 0
+    // additionally holds the late one — held timely evidence beats
+    // held late evidence; delivery 1 holds the timely one alone and
+    // the late receipt arrives after the verdict).
+    inputs.insert(
+        "deliveries".into(),
+        json!([
+            [
+                "c1",
+                "c2",
+                "c3",
+                "c4",
+                "late",
+                "timely_i",
+                "i",
+                "timely_i2",
+                "i2"
+            ],
+            [
+                "c2",
+                "c1",
+                "c3",
+                "c4",
+                "timely_i",
+                "i",
+                "late",
+                "timely_i2",
+                "i2"
+            ]
+        ]),
+    );
+    let mut aux_map = JsonMap::new();
+    aux_map.insert(
+        "index".into(),
+        json!(hex_of(&index_aux(&[
+            (a.addr, a.claim_hash),
+            (addr2, i2.op_hash())
+        ]))),
+    );
+    aux_map.insert("lease.d2".into(), json!(hex_of(&lease.encode())));
+    inputs.insert("aux".into(), Json::Object(aux_map));
+
+    Vector {
+        family: 9,
+        name: "lease-lifecycle-timely-first-forks".into(),
+        case_kind: "evidence-lifecycle".into(),
+        source: "4.7".into(),
+        surfaces: vec!["core".into()],
+        rng: Some(a.rig.rng.into_json()),
+        inputs,
+        expected: Expected::Result(json!({
+            "per_item": [
+                { "item": "c1" },
+                { "item": "c2" },
+                { "item": "c3" },
+                { "item": "c4" },
+                { "item": "late" },
+                { "item": "timely_i" },
+                { "item": "i", "outcome": "fork", "disposition": "freeze-writer" },
+                { "item": "timely_i2" },
+                { "item": "i2", "outcome": "fork", "disposition": "freeze-writer" },
+            ],
+            "arrival_is_semantic": true,
+        })),
+    }
+}
+
 fn hex_of(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -701,6 +828,7 @@ pub fn corpus_time() -> Vec<Vector> {
         f9_lease_stale_quarantines(),
         f9_lease_late_then_timely_receipt_admits(),
         f9_lease_lifecycle_sticky_reproposal(),
+        f9_lease_lifecycle_timely_first_forks(),
         f9_lease_present_no_receipt_pends(),
         f9_lease_overlong_window_invalid(),
     ]

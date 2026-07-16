@@ -45,12 +45,14 @@ Proposed:
 > late — is held at its first evaluation), convergence rides the
 > writer's re-proposed operation at the freed coordinate. A replica
 > holding timely evidence at first evaluation admits the ORIGINAL
-> operation, and the same-coordinate re-proposal reaching it is
-> D-130 fork evidence (`fork`, `freeze-writer`) — the pair is
-> reconcilable only by a committed boundary selection (the D-130
-> lane). The cross-structure divergence of the pair's verdicts is a
-> stated, owner-visible residual of alternative (ii). Held timely
-> evidence beats held late evidence at first evaluation.
+> operation at evaluation, and the same-coordinate re-proposal
+> reaching it contests an OCCUPIED coordinate: D-130 fork evidence —
+> BOTH variants, the admitted original included, freeze (`fork`,
+> `freeze-writer`), reconcilable only by a committed boundary
+> selection (the D-130 lane). The cross-structure divergence of the
+> pair's verdicts is a stated, owner-visible residual of
+> alternative (ii). Held timely evidence beats held late evidence at
+> first evaluation.
 
 ### Proposed decision row
 
@@ -60,17 +62,21 @@ Proposed:
 > class (timely vs late) at the original operation's first evaluation
 > — late-first replicas issue sticky `lease-stale` and admit the
 > re-proposal at the freed coordinate; timely-first replicas admit
-> the original, and the arriving re-proposal is D-130 same-coordinate
-> fork evidence (`fork`, `freeze-writer`), the pair reconcilable only
-> by a committed boundary selection. The cross-structure verdict
-> divergence is a stated owner-visible residual of alternative (ii)
-> (v0.5.20's unqualified carrier sentence promised a cross-structure
-> convergence no same-coordinate retry can honor — the Gate-A
-> criterion-12 review's executable trace); harness enforcement: a
-> fold vector's listed deliveries MUST share the declared
-> evidence-arrival structure, and the structure pair is vector-pinned
-> (`f9-lease-lifecycle-sticky-reproposal` late-first /
-> `f9-lease-lifecycle-timely-first-forks` timely-first) | Ratified,
+> the original at evaluation, and the arriving re-proposal contests
+> an OCCUPIED coordinate: D-130 fork evidence — BOTH variants, the
+> admitted original included, freeze (`fork`, `freeze-writer`),
+> reconcilable only by a committed boundary selection. The
+> cross-structure verdict divergence is a stated owner-visible
+> residual of alternative (ii) (v0.5.20's unqualified carrier
+> sentence promised a cross-structure convergence no same-coordinate
+> retry can honor — the Gate-A criterion-12 review's executable
+> trace); harness enforcement: an evidence-lifecycle vector's listed
+> deliveries MUST share the declared evidence-arrival structure, and
+> the structure pair is vector-pinned
+> (`lease-lifecycle-sticky-reproposal` late-first /
+> `lease-lifecycle-timely-first-forks` timely-first, with the
+> cross-world relationship pinned from one byte source by the
+> reducer's `d202_two_worlds_derive_ruled_states` test) | Ratified,
 > owner, 2026-07-__ |
 
 ### Mechanical consequences on ratification (owner's act, not this tranche's)

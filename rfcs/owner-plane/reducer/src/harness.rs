@@ -1182,7 +1182,7 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            167,
+            168,
             "the corpus through the criterion-12 tranche"
         );
         for r in &reports {
@@ -1197,6 +1197,89 @@ mod tests {
             );
             assert_eq!(r.semantics, SemStatus::Pass, "{}", r.file);
         }
+    }
+
+    /// The D-202 pair's cross-world assertion (the criterion-12 F3
+    /// record, kept executable): ONE committed ceremony's bytes run
+    /// under BOTH ruled evidence-arrival structures, each world's
+    /// derived Memory state asserted exactly — the divergence is the
+    /// ruled, owner-visible residual the D-204 draft narrows the
+    /// D-202 convergence promise around. Late-first: the issued
+    /// `lease-stale` is terminal and the re-proposal admits at the
+    /// freed coordinate. Timely-first: the original admits and the
+    /// same-coordinate re-proposal is D-130 fork evidence. The
+    /// committed vector pair (`f09-lease-lifecycle-sticky-reproposal`
+    /// / `f09-lease-lifecycle-timely-first-forks`) pins each world
+    /// through the full differential lane; this test pins the
+    /// CROSS-world relationship from one byte source.
+    #[test]
+    fn d202_two_worlds_derive_ruled_states() {
+        use crate::fold::{run_lifecycle, Verdict};
+        let path = plane_root()
+            .join("vectors")
+            .join("f09-lease-lifecycle-sticky-reproposal.json");
+        let v: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut items = std::collections::BTreeMap::new();
+        for (name, hv) in v["inputs"]["items"].as_object().unwrap() {
+            items.insert(name.clone(), unhex(hv.as_str().unwrap()).unwrap());
+        }
+        let aux = parse_aux(&v).unwrap();
+        let order =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+        let late_first = order(&[
+            "c1",
+            "c2",
+            "c3",
+            "c4",
+            "late",
+            "i",
+            "timely_i",
+            "timely_i2",
+            "i2",
+        ]);
+        let timely_first = order(&[
+            "c1",
+            "c2",
+            "c3",
+            "c4",
+            "late",
+            "timely_i",
+            "i",
+            "timely_i2",
+            "i2",
+        ]);
+        let lf = run_lifecycle(&items, &aux, &late_first)
+            .unwrap()
+            .final_verdicts;
+        let tf = run_lifecycle(&items, &aux, &timely_first)
+            .unwrap()
+            .final_verdicts;
+        assert_eq!(
+            lf["i"],
+            Verdict::Rejected("lease-stale", "quarantine-reproposal"),
+            "late-first: the issued stale is terminal where issued"
+        );
+        assert_eq!(
+            lf["i2"],
+            Verdict::Admitted,
+            "late-first: the re-proposal admits at the freed coordinate"
+        );
+        assert_eq!(
+            tf["i"],
+            Verdict::Rejected("fork", "freeze-writer"),
+            "timely-first: the admitted original freezes too once the \
+             re-proposal contests its coordinate (D-130 — both variants \
+             inert pending a committed selection)"
+        );
+        assert_eq!(
+            tf["i2"],
+            Verdict::Rejected("fork", "freeze-writer"),
+            "timely-first: the same-coordinate re-proposal is fork evidence"
+        );
+        assert_ne!(
+            lf, tf,
+            "the ruled cross-structure divergence is real, not incidental"
+        );
     }
 
     /// The CLI gate goes red on semantic failure: a committed vector

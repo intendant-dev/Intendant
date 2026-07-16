@@ -70,6 +70,7 @@
     ],
     "fork": [
       "equal-coordinates-differing-hash",
+      "lease-lifecycle-timely-first-forks",
       "tenant-same-seq-fork"
     ],
     "hosted-ceiling": [

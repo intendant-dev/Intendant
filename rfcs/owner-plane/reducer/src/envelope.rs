@@ -449,8 +449,9 @@ mod tests {
         // R3 arms (forged, unadmitted). Only the stmt basis-typing
         // and unheld-pends journal fixtures remain frame/aux-only.
         // +2: the criterion-12 D-99 multi-fault pair (CDDL-invalid
-        // × C2, CDDL-invalid × consumed-request-ID).
-        assert_eq!(geneses, 80);
+        // × C2, CDDL-invalid × consumed-request-ID); +1: the D-202
+        // timely-first world sibling.
+        assert_eq!(geneses, 81);
     }
 
     /// Tampering any byte of the header breaks the signature; the
