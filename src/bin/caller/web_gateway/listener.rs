@@ -10,9 +10,21 @@ use super::*;
 
 pub(crate) const TLS_FAILURE_LOG_INTERVAL_SECS: u64 = 30;
 
+/// Size cap for the rate-limiter map: entries are keyed by
+/// `kind|peer|detail`, so an internet-exposed port collects one entry per
+/// distinct scanner address for the daemon's lifetime. At the cap, entries
+/// stale for a full log interval are swept; if everything is somehow live,
+/// the map is reset (worst case: one duplicate log line per key).
+pub(crate) const TLS_FAILURE_LOG_MAX_ENTRIES: usize = 4096;
+
 #[derive(Debug)]
 pub(crate) struct TlsFailureLogEntry {
     last_logged: std::time::Instant,
+    /// Updated on EVERY hit, suppressed ones included — the eviction
+    /// signal. `last_logged` alone is recency-BLIND for a continuously
+    /// hot suppressed key (it never re-logs inside the window), which
+    /// made exactly the keys the limiter exists for look "oldest".
+    last_seen: std::time::Instant,
     suppressed: u64,
 }
 
@@ -27,16 +39,40 @@ pub(crate) fn log_tls_failure_rate_limited(
     let now = std::time::Instant::now();
     let key = format!("{kind}|{peer}|{detail}");
     let mut map = state.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= TLS_FAILURE_LOG_MAX_ENTRIES && !map.contains_key(&key) {
+        map.retain(|_, entry| {
+            now.duration_since(entry.last_seen)
+                < std::time::Duration::from_secs(TLS_FAILURE_LOG_INTERVAL_SECS)
+        });
+        if map.len() >= TLS_FAILURE_LOG_MAX_ENTRIES {
+            // Everything is inside the window (key churn): evict the
+            // least-recently-SEEN entries down to half the cap instead of
+            // clearing — a clear-all would wipe the HOT keys' suppression
+            // state and let them log again every churn cycle. Log-budget
+            // only, so the sort on this rare overflow path is fine.
+            let mut by_age: Vec<(String, std::time::Instant)> = map
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.last_seen))
+                .collect();
+            by_age.sort_by_key(|(_, last_seen)| *last_seen);
+            let excess = map.len().saturating_sub(TLS_FAILURE_LOG_MAX_ENTRIES / 2);
+            for (stale_key, _) in by_age.into_iter().take(excess) {
+                map.remove(&stale_key);
+            }
+        }
+    }
     match map.get_mut(&key) {
         Some(entry)
             if now.duration_since(entry.last_logged)
                 < std::time::Duration::from_secs(TLS_FAILURE_LOG_INTERVAL_SECS) =>
         {
+            entry.last_seen = now;
             entry.suppressed = entry.suppressed.saturating_add(1);
         }
         Some(entry) => {
             let suppressed = entry.suppressed;
             entry.last_logged = now;
+            entry.last_seen = now;
             entry.suppressed = 0;
             drop(map);
             if suppressed > 0 {
@@ -53,12 +89,63 @@ pub(crate) fn log_tls_failure_rate_limited(
                 key,
                 TlsFailureLogEntry {
                     last_logged: now,
+                    last_seen: now,
                     suppressed: 0,
                 },
             );
             drop(map);
             eprintln!("[web_gateway] {kind} from {peer}: {detail}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tls_log_budget_tests {
+    use super::*;
+
+    /// A continuously hot key whose repeats are all SUPPRESSED (so its
+    /// `last_logged` never moves) must survive an overflow eviction —
+    /// evicting by log recency instead of seen recency recreated the
+    /// original per-cycle log flood for exactly the hottest keys.
+    #[test]
+    fn overflow_eviction_keeps_hot_suppressed_keys() {
+        let state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
+        log_tls_failure_rate_limited(&state, "10.0.0.1:1", "tls handshake failed", "hot");
+        // Churn: distinct scanner keys fill the map to the cap.
+        for index in 0..(TLS_FAILURE_LOG_MAX_ENTRIES - 1) {
+            log_tls_failure_rate_limited(
+                &state,
+                &format!("10.0.{}.{}:2", index / 256, index % 256),
+                "tls handshake failed",
+                "churn",
+            );
+        }
+        // The hot key keeps hitting — suppressed (inside the interval),
+        // so only `last_seen` moves.
+        log_tls_failure_rate_limited(&state, "10.0.0.1:1", "tls handshake failed", "hot");
+        {
+            let map = state.lock().unwrap();
+            assert_eq!(map.len(), TLS_FAILURE_LOG_MAX_ENTRIES);
+            let hot = map
+                .get("tls handshake failed|10.0.0.1:1|hot")
+                .expect("hot key present before overflow");
+            assert_eq!(hot.suppressed, 1, "second hit rides suppression");
+        }
+        // One more distinct key overflows the cap and triggers eviction.
+        log_tls_failure_rate_limited(&state, "10.9.9.9:3", "tls handshake failed", "overflow");
+        let map = state.lock().unwrap();
+        assert!(
+            map.len() <= TLS_FAILURE_LOG_MAX_ENTRIES / 2 + 1,
+            "eviction trims to half cap (+ the new key), got {}",
+            map.len()
+        );
+        let hot = map
+            .get("tls handshake failed|10.0.0.1:1|hot")
+            .expect("hot suppressed key must survive eviction");
+        assert_eq!(
+            hot.suppressed, 1,
+            "suppression state rides through the eviction"
+        );
     }
 }
 
@@ -384,7 +471,9 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
     }
     let agent_card_json =
         serde_json::to_string(&agent_card_value).unwrap_or_else(|_| "{}".to_string());
-    let agent_card_value_for_targets = agent_card_value.clone();
+    // Arc'd once at spawn: the per-request `HttpRequestCtx` rebuild used to
+    // deep-clone this multi-KB JSON tree for every request since keep-alive.
+    let agent_card_value_for_targets = Arc::new(agent_card_value.clone());
     let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
 
     // Warm the session list in the background so the first dashboard
@@ -1718,6 +1807,10 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
                     let (direct_tx, direct_rx) = mpsc::unbounded_channel::<String>();
+                    // Bounded PTY-output lane: terminal forwarders park on a
+                    // stalled socket instead of flooding the direct lane.
+                    let (terminal_forward_tx, terminal_forward_rx) =
+                        mpsc::channel::<String>(crate::web_gateway::TERMINAL_FORWARD_LANE_CAP);
 
                     // Subscribe before reading the authority bootstrap. Any
                     // transition racing the snapshot is then either represented
@@ -2106,6 +2199,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                         bus: bus.clone(),
                         query_ctx: query_ctx.clone(),
                         direct_tx: direct_tx.clone(),
+                        terminal_forward_tx,
                         voice_debug: voice_debug.clone(),
                         live_provider: session_provider.clone(),
                         live_model: session_model.clone(),
@@ -2142,6 +2236,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     let outbound = tokio::spawn(ws_outbound_task(
                         outbound_rx,
                         direct_rx,
+                        terminal_forward_rx,
                         ws_tx,
                         authority_change_rx,
                         connection_id.clone(),

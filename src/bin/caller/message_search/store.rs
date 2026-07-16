@@ -105,6 +105,14 @@ pub(crate) enum PublishOutcome {
     RejectedTombstoned,
 }
 
+/// One queued session publish for [`Store::publish_sessions`].
+pub(crate) struct PendingPublish {
+    pub session_key: String,
+    pub shard: SessionShard,
+    pub cursors: Vec<SourceCursor>,
+    pub source_gone: bool,
+}
+
 impl Store {
     pub(crate) fn open(root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(root.join("generations"))?;
@@ -155,6 +163,9 @@ impl Store {
 
     /// Publish one session's freshly derived shard. `watermark` is the
     /// publisher's consumed-source progress (sum of cursor offsets).
+    /// Production publishes ride [`Self::publish_sessions`] (one manifest
+    /// write per batch); this single-session form serves the tests.
+    #[cfg(test)]
     pub(crate) fn publish_session(
         &self,
         session_key: &str,
@@ -164,6 +175,82 @@ impl Store {
     ) -> std::io::Result<PublishOutcome> {
         let _lock = WriterLock::acquire(&self.root)?;
         let mut manifest = self.read_manifest();
+        let outcome =
+            self.apply_publish(&mut manifest, session_key, shard, cursors, source_gone)?;
+        if matches!(outcome, PublishOutcome::Published) {
+            self.write_published_manifest(&mut manifest)?;
+        }
+        Ok(outcome)
+    }
+
+    /// Publish a whole batch under ONE writer lock, ONE manifest read and
+    /// (at most) ONE manifest write. The per-session publish used to
+    /// read + parse and pretty-serialize + rewrite the whole manifest for
+    /// every published session, every sweep — measured ~7 GB/day of
+    /// manifest write traffic on a busy box. Staleness/tombstone checks
+    /// run per session against the same locked view they always ran under.
+    pub(crate) fn publish_sessions(
+        &self,
+        batch: Vec<PendingPublish>,
+    ) -> Vec<std::io::Result<PublishOutcome>> {
+        fn replicate_error(error: &std::io::Error) -> std::io::Error {
+            std::io::Error::new(error.kind(), error.to_string())
+        }
+        if batch.is_empty() {
+            return Vec::new();
+        }
+        let _lock = match WriterLock::acquire(&self.root) {
+            Ok(lock) => lock,
+            Err(error) => return batch.iter().map(|_| Err(replicate_error(&error))).collect(),
+        };
+        let mut manifest = self.read_manifest();
+        let mut published_any = false;
+        let outcomes: Vec<std::io::Result<PublishOutcome>> = batch
+            .into_iter()
+            .map(|pending| {
+                let outcome = self.apply_publish(
+                    &mut manifest,
+                    &pending.session_key,
+                    &pending.shard,
+                    pending.cursors,
+                    pending.source_gone,
+                );
+                if matches!(outcome, Ok(PublishOutcome::Published)) {
+                    published_any = true;
+                }
+                outcome
+            })
+            .collect();
+        if published_any {
+            if let Err(error) = self.write_published_manifest(&mut manifest) {
+                // Nothing persisted: report the write failure for every
+                // entry (orphaned generation files are GC'd as
+                // unreferenced).
+                return outcomes
+                    .iter()
+                    .map(|_| Err(replicate_error(&error)))
+                    .collect();
+            }
+        }
+        outcomes
+    }
+
+    fn write_published_manifest(&self, manifest: &mut Manifest) -> std::io::Result<()> {
+        manifest.schema = 1;
+        manifest.parser_version = PARSER_VERSION;
+        manifest.updated_at_ms = now_ms();
+        self.write_manifest(manifest)
+    }
+
+    /// The caller holds the writer lock and owns writing `manifest` back.
+    fn apply_publish(
+        &self,
+        manifest: &mut Manifest,
+        session_key: &str,
+        shard: &SessionShard,
+        cursors: Vec<SourceCursor>,
+        source_gone: bool,
+    ) -> std::io::Result<PublishOutcome> {
         if manifest.tombstones.contains_key(session_key) {
             return Ok(PublishOutcome::RejectedTombstoned);
         }
@@ -189,17 +276,33 @@ impl Store {
                     .cursors
                     .iter()
                     .all(|old| cursors.iter().any(|new| new.path == old.path));
-            let same_source_state = same_paths
-                && existing.cursors.iter().all(|old| {
-                    cursors
-                        .iter()
-                        .find(|new| new.path == old.path)
-                        .is_none_or(|new| {
-                            new.prefix_hash16 == old.prefix_hash16 && new.identity == old.identity
-                        })
+            // Same cursor set with a LOWER watermark: either a stale
+            // writer (lost race — an older snapshot of the same growing
+            // byte stream) or a legitimate rebuild after the source
+            // itself changed under the stored cursors. Snapshot-to-
+            // snapshot field comparison cannot tell those apart — two
+            // honest snapshots of a growing file differ in len and in
+            // tail-hash-at-offset, while a prefix-preserving in-place
+            // TRUNCATION kept head hash + identity equal and was
+            // rejected as stale forever (every sweep re-derived and
+            // re-rejected it). Ask the STORED cursors about the live
+            // files instead: while every one still describes its file
+            // (Unchanged/Appended), the incoming lower watermark is a
+            // stale view — once any reads Rewritten/Gone, the source
+            // genuinely changed and the rebuild is the fresher truth.
+            // (Two ≤4 KiB window reads per stored cursor, only on the
+            // rare lower-watermark path, under the writer lock.)
+            if watermark < existing.source_watermark && same_paths {
+                let stored_still_current = existing.cursors.iter().all(|old| {
+                    matches!(
+                        old.check(),
+                        super::cursor::CursorCheck::Unchanged
+                            | super::cursor::CursorCheck::Appended
+                    )
                 });
-            if watermark < existing.source_watermark && same_source_state {
-                return Ok(PublishOutcome::RejectedStale);
+                if stored_still_current {
+                    return Ok(PublishOutcome::RejectedStale);
+                }
             }
         }
 
@@ -227,10 +330,6 @@ impl Store {
                 source_gone,
             },
         );
-        manifest.schema = 1;
-        manifest.parser_version = PARSER_VERSION;
-        manifest.updated_at_ms = now_ms();
-        self.write_manifest(&mut manifest)?;
         Ok(PublishOutcome::Published)
     }
 
@@ -301,7 +400,11 @@ impl Store {
 
     fn write_manifest(&self, manifest: &mut Manifest) -> std::io::Result<()> {
         manifest.revision += 1;
-        let body = serde_json::to_string_pretty(manifest).map_err(std::io::Error::other)?;
+        // Compact, not pretty: the manifest is machine-read only, grows
+        // with session count (1.2 MB at ~1,600 sessions), and is rewritten
+        // on every publish flush — indentation was pure write
+        // amplification.
+        let body = serde_json::to_string(manifest).map_err(std::io::Error::other)?;
         crate::file_watcher::atomic_write(&self.manifest_path(), body.as_bytes())
     }
 }
@@ -400,6 +503,75 @@ mod tests {
             std::fs::write(&path, "line\n".repeat(64)).unwrap();
         }
         SourceCursor::capture(&path, offset).unwrap()
+    }
+
+    /// A prefix-preserving in-place TRUNCATION legitimately lowers the
+    /// watermark: the rebuild must be ACCEPTED (the tail window / len
+    /// prove the source changed), not rejected as a stale writer forever.
+    #[test]
+    fn truncated_source_rebuild_with_lower_watermark_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let path = tmp.path().join("truncating.jsonl");
+        // Head fills the 4 KiB prefix window so truncation preserves it.
+        let head = format!("{}\n", "h".repeat(4096));
+        std::fs::write(&path, format!("{head}tail-one\ntail-two\n")).unwrap();
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        let full_cursor = SourceCursor::capture(&path, full_len).unwrap();
+        let shard = SessionShard {
+            records: vec![record(100, "before truncation")],
+            marks: vec![],
+        };
+        assert!(matches!(
+            store
+                .publish_session("intendant:trunc", &shard, vec![full_cursor], false)
+                .unwrap(),
+            PublishOutcome::Published
+        ));
+
+        // In-place truncation, first 4 KiB intact, same inode.
+        let truncated = format!("{head}tail-one\n");
+        std::fs::write(&path, &truncated).unwrap();
+        let short_len = std::fs::metadata(&path).unwrap().len();
+        assert!(short_len < full_len);
+        let short_cursor = SourceCursor::capture(&path, short_len).unwrap();
+        let rebuilt = SessionShard {
+            records: vec![record(101, "after truncation")],
+            marks: vec![],
+        };
+        assert!(
+            matches!(
+                store
+                    .publish_session(
+                        "intendant:trunc",
+                        &rebuilt,
+                        vec![short_cursor.clone()],
+                        false
+                    )
+                    .unwrap(),
+                PublishOutcome::Published
+            ),
+            "a genuinely changed source must accept the lower-watermark rebuild"
+        );
+        // Steady state afterwards: the stored cursor matches the disk, so
+        // the next sweep reads Unchanged — no rebuild loop.
+        assert_eq!(
+            short_cursor.check(),
+            super::super::cursor::CursorCheck::Unchanged
+        );
+        // And a REAL stale writer (same source state, lower watermark)
+        // is still rejected.
+        let stale = SessionShard {
+            records: vec![record(99, "stale race loser")],
+            marks: vec![],
+        };
+        let stale_cursor = SourceCursor::capture(&path, short_len - 9).unwrap();
+        assert!(matches!(
+            store
+                .publish_session("intendant:trunc", &stale, vec![stale_cursor], false)
+                .unwrap(),
+            PublishOutcome::RejectedStale
+        ));
     }
 
     #[test]

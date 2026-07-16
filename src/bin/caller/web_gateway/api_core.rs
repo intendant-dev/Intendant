@@ -246,7 +246,11 @@ impl ApiResponse {
 #[derive(Clone, Debug)]
 pub(crate) struct RequestAuthority {
     pub(crate) principal: crate::access::iam::AccessPrincipal,
-    pub(crate) iam_state: Option<crate::access::iam::LocalIamState>,
+    /// Shared snapshot from the stat-fingerprint cache
+    /// (`iam::load_state_cached_arc`): one consistent state per request,
+    /// without deep-cloning principals/grants/audit history per request
+    /// or per context clone (e.g. into `spawn_blocking`).
+    pub(crate) iam_state: Option<std::sync::Arc<crate::access::iam::LocalIamState>>,
 }
 
 impl RequestAuthority {

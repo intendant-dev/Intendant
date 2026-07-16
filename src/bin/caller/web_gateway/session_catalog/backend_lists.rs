@@ -453,16 +453,17 @@ pub(crate) fn list_codex_sessions_with_limit(
         }
     }
 
-    let mut files = collect_recent_files(&codex.join("sessions"), ".jsonl", scan_limit);
-    files.extend(collect_recent_files(
+    let mut files = collect_recent_files_keyed(&codex.join("sessions"), ".jsonl", scan_limit);
+    files.extend(collect_recent_files_keyed(
         &codex.join("archived_sessions"),
         ".jsonl",
         scan_limit,
     ));
-    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
+    // Keys carried out of the walks: no re-stat per comparison.
+    files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
     files.truncate(scan_limit);
     let mut summaries = Vec::new();
-    for path in files {
+    for (_, path) in files {
         let Some(summary) = codex_session_list_summary_from_file(&path) else {
             continue;
         };
@@ -611,53 +612,70 @@ pub(crate) fn list_codex_sessions_with_limit(
     rows.into_values().collect()
 }
 
-pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
-    let key = session_list_cache_key("claude-code", path, SESSION_ROW_PREVIEW_FORMAT)?;
-    if let Some(row) = cached_session_list_row(&key) {
-        return Some(row);
-    }
+/// Incremental fold state for [`claude_session_list_row_from_file`]. An
+/// ACTIVE transcript invalidates its (len, mtime, ino) row-cache key on
+/// every append, which used to re-parse the whole multi-MB file per list
+/// rebuild, per live session, for as long as the agent runs — the
+/// dominant steady CPU sink of the catalog. The accumulator checkpoints
+/// the fold + consumed byte offset per path, so an append parses only
+/// the suffix; identity/length/prefix-hash checks downgrade any rewrite
+/// or replacement to the full re-parse.
+#[derive(Clone, Default)]
+struct ClaudeRowAccumulator {
+    identity: Option<crate::platform::FileIdentity>,
+    /// Head-hash over `prefix_hash_bytes` (≤ 4 KiB, and never more than
+    /// the consumed range, so resumed and fresh captures compare the
+    /// same window).
+    prefix_hash16: String,
+    prefix_hash_bytes: usize,
+    /// Second rewrite-detection window: hash of the last
+    /// `min(4096, consumed_len)` bytes ENDING at the consumed offset.
+    /// The head window alone cannot exclude a rewrite past the first
+    /// 4 KiB that also grows the file; requiring both narrows the
+    /// undetected residual to a head-and-tail-preserving growth rewrite
+    /// (documented, same contract as the message-search cursor).
+    consumed_tail_hash16: String,
+    /// Offset just past the last COMPLETE line folded.
+    consumed_len: u64,
+    /// Complete lines folded so far — continues the historical 0-based
+    /// `line-{idx}` usage-dedup keys across resumed parses.
+    lines_consumed: u64,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    session_cwd: Option<String>,
+    cwd: Option<String>,
+    task: Option<String>,
+    model: Option<String>,
+    usage: SessionUsage,
+    daily_usage: BTreeMap<String, SessionUsage>,
+    seen_usage: HashSet<String>,
+    turns: u64,
+    preview: SessionPreviewBuilder,
+}
 
-    let session_id = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default()
-        .to_string();
-    if session_id.is_empty() {
-        return None;
-    }
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut created_at = None;
-    let mut updated_at = None;
-    let mut session_cwd = None;
-    let mut cwd = None;
-    let mut task = None;
-    let mut model = None;
-    let mut usage = SessionUsage::default();
-    let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
-    let mut seen_usage = HashSet::new();
-    let mut turns = 0u64;
-    let mut preview = SessionPreviewBuilder::default();
-    for (line_idx, line_result) in reader.lines().enumerate() {
-        let Ok(line) = line_result else {
-            continue;
+impl ClaudeRowAccumulator {
+    fn fold_line(&mut self, line: &str) {
+        let line_idx = self.lines_consumed;
+        self.lines_consumed += 1;
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
         };
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
-        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        self.created_at = self
+            .created_at
+            .take()
+            .or_else(|| value_str(&obj, "timestamp"));
+        self.updated_at = value_str(&obj, "timestamp").or(self.updated_at.take());
         if let Some(value) = value_str(&obj, "cwd") {
-            if session_cwd.is_none() {
-                session_cwd = Some(value.clone());
+            if self.session_cwd.is_none() {
+                self.session_cwd = Some(value.clone());
             }
-            cwd = Some(value);
+            self.cwd = Some(value);
         }
         let record_type = obj.get("type").and_then(|v| v.as_str());
         let record_is_meta = obj.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false);
         if record_type == Some("user") {
-            turns += 1;
-            if task.is_none() {
+            self.turns += 1;
+            if self.task.is_none() {
                 if let Some(msg) = obj.get("message") {
                     if let Some(content) = msg.get("content").and_then(message_content_text) {
                         // Supervised sessions carry the Intendant bootstrap
@@ -670,7 +688,7 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
                             .next()
                             .unwrap_or(&content)
                             .trim_end();
-                        task = Some(compact_text(user_text, 180));
+                        self.task = Some(compact_text(user_text, 180));
                     }
                 }
             }
@@ -689,7 +707,7 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
                         .next()
                         .unwrap_or(&content)
                         .trim_end();
-                    preview.push_user(user_text);
+                    self.preview.push_user(user_text);
                 }
             }
         }
@@ -699,12 +717,12 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
                 .and_then(|m| m.get("content"))
                 .and_then(message_prose_text)
             {
-                preview.push_assistant(&content);
+                self.preview.push_assistant(&content);
             }
         }
         if let Some(msg) = obj.get("message") {
-            if model.is_none() {
-                model = msg
+            if self.model.is_none() {
+                self.model = msg
                     .get("model")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
@@ -713,46 +731,315 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
                 let key = value_str(&obj, "requestId")
                     .or_else(|| value_str(msg, "id"))
                     .unwrap_or_else(|| format!("line-{line_idx}"));
-                if seen_usage.insert(key) {
-                    usage.add(parsed);
+                if self.seen_usage.insert(key) {
+                    self.usage.add(parsed);
                     if let Some(day) =
                         usage_day_from_timestamp(value_str(&obj, "timestamp").as_deref())
                     {
-                        daily_usage.entry(day).or_default().add(parsed);
+                        self.daily_usage.entry(day).or_default().add(parsed);
                     }
                 }
             }
         }
     }
-    let effective_cwd = cwd.or_else(|| session_cwd.clone());
-    let project_root =
-        derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
-    let mut session = external_session_json(
-        "claude-code",
-        "Claude Code",
-        session_id.clone(),
-        session_id,
-        created_at
-            .or_else(|| updated_at.clone())
-            .or_else(|| file_mtime_string(path)),
-        file_mtime_string(path).or(updated_at),
-        None,
-        task,
-        "Claude Code",
-        model.clone(),
-        turns,
-        project_root,
-        effective_cwd,
-        Some(path.to_string_lossy().to_string()),
-        file_size(path),
-    );
-    apply_session_usage(&mut session, usage, model.as_deref());
-    apply_session_daily_usage(&mut session, &daily_usage, model.as_deref());
-    if let Some(preview) = preview.into_value() {
-        session["preview"] = preview;
+
+    /// Whether the checkpoint may resume against the file's current state:
+    /// same reliable identity, no truncation, unchanged consumed head AND
+    /// unchanged consumed tail. Requiring both hash windows narrows the
+    /// undetected rewrite to one that preserves the first 4 KiB, the last
+    /// 4 KiB before the consumed offset, and grows the file — the same
+    /// documented residual as the message-search cursor.
+    fn resumable_for(&self, path: &Path, current_len: u64) -> bool {
+        if current_len < self.consumed_len {
+            return false;
+        }
+        let identity_ok = match (
+            self.identity,
+            crate::platform::FileIdentity::from_path(path).ok(),
+        ) {
+            (Some(saved), Some(current)) => {
+                saved.is_reliable() && current.is_reliable() && saved == current
+            }
+            _ => false,
+        };
+        if !identity_ok {
+            return false;
+        }
+        if self.consumed_tail_hash16.is_empty()
+            || crate::message_search::cursor::tail_hash16_ending_at(path, self.consumed_len)
+                .as_deref()
+                != Some(self.consumed_tail_hash16.as_str())
+        {
+            return false;
+        }
+        crate::message_search::cursor::prefix_hash16_bytes(path, self.prefix_hash_bytes).as_deref()
+            == Some(self.prefix_hash16.as_str())
+    }
+
+    fn render(self, path: &Path, session_id: String) -> serde_json::Value {
+        let effective_cwd = self.cwd.or_else(|| self.session_cwd.clone());
+        let project_root =
+            derive_project_root_from_cwd(self.session_cwd.as_deref().or(effective_cwd.as_deref()));
+        let mut session = external_session_json(
+            "claude-code",
+            "Claude Code",
+            session_id.clone(),
+            session_id,
+            self.created_at
+                .or_else(|| self.updated_at.clone())
+                .or_else(|| file_mtime_string(path)),
+            file_mtime_string(path).or(self.updated_at),
+            None,
+            self.task,
+            "Claude Code",
+            self.model.clone(),
+            self.turns,
+            project_root,
+            effective_cwd,
+            Some(path.to_string_lossy().to_string()),
+            file_size(path),
+        );
+        apply_session_usage(&mut session, self.usage, self.model.as_deref());
+        apply_session_daily_usage(&mut session, &self.daily_usage, self.model.as_deref());
+        if let Some(preview) = self.preview.into_value() {
+            session["preview"] = preview;
+        }
+        session
+    }
+}
+
+/// Retained checkpoints for the incremental claude row fold, keyed by
+/// transcript path. Bounded like the sibling row caches.
+fn claude_row_accumulators() -> &'static Mutex<HashMap<PathBuf, ClaudeRowAccumulator>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ClaudeRowAccumulator>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+const CLAUDE_ROW_ACCUMULATOR_CAP: usize = 256;
+
+pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
+    let key = session_list_cache_key("claude-code", path, SESSION_ROW_PREVIEW_FORMAT)?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+
+    let session_id = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    let current_len = std::fs::metadata(path).ok()?.len();
+    let checkpoint = claude_row_accumulators()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path);
+    let mut acc = match checkpoint {
+        Some(saved) if saved.resumable_for(path, current_len) => saved,
+        _ => ClaudeRowAccumulator::default(),
+    };
+    // TOCTOU guard facts: what `resumable_for` just validated. Re-checked
+    // AFTER the fold below — a rewrite landing between the validation and
+    // the suffix read would merge new bytes onto stale fold state, and
+    // re-hashing the rewritten file afterwards would legitimize the
+    // corrupt checkpoint permanently.
+    let resume_guard = (acc.consumed_len > 0).then(|| {
+        (
+            acc.prefix_hash_bytes,
+            acc.prefix_hash16.clone(),
+            acc.consumed_tail_hash16.clone(),
+            acc.consumed_len,
+        )
+    });
+    let mut consumed = crate::message_search::cursor::for_each_complete_line_from(
+        path,
+        acc.consumed_len,
+        |line| acc.fold_line(line),
+    )
+    .ok()?;
+    if let Some((saved_prefix_bytes, saved_prefix, saved_tail, saved_consumed)) = resume_guard {
+        let still_plain_append =
+            crate::message_search::cursor::prefix_hash16_bytes(path, saved_prefix_bytes).as_deref()
+                == Some(saved_prefix.as_str())
+                && crate::message_search::cursor::tail_hash16_ending_at(path, saved_consumed)
+                    .as_deref()
+                    == Some(saved_tail.as_str());
+        if !still_plain_append {
+            // Discard the merged fold; parse the whole file fresh.
+            acc = ClaudeRowAccumulator::default();
+            consumed =
+                crate::message_search::cursor::for_each_complete_line_from(path, 0, |line| {
+                    acc.fold_line(line)
+                })
+                .ok()?;
+        }
+    }
+    acc.consumed_len = consumed;
+    acc.identity = crate::platform::FileIdentity::from_path(path).ok();
+    acc.prefix_hash_bytes =
+        consumed.min(crate::message_search::cursor::PREFIX_HASH_BYTES as u64) as usize;
+    acc.prefix_hash16 =
+        crate::message_search::cursor::prefix_hash16_bytes(path, acc.prefix_hash_bytes)?;
+    acc.consumed_tail_hash16 =
+        crate::message_search::cursor::tail_hash16_ending_at(path, consumed)?;
+
+    // Parity with the historical whole-file `.lines()` read: an
+    // unterminated trailing line still renders into THIS row, but never
+    // into the retained checkpoint (its bytes re-read once complete).
+    let session = match read_unterminated_tail(path, consumed) {
+        UnterminatedTail::None => acc.clone().render(path, session_id),
+        UnterminatedTail::Tail(tail) => {
+            let mut render = acc.clone();
+            for piece in tail.split('\n') {
+                let piece = piece.trim_end_matches('\r');
+                if !piece.is_empty() {
+                    render.fold_line(piece);
+                }
+            }
+            render.render(path, session_id)
+        }
+        // A valid final record can legitimately exceed the tail cap (one
+        // huge unterminated paste): silently omitting it would leave the
+        // row permanently short on a stable file. Render such rows from
+        // a full streaming `.lines()` pass instead — the checkpoint
+        // (complete lines only) stays valid either way.
+        UnterminatedTail::Oversized => claude_row_full_render(path, session_id)?,
+    };
+
+    {
+        let mut cache = claude_row_accumulators()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= CLAUDE_ROW_ACCUMULATOR_CAP && !cache.contains_key(path) {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), acc);
     }
     store_session_list_row(key, &session);
     Some(session)
+}
+
+/// In-memory bound on the unterminated-tail fast path; larger tails take
+/// the full streaming render instead of being buffered here.
+const CLAUDE_ROW_TAIL_CAP_BYTES: u64 = 4 * 1024 * 1024;
+
+enum UnterminatedTail {
+    /// The file ends exactly at the consumed offset.
+    None,
+    /// Bytes past the last complete line (a live writer mid-append).
+    Tail(String),
+    /// More tail bytes than the in-memory cap: the caller must render
+    /// via the full streaming pass, never omit the record.
+    Oversized,
+}
+
+fn read_unterminated_tail(path: &Path, from: u64) -> UnterminatedTail {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return UnterminatedTail::None;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return UnterminatedTail::None;
+    };
+    let len = metadata.len();
+    if len <= from {
+        return UnterminatedTail::None;
+    }
+    if len - from > CLAUDE_ROW_TAIL_CAP_BYTES {
+        return UnterminatedTail::Oversized;
+    }
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return UnterminatedTail::None;
+    }
+    let mut buf = Vec::with_capacity((len - from) as usize);
+    if file
+        .take(CLAUDE_ROW_TAIL_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+        || buf.is_empty()
+    {
+        return UnterminatedTail::None;
+    }
+    UnterminatedTail::Tail(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Largest single record the full-render fallback will buffer. Records
+/// beyond it are SKIPPED with a warning instead of being materialized —
+/// the fallback exists to bound memory, so it must not itself allocate an
+/// arbitrarily large line the way `.lines()` would. Tradeoff, documented:
+/// a >32 MiB record does not contribute to that row's turns/usage/preview
+/// (row-level metadata; message search and transcript serving still see
+/// the file through their own lanes).
+const CLAUDE_ROW_MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Full streaming render including a final unterminated line (the
+/// historical `.lines()` semantics) — the oversized-tail fallback —
+/// with per-record memory bounded at `max_record_bytes`.
+fn claude_row_full_render(path: &Path, session_id: String) -> Option<serde_json::Value> {
+    claude_row_full_render_with_record_cap(path, session_id, CLAUDE_ROW_MAX_RECORD_BYTES)
+}
+
+fn claude_row_full_render_with_record_cap(
+    path: &Path,
+    session_id: String,
+    max_record_bytes: usize,
+) -> Option<serde_json::Value> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut acc = ClaudeRowAccumulator::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut skipped_oversized = 0u64;
+    loop {
+        buf.clear();
+        // Capped read: at most max_record_bytes + 1, so an over-cap line
+        // is detected without ever buffering it whole.
+        let bytes = std::io::Read::take(&mut reader, max_record_bytes as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .ok()?;
+        if bytes == 0 {
+            break;
+        }
+        if buf.len() > max_record_bytes {
+            skipped_oversized += 1;
+            if buf.last() != Some(&b'\n') {
+                // Discard the rest of the over-cap line without buffering.
+                loop {
+                    let available = reader.fill_buf().ok()?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    match available.iter().position(|&byte| byte == b'\n') {
+                        Some(position) => {
+                            reader.consume(position + 1);
+                            break;
+                        }
+                        None => {
+                            let discard = available.len();
+                            reader.consume(discard);
+                        }
+                    }
+                }
+            }
+            buf.clear();
+            // fold_line numbering: the skipped record still occupies a
+            // line slot so `line-{idx}` usage-dedup keys stay aligned
+            // with a hypothetical uncapped parse.
+            acc.lines_consumed += 1;
+            continue;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        acc.fold_line(line.trim_end_matches(['\n', '\r']));
+    }
+    if skipped_oversized > 0 {
+        eprintln!(
+            "[session-catalog] {}: skipped {skipped_oversized} record(s) over {max_record_bytes} bytes in the full-render fallback (row metadata omits them)",
+            path.display()
+        );
+    }
+    Some(acc.render(path, session_id))
 }
 
 #[allow(dead_code)]
@@ -2468,6 +2755,290 @@ mod tests {
         assert_eq!(session["total_tokens"].as_u64(), Some(10000));
         let cost = session["estimated_cost"].as_f64().unwrap();
         assert!((cost - 0.0714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn claude_row_fold_resumes_on_append_instead_of_reparsing() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-tmp-inc");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("fold-resume-abc.jsonl");
+
+        let first = serde_json::json!({
+            "timestamp": "2026-07-14T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/inc",
+            "message": {"content": "first prompt"}
+        });
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(row["turns"].as_u64(), Some(1));
+
+        // Poison the retained checkpoint's fold state: if the append path
+        // resumes from the checkpoint (as it must), the poison shows in
+        // the next row; a silent full re-parse would erase it.
+        {
+            let mut cache = claude_row_accumulators()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let acc = cache.get_mut(&path).expect("checkpoint retained");
+            acc.turns += 100;
+        }
+        let second = serde_json::json!({
+            "timestamp": "2026-07-14T10:01:00Z",
+            "type": "user",
+            "message": {"content": "second prompt"}
+        });
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(file, "{second}").unwrap();
+        }
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(102),
+            "append must fold into the retained checkpoint (1 + poison 100 + 1)"
+        );
+    }
+
+    #[test]
+    fn claude_row_fold_matches_a_full_parse_and_detects_rewrites() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-tmp-par");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let incremental = project_dir.join("fold-parity-abc.jsonl");
+        let fresh = project_dir.join("fold-parity-fresh.jsonl");
+
+        let user = serde_json::json!({
+            "timestamp": "2026-07-14T11:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/par",
+            "message": {"content": "count my usage"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-07-14T11:00:02Z",
+            "type": "assistant",
+            "requestId": "req-1",
+            "message": {
+                "id": "msg-1",
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 100, "output_tokens": 200}
+            }
+        });
+        let follow_up = serde_json::json!({
+            "timestamp": "2026-07-14T11:01:00Z",
+            "type": "user",
+            "message": {"content": "and again"}
+        });
+        let assistant_two = serde_json::json!({
+            "timestamp": "2026-07-14T11:01:02Z",
+            "type": "assistant",
+            "requestId": "req-2",
+            "message": {
+                "id": "msg-2",
+                "model": "claude-sonnet-4-6",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+                "content": [{"type": "text", "text": "done again"}]
+            }
+        });
+
+        // Incremental: parse the prefix, then fold the appended suffix.
+        std::fs::write(&incremental, format!("{user}\n{assistant}\n")).unwrap();
+        claude_session_list_row_from_file(&incremental).unwrap();
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&incremental)
+                .unwrap();
+            writeln!(file, "{follow_up}").unwrap();
+            writeln!(file, "{assistant_two}").unwrap();
+        }
+        let folded = claude_session_list_row_from_file(&incremental).unwrap();
+
+        // Fresh: the same final bytes parsed from scratch.
+        std::fs::write(
+            &fresh,
+            format!("{user}\n{assistant}\n{follow_up}\n{assistant_two}\n"),
+        )
+        .unwrap();
+        let full = claude_session_list_row_from_file(&fresh).unwrap();
+
+        for field in [
+            "turns",
+            "task",
+            "model",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "preview",
+            "cwd",
+            "project_root",
+            "daily_usage",
+        ] {
+            assert_eq!(
+                folded.get(field),
+                full.get(field),
+                "fold/full divergence on {field}"
+            );
+        }
+
+        // A rewrite (changed head) must fall back to the full re-parse:
+        // nothing folded from the old content may survive.
+        let rewritten_user = serde_json::json!({
+            "timestamp": "2026-07-14T12:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/par",
+            "message": {"content": "brand new history"}
+        });
+        std::fs::write(&incremental, format!("{rewritten_user}\n")).unwrap();
+        let rewritten = claude_session_list_row_from_file(&incremental).unwrap();
+        assert_eq!(rewritten["turns"].as_u64(), Some(1));
+        assert_eq!(
+            rewritten["task"].as_str(),
+            Some("brand new history"),
+            "stale folded state must not survive a rewrite"
+        );
+    }
+
+    #[test]
+    fn claude_row_post_prefix_rewrite_that_grows_falls_back_to_full_parse() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home.path().join(".claude").join("projects").join("-tmp-rw");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("fold-rewrite-abc.jsonl");
+
+        // First record alone fills the 4 KiB head window, so a rewrite
+        // past it leaves the prefix hash intact.
+        let padded = serde_json::json!({
+            "timestamp": "2026-07-15T09:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/rw",
+            "message": {"content": "p".repeat(5000)}
+        });
+        let old_second = serde_json::json!({
+            "timestamp": "2026-07-15T09:01:00Z",
+            "type": "user",
+            "message": {"content": "old second"}
+        });
+        std::fs::write(&path, format!("{padded}\n{old_second}\n")).unwrap();
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(row["turns"].as_u64(), Some(2));
+
+        // Rewrite past the prefix window AND grow the file (same inode:
+        // fs::write truncates in place). A checkpoint resume here would
+        // fold suffix bytes onto stale totals; the consumed-tail window
+        // must force the full re-parse.
+        let new_second = serde_json::json!({
+            "timestamp": "2026-07-15T09:02:00Z",
+            "type": "user",
+            "message": {"content": "new second"}
+        });
+        let third = serde_json::json!({
+            "timestamp": "2026-07-15T09:03:00Z",
+            "type": "user",
+            "message": {"content": "third prompt"}
+        });
+        std::fs::write(&path, format!("{padded}\n{new_second}\n{third}\n")).unwrap();
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(3),
+            "stale checkpoint state must not survive a post-prefix rewrite"
+        );
+        let preview = row["preview"].to_string();
+        assert!(preview.contains("new second"), "{preview}");
+        assert!(!preview.contains("old second"), "{preview}");
+    }
+
+    /// The full-render fallback is memory-bounded: records over the cap
+    /// are skipped (with a warning), never buffered whole — terminated or
+    /// not — and the surrounding records still fold.
+    #[test]
+    fn full_render_fallback_skips_records_over_the_record_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capped-abc.jsonl");
+        let small = |uuid: &str, text: &str| {
+            serde_json::json!({
+                "timestamp": "2026-07-15T11:00:00Z",
+                "type": "user",
+                "message": {"content": text},
+                "uuid": uuid,
+            })
+        };
+        let giant_terminated = serde_json::json!({
+            "timestamp": "2026-07-15T11:01:00Z",
+            "type": "user",
+            "message": {"content": "g".repeat(2048)}
+        });
+        let giant_unterminated = serde_json::json!({
+            "timestamp": "2026-07-15T11:03:00Z",
+            "type": "user",
+            "message": {"content": "u".repeat(2048)}
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{giant_terminated}\n{}\n{giant_unterminated}",
+                small("u-1", "first"),
+                small("u-2", "second"),
+            ),
+        )
+        .unwrap();
+
+        let row =
+            claude_row_full_render_with_record_cap(&path, "capped-abc".to_string(), 512).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(2),
+            "both small records fold; both over-cap records are skipped"
+        );
+        let preview = row["preview"].to_string();
+        assert!(!preview.contains("ggg"), "{preview}");
+        assert!(!preview.contains("uuu"), "{preview}");
+    }
+
+    #[test]
+    fn claude_row_renders_an_oversized_unterminated_final_record() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home.path().join(".claude").join("projects").join("-tmp-ov");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("oversized-tail-abc.jsonl");
+
+        let first = serde_json::json!({
+            "timestamp": "2026-07-15T10:00:00Z",
+            "type": "user",
+            "cwd": "/tmp/ov",
+            "message": {"content": "small first"}
+        });
+        // A VALID final record larger than the tail fast-path cap,
+        // WITHOUT a trailing newline: it must still count (the old cap
+        // silently dropped it from the row forever on a stable file).
+        let huge = serde_json::json!({
+            "timestamp": "2026-07-15T10:01:00Z",
+            "type": "user",
+            "message": {"content": "h".repeat(CLAUDE_ROW_TAIL_CAP_BYTES as usize + 4096)}
+        });
+        std::fs::write(&path, format!("{first}\n{huge}")).unwrap();
+
+        let row = claude_session_list_row_from_file(&path).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(2),
+            "an oversized unterminated final record must render via the full parse"
+        );
     }
 
     #[test]

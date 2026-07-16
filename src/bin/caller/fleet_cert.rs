@@ -238,6 +238,18 @@ pub fn status_snapshot() -> FleetCertStatus {
         .clone()
 }
 
+/// The delegated fleet zone alone. The request-path IAM evaluator only ever
+/// reads `.zone`, and [`status_snapshot`] deep-clones the whole struct
+/// (address vectors and CT serial summaries included) under the mutex —
+/// per authorization decision, daemon-wide.
+pub fn fleet_zone() -> Option<String> {
+    registry()
+        .lock()
+        .expect("fleet cert status poisoned")
+        .zone
+        .clone()
+}
+
 fn with_status(update: impl FnOnce(&mut FleetCertStatus)) {
     let mut status = registry().lock().expect("fleet cert status poisoned");
     update(&mut status);

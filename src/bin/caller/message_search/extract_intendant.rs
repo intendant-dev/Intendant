@@ -30,7 +30,7 @@
 //! the external backend's own log (the Codex/Claude extractors' lane) —
 //! extracting them here would double every wrapped message.
 
-use super::cursor::{read_complete_lines_from, SourceCursor};
+use super::cursor::{for_each_complete_line_from, SourceCursor};
 use super::record::{
     cap_text, Locator, MessageRecord, Role, Source, SupersessionMark, MESSAGE_TEXT_CAP_BYTES,
 };
@@ -59,7 +59,6 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
             wrapper: false,
         });
     }
-    let (lines, consumed) = read_complete_lines_from(&session_jsonl, 0)?;
     let meta = read_meta(log_dir);
     let session_id = log_dir
         .file_name()
@@ -67,15 +66,19 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
         .or_else(|| meta.as_ref().map(|meta| meta.session_id.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Single parse pass; era decisions need whole-file facts (marker
-    // position, wrapper flag, whether any canonical rows exist at all).
+    // Single STREAMING parse pass (no whole-file Vec<String>); era
+    // decisions need whole-file facts (marker position, wrapper flag,
+    // whether any canonical rows exist at all), so the parsed events are
+    // still collected.
     let mut events: Vec<(u64, serde_json::Value)> = Vec::new();
     let mut wrapper = false;
     let mut first_marker: Option<usize> = None;
     let mut any_conversation_message = false;
-    for (index, line) in lines.iter().enumerate() {
+    let mut line_no: u64 = 0;
+    let consumed = for_each_complete_line_from(&session_jsonl, 0, |line| {
+        line_no += 1;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue; // torn or foreign line: not extractable, never fatal
+            return; // torn or foreign line: not extractable, never fatal
         };
         match value.get("event").and_then(|event| event.as_str()) {
             Some("session_identity") => wrapper = true,
@@ -85,8 +88,8 @@ pub(crate) fn extract_intendant_session(log_dir: &Path) -> std::io::Result<Inten
             Some("conversation_message") => any_conversation_message = true,
             _ => {}
         }
-        events.push((index as u64 + 1, value));
-    }
+        events.push((line_no, value));
+    })?;
 
     let cursors = SourceCursor::capture(&session_jsonl, consumed)
         .map(|cursor| vec![cursor])

@@ -109,7 +109,9 @@ pub(crate) struct ExternalTranscriptCacheKey {
 #[derive(Clone, Debug)]
 pub(crate) struct ExternalTranscriptCacheEntry {
     key: ExternalTranscriptCacheKey,
-    entries: Vec<serde_json::Value>,
+    /// Shared: a cache hit hands out the Arc instead of deep-cloning the
+    /// whole parsed transcript per bootstrap/detail request.
+    entries: std::sync::Arc<Vec<serde_json::Value>>,
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +625,7 @@ pub(crate) fn hydrate_codex_session_goal_for_row(
         return;
     }
     for id in row_ids {
-        let Some(entries) = external_session_entries_from_home(home, "codex", &id) else {
+        let Some(entries) = external_session_entries_from_home_arc(home, "codex", &id) else {
             continue;
         };
         let Some(goal) = latest_session_goal_from_entries(&entries, &id) else {
@@ -1106,18 +1108,20 @@ pub(crate) fn extend_codex_observed_worktree_session_hints(
     );
     if files.is_empty() {
         let codex = codex_dir(home);
-        files = collect_recent_files(
+        let mut keyed = collect_recent_files_keyed(
             &codex.join("sessions"),
             ".jsonl",
             WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
         );
-        files.extend(collect_recent_files(
+        keyed.extend(collect_recent_files_keyed(
             &codex.join("archived_sessions"),
             ".jsonl",
             WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
         ));
-        files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
-        files.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+        // Keys carried out of the walks: no re-stat per comparison.
+        keyed.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        keyed.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+        files = keyed.into_iter().map(|(_, path)| path).collect();
     }
 
     for path in files {
@@ -1191,9 +1195,15 @@ pub(crate) fn agent_session_files_from_rows(
             files.push(path);
         }
     }
-    files.sort_by_key(|b| std::cmp::Reverse(file_mtime_secs(b)));
-    files.truncate(limit);
-    files
+    // Decorate once: `sort_by_key(file_mtime_secs)` re-stats per
+    // comparison.
+    let mut keyed: Vec<(u64, PathBuf)> = files
+        .into_iter()
+        .map(|path| (file_mtime_secs(&path), path))
+        .collect();
+    keyed.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    keyed.truncate(limit);
+    keyed.into_iter().map(|(_, path)| path).collect()
 }
 
 pub(crate) fn extend_gemini_observed_worktree_session_hints(
@@ -1512,6 +1522,20 @@ pub(crate) fn push_session_file_fingerprint(
     let Ok(metadata) = std::fs::metadata(path) else {
         return;
     };
+    push_session_file_fingerprint_with_metadata(entries, base, path, &metadata, is_dir);
+}
+
+/// [`push_session_file_fingerprint`] for callers already holding the
+/// metadata (dir-entry walks) — the fingerprint sweep covers every
+/// session dir per rebuild, and busy dirs hold thousands of turn/seg
+/// files, so the redundant second stat per file was most of its cost.
+pub(crate) fn push_session_file_fingerprint_with_metadata(
+    entries: &mut Vec<SessionFileFingerprint>,
+    base: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    is_dir: bool,
+) {
     if metadata.is_dir() != is_dir {
         return;
     }
@@ -1520,16 +1544,26 @@ pub(crate) fn push_session_file_fingerprint(
         .unwrap_or(path)
         .to_string_lossy()
         .to_string();
-    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    let (dev, ino) = crate::platform::metadata_dev_ino(metadata);
     entries.push(SessionFileFingerprint {
         rel,
         len: metadata.len(),
-        mtime_nanos: metadata_mtime_nanos(&metadata),
-        ctime_nanos: metadata_ctime_nanos(&metadata),
+        mtime_nanos: metadata_mtime_nanos(metadata),
+        ctime_nanos: metadata_ctime_nanos(metadata),
         dev,
         ino,
         is_dir,
     });
+}
+
+/// Dir-entry metadata with the platform-standard follow semantics:
+/// symlinks resolve through `fs::metadata`, everything else reuses the
+/// readdir-adjacent stat.
+fn dir_entry_metadata_following(entry: &std::fs::DirEntry) -> std::io::Result<std::fs::Metadata> {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_symlink() => std::fs::metadata(entry.path()),
+        _ => entry.metadata(),
+    }
 }
 
 pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint> {
@@ -1543,26 +1577,45 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
         "summary.json",
         "conversation.jsonl",
     ] {
-        let path = dir.join(name);
-        if path.is_file() {
-            push_session_file_fingerprint(&mut entries, dir, &path, false);
-        }
+        // No is_file() pre-check: the push validates kind from the one
+        // stat it takes anyway (missing or dir-shaped entries no-op).
+        push_session_file_fingerprint(&mut entries, dir, &dir.join(name), false);
     }
 
     let recordings_dir = dir.join("recordings");
     if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
         for re in rd.flatten() {
             let recording_dir = re.path();
-            if !recording_dir.is_dir() {
+            let Ok(dir_meta) = dir_entry_metadata_following(&re) else {
+                continue;
+            };
+            if !dir_meta.is_dir() {
                 continue;
             }
-            push_session_file_fingerprint(&mut entries, dir, &recording_dir, true);
+            push_session_file_fingerprint_with_metadata(
+                &mut entries,
+                dir,
+                &recording_dir,
+                &dir_meta,
+                true,
+            );
             if let Ok(files) = std::fs::read_dir(&recording_dir) {
                 for file in files.flatten() {
-                    let path = file.path();
                     let name = file.file_name().to_string_lossy().to_string();
-                    if name.starts_with("seg_") && path.is_file() {
-                        push_session_file_fingerprint(&mut entries, dir, &path, false);
+                    if !name.starts_with("seg_") {
+                        continue;
+                    }
+                    let Ok(metadata) = dir_entry_metadata_following(&file) else {
+                        continue;
+                    };
+                    if metadata.is_file() {
+                        push_session_file_fingerprint_with_metadata(
+                            &mut entries,
+                            dir,
+                            &file.path(),
+                            &metadata,
+                            false,
+                        );
                     }
                 }
             }
@@ -1572,9 +1625,17 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
     let frames_dir = dir.join("frames");
     if let Ok(fd) = std::fs::read_dir(&frames_dir) {
         for fe in fd.flatten() {
-            let path = fe.path();
-            if path.is_file() {
-                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            let Ok(metadata) = dir_entry_metadata_following(&fe) else {
+                continue;
+            };
+            if metadata.is_file() {
+                push_session_file_fingerprint_with_metadata(
+                    &mut entries,
+                    dir,
+                    &fe.path(),
+                    &metadata,
+                    false,
+                );
             }
         }
     }
@@ -1582,9 +1643,17 @@ pub(crate) fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDir
     let turns_dir = dir.join("turns");
     if let Ok(td) = std::fs::read_dir(&turns_dir) {
         for te in td.flatten() {
-            let path = te.path();
-            if path.is_file() {
-                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            let Ok(metadata) = dir_entry_metadata_following(&te) else {
+                continue;
+            };
+            if metadata.is_file() {
+                push_session_file_fingerprint_with_metadata(
+                    &mut entries,
+                    dir,
+                    &te.path(),
+                    &metadata,
+                    false,
+                );
             }
         }
     }

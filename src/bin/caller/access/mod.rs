@@ -40,11 +40,21 @@ pub mod wizard;
 /// Callable from `intendant --web` without running any `access` action,
 /// because the backend's `cert_dir()` is a pure path accessor with no
 /// privileged I/O.
+///
+/// Cached for the process lifetime: resolution shells out to `hostname`
+/// and probes up to three cert-store directories, and callers sit on
+/// request-serving paths (org target ids, peer cards). The label only
+/// changes through `intendant access` runs, which are separate processes.
 pub fn resolve_host_label() -> String {
-    let be = backend::select_backend();
-    let cert_dir = be.cert_dir();
-    let candidates = host_label_candidates(&cert_dir);
-    choose_host_label(candidates, hostname().ok().as_deref())
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL
+        .get_or_init(|| {
+            let be = backend::select_backend();
+            let cert_dir = be.cert_dir();
+            let candidates = host_label_candidates(&cert_dir);
+            choose_host_label(candidates, hostname().ok().as_deref())
+        })
+        .clone()
 }
 
 /// Read the system hostname by shelling out to the platform `hostname` command.

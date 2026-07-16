@@ -452,11 +452,18 @@ pub enum DashboardControlGrant {
     TrustedLocal,
     UserClient {
         principal: crate::access::iam::AccessPrincipal,
-        iam_state: crate::access::iam::LocalIamState,
+        /// The opening IAM snapshot (shared from the stat-fingerprint
+        /// cache — construction must not deep-clone the state per
+        /// connection). Immutable for the session lifetime: liveness
+        /// checks compare it against freshly loaded state.
+        iam_state: std::sync::Arc<crate::access::iam::LocalIamState>,
         /// Production sessions reload this daemon-owned IAM directory through
         /// the stat-fingerprint cache before every authorization decision.
         /// `None` is reserved for hermetic in-memory tests.
         iam_cert_dir: Option<PathBuf>,
+        /// Per-session memo for [`Self::opening_authority_is_current`];
+        /// construct with `Default::default()`.
+        authority_memo: OpeningAuthorityMemo,
     },
     Peer {
         fingerprint: String,
@@ -502,6 +509,65 @@ pub(crate) enum DashboardControlSessionMutation {
     Forbidden,
 }
 
+/// Memo for [`DashboardControlGrant::opening_authority_is_current`]: the
+/// exact IAM state snapshot (by `Arc` identity) the last **successful** full
+/// validation ran against, plus the validated grant's expiry — the only
+/// input of that verdict that changes without a state change. Clones of a
+/// grant share the cell, which is sound because clones carry the identical
+/// opening snapshot.
+///
+/// Trust invariants (do not weaken):
+/// - Only positive verdicts are memoized; any negative outcome re-runs the
+///   full validation on the next call.
+/// - A hit requires `Arc::ptr_eq` with a snapshot this memo keeps alive, so
+///   a match can never be an ABA false positive from a recycled allocation.
+///   Every IAM edit — revocation included — reaches sessions as a *new* Arc
+///   from the stat-fingerprint cache and therefore forces full revalidation.
+/// - The expiry instant is re-checked on every hit (`IamGrant::is_active_at`
+///   semantics): a grant expiring between two events is caught even though
+///   the state snapshot never changed.
+#[derive(Clone, Debug, Default)]
+pub struct OpeningAuthorityMemo(Arc<std::sync::Mutex<Option<OpeningAuthorityMemoEntry>>>);
+
+#[derive(Debug)]
+struct OpeningAuthorityMemoEntry {
+    /// The snapshot the full validation passed against. Holding the Arc
+    /// pins the allocation, making the pointer comparison an identity test.
+    validated: Arc<crate::access::iam::LocalIamState>,
+    /// `expires_at_unix_ms` of the validated current grant.
+    expires_at_unix_ms: Option<u64>,
+}
+
+impl OpeningAuthorityMemo {
+    /// `Some(expires_at_unix_ms)` when `current` is the exact snapshot the
+    /// last successful full validation ran against.
+    fn validated_expiry(
+        &self,
+        current: &Arc<crate::access::iam::LocalIamState>,
+    ) -> Option<Option<u64>> {
+        let memo = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        memo.as_ref()
+            .filter(|entry| Arc::ptr_eq(&entry.validated, current))
+            .map(|entry| entry.expires_at_unix_ms)
+    }
+
+    fn store(
+        &self,
+        validated: Arc<crate::access::iam::LocalIamState>,
+        expires_at_unix_ms: Option<u64>,
+    ) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(OpeningAuthorityMemoEntry {
+            validated,
+            expires_at_unix_ms,
+        });
+    }
+
+    #[cfg(test)]
+    fn is_primed(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+}
+
 /// The verified human identity behind a delegation-lane connection.
 #[derive(Clone, Debug)]
 pub struct PeerAttribution {
@@ -530,7 +596,7 @@ impl DashboardControlGrant {
         match iam_cert_dir {
             Some(cert_dir) => crate::access::iam::load_state_cached_arc(cert_dir)
                 .map_err(|error| format!("reload local IAM state: {error}")),
-            None => Ok(Arc::new(iam_state.clone())),
+            None => Ok(Arc::clone(iam_state)),
         }
     }
 
@@ -539,11 +605,19 @@ impl DashboardControlGrant {
     /// revocation, expiry/ORL materialization, scope edit, deletion, or a
     /// reload error) makes the session stale and forces a reconnect under the
     /// new authority. Unrelated IAM edits do not disturb it.
+    ///
+    /// Called per injected input event and per transfer-pump beat, so the
+    /// full record validation is memoized per state snapshot (see
+    /// [`OpeningAuthorityMemo`] for the trust argument): the state content
+    /// is immutable within one cached `Arc`, revocation liveness arrives as
+    /// a *new* `Arc`, and the expiry instant — the one time-dependent input
+    /// — is re-checked on every call, memo hit or not.
     pub(crate) fn opening_authority_is_current(&self) -> bool {
         match self {
             Self::UserClient {
                 principal,
                 iam_state,
+                authority_memo,
                 ..
             } => {
                 let Some(grant_id) = principal.grant_id.as_deref() else {
@@ -552,6 +626,17 @@ impl DashboardControlGrant {
                 let Ok(current) = self.current_user_client_state() else {
                     return false;
                 };
+                let now_unix_ms = crate::access::client_key::now_unix_ms();
+                if let Some(expires_at_unix_ms) = authority_memo.validated_expiry(&current) {
+                    // This exact snapshot already passed the full validation
+                    // below; only the expiry comparison involves the clock.
+                    // Mirrors `IamGrant::is_active_at` (statuses were
+                    // enforced at memo time and are immutable in-snapshot).
+                    return match expires_at_unix_ms {
+                        Some(expires) => (now_unix_ms as u128) < (expires as u128),
+                        None => true,
+                    };
+                }
                 let Some(opening_grant) =
                     iam_state.grants.iter().find(|grant| grant.id == grant_id)
                 else {
@@ -591,12 +676,24 @@ impl DashboardControlGrant {
                 let hosted_provenance_unchanged = principal.authn_kind.as_deref()
                     != Some("client_key")
                     || iam_state.hosted_origins == current.hosted_origins;
-                opening_grant == current_grant
+                let records_current = opening_grant == current_grant
                     && opening_principal == current_principal
                     && opening_role == current_role
                     && hosted_provenance_unchanged
-                    && current_grant.is_active_at(crate::access::client_key::now_unix_ms())
-                    && crate::access::iam::is_enforced_status(&current_principal.status)
+                    && crate::access::iam::is_enforced_status(&current_grant.status)
+                    && crate::access::iam::is_enforced_status(&current_principal.status);
+                if records_current {
+                    // Everything except the expiry instant validated true
+                    // for this snapshot; hits re-run only the expiry check.
+                    authority_memo.store(Arc::clone(&current), current_grant.expires_at_unix_ms);
+                }
+                // `records_current` covers the grant-status half of
+                // `is_active_at`; the expiry half stays live.
+                records_current
+                    && match current_grant.expires_at_unix_ms {
+                        Some(expires) => (now_unix_ms as u128) < (expires as u128),
+                        None => true,
+                    }
             }
             Self::Peer {
                 fingerprint,
@@ -1996,8 +2093,9 @@ mod fs_scope_grant_tests {
                 .unwrap();
         DashboardControlGrant::UserClient {
             principal,
-            iam_state: state,
+            iam_state: std::sync::Arc::new(state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         }
     }
 
@@ -2094,8 +2192,9 @@ mod fs_scope_grant_tests {
         .unwrap();
         let grant = DashboardControlGrant::UserClient {
             principal,
-            iam_state: state.clone(),
+            iam_state: std::sync::Arc::new(state.clone()),
             iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: Default::default(),
         };
         assert!(grant.opening_authority_is_current());
         assert!(grant.has_owner_dashboard_authority());
@@ -2125,6 +2224,116 @@ mod fs_scope_grant_tests {
         let denied = grant.access_decision(PeerOperation::PresenceRead);
         assert!(!denied.allowed);
         assert!(denied.reason.contains("unavailable"), "{}", denied.reason);
+    }
+
+    /// Trust pin for the `OpeningAuthorityMemo` fast path: a memo hit
+    /// (same state `Arc`, no IAM edit in between) must still re-check the
+    /// grant's expiry instant on every call — a grant expiring between two
+    /// input events is caught even though the state snapshot never changed.
+    #[test]
+    fn opening_authority_memo_hit_still_rechecks_expiry_instant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        // Wide enough that upsert + save + the two pre-expiry assertions
+        // comfortably fit before the instant, even on a loaded CI box;
+        // the post-expiry wait below is bounded by the same margin.
+        let expires_at = crate::access::client_key::now_unix_ms() as u64 + 1_500;
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:57".to_string()),
+                role_id: Some("role:observer".to_string()),
+                expires_at_unix_ms: Some(expires_at),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:57",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let memo = OpeningAuthorityMemo::default();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: std::sync::Arc::new(state.clone()),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: memo.clone(),
+        };
+        // Full validation primes the memo; the repeat call is the hit path.
+        assert!(grant.opening_authority_is_current());
+        assert!(memo.is_primed());
+        assert!(grant.opening_authority_is_current());
+        // Cross the expiry instant WITHOUT touching iam.json: the snapshot
+        // Arc is unchanged, so only the hit path's expiry re-check can (and
+        // must) flip the verdict.
+        while (crate::access::client_key::now_unix_ms() as u64) < expires_at {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(memo.is_primed());
+        assert!(!grant.opening_authority_is_current());
+    }
+
+    /// Trust pin for the `OpeningAuthorityMemo` fast path: any IAM edit
+    /// reaches the session as a NEW state `Arc` from the fingerprint cache,
+    /// so a primed memo never carries a stale verdict across a revocation.
+    #[test]
+    fn opening_authority_memo_never_outlives_a_state_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "unit");
+        let mut state = crate::access::iam::LocalIamState::default();
+        let created = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:58".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let principal = crate::access::iam::principal_for_browser_mtls_cert(
+            &state,
+            "AA:58",
+            "webrtc-datachannel",
+        )
+        .unwrap();
+        let memo = OpeningAuthorityMemo::default();
+        let grant = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: std::sync::Arc::new(state.clone()),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: memo.clone(),
+        };
+        // Prime the memo through the full validation, then exercise the
+        // hit path once so the fast path is what the revocation must beat.
+        assert!(grant.opening_authority_is_current());
+        assert!(memo.is_primed());
+        assert!(grant.opening_authority_is_current());
+
+        crate::access::iam::update_user_client_grant(
+            &mut state,
+            crate::access::iam::IamGrantUpdateRequest {
+                grant_id: created.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        // The revoked state loads as a new Arc → pointer mismatch → full
+        // revalidation → stale session.
+        assert!(!grant.opening_authority_is_current());
+        // And the memo must not have been re-primed by the failed check.
+        assert!(!grant.opening_authority_is_current());
     }
 
     #[test]
@@ -2172,8 +2381,9 @@ mod fs_scope_grant_tests {
         .unwrap();
         let grant = DashboardControlGrant::UserClient {
             principal,
-            iam_state: state.clone(),
+            iam_state: std::sync::Arc::new(state.clone()),
             iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: Default::default(),
         };
         assert!(grant.opening_authority_is_current());
         assert!(grant.allows_unfiltered_websocket_stream());
@@ -2251,8 +2461,9 @@ mod fs_scope_grant_tests {
         // pre-gate denies it before ICE/close can reach the owner comparison.
         let mut revoked = opening.clone();
         if let DashboardControlGrant::UserClient { iam_state, .. } = &mut revoked {
-            iam_state.grants[0].status = "revoked".to_string();
-            iam_state.grants[0].revoked_at_unix_ms = Some(1);
+            let state = std::sync::Arc::make_mut(iam_state);
+            state.grants[0].status = "revoked".to_string();
+            state.grants[0].revoked_at_unix_ms = Some(1);
         }
         assert!(peer.belongs_to(&revoked));
         assert!(!revoked.has_any_effective_operation());
@@ -2262,8 +2473,9 @@ mod fs_scope_grant_tests {
                 Some("DD:40"),
                 "webrtc-datachannel",
             ),
-            iam_state: crate::access::iam::LocalIamState::default(),
+            iam_state: Default::default(),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         };
         assert!(!peer.belongs_to(&unknown));
         assert!(!unknown.has_any_effective_operation());
@@ -2381,8 +2593,9 @@ mod fs_scope_grant_tests {
         };
         let scoped = DashboardControlGrant::UserClient {
             principal,
-            iam_state: state.clone(),
+            iam_state: std::sync::Arc::new(state.clone()),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         };
         let scope = scoped.filesystem().expect("scoped grant exposes fs scope");
         assert_eq!(scope.read_roots, vec![std::path::PathBuf::from(srv_shared)]);
@@ -3274,8 +3487,9 @@ mod tests {
                 .unwrap();
         DashboardControlGrant::UserClient {
             principal,
-            iam_state,
+            iam_state: std::sync::Arc::new(iam_state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         }
     }
 

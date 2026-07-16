@@ -44,7 +44,7 @@ pub(crate) fn external_transcript_cache_slot(key: &ExternalTranscriptCacheKey) -
 
 pub(crate) fn cached_external_transcript_entries(
     key: &ExternalTranscriptCacheKey,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
     let slot = external_transcript_cache_slot(key);
     let cache = external_transcript_cache()
         .lock()
@@ -52,13 +52,35 @@ pub(crate) fn cached_external_transcript_entries(
     cache
         .get(&slot)
         .filter(|entry| &entry.key == key)
-        .map(|entry| entry.entries.clone())
+        .map(|entry| std::sync::Arc::clone(&entry.entries))
 }
+
+/// Byte-admission gate: parses of sources beyond this size are served but
+/// never cached. 32 unbounded slots otherwise pin several GB once a few
+/// multi-hundred-MB rollouts cycle through (parsed `Value`s outweigh
+/// their source bytes), and whales evict every warm small entry.
+pub(crate) const EXTERNAL_TRANSCRIPT_CACHE_MAX_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
 pub(crate) fn store_external_transcript_entries(
     key: ExternalTranscriptCacheKey,
-    entries: &[serde_json::Value],
+    entries: &std::sync::Arc<Vec<serde_json::Value>>,
 ) {
+    if key.len > EXTERNAL_TRANSCRIPT_CACHE_MAX_SOURCE_BYTES {
+        return;
+    }
+    // Admission re-check AFTER the parse: the key was stat'd before it,
+    // and a live writer can grow the file past the cap (or past the
+    // keyed snapshot) while we parse — caching that parse would pin an
+    // oversized vec under a key no future lookup matches. Only cache
+    // when the file still IS the keyed snapshot. (A metadata-preserving
+    // replacement between parse and re-stat — same len AND mtime with
+    // different bytes — is outside this cache's benign-writer model,
+    // like every (len, mtime)-keyed cache in the catalog.)
+    match std::fs::metadata(Path::new(&key.path)) {
+        Ok(metadata)
+            if metadata.len() == key.len && metadata_mtime_nanos(&metadata) == key.mtime_nanos => {}
+        _ => return,
+    }
     let slot = external_transcript_cache_slot(&key);
     let mut cache = external_transcript_cache()
         .lock()
@@ -70,7 +92,7 @@ pub(crate) fn store_external_transcript_entries(
         slot,
         ExternalTranscriptCacheEntry {
             key,
-            entries: entries.to_vec(),
+            entries: std::sync::Arc::clone(entries),
         },
     );
 }
@@ -382,8 +404,10 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
     let mut current_turn_id: Option<String> = None;
     let mut synthetic_item_seq = 0_u64;
     let mut command_calls: HashMap<String, serde_json::Value> = HashMap::new();
-    let canonical_user_message_events = codex_session_has_user_message_events(path);
-    let canonical_assistant_response_items = codex_session_has_assistant_response_items(path);
+    // One combined probe pass (early-exits once both lanes are proven)
+    // instead of two independent full-file scans before the main parse.
+    let (canonical_user_message_events, canonical_assistant_response_items) =
+        codex_session_canonical_lanes(path);
     // (count_before, count_after) entry-count boundaries for each rollout item id,
     // so an item-anchor rewind can supersede exactly the entries after the anchor.
     let mut item_entry_boundaries: std::collections::HashMap<String, (usize, usize)> =
@@ -682,68 +706,63 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
     Some(entries)
 }
 
-pub(crate) fn codex_session_has_user_message_events(path: &Path) -> bool {
+/// Whole-file facts the codex projection needs before line 1:
+/// `(has canonical user_message events, has canonical assistant
+/// response_items)`. One scan answers both — the two independent probe
+/// passes each read the rollout to EOF whenever their answer was "no" —
+/// and it stops as soon as both lanes are proven.
+pub(crate) fn codex_session_canonical_lanes(path: &Path) -> (bool, bool) {
     let Ok(file) = std::fs::File::open(path) else {
-        return false;
+        return (false, false);
     };
     let reader = std::io::BufReader::new(file);
+    let mut has_user_message_events = false;
+    let mut has_assistant_response_items = false;
     for line in reader.lines() {
         let Ok(line) = line else {
             continue;
         };
         let trimmed = line.trim();
-        if trimmed.is_empty() || !trimmed.contains("\"user_message\"") {
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Substring prefilters keep the JSON parse off unrelated lines,
+        // exactly as the split probes did.
+        let user_candidate = !has_user_message_events && trimmed.contains("\"user_message\"");
+        let assistant_candidate =
+            !has_assistant_response_items && trimmed.contains("\"assistant\"");
+        if !user_candidate && !assistant_candidate {
             continue;
         }
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
-        if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+        if user_candidate
+            && obj.get("type").and_then(|v| v.as_str()) == Some("event_msg")
             && obj
                 .get("payload")
                 .and_then(|payload| payload.get("type"))
                 .and_then(|v| v.as_str())
                 == Some("user_message")
         {
-            return true;
+            has_user_message_events = true;
+        }
+        if assistant_candidate && obj.get("type").and_then(|v| v.as_str()) == Some("response_item")
+        {
+            if let Some(payload) = obj.get("payload") {
+                if payload.get("type").and_then(|v| v.as_str()) == Some("message")
+                    && payload.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                    && codex_payload_text(payload).is_some()
+                {
+                    has_assistant_response_items = true;
+                }
+            }
+        }
+        if has_user_message_events && has_assistant_response_items {
+            break;
         }
     }
-    false
-}
-
-pub(crate) fn codex_session_has_assistant_response_items(path: &Path) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let reader = std::io::BufReader::new(file);
-    for line in reader.lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() || !trimmed.contains("\"assistant\"") {
-            continue;
-        }
-        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-        if obj.get("type").and_then(|v| v.as_str()) != Some("response_item") {
-            continue;
-        }
-        let Some(payload) = obj.get("payload") else {
-            continue;
-        };
-        if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
-            continue;
-        }
-        if payload.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-            continue;
-        }
-        if codex_payload_text(payload).is_some() {
-            return true;
-        }
-    }
-    false
+    (has_user_message_events, has_assistant_response_items)
 }
 
 /// Rebuild Activity entries from Claude Code's native `~/.claude` session
@@ -982,37 +1001,89 @@ pub(crate) fn find_claude_session_file_for_transcript(
     home: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
+    // Fast path: mains live at `projects/<project>/<session_id>.jsonl` —
+    // one stat per project dir instead of a full recursive walk of the
+    // store (>1,000 files on a busy box) per WS bootstrap / detail fetch.
+    let projects = home.join(".claude").join("projects");
+    let file_name = format!("{session_id}.jsonl");
+    if let Ok(project_dirs) = std::fs::read_dir(&projects) {
+        for project in project_dirs.flatten() {
+            let candidate = project.path().join(&file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Fallback: the historical exhaustive walk (unusual nesting).
     let mut files = Vec::new();
-    collect_files(&home.join(".claude").join("projects"), ".jsonl", &mut files);
+    collect_files(&projects, ".jsonl", &mut files);
     files
         .into_iter()
         .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
+}
+
+/// (home, session_id) → chat path for gemini lookups, so a repeat fetch
+/// verifies ONE file instead of read+parsing every chat in the store
+/// again. Keyed by the caller-supplied home: the same session id under
+/// two homes (tests inject temp homes; leased stores differ) must
+/// resolve independently.
+fn gemini_transcript_path_cache() -> &'static Mutex<HashMap<(PathBuf, String), PathBuf>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn gemini_chat_file_matches(path: &Path, session_id: &str) -> bool {
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        != Some("chats")
+    {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|obj| value_str(&obj, "sessionId"))
+        .as_deref()
+        == Some(session_id)
 }
 
 pub(crate) fn find_gemini_session_file_for_transcript(
     home: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
+    // Normalized once so symlinked/relative spellings of the same home
+    // share one entry instead of duplicating the cache per alias.
+    let home_key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let cache_key = (home_key, session_id.to_string());
+    if let Some(cached) = gemini_transcript_path_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        // Re-verify the single remembered file (ids are stable but chats
+        // can be deleted or rewritten); a miss falls through to the scan.
+        if gemini_chat_file_matches(&cached, session_id) {
+            return Some(cached);
+        }
+    }
     let mut files = Vec::new();
     collect_files(&home.join(".gemini").join("tmp"), ".json", &mut files);
-    files.into_iter().find(|path| {
-        if path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            != Some("chats")
-        {
-            return false;
-        }
-        let Ok(contents) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        serde_json::from_str::<serde_json::Value>(&contents)
-            .ok()
-            .and_then(|obj| value_str(&obj, "sessionId"))
-            .as_deref()
-            == Some(session_id)
-    })
+    let found = files
+        .into_iter()
+        .find(|path| gemini_chat_file_matches(path, session_id))?;
+    let mut cache = gemini_transcript_path_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 512 && !cache.contains_key(&cache_key) {
+        cache.clear();
+    }
+    cache.insert(cache_key, found.clone());
+    Some(found)
 }
 
 pub(crate) fn parse_external_session_entries_from_file(
@@ -1028,11 +1099,13 @@ pub(crate) fn parse_external_session_entries_from_file(
     }
 }
 
-pub(crate) fn external_session_entries_from_file(
+/// Shared-snapshot form: read-only consumers take the cache's Arc
+/// directly instead of deep-cloning the whole parsed transcript per hit.
+pub(crate) fn external_session_entries_from_file_arc(
     source: &str,
     session_id: &str,
     path: &Path,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
     let key = external_transcript_cache_key(source, session_id, path)?;
     if let Some(entries) = cached_external_transcript_entries(&key) {
         return Some(entries);
@@ -1040,15 +1113,16 @@ pub(crate) fn external_session_entries_from_file(
 
     let mut entries = parse_external_session_entries_from_file(source, session_id, path)?;
     annotate_external_transcript_entries(source, session_id, &mut entries);
+    let entries = std::sync::Arc::new(entries);
     store_external_transcript_entries(key, &entries);
     Some(entries)
 }
 
-pub(crate) fn external_session_entries_from_home(
+pub(crate) fn external_session_entries_from_home_arc(
     home: &Path,
     source: &str,
     session_id: &str,
-) -> Option<Vec<serde_json::Value>> {
+) -> Option<std::sync::Arc<Vec<serde_json::Value>>> {
     let source = crate::session_names::normalize_source(source);
     let path = match source.as_str() {
         "codex" => find_codex_session_file(home, session_id),
@@ -1057,7 +1131,16 @@ pub(crate) fn external_session_entries_from_home(
         _ => None,
     }?;
 
-    external_session_entries_from_file(&source, session_id, &path)
+    external_session_entries_from_file_arc(&source, session_id, &path)
+}
+
+pub(crate) fn external_session_entries_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    external_session_entries_from_home_arc(home, source, session_id)
+        .map(|entries| (*entries).clone())
 }
 
 #[allow(dead_code)]
@@ -1529,6 +1612,61 @@ pub(crate) fn session_ended_id_from_wire(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemini_transcript_lookup_is_scoped_per_home() {
+        let write_chat = |home: &Path, session_id: &str, text: &str| {
+            let chats = home.join(".gemini").join("tmp").join("proj").join("chats");
+            std::fs::create_dir_all(&chats).unwrap();
+            let body = serde_json::json!({
+                "sessionId": session_id,
+                "messages": [{ "role": "user", "content": text }],
+            });
+            std::fs::write(chats.join("chat-1.json"), body.to_string()).unwrap();
+        };
+        let home_a = tempfile::tempdir().unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        // The SAME session id exists under both homes: each lookup must
+        // resolve within its own home — a shared id-only cache key would
+        // serve home A's transcript to home B.
+        write_chat(home_a.path(), "shared-id", "from home a");
+        write_chat(home_b.path(), "shared-id", "from home b");
+
+        let found_a = find_gemini_session_file_for_transcript(home_a.path(), "shared-id")
+            .expect("home a chat resolves");
+        assert!(found_a.starts_with(home_a.path()), "{}", found_a.display());
+        // Repeat (cache-hit path) must stay inside home B, not replay A.
+        for _ in 0..2 {
+            let found_b = find_gemini_session_file_for_transcript(home_b.path(), "shared-id")
+                .expect("home b chat resolves");
+            assert!(found_b.starts_with(home_b.path()), "{}", found_b.display());
+        }
+    }
+
+    #[test]
+    fn transcript_cache_admission_rechecks_the_source_after_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-post-parse.jsonl");
+        std::fs::write(&path, b"{\"type\":\"noise\"}\n").unwrap();
+        // Key stat'd BEFORE the (simulated) parse...
+        let key = external_transcript_cache_key("codex", "post-parse-growth", &path)
+            .expect("key from pre-parse stat");
+        // ...then the file grows mid-parse: caching now would pin the
+        // parse under a key no future lookup matches (and could exceed
+        // the byte gate unnoticed).
+        std::fs::write(&path, b"{\"type\":\"noise\"}\n{\"type\":\"more\"}\n").unwrap();
+        let entries = std::sync::Arc::new(vec![serde_json::json!({ "content": "stale parse" })]);
+        store_external_transcript_entries(key.clone(), &entries);
+        assert!(
+            cached_external_transcript_entries(&key).is_none(),
+            "a parse of bytes that no longer match the keyed snapshot must not be cached"
+        );
+        // The steady case (file unchanged since the key) still caches.
+        let fresh_key =
+            external_transcript_cache_key("codex", "post-parse-growth", &path).expect("fresh key");
+        store_external_transcript_entries(fresh_key.clone(), &entries);
+        assert!(cached_external_transcript_entries(&fresh_key).is_some());
+    }
 
     #[test]
     fn external_transcript_cache_invalidates_when_source_file_changes() {

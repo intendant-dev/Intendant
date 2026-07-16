@@ -2792,8 +2792,9 @@ mod tests {
         rt.display_authority = Some(bridge);
         rt.grant = DashboardControlGrant::UserClient {
             principal,
-            iam_state: state.clone(),
+            iam_state: std::sync::Arc::new(state.clone()),
             iam_cert_dir: Some(tmp.path().to_path_buf()),
+            authority_memo: Default::default(),
         };
         let shutdown = CancellationToken::new();
         assert!(dashboard_display_input_remains_authorized(

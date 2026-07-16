@@ -20,6 +20,9 @@ pub const IAM_STATE_FILE: &str = "iam.json";
 pub const BROWSER_MTLS_INITIALIZED_FILE: &str = "browser-mtls-root.initialized";
 pub const IAM_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_HOSTED_ORIGIN: &str = "https://connect.intendant.dev";
+/// Newest audit events retained inside `iam.json` (see `normalize`); the
+/// same order of magnitude as the credential custody trail's in-memory cap.
+const IAM_AUDIT_EVENTS_CAP: usize = 300;
 
 fn default_schema_version() -> u32 {
     // A missing version is a legacy state and must run migrations.
@@ -842,6 +845,18 @@ impl LocalIamState {
         self.grants
             .retain(|g| !g.id.trim().is_empty() && !g.principal_id.trim().is_empty());
         self.audit_events.retain(|e| !e.id.trim().is_empty());
+        // Bound the audit trail to a recent tail, mirroring the credential
+        // custody trail's in-memory cap (`credential_audit::MEM_CAP`).
+        // Events are appended chronologically, so the head is the oldest.
+        // The evaluator never reads `audit_events` — retention is a
+        // forensics window, not an authorization input — and an uncapped
+        // vec otherwise rides every request-path load, per-mutation
+        // pretty-print + fsync, and `/api/access/iam/state` response for
+        // the daemon's lifetime.
+        if self.audit_events.len() > IAM_AUDIT_EVENTS_CAP {
+            let excess = self.audit_events.len() - IAM_AUDIT_EVENTS_CAP;
+            self.audit_events.drain(..excess);
+        }
         self
     }
 
@@ -1279,14 +1294,6 @@ pub fn load_state_cached_arc(cert_dir: &Path) -> AccessResult<std::sync::Arc<Loc
     Ok(std::sync::Arc::new(state))
 }
 
-/// Owned compatibility wrapper for callers that intentionally mutate or
-/// retain an independent IAM snapshot. Hot authorization paths should prefer
-/// [`load_state_cached_arc`] so an unchanged state does not deep-clone its
-/// principals, grants, and audit history on every input frame.
-pub fn load_state_cached(cert_dir: &Path) -> AccessResult<LocalIamState> {
-    load_state_cached_arc(cert_dir).map(|state| (*state).clone())
-}
-
 struct UserClientBinding {
     principal_id: String,
     principal_kind: String,
@@ -1301,7 +1308,7 @@ pub fn upsert_user_client_grant(
     request: UserClientGrantUpsertRequest,
     actor: &AccessPrincipal,
 ) -> AccessResult<UserClientGrantUpsertResult> {
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let fleet_zone = crate::fleet_cert::fleet_zone();
     upsert_user_client_grant_with_fleet_zone(state, request, actor, fleet_zone.as_deref())
 }
 
@@ -1497,7 +1504,7 @@ pub fn update_user_client_grant(
     request: IamGrantUpdateRequest,
     actor: &AccessPrincipal,
 ) -> AccessResult<IamGrantUpdateResult> {
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let fleet_zone = crate::fleet_cert::fleet_zone();
     update_user_client_grant_with_fleet_zone(state, request, actor, fleet_zone.as_deref())
 }
 
@@ -2495,7 +2502,15 @@ pub fn evaluate_principal_operation_with_state(
     principal: &AccessPrincipal,
     op: crate::access::access_policy::PeerOperation,
 ) -> AccessDecision {
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    // The zone feeds only the client_key origin classification below —
+    // fetch it lazily so every other principal kind (mTLS certificates,
+    // root sessions, peers, agent sessions) skips the fleet-status mutex
+    // on this per-request/per-frame path.
+    let fleet_zone = if principal.authn_kind.as_deref() == Some("client_key") {
+        crate::fleet_cert::fleet_zone()
+    } else {
+        None
+    };
     evaluate_principal_operation_with_state_and_fleet_zone(
         state,
         principal,
@@ -2948,7 +2963,7 @@ pub fn operation_permission_id(op: crate::access::access_policy::PeerOperation) 
 }
 
 pub fn principal_overview_values(state: &LocalIamState) -> Vec<Value> {
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let fleet_zone = crate::fleet_cert::fleet_zone();
     principal_overview_values_with_fleet_zone(state, fleet_zone.as_deref())
 }
 
@@ -2993,7 +3008,7 @@ pub(crate) fn principal_overview_values_with_fleet_zone(
 }
 
 pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> Vec<Value> {
-    let fleet_zone = crate::fleet_cert::status_snapshot().zone;
+    let fleet_zone = crate::fleet_cert::fleet_zone();
     grant_overview_values_with_fleet_zone(state, default_target_id, fleet_zone.as_deref())
 }
 
@@ -4262,6 +4277,29 @@ mod tests {
     }
 
     #[test]
+    fn normalize_bounds_audit_events_to_newest_tail() {
+        let mut state = LocalIamState::default();
+        for index in 0..(IAM_AUDIT_EVENTS_CAP + 50) {
+            state.audit_events.push(IamAuditEvent {
+                id: format!("audit:{index}"),
+                at_unix_ms: Some(index as u64),
+                actor_principal_id: "principal:test".to_string(),
+                action: "test".to_string(),
+                target_id: "target".to_string(),
+                summary: format!("event {index}"),
+            });
+        }
+        let state = state.normalize();
+        assert_eq!(state.audit_events.len(), IAM_AUDIT_EVENTS_CAP);
+        // Oldest events dropped, newest retained, order preserved.
+        assert_eq!(state.audit_events.first().unwrap().id, "audit:50");
+        assert_eq!(
+            state.audit_events.last().unwrap().id,
+            format!("audit:{}", IAM_AUDIT_EVENTS_CAP + 49)
+        );
+    }
+
+    #[test]
     fn malformed_state_reports_error_for_overview() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(iam_state_path(tmp.path()), b"{not json").unwrap();
@@ -4278,7 +4316,7 @@ mod tests {
 
         // Missing file: same default-state contract as load_state.
         assert_eq!(
-            load_state_cached(tmp.path()).unwrap(),
+            *load_state_cached_arc(tmp.path()).unwrap(),
             load_state(tmp.path()).unwrap()
         );
 
@@ -4298,20 +4336,21 @@ mod tests {
             created_at_unix_ms: Some(1),
         });
         save_state(tmp.path(), &state).unwrap();
-        let cached = load_state_cached(tmp.path()).unwrap();
-        assert_eq!(cached, load_state(tmp.path()).unwrap());
+        let cached = load_state_cached_arc(tmp.path()).unwrap();
+        assert_eq!(*cached, load_state(tmp.path()).unwrap());
         assert!(cached
             .principals
             .iter()
             .any(|p| p.id == "principal:cache-a"));
-        // Second read (a cache hit) is identical.
-        assert_eq!(load_state_cached(tmp.path()).unwrap(), cached);
-        assert_eq!(*load_state_cached_arc(tmp.path()).unwrap(), cached);
+        // Second read (a cache hit) is the same shared snapshot.
+        let hit = load_state_cached_arc(tmp.path()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&hit, &cached));
+        assert_eq!(*hit, *cached);
 
         // A writer that bypasses save_state (another process, a hand
         // edit) must be picked up by the per-call fingerprint re-check —
         // never trust invalidation.
-        let mut external = cached.clone();
+        let mut external = (*cached).clone();
         for principal in &mut external.principals {
             if principal.id == "principal:cache-a" {
                 principal.label = "Cache A (externally rewritten)".to_string();
@@ -4319,17 +4358,17 @@ mod tests {
         }
         let body = serde_json::to_string_pretty(&external).unwrap();
         std::fs::write(iam_state_path(tmp.path()), body).unwrap();
-        let reread = load_state_cached(tmp.path()).unwrap();
+        let reread = load_state_cached_arc(tmp.path()).unwrap();
         assert!(reread
             .principals
             .iter()
             .any(|p| p.label == "Cache A (externally rewritten)"));
-        assert_eq!(reread, load_state(tmp.path()).unwrap());
+        assert_eq!(*reread, load_state(tmp.path()).unwrap());
 
         // Deleting the file falls back to the default state.
         std::fs::remove_file(iam_state_path(tmp.path())).unwrap();
         assert_eq!(
-            load_state_cached(tmp.path()).unwrap(),
+            *load_state_cached_arc(tmp.path()).unwrap(),
             LocalIamState::default()
         );
     }

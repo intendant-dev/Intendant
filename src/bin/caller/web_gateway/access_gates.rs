@@ -980,7 +980,9 @@ mod tests {
                 Some("unknown-cert"),
                 "https",
             ),
-            iam_state: Some(crate::access::iam::LocalIamState::default()),
+            iam_state: Some(std::sync::Arc::new(
+                crate::access::iam::LocalIamState::default(),
+            )),
         };
         let root = RequestAuthority {
             principal: crate::access::iam::AccessPrincipal::root_dashboard_session(
@@ -1011,7 +1013,7 @@ mod tests {
         .expect("revoked binding remains attributable");
         let revoked = RequestAuthority {
             principal: revoked_principal,
-            iam_state: Some(revoked_state),
+            iam_state: Some(std::sync::Arc::new(revoked_state)),
         };
 
         for (path, operation) in [

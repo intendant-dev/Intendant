@@ -626,7 +626,12 @@ async fn run_connect_rendezvous_client(
                                 event,
                             )
                             .await;
-                            continue;
+                            // Fall through to the refresh check below: a
+                            // continuous event stream must not starve the
+                            // periodic re-register (daemon_session_token
+                            // rotation + claim-code refresh), which used to
+                            // be reachable only after an empty poll.
+                            false
                         }
                         Ok(None) => {
                             report_dry_credentials(&client, &base_url, &config, &daemon_id).await;

@@ -142,6 +142,13 @@ pub(crate) fn bootstrap_cache_resync_lines(
     lines
 }
 
+/// Capacity of the per-connection bounded PTY-output lane. Entries are one
+/// JSON-wrapped base64 chunk each (terminal.rs merges output up to 64 KiB
+/// per entry), so the lane holds ~1.4 MiB worst-case — the same order as
+/// terminal.rs's own 1 MiB per-listener bound that takes over (drop-oldest)
+/// once this lane fills and the forwarders park.
+pub(crate) const TERMINAL_FORWARD_LANE_CAP: usize = 16;
+
 /// Outbound half of a local `/ws` session: broadcast + direct responses ->
 /// the WebSocket, converting each input-authority change into a personalized
 /// `display_input_authority_state` wire message. Connection IDs never leave
@@ -163,6 +170,7 @@ pub(crate) fn bootstrap_cache_resync_lines(
 pub(crate) async fn ws_outbound_task(
     mut outbound_rx: broadcast::Receiver<String>,
     mut direct_rx: mpsc::UnboundedReceiver<String>,
+    mut terminal_forward_rx: mpsc::Receiver<String>,
     mut ws_tx: futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<DemuxStream>,
         Message,
@@ -177,6 +185,7 @@ pub(crate) async fn ws_outbound_task(
     session_cancel: CancellationToken,
 ) {
     let mut bootstrap_flushed = false;
+    let mut terminal_lane_open = true;
     let mut authority_tick =
         tokio::time::interval(crate::dashboard_control::LIVE_AUTHORITY_RECHECK_INTERVAL);
     authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -208,6 +217,35 @@ pub(crate) async fn ws_outbound_task(
                         }
                     }
                     None => break,
+                }
+            }
+            // PTY output rides its own small BOUNDED lane: when this send
+            // stalls on TCP backpressure (frozen tab), the lane fills, the
+            // per-terminal forwarders' `send().await` parks, and
+            // terminal.rs's per-listener drop-oldest bound re-engages —
+            // instead of the output flood growing the unbounded direct
+            // lane at PTY rate. Ordered after `direct_rx` so control
+            // responses (e.g. `terminal_opened`) keep draining first.
+            msg = terminal_forward_rx.recv(), if terminal_lane_open => {
+                match msg {
+                    Some(line) => {
+                        if !grant.opening_authority_is_current() {
+                            let _ = ws_tx.send(Message::Close(None)).await;
+                            session_cancel.cancel();
+                            break;
+                        }
+                        if ws_tx
+                            .send(Message::Text(line.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // All senders gone (inbound task tore down): stop
+                    // polling this lane; the other lanes keep serving
+                    // until the session cancel arm ends the loop.
+                    None => terminal_lane_open = false,
                 }
             }
             _ = &mut bootstrap_flushed_rx, if !bootstrap_flushed => {
@@ -403,6 +441,10 @@ pub(crate) struct WsInboundCtx {
     pub(crate) bus: EventBus,
     pub(crate) query_ctx: Option<WebQueryCtx>,
     pub(crate) direct_tx: mpsc::UnboundedSender<String>,
+    /// Bounded PTY-output lane (see `ws_outbound_task`): per-terminal
+    /// forwarders `send().await` here so a stalled socket re-engages
+    /// terminal.rs's drop-oldest bound instead of growing `direct_tx`.
+    pub(crate) terminal_forward_tx: mpsc::Sender<String>,
     pub(crate) voice_debug: Arc<Mutex<VoiceDebugState>>,
     pub(crate) live_provider: String,
     pub(crate) live_model: String,
@@ -447,6 +489,7 @@ pub(crate) async fn ws_inbound_task(
         bus: bus_inbound,
         query_ctx: query_ctx_inbound,
         direct_tx: direct_tx_inbound,
+        terminal_forward_tx: terminal_forward_tx_inbound,
         voice_debug: voice_debug_inbound,
         live_provider,
         live_model,
@@ -535,9 +578,11 @@ pub(crate) async fn ws_inbound_task(
             break;
         }
         if let Message::Text(text) = msg {
-            // Re-derive after the live IAM check above so a root→scoped
-            // change can never retain the root terminal visibility lane.
-            let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
+            // The terminal actor is re-derived inside each terminal_* arm —
+            // still after the live IAM check above, so a root→scoped change
+            // can never retain the root terminal visibility lane — but
+            // lazily, so pointer/keystroke/audio frames skip the extra IAM
+            // load + grant scan it costs.
             let trimmed = text.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1717,6 +1762,7 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("terminal_open") => {
                         // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
                         let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
                         let terminal_id = json["terminal_id"]
                             .as_str()
@@ -1755,13 +1801,32 @@ pub(crate) async fn ws_inbound_task(
                             .await
                         {
                             Ok((session, _created)) => {
+                                // Ack before the forwarder spawns so
+                                // `terminal_opened` is enqueued ahead of any
+                                // output frame (the outbound task drains the
+                                // direct lane before the terminal lane).
+                                let ack = serde_json::json!({
+                                    "t": "terminal_opened",
+                                    "host_id": host_id,
+                                    "terminal_id": terminal_id,
+                                    "shared": session.shared(),
+                                    "can_share": session
+                                        .managed_by(&ws_terminal_actor),
+                                });
+                                let _ = direct_tx_inbound.send(ack.to_string());
+
                                 // Spawn a forwarder task that drains the session's
                                 // per-listener queue (coalesced + bounded in
                                 // terminal.rs) and sends base64-encoded
-                                // output to this WS connection.
+                                // output to this WS connection over the
+                                // BOUNDED terminal lane: when the socket
+                                // stalls, `send().await` parks this task and
+                                // terminal.rs's drop-oldest bound holds the
+                                // memory line instead of the direct lane
+                                // growing at PTY rate.
                                 let mut rx = session.attach();
 
-                                let forwarder_tx = direct_tx_inbound.clone();
+                                let forwarder_tx = terminal_forward_tx_inbound.clone();
                                 let fwd_host = host_id.clone();
                                 let fwd_term = terminal_id.clone();
                                 tokio::spawn(async move {
@@ -1787,21 +1852,11 @@ pub(crate) async fn ws_inbound_task(
                                                 })
                                             }
                                         };
-                                        if forwarder_tx.send(msg.to_string()).is_err() {
+                                        if forwarder_tx.send(msg.to_string()).await.is_err() {
                                             break;
                                         }
                                     }
                                 });
-
-                                let ack = serde_json::json!({
-                                    "t": "terminal_opened",
-                                    "host_id": host_id,
-                                    "terminal_id": terminal_id,
-                                    "shared": session.shared(),
-                                    "can_share": session
-                                        .managed_by(&ws_terminal_actor),
-                                });
-                                let _ = direct_tx_inbound.send(ack.to_string());
                             }
                             Err(e) => {
                                 let err = serde_json::json!({
@@ -1816,6 +1871,7 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("terminal_input") => {
                         // {"t":"terminal_input","host_id":"local","terminal_id":"shell-0","data":"<base64>"}
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
                         let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
                         let terminal_id = json["terminal_id"]
                             .as_str()
@@ -1839,6 +1895,7 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("terminal_resize") => {
                         // {"t":"terminal_resize","host_id":"local","terminal_id":"shell-0","cols":N,"rows":N}
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
                         let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
                         let terminal_id = json["terminal_id"]
                             .as_str()
@@ -1859,6 +1916,7 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("terminal_close") => {
                         // {"t":"terminal_close","host_id":"local","terminal_id":"shell-0"}
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
                         let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
                         let terminal_id = json["terminal_id"]
                             .as_str()
@@ -1874,6 +1932,7 @@ pub(crate) async fn ws_inbound_task(
                     }
                     Some("terminal_share") => {
                         // {"t":"terminal_share","host_id":"local","terminal_id":"shell-0","shared":true}
+                        let ws_terminal_actor = dashboard_control_grant_inbound.terminal_actor();
                         let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
                         let terminal_id = json["terminal_id"]
                             .as_str()
@@ -2638,8 +2697,9 @@ mod signaling_ownership_tests {
                 .unwrap();
         let grant = crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
-            iam_state: state,
+            iam_state: std::sync::Arc::new(state),
             iam_cert_dir: None,
+            authority_memo: Default::default(),
         };
         assert!(
             grant

@@ -12,8 +12,17 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-/// Bytes hashed from the file head for the prefix fingerprint.
-const PREFIX_HASH_BYTES: usize = 4096;
+/// Bytes hashed from the file head for the prefix fingerprint. Shared
+/// with the session catalog's incremental row accumulators, which use the
+/// same head-hash to distinguish appends from rewrites.
+pub(crate) const PREFIX_HASH_BYTES: usize = 4096;
+
+/// How much older than the check time a stored mtime must be before
+/// timestamp equality is trusted without re-hashing (racy-mtime
+/// distrust). Covers every supported filesystem's stamp granularity —
+/// Linux jiffies (~1-4 ms) through FAT/exFAT (2 s) — with the whole
+/// window as margin.
+const RACY_MTIME_QUIESCENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SourceCursor {
@@ -22,10 +31,33 @@ pub(crate) struct SourceCursor {
     pub identity: Option<FileIdentity>,
     pub len: u64,
     pub mtime_ms: i64,
+    /// Full-precision mtime for the cheap-facts short-circuit. Precision
+    /// alone cannot carry it — filesystem stamps come from coarse kernel
+    /// clocks (Linux jiffies: ~1-4 ms; FAT/exFAT: 2 s granules), so two
+    /// writes inside one granule are indistinguishable at ANY stored
+    /// precision. The short-circuit therefore also requires the stored
+    /// mtime to be QUIESCENT — at least [`RACY_MTIME_QUIESCENCE`] older
+    /// than the check time (git's racy-index discipline); fresh mtimes
+    /// always fall through to the hash windows. `0` on cursors persisted
+    /// before the field — those never short-circuit (they hash every
+    /// sweep, the historical behavior).
+    #[serde(default)]
+    pub mtime_ns: u64,
     /// Offset just past the last COMPLETE line consumed — a partial
     /// trailing line (no newline yet) stays unread until it completes.
     pub last_complete_line_offset: u64,
     pub prefix_hash16: String,
+    /// Second rewrite-detection window: hash of the last
+    /// `min(4096, last_complete_line_offset)` bytes ENDING at the consumed
+    /// offset. The head window alone cannot exclude a rewrite past the
+    /// first 4 KiB that also grows the file (it would read as a benign
+    /// append); requiring both windows narrows the undetected residual to
+    /// a rewrite that preserves the head, the pre-consumed tail, AND grows
+    /// the file — accepted and documented. Empty on cursors persisted
+    /// before the field existed: those classify as before but are never
+    /// eligible for incremental resume.
+    #[serde(default)]
+    pub consumed_tail_hash16: String,
     pub parser_version: u32,
 }
 
@@ -53,21 +85,61 @@ fn file_mtime_ms(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+fn file_mtime_ns(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 fn prefix_hash16(path: &Path) -> Option<String> {
+    prefix_hash16_bytes(path, PREFIX_HASH_BYTES)
+}
+
+/// Hash16 over the first `max_bytes` of `path` (fewer at EOF).
+pub(crate) fn prefix_hash16_bytes(path: &Path, max_bytes: usize) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; PREFIX_HASH_BYTES];
+    let mut buf = vec![0u8; max_bytes];
     let mut read = 0usize;
     loop {
+        if read == buf.len() {
+            break;
+        }
         match file.read(&mut buf[read..]) {
             Ok(0) => break,
             Ok(n) => read += n,
             Err(_) => return None,
         }
+    }
+    buf.truncate(read);
+    Some(hash16(&buf))
+}
+
+/// Hash16 over the `min(4096, end)` bytes ENDING at offset `end` — the
+/// second rewrite-detection window (see `consumed_tail_hash16`). For
+/// consumed ranges under 4 KiB this window covers every consumed byte,
+/// which is what closes the small-file head-mutation hole the prefix
+/// window's "not comparable on growth" rule leaves open.
+pub(crate) fn tail_hash16_ending_at(path: &Path, end: u64) -> Option<String> {
+    let window = end.min(PREFIX_HASH_BYTES as u64);
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(end - window)).ok()?;
+    let mut buf = vec![0u8; window as usize];
+    let mut read = 0usize;
+    loop {
         if read == buf.len() {
             break;
         }
+        match file.read(&mut buf[read..]) {
+            // Shorter than the recorded consumed range: a concurrent
+            // truncation; the caller's length checks classify it.
+            Ok(0) => return None,
+            Ok(n) => read += n,
+            Err(_) => return None,
+        }
     }
-    buf.truncate(read);
     Some(hash16(&buf))
 }
 
@@ -90,14 +162,30 @@ impl SourceCursor {
             identity: FileIdentity::from_path(path).ok(),
             len: metadata.len(),
             mtime_ms: file_mtime_ms(&metadata),
+            mtime_ns: file_mtime_ns(&metadata),
             last_complete_line_offset,
             prefix_hash16: prefix_hash16(path)?,
+            consumed_tail_hash16: tail_hash16_ending_at(path, last_complete_line_offset)?,
             parser_version: super::record::PARSER_VERSION,
         })
     }
 
+    /// Whether this cursor carries the second (consumed-tail) hash window.
+    /// Incremental resume REQUIRES it: cursors persisted before the field
+    /// existed classify exactly as before, but never resume — the next
+    /// full re-parse re-captures with both windows.
+    pub(crate) fn supports_incremental_resume(&self) -> bool {
+        !self.consumed_tail_hash16.is_empty()
+    }
+
     /// Compare the file on disk against this cursor.
     pub(crate) fn check(&self) -> CursorCheck {
+        self.check_at(std::time::SystemTime::now())
+    }
+
+    /// [`Self::check`] with an injectable clock, so tests pin the racy
+    /// mtime-distrust window without sleeping.
+    pub(crate) fn check_at(&self, now: std::time::SystemTime) -> CursorCheck {
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             return CursorCheck::Gone;
         };
@@ -107,25 +195,82 @@ impl SourceCursor {
         if metadata.len() < self.len {
             return CursorCheck::Rewritten;
         }
-        if let (Some(saved), Ok(current)) = (self.identity, FileIdentity::from_path(&self.path)) {
-            if saved.is_reliable() && current.is_reliable() && saved != current {
-                return CursorCheck::Rewritten;
-            }
-        }
-        match prefix_hash16(&self.path) {
-            Some(hash) => {
-                // The saved and fresh hashes cover the same byte window
-                // only when the saved file already filled the window, or
-                // the length hasn't changed — an append to a small file
-                // widens the hashed window and is NOT comparable (and is
-                // exactly the benign case the offset check below handles).
-                let comparable =
-                    self.len as usize >= PREFIX_HASH_BYTES || metadata.len() == self.len;
-                if comparable && hash != self.prefix_hash16 {
+        let current_identity = FileIdentity::from_path(&self.path).ok();
+        let identity_reliably_same = match (self.identity, current_identity) {
+            (Some(saved), Some(current)) if saved.is_reliable() && current.is_reliable() => {
+                if saved != current {
                     return CursorCheck::Rewritten;
                 }
+                true
             }
-            None => return CursorCheck::Gone,
+            _ => false,
+        };
+        // Full-precision when both sides carry it; ms for legacy cursors.
+        let mtime_moved = if self.mtime_ns != 0 {
+            file_mtime_ns(&metadata) != self.mtime_ns
+        } else {
+            file_mtime_ms(&metadata) != self.mtime_ms
+        };
+        // Same length, moved mtime: an in-place rewrite whose changed bytes
+        // lie past the hashed prefix window would otherwise read as
+        // Unchanged forever (the module doc's "folds len + timestamps"
+        // promise). A benign touch(1) costs one idempotent rebuild.
+        if metadata.len() == self.len && mtime_moved {
+            return CursorCheck::Rewritten;
+        }
+        // Cheap-facts short-circuit: a reliable identity match with
+        // unchanged len + full-precision mtime is the steady state of
+        // nearly every in-retention file on every 30s sweep — skip the
+        // open + 4 KiB read + SHA-256 that used to run merely to confirm
+        // it. Racy-mtime distrust (git's index discipline): timestamp
+        // equality is only trusted on a QUIESCENT file — the stored mtime
+        // must be comfortably older than the check time. Filesystem
+        // stamps come from coarse kernel clocks (a Linux jiffy is ~1-4 ms;
+        // FAT/exFAT granules are 2 s), so a rewrite landing in the same
+        // granule as the captured write is timestamp-invisible; a fresh
+        // mtime therefore falls through to the hash windows, and only
+        // files untouched for the full window skip them. Legacy cursors
+        // without `mtime_ns` never short-circuit.
+        let stored_mtime_quiescent = now
+            .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(self.mtime_ns))
+            .is_ok_and(|age| age >= RACY_MTIME_QUIESCENCE);
+        let hash_needed = !(identity_reliably_same
+            && metadata.len() == self.len
+            && self.mtime_ns != 0
+            && !mtime_moved
+            && stored_mtime_quiescent);
+        if hash_needed {
+            match prefix_hash16(&self.path) {
+                Some(hash) => {
+                    // The saved and fresh hashes cover the same byte window
+                    // only when the saved file already filled the window, or
+                    // the length hasn't changed — an append to a small file
+                    // widens the hashed window and is NOT comparable (and is
+                    // exactly the benign case the offset check below handles;
+                    // the consumed-tail window below covers every consumed
+                    // byte of such a small file, so a head mutation on a
+                    // grown small file still reads as Rewritten).
+                    let comparable =
+                        self.len as usize >= PREFIX_HASH_BYTES || metadata.len() == self.len;
+                    if comparable && hash != self.prefix_hash16 {
+                        return CursorCheck::Rewritten;
+                    }
+                }
+                None => return CursorCheck::Gone,
+            }
+            // Second window: the head hash alone cannot exclude a rewrite
+            // past the first 4 KiB that also grows the file — it would
+            // read as a benign append. An honest append never changes
+            // bytes at or before the consumed offset, so a moved tail
+            // window is proof of rewrite. (Both-windows-preserved growth
+            // rewrites remain the documented residual.)
+            if !self.consumed_tail_hash16.is_empty() {
+                match tail_hash16_ending_at(&self.path, self.last_complete_line_offset) {
+                    Some(hash) if hash == self.consumed_tail_hash16 => {}
+                    Some(_) => return CursorCheck::Rewritten,
+                    None => return CursorCheck::Gone,
+                }
+            }
         }
         if metadata.len() > self.last_complete_line_offset {
             CursorCheck::Appended
@@ -135,17 +280,22 @@ impl SourceCursor {
     }
 }
 
-/// Read complete lines from `path` starting at `offset`; returns the
-/// lines and the offset just past the last complete line (a trailing
-/// partial line is left for the next pass — plan §6).
-pub(crate) fn read_complete_lines_from(
+/// Stream complete lines from `path` starting at `offset` through
+/// `consume`; returns the offset just past the last complete line (a
+/// trailing partial line is left for the next pass — plan §6).
+///
+/// Streaming, not collecting: extraction runs on every changed
+/// in-retention source every sweep, and materializing a multi-hundred-MB
+/// rollout as an owned `Vec<String>` was a file-sized allocation spike
+/// per parse. One reused line buffer serves the whole read.
+pub(crate) fn for_each_complete_line_from(
     path: &Path,
     offset: u64,
-) -> std::io::Result<(Vec<String>, u64)> {
+    mut consume: impl FnMut(&str),
+) -> std::io::Result<u64> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = std::io::BufReader::new(file);
-    let mut lines = Vec::new();
     let mut consumed = offset;
     let mut buf = Vec::new();
     loop {
@@ -160,9 +310,20 @@ pub(crate) fn read_complete_lines_from(
         }
         consumed += bytes as u64;
         let line = String::from_utf8_lossy(&buf);
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        lines.push(trimmed.to_string());
+        consume(line.trim_end_matches(['\n', '\r']));
     }
+    Ok(consumed)
+}
+
+/// Collected form of [`for_each_complete_line_from`] — tests and small
+/// bounded reads only; extraction paths must stream.
+#[cfg(test)]
+pub(crate) fn read_complete_lines_from(
+    path: &Path,
+    offset: u64,
+) -> std::io::Result<(Vec<String>, u64)> {
+    let mut lines = Vec::new();
+    let consumed = for_each_complete_line_from(path, offset, |line| lines.push(line.to_string()))?;
     Ok((lines, consumed))
 }
 
@@ -208,14 +369,125 @@ mod tests {
         assert_eq!(cursor.check(), CursorCheck::Rewritten);
     }
 
+    /// Sets an explicit whole-second mtime (exactly representable on
+    /// every supported filesystem, so the captured stamp round-trips).
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    fn whole_seconds_now() -> std::time::SystemTime {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// Deterministic detection via the moved-mtime rule: explicit DISTINCT
+    /// stamps, no reliance on platform clock granularity.
     #[test]
     fn same_length_prefix_rewrite_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
+        let t0 = whole_seconds_now() - std::time::Duration::from_secs(10);
         std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, t0);
         let cursor = SourceCursor::capture(&path, 10).unwrap();
         std::fs::write(&path, "zzzz\nbbbb\n").unwrap(); // same len, new head
+        set_mtime(&path, t0 + std::time::Duration::from_secs(1));
         assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    /// A rewrite landing in the SAME timestamp granule as the captured
+    /// write (identical mtime, identical length — what a coarse kernel
+    /// clock produces for rapid writes) must still be caught: the racy
+    /// window distrusts fresh mtimes and falls through to the hash
+    /// windows. No sleeps — the check time is injected.
+    #[test]
+    fn same_granule_rewrite_is_caught_inside_the_racy_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let stamp = whole_seconds_now();
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        let cursor = SourceCursor::capture(&path, 10).unwrap();
+        assert_eq!(cursor.mtime_ns % 1_000_000_000, 0, "whole-second stamp");
+
+        // Same-granule rewrite: same length, same mtime, new head bytes.
+        std::fs::write(&path, "zzzz\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        assert_eq!(
+            cursor.check_at(stamp + std::time::Duration::from_millis(100)),
+            CursorCheck::Rewritten,
+            "a fresh mtime must fall through to the hash windows"
+        );
+
+        // Quiescent fast path still exists: with the ORIGINAL bytes back
+        // and the same stamp, an old-mtime check trusts the facts.
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        assert_eq!(
+            cursor.check_at(stamp + std::time::Duration::from_secs(3)),
+            CursorCheck::Unchanged,
+            "a quiescent matching file skips the hashes and reads Unchanged"
+        );
+    }
+
+    #[test]
+    fn post_prefix_rewrite_that_grows_reads_as_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        // First line fills the 4 KiB prefix window; the second is the
+        // post-prefix content a growth rewrite mutates.
+        let head = format!("{}\n", "h".repeat(PREFIX_HASH_BYTES));
+        let body = format!("{head}old-tail-line\n");
+        std::fs::write(&path, &body).unwrap();
+        let cursor = SourceCursor::capture(&path, body.len() as u64).unwrap();
+        assert!(cursor.supports_incremental_resume());
+
+        // Same head 4 KiB, mutated bytes past it, file GROWN: the head
+        // window matches and the length check passes — only the
+        // consumed-tail window can (and must) catch it.
+        std::fs::write(&path, format!("{head}new-tail-line\nappended line\n")).unwrap();
+        assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    #[test]
+    fn small_file_head_mutating_grow_reads_as_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap(); // well under 4 KiB
+        let cursor = SourceCursor::capture(&path, 10).unwrap();
+
+        // Head mutated AND grown: the prefix window is "not comparable"
+        // (saved len < window, length changed), which used to read as a
+        // benign append; the consumed-tail window covers every consumed
+        // byte of a small file and catches it.
+        std::fs::write(&path, "zzzz\nbbbb\ncccc\n").unwrap();
+        assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    #[test]
+    fn honest_append_keeps_both_windows_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let head = format!("{}\n", "h".repeat(PREFIX_HASH_BYTES));
+        let body = format!("{head}tail-line\n");
+        std::fs::write(&path, &body).unwrap();
+        let cursor = SourceCursor::capture(&path, body.len() as u64).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"appended line\n").unwrap();
+        drop(file);
+        assert_eq!(cursor.check(), CursorCheck::Appended);
     }
 
     #[test]
