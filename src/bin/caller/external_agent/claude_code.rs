@@ -1592,25 +1592,28 @@ impl CcReader {
             return;
         }
 
+        // Build the failure snippet before the delta event so the (possibly
+        // large) result text can move into the event instead of being cloned
+        // wholesale just to keep a 200-char error excerpt alive.
+        let failure_message = is_error.then(|| {
+            let message: String = content_text.chars().take(200).collect();
+            if message.trim().is_empty() {
+                "tool error".to_string()
+            } else {
+                message
+            }
+        });
         if !content_text.is_empty() {
             out.events.push(AgentEvent::ToolOutputDelta {
                 item_id: tool_id.clone(),
-                text: content_text.clone(),
+                text: content_text,
             });
         }
 
         self.open_tools.remove(&tool_id);
-        let status = if is_error {
-            let message: String = content_text.chars().take(200).collect();
-            ToolCompletionStatus::Failed {
-                message: if message.trim().is_empty() {
-                    "tool error".into()
-                } else {
-                    message
-                },
-            }
-        } else {
-            ToolCompletionStatus::Success
+        let status = match failure_message {
+            Some(message) => ToolCompletionStatus::Failed { message },
+            None => ToolCompletionStatus::Success,
         };
         out.events.push(AgentEvent::ToolCompleted {
             item_id: tool_id,

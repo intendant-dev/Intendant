@@ -57,6 +57,41 @@ pub(crate) struct JsonRpcError {
     pub(crate) message: String,
 }
 
+/// Decode an already-parsed JSON-RPC envelope by moving its five known
+/// fields out of the object — the reader loop's second pass. Equivalent to
+/// `serde_json::from_value::<JsonRpcMessage>` (which re-walks and rebuilds
+/// the entire tree, including multi-hundred-KB `params`) but O(fields):
+/// `None` exactly where the serde derive would error — a non-object
+/// envelope, a non-u64 `id`, a non-string `method`, or a malformed `error`
+/// object. `null` fields decode as absent, unknown fields are ignored, both
+/// as under the derive.
+pub(crate) fn decode_jsonrpc_message(raw: serde_json::Value) -> Option<JsonRpcMessage> {
+    let serde_json::Value::Object(mut envelope) = raw else {
+        return None;
+    };
+    let id = match envelope.remove("id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Number(id)) => Some(id.as_u64()?),
+        Some(_) => return None,
+    };
+    let method = match envelope.remove("method") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(method)) => Some(method),
+        Some(_) => return None,
+    };
+    let error = match envelope.remove("error") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(error) => Some(serde_json::from_value::<JsonRpcError>(error).ok()?),
+    };
+    Some(JsonRpcMessage {
+        id,
+        method,
+        params: envelope.remove("params").filter(|v| !v.is_null()),
+        result: envelope.remove("result").filter(|v| !v.is_null()),
+        error,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pending-request bookkeeping
 // ---------------------------------------------------------------------------
@@ -300,6 +335,58 @@ mod tests {
             // These should either parse successfully (with missing optional fields)
             // or fail gracefully without panicking
             let _result: Result<JsonRpcMessage, _> = serde_json::from_str(line);
+        }
+    }
+
+    #[test]
+    fn decode_jsonrpc_message_matches_serde_derive() {
+        // The reader's direct field extraction must accept and reject exactly
+        // what `from_value::<JsonRpcMessage>` did, shape for shape.
+        let cases = [
+            r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32600,"message":"Invalid request"}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}}"#,
+            r#"{"jsonrpc":"2.0","id":99,"method":"x/requestApproval","params":{"item":{}}}"#,
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":null,"params":null,"result":null,"error":null}"#,
+            r#"{"jsonrpc":"2.0","id":"not-a-number"}"#,
+            r#"{"jsonrpc":"2.0","id":-3}"#,
+            r#"{"jsonrpc":"2.0","method":42}"#,
+            r#"{"jsonrpc":"2.0","error":{"code":"nope"}}"#,
+            r#"{"jsonrpc":"2.0","unknown_extra":true,"id":7,"method":"m"}"#,
+            r#"[1,2,3]"#,
+            r#""just a string""#,
+        ];
+        for case in cases {
+            let raw: serde_json::Value = serde_json::from_str(case).unwrap();
+            let derived: Result<JsonRpcMessage, _> = serde_json::from_value(raw.clone());
+            let decoded = decode_jsonrpc_message(raw);
+            match derived {
+                Ok(expected) => {
+                    let actual = decoded.unwrap_or_else(|| {
+                        panic!("decode_jsonrpc_message rejected accepted shape: {case}")
+                    });
+                    assert_eq!(actual.id, expected.id, "id mismatch for {case}");
+                    assert_eq!(actual.method, expected.method, "method mismatch for {case}");
+                    assert_eq!(actual.params, expected.params, "params mismatch for {case}");
+                    assert_eq!(actual.result, expected.result, "result mismatch for {case}");
+                    assert_eq!(
+                        actual.error.is_some(),
+                        expected.error.is_some(),
+                        "error presence mismatch for {case}"
+                    );
+                    if let (Some(actual), Some(expected)) = (actual.error, expected.error) {
+                        assert_eq!(actual.code, expected.code);
+                        assert_eq!(actual.message, expected.message);
+                    }
+                }
+                Err(_) => {
+                    assert!(
+                        decoded.is_none(),
+                        "decode_jsonrpc_message accepted rejected shape: {case}"
+                    );
+                }
+            }
         }
     }
 

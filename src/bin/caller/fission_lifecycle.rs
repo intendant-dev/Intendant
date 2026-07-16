@@ -148,8 +148,12 @@ pub enum WaitOutcome {
 /// group detaches, or the timeout elapses. `branch_session_id = None` waits
 /// for ANY branch of the group to become terminal.
 ///
-/// Ledger-poll implementation (1s cadence). The supervisor stage may layer
-/// bus-event wakeups on top; the polling contract and return shape stay.
+/// Ledger-poll implementation (1s cadence), fingerprint-guarded: the ~MB
+/// ledger is only re-read and re-parsed when its (len, mtime) moved — every
+/// write goes through an atomic rename, so unchanged metadata means an
+/// unchanged ledger and the previous evaluation still holds. The supervisor
+/// stage may layer bus-event wakeups on top; the polling contract and
+/// return shape stay.
 pub async fn wait_for_branch_terminal(
     log_dir: &Path,
     group_id: &str,
@@ -157,13 +161,20 @@ pub async fn wait_for_branch_terminal(
     timeout: Duration,
 ) -> io::Result<WaitOutcome> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let ledger_path = fission_ledger::ledger_path(log_dir);
+    let mut last_fingerprint: Option<Option<(u64, u128)>> = None;
+    let mut snapshot: Option<(FissionGroup, bool)> = None;
     loop {
-        let snapshot = read_group(log_dir, group_id)?;
-        let Some((group, detached)) = snapshot else {
+        let fingerprint = ledger_file_fingerprint(&ledger_path);
+        if last_fingerprint != Some(fingerprint) {
+            snapshot = read_group(log_dir, group_id)?;
+            last_fingerprint = Some(fingerprint);
+        }
+        let Some((group, detached)) = snapshot.as_ref() else {
             return Ok(WaitOutcome::GroupNotFound);
         };
-        if detached {
-            return Ok(WaitOutcome::Detached(group));
+        if *detached {
+            return Ok(WaitOutcome::Detached(group.clone()));
         }
         match branch_session_id.map(str::trim).filter(|id| !id.is_empty()) {
             Some(branch_id) => {
@@ -172,10 +183,10 @@ pub async fn wait_for_branch_terminal(
                     .iter()
                     .find(|branch| branch.session_id == branch_id)
                 else {
-                    return Ok(WaitOutcome::BranchNotFound(group));
+                    return Ok(WaitOutcome::BranchNotFound(group.clone()));
                 };
                 if fission_ledger::branch_status_is_terminal(&branch.status) {
-                    return Ok(WaitOutcome::Terminal(group));
+                    return Ok(WaitOutcome::Terminal(group.clone()));
                 }
             }
             None => {
@@ -184,15 +195,28 @@ pub async fn wait_for_branch_terminal(
                     .iter()
                     .any(|branch| fission_ledger::branch_status_is_terminal(&branch.status))
                 {
-                    return Ok(WaitOutcome::Terminal(group));
+                    return Ok(WaitOutcome::Terminal(group.clone()));
                 }
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(WaitOutcome::StillRunning(group));
+            return Ok(WaitOutcome::StillRunning(group.clone()));
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// (len, mtime-nanos) of the ledger file; `None` when it does not exist.
+/// Same change-detection discipline as the wrapper-index cache.
+fn ledger_file_fingerprint(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    Some((metadata.len(), mtime_nanos))
 }
 
 fn read_group(log_dir: &Path, group_id: &str) -> io::Result<Option<(FissionGroup, bool)>> {
@@ -242,7 +266,32 @@ pub fn spawn_fission_lifecycle_watcher(
     tokio::spawn(async move {
         let mut state = LifecycleWatcherState::default();
         while let Some(event) = rx.recv().await {
-            handle_lifecycle_event(&event, &mut state);
+            if !matches!(event, AppEvent::FileChanged { .. }) {
+                handle_lifecycle_event(&event, &mut state);
+                continue;
+            }
+            // Changed-file burst: drain every immediately available event,
+            // staging FileChanged paths (dedup/cap applied per event, in
+            // stream order) and flushing the whole batch as ONE ledger
+            // read→modify→write per log dir — a save storm otherwise costs
+            // one fsync'd multi-MB rewrite per file per branch. Non-file
+            // events flush what preceded them first, preserving the
+            // pre-terminal/post-terminal accumulation order.
+            let mut batch = ChangedFileBatch::default();
+            stage_lifecycle_event(&event, &mut state, &mut batch);
+            loop {
+                match rx.try_recv() {
+                    Ok(next @ AppEvent::FileChanged { .. }) => {
+                        stage_lifecycle_event(&next, &mut state, &mut batch);
+                    }
+                    Ok(next) => {
+                        batch.flush();
+                        handle_lifecycle_event(&next, &mut state);
+                    }
+                    Err(_) => break,
+                }
+            }
+            batch.flush();
         }
     })
 }
@@ -418,6 +467,45 @@ fn record_branch_observation(
     }
 }
 
+/// Changed-file deltas staged per (log dir, group, branch), flushed as one
+/// bulk ledger write per log dir ([`fission_ledger::update_branches_changed_files`]).
+#[derive(Default)]
+struct ChangedFileBatch {
+    staged: HashMap<PathBuf, HashMap<(String, String), Vec<String>>>,
+}
+
+impl ChangedFileBatch {
+    fn flush(&mut self) {
+        for (log_dir, branches) in self.staged.drain() {
+            let updates: Vec<fission_ledger::BranchChangedFiles> = branches
+                .into_iter()
+                .map(|((group_id, branch_session_id), changed_files)| {
+                    fission_ledger::BranchChangedFiles {
+                        group_id,
+                        branch_session_id,
+                        changed_files,
+                    }
+                })
+                .collect();
+            if let Err(err) = fission_ledger::update_branches_changed_files(&log_dir, &updates) {
+                eprintln!("[fission-lifecycle] failed to record changed files: {err}");
+            }
+        }
+    }
+}
+
+/// Stage `FileChanged` events into `batch`; every other event is a no-op
+/// here (the caller routes those through [`handle_lifecycle_event`]).
+fn stage_lifecycle_event(
+    event: &AppEvent,
+    state: &mut LifecycleWatcherState,
+    batch: &mut ChangedFileBatch,
+) {
+    if let AppEvent::FileChanged { path, .. } = event {
+        stage_changed_file(state, batch, path);
+    }
+}
+
 /// Accumulate a project `FileChanged` path into the work metadata of every
 /// registered, still-running branch. The project file watcher carries no
 /// per-session attribution, and fission branches that share the parent
@@ -426,6 +514,14 @@ fn record_branch_observation(
 /// bounded by [`CHANGED_FILES_PER_BRANCH_CAP`]). Branches in isolated
 /// worktrees edit outside the watch root and naturally accumulate nothing.
 fn record_changed_file(state: &mut LifecycleWatcherState, path: &str) {
+    let mut batch = ChangedFileBatch::default();
+    stage_changed_file(state, &mut batch, path);
+    batch.flush();
+}
+
+/// The per-event core of changed-file accumulation: state dedup + cap, then
+/// stage (never write) the path for each still-running branch.
+fn stage_changed_file(state: &mut LifecycleWatcherState, batch: &mut ChangedFileBatch, path: &str) {
     let path = path.trim();
     if path.is_empty() {
         return;
@@ -448,14 +544,13 @@ fn record_changed_file(state: &mut LifecycleWatcherState, path: &str) {
             continue;
         }
         recorded.insert(path.to_string());
-        let _ = fission_ledger::update_branch_work(
-            &route.log_dir,
-            &route.group_id,
-            &branch_session_id,
-            &[path.to_string()],
-            &[],
-            None,
-        );
+        batch
+            .staged
+            .entry(route.log_dir)
+            .or_default()
+            .entry((route.group_id, branch_session_id))
+            .or_default()
+            .push(path.to_string());
     }
 }
 
@@ -914,6 +1009,81 @@ mod tests {
             .any(|path| path == "src/lw_fc_post_terminal.rs"));
 
         drop_pending_deliveries(&[group_id]);
+    }
+
+    #[test]
+    fn changed_file_burst_batch_flushes_all_branches_in_one_write() {
+        let dir = tempdir().unwrap();
+        let group_a =
+            register_test_branch(dir.path(), "lw-parent-9", "lw-call-9a", "lw-child-batch-a");
+        let group_b =
+            register_test_branch(dir.path(), "lw-parent-9", "lw-call-9b", "lw-child-batch-b");
+        register_branch("lw-child-batch-a", &group_a, dir.path());
+        register_branch("lw-child-batch-b", &group_b, dir.path());
+        let mut state = LifecycleWatcherState::default();
+
+        // Stage a burst of changed files (as the watcher loop's drain does),
+        // then flush once: every (branch, path) pair lands.
+        let mut batch = ChangedFileBatch::default();
+        stage_changed_file(&mut state, &mut batch, "src/lw_batch_1.rs");
+        stage_changed_file(&mut state, &mut batch, "src/lw_batch_2.rs");
+        stage_changed_file(&mut state, &mut batch, "src/lw_batch_1.rs"); // dedup
+        batch.flush();
+        assert!(batch.staged.is_empty());
+
+        let document = fission_ledger::read_fission_ledger_document(dir.path())
+            .unwrap()
+            .expect("document");
+        for (group, branch) in [
+            (&group_a, "lw-child-batch-a"),
+            (&group_b, "lw-child-batch-b"),
+        ] {
+            let ext = document.branch_ext(group, branch).expect("branch ext");
+            // Containment (not exact equality): the branch registry is
+            // process-global, so concurrently running watcher tests may
+            // interleave their own paths into these branches.
+            for path in ["src/lw_batch_1.rs", "src/lw_batch_2.rs"] {
+                assert_eq!(
+                    ext.changed_files
+                        .iter()
+                        .filter(|existing| existing.as_str() == path)
+                        .count(),
+                    1,
+                    "branch {branch} path {path}"
+                );
+            }
+        }
+
+        // The staged path respects terminal suppression mid-burst, exactly
+        // like the immediate path.
+        handle_lifecycle_event(
+            &AppEvent::TaskComplete {
+                session_id: Some("lw-child-batch-a".to_string()),
+                reason: "done".to_string(),
+                summary: None,
+            },
+            &mut state,
+        );
+        let mut batch = ChangedFileBatch::default();
+        stage_changed_file(&mut state, &mut batch, "src/lw_batch_3.rs");
+        batch.flush();
+        let document = fission_ledger::read_fission_ledger_document(dir.path())
+            .unwrap()
+            .expect("document");
+        assert!(!document
+            .branch_ext(&group_a, "lw-child-batch-a")
+            .expect("branch ext")
+            .changed_files
+            .iter()
+            .any(|path| path == "src/lw_batch_3.rs"));
+        assert!(document
+            .branch_ext(&group_b, "lw-child-batch-b")
+            .expect("branch ext")
+            .changed_files
+            .iter()
+            .any(|path| path == "src/lw_batch_3.rs"));
+
+        drop_pending_deliveries(&[group_a, group_b]);
     }
 
     #[test]

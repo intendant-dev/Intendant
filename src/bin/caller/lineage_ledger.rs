@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 /// Boilerplate the session log writes for a `done_signal` with no caller message
 /// (see `SessionLog::done_signal_for_session`). Filtered out so it isn't treated
@@ -55,7 +57,7 @@ struct RelationshipKey {
     ephemeral: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SessionFacts {
     identities: HashMap<String, String>,
     tasks: HashMap<String, String>,
@@ -66,6 +68,9 @@ struct SessionFacts {
     /// selection can pick the *latest* rewind-restore rather than relying on the
     /// `BTreeSet`'s lexicographic ordering of (random) child session ids.
     relationship_order: HashMap<RelationshipKey, usize>,
+    /// Next relationship sequence index (fold state — lives here so an
+    /// incremental fold continues exactly where the previous one stopped).
+    relationship_seq: usize,
     /// `(parent, child)` pairs severed by a `fission-detached` relationship:
     /// the branch's spawn anchor left the effective history (rewound past) or
     /// the group was explicitly severed.
@@ -73,29 +78,365 @@ struct SessionFacts {
     /// `(parent, child)` pairs whose result a `fission-imported` relationship
     /// marked as explicitly imported into the parent's continuation.
     fission_imported: BTreeSet<(String, String)>,
+    /// Detach/import marker relationships in emission order. Whether a
+    /// marker dedups into its spawn row or renders standalone depends on the
+    /// full relationship set, so they are resolved at derive time
+    /// ([`lineage_ledger_from_facts`]) rather than folded in.
+    pending_fission_marks: Vec<RelationshipKey>,
+}
+
+/// How many session dirs' folded facts to retain. Facts are small (id/status
+/// maps, not the log), but a long-lived daemon touches many session dirs;
+/// past the cap the map is cleared and the active dirs re-fold once.
+const LINEAGE_FACTS_CACHE_CAP: usize = 64;
+
+/// Folded `session.jsonl` facts plus the cursor they were folded through.
+/// `consumed_bytes` only ever advances past consumable content — the writer
+/// newline-terminates every event, so a trailing partial line is a
+/// mid-flush artifact folded once complete. `(stat_len, mtime_nanos)`
+/// record the file stat at the last evaluation (consumed can lag stat_len
+/// while a partial tail is pending): an mtime change without growth is a
+/// rewrite and re-folds, growth is an append.
+struct CachedLineageFacts {
+    consumed_bytes: u64,
+    stat_len: u64,
+    mtime_nanos: u128,
+    facts: SessionFacts,
+}
+
+fn lineage_facts_cache() -> &'static Mutex<HashMap<PathBuf, Arc<CachedLineageFacts>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<CachedLineageFacts>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_lineage_facts(path: &Path, entry: Arc<CachedLineageFacts>) {
+    let mut cache = lineage_facts_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= LINEAGE_FACTS_CACHE_CAP && !cache.contains_key(path) {
+        cache.clear();
+    }
+    cache.insert(path.to_path_buf(), entry);
+}
+
+fn mtime_nanos_of(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Read `session.jsonl` from `log_dir` and derive the lineage ledger for
 /// `source_session_id` (see [`lineage_ledger_from_jsonl`]). Called by the MCP
 /// `get_status` surface (`mcp.rs`) and the rewind-record snapshot path
 /// (`main.rs`). `Ok(None)` when no session log exists.
+///
+/// The multi-MB log is NOT re-parsed per call: folded facts are cached per
+/// path and extended incrementally — an unchanged (len, mtime) serves from
+/// cache with one stat, an append folds only the new complete lines, and a
+/// detected rewrite (shrunk file, or an mtime change at unchanged length)
+/// re-folds from scratch. The writer is append-only today, so rewrite
+/// detection is contract hardening; a rewrite that regrows PAST the cursor
+/// within one poll interval is the residual undetected case.
 pub fn read_lineage_ledger(
     log_dir: &Path,
     source_session_id: &str,
 ) -> io::Result<Option<LineageLedger>> {
     let path = log_dir.join("session.jsonl");
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    Ok(lineage_ledger_from_jsonl(&contents, source_session_id))
+    let len = metadata.len();
+    let mtime_nanos = mtime_nanos_of(&metadata);
+
+    let cached = lineage_facts_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&path)
+        .cloned();
+
+    let entry = match cached {
+        // Stat unchanged since the last evaluation: derive straight from the
+        // cached facts (also covers an unchanged pending partial tail — no
+        // re-read until the file actually moves).
+        Some(entry) if entry.stat_len == len && entry.mtime_nanos == mtime_nanos => entry,
+        // Grown file: fold only the appended consumable lines. (Strictly
+        // greater than the last observed stat length — an mtime change
+        // without growth, even while a partial tail left consumed < len, is
+        // a rewrite and falls through to the full refold below.)
+        Some(entry) if len > entry.stat_len => {
+            match read_new_complete_lines_sync(&path, entry.consumed_bytes, len)? {
+                Some((text, consumed)) => {
+                    let mut facts = entry.facts.clone();
+                    for line in text.lines() {
+                        fold_session_facts_line(&mut facts, line);
+                    }
+                    let entry = Arc::new(CachedLineageFacts {
+                        consumed_bytes: entry.consumed_bytes + consumed,
+                        stat_len: len,
+                        mtime_nanos,
+                        facts,
+                    });
+                    store_lineage_facts(&path, entry.clone());
+                    entry
+                }
+                // No consumable new content yet — record the observed stat
+                // (so an untouched file serves from cache and a later
+                // no-growth mtime change still reads as a rewrite) and
+                // evaluate the cached facts.
+                None => {
+                    let entry = Arc::new(CachedLineageFacts {
+                        consumed_bytes: entry.consumed_bytes,
+                        stat_len: len,
+                        mtime_nanos,
+                        facts: entry.facts.clone(),
+                    });
+                    store_lineage_facts(&path, entry.clone());
+                    entry
+                }
+            }
+        }
+        // Cold cache, a shrunk file, or a rewrite without growth (mtime
+        // moved at the same stat length): fold from scratch.
+        _ => {
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(err) => return Err(err),
+            };
+            let (complete, consumed) = complete_lines_prefix(&contents);
+            let entry = Arc::new(CachedLineageFacts {
+                consumed_bytes: consumed,
+                stat_len: len,
+                mtime_nanos,
+                facts: session_facts_from_jsonl(complete),
+            });
+            store_lineage_facts(&path, entry.clone());
+            entry
+        }
+    };
+    Ok(lineage_ledger_from_facts(&entry.facts, source_session_id))
+}
+
+/// The byte length of the foldable JSONL prefix of `buf`: every complete
+/// (newline-terminated) line, plus an unterminated final line iff it already
+/// parses as a complete JSON value. Event lines are JSON objects and no
+/// strict prefix of a JSON object parses, so a parsing tail is a whole event
+/// whose newline just hasn't landed — or a writer that never terminated its
+/// final line, which the historical full re-parse accepted. `None` when
+/// nothing is consumable yet. (An async twin lives in the Codex
+/// `context_trace.rs` for the trace-index fold.)
+fn consumable_jsonl_prefix(buf: &[u8]) -> Option<usize> {
+    let complete = buf
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let tail = &buf[complete..];
+    let consumed = if !tail.is_empty() && serde_json::from_slice::<serde_json::Value>(tail).is_ok()
+    {
+        buf.len()
+    } else {
+        complete
+    };
+    (consumed > 0).then_some(consumed)
+}
+
+/// The foldable prefix of `contents` and its byte length
+/// ([`consumable_jsonl_prefix`]).
+fn complete_lines_prefix(contents: &str) -> (&str, u64) {
+    match consumable_jsonl_prefix(contents.as_bytes()) {
+        Some(consumed) => (&contents[..consumed], consumed as u64),
+        None => ("", 0),
+    }
+}
+
+/// Read the consumable lines appended past `offset`
+/// ([`consumable_jsonl_prefix`]); `None` when nothing consumable arrived.
+/// Never consumes a partially flushed trailing line. The read is clamped to
+/// the caller's stat snapshot (`stat_len`) so the recorded mtime stays
+/// paired with the consumed length.
+fn read_new_complete_lines_sync(
+    path: &Path,
+    offset: u64,
+    stat_len: u64,
+) -> io::Result<Option<(String, u64)>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))?;
+    }
+    let mut buf = Vec::new();
+    file.take(stat_len.saturating_sub(offset))
+        .read_to_end(&mut buf)?;
+    let Some(consumed) = consumable_jsonl_prefix(&buf) else {
+        return Ok(None);
+    };
+    buf.truncate(consumed);
+    // The writer emits UTF-8 JSONL; a non-UTF-8 tail is treated as
+    // not-yet-complete rather than corrupting the fold.
+    match String::from_utf8(buf) {
+        Ok(text) => Ok(Some((text, consumed as u64))),
+        Err(_) => Ok(None),
+    }
+}
+
+/// One-shot fold + derive over raw `session.jsonl` contents — the uncached
+/// composition of [`session_facts_from_jsonl`] and
+/// [`lineage_ledger_from_facts`]. Test surface: production reads go through
+/// [`read_lineage_ledger`]'s cache.
+#[cfg(test)]
+pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Option<LineageLedger> {
+    lineage_ledger_from_facts(&session_facts_from_jsonl(contents), source_session_id)
+}
+
+fn session_facts_from_jsonl(contents: &str) -> SessionFacts {
+    let mut facts = SessionFacts::default();
+    for line in contents.lines() {
+        fold_session_facts_line(&mut facts, line);
+    }
+    facts
+}
+
+/// Fold one `session.jsonl` line into the facts — a pure left-fold, so the
+/// incremental cache in [`read_lineage_ledger`] can continue exactly where
+/// the previous fold stopped.
+fn fold_session_facts_line(facts: &mut SessionFacts, line: &str) {
+    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let event = entry
+        .get("event")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let data = entry.get("data").unwrap_or(&serde_json::Value::Null);
+    match event {
+        "session_identity" => {
+            let session_id = json_string(data, "session_id");
+            let backend_session_id = json_string(data, "backend_session_id");
+            if !session_id.is_empty() && !backend_session_id.is_empty() {
+                facts.identities.insert(session_id, backend_session_id);
+            }
+        }
+        "session_started" => {
+            let session_id = json_string(data, "session_id");
+            let task = json_string(data, "task");
+            if !session_id.is_empty() && !task.is_empty() {
+                facts.tasks.insert(session_id, task);
+            }
+        }
+        "session_relationship" => {
+            let rel = RelationshipKey {
+                parent_session_id: json_string(data, "parent_session_id"),
+                child_session_id: json_string(data, "child_session_id"),
+                relationship: json_string(data, "relationship"),
+                ephemeral: data
+                    .get("ephemeral")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            };
+            if !rel.parent_session_id.is_empty()
+                && !rel.child_session_id.is_empty()
+                && !rel.relationship.is_empty()
+            {
+                facts
+                    .relationship_order
+                    .insert(rel.clone(), facts.relationship_seq);
+                facts.relationship_seq += 1;
+                match rel.relationship.as_str() {
+                    // Fission detach/import markers prefer updating their
+                    // spawn row over becoming rows of their own; whether a
+                    // spawn row exists depends on the full relationship set,
+                    // so they are resolved at derive time (event order does
+                    // not matter).
+                    "fission-detached" | "fission-imported" => {
+                        let pair = (rel.parent_session_id.clone(), rel.child_session_id.clone());
+                        if rel.relationship == "fission-detached" {
+                            facts.fission_detached.insert(pair);
+                        } else {
+                            facts.fission_imported.insert(pair);
+                        }
+                        facts.pending_fission_marks.push(rel);
+                    }
+                    _ => {
+                        facts.relationships.insert(rel);
+                    }
+                }
+            }
+        }
+        "done_signal" => {
+            let session_id = json_string(data, "session_id");
+            if !session_id.is_empty() {
+                facts
+                    .statuses
+                    .insert(session_id.clone(), "completed".into());
+                // Ignore the writer's boilerplate default ("Agent signalled
+                // done") so it doesn't masquerade as a model-authored summary.
+                if let Some(message) = entry
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|message| {
+                        !message.is_empty() && *message != DONE_SIGNAL_DEFAULT_MESSAGE
+                    })
+                    .map(trim_summary)
+                {
+                    facts.summaries.insert(session_id, message);
+                }
+            }
+        }
+        "task_complete" => {
+            let session_id = json_string(data, "session_id");
+            if !session_id.is_empty() {
+                facts
+                    .statuses
+                    .insert(session_id.clone(), "completed".into());
+                let summary = data
+                    .get("summary")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| data.get("reason").and_then(|value| value.as_str()))
+                    .map(trim_summary);
+                if let Some(summary) = summary {
+                    facts.summaries.insert(session_id, summary);
+                }
+            }
+        }
+        "session_ended" => {
+            let session_id = json_string(data, "session_id");
+            if !session_id.is_empty() {
+                let reason = json_string(data, "reason");
+                // A generic teardown must not downgrade a completed task or
+                // clobber a model-authored summary with a terse reason.
+                if facts.statuses.get(&session_id).map(String::as_str) != Some("completed") {
+                    let status = if session_ended_reason_is_failure(&reason) {
+                        "failed"
+                    } else {
+                        "ended"
+                    };
+                    facts.statuses.insert(session_id.clone(), status.into());
+                }
+                if !reason.is_empty() && !facts.summaries.contains_key(&session_id) {
+                    facts.summaries.insert(session_id, trim_summary(&reason));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Derive the lineage ledger for `source_session_id`'s connected component
-/// from raw `session.jsonl` contents. Called by [`read_lineage_ledger`] (the
-/// dashboard Managed tab / MCP `get_status` read side and the rewind path's
-/// lineage snapshot in `main.rs`).
+/// from folded facts — the cheap per-call step over the cached fold.
+/// Consumed by [`read_lineage_ledger`] (the dashboard Managed tab / MCP
+/// `get_status` read side and the rewind path's lineage snapshot in
+/// `main.rs`).
 ///
 /// Branch rows come from `session_relationship` events. Specially handled
 /// relationship kinds:
@@ -112,154 +453,33 @@ pub fn read_lineage_ledger(
 ///
 /// Everything else (`subagent`, `managed-edit-branch`, …) renders generically
 /// with the child's observed status.
-pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Option<LineageLedger> {
-    let mut facts = SessionFacts::default();
-    let mut relationship_seq = 0usize;
-    let mut pending_fission_marks: Vec<RelationshipKey> = Vec::new();
-    for line in contents.lines() {
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let event = entry
-            .get("event")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default();
-        let data = entry.get("data").unwrap_or(&serde_json::Value::Null);
-        match event {
-            "session_identity" => {
-                let session_id = json_string(data, "session_id");
-                let backend_session_id = json_string(data, "backend_session_id");
-                if !session_id.is_empty() && !backend_session_id.is_empty() {
-                    facts.identities.insert(session_id, backend_session_id);
-                }
-            }
-            "session_started" => {
-                let session_id = json_string(data, "session_id");
-                let task = json_string(data, "task");
-                if !session_id.is_empty() && !task.is_empty() {
-                    facts.tasks.insert(session_id, task);
-                }
-            }
-            "session_relationship" => {
-                let rel = RelationshipKey {
-                    parent_session_id: json_string(data, "parent_session_id"),
-                    child_session_id: json_string(data, "child_session_id"),
-                    relationship: json_string(data, "relationship"),
-                    ephemeral: data
-                        .get("ephemeral")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false),
-                };
-                if !rel.parent_session_id.is_empty()
-                    && !rel.child_session_id.is_empty()
-                    && !rel.relationship.is_empty()
-                {
-                    facts
-                        .relationship_order
-                        .insert(rel.clone(), relationship_seq);
-                    relationship_seq += 1;
-                    match rel.relationship.as_str() {
-                        // Fission detach/import markers prefer updating their
-                        // spawn row over becoming rows of their own; whether a
-                        // spawn row exists is only known once the whole log
-                        // has been scanned, so they are resolved after the
-                        // loop (event order does not matter).
-                        "fission-detached" | "fission-imported" => {
-                            let pair =
-                                (rel.parent_session_id.clone(), rel.child_session_id.clone());
-                            if rel.relationship == "fission-detached" {
-                                facts.fission_detached.insert(pair);
-                            } else {
-                                facts.fission_imported.insert(pair);
-                            }
-                            pending_fission_marks.push(rel);
-                        }
-                        _ => {
-                            facts.relationships.insert(rel);
-                        }
-                    }
-                }
-            }
-            "done_signal" => {
-                let session_id = json_string(data, "session_id");
-                if !session_id.is_empty() {
-                    facts
-                        .statuses
-                        .insert(session_id.clone(), "completed".into());
-                    // Ignore the writer's boilerplate default ("Agent signalled
-                    // done") so it doesn't masquerade as a model-authored summary.
-                    if let Some(message) = entry
-                        .get("message")
-                        .and_then(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|message| {
-                            !message.is_empty() && *message != DONE_SIGNAL_DEFAULT_MESSAGE
-                        })
-                        .map(trim_summary)
-                    {
-                        facts.summaries.insert(session_id, message);
-                    }
-                }
-            }
-            "task_complete" => {
-                let session_id = json_string(data, "session_id");
-                if !session_id.is_empty() {
-                    facts
-                        .statuses
-                        .insert(session_id.clone(), "completed".into());
-                    let summary = data
-                        .get("summary")
-                        .and_then(|value| value.as_str())
-                        .or_else(|| data.get("reason").and_then(|value| value.as_str()))
-                        .map(trim_summary);
-                    if let Some(summary) = summary {
-                        facts.summaries.insert(session_id, summary);
-                    }
-                }
-            }
-            "session_ended" => {
-                let session_id = json_string(data, "session_id");
-                if !session_id.is_empty() {
-                    let reason = json_string(data, "reason");
-                    // A generic teardown must not downgrade a completed task or
-                    // clobber a model-authored summary with a terse reason.
-                    if facts.statuses.get(&session_id).map(String::as_str) != Some("completed") {
-                        let status = if session_ended_reason_is_failure(&reason) {
-                            "failed"
-                        } else {
-                            "ended"
-                        };
-                        facts.statuses.insert(session_id.clone(), status.into());
-                    }
-                    if !reason.is_empty() && !facts.summaries.contains_key(&session_id) {
-                        facts.summaries.insert(session_id, trim_summary(&reason));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
+fn lineage_ledger_from_facts(
+    facts: &SessionFacts,
+    source_session_id: &str,
+) -> Option<LineageLedger> {
     // A detach/import marker dedups into its spawn row (`fission-branch`)
     // when one exists — the marker then only drives that row's status — and
     // becomes a standalone row otherwise (e.g. a truncated log that no longer
     // carries the spawn event), so the fact stays visible either way.
-    for rel in pending_fission_marks {
-        let has_spawn_row = facts.relationships.iter().any(|existing| {
+    // Resolved per derive (not folded into the base facts) so a spawn event
+    // appended after its marker still dedups.
+    let mut relationships = facts.relationships.clone();
+    for rel in &facts.pending_fission_marks {
+        let has_spawn_row = relationships.iter().any(|existing| {
             existing.relationship == "fission-branch"
                 && existing.parent_session_id == rel.parent_session_id
                 && existing.child_session_id == rel.child_session_id
         });
         if !has_spawn_row {
-            facts.relationships.insert(rel);
+            relationships.insert(rel.clone());
         }
     }
 
-    if facts.relationships.is_empty() {
+    if relationships.is_empty() {
         return None;
     }
 
-    let relationships = related_relationships(facts.relationships, source_session_id);
+    let relationships = related_relationships(relationships, source_session_id);
     if relationships.is_empty() {
         return None;
     }
@@ -680,5 +900,145 @@ mod tests {
             .unwrap();
         assert_eq!(subagent.status, "completed");
         assert_eq!(detached.status, "detached");
+    }
+
+    #[test]
+    fn read_lineage_ledger_folds_appends_incrementally_and_refolds_on_truncation() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let rel_line = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child","relationship":"subagent","ephemeral":false}}"#;
+        let done_line = r#"{"event":"task_complete","data":{"session_id":"child","reason":"done","summary":"parser is fine"}}"#;
+        std::fs::write(&path, format!("{rel_line}\n")).unwrap();
+
+        // Missing log dir: clean None.
+        assert!(read_lineage_ledger(&dir.path().join("missing"), "parent")
+            .unwrap()
+            .is_none());
+
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].status, "running");
+
+        // Append (as the writer does) — the cached fold extends and the new
+        // fact shows up.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{done_line}").unwrap();
+        drop(file);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].status, "completed");
+        assert_eq!(
+            ledger.groups[0].branches[0].summary.as_deref(),
+            Some("parser is fine")
+        );
+
+        // A partial trailing line (writer mid-flush) is invisible until its
+        // newline lands, then folds exactly once.
+        let second_rel = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child-2","relationship":"subagent","ephemeral":false}}"#;
+        let (head, tail) = second_rel.split_at(second_rel.len() / 2);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{head}").unwrap();
+        drop(file);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches.len(), 1);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{tail}").unwrap();
+        drop(file);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches.len(), 2);
+
+        // Truncation (never produced by the append-only writer, but the
+        // cache must not serve stale facts): full refold.
+        std::fs::write(&path, format!("{rel_line}\n")).unwrap();
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches.len(), 1);
+        assert_eq!(ledger.groups[0].branches[0].status, "running");
+    }
+
+    fn set_mtime(path: &Path, secs_since_epoch: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch))
+            .unwrap();
+    }
+
+    #[test]
+    fn read_lineage_ledger_refolds_same_length_rewrite_while_partial_tail_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let rel_a = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child-a","relationship":"subagent","ephemeral":false}}"#;
+        let rel_b = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child-b","relationship":"subagent","ephemeral":false}}"#;
+        assert_eq!(rel_a.len(), rel_b.len(), "test needs equal-length lines");
+        let done = r#"{"event":"task_complete","data":{"session_id":"child-a","summary":"ok"}}"#;
+        let (partial, _rest) = done.split_at(done.len() / 2);
+
+        // Cached state with a pending partial tail: consumed < stat len.
+        std::fs::write(&path, format!("{rel_a}\n{partial}")).unwrap();
+        set_mtime(&path, 1_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].session_id, "child-a");
+
+        // Same TOTAL length, different content and mtime: a pure
+        // consumed<=len append model would tail-read from the stale cursor;
+        // the recorded stat length classifies it as a rewrite instead.
+        std::fs::write(&path, format!("{rel_b}\n{partial}")).unwrap();
+        set_mtime(&path, 2_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(ledger.groups[0].branches[0].session_id, "child-b");
+    }
+
+    #[test]
+    fn read_lineage_ledger_refolds_on_same_length_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let rel_line = r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child","relationship":"subagent","ephemeral":false}}"#;
+        let done_a = r#"{"event":"task_complete","data":{"session_id":"child","reason":"done","summary":"parser is fine"}}"#;
+        let done_b = r#"{"event":"task_complete","data":{"session_id":"child","reason":"done","summary":"parser is FINE"}}"#;
+        assert_eq!(done_a.len(), done_b.len(), "test needs equal-length lines");
+
+        std::fs::write(&path, format!("{rel_line}\n{done_a}\n")).unwrap();
+        set_mtime(&path, 1_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(
+            ledger.groups[0].branches[0].summary.as_deref(),
+            Some("parser is fine")
+        );
+
+        // Same total length, different content, different mtime: the pure
+        // (consumed <= len) model would read zero new bytes and serve the
+        // stale facts forever.
+        std::fs::write(&path, format!("{rel_line}\n{done_b}\n")).unwrap();
+        set_mtime(&path, 2_000);
+        let ledger = read_lineage_ledger(dir.path(), "parent")
+            .unwrap()
+            .expect("ledger");
+        assert_eq!(
+            ledger.groups[0].branches[0].summary.as_deref(),
+            Some("parser is FINE")
+        );
     }
 }
