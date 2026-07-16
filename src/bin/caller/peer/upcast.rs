@@ -4499,6 +4499,7 @@ mod tests {
             }),
             cache: None,
             limits: Vec::new(),
+            activity: None,
         }
     }
 
