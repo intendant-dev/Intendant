@@ -81,6 +81,88 @@ pub(crate) fn read_model_response_content(
     fs::read_to_string(path).unwrap_or_else(|_| message.to_string())
 }
 
+/// Monotonic generation per logs ROOT (the parent of session log dirs),
+/// bumped by [`crate::session_log::SessionLog`] AFTER every flushed
+/// `agent_output` row anywhere under that root. The gateway's negative
+/// agent-output memo records the generation it observed at sweep time and
+/// treats any mismatch as stale — so an id that a sweep missed becomes
+/// findable the moment ANY session under the root appends output, instead
+/// of after a fixed TTL.
+///
+/// Keys are CANONICAL root paths (see [`canonical_logs_root`]): writer and
+/// reader can reach the same directory through different spellings —
+/// path-form session resolution canonicalizes its input while the
+/// home-derived fallback root does not, so under a symlinked home the two
+/// would otherwise maintain independent generations and a write via one
+/// spelling would never invalidate a miss memoized under the other,
+/// silently reinstating the full-TTL blind window.
+static AGENT_OUTPUT_GENERATIONS: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::Mutex::new(None);
+
+const CANONICAL_LOGS_ROOT_MEMO_CAP: usize = 256;
+
+/// Spelling → canonical form memo for logs roots, so the per-append and
+/// per-fetch canonicalization is one map hit instead of a component-walk
+/// of syscalls. Values are recomputable, so overflowing the cap just
+/// clears the memo. A root whose symlink TARGET is repointed mid-process
+/// keeps its first resolution — logs roots are stable for a daemon's
+/// lifetime, and both sides of the generation contract go through this
+/// same memo, so they can never disagree with each other.
+static CANONICAL_LOGS_ROOTS: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>>,
+> = std::sync::Mutex::new(None);
+
+/// Canonical form of a logs root (memoized). Falls back to the lexical
+/// path when canonicalization fails (root vanished) — both sides fall back
+/// identically, so the keys still agree.
+pub(crate) fn canonical_logs_root(root: &Path) -> std::path::PathBuf {
+    {
+        let memo = CANONICAL_LOGS_ROOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(canonical) = memo.as_ref().and_then(|map| map.get(root)) {
+            return canonical.clone();
+        }
+    }
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut memo = CANONICAL_LOGS_ROOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = memo.get_or_insert_with(std::collections::HashMap::new);
+    if map.len() >= CANONICAL_LOGS_ROOT_MEMO_CAP {
+        map.clear();
+    }
+    map.insert(root.to_path_buf(), canonical.clone());
+    canonical
+}
+
+/// Current append generation for a logs root (0 until the first append).
+/// The root may be any spelling; it is canonicalized here.
+pub fn agent_output_generation(logs_root: &Path) -> u64 {
+    let root = canonical_logs_root(logs_root);
+    AGENT_OUTPUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(&root).copied())
+        .unwrap_or(0)
+}
+
+/// Bump the generation for the logs root containing `log_dir`. Called at
+/// the `agent_output` write choke point, after the row is flushed.
+pub(crate) fn note_agent_output_appended(log_dir: &Path) {
+    let Some(root) = log_dir.parent() else {
+        return;
+    };
+    let root = canonical_logs_root(root);
+    let mut map = AGENT_OUTPUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(std::collections::HashMap::new);
+    *map.entry(root).or_insert(0) += 1;
+}
+
 pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOutputChunk> {
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     if wanted.is_empty() {
@@ -94,6 +176,17 @@ pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOut
         std::collections::HashMap::new();
 
     for line in contents.lines() {
+        // Resolving a few ids used to JSON-parse every line of the whole
+        // log — including the ~99% that are not agent_output rows — on
+        // every dashboard output fetch. Prescan for the event marker
+        // (payload text can false-positive; the parse stays the authority)
+        // and stop once every requested id is resolved.
+        if found.len() == wanted.len() {
+            break;
+        }
+        if !line.contains("agent_output") {
+            continue;
+        }
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
@@ -399,7 +492,7 @@ pub fn session_log_entry_to_app_event(
             // Backward compat: older sessions stored the raw JSON blob in
             // `message`; newer sessions store a pre-formatted preview.
             let commands_preview = if message.starts_with('{') {
-                crate::format_commands_preview(message)
+                crate::tool_batch::BatchFacts::from_json(message).commands_preview
             } else {
                 message.to_string()
             };
@@ -1953,6 +2046,123 @@ mod tests {
         assert_eq!(chunks[1].output_id, "out-1");
         assert_eq!(chunks[1].stdout, "first");
         assert_eq!(chunks[1].stderr, "");
+    }
+
+    /// The generation must publish only AFTER the agent_output row is
+    /// readable. A concurrent writer appends a large output; the moment the
+    /// observer sees the generation move, the row must already resolve — a
+    /// pre-emit bump exposes a window (new generation, row absent) in which
+    /// a sweep would memoize the miss under a generation the completing
+    /// write never moves again, blinding fetches for the full memo TTL.
+    /// The multi-MB payload widens that window enough that the pre-emit
+    /// ordering reliably fails this test.
+    #[test]
+    fn agent_output_generation_bump_publishes_after_row_is_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_root = dir.path().join("logs");
+        let log_dir = logs_root.join("writer");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        let before = agent_output_generation(&logs_root);
+
+        let writer = std::thread::spawn(move || {
+            let mut log = log;
+            let big = "x".repeat(4 * 1024 * 1024);
+            log.agent_output_with_id(&big, "", None, Some("gen-order-probe"));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while agent_output_generation(&logs_root) == before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writer never bumped the generation"
+            );
+            std::thread::yield_now();
+        }
+        // Generation moved: the row (and its span files) must be resolvable
+        // right now, with no further writer progress required.
+        let chunks = agent_output_chunks_by_id(&log_dir, &["gen-order-probe".to_string()]);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "generation bumped before the agent_output row was readable"
+        );
+        assert_eq!(chunks[0].stdout.len(), 4 * 1024 * 1024);
+        writer.join().unwrap();
+    }
+
+    /// A FAILED flush must not publish the generation: the row is not
+    /// readable, so a bump would let a fetch memoize the miss under a
+    /// generation this write never moves again — the same trap the
+    /// post-emit ordering closes on the success path, reopened on the
+    /// failure path (retained buffered bytes can surface later via an
+    /// unrelated flush, with no further bump). No bump on emit failure;
+    /// the next successful output append bumps and the id resolves.
+    #[test]
+    fn agent_output_generation_holds_on_failed_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_root = dir.path().join("logs");
+        let log_dir = logs_root.join("writer");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let before = agent_output_generation(&logs_root);
+
+        log.sabotage_writer_for_tests();
+        log.agent_output_with_id("never lands", "", None, Some("gen-fail-probe"));
+        assert_eq!(
+            agent_output_generation(&logs_root),
+            before,
+            "a failed flush must not publish the generation"
+        );
+        assert!(
+            agent_output_chunks_by_id(&log_dir, &["gen-fail-probe".to_string()]).is_empty(),
+            "the sabotaged row must not be readable"
+        );
+
+        // Recover the writer (fresh append handle on the same log) and land
+        // the row: the successful emit bumps, and the id resolves.
+        drop(log);
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("recovered", "", None, Some("gen-fail-probe"));
+        drop(log);
+        assert!(
+            agent_output_generation(&logs_root) > before,
+            "the successful append must bump the generation"
+        );
+        let chunks = agent_output_chunks_by_id(&log_dir, &["gen-fail-probe".to_string()]);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].stdout, "recovered");
+    }
+
+    /// Writer and reader can reach one logs root through different
+    /// spellings (path-form session resolution canonicalizes; the
+    /// home-derived fallback root does not): the generation must be shared
+    /// across spellings, or a write via one spelling would never invalidate
+    /// a miss memoized under the other.
+    #[test]
+    fn agent_output_generation_is_canonical_across_root_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_root = dir.path().join("logs");
+        let log_dir = logs_root.join("writer");
+        // A second, lexically different spelling of the same directory
+        // (kept portable: dotted traversal instead of a symlink, which
+        // Windows runners cannot always create).
+        std::fs::create_dir_all(logs_root.join("subprobe")).unwrap();
+        let dotted_spelling = logs_root.join("subprobe").join("..");
+
+        let before_a = agent_output_generation(&logs_root);
+        let before_b = agent_output_generation(&dotted_spelling);
+        assert_eq!(before_a, before_b, "spellings must share a generation");
+
+        let mut log = SessionLog::open(log_dir).unwrap();
+        log.agent_output_with_id("hello", "", None, Some("gen-spelling-probe"));
+        drop(log);
+
+        let after_a = agent_output_generation(&logs_root);
+        let after_b = agent_output_generation(&dotted_spelling);
+        assert!(after_a > before_a, "append must bump the generation");
+        assert_eq!(
+            after_a, after_b,
+            "one append must be visible through every spelling of the root"
+        );
     }
 
     #[test]

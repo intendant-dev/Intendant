@@ -126,9 +126,16 @@ pub(crate) fn latest_external_context_snapshot_from_log(
     let contents = std::fs::read_to_string(session_path).ok()?;
     let session_id = config.session_id.as_deref();
     let alias_session_id = config.alias_session_id.as_deref();
-    let mut latest = None;
 
-    for line in contents.lines() {
+    // Only the LATEST session-targeted snapshot matters, so scan from the
+    // end and stop at the first match. The forward version parsed every
+    // line of the session log AND converted every context_snapshot row —
+    // each conversion eagerly opening its payload sidecar — to keep one.
+    // The prescan is a cheap filter; conversion stays the authority.
+    for line in contents.lines().rev() {
+        if !line.contains("context_snapshot") {
+            continue;
+        }
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
@@ -166,7 +173,7 @@ pub(crate) fn latest_external_context_snapshot_from_log(
             }
             _ => None,
         };
-        latest = Some(external_agent::AgentContextSnapshot {
+        return Some(external_agent::AgentContextSnapshot {
             source,
             label,
             request_id,
@@ -185,7 +192,7 @@ pub(crate) fn latest_external_context_snapshot_from_log(
         });
     }
 
-    latest
+    None
 }
 
 pub(crate) async fn refresh_external_context_usage_snapshot_for_preflight(
@@ -916,12 +923,15 @@ pub(crate) async fn attempt_supervisor_surgical_context_rewind(
     let Some((item_id, position)) = managed_context_surgical_anchor_choice(&anchors) else {
         return Err("no recovery-eligible anchor in the rewind catalog".to_string());
     };
-    let prior_rewind_record_ids: Vec<String> = context_rewind::list_records(config.log_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|record| record.thread_id == thread_id)
-        .map(|record| record.record_id)
-        .collect();
+    // Skinny listing: only ids are needed for the primer, and full records
+    // embed complete fission/lineage ledger snapshots.
+    let prior_rewind_record_ids: Vec<String> =
+        context_rewind::list_record_summaries(config.log_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.thread_id == thread_id)
+            .map(|record| record.record_id)
+            .collect();
     let request = ExternalContextRewindRequest {
         session_id: config.session_id.clone(),
         item_id,

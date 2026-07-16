@@ -1269,8 +1269,36 @@ impl IntendantServer {
         // Supervised parents log under `~/.intendant/logs/<id>/`, which is not
         // necessarily this server's primary log dir, so merge the ledger reads
         // across every candidate dir the requested session is known by.
-        let ledger_dirs = status_ledger_candidate_dirs(&self.home, &log_dir, &session_id);
-        if let Some(ledger) = merged_lineage_ledger_for_session(&ledger_dirs, &session_id) {
+        //
+        // On the blocking pool: candidate resolution can scan the session
+        // store on an id miss, and the fission ledger document is a full
+        // read + parse of a file observed at ~1 MB — get_status is the
+        // model's habitual poll, and this ran inline on the async handler.
+        // (The lineage read behind it is incrementally cached; the fission
+        // document read is not yet.)
+        let ledgers = {
+            let home = self.home.clone();
+            let ledger_log_dir = log_dir.clone();
+            let ledger_session_id = session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let ledger_dirs =
+                    status_ledger_candidate_dirs(&home, &ledger_log_dir, &ledger_session_id);
+                (
+                    merged_lineage_ledger_for_session(&ledger_dirs, &ledger_session_id),
+                    merged_fission_ledger_document_for_session(&ledger_dirs, &ledger_session_id),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                // A JoinError here is a panic (or forced shutdown) inside
+                // the merge — answer without ledgers, but never silently:
+                // a status payload missing its ledgers looks identical to
+                // "no fission activity" to the caller.
+                eprintln!("[mcp] get_status ledger merge task failed: {e}");
+                (None, None)
+            })
+        };
+        if let Some(ledger) = ledgers.0 {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "lineage_ledger".to_string(),
@@ -1282,9 +1310,7 @@ impl IntendantServer {
         // markers and branch charters are visible in the status payload; the
         // wire shape stays back-compatible because `ext` serializes only when
         // non-empty.
-        if let Some(document) =
-            merged_fission_ledger_document_for_session(&ledger_dirs, &session_id)
-        {
+        if let Some(document) = ledgers.1 {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "fission_ledger".to_string(),

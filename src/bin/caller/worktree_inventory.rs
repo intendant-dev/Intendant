@@ -884,7 +884,9 @@ pub fn clean_worktree_target_if_safe(
     }
     let size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
     let hint_index = HintIndex::new(session_hints);
-    let entry = enrich_worktree(raw, &repo_ctx, &hint_index, &size_budget)?;
+    // measure=false: this enrich exists for the HEAD pin below; the only
+    // size this endpoint reports is `freed_bytes`, measured target-only.
+    let entry = enrich_worktree_with_measure(raw, &repo_ctx, &hint_index, &size_budget, false)?;
 
     if let Some(expected) = request
         .expected_head
@@ -1140,6 +1142,22 @@ fn enrich_worktree(
     hints: &HintIndex<'_>,
     size_budget: &SizeBudget,
 ) -> Result<WorktreeEntry, String> {
+    enrich_worktree_with_measure(raw, repo, hints, size_budget, true)
+}
+
+/// `measure: false` skips the whole-tree size walk (up to the 75k-entry
+/// budget, `target/` included) and leaves the size/mtime fields at their
+/// defaults. Verification-only paths use it: the safety verdict reads
+/// status/merge/lock/session state, never sizes — `clean_worktree_target_
+/// if_safe` was paying a full worktree walk here and then measuring the
+/// same `target/` again for its `before` figure.
+fn enrich_worktree_with_measure(
+    raw: RawWorktree,
+    repo: &RepoContext,
+    hints: &HintIndex<'_>,
+    size_budget: &SizeBudget,
+    measure: bool,
+) -> Result<WorktreeEntry, String> {
     let repo_root = repo.root.clone();
     let default_branch = repo.default_branch.clone();
     let status = if raw.path.is_dir() {
@@ -1192,7 +1210,7 @@ fn enrich_worktree(
     }
     .to_string();
 
-    let tree = if raw.path.is_dir() && !is_main {
+    let tree = if measure && raw.path.is_dir() && !is_main {
         measure_tree_with_budget(&raw.path, size_budget)
     } else {
         TreeMeasure::default()

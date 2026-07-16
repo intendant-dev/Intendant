@@ -97,14 +97,43 @@ impl SessionSupervisor {
         // make the fresh checkout the session's effective project root. A
         // failure (not a git repo, no commits, bad branch name) closes the
         // just-opened session honestly, exactly like the no-project arm.
+        //
+        // The git chain (HEAD probe, collision listing, `git worktree add`
+        // materializing a full checkout — seconds on large projects) runs on
+        // the blocking pool under the daemon-wide git-ops bound. What that
+        // buys: a tokio worker is no longer pinned for the duration, and a
+        // panic inside the chain surfaces as this session's honest
+        // create-failure instead of unwinding the supervisor. What it does
+        // NOT buy: this function is still awaited inline by the
+        // supervisor's single sequential control-intake loop, so other
+        // sessions' approvals/steers/interrupts still wait out the checkout
+        // — the real fix is dispatching session-create handling off the
+        // intake loop (see the PR follow-up; the delegation ack must keep
+        // its ordering guarantee).
         let worktree_meta = match worktree.as_ref() {
             Some(request) => {
-                match prepare_session_worktree(
-                    &project_root,
-                    request,
-                    session_name.as_deref(),
-                    &session_id,
-                ) {
+                let permit = worktree::git_ops_semaphore().clone().acquire_owned().await;
+                let blocking_root = project_root.clone();
+                let blocking_request = request.clone();
+                let blocking_name = session_name.clone();
+                let blocking_session_id = session_id.clone();
+                let prepared = match permit {
+                    Ok(permit) => tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        prepare_session_worktree(
+                            &blocking_root,
+                            &blocking_request,
+                            blocking_name.as_deref(),
+                            &blocking_session_id,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("worktree preparation task failed: {e}"))),
+                    // The semaphore is never closed; refuse rather than run
+                    // unbounded if that ever changes.
+                    Err(e) => Err(format!("worktree git-ops slot unavailable: {e}")),
+                };
+                match prepared {
                     Ok(meta) => Some(meta),
                     Err(e) => {
                         let reason = format!("worktree launch failed: {e}");
