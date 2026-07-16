@@ -191,13 +191,15 @@ file_snapshots/
 
 `store.lock` is the store's advisory cross-process lock (held for the owning
 watcher's lifetime; a second process opens the store read-only). A
-`history.json.damaged-<ts>` file is a previous index that failed to parse,
-preserved verbatim when a fresh timeline was started.
+`history.json.damaged-<ts>-<pid>-<seq>` file is a previous index that failed
+to parse, preserved verbatim when a fresh timeline was started (forensic
+only: the fresh timeline reuses round ids, and its epoch/maps-hash binding
+already makes the old manifests unresolvable).
 
 `history.json` schema (format 2 — a slim index; `"format": 2` marks it):
 
 - `current_head_id`: active round id.
-- `rounds[]`: `id`, `parent_id`, `summary`, `timestamp_unix`, `files_changed`, optional `turn_count`, optional `native_message_count`, optional `maps_from_round`. Round stubs carry no path→hash maps — the per-round maps live in `rounds/round_<id>/manifest.json` (below). A round may exceptionally retain inline `files_at_end`/`all_files_at_end` when its manifest write failed, marked by `maps_inline: true` (the marker is what keeps an empty-tree retention alive, since empty maps serialize to nothing); the index stays authoritative for it until a later load migrates it.
+- `rounds[]`: `id`, `parent_id`, `summary`, `timestamp_unix`, `files_changed`, optional `turn_count`, optional `native_message_count`, optional `maps_from_round`, optional `maps_hash` (content hash of the round's maps — the resolver refuses a manifest whose payload doesn't hash to it). Round stubs carry no path→hash maps — the per-round maps live in `rounds/round_<id>/manifest.json` (below). A round may exceptionally retain inline `files_at_end`/`all_files_at_end` when its manifest write failed, marked by `maps_inline: true` (the marker is what keeps an empty-tree retention alive, since empty maps serialize to nothing); the index stays authoritative for it until a later load migrates it.
 - `abandoned_branches[]`: rollback-then-new-action branches with `branched_from_id`, `rounds`, `created_at_unix`.
 - `next_id`: next round id.
 - `store_epoch`: identity stamp binding this index to its manifests. Absent on a pre-epoch store whose manifest stamping has not completed yet; while absent, restores are guarded by content binding (the manifest's scalars must match its index row) instead.

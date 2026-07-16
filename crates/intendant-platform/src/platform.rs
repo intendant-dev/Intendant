@@ -1397,7 +1397,17 @@ pub fn file_change_stamp(
         if ok == 0 {
             return None;
         }
+        // FAT-family and some network filesystems report no ChangeTime
+        // (zero) and/or no real file identity — that is "no signal", never
+        // a comparable value (a shared zero would compare equal across
+        // rewrites, exactly the stale-hit this helper exists to prevent).
+        if info.ChangeTime == 0 {
+            return None;
+        }
         let identity = FileIdentity::from_file(&file).ok()?;
+        if !identity.is_reliable() {
+            return None;
+        }
         Some(FileChangeStamp {
             change_signal: i128::from(info.ChangeTime),
             identity,

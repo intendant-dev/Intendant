@@ -117,6 +117,44 @@ pub struct HistoryRound {
     /// be unreachable. `false` everywhere else (stubs, manifests, legacy).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub maps_inline: bool,
+    /// Content hash of this round's maps (the actual restore payload),
+    /// recorded in the slim index row when the manifest is written. The
+    /// resolver verifies a manifest's maps against this before serving —
+    /// scalar binding alone would bless a manifest whose scalars match but
+    /// whose maps were replaced. `None` only on rows that predate the
+    /// field (verification is skipped for them; every write path stamps
+    /// it, and the restamp sweep backfills it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maps_hash: Option<String>,
+}
+
+/// Canonical content hash of a round's two maps: length-prefixed,
+/// domain-separated, key-sorted — independent of `HashMap` iteration order
+/// and JSON formatting.
+fn maps_content_hash(
+    files_at_end: &HashMap<String, String>,
+    all_files_at_end: &HashMap<String, String>,
+) -> String {
+    fn fold_map(hasher: &mut Sha256, label: &[u8], map: &HashMap<String, String>) {
+        hasher.update(label);
+        hasher.update((map.len() as u64).to_le_bytes());
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        for key in keys {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            let value = &map[key];
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    let mut hasher = Sha256::new();
+    fold_map(&mut hasher, b"files_at_end", files_at_end);
+    fold_map(&mut hasher, b"all_files_at_end", all_files_at_end);
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&digest);
+    hex_encode(&raw)
 }
 
 /// Whether an index row is currently the authoritative carrier of its own
@@ -640,6 +678,10 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 /// "no rollback offered" downgrade instead of restoring from empty maps.
 const HISTORY_INDEX_FORMAT: u64 = 2;
 
+/// Per-process sequence for damaged-index backup names (see
+/// `load_history_from_disk`): keeps same-second backups from colliding.
+static DAMAGED_BACKUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Path of the on-disk manifest carrying one round's full snapshot record.
 fn round_manifest_path(snapshot_dir: &Path, round_id: u64) -> PathBuf {
     snapshot_dir
@@ -710,9 +752,30 @@ fn load_history_from_disk(snapshot_dir: &Path, read_only: bool) -> LoadedHistory
             if read_only {
                 return LoadedHistory::read_only_with(History::default());
             }
-            let damaged_path = snapshot_dir.join(format!("history.json.damaged-{}", now_unix()));
+            // Collision-proof backup name (std rename REPLACES an existing
+            // file): time + pid + per-process sequence, existence-checked —
+            // sound because the store lock makes us the only writer.
+            let damaged_path = loop {
+                let seq = DAMAGED_BACKUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let candidate = snapshot_dir.join(format!(
+                    "history.json.damaged-{}-{}-{}",
+                    now_unix(),
+                    std::process::id(),
+                    seq
+                ));
+                if !candidate.exists() {
+                    break candidate;
+                }
+            };
             match std::fs::rename(&history_path, &damaged_path) {
                 Ok(()) => {
+                    // Residual, documented: the fresh timeline reuses round
+                    // ids from 0, so new manifests will overwrite the damaged
+                    // timeline's rounds/round_N files as rounds accrue. With
+                    // epoch + maps-hash binding those old manifests are
+                    // already unresolvable by this fresh index — the damaged
+                    // JSON is preserved for forensics, not for automatic
+                    // recovery.
                     eprintln!(
                         "[file_watcher] history.json was unreadable; preserved it at {} and \
                          starting a fresh timeline",
@@ -744,7 +807,12 @@ fn load_history_from_disk(snapshot_dir: &Path, read_only: bool) -> LoadedHistory
     if history.store_epoch.is_none() {
         let epoch = mint_store_epoch(snapshot_dir);
         let restamped_ok = format < HISTORY_INDEX_FORMAT
-            || restamp_manifests_for_new_epoch(&history, snapshot_dir, &epoch);
+            || restamp_manifests_for_new_epoch(
+                &mut history,
+                snapshot_dir,
+                &epoch,
+                &mut needs_persist,
+            );
         if restamped_ok {
             history.store_epoch = Some(epoch);
             needs_persist = true;
@@ -814,10 +882,12 @@ fn migrate_inline_round_maps(
         // Always rewrite from the inline maps — they are the authoritative
         // copy; a pre-existing manifest at this id is not trusted (it may be
         // unparseable, unstamped, or a foreign timeline's).
+        let maps_hash = maps_content_hash(&round.files_at_end, &round.all_files_at_end);
         let manifest = HistoryRound {
             store_epoch: epoch.clone(),
             maps_from_round: None,
             maps_inline: false,
+            maps_hash: Some(maps_hash.clone()),
             ..round.clone()
         };
         let manifest_path = round_manifest_path(snapshot_dir, round.id);
@@ -829,6 +899,7 @@ fn migrate_inline_round_maps(
             round.all_files_at_end = HashMap::new();
             round.maps_from_round = None;
             round.maps_inline = false;
+            round.maps_hash = Some(maps_hash);
             *needs_persist = true;
         } else if !round.maps_inline {
             round.maps_inline = true;
@@ -850,28 +921,41 @@ fn migrate_inline_round_maps(
 /// stamped when its content BINDS to its index row
 /// ([`manifest_binds_to_round`]) — identity alone never blesses a manifest,
 /// so one poisoned by a pre-format-2 binary (same id, different round)
-/// stays unstamped and fails closed at resolve time. Returns `false` when
-/// any binding manifest could not be written — the caller must then defer
-/// epoch adoption (see FIX in `load_history_from_disk`).
-fn restamp_manifests_for_new_epoch(history: &History, snapshot_dir: &Path, epoch: &str) -> bool {
+/// stays unstamped and fails closed at resolve time. Rows that predate
+/// `maps_hash` are backfilled from the binding manifest's maps, freezing
+/// the payload against later tampering. Returns `false` when any binding
+/// manifest could not be written OR read (a transiently unreadable correct
+/// manifest must defer epoch adoption exactly like a failed write —
+/// otherwise the persisted epoch would orphan it permanently).
+fn restamp_manifests_for_new_epoch(
+    history: &mut History,
+    snapshot_dir: &Path,
+    epoch: &str,
+    needs_persist: &mut bool,
+) -> bool {
     let mut all_ok = true;
-    let rounds = history
-        .rounds
-        .iter()
-        .chain(history.abandoned_branches.iter().flat_map(|b| &b.rounds));
-    for round in rounds {
+    let mut restamp_round = |round: &mut HistoryRound| {
         if round_has_inline_maps(round) {
             // Retained in the index; no manifest of ours to stamp.
-            continue;
+            return true;
         }
         let manifest_path = round_manifest_path(snapshot_dir, round.id);
-        let Ok(bytes) = std::fs::read(&manifest_path) else {
-            // Missing: unresolvable with or without an epoch — not a stamp
-            // failure.
-            continue;
+        let bytes = match std::fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Missing: unresolvable with or without an epoch — not a
+                // stamp failure.
+                return true;
+            }
+            Err(_) => {
+                // Transient read failure (permissions, I/O): the manifest
+                // may be perfectly correct — adopting the epoch now would
+                // orphan it. Defer.
+                return false;
+            }
         };
         let Ok(mut manifest) = serde_json::from_slice::<HistoryRound>(&bytes) else {
-            continue;
+            return true;
         };
         if !manifest_binds_to_round(&manifest, round) {
             eprintln!(
@@ -879,17 +963,29 @@ fn restamp_manifests_for_new_epoch(history: &History, snapshot_dir: &Path, epoch
                  damaged write?) — leaving it unstamped; restores of that round will refuse",
                 round.id
             );
-            continue;
+            return true;
+        }
+        if round.maps_hash.is_none() {
+            round.maps_hash = Some(maps_content_hash(
+                &manifest.files_at_end,
+                &manifest.all_files_at_end,
+            ));
+            *needs_persist = true;
         }
         if manifest.store_epoch.as_deref() == Some(epoch) {
-            continue;
+            return true;
         }
         manifest.store_epoch = Some(epoch.to_string());
-        let written = serde_json::to_vec_pretty(&manifest)
+        serde_json::to_vec_pretty(&manifest)
             .ok()
-            .is_some_and(|stamped| atomic_write(&manifest_path, &stamped).is_ok());
-        if !written {
-            all_ok = false;
+            .is_some_and(|stamped| atomic_write(&manifest_path, &stamped).is_ok())
+    };
+    for round in &mut history.rounds {
+        all_ok &= restamp_round(round);
+    }
+    for branch in &mut history.abandoned_branches {
+        for round in &mut branch.rounds {
+            all_ok &= restamp_round(round);
         }
     }
     all_ok
@@ -960,7 +1056,13 @@ fn reconcile_baseline_dir(baseline_dir: &Path, manifest: &BaselineManifest) -> b
                 continue;
             }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            // Per-entry iteration errors matter: a hidden stale file is a
+            // divergence between the on-disk universe and the manifest.
+            let Ok(entry) = entry else {
+                ok = false;
+                continue;
+            };
             let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
@@ -969,11 +1071,18 @@ fn reconcile_baseline_dir(baseline_dir: &Path, manifest: &BaselineManifest) -> b
                     continue;
                 }
             };
-            if ft.is_dir() {
-                stack.push(path);
+            // baseline/ only ever contains regular files and directories we
+            // wrote ourselves — a symlink (or any other type) is a foreign
+            // leftover. The fallback scan's reads would FOLLOW a file
+            // symlink, so it must go like any other stale entry.
+            if ft.is_symlink() || (!ft.is_dir() && !ft.is_file()) {
+                if std::fs::remove_file(&path).is_err() && std::fs::remove_dir(&path).is_err() {
+                    ok = false;
+                }
                 continue;
             }
-            if !ft.is_file() {
+            if ft.is_dir() {
+                stack.push(path);
                 continue;
             }
             let rel = match path.strip_prefix(baseline_dir) {
@@ -1267,12 +1376,10 @@ impl FileWatcher {
         bus: EventBus,
     ) -> Result<Self, CallerError> {
         let baseline_dir = snapshot_dir.join("baseline");
-        std::fs::create_dir_all(&baseline_dir)
+        // Only the store root exists before the lock: the lockfile needs a
+        // home, and a read-only loser must create nothing else.
+        std::fs::create_dir_all(&snapshot_dir)
             .map_err(|e| CallerError::Config(format!("create snapshot dir: {}", e)))?;
-        std::fs::create_dir_all(snapshot_dir.join("objects"))
-            .map_err(|e| CallerError::Config(format!("create objects dir: {}", e)))?;
-        std::fs::create_dir_all(snapshot_dir.join("rounds"))
-            .map_err(|e| CallerError::Config(format!("create rounds dir: {}", e)))?;
 
         // Cross-process exclusion, acquired before any store write: a second
         // watcher on the same store (another daemon resuming this session)
@@ -1284,6 +1391,13 @@ impl FileWatcher {
                  rewind runs read-only in this instance",
                 snapshot_dir.display()
             );
+        } else {
+            std::fs::create_dir_all(&baseline_dir)
+                .map_err(|e| CallerError::Config(format!("create baseline dir: {}", e)))?;
+            std::fs::create_dir_all(snapshot_dir.join("objects"))
+                .map_err(|e| CallerError::Config(format!("create objects dir: {}", e)))?;
+            std::fs::create_dir_all(snapshot_dir.join("rounds"))
+                .map_err(|e| CallerError::Config(format!("create rounds dir: {}", e)))?;
         }
 
         let mut baseline_manifest = BaselineManifest::new();
@@ -1815,6 +1929,9 @@ impl FileWatcher {
 
         let id = self.history.next_id;
         self.history.next_id += 1;
+        // Recorded in the index row so the resolver can verify a manifest's
+        // maps (the restore payload) before ever serving them.
+        let maps_hash = maps_content_hash(&files_at_end, &all_files_at_end);
         let stub = HistoryRound {
             id,
             parent_id,
@@ -1828,6 +1945,7 @@ impl FileWatcher {
             maps_from_round: maps_source_id,
             store_epoch: None,
             maps_inline: false,
+            maps_hash: Some(maps_hash),
         };
 
         // Write the per-round manifest — the durable home of the maps,
@@ -1909,7 +2027,7 @@ impl FileWatcher {
 
         // Refresh in-memory hash/baseline mirrors so the watcher doesn't
         // re-emit spurious "modified" events for paths we just rewrote.
-        self.refresh_hashes_from_tree();
+        let _ = self.refresh_hashes_from_tree();
 
         self.history.current_head_id = Some(target_id);
         self.head_maps = Some(HeadMapsCache {
@@ -1961,7 +2079,7 @@ impl FileWatcher {
             ))
         })?;
         let files_reverted = self.restore_to_state(&next_maps.files_at_end)?;
-        self.refresh_hashes_from_tree();
+        let _ = self.refresh_hashes_from_tree();
 
         self.history.current_head_id = Some(next_id);
         self.head_maps = Some(HeadMapsCache {
@@ -2189,6 +2307,7 @@ impl FileWatcher {
         // Prefer the in-memory stub's backreference (skips one manifest
         // read); the chain below re-verifies every hop against its own
         // index row anyway.
+        let expected_maps_hash = stub.maps_hash.clone();
         let mut source_id = stub.maps_from_round.unwrap_or(round_id);
         // Backreferences are written depth-1; the visited set and bound are
         // defense against corrupt or foreign manifests.
@@ -2235,6 +2354,18 @@ impl FileWatcher {
             match manifest.maps_from_round {
                 Some(next) => source_id = next,
                 None => {
+                    // Payload binding: the maps we are about to serve must
+                    // hash to what the requested round's index row recorded
+                    // — scalar binding alone would bless a manifest whose
+                    // scalars match but whose maps were replaced. Rows
+                    // predating the field (`None`) skip this check.
+                    if let Some(expected) = expected_maps_hash.as_deref() {
+                        let actual =
+                            maps_content_hash(&manifest.files_at_end, &manifest.all_files_at_end);
+                        if actual != expected {
+                            return None;
+                        }
+                    }
                     return Some(ResolvedRoundMaps {
                         source_round_id: source_id,
                         files_at_end: manifest.files_at_end,
@@ -2407,7 +2538,13 @@ impl FileWatcher {
     /// Cache-aware: `restore_to_state` refreshed the scan cache for every
     /// path it touched, so this walk is stats plus reads of only the files
     /// that changed outside the restore.
-    fn refresh_hashes_from_tree(&mut self) {
+    ///
+    /// Returns `false` — and degrades the live index — when a subtree could
+    /// not be enumerated (non-NotFound `read_dir` failure): the rebuilt
+    /// mirrors would silently omit whatever lives there. Per-file races
+    /// (a path deleted mid-walk) are benign; the next event covers them.
+    fn refresh_hashes_from_tree(&mut self) -> bool {
+        let mut ok = true;
         let mut new_hashes = HashMap::new();
         let mut large_file_fingerprints = HashMap::new();
         let mut next_cache: HashMap<PathBuf, ScanCacheEntry> =
@@ -2416,7 +2553,12 @@ impl FileWatcher {
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(err) => {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        ok = false;
+                    }
+                    continue;
+                }
             };
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -2501,6 +2643,10 @@ impl FileWatcher {
         self.hashes = new_hashes;
         self.large_file_fingerprints = large_file_fingerprints;
         self.round_scan_cache = next_cache;
+        if !ok {
+            self.live_index_degraded = true;
+        }
+        ok
     }
 
     /// Persist `history.json` atomically via tmp + rename.
@@ -2646,23 +2792,22 @@ async fn run_watcher_loop(
     // Close the scan-to-watch gap: the construction scan ran before the
     // watch registration above, so a change landing between them has no
     // event. Re-sync the hash mirrors from disk (a fingerprint walk), drain
-    // whatever raced in meanwhile, and only then mark the index healthy.
-    {
-        let mut w = shared.lock().await;
-        w.refresh_hashes_from_tree();
-    }
+    // whatever raced in meanwhile, and only then — and only if every one of
+    // those steps succeeded — mark the index healthy.
+    let resync_ok = { shared.lock().await.refresh_hashes_from_tree() };
+    let mut drain_ok = true;
     while let Ok(res) = rx.try_recv() {
-        apply_notify_result(&shared, res).await;
+        drain_ok &= apply_notify_result(&shared, res).await;
     }
     {
         let mut w = shared.lock().await;
-        if !w.live_index_disabled {
+        if resync_ok && drain_ok && !w.live_index_disabled {
             w.live_index_degraded = false;
         }
     }
 
     while let Some(res) = rx.recv().await {
-        apply_notify_result(&shared, res).await;
+        let _ = apply_notify_result(&shared, res).await;
     }
 
     shared.lock().await.live_index_degraded = true;
@@ -2671,24 +2816,29 @@ async fn run_watcher_loop(
 
 /// Apply one notify callback result to the shared watcher: rescan-flagged
 /// events re-sync the hash mirrors first (the backend dropped events);
-/// errors degrade the live index for the rest of the process.
+/// errors degrade the live index for the rest of the process. Returns
+/// whether the result was applied cleanly (a failed rescan re-sync or a
+/// notify error both degrade and return `false`).
 async fn apply_notify_result(
     shared: &SharedFileWatcher,
     res: Result<notify::Event, notify::Error>,
-) {
+) -> bool {
     match res {
         Ok(notify_event) => {
             let mut w = shared.lock().await;
+            let mut ok = true;
             if notify_event.need_rescan() {
-                w.refresh_hashes_from_tree();
+                ok = w.refresh_hashes_from_tree();
             }
             for path in &notify_event.paths {
                 w.process_change(path, &notify_event.kind);
             }
+            ok
         }
         Err(err) => {
             eprintln!("[file_watcher] notify error, live index degraded: {}", err);
             shared.lock().await.live_index_degraded = true;
+            false
         }
     }
 }
@@ -3260,6 +3410,7 @@ mod tests {
                 maps_from_round: None,
                 store_epoch: None,
                 maps_inline: false,
+                maps_hash: None,
             };
             w.history.abandoned_branches.push(AbandonedBranch {
                 branched_from_id: r1,
@@ -3506,6 +3657,7 @@ mod tests {
             round.files_at_end = maps.files_at_end;
             round.all_files_at_end = maps.all_files_at_end;
             round.maps_from_round = None;
+            round.maps_hash = None;
         }
         drop(w);
         std::fs::remove_dir_all(tmp_snap.path().join("rounds")).unwrap();
@@ -3747,6 +3899,7 @@ mod tests {
             round.files_at_end = maps.files_at_end;
             round.all_files_at_end = maps.all_files_at_end;
             round.maps_from_round = None;
+            round.maps_hash = None;
         }
         drop(w);
         let rounds_dir = tmp_snap.path().join("rounds");
@@ -3802,6 +3955,149 @@ mod tests {
         let other = TempDir::new().unwrap();
         assert!(live_watcher_for(other.path(), tmp_snap.path()).is_none());
         assert!(live_watcher_for(tmp_proj.path(), other.path()).is_none());
+    }
+
+    /// FIX (round 3): a manifest whose scalars all bind but whose MAPS —
+    /// the actual restore payload — were replaced must be refused: the
+    /// index row records a content hash of the maps and the resolver
+    /// verifies it before serving.
+    #[test]
+    fn map_only_poison_is_refused() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        drop(w);
+
+        // Poison ONLY the payload: every scalar and the epoch stay intact.
+        let manifest_path = round_manifest_path(tmp_snap.path(), r1);
+        let mut manifest: HistoryRound =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let poison_hash = hex_encode(&sha256_hash(b"attacker content"));
+        manifest.files_at_end = HashMap::from([("a.txt".to_string(), poison_hash.clone())]);
+        manifest.all_files_at_end = HashMap::from([("a.txt".to_string(), poison_hash)]);
+        atomic_write(
+            &manifest_path,
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let mut resumed = make_watcher(root, tmp_snap.path());
+        assert!(
+            resumed.resolved_round_maps(r1).is_none(),
+            "a map-only poison must fail the payload hash, not be served"
+        );
+        assert!(resumed.rollback(r1).is_err());
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+    }
+
+    /// FIX (round 3): a transiently UNREADABLE manifest defers epoch
+    /// adoption exactly like a failed write — otherwise the persisted epoch
+    /// would orphan a perfectly correct manifest.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_manifest_defers_epoch_adoption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        drop(w);
+
+        // Pre-epoch layout + an unreadable (but correct) manifest.
+        let index_path = tmp_snap.path().join("history.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        index.as_object_mut().unwrap().remove("store_epoch");
+        atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+        let manifest_path = round_manifest_path(tmp_snap.path(), r1);
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let deferred = make_watcher(root, tmp_snap.path());
+        assert_eq!(
+            deferred.history.store_epoch, None,
+            "an unreadable manifest must defer epoch adoption like a failed write"
+        );
+        drop(deferred);
+
+        // Readable again: the next load completes the mint and restamps.
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let adopted = make_watcher(root, tmp_snap.path());
+        assert!(adopted.history.store_epoch.is_some());
+        assert!(adopted.resolved_round_maps(r1).is_some());
+    }
+
+    /// FIX (round 3): a symlink left under baseline/ (which only ever holds
+    /// regular files we wrote) is a foreign leftover — reconciliation
+    /// removes it, keeping the fallback scan's key universe identical to
+    /// the watcher index's.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_baseline_leftover_is_reconciled() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("real.rs"), b"tracked").unwrap();
+        let first = make_watcher(root, tmp_snap.path());
+        drop(first);
+
+        // Plant a symlink leftover pointing at live content.
+        let target = root.join("real.rs");
+        let link = tmp_snap.path().join("baseline").join("ghost.rs");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut second = make_watcher(root, tmp_snap.path());
+        assert!(
+            !link.exists() && std::fs::symlink_metadata(&link).is_err(),
+            "the symlink leftover must be removed"
+        );
+        second.mark_live_index_healthy_for_tests();
+        assert!(
+            second.changes_index_snapshot().is_some(),
+            "a successful reconciliation (including symlink removal) keeps the fast path"
+        );
+    }
+
+    /// FIX (round 3): if the post-watch re-sync cannot enumerate part of
+    /// the tree, the live index must STAY degraded — never marked healthy
+    /// over silently missing subtrees.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resync_failure_keeps_index_degraded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path().to_path_buf();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/inner.rs"), b"content").unwrap();
+        let w = make_watcher(&root, tmp_snap.path());
+
+        // Make the subtree unenumerable between construction and watch.
+        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (shared, _watcher_handle, _round_handle) = w.start_shared();
+        // The healthy transition (if it were wrongly taken) happens right
+        // after spawn; give it ample time, asserting it never happens.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                shared.lock().await.changes_index_snapshot().is_none(),
+                "a failed re-sync must keep the index degraded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Windows: a same-length rewrite whose mtime is backdated OUTSIDE the
@@ -4025,6 +4321,7 @@ mod tests {
             round.all_files_at_end = maps.all_files_at_end;
             round.maps_from_round = None;
             round.maps_inline = false;
+            round.maps_hash = None;
         }
         assert!(legacy.rounds[0].files_at_end.is_empty(), "empty-tree round");
         drop(w);
