@@ -128,8 +128,12 @@ impl PeerFileTransferAuthorization {
 /// (the driver plus each spawned read stream) share the memo cell.
 ///
 /// Trust invariants (do not weaken):
-/// - Negative verdicts are never memoized — a failed check re-verifies
-///   fresh on every subsequent call.
+/// - The fresh check and the memo update are ATOMIC: the memo lock is
+///   held across the identity-store consult, so a preempted positive
+///   check can never stamp the memo after a newer negative observed the
+///   revocation.
+/// - A fresh negative CLEARS the memo — no stale positive survives a
+///   fresh failure, and negative verdicts are never memoized.
 /// - The request-authorization path ([`authorize_path`],
 ///   [`open_authorized_read_file`]) and the driver's authority tick call
 ///   [`Self::is_current_fresh`], so authorization decisions and the
@@ -141,7 +145,10 @@ impl PeerFileTransferAuthorization {
 struct LiveTransferAuthority {
     authorization: PeerFileTransferAuthorization,
     /// Instant of the last fresh **positive** verification, shared across
-    /// clones. `None` until first verified.
+    /// clones. `None` until first verified and after any fresh negative.
+    /// Fresh checks run UNDER this lock (see the atomicity invariant in
+    /// the type docs); they are low-frequency (250 ms tick + per-request
+    /// authorization), so serializing them here costs nothing.
     verified_at: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
@@ -154,26 +161,36 @@ impl LiveTransferAuthority {
     }
 
     /// Memoized liveness: reuse a positive verdict younger than
-    /// [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`], else verify fresh.
+    /// [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`], else verify fresh (under the
+    /// memo lock, like [`Self::is_current_fresh`]).
     fn is_current(&self) -> bool {
-        {
-            let verified_at = self.verified_at.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(at) = *verified_at {
-                if at.elapsed() < LIVE_TRANSFER_AUTHORITY_MEMO_TTL {
-                    return true;
-                }
+        let mut verified_at = self.verified_at.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = *verified_at {
+            if at.elapsed() < LIVE_TRANSFER_AUTHORITY_MEMO_TTL {
+                return true;
             }
         }
-        self.is_current_fresh()
+        Self::refresh_locked(&self.authorization, &mut verified_at)
     }
 
-    /// Uncached liveness against the identity store; primes the memo on a
-    /// positive verdict only.
+    /// Uncached liveness against the identity store. Check and stamp are
+    /// one critical section: a positive primes the memo, a negative
+    /// clears it — a preempted stale positive can never re-prime the memo
+    /// after a newer negative.
     fn is_current_fresh(&self) -> bool {
-        let ok = self.authorization.is_current();
-        if ok {
-            *self.verified_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        }
+        let mut verified_at = self.verified_at.lock().unwrap_or_else(|e| e.into_inner());
+        Self::refresh_locked(&self.authorization, &mut verified_at)
+    }
+
+    /// The one fresh-check-and-stamp critical section (callers hold the
+    /// memo lock). Lock order is memo → identity-cache global lock; no
+    /// reverse path exists.
+    fn refresh_locked(
+        authorization: &PeerFileTransferAuthorization,
+        verified_at: &mut Option<Instant>,
+    ) -> bool {
+        let ok = authorization.is_current();
+        *verified_at = if ok { Some(Instant::now()) } else { None };
         ok
     }
 }
@@ -661,7 +678,22 @@ enum TransferCommand {
     AddIceCandidate(String),
     SendText(String),
     SendBinary(BytesMut),
-    ReadFinished(String),
+    /// Natural completion of the read stream spawned as `generation` —
+    /// the driver deregisters the entry only when the generation still
+    /// matches, so a finished superseded task can never evict its
+    /// replacement (which would leave an uncounted, uncancellable
+    /// stream defeating [`MAX_CONCURRENT_READS_PER_SESSION`]).
+    ReadFinished {
+        id: String,
+        generation: u64,
+    },
+}
+
+/// One tracked read stream: its cancel token plus the spawn generation
+/// that keys [`TransferCommand::ReadFinished`] deregistration.
+struct ActiveRead {
+    cancel: CancellationToken,
+    generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -735,7 +767,8 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
     }
 
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
-    let mut active_reads: HashMap<String, CancellationToken> = HashMap::new();
+    let mut active_reads: HashMap<String, ActiveRead> = HashMap::new();
+    let mut next_read_generation: u64 = 0;
     // True while the transfer channel's SCTP send buffer sits above the
     // high watermark: the command lane stops admitting work (chunks, text,
     // trickled candidates alike — FIFO order must hold anyway), the bounded
@@ -890,6 +923,10 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
             }
             // Gated on the SCTP send-buffer watermark: while paused, queued
             // commands wait in the bounded channel and the readers park.
+            // AddIceCandidate rides the same lane, so trickled candidates
+            // queue behind the pause too — incidental coupling, harmless
+            // today (candidates matter during setup, before bulk data can
+            // congest the channel; an established pair needs no new ones).
             Some(cmd) = command_rx.recv(), if !send_paused => {
                 if !authorization.is_current() {
                     shutdown.cancel();
@@ -914,8 +951,8 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                     TransferCommand::SendBinary(bytes) => {
                         send_transfer_binary(&mut rtc, &channels, bytes);
                     }
-                    TransferCommand::ReadFinished(id) => {
-                        active_reads.remove(&id);
+                    TransferCommand::ReadFinished { id, generation } => {
+                        deregister_finished_read(&mut active_reads, &id, generation);
                     }
                 }
                 let _ = rtc.handle_timeout(Instant::now());
@@ -946,19 +983,25 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                 shutdown.cancel();
                 break 'driver;
             }
-            handle_transfer_request(
+            if let Some(reply) = handle_transfer_request(
                 &session_id,
                 text,
                 &authorization,
                 &bus,
                 command_tx.clone(),
                 &mut active_reads,
-            );
+                &mut next_read_generation,
+            ) {
+                // Rejections bypass the (possibly watermark-paused) command
+                // lane: the driver owns the rtc right here, and a dropped
+                // rejection would leave the client waiting forever.
+                send_transfer_text(&mut rtc, &channels, reply);
+            }
         }
     }
 
-    for (_, token) in active_reads {
-        token.cancel();
+    for (_, read) in active_reads {
+        read.cancel.cancel();
     }
     for handle in forwarder_handles {
         let _ = handle.await;
@@ -1030,12 +1073,16 @@ async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
                     // tile-delta backpressure): the High event pauses the
                     // driver's command lane, Low resumes it.
                     if let Some(mut channel) = rtc.data_channel(cid) {
-                        channel.set_buffered_amount_high_threshold(watermark_to_u32(
-                            TRANSFER_BUFFERED_HIGH_WATERMARK_BYTES,
-                        ));
-                        channel.set_buffered_amount_low_threshold(watermark_to_u32(
-                            TRANSFER_BUFFERED_LOW_WATERMARK_BYTES,
-                        ));
+                        channel.set_buffered_amount_high_threshold(
+                            crate::dashboard_control::watermark_to_u32(
+                                TRANSFER_BUFFERED_HIGH_WATERMARK_BYTES,
+                            ),
+                        );
+                        channel.set_buffered_amount_low_threshold(
+                            crate::dashboard_control::watermark_to_u32(
+                                TRANSFER_BUFFERED_LOW_WATERMARK_BYTES,
+                            ),
+                        );
                     }
                     *send_paused = false;
                 }
@@ -1081,22 +1128,27 @@ async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
 }
 
+/// Handle one inbound transfer request. Rejections come back as
+/// `Some(<error frame text>)` for the DRIVER to send directly over the
+/// datachannel — the command lane may be watermark-paused or full, and a
+/// `try_send` there dropped rejections exactly when the wire was busy.
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 fn handle_transfer_request(
     session_id: &str,
     text: &str,
     authorization: &LiveTransferAuthority,
     bus: &crate::event::EventBus,
     command_tx: mpsc::Sender<TransferCommand>,
-    active_reads: &mut HashMap<String, CancellationToken>,
-) {
+    active_reads: &mut HashMap<String, ActiveRead>,
+    next_read_generation: &mut u64,
+) -> Option<String> {
     let request = match serde_json::from_str::<TransferRequest>(text) {
         Ok(request) => request,
         Err(e) => {
-            let _ = command_tx.try_send(TransferCommand::SendText(
+            return Some(
                 serde_json::json!({"t": "error", "id": null, "error": format!("invalid request: {e}")})
                     .to_string(),
-            ));
-            return;
+            );
         }
     };
 
@@ -1108,10 +1160,10 @@ fn handle_transfer_request(
             length,
         } => {
             if let Some(old) = active_reads.remove(&id) {
-                old.cancel();
+                old.cancel.cancel();
             }
             if active_reads.len() >= MAX_CONCURRENT_READS_PER_SESSION {
-                let _ = command_tx.try_send(TransferCommand::SendText(
+                return Some(
                     serde_json::json!({
                         "t": "error",
                         "id": id,
@@ -1120,11 +1172,18 @@ fn handle_transfer_request(
                         ),
                     })
                     .to_string(),
-                ));
-                return;
+                );
             }
+            *next_read_generation = next_read_generation.wrapping_add(1);
+            let generation = *next_read_generation;
             let cancel = CancellationToken::new();
-            active_reads.insert(id.clone(), cancel.clone());
+            active_reads.insert(
+                id.clone(),
+                ActiveRead {
+                    cancel: cancel.clone(),
+                    generation,
+                },
+            );
             let authorization = authorization.clone();
             let bus = bus.clone();
             let session_id = session_id.to_string();
@@ -1132,6 +1191,7 @@ fn handle_transfer_request(
                 stream_read_request(
                     session_id,
                     id,
+                    generation,
                     path,
                     offset,
                     length,
@@ -1142,12 +1202,45 @@ fn handle_transfer_request(
                 )
                 .await;
             });
+            None
         }
         TransferRequest::Cancel { id } => {
-            if let Some(token) = active_reads.remove(&id) {
-                token.cancel();
+            if let Some(read) = active_reads.remove(&id) {
+                read.cancel.cancel();
             }
+            None
         }
+    }
+}
+
+/// The driver's `ReadFinished` handling (extracted for tests): deregister
+/// only when the finishing generation still owns the entry, so a
+/// superseded task's natural completion cannot evict its replacement.
+fn deregister_finished_read(
+    active_reads: &mut HashMap<String, ActiveRead>,
+    id: &str,
+    generation: u64,
+) {
+    if active_reads
+        .get(id)
+        .is_some_and(|read| read.generation == generation)
+    {
+        active_reads.remove(id);
+    }
+}
+
+/// Send a transfer command, aborting when the read is cancelled — a
+/// watermark-paused command lane must never pin a cancelled read task
+/// inside an un-cancellable `send().await`.
+async fn send_command_or_cancelled(
+    command_tx: &mpsc::Sender<TransferCommand>,
+    cancel: &CancellationToken,
+    command: TransferCommand,
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("transfer cancelled".to_string()),
+        sent = command_tx.send(command) => sent.map_err(|_| "transfer driver gone".to_string()),
     }
 }
 
@@ -1155,6 +1248,7 @@ fn handle_transfer_request(
 async fn stream_read_request(
     session_id: String,
     id: String,
+    generation: u64,
     raw_path: String,
     offset: u64,
     length: Option<u64>,
@@ -1189,8 +1283,10 @@ async fn stream_read_request(
         if !authorization.is_current() {
             return Err("peer file-transfer identity changed before response".to_string());
         }
-        command_tx
-            .send(TransferCommand::SendText(
+        send_command_or_cancelled(
+            &command_tx,
+            &cancel,
+            TransferCommand::SendText(
                 serde_json::json!({
                     "t": "start",
                     "id": id,
@@ -1202,9 +1298,9 @@ async fn stream_read_request(
                     "total_size": total_size,
                 })
                 .to_string(),
-            ))
-            .await
-            .map_err(|_| "transfer driver gone".to_string())?;
+            ),
+        )
+        .await?;
 
         stream_file_range(
             file,
@@ -1219,8 +1315,10 @@ async fn stream_read_request(
         if !authorization.is_current() {
             return Err("peer file-transfer identity changed before completion".to_string());
         }
-        command_tx
-            .send(TransferCommand::SendText(
+        send_command_or_cancelled(
+            &command_tx,
+            &cancel,
+            TransferCommand::SendText(
                 serde_json::json!({
                     "t": "end",
                     "id": id,
@@ -1229,9 +1327,9 @@ async fn stream_read_request(
                     "total_size": total_size,
                 })
                 .to_string(),
-            ))
-            .await
-            .map_err(|_| "transfer driver gone".to_string())?;
+            ),
+        )
+        .await?;
         Ok::<(), String>(())
     }
     .await;
@@ -1255,16 +1353,31 @@ async fn stream_read_request(
             });
         }
         Err(error) => {
-            if authorization.is_current() {
-                let _ = command_tx
-                    .send(TransferCommand::SendText(
+            if !cancel.is_cancelled() && authorization.is_current() {
+                let _ = send_command_or_cancelled(
+                    &command_tx,
+                    &cancel,
+                    TransferCommand::SendText(
                         serde_json::json!({"t": "error", "id": id, "error": error}).to_string(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
             }
         }
     }
-    let _ = command_tx.send(TransferCommand::ReadFinished(id)).await;
+    // Deregister on NATURAL completion only: whoever cancels a read
+    // (replacement, Cancel request, driver teardown) removes the registry
+    // entry itself, and this task must never sit in an un-cancellable
+    // send. The generation keys the removal so a superseded task cannot
+    // evict its replacement.
+    if !cancel.is_cancelled() {
+        let _ = send_command_or_cancelled(
+            &command_tx,
+            &cancel,
+            TransferCommand::ReadFinished { id, generation },
+        )
+        .await;
+    }
 }
 
 fn authorize_path(
@@ -1371,10 +1484,12 @@ async fn stream_file_range(
             return Err("peer file-transfer identity changed during read".to_string());
         }
         remaining = remaining.saturating_sub(n as u64);
-        command_tx
-            .send(TransferCommand::SendBinary(buf.split_to(n)))
-            .await
-            .map_err(|_| "transfer driver gone".to_string())?;
+        send_command_or_cancelled(
+            command_tx,
+            cancel,
+            TransferCommand::SendBinary(buf.split_to(n)),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1407,12 +1522,6 @@ fn send_transfer_binary<I: rtc::interceptor::Interceptor>(
             eprintln!("[peer-file-transfer] data channel binary write failed: {e:?}");
         }
     }
-}
-
-/// Clamp a byte watermark into the `u32` the rtc data-channel threshold
-/// setters take.
-fn watermark_to_u32(bytes: usize) -> u32 {
-    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 fn to_rtc_ice_servers(servers: &[crate::display::IceServer]) -> Vec<RTCIceServer> {
@@ -1536,6 +1645,125 @@ mod tests {
         assert!(authority.verified_at.lock().unwrap().is_some());
         crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
         assert!(!authority.is_current_fresh());
+        // A fresh negative clears the memo, so the memoized path observes
+        // the revocation immediately — no TTL ride-out on a verdict the
+        // fresh path already invalidated.
+        assert!(
+            authority.verified_at.lock().unwrap().is_none(),
+            "a fresh negative must clear the memo"
+        );
+        assert!(!authority.is_current());
+    }
+
+    /// Read-id reuse must never orphan the replacement stream: the old
+    /// generation's completion may not deregister the new generation's
+    /// entry (which would leave an uncounted, uncancellable stream
+    /// defeating the concurrency cap), and replacement cancels the old
+    /// token.
+    #[tokio::test]
+    async fn read_id_reuse_keeps_the_replacement_tracked() {
+        let (command_tx, _command_rx) = mpsc::channel(COMMAND_CHANNEL);
+        let authority = LiveTransferAuthority::new(PeerFileTransferAuthorization {
+            fingerprint: "fp".into(),
+            label: "peer".into(),
+            profile: "file-reader".into(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+        });
+        let bus = crate::event::EventBus::new();
+        let mut active_reads: HashMap<String, ActiveRead> = HashMap::new();
+        let mut next_generation = 0u64;
+        let read_request =
+            r#"{"t":"read","id":"r1","path":"/nonexistent/fixture","offset":0}"#.to_string();
+
+        assert!(handle_transfer_request(
+            "session",
+            &read_request,
+            &authority,
+            &bus,
+            command_tx.clone(),
+            &mut active_reads,
+            &mut next_generation,
+        )
+        .is_none());
+        let first_generation = active_reads["r1"].generation;
+        let first_token = active_reads["r1"].cancel.clone();
+
+        // Reuse the id: the old stream is cancelled, a new generation is
+        // registered.
+        assert!(handle_transfer_request(
+            "session",
+            &read_request,
+            &authority,
+            &bus,
+            command_tx.clone(),
+            &mut active_reads,
+            &mut next_generation,
+        )
+        .is_none());
+        assert!(first_token.is_cancelled());
+        let second_generation = active_reads["r1"].generation;
+        assert_ne!(first_generation, second_generation);
+
+        // The superseded generation's completion is a no-op…
+        deregister_finished_read(&mut active_reads, "r1", first_generation);
+        assert!(
+            active_reads.contains_key("r1"),
+            "a superseded completion must not evict the replacement"
+        );
+        // …while the live generation deregisters normally.
+        deregister_finished_read(&mut active_reads, "r1", second_generation);
+        assert!(!active_reads.contains_key("r1"));
+    }
+
+    /// The concurrency-cap rejection is returned to the driver for a
+    /// direct datachannel send — never dropped into a possibly paused
+    /// command lane.
+    #[tokio::test]
+    async fn read_cap_rejection_is_returned_for_direct_send() {
+        let (command_tx, _command_rx) = mpsc::channel(COMMAND_CHANNEL);
+        let authority = LiveTransferAuthority::new(PeerFileTransferAuthorization {
+            fingerprint: "fp".into(),
+            label: "peer".into(),
+            profile: "file-reader".into(),
+            filesystem: Default::default(),
+            identity_record: None,
+            iam_cert_dir: None,
+        });
+        let bus = crate::event::EventBus::new();
+        let mut active_reads: HashMap<String, ActiveRead> = HashMap::new();
+        let mut next_generation = 0u64;
+        for index in 0..MAX_CONCURRENT_READS_PER_SESSION {
+            let request = format!(
+                r#"{{"t":"read","id":"r{index}","path":"/nonexistent/fixture","offset":0}}"#
+            );
+            assert!(handle_transfer_request(
+                "session",
+                &request,
+                &authority,
+                &bus,
+                command_tx.clone(),
+                &mut active_reads,
+                &mut next_generation,
+            )
+            .is_none());
+        }
+        let rejection = handle_transfer_request(
+            "session",
+            r#"{"t":"read","id":"over","path":"/nonexistent/fixture","offset":0}"#,
+            &authority,
+            &bus,
+            command_tx.clone(),
+            &mut active_reads,
+            &mut next_generation,
+        )
+        .expect("over-cap read must return a rejection for the driver to send");
+        assert!(rejection.contains("too many concurrent reads"));
+        assert_eq!(active_reads.len(), MAX_CONCURRENT_READS_PER_SESSION);
+        for (_, read) in active_reads {
+            read.cancel.cancel();
+        }
     }
 
     /// Trust pin for the memoized wrapper: a positive verdict is reusable

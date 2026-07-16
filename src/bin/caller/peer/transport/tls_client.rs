@@ -113,22 +113,43 @@ fn load_client_identity(
     })
 }
 
-/// Stat fingerprint (length + mtime) of one PEM file — the freshness probe
-/// for [`TlsClientCache`], so a re-issued `client.crt`/`client.key` is
-/// picked up on the next use for two stats instead of re-reading and
-/// re-parsing the PEMs (and, on the no-pin path, the whole native root
-/// store) per connect attempt.
+/// Stat fingerprint of one PEM file — the freshness probe for
+/// [`TlsClientCache`], so a re-issued `client.crt`/`client.key` is picked
+/// up on the next use for two stats instead of re-reading and re-parsing
+/// the PEMs (and, on the no-pin path, the whole native root store) per
+/// connect attempt.
+///
+/// Same identity vocabulary as the peer-record cache
+/// (`access_policy::PeerRecordFingerprint`): certificate writes replace
+/// files atomically, so a fresh `(dev, ino)` distinguishes a
+/// same-length, timestamp-preserving replacement (`cp -p` rollback,
+/// same-granule rewrite) that length+mtime alone would miss;
+/// nanosecond mtime and length are the portable fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
-    modified: Option<std::time::SystemTime>,
+    mtime_nanos: u128,
+    dev: u64,
+    ino: u64,
 }
 
 fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
     let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
     Some(FileStamp {
         len: metadata.len(),
-        modified: metadata.modified().ok(),
+        mtime_nanos,
+        dev,
+        ino,
     })
 }
 
@@ -350,5 +371,59 @@ mod tests {
         assert!(cache.client_config(&[], None).unwrap().is_none());
         let _client = cache.http_client(&[], None).unwrap();
         assert!(cache.client_config(&[], None).unwrap().is_none());
+    }
+
+    /// An atomic certificate replacement that preserves BOTH length and
+    /// mtime (a `cp -p`-style rollback, a same-granule rewrite) must
+    /// still invalidate the cache: the fresh inode is the discriminator
+    /// (`PeerRecordFingerprint`'s identity vocabulary).
+    #[cfg(unix)]
+    #[test]
+    fn tls_cache_detects_same_length_preserved_mtime_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(dir.path(), &names, "peer-client-inode-test", false)
+            .unwrap();
+        let identity = ClientIdentityPaths {
+            cert_path: dir.path().join("client.crt"),
+            key_path: dir.path().join("client.key"),
+        };
+        let pins = [[0u8; 32]];
+        let cache = TlsClientCache::default();
+        let first = cache
+            .client_config(&pins, Some(&identity))
+            .unwrap()
+            .expect("pinned + identity builds a config");
+
+        // Stage identical bytes, copy the original mtime onto them, then
+        // rename over the original: same length, same mtime, new inode.
+        let original = std::fs::read(&identity.cert_path).unwrap();
+        let mtime = std::fs::metadata(&identity.cert_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        let staged = identity.cert_path.with_extension("crt.staged");
+        std::fs::write(&staged, &original).unwrap();
+        let staged_file = std::fs::File::options().write(true).open(&staged).unwrap();
+        staged_file.set_modified(mtime).unwrap();
+        drop(staged_file);
+        std::fs::rename(&staged, &identity.cert_path).unwrap();
+        let after = std::fs::metadata(&identity.cert_path).unwrap();
+        assert_eq!(after.len() as usize, original.len());
+        assert_eq!(after.modified().unwrap(), mtime);
+
+        let rotated = cache
+            .client_config(&pins, Some(&identity))
+            .unwrap()
+            .expect("rebuilt config after replacement");
+        assert!(
+            !Arc::ptr_eq(&first, &rotated),
+            "a same-length, mtime-preserved replacement must rebuild the config"
+        );
     }
 }

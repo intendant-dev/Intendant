@@ -937,6 +937,7 @@ where
         receipts_tx,
         receipts: HashMap::new(),
         receipt_order: std::collections::VecDeque::new(),
+        pending_partials: HashMap::new(),
         seq: 0,
         via_urls,
         label_override,

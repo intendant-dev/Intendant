@@ -456,14 +456,18 @@ impl PeerRegistry {
         let log_sink = self.inner.log_sink.clone();
 
         // Retained on the handle for gateway HTTP side-channels (e.g.
-        // POST /mcp): the same bundle the transports below are built
-        // from, so both paths present one identity to the peer.
+        // POST /mcp): the transports below are built from CLONES of this
+        // same bundle, so both paths present one identity to the peer AND
+        // share one TlsClientCache cell (clones share the Arc) — the card
+        // fetch, the WS connect, and /mcp calls reuse the same built TLS
+        // material.
         let transport_credentials = crate::peer::transport::intendant::TransportCredentials {
-            bearer_token: bearer_token.clone(),
-            pinned_fingerprints: pinned_fingerprints.clone(),
-            client_identity: client_identity.clone(),
+            bearer_token,
+            pinned_fingerprints,
+            client_identity,
             tls: Default::default(),
         };
+        let transport_factory_credentials = transport_credentials.clone();
 
         let handle = spawn_peer(
             peer_id.clone(),
@@ -475,18 +479,16 @@ impl PeerRegistry {
             log_sink,
             move |events_tx| {
                 // Build one concrete transport per supported spec (each
-                // gets its own clone of `events_tx`, `bearer_token`,
-                // `pinned_fingerprints`, and `client_identity`) and wrap them in a
-                // `MultiTransport` that probes them in order on connect.
+                // gets its own clone of `events_tx` and of the shared
+                // credentials bundle) and wrap them in a `MultiTransport`
+                // that probes them in order on connect.
                 let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> = supported_specs
                     .iter()
                     .map(|spec| {
                         build_transport(
                             spec,
                             events_tx.clone(),
-                            bearer_token.clone(),
-                            pinned_fingerprints.clone(),
-                            client_identity.clone(),
+                            transport_factory_credentials.clone(),
                         )
                     })
                     .collect();
@@ -703,20 +705,13 @@ fn pick_supported_transports(transports: &[TransportSpec]) -> Vec<TransportSpec>
 fn build_transport(
     spec: &TransportSpec,
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
-    bearer_token: Option<String>,
-    pinned_fingerprints: Vec<crate::peer::transport::pinning::Fingerprint>,
-    client_identity: Option<ClientIdentityPaths>,
+    credentials: crate::peer::transport::intendant::TransportCredentials,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
         TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_credentials(
             url.clone(),
             events_tx,
-            crate::peer::transport::intendant::TransportCredentials {
-                bearer_token,
-                pinned_fingerprints,
-                client_identity,
-                tls: Default::default(),
-            },
+            credentials,
         )),
         other => {
             // Should be unreachable: `pick_supported_transports`
