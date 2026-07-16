@@ -1397,11 +1397,11 @@ mod authority_wire_tests {
         }
     }
 
-    /// The dispatch in `connect_server` matches `t == "display_input_authority_state"`
-    /// and reads `display_id: u64` + `state: &str`.  This test pins
-    /// that exact shape against the JSON the gateway actually emits,
-    /// failing loudly if either side renames a field or changes a
-    /// type.
+    /// The dispatch in `route_server_message` matches
+    /// `t == "display_input_authority_state"` and reads `display_id: u64` +
+    /// `state: &str`.  This test pins that exact shape against the JSON the
+    /// gateway actually emits, failing loudly if either side renames a
+    /// field or changes a type.
     #[test]
     fn display_input_authority_state_shape_matches_dispatch() {
         // Construct the JSON the way `web_gateway` emits it (see

@@ -1133,16 +1133,24 @@ impl StationInner {
         } else if let Some(scene_ctx) = self.scene_ctx.as_ref() {
             self.draw_scene_lines(scene_ctx);
         }
+        if !gpu_render_ok && !scene_static {
+            // A failed *uploading* render leaves the vertex buffers holding
+            // the previous frame while `self.frame` has moved on
+            // (`GpuState::render` bails on surface-acquire before its upload
+            // block) — re-arm the rebuild unconditionally. Merely preserving
+            // an already-true latch is not enough: at motion 0 the tick that
+            // expires the last particle uploads with `hud_dirty` false, and
+            // a failure there would otherwise hand every following
+            // present-only (scene_static) tick stale buffers indefinitely.
+            // A failed present-only tick needs no latch: the buffers still
+            // hold exactly the frame being presented.
+            self.hud_dirty = true;
+        }
 
         if full_hud {
             self.draw_hud(anim_ms);
-            // Clear the dirty latch only when the scene actually made it
-            // onto the GPU: `GpuState::render` bails before its upload
-            // block on surface-acquire failure, so clearing on a failed
-            // upload tick would launder pre-change vertex buffers through
-            // the present-only path (scene_static) indefinitely at
-            // motion 0. A failed present-only tick keeps the latch
-            // untouched anyway (scene_static implies !full_hud).
+            // Don't let this tick's clear cancel the failed-upload re-arm
+            // above.
             if gpu_render_ok {
                 self.hud_dirty = false;
             }
