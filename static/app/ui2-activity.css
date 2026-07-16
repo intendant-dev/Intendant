@@ -604,6 +604,33 @@ html.ui-v2 #question-panel .question-free-text:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
+/* pinned index chips ride the same sky grammar as the header chips;
+   answered flips to the success hue (tick glyph comes from the base rule) */
+html.ui-v2 #question-panel .question-index-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-index-chip:hover {
+  background: rgba(var(--sky-rgb), .16);
+  border-color: rgba(var(--sky-rgb), .38);
+}
+html.ui-v2 #question-panel .question-index-chip.answered {
+  color: var(--green);
+  background: rgba(var(--green-rgb), .1);
+  border-color: rgba(var(--green-rgb), .32);
+}
+html.ui-v2 #question-panel .question-progress {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+}
 
 /* Inline command code rides the design mono, not the UA's generic
    monospace (chrome-audit cross-surface sweep). */

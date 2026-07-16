@@ -2443,6 +2443,19 @@ body.context-focus-active {
   right: 0;
   bottom: 0;
   z-index: 60;
+  /* Bound the overlay: it grows upward from bottom:0, and an over-tall
+     panel (many-question AskUserQuestion) crosses .tab-content's
+     overflow:hidden — top clipped, no scrollbar anywhere. Cap it short
+     of the pane so a sliver of log stays visible, and let panel bodies
+     scroll internally (flex column so .panel-body can shrink). */
+  max-height: calc(100% - 48px);
+  display: flex;
+  flex-direction: column;
+}
+#activity-log-pane .bottom-panel .panel-header { flex-shrink: 0; }
+#activity-log-pane .bottom-panel .panel-body {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* Approval — modern card matching the dashboard notification banners */
@@ -2543,6 +2556,33 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--blue) 10%, transparent);
   border-color: color-mix(in srgb, var(--blue) 40%, transparent);
 }
+/* Tall question sets: the card pins title, index, and actions while the
+   question list (.question-scroll) scrolls internally — Submit stays
+   reachable no matter how many questions arrived. min-height:0 at each
+   flex level lets the panel's max-height cap reach the scroll region. */
+#question-panel .panel-body {
+  display: flex;
+  flex-direction: column;
+}
+#question-panel .approval-card {
+  align-items: stretch;
+  min-height: 0;
+}
+#question-panel .approval-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#question-panel .approval-content > .approval-title,
+#question-panel .approval-content > .question-index,
+#question-panel .approval-content > .approval-actions {
+  flex-shrink: 0;
+}
+#question-panel .approval-content > .approval-actions { margin-top: 8px; }
+.question-scroll {
+  min-height: 0;
+  overflow-y: auto;
+}
 .question-block { margin-bottom: 10px; }
 .question-block:last-of-type { margin-bottom: 0; }
 .question-header-chip {
@@ -2607,6 +2647,41 @@ body.context-focus-active {
   box-sizing: border-box;
 }
 .question-free-text:focus { border-color: var(--blue); outline: none; }
+/* Pinned question index (2+ questions): one chip per question header,
+   kept above the scroll region; tapping a chip scrolls its question into
+   view, and a tick marks questions that already have an answer. */
+.question-index {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.question-index-chip {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--subtext0);
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.question-index-chip:hover { background: var(--surface1); border-color: var(--overlay0); }
+.question-index-chip.answered {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 45%, transparent);
+}
+.question-index-chip.answered::after { content: " \2713"; }
+/* Plain-language "N of M answered" counter beside Submit/Skip. */
+.question-progress {
+  margin-left: auto;
+  align-self: center;
+  font-size: 11px;
+  color: var(--subtext0);
+}
 
 /* Input / Follow-up */
 .input-question {
