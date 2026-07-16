@@ -53,7 +53,12 @@ pub(crate) struct DriverState {
     /// commit 2 lights up multi-encoding), the map has exactly one
     /// entry per active spec — same shape as the previous keying,
     /// just with the RID dimension along for the ride.
-    video_specs: HashMap<(crate::encode::PayloadSpec, SimulcastRid), SpecState>,
+    /// Keyed by `(PayloadSpec, SimulcastRid)` — see the data-shape pin
+    /// test. Stored as a small linear vector (a handful of entries at
+    /// most: codecs × rids for one peer) so the per-frame lookup
+    /// compares by reference instead of cloning the spec + rid into an
+    /// owned `HashMap` key on every frame.
+    video_specs: Vec<((crate::encode::PayloadSpec, SimulcastRid), SpecState)>,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
     /// F-1.2: queued `display_input_authority_state` messages awaiting
@@ -106,6 +111,11 @@ pub(crate) struct DriverState {
 pub(crate) struct RidRtpState {
     ssrc: u32,
     packetizer: Box<dyn Packetizer + Send>,
+    /// The RID as an RTP `sdes:rtp-stream-id` header-extension payload,
+    /// precomputed once — the write loop stamps it onto every packet
+    /// (hundreds per keyframe), so building a fresh `Vec` + `Bytes`
+    /// there was steady per-packet allocator churn.
+    rid_ext: Bytes,
 }
 
 pub(crate) struct RtpSendState {
@@ -119,6 +129,10 @@ pub(crate) struct RtpSendState {
     by_rid: HashMap<SimulcastRid, RidRtpState>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
+    /// The mid as an RTP `sdes:mid` header-extension payload,
+    /// precomputed for the same per-packet reason as
+    /// [`RidRtpState::rid_ext`].
+    mid_ext: Bytes,
 }
 
 /// Inbound packet from one of the per-interface forwarder tasks or a
@@ -240,11 +254,13 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
             RidRtpState {
                 ssrc: *ssrc,
                 packetizer: Box::new(packetizer),
+                rid_ext: Bytes::copy_from_slice(rid.as_str().as_bytes()),
             },
         );
     }
+    let mid_ext = Bytes::copy_from_slice(rtp_config.mid.as_bytes());
     let mut state = DriverState {
-        video_specs: HashMap::new(),
+        video_specs: Vec::new(),
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
         pending_tile_control: Vec::new(),
@@ -258,6 +274,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
             by_rid,
             mid_ext_id: None,
             rid_ext_id: None,
+            mid_ext,
         },
     };
 
@@ -1441,33 +1458,45 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     // Phase-4c-prep: the keyframe gate is keyed by `(payload_spec, rid)`,
     // not `payload_spec` alone. See `DriverState::video_specs` for why
     // — VP8 simulcast layers share the same payload_spec but each
-    // RID's keyframe gate must be independent.
-    let spec_key = (frame.payload_spec.clone(), rid.clone());
-    if !state.video_specs.contains_key(&spec_key) {
-        let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
-            SpecState::Ready {
-                keyframe_seen: false,
-            }
-        } else {
-            eprintln!(
-                "[display/webrtc] encoded frame spec {} (rid {}) does not match \
-                 negotiated codec {}; dropping this (spec, rid)",
-                frame.payload_spec.codec_mime,
-                rid.as_str(),
-                state.rtp.codec.mime_type,
-            );
-            SpecState::Unsupported
-        };
-        state.video_specs.insert(spec_key.clone(), new);
-    }
+    // RID's keyframe gate must be independent. Looked up by reference
+    // (linear scan of a ≤handful-entry vector) so the steady state
+    // clones nothing; the owned key is built only when a new
+    // `(spec, rid)` pair first appears.
+    let spec_idx = match state
+        .video_specs
+        .iter()
+        .position(|((spec, spec_rid), _)| *spec == frame.payload_spec && spec_rid == rid)
+    {
+        Some(idx) => idx,
+        None => {
+            let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
+                SpecState::Ready {
+                    keyframe_seen: false,
+                }
+            } else {
+                eprintln!(
+                    "[display/webrtc] encoded frame spec {} (rid {}) does not match \
+                     negotiated codec {}; dropping this (spec, rid)",
+                    frame.payload_spec.codec_mime,
+                    rid.as_str(),
+                    state.rtp.codec.mime_type,
+                );
+                SpecState::Unsupported
+            };
+            state
+                .video_specs
+                .push(((frame.payload_spec.clone(), rid.clone()), new));
+            state.video_specs.len() - 1
+        }
+    };
 
     // Step 2: extract current keyframe readiness from the spec state.
     // Copy out immutably so we can mutate `state.first_frame_at` below
     // without borrow conflicts with `state.video_specs`.
-    let keyframe_ready = match state.video_specs.get(&spec_key) {
-        Some(SpecState::Ready { keyframe_seen }) => *keyframe_seen,
-        // Unsupported or (impossibly) missing — drop silently. The
-        // first arm already emitted a log on entering Unsupported.
+    let keyframe_ready = match state.video_specs[spec_idx].1 {
+        SpecState::Ready { keyframe_seen } => keyframe_seen,
+        // Unsupported — drop silently. The insert arm already emitted
+        // a log on entering Unsupported.
         _ => return,
     };
 
@@ -1516,7 +1545,13 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     // packetizer (its own sequence + RTP-timestamp continuation
     // state) and stamp the per-RID SSRC onto every packet so
     // `RTCRtpSender::write_rtp` routes to the matching encoding.
-    let payload = Bytes::from(frame.data.clone());
+    //
+    // `frame.data` is `Bytes`: the clone is a refcount bump, not a
+    // copy of the encoded payload — the pool broadcasts one
+    // `Arc<EncodedFrame>` to every peer precisely so the fan-out
+    // stays copy-free, and the packetizer slices the `Bytes`
+    // refcounted from here on.
+    let payload = frame.data.clone();
     let packets = match rid_state.packetizer.packetize(&payload, samples) {
         Ok(p) => p,
         Err(e) => {
@@ -1528,24 +1563,23 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
         }
     };
     let rid_ssrc = rid_state.ssrc;
+    let rid_ext = rid_state.rid_ext.clone();
 
     let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
+    // One sender lookup per frame, not per packet — a 1440p keyframe
+    // packetizes into hundreds of packets.
+    let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
+        return;
+    };
     for mut packet in packets {
         packet.header.ssrc = rid_ssrc;
         if let Some(id) = mid_ext_id {
-            let _ = packet
-                .header
-                .set_extension(id, Bytes::from(state.rtp.mid.as_bytes().to_vec()));
+            let _ = packet.header.set_extension(id, state.rtp.mid_ext.clone());
         }
         if let Some(id) = rid_ext_id {
-            let _ = packet
-                .header
-                .set_extension(id, Bytes::from(rid.as_str().as_bytes().to_vec()));
+            let _ = packet.header.set_extension(id, rid_ext.clone());
         }
 
-        let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
-            return;
-        };
         match sender.write_rtp(packet) {
             Ok(()) => {}
             Err(e) => {
@@ -1559,7 +1593,7 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     }
 
     if !keyframe_ready {
-        if let Some(SpecState::Ready { keyframe_seen }) = state.video_specs.get_mut(&spec_key) {
+        if let Some((_, SpecState::Ready { keyframe_seen })) = state.video_specs.get_mut(spec_idx) {
             // Only flip keyframe_seen for this (spec, rid) pair AFTER
             // a successful packet write. If the write is the first
             // keyframe on this (spec, rid), the gate opens for

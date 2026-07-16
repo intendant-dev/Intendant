@@ -276,7 +276,11 @@ pub enum FrameFormat {
 /// sets, not just codec names.
 #[derive(Clone)]
 pub struct EncodedFrame {
-    pub data: Vec<u8>,
+    /// Encoded payload. `Bytes` (not `Vec<u8>`) so the per-peer WebRTC
+    /// drivers can hand the payload to the RTP packetizer with a
+    /// refcount bump instead of copying the whole frame once per peer
+    /// per frame.
+    pub data: bytes::Bytes,
     pub pts_ms: u64,
     pub duration_ms: u64,
     pub is_keyframe: bool,

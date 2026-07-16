@@ -881,7 +881,8 @@ impl EncodedPacket {
     /// Convert to the shared `EncodedFrame` type used by the display session.
     pub fn into_encoded_frame(self) -> EncodedFrame {
         EncodedFrame {
-            data: self.data,
+            // Vec -> Bytes is an ownership move, not a copy.
+            data: self.data.into(),
             pts_ms: self.pts_ms,
             duration_ms: self.duration_ms,
             is_keyframe: self.is_keyframe,
