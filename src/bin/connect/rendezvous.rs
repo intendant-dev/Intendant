@@ -838,7 +838,10 @@ pub(crate) async fn daemon_next(
     require_daemon_session(&state, &headers, &daemon_id).await?;
     check_rate_limit(&state, &headers, "daemon_next", 240, 60_000).await?;
     touch_daemon(&state, &daemon_id).await?;
-    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(30_000));
+    // Cap below main's global REQUEST_TIMEOUT so a parked poll always ends
+    // naturally inside the shutdown drain (NO_CONTENT at any moment is
+    // protocol-normal — the daemon simply re-polls).
+    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(15_000));
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(event) = pop_event(&state, &daemon_id).await {

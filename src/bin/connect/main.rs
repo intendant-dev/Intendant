@@ -180,12 +180,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.listen, config.public_origin, config.rp_id
     );
     eprintln!("[connect] state file {}", config.data_file.display());
-    // Graceful shutdown with a BOUNDED drain: `with_graceful_shutdown` alone
-    // waits for every in-flight request (only the daemon long-poll caps
-    // itself at 30s — one slow POST would hold the drain until the
-    // supervisor SIGKILLs, killing the final flush below). After the signal
-    // plus the grace window, the serve future is dropped, aborting whatever
-    // is still in flight.
+    // Bounded graceful shutdown, in the only order that is actually sound:
+    // every REQUEST is deadline-bounded (the REQUEST_TIMEOUT layer inside
+    // `connect_router`; the daemon long-poll self-caps below it), and the
+    // graceful drain WAITS for those bounded requests — axum spawns each
+    // connection as a detached task, so dropping the serve future would
+    // abandon rather than abort them, and a straggler could mutate the
+    // store after a premature flush. Serve returns once accepting stopped
+    // AND all connections finished; the final flush below therefore runs
+    // provably after every handler mutation.
     let (shutdown_seen_tx, shutdown_seen_rx) = oneshot::channel::<()>();
     let serve = std::future::IntoFuture::into_future(
         axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -199,17 +202,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = async {
             // Only starts counting once the shutdown signal actually fired.
             let _ = shutdown_seen_rx.await;
-            tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await;
+            tokio::time::sleep(SHUTDOWN_FLUSH_DEADLINE).await;
         } => {
+            // Should be unreachable: requests are deadline-bounded, so the
+            // drain is too. If the drain wedges anyway, flushing now (with
+            // stragglers conceivably still running) beats letting the
+            // supervisor SIGKILL us with the dirty window unwritten.
             eprintln!(
-                "[connect] graceful drain exceeded {}s; aborting in-flight requests",
-                SHUTDOWN_DRAIN_GRACE.as_secs()
+                "[connect] drain still running {}s after the shutdown signal; flushing state anyway",
+                SHUTDOWN_FLUSH_DEADLINE.as_secs()
             );
             Ok(())
         }
     };
-    // The final flush runs on EVERY exit path — clean drain, bounded-drain
-    // abort, or a serve error — before the error (if any) propagates.
+    // The final flush runs on EVERY exit path — clean drain, wedged-drain
+    // deadline, or a serve error — before the error (if any) propagates.
     // Without it, every restart would discard the pending debounce window
     // (a daemon that went offline during it would permanently lose its last
     // presence hours).
@@ -218,11 +225,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// How long in-flight requests may drain after the shutdown signal before
-/// they are aborted. Below typical supervisor stop timeouts, so the final
-/// store flush always gets to run; overrunning requests (the 30s-max daemon
-/// long-poll included) are dropped — daemons and browsers retry.
-const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(25);
+/// Deadline for every HTTP request (`connect_router` applies it to the whole
+/// surface). Every handler is fast except the daemon long-poll, which
+/// self-caps at 15s — comfortably inside this bound — so the deadline only
+/// ever fires on a genuinely wedged request. It is also what bounds the
+/// graceful-shutdown drain.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Paranoid backstop for the shutdown drain: requests are bounded by
+/// `REQUEST_TIMEOUT`, so the drain should always finish well inside this.
+/// If it somehow does not, the final flush runs anyway (logged) rather than
+/// letting the supervisor's SIGKILL discard the pending debounce window.
+/// Below typical supervisor stop timeouts.
+const SHUTDOWN_FLUSH_DEADLINE: Duration = Duration::from_secs(40);
 
 /// Resolves on SIGTERM (what systemd/deploy tooling sends) or ctrl-c. A
 /// failed handler registration degrades to the OTHER signal staying live:
@@ -275,7 +290,7 @@ async fn final_store_flush(state: &AppState) {
 /// this same constructor so a new route or fallback cannot bypass the hosted
 /// static/control cutoff without changing the exercised router.
 fn connect_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(landing_ui))
         .route("/connect", get(connect_ui))
         .route("/access", get(access_ui))
@@ -370,7 +385,32 @@ fn connect_router(state: Arc<AppState>) -> Router {
         .route("/api/browser/ice", post(browser_ice))
         .route("/api/browser/close", post(browser_close))
         .fallback(not_found)
-        .with_state(state)
+        .with_state(state);
+    // Global request deadline: no request may outlive REQUEST_TIMEOUT, which
+    // is what makes the graceful-shutdown drain bounded (main). Applied to
+    // the whole surface, fallback included, so tests that exercise this
+    // router exercise the deadline too.
+    with_request_timeout(router, REQUEST_TIMEOUT)
+}
+
+/// Wrap a router so every request is answered within `timeout`, with 408 on
+/// expiry. The handler future is dropped at an await point on timeout; every
+/// store mutation in this binary is awaitpoint-free from first write through
+/// its mark/persist (locks are acquired before, I/O helpers are synchronous),
+/// so cancellation can never publish a half-applied mutation.
+fn with_request_timeout(router: Router, timeout: Duration) -> Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            match tokio::time::timeout(timeout, next.run(request)).await {
+                Ok(response) => response,
+                Err(_) => (
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(json!({ "ok": false, "error": "request timed out" })),
+                )
+                    .into_response(),
+            }
+        },
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1812,6 +1852,123 @@ mod tests {
         assert!(
             !state.store_dirty.take(),
             "flusher consumed the mark it wrote"
+        );
+    }
+
+    /// The request deadline is what bounds the shutdown drain: a handler
+    /// that outlives it is answered 408 (its future dropped at an await
+    /// point), so no request can hold the drain open indefinitely.
+    #[tokio::test]
+    async fn request_timeout_answers_408_for_overrunning_handlers() {
+        let app = with_request_timeout(
+            Router::new().route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    "done"
+                }),
+            ),
+            Duration::from_millis(50),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}/slow"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        server.abort();
+    }
+
+    /// The R3 drain contract, end to end on the production router: axum
+    /// spawns connections as detached tasks, so the shutdown path must WAIT
+    /// for (deadline-bounded) requests rather than drop the serve future —
+    /// otherwise a straggler could mutate the store after the final flush.
+    /// A parked daemon long-poll (which touches presence and marks the
+    /// dirty flag before parking) spans the shutdown signal; serve returns
+    /// only after it completes, the flush runs after serve, and the store
+    /// on disk equals memory at exit.
+    #[tokio::test]
+    async fn shutdown_waits_for_bounded_requests_then_flushes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        {
+            let mut store = state.store.lock().await;
+            store.daemons.push(DaemonRecord {
+                daemon_id: "daemon-drain".to_string(),
+                label: None,
+                daemon_public_key: "key".to_string(),
+                owner_user_id: None,
+                claim_code_hash: None,
+                claim_code_created_unix_ms: None,
+                last_registration_proof_unix_ms: None,
+                route_link_revision: 0,
+                last_unclaim_proof_unix_ms: None,
+                registered_unix_ms: 1,
+                last_seen_unix_ms: 1,
+                updated_unix_ms: 1,
+                presence_hours: Vec::new(),
+            });
+        }
+        state.daemon_sessions.lock().await.insert(
+            "daemon-drain".to_string(),
+            DaemonSessionCredential {
+                token: "drain-token".to_string(),
+                expires_unix_ms: now_unix_ms() + 60_000,
+            },
+        );
+        let app = connect_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn({
+            let state = state.clone();
+            async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .unwrap();
+                // main()'s sequence: the flush runs after serve returned,
+                // i.e. after every connection finished.
+                final_store_flush(&state).await;
+            }
+        });
+        let poll = tokio::spawn(async move {
+            reqwest::Client::new()
+                .get(format!(
+                    "http://{address}/api/daemon/next?daemon_id=daemon-drain&timeout_ms=1500"
+                ))
+                .header(DAEMON_SESSION_HEADER, "drain-token")
+                .send()
+                .await
+        });
+        // Let the poll park (its presence touch + dirty mark already ran),
+        // then signal shutdown mid-park.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = shutdown_tx.send(());
+        let response = poll.await.unwrap().unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "the parked poll completed naturally inside the drain"
+        );
+        server.await.unwrap();
+        let disk = load_store(&state.config.data_file).unwrap();
+        let memory = state.store.lock().await;
+        assert_eq!(
+            serde_json::to_value(&disk).unwrap(),
+            serde_json::to_value(&*memory).unwrap(),
+            "store on disk equals memory at exit"
+        );
+        assert!(
+            disk.daemons[0].last_seen_unix_ms > 1,
+            "the in-flight request's mutation was flushed, not lost"
+        );
+        assert!(
+            !state.store_dirty.take(),
+            "no un-flushed mark survives shutdown"
         );
     }
 

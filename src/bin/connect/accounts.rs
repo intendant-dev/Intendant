@@ -507,12 +507,15 @@ pub(crate) fn header_string(headers: &HeaderMap, name: &'static str) -> Option<S
 /// Canonicalized, bounded source token for rate keys. The first forwarded
 /// hop is parsed as an IP address (accepting an `ip:port` form some proxies
 /// emit) and re-rendered canonically, so the key space is also byte-capped
-/// (≤45 chars). IPv6 sources aggregate by /64 prefix — one household/VM
-/// gets one bucket, and rotating addresses inside a /64 (free for any v6
-/// holder) stops minting fresh buckets; IPv4-mapped IPv6 folds to its IPv4
-/// form so `::ffff:203.0.113.9` and `203.0.113.9` share one budget. A
-/// present-but-unparseable value (zone-qualified link-local like
-/// `fe80::1%eth0` included — a link-local peer behind a proxy is not a
+/// (≤45 chars). IPv6 sources aggregate by /64 prefix: rotating addresses
+/// inside a /64 (free for any v6 holder) stops minting fresh buckets. The
+/// accepted collateral — analogous to IPv4 NAT sharing — is that everything
+/// behind one /64 shares each per-source budget: typically one household or
+/// VM, but a hosting subnet can pack MANY tenants into a single /64, and
+/// they then share e.g. the 30/hour new-identity budget. IPv4-mapped IPv6
+/// folds to its IPv4 form so `::ffff:203.0.113.9` and `203.0.113.9` share
+/// one budget. A present-but-unparseable value (zone-qualified link-local
+/// like `fe80::1%eth0` included — a link-local peer behind a proxy is not a
 /// meaningful source identity) collapses to one bounded "invalid" bucket
 /// instead of becoming an attacker-mintable arbitrary-length key; the
 /// absent-header fallback stays "unknown", unchanged.
@@ -575,15 +578,18 @@ pub(crate) fn client_observed_ip(headers: &HeaderMap) -> Option<String> {
 /// Per-scope key capacity, derived from the scope's window. Short windows
 /// (minutes) serve high-cardinality populations — every polling daemon,
 /// public log readers — and their buckets churn out within minutes, so the
-/// cap is generous. Long windows (≥10 min: the attest / subscribe budgets,
-/// the hourly new-daemon-identity budget) pin a slot for the whole window
-/// and serve small legitimate populations, so the cap is small. Worst-case
-/// total memory = scopes × cap × ~100B — a few MB with today's ~20 scopes.
+/// cap is generous (5k distinct sources per window is far beyond alpha
+/// traffic). Long windows (≥10 min: the attest / subscribe budgets, the
+/// hourly new-daemon-identity budget) pin a slot for the whole window and
+/// serve small legitimate populations, so the cap is small. Worst-case
+/// memory with today's ~27 scopes (21 short, 6 long): 21×5k + 6×2k ≈ 117k
+/// entries ≈ ~12 MB at ~100B/entry — the hard ceiling under full-spectrum
+/// key flooding, not a steady state.
 fn scope_capacity(window_ms: u64) -> usize {
     if window_ms >= 10 * 60_000 {
         2_000
     } else {
-        10_000
+        5_000
     }
 }
 
