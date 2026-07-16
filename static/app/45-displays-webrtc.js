@@ -200,6 +200,13 @@ function bumpDisplayStreamGeneration(displayId) {
   return next;
 }
 
+// Presence-stream HQ archival gap ceiling. Duplicate frames skip the HQ
+// encode + upload (the server already holds identical pixels — a static
+// screen otherwise re-uploads ~100-200 KB every second), but never for
+// longer than this: past it the tick uploads even a duplicate, so the
+// worst-case archival gap stays bounded.
+const HQ_ARCHIVAL_MAX_GAP_MS = 10000;
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -269,6 +276,7 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
+    this._lastHqUploadAt = 0;  // wall-clock of the last HQ archival upload (see HQ_ARCHIVAL_MAX_GAP_MS)
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -1465,6 +1473,8 @@ class DisplaySlot {
     // first ticks).
     const gen = bumpDisplayStreamGeneration(this.displayId);
     this._streamEncodePending = false;
+    // Fresh run: the first tick always uploads an HQ archival frame.
+    this._lastHqUploadAt = 0;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
@@ -1487,16 +1497,14 @@ class DisplaySlot {
       const scale = Math.min(LIVE_RES / sw, LIVE_RES / sh);
       DisplaySlot._sizeCanvas(this._streamCanvas, Math.round(sw * scale), Math.round(sh * scale));
       liveCtx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
-      // HQ: logical resolution — always sent for archival. Drawn in the
-      // same tick as the live lane so both lanes capture the same instant.
+      // HQ: logical resolution — drawn in the same tick as the live lane
+      // so both lanes capture the same instant; encoded + uploaded only
+      // when the archival lane actually sends (see the dup-skip below).
       const dpr = window.devicePixelRatio || 1;
       DisplaySlot._sizeCanvas(this._hqStreamCanvas, Math.round(sw / dpr), Math.round(sh / dpr));
       hqCtx.drawImage(vid, 0, 0, this._hqStreamCanvas.width, this._hqStreamCanvas.height);
       this._streamEncodePending = true;
-      Promise.all([
-        DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
-        DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
-      ]).then(([liveB64, hqB64]) => {
+      DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8).then(liveB64 => {
         // Restarted since capture — by this slot object, or by a new slot
         // re-granted the same display id after this one was removed: these
         // pixels belong to the retired sequence, never emit them.
@@ -1505,7 +1513,7 @@ class DisplaySlot {
         // still deliver it (it is the stream's final frame), but leave the
         // torn-down chrome (frame-id chip) alone.
         const chromeLive = this.streaming;
-        // Skip duplicate frames for voice model — still send HQ to server for archival
+        // Skip duplicate frames for voice model
         const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
         const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
         if (!frameDup) {
@@ -1524,7 +1532,17 @@ class DisplaySlot {
           tickerFramesDropped++;
           sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
         }
-        sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+        // Archival lane: a duplicate frame is pixel-identical to what the
+        // server already holds, so skip its HQ encode + upload while the
+        // last upload is fresh; once HQ_ARCHIVAL_MAX_GAP_MS elapses even a
+        // duplicate goes out (the forced insurance frame). Every upload —
+        // fresh pixels or forced — resets the gap clock.
+        if (frameDup && Date.now() - this._lastHqUploadAt < HQ_ARCHIVAL_MAX_GAP_MS) return;
+        return DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80).then(hqB64 => {
+          if (gen !== displayStreamGeneration(this.displayId)) return;
+          this._lastHqUploadAt = Date.now();
+          sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+        });
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
       }).finally(() => {
