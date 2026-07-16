@@ -21,7 +21,9 @@
 //!   chain, including inactive sibling branch tips (a follow-up phase; the
 //!   catalog reports `supported: false` until the tree parser lands).
 
+mod claude_tree;
 mod fork_points;
+pub(crate) use claude_tree::*;
 pub(crate) use fork_points::*;
 
 use serde::Serialize;
@@ -50,6 +52,15 @@ pub(crate) struct ForkPoint {
     /// Codex only: cut position relative to the item (`before`/`after`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) position: Option<&'static str>,
+    /// Claude Code only: the transcript message uuid the fork keeps
+    /// history through (the chain-slice anchor).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) message_uuid: Option<String>,
+    /// Claude Code only: the anchor sits on history replaced by the
+    /// newest compact boundary. Informational — the chain-slice fork
+    /// omits the boundary and keeps full pre-compaction history.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) pre_compaction: bool,
     pub(crate) preview: String,
     pub(crate) eligible: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
