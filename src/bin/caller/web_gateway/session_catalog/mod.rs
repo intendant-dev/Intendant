@@ -1813,6 +1813,34 @@ pub(crate) fn intendant_session_list_row_from_dir(
             let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
             let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
 
+            // A row describes ONE session, but not every event in a dir's
+            // log is that session's: the daemon session's log carries the
+            // bus tee's copies of every session's lifecycle events
+            // (capabilities, vitals, task_complete, …). Honor an event that
+            // names a session only when it names this dir's session — the
+            // dir id, its meta-canonical id, or the backend id this dir's
+            // own identity events established (post-collapse events are
+            // keyed by the backend id). Events without a session id are the
+            // dir's own runtime lines. Without this, the daemon session's
+            // row absorbed whichever session's capabilities the tee copied
+            // in first and the merge below stamped that config onto another
+            // session's row (the codex-for-claude-code incident,
+            // 2026-07-16).
+            if let Some(event_session_id) = obj
+                .get("data")
+                .and_then(|data| data.get("session_id"))
+                .and_then(|v| v.as_str())
+            {
+                let belongs = crate::session_identity::event_names_session(
+                    Some(event_session_id),
+                    session_id,
+                    canonical_session_id.as_deref(),
+                ) || external_resume_id.as_deref() == Some(event_session_id);
+                if !belongs {
+                    continue;
+                }
+            }
+
             match event {
                 "session_start" => {
                     if created_at.is_none() {
@@ -1825,14 +1853,17 @@ pub(crate) fn intendant_session_list_row_from_dir(
                 "session_identity" => {
                     // Structured identity beats the prose scrape below; later
                     // events supersede earlier ones (placeholder → native-id
-                    // upgrades append). Wrapper matching keeps identities the
-                    // bus tee copied into the daemon-main log from stamping
-                    // the daemon session's row with a child's backend id, and
-                    // the canonical filter keeps placeholder ids in pre-guard
-                    // logs from conjuring ghost windows (see
+                    // upgrades append). Attribution matching keeps identities
+                    // the bus tee copied into the daemon-main log from
+                    // stamping the daemon session's row with a child's
+                    // backend id (`event_names_session` — the addressing
+                    // predicate `wrapper_matches` accepted ANY event once
+                    // meta and dir agreed on the id), and the canonical
+                    // filter keeps placeholder ids in pre-guard logs from
+                    // conjuring ghost windows (see
                     // `scraped_external_thread_id_is_canonical`).
                     if let Some(data) = obj.get("data") {
-                        if crate::session_identity::wrapper_matches(
+                        if crate::session_identity::event_names_session(
                             data.get("session_id").and_then(|v| v.as_str()),
                             session_id,
                             canonical_session_id.as_deref(),
@@ -1948,34 +1979,6 @@ pub(crate) fn intendant_session_list_row_from_dir(
                         .get("data")
                         .and_then(|data| data.get("capabilities"))
                         .cloned();
-                    if session_agent_config.is_none() {
-                        let source = external_source.as_deref().or(Some("codex"));
-                        let command = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_command"))
-                            .and_then(|v| v.as_str());
-                        let mode = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_managed_context"))
-                            .and_then(|v| v.as_str());
-                        let archive = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_context_archive"))
-                            .and_then(|v| v.as_str());
-                        let service_tier = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_service_tier"))
-                            .and_then(|v| v.as_str());
-                        session_agent_config = Some(crate::session_config::from_wire(
-                            source,
-                            command,
-                            None,
-                            None,
-                            mode,
-                            archive,
-                            service_tier,
-                        ));
-                    }
                 }
                 "round_complete" if status != "interrupted" => {
                     status = "idle".to_string();
@@ -1988,6 +1991,27 @@ pub(crate) fn intendant_session_list_row_from_dir(
     if status != "completed" {
         if let Some(ended) = summary_json_status(dir) {
             status = ended.to_string();
+        }
+    }
+
+    // Dirs that predate the per-session config file: recover launch config
+    // from the session's own (last) capabilities announcement — but only
+    // under a source its own identity established. Fabricating a source
+    // here (this used to default to "codex") let the daemon session's row
+    // grow another session's launch config from tee-copied capabilities.
+    if session_agent_config.is_none() {
+        if let (Some(source), Some(caps)) = (external_source.as_deref(), capabilities.as_ref()) {
+            let caps_str =
+                |key: &str| -> Option<&str> { caps.get(key).and_then(|value| value.as_str()) };
+            session_agent_config = Some(crate::session_config::from_wire(
+                Some(source),
+                caps_str("codex_command"),
+                None,
+                None,
+                caps_str("codex_managed_context"),
+                caps_str("codex_context_archive"),
+                caps_str("codex_service_tier"),
+            ));
         }
     }
 
@@ -2777,6 +2801,113 @@ mod tests {
         .unwrap();
         let row = intendant_session_list_row_from_dir(dir.path(), "ghost-1").unwrap();
         assert_eq!(row["status"], "abandoned");
+    }
+
+    /// The daemon session's log carries the bus tee's copies of every
+    /// session's lifecycle events. Its row must not absorb them: no
+    /// backend-id claim, no launch config harvested from another session's
+    /// capabilities, no status flip from another session's task_complete —
+    /// the exact contamination that resumed a claude-code session on the
+    /// codex binary (2026-07-16).
+    #[test]
+    fn daemon_lane_log_events_do_not_contaminate_the_dir_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_id = "aaaa1111-0000-4000-8000-00000000d0d0";
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": daemon_id,
+                "created_at": "2026-07-16T08:33:17",
+                "status": "running",
+                "task": "daemon lane",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let events = [
+            serde_json::json!({"event": "session_start", "ts": "08:33:17.908"}),
+            // Tee'd copies of a codex session's announcements…
+            serde_json::json!({"event": "session_capabilities", "data": {
+                "session_id": "cccc2222-0000-4000-8000-00000000c0de",
+                "capabilities": {"codex_command": "codex", "codex_managed_context": "vanilla"},
+            }}),
+            serde_json::json!({"event": "session_identity", "data": {
+                "session_id": "cccc2222-0000-4000-8000-00000000c0de",
+                "source": "codex",
+                "backend_session_id": "019ea8b9-0000-7000-8000-00000000beef",
+            }}),
+            // …and of that session finishing.
+            serde_json::json!({"event": "task_complete", "data": {
+                "session_id": "cccc2222-0000-4000-8000-00000000c0de",
+            }}),
+        ];
+        std::fs::write(
+            dir.path().join("session.jsonl"),
+            events.map(|event| event.to_string()).join("\n") + "\n",
+        )
+        .unwrap();
+
+        let row = intendant_session_list_row_from_dir(dir.path(), daemon_id).unwrap();
+        assert_eq!(row["backend_session_id"], serde_json::Value::Null);
+        assert_eq!(row["backend_source"], serde_json::Value::Null);
+        assert!(row.get("agent_command").is_none());
+        assert!(row.get("codex_command").is_none());
+        assert!(row.get("configured_source").is_none());
+        assert_eq!(row["capabilities"], serde_json::Value::Null);
+        assert_ne!(row["status"], "completed");
+    }
+
+    /// A wrapper session's own events stay attributed through the identity
+    /// collapse: once its identity event binds the backend id, later events
+    /// keyed by that backend id (capabilities, completion) are its own.
+    #[test]
+    fn wrapper_row_follows_its_own_identity_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper_id = "bbbb3333-0000-4000-8000-00000000aaaa";
+        let backend_id = "019ea8b9-0000-7000-8000-00000000cafe";
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-07-16T07:46:41",
+                "status": "running",
+                "task": "wrapped work",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let events = [
+            serde_json::json!({"event": "session_start", "ts": "07:46:41.671"}),
+            serde_json::json!({"event": "session_identity", "data": {
+                "session_id": wrapper_id,
+                "source": "codex",
+                "backend_session_id": backend_id,
+            }}),
+            // Post-collapse: the session's own events are keyed by the
+            // backend id.
+            serde_json::json!({"event": "session_capabilities", "data": {
+                "session_id": backend_id,
+                "capabilities": {"codex_command": "codex-nightly", "codex_managed_context": "managed"},
+            }}),
+            serde_json::json!({"event": "task_complete", "data": {
+                "session_id": backend_id,
+            }}),
+        ];
+        std::fs::write(
+            dir.path().join("session.jsonl"),
+            events.map(|event| event.to_string()).join("\n") + "\n",
+        )
+        .unwrap();
+
+        let row = intendant_session_list_row_from_dir(dir.path(), wrapper_id).unwrap();
+        assert_eq!(row["backend_session_id"], backend_id);
+        assert_eq!(row["backend_source"], "codex");
+        assert_eq!(row["status"], "completed");
+        assert_eq!(row["capabilities"]["codex_command"], "codex-nightly");
+        // The capabilities fallback recovers launch config under the
+        // session's OWN source (no fabricated default).
+        assert_eq!(row["agent_command"], "codex-nightly");
+        assert_eq!(row["codex_managed_context"], "managed");
     }
 
     #[test]

@@ -118,6 +118,39 @@ impl SessionSupervisor {
             self.loop_error(message);
             return;
         };
+        if let Some(command) = overrides
+            .agent_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            if let Some(owner) = crate::session_config::agent_command_conflicts_with_source(
+                backend.as_short_str(),
+                command,
+            ) {
+                // An explicit save of another backend's CLI is a user-visible
+                // error, not something to silently strip: persisting it would
+                // brick every future resume of this session (the codex-for-
+                // claude-code incident, 2026-07-16).
+                let message = format!(
+                    "Session config failed: agent command '{}' is the {} CLI but this session's agent is {}",
+                    command,
+                    owner,
+                    backend.as_short_str()
+                );
+                self.config.bus.send(AppEvent::SessionAgentConfigResult {
+                    session_id,
+                    source: backend.as_short_str().to_string(),
+                    backend_session_id,
+                    intendant_session_id,
+                    persisted_session_ids: Vec::new(),
+                    success: false,
+                    message: message.clone(),
+                });
+                self.loop_error(message);
+                return;
+            }
+        }
         let is_codex = matches!(backend, external_agent::AgentBackend::Codex);
         let is_claude = matches!(backend, external_agent::AgentBackend::ClaudeCode);
         let clear_codex_sandbox =

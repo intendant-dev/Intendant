@@ -68,24 +68,11 @@ function sessionConfigMetadata(sessionOrId) {
   return managedContextNormalizeSessionMeta(merged, sid || backendId);
 }
 
-function sessionLaunchOverridesForSession(sessionOrId) {
-  const meta = sessionConfigMetadata(sessionOrId);
-  const source = sessionConfigSource(meta);
-  const overrides = {};
-  const command = sessionConfigCommand(meta);
-  if (command) overrides.agent_command = command;
-  if (source === 'codex') {
-    const sandbox = sessionLaunchSandboxMode(meta);
-    const approvalPolicy = sessionLaunchApprovalPolicy(meta);
-    const managedMode = sessionLaunchManagedMode(meta);
-    const archiveMode = sessionLaunchArchiveMode(meta);
-    if (sandbox) overrides.codex_sandbox = sandbox;
-    if (approvalPolicy) overrides.codex_approval_policy = approvalPolicy;
-    if (managedMode) overrides.codex_managed_context = managedMode;
-    if (archiveMode) overrides.codex_context_archive = archiveMode;
-  }
-  return overrides;
-}
+// (There is deliberately no "launch overrides from session metadata"
+// helper anymore: resume messages carry no launch config — the daemon
+// applies each session's persisted config itself. Echoing metadata-derived
+// config back over the wire is how a contaminated row once relaunched a
+// claude-code session on the codex binary.)
 
 function openSessionConfigModal(sessionOrId) {
   const meta = sessionConfigMetadata(sessionOrId);

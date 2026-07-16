@@ -142,6 +142,57 @@ impl SessionAgentConfig {
     }
 }
 
+/// The agent command names ANOTHER known backend's CLI: `Some(<that
+/// backend's short name>)` when `command`'s executable is unmistakably a
+/// different agent's canonical binary than `source`'s (spawning the codex
+/// CLI with claude-code's wire flags can never work — observed live
+/// 2026-07-16, where a contaminated catalog row resumed a claude-code
+/// session with `agent_command: "codex"` and the session died on codex's
+/// argument parser). Custom wrappers and absolute paths pass: only an
+/// executable stem that IS a known backend's binary name conflicts.
+/// Unknown sources are never judged.
+pub fn agent_command_conflicts_with_source(source: &str, command: &str) -> Option<&'static str> {
+    let source_backend = AgentBackend::from_str_loose(source)?;
+    let executable = command.split_whitespace().next()?;
+    let stem = executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable)
+        .trim();
+    let stem = stem
+        .rsplit_once('.')
+        .filter(|(_, ext)| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "exe" | "cmd" | "bat" | "ps1"
+            )
+        })
+        .map(|(name, _)| name)
+        .unwrap_or(stem);
+    let owner = match stem.to_ascii_lowercase().as_str() {
+        "codex" => AgentBackend::Codex,
+        "claude" => AgentBackend::ClaudeCode,
+        _ => return None,
+    };
+    (owner != source_backend).then(|| owner.as_short_str())
+}
+
+/// Drop an agent command that names a different backend's CLI than
+/// `source` (see [`agent_command_conflicts_with_source`]). Every config
+/// funnel (wire parse, dir/overlay read, overlay write) applies this, so a
+/// cross-agent command can neither launch nor persist — and stores that
+/// were already poisoned heal on the next read.
+fn sanitize_agent_command_for_source(
+    source: Option<&str>,
+    command: Option<String>,
+) -> Option<String> {
+    let command = command?;
+    match source {
+        Some(source) if agent_command_conflicts_with_source(source, &command).is_some() => None,
+        _ => Some(command),
+    }
+}
+
 pub fn normalize_agent_command(command: Option<&str>) -> Option<String> {
     command
         .map(str::trim)
@@ -334,10 +385,14 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
         .filter(|value| !value.is_empty());
     let is_codex = source.as_deref() == Some("codex");
     let is_claude = source.as_deref() == Some("claude-code");
+    let agent_command = sanitize_agent_command_for_source(
+        source.as_deref(),
+        normalize_agent_command(fields.agent_command),
+    );
     SessionAgentConfig {
         source,
         project_root: None,
-        agent_command: normalize_agent_command(fields.agent_command),
+        agent_command,
         codex_model: is_codex
             .then(|| normalize_codex_model(fields.codex_model))
             .flatten(),
@@ -536,7 +591,10 @@ fn normalize_session_agent_config(
         config.project_root = normalize_project_root(Some(&root));
     }
     if let Some(command) = config.agent_command.take() {
-        config.agent_command = normalize_agent_command(Some(&command));
+        config.agent_command = sanitize_agent_command_for_source(
+            config.source.as_deref(),
+            normalize_agent_command(Some(&command)),
+        );
     }
     if let Some(model) = config.codex_model.take() {
         config.codex_model = normalize_codex_model(Some(&model));
@@ -746,6 +804,10 @@ pub fn lookup_external_overlay(
         .get(&source)
         .and_then(|by_id| by_id.get(session_id))
         .cloned()
+        // Re-normalize on read: entries written before the cross-agent
+        // command guard existed may carry another backend's binary; they
+        // must not feed a resume while they wait to be rewritten.
+        .map(|config| normalize_session_agent_config(config, Some(&source)))
 }
 
 pub fn load_for_resume(
@@ -1097,6 +1159,159 @@ mod tests {
         assert_eq!(
             order,
             ["recent", "older", "restored-pre-epoch", "configless"]
+        );
+    }
+
+    /// The cross-agent command guard: another backend's canonical binary
+    /// conflicts, everything else (custom wrappers, paths that merely
+    /// contain a backend name, unknown sources) passes.
+    #[test]
+    fn agent_command_conflict_detection() {
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "codex"),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "/usr/local/bin/codex"),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "Codex.exe"),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "codex --dangerously"),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("codex", "claude"),
+            Some("claude-code")
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("codex", r"C:\tools\claude.CMD"),
+            Some("claude-code")
+        );
+        // Own binary, custom wrappers, and paths that merely mention a
+        // backend never conflict.
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "claude"),
+            None
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "/opt/claude-nightly/claude"),
+            None
+        );
+        assert_eq!(agent_command_conflicts_with_source("codex", "codex"), None);
+        assert_eq!(
+            agent_command_conflicts_with_source("claude-code", "my-claude-wrapper"),
+            None
+        );
+        assert_eq!(
+            agent_command_conflicts_with_source("codex", "/home/codex/bin/run-agent"),
+            None
+        );
+        // Unknown sources are never judged.
+        assert_eq!(
+            agent_command_conflicts_with_source("intendant", "codex"),
+            None
+        );
+        assert_eq!(agent_command_conflicts_with_source("", "codex"), None);
+    }
+
+    /// Every config funnel drops a cross-agent command: the wire parse, the
+    /// per-dir file read (already-poisoned stores heal on read), and the
+    /// overlay lookup.
+    #[test]
+    fn cross_agent_command_is_dropped_at_every_funnel() {
+        // Wire parse.
+        let cfg = from_wire(
+            Some("claude-code"),
+            Some("codex"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(cfg.source.as_deref(), Some("claude-code"));
+        assert_eq!(cfg.agent_command, None);
+
+        // Dir read of a poisoned file (the 2026-07-16 incident's shape).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SESSION_AGENT_CONFIG_FILE),
+            serde_json::json!({
+                "source": "claude-code",
+                "agent_command": "codex",
+                "claude_model": "fable",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let read = read_log_dir_config(dir.path()).expect("config still parses");
+        assert_eq!(read.agent_command, None);
+        assert_eq!(read.claude_model.as_deref(), Some("fable"));
+
+        // Overlay lookup of a poisoned entry.
+        let home = tempfile::tempdir().unwrap();
+        let overlay = overlay_path(home.path());
+        std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+        std::fs::write(
+            &overlay,
+            serde_json::json!({
+                "claude-code": {
+                    "0caf4660-7345-4f3b-b8e7-407e59aefa5d": {
+                        "source": "claude-code",
+                        "agent_command": "codex",
+                        "claude_permission_mode": "bypassPermissions",
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let looked_up = lookup_external_overlay(
+            home.path(),
+            "claude-code",
+            "0caf4660-7345-4f3b-b8e7-407e59aefa5d",
+        )
+        .expect("entry resolves");
+        assert_eq!(looked_up.agent_command, None);
+        assert_eq!(
+            looked_up.claude_permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
+
+        // A rewrite through the overlay writer persists the healed shape.
+        write_external_overlay(
+            home.path(),
+            "claude-code",
+            "0caf4660-7345-4f3b-b8e7-407e59aefa5d",
+            &looked_up,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&overlay).unwrap();
+        let disk: Value = serde_json::from_str(&raw).unwrap();
+        assert!(disk["claude-code"]["0caf4660-7345-4f3b-b8e7-407e59aefa5d"]
+            .get("agent_command")
+            .is_none());
+    }
+
+    /// A legitimate custom binary survives every funnel untouched.
+    #[test]
+    fn custom_agent_command_survives_normalization() {
+        let cfg = from_wire(
+            Some("claude-code"),
+            Some("/opt/claude-nightly/claude"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            cfg.agent_command.as_deref(),
+            Some("/opt/claude-nightly/claude")
         );
     }
 
