@@ -550,7 +550,10 @@ pub(crate) struct LaunchOverrides {
     /// absent from `as_wire_fields`, so `ResumeSession` senders cannot
     /// inject them; applied onto the merged config by
     /// `apply_fork_lineage`). `fork_relationship` here overrides the
-    /// wire-vetted kind (`anchor-fork` is minted internally only).
+    /// wire-vetted kind (`anchor-fork` is minted internally only), and
+    /// `forked_from` covers engines whose child resumes its OWN id (the
+    /// claude-code chain-slice: resume token = child uuid ≠ parent).
+    pub(crate) forked_from: Option<String>,
     pub(crate) fork_relationship: Option<String>,
     pub(crate) fork_anchor: Option<String>,
     pub(crate) codex_fork_rollout_path: Option<String>,
@@ -597,6 +600,9 @@ impl LaunchOverrides {
         let Some(config) = config else {
             return;
         };
+        if self.forked_from.is_some() {
+            config.forked_from = self.forked_from.clone();
+        }
         if self.fork_relationship.is_some() {
             config.fork_relationship = self.fork_relationship.clone();
         }

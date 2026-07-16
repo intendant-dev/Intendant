@@ -116,10 +116,23 @@ fn node_preview(value: &serde_json::Value) -> String {
 pub(crate) fn parse_claude_transcript_tree(path: &Path) -> io::Result<ClaudeTranscriptTree> {
     let file = std::fs::File::open(path)?;
     let reader = io::BufReader::new(file);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        lines.push(line?);
+    }
+    Ok(parse_claude_transcript_tree_from_lines(
+        lines.iter().map(String::as_str),
+    ))
+}
+
+/// The in-memory parse the path variant wraps — the surgery engine slices
+/// the SAME lines it parsed, so file-vs-cache skew cannot mis-cut.
+pub(crate) fn parse_claude_transcript_tree_from_lines<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> ClaudeTranscriptTree {
     let mut tree = ClaudeTranscriptTree::default();
 
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
+    for (line_index, line) in lines.enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -174,7 +187,7 @@ pub(crate) fn parse_claude_transcript_tree(path: &Path) -> io::Result<ClaudeTran
             tree.active_leaf = Some(uuid);
         }
     }
-    Ok(tree)
+    tree
 }
 
 /// Shared (possibly cached) tree scan, copying the managed-context

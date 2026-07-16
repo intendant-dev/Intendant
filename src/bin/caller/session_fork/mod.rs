@@ -21,10 +21,12 @@
 //!   chain, including inactive sibling branch tips (a follow-up phase; the
 //!   catalog reports `supported: false` until the tree parser lands).
 
+mod claude_surgery;
 mod claude_tree;
 mod codex_stage;
 mod fork_points;
 mod native;
+pub(crate) use claude_surgery::*;
 pub(crate) use claude_tree::*;
 pub(crate) use codex_stage::*;
 pub(crate) use fork_points::*;
