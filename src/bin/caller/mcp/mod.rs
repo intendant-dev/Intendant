@@ -212,22 +212,41 @@ impl IntendantServer {
             .read()
             .await
             .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
-        let mut tools: Vec<serde_json::Value> = self
-            .tool_router
-            .list_all()
+        // Router tool definitions are static per process, but every call
+        // used to re-serialize and ref-inline all ~50 schemas. Build the
+        // unfiltered set once; per-request work is the name-keyed
+        // profile/managed-context filter plus a clone of the surviving
+        // definitions.
+        let router_definitions: &'static [serde_json::Value] = {
+            static DEFINITIONS: std::sync::OnceLock<Vec<serde_json::Value>> =
+                std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| {
+                self.tool_router
+                    .list_all()
+                    .iter()
+                    .map(|tool| {
+                        let mut schema =
+                            serde_json::to_value(&*tool.input_schema).unwrap_or_default();
+                        inline_schema_refs(&mut schema);
+                        serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": schema,
+                        })
+                    })
+                    .collect()
+            })
+        };
+        let mut tools: Vec<serde_json::Value> = router_definitions
             .iter()
             .filter(|tool| {
-                tool_allowed_for_profile(tool.name.as_ref(), managed_context, tool_profile)
+                tool.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        tool_allowed_for_profile(name, managed_context, tool_profile)
+                    })
             })
-            .map(|tool| {
-                let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
-                inline_schema_refs(&mut schema);
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": schema,
-                })
-            })
+            .cloned()
             .collect();
         append_manual_http_tool_definitions(&mut tools, managed_context, tool_profile);
         serde_json::json!({ "tools": tools })
@@ -1045,7 +1064,10 @@ impl IntendantServer {
         };
         if let Some(loop_dir) = needs_collect {
             let raw = collect_controller_loop_raw_status(&loop_dir);
-            self.state.read().await.store_controller_loop_raw_status(raw);
+            self.state
+                .read()
+                .await
+                .store_controller_loop_raw_status(raw);
         }
         {
             let mut s = self.state.write().await;
@@ -1085,7 +1107,11 @@ impl IntendantServer {
                     target_phase = Some(Phase::Thinking);
                 }
                 if target_phase.as_ref().is_some_and(|phase| {
-                    mcp_state_codex_active_phase_has_stale_controller(&s, &target_session_id, phase)
+                    mcp_state_codex_active_phase_has_stale_controller(
+                        &mut s,
+                        &target_session_id,
+                        phase,
+                    )
                 }) {
                     s.note_session_phase(Some(&target_session_id), None, Phase::Done, None);
                 }
@@ -1502,7 +1528,7 @@ impl IntendantServer {
             phase = Some(Phase::Thinking);
         }
         if phase.as_ref().is_some_and(|phase| {
-            mcp_state_codex_active_phase_has_stale_controller(&s, session_id, phase)
+            mcp_state_codex_active_phase_has_stale_controller(&mut s, session_id, phase)
         }) {
             s.note_session_phase(Some(session_id), None, Phase::Done, None);
             return Some(Phase::Done);
@@ -1937,19 +1963,32 @@ impl ServerHandler for IntendantServer {
 
     async fn subscribe(
         &self,
-        _request: SubscribeRequestParams,
+        request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        // We push notifications for all resources on every relevant event change
-        // (handled in spawn_event_listener). Accept all subscriptions.
+        // Record the subscription: the event listener pushes
+        // `notifications/resources/updated` only for subscribed URIs
+        // (resource notifications are subscription-scoped in MCP; the
+        // historical behavior of broadcasting every change to every client
+        // regardless made each fold-loop event a stdout JSON-RPC write).
+        self.state
+            .write()
+            .await
+            .subscribed_resource_uris
+            .insert(request.uri);
         Ok(())
     }
 
     async fn unsubscribe(
         &self,
-        _request: UnsubscribeRequestParams,
+        request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        self.state
+            .write()
+            .await
+            .subscribed_resource_uris
+            .remove(&request.uri);
         Ok(())
     }
 }

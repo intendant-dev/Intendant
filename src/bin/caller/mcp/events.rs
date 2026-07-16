@@ -126,6 +126,49 @@ pub(crate) fn codex_thread_action_result_targets_session(
 /// [`McpAppState`], exactly as the TUI's `handle_event` does.
 ///
 /// Returns a handle for cleanup.
+/// How long resource-update notifications are coalesced before flushing.
+/// During output bursts every fold-loop event used to produce an immediate
+/// per-event stdout JSON-RPC write (and a conforming client re-reads the
+/// resource per notification); one debounced notification per URI per window
+/// carries the same information.
+const RESOURCE_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Send `notifications/resources/updated` for every dirty URI the client
+/// subscribed to, then clear the dirty set. Unsubscribed URIs are dropped:
+/// resource notifications are subscription-scoped in MCP, so a client that
+/// never subscribes no longer receives (and re-reads on) unsolicited spam.
+async fn flush_resource_notifications(
+    state: &SharedMcpState,
+    peer: &Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
+    dirty: &mut std::collections::HashSet<String>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    let mut subscribed: Vec<String> = {
+        let s = state.read().await;
+        dirty
+            .iter()
+            .filter(|uri| s.subscribed_resource_uris.contains(*uri))
+            .cloned()
+            .collect()
+    };
+    dirty.clear();
+    if subscribed.is_empty() {
+        return;
+    }
+    subscribed.sort();
+    let peer_guard = peer.lock().await;
+    let Some(ref p) = *peer_guard else {
+        return;
+    };
+    for uri in subscribed {
+        let _ = p
+            .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
+            .await;
+    }
+}
+
 pub fn spawn_event_listener(
     state: SharedMcpState,
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
@@ -135,11 +178,31 @@ pub fn spawn_event_listener(
     control_tx: Option<broadcast::Sender<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut dirty_resources: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut flush_deadline: Option<tokio::time::Instant> = None;
         loop {
-            let event = match event_rx.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let event = tokio::select! {
+                event = event_rx.recv() => match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Flush anything still pending before exiting so a
+                        // final state change is not silently dropped.
+                        flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                        break;
+                    }
+                },
+                // NOTE: the async expression is evaluated even when the
+                // precondition is false, so the disabled arm must not
+                // unwrap a missing deadline.
+                _ = tokio::time::sleep_until(
+                    flush_deadline.unwrap_or_else(tokio::time::Instant::now),
+                ), if flush_deadline.is_some() => {
+                    flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                    flush_deadline = None;
+                    continue;
+                }
             };
             let mut resource_changed: Option<&str> = None;
             let mut deferred_control_msg: Option<ControlMsg> = None;
@@ -1048,23 +1111,21 @@ pub fn spawn_event_listener(
                 }
             }
 
+            // Mark changed resources dirty and coalesce the notifications:
+            // both the event's own resource and a control command's are
+            // recorded (the historical single slot dropped the first when a
+            // deferred control command followed in the same iteration).
+            if let Some(uri) = resource_changed {
+                dirty_resources.insert(uri.to_string());
+            }
             if let Some(msg) = deferred_control_msg {
                 if let Some(uri) = handle_control_command_mcp(&state, &bus, &control_tx, msg).await
                 {
-                    resource_changed = Some(uri);
+                    dirty_resources.insert(uri.to_string());
                 }
             }
-
-            // Send resource update notification if something changed
-            if let Some(uri) = resource_changed {
-                let peer_guard = peer.lock().await;
-                if let Some(ref p) = *peer_guard {
-                    let _ = p
-                        .notify_resource_updated(ResourceUpdatedNotificationParam {
-                            uri: uri.to_string(),
-                        })
-                        .await;
-                }
+            if !dirty_resources.is_empty() && flush_deadline.is_none() {
+                flush_deadline = Some(tokio::time::Instant::now() + RESOURCE_NOTIFY_DEBOUNCE);
             }
         }
     })
@@ -1586,11 +1647,7 @@ mod tests {
         rt.block_on(async {
             let home = tempdir().unwrap();
             let session_id = "sess-hydrate-cursor";
-            let log_dir = home
-                .path()
-                .join(".intendant")
-                .join("logs")
-                .join(session_id);
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
             let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
             log.write_meta(None, Some("cursor test task"));
             log.agent_started_with_session_id(
@@ -1609,7 +1666,8 @@ mod tests {
                 session_id
             ));
             assert_eq!(
-                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
                 Some(Phase::RunningAgent)
             );
 
@@ -1624,7 +1682,8 @@ mod tests {
                 session_id
             ));
             assert_eq!(
-                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
                 Some(Phase::WaitingFollowUp)
             );
 
@@ -1658,7 +1717,8 @@ mod tests {
                 session_id
             ));
             assert_eq!(
-                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
                 Some(Phase::Done)
             );
         });

@@ -1185,13 +1185,14 @@ mod tests {
     fn cursor_paginated_get_logs_serves_appended_tail_with_stable_ids() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("session.jsonl");
-        std::fs::write(&log_path, format!("{}\n{}\n", info_line("a"), info_line("b"))).unwrap();
-
-        let first = read_persisted_log_entries_from_dir(
-            dir.path(),
-            &get_logs_params(None, None),
+        std::fs::write(
+            &log_path,
+            format!("{}\n{}\n", info_line("a"), info_line("b")),
         )
         .unwrap();
+
+        let first =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[1].id, 1);
 
@@ -1222,7 +1223,11 @@ mod tests {
     fn replaced_log_file_invalidates_the_read_cursor() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("session.jsonl");
-        std::fs::write(&log_path, format!("{}\n{}\n", info_line("a"), info_line("b"))).unwrap();
+        std::fs::write(
+            &log_path,
+            format!("{}\n{}\n", info_line("a"), info_line("b")),
+        )
+        .unwrap();
 
         // Seed the cursor with a full pass.
         let seeded =
@@ -1280,11 +1285,8 @@ mod tests {
         write!(appended, "\n{}\n", info_line("next")).unwrap();
         drop(appended);
 
-        let tail = read_persisted_log_entries_from_dir(
-            dir.path(),
-            &get_logs_params(Some(0), None),
-        )
-        .unwrap();
+        let tail = read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(Some(0), None))
+            .unwrap();
         assert_eq!(
             tail.iter()
                 .map(|entry| (entry.id, entry.content.clone()))

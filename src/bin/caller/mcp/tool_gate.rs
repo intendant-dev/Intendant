@@ -311,19 +311,44 @@ macro_rules! manual_http_tool_definition {
     }};
 }
 
+/// Every manual HTTP tool definition, unfiltered, built once per process:
+/// each `tools/list` used to re-run `schemars::schema_for!` + ref inlining
+/// and re-allocate the multi-KB description literals for all ~20 manual
+/// tools. Profile/managed-context gating is name-keyed, so filtering the
+/// prebuilt list per request (see [`append_manual_http_tool_definitions`])
+/// yields exactly the historical output.
+fn manual_http_tool_definitions() -> &'static [serde_json::Value] {
+    static DEFINITIONS: std::sync::OnceLock<Vec<serde_json::Value>> = std::sync::OnceLock::new();
+    DEFINITIONS.get_or_init(build_manual_http_tool_definitions)
+}
+
 pub(crate) fn append_manual_http_tool_definitions(
     tools: &mut Vec<serde_json::Value>,
     managed_context: bool,
     tool_profile: Option<&str>,
 ) {
-    let mut push = |name: &'static str, definition: serde_json::Value| {
+    for definition in manual_http_tool_definitions() {
+        let Some(name) = definition.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
         if tool_allowed_for_profile(name, managed_context, tool_profile)
             && !tools
                 .iter()
                 .any(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some(name))
         {
-            tools.push(definition);
+            tools.push(definition.clone());
         }
+    }
+}
+
+fn build_manual_http_tool_definitions() -> Vec<serde_json::Value> {
+    let mut tools = Vec::new();
+    let mut push = |name: &'static str, definition: serde_json::Value| {
+        debug_assert_eq!(
+            definition.get("name").and_then(serde_json::Value::as_str),
+            Some(name)
+        );
+        tools.push(definition);
     };
 
     push(
@@ -566,6 +591,7 @@ pub(crate) fn append_manual_http_tool_definitions(
             PeerExecuteCuActionsParams
         ),
     );
+    tools
 }
 
 #[cfg(test)]

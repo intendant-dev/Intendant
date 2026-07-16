@@ -134,6 +134,11 @@ pub struct McpAppState {
     pub active_session_source: Option<String>,
     /// Map Intendant wrapper session IDs and backend session IDs to their external source.
     pub session_sources: std::collections::HashMap<String, String>,
+    /// Session ids whose persisted log resolved to a non-external session —
+    /// the negative memo for [`mcp_state_session_source_for_id`]'s fallback,
+    /// which otherwise re-reads and identity-scans the whole session log on
+    /// every status poll of a native session.
+    pub(crate) session_known_non_external: std::collections::HashSet<String>,
     /// Successful rewind records awaiting the next backend usage sample, keyed
     /// by Intendant/backend session id.
     pub(crate) pending_rewind_pressure_checks: std::collections::HashMap<String, String>,
@@ -154,6 +159,11 @@ pub struct McpAppState {
     /// `ask_user` auto-answers immediately with best-judgment guidance
     /// instead of blocking on nobody.
     pub interactive_frontends: bool,
+    /// Resource URIs the stdio MCP client subscribed to. The event listener
+    /// only pushes `notifications/resources/updated` for these (MCP resource
+    /// notifications are subscription-scoped); with no subscriptions the
+    /// per-event stdout writes are skipped entirely.
+    pub(crate) subscribed_resource_uris: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +190,12 @@ pub(crate) struct DensityMaintenanceSatisfaction {
     rewind_only_limit: u64,
     round: usize,
 }
+
+/// Soft cap on the per-session bookkeeping maps. Entries for every session
+/// id and alias ever observed used to accumulate for the daemon's lifetime;
+/// once the status map outgrows this, ended sessions are pruned on
+/// [`McpAppState::note_session_ended`] instead of lingering.
+const ENDED_SESSION_PRUNE_THRESHOLD: usize = 1024;
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
 pub struct PendingApprovalState {
@@ -253,10 +269,12 @@ impl McpAppState {
             session_status: std::collections::HashMap::new(),
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
+            session_known_non_external: std::collections::HashSet::new(),
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
             insufficient_rewind_notices: std::collections::HashMap::new(),
             density_maintenance_satisfied: std::collections::HashMap::new(),
             interactive_frontends: false,
+            subscribed_resource_uris: std::collections::HashSet::new(),
         }
     }
 
@@ -573,6 +591,34 @@ impl McpAppState {
         self.remove_pending_rewind_pressure_check_for_key(session_id);
         self.remove_insufficient_rewind_notice_for_key(session_id);
         self.remove_density_maintenance_satisfied_for_key(session_id);
+        if self.session_status.len() > ENDED_SESSION_PRUNE_THRESHOLD {
+            self.prune_ended_session_bookkeeping(session_id);
+        }
+    }
+
+    /// Drop an ended session's per-session bookkeeping (status, usage,
+    /// sources, aliases, managed-context latch). Only invoked once the
+    /// status map outgrows [`ENDED_SESSION_PRUNE_THRESHOLD`]: under the cap
+    /// an ended session stays resident so post-end queries (get_status of a
+    /// finished session, get_logs by backend alias) answer from memory;
+    /// over it, a later query rebuilds the entries from the persisted log
+    /// via hydration — correct, just one full replay slower.
+    fn prune_ended_session_bookkeeping(&mut self, session_id: &str) {
+        let ids = self.session_related_ids(session_id);
+        for id in &ids {
+            self.session_status.remove(id);
+            self.session_usage.remove(id);
+            self.session_sources.remove(id);
+            self.session_codex_managed_context.remove(id);
+            self.session_known_non_external.remove(id);
+            self.session_aliases.remove(id);
+        }
+        // Hydration cursors are keyed by log dir, not session id, and a
+        // pruned session's next hydration must be a full replay (its folded
+        // state is gone). Dropping them all is safe — every cursor
+        // self-heals with one full pass — and this branch is rare by
+        // construction.
+        self.session_log_hydration_cursors.clear();
     }
 
     pub(crate) fn session_id_applies_to_current_session(&self, session_id: Option<&str>) -> bool {
@@ -1663,5 +1709,42 @@ mod tests {
             assert_eq!(snap.id, 42);
             assert_eq!(snap.category, "destructive");
         });
+    }
+
+    #[test]
+    fn ended_sessions_keep_done_status_under_cap_and_prune_over_it() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        // Under the cap: an ended session's status (and aliases) stay
+        // resident so post-end status/log queries answer from memory.
+        s.link_session_aliases("wrapper-under", "backend-under");
+        s.note_session_phase(Some("wrapper-under"), Some(3), Phase::Thinking, None);
+        s.note_session_ended("wrapper-under");
+        assert_eq!(
+            s.session_status_for_id("backend-under")
+                .map(|st| st.phase.clone()),
+            Some(Phase::Done)
+        );
+
+        // Blow past the cap with unrelated sessions, then end one: its
+        // whole related-id component must be pruned from the bookkeeping.
+        for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+            s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+        }
+        s.link_session_aliases("wrapper-over", "backend-over");
+        s.note_session_phase(Some("wrapper-over"), Some(5), Phase::Thinking, None);
+        s.session_sources
+            .insert("wrapper-over".to_string(), "codex".to_string());
+        s.note_session_ended("wrapper-over");
+        assert!(s.session_status_for_id("wrapper-over").is_none());
+        assert!(s.session_status_for_id("backend-over").is_none());
+        assert!(s.session_source_for_id("wrapper-over").is_none());
+        assert!(!s.session_aliases.contains_key("wrapper-over"));
+        assert!(!s.session_aliases.contains_key("backend-over"));
     }
 }

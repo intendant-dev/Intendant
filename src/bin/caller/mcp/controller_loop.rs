@@ -574,21 +574,47 @@ pub(crate) fn controller_loop_status_has_live_owner_or_process(status: &serde_js
             > 0
 }
 
-pub(crate) fn mcp_state_session_source_for_id(s: &McpAppState, session_id: &str) -> Option<String> {
-    s.session_source_for_id(session_id)
-        .map(str::to_string)
-        .or_else(|| {
-            (s.session_id == session_id)
-                .then(|| s.active_session_source.clone())
-                .flatten()
-        })
-        .or_else(|| {
-            match resolve_persisted_start_target(&mcp_state_session_logs_home(s), session_id) {
-                PersistedStartTarget::External(target) => Some(target.source),
-                PersistedStartTarget::ExternalMissingResume { source } => source,
-                PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => None,
-            }
-        })
+pub(crate) fn mcp_state_session_source_for_id(
+    s: &mut McpAppState,
+    session_id: &str,
+) -> Option<String> {
+    if let Some(source) = s.session_source_for_id(session_id).map(str::to_string) {
+        return Some(source);
+    }
+    if s.session_id == session_id {
+        if let Some(source) = s.active_session_source.clone() {
+            return Some(source);
+        }
+    }
+    // The persisted fallback reads and identity-scans the whole session log;
+    // a status poller for a session whose source never lands in
+    // session_sources would otherwise pay that scan on every call. Memoize
+    // both resolvable outcomes — resolved sources into session_sources,
+    // known-non-external ids into a dedicated set. NotFound stays uncached:
+    // the session's log may materialize a moment later.
+    if s.session_known_non_external.contains(session_id) {
+        return None;
+    }
+    match resolve_persisted_start_target(&mcp_state_session_logs_home(s), session_id) {
+        PersistedStartTarget::External(target) => {
+            s.session_sources
+                .insert(session_id.to_string(), target.source.clone());
+            Some(target.source)
+        }
+        PersistedStartTarget::ExternalMissingResume {
+            source: Some(source),
+        } => {
+            s.session_sources
+                .insert(session_id.to_string(), source.clone());
+            Some(source)
+        }
+        PersistedStartTarget::ExternalMissingResume { source: None }
+        | PersistedStartTarget::NotFound => None,
+        PersistedStartTarget::NonExternal => {
+            s.session_known_non_external.insert(session_id.to_string());
+            None
+        }
+    }
 }
 
 pub(crate) fn mcp_state_controller_loop_dir(s: &McpAppState) -> std::path::PathBuf {
@@ -822,7 +848,7 @@ pub(crate) fn mcp_state_controller_loop_has_active_codex_for_session(
 }
 
 pub(crate) fn mcp_state_codex_active_phase_has_stale_controller(
-    s: &McpAppState,
+    s: &mut McpAppState,
     session_id: &str,
     phase: &Phase,
 ) -> bool {
