@@ -97,14 +97,30 @@ impl SessionSupervisor {
         // make the fresh checkout the session's effective project root. A
         // failure (not a git repo, no commits, bad branch name) closes the
         // just-opened session honestly, exactly like the no-project arm.
+        //
+        // The git chain (HEAD probe, collision listing, `git worktree add`
+        // materializing a full checkout — seconds on large projects) runs on
+        // the blocking pool: this function is awaited by the supervisor's
+        // single sequential control-intake loop, and running it inline
+        // queued every session's approvals/steers/interrupts behind the
+        // checkout.
         let worktree_meta = match worktree.as_ref() {
             Some(request) => {
-                match prepare_session_worktree(
-                    &project_root,
-                    request,
-                    session_name.as_deref(),
-                    &session_id,
-                ) {
+                let blocking_root = project_root.clone();
+                let blocking_request = request.clone();
+                let blocking_name = session_name.clone();
+                let blocking_session_id = session_id.clone();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    prepare_session_worktree(
+                        &blocking_root,
+                        &blocking_request,
+                        blocking_name.as_deref(),
+                        &blocking_session_id,
+                    )
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("worktree preparation task failed: {e}")));
+                match prepared {
                     Ok(meta) => Some(meta),
                     Err(e) => {
                         let reason = format!("worktree launch failed: {e}");

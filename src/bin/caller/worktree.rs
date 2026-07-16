@@ -108,9 +108,14 @@ pub fn derive_branch_name(session_name: Option<&str>, session_id: &str) -> Strin
 /// as a local branch nor collides with an existing worktree directory.
 /// After a bounded scan it falls back to a nanos suffix so the launch can
 /// never loop forever on a pathological repo.
+///
+/// One `git for-each-ref` listing answers branch existence for every
+/// candidate — the previous per-candidate `git show-ref` spawned up to 51
+/// processes on a collision streak, inline on the session-launch path.
 pub fn unique_branch_name(project_root: &Path, base: &str) -> String {
+    let existing = branches_with_prefix(project_root, base);
     let taken = |candidate: &str| {
-        branch_exists(project_root, candidate)
+        existing.contains(candidate)
             || project_root
                 .join(".intendant")
                 .join("worktrees")
@@ -133,6 +138,38 @@ pub fn unique_branch_name(project_root: &Path, base: &str) -> String {
     format!("{base}-{nanos}")
 }
 
+/// Local branch names starting with `prefix`, from one `git for-each-ref`.
+/// `prefix` comes from `derive_branch_name`/`validate_branch_name` output,
+/// which admits no glob metacharacters, so `refs/heads/{prefix}*` matches
+/// exactly the name-prefixed refs. Failure (not a repo, no git) yields an
+/// empty set — candidates then read as free, matching `branch_exists`'s
+/// error behavior, and `git worktree add` stays the authority that fails.
+fn branches_with_prefix(project_root: &Path, prefix: &str) -> std::collections::HashSet<String> {
+    let output = Command::new("git")
+        .args([
+            "for-each-ref",
+            // Full refname, stripped below: `:short` would disambiguate
+            // against same-named tags (yielding "heads/x" instead of "x")
+            // and silently miss the collision.
+            "--format=%(refname)",
+            &format!("refs/heads/{prefix}*"),
+        ])
+        .current_dir(project_root)
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("refs/heads/"))
+            .map(str::to_string)
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    }
+}
+
+/// Exact single-branch existence probe. Production collision scans go
+/// through `branches_with_prefix` (one listing for all candidates); this
+/// stays as the precise probe for tests and one-off checks.
+#[allow(dead_code)]
 pub fn branch_exists(project_root: &Path, branch: &str) -> bool {
     Command::new("git")
         .args([
@@ -625,6 +662,22 @@ mod tests {
         assert_eq!(unique_branch_name(repo, "taken"), "taken-2");
         create(repo, "taken-2", "HEAD").unwrap();
         assert_eq!(unique_branch_name(repo, "taken"), "taken-3");
+    }
+
+    /// The one-listing collision probe must read full refnames: with a tag
+    /// named like the branch, `%(refname:short)` would disambiguate the
+    /// branch to `heads/<name>` and the collision would be missed.
+    #[test]
+    fn unique_branch_name_sees_collision_despite_same_named_tag() {
+        let dir = init_test_repo();
+        let repo = dir.path();
+        create(repo, "tagged", "HEAD").unwrap();
+        Command::new("git")
+            .args(["tag", "tagged"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert_eq!(unique_branch_name(repo, "tagged"), "tagged-2");
     }
 
     #[test]

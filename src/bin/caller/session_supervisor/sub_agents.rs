@@ -227,13 +227,17 @@ impl SessionSupervisor {
         });
 
         // Worktree isolation: branch off the parent project's HEAD, same
-        // machinery fission branches use.
+        // machinery fission branches use. `git worktree add` materializes a
+        // full checkout, so it runs on the blocking pool instead of stalling
+        // this async task's worker.
         let worktree_path = if params.worktree {
-            let wt = worktree::create(
-                &parent_project.root,
-                &format!("subagent-{}", short_session(&child_session_id)),
-                "HEAD",
-            )
+            let blocking_root = parent_project.root.clone();
+            let branch = format!("subagent-{}", short_session(&child_session_id));
+            let wt = tokio::task::spawn_blocking(move || {
+                worktree::create(&blocking_root, &branch, "HEAD")
+            })
+            .await
+            .map_err(|e| format!("sub-agent worktree task failed: {e}"))?
             .map_err(|e| format!("sub-agent worktree creation failed: {e}"))?;
             Some(wt.path)
         } else {

@@ -1291,6 +1291,29 @@ pub(crate) async fn apply_fission_spawn_action(
     }
 }
 
+/// Remove a fission branch's worktree after a failed spawn step, on the
+/// blocking pool (checkout deletion + branch delete spawn git). Returns a
+/// `; cleanup …` suffix for the step's error message when the cleanup itself
+/// fails, empty otherwise — the shape the old inline closure produced.
+async fn cleanup_fission_worktree(
+    project_root: &Path,
+    branch_worktree: &Option<worktree::Worktree>,
+) -> String {
+    let Some(wt) = branch_worktree else {
+        return String::new();
+    };
+    let display_path = wt.path.display().to_string();
+    let root = project_root.to_path_buf();
+    let wt = wt.clone();
+    match tokio::task::spawn_blocking(move || worktree::remove_worktree_and_branch(&root, &wt))
+        .await
+    {
+        Ok(Ok(())) => String::new(),
+        Ok(Err(err)) => format!("; cleanup of worktree {display_path} also failed: {err}"),
+        Err(err) => format!("; cleanup task for worktree {display_path} also failed: {err}"),
+    }
+}
+
 /// Launch one fission branch: optional worktree → live-thread fork → charter
 /// injection → durable ledger registration → lifecycle route → frontend
 /// wiring (rename + relationship + resume with the kickoff task). Any failed
@@ -1308,28 +1331,21 @@ pub(crate) async fn spawn_single_fission_branch(
         ctx.project_root_is_git,
         ctx.use_worktree_override,
     );
+    // Worktree create/remove spawn git and materialize/delete full checkouts;
+    // both run on the blocking pool so the fission drain task's worker is
+    // never parked behind them.
     let branch_worktree = if use_worktree {
-        Some(
-            worktree::create(
-                config.project_root,
-                &fission_branch_git_name(ctx.group_id, ordinal),
-                "HEAD",
-            )
-            .map_err(|e| format!("worktree creation failed: {e}"))?,
-        )
+        let blocking_root = config.project_root.to_path_buf();
+        let branch = fission_branch_git_name(ctx.group_id, ordinal);
+        let wt = tokio::task::spawn_blocking(move || {
+            worktree::create(&blocking_root, &branch, "HEAD")
+        })
+        .await
+        .map_err(|e| format!("worktree creation task failed: {e}"))?
+        .map_err(|e| format!("worktree creation failed: {e}"))?;
+        Some(wt)
     } else {
         None
-    };
-    let cleanup_worktree = |wt: &Option<worktree::Worktree>| -> String {
-        if let Some(wt) = wt {
-            if let Err(err) = worktree::remove_worktree_and_branch(config.project_root, wt) {
-                return format!(
-                    "; cleanup of worktree {} also failed: {err}",
-                    wt.path.display()
-                );
-            }
-        }
-        String::new()
     };
 
     let display_name = spec.name.clone().unwrap_or_else(|| {
@@ -1349,7 +1365,7 @@ pub(crate) async fn spawn_single_fission_branch(
     {
         Ok(child) => child,
         Err(e) => {
-            let cleanup = cleanup_worktree(&branch_worktree);
+            let cleanup = cleanup_fission_worktree(config.project_root, &branch_worktree).await;
             return Err(format!("live-thread fork failed: {e}{cleanup}"));
         }
     };
@@ -1365,7 +1381,7 @@ pub(crate) async fn spawn_single_fission_branch(
         .inject_thread_developer_message(&child.thread_id, &charter)
         .await
     {
-        let cleanup = cleanup_worktree(&branch_worktree);
+        let cleanup = cleanup_fission_worktree(config.project_root, &branch_worktree).await;
         return Err(format!(
             "charter injection into forked thread {} failed: {e}{cleanup}",
             child.thread_id
@@ -1390,7 +1406,7 @@ pub(crate) async fn spawn_single_fission_branch(
             ..Default::default()
         },
     ) {
-        let cleanup = cleanup_worktree(&branch_worktree);
+        let cleanup = cleanup_fission_worktree(config.project_root, &branch_worktree).await;
         return Err(format!(
             "fission ledger registration for forked thread {} failed: {err}{cleanup}",
             child.thread_id
