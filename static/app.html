@@ -6163,6 +6163,19 @@ body.context-focus-active {
   right: 0;
   bottom: 0;
   z-index: 60;
+  /* Bound the overlay: it grows upward from bottom:0, and an over-tall
+     panel (many-question AskUserQuestion) crosses .tab-content's
+     overflow:hidden — top clipped, no scrollbar anywhere. Cap it short
+     of the pane so a sliver of log stays visible, and let panel bodies
+     scroll internally (flex column so .panel-body can shrink). */
+  max-height: calc(100% - 48px);
+  display: flex;
+  flex-direction: column;
+}
+#activity-log-pane .bottom-panel .panel-header { flex-shrink: 0; }
+#activity-log-pane .bottom-panel .panel-body {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* Approval — modern card matching the dashboard notification banners */
@@ -6263,6 +6276,33 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--blue) 10%, transparent);
   border-color: color-mix(in srgb, var(--blue) 40%, transparent);
 }
+/* Tall question sets: the card pins title, index, and actions while the
+   question list (.question-scroll) scrolls internally — Submit stays
+   reachable no matter how many questions arrived. min-height:0 at each
+   flex level lets the panel's max-height cap reach the scroll region. */
+#question-panel .panel-body {
+  display: flex;
+  flex-direction: column;
+}
+#question-panel .approval-card {
+  align-items: stretch;
+  min-height: 0;
+}
+#question-panel .approval-content {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#question-panel .approval-content > .approval-title,
+#question-panel .approval-content > .question-index,
+#question-panel .approval-content > .approval-actions {
+  flex-shrink: 0;
+}
+#question-panel .approval-content > .approval-actions { margin-top: 8px; }
+.question-scroll {
+  min-height: 0;
+  overflow-y: auto;
+}
 .question-block { margin-bottom: 10px; }
 .question-block:last-of-type { margin-bottom: 0; }
 .question-header-chip {
@@ -6327,6 +6367,41 @@ body.context-focus-active {
   box-sizing: border-box;
 }
 .question-free-text:focus { border-color: var(--blue); outline: none; }
+/* Pinned question index (2+ questions): one chip per question header,
+   kept above the scroll region; tapping a chip scrolls its question into
+   view, and a tick marks questions that already have an answer. */
+.question-index {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.question-index-chip {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--subtext0);
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.question-index-chip:hover { background: var(--surface1); border-color: var(--overlay0); }
+.question-index-chip.answered {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 45%, transparent);
+}
+.question-index-chip.answered::after { content: " \2713"; }
+/* Plain-language "N of M answered" counter beside Submit/Skip. */
+.question-progress {
+  margin-left: auto;
+  align-self: center;
+  font-size: 11px;
+  color: var(--subtext0);
+}
 
 /* Input / Follow-up */
 .input-question {
@@ -18875,6 +18950,33 @@ html.ui-v2 #question-panel .question-free-text:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
+/* pinned index chips ride the same sky grammar as the header chips;
+   answered flips to the success hue (tick glyph comes from the base rule) */
+html.ui-v2 #question-panel .question-index-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-index-chip:hover {
+  background: rgba(var(--sky-rgb), .16);
+  border-color: rgba(var(--sky-rgb), .38);
+}
+html.ui-v2 #question-panel .question-index-chip.answered {
+  color: var(--green);
+  background: rgba(var(--green-rgb), .1);
+  border-color: rgba(var(--green-rgb), .32);
+}
+html.ui-v2 #question-panel .question-progress {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+}
 
 /* Inline command code rides the design mono, not the UA's generic
    monospace (chrome-audit cross-surface sweep). */
@@ -23787,8 +23889,10 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
           </div>
 
           <!-- Structured User Question Panel (external agents' ask-the-user tool).
-               Body is rendered by showUserQuestion(): one block per question with
-               option buttons, a free-text input, and Submit/Skip actions. -->
+               Body is rendered by showUserQuestion(): a pinned header-chip index
+               (2+ questions), a scrollable list of question blocks (option
+               buttons + a free-text input each), and pinned Submit/Skip actions
+               with an "N of M answered" counter. -->
           <div class="bottom-panel" id="question-panel">
             <div class="panel-body">
               <div class="approval-card">
@@ -28476,7 +28580,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c524e20c8672d41a';
+const INTENDANT_APP_BUILD = 'c7db766d2beeafcd';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -57547,6 +57651,7 @@ function questionOptionClicked(qIndex, optIndex) {
     buttons.forEach((b) => b.classList.remove('selected'));
     btn.classList.add('selected');
   }
+  updateQuestionProgress();
 }
 
 function collectQuestionAnswers() {
@@ -57567,6 +57672,45 @@ function collectQuestionAnswers() {
     answers[q.question] = answer;
   }
   return { answers };
+}
+
+// Scroll a question block to the top of the panel's internal scroll region.
+// Deliberately NOT scrollIntoView: that also adjusts overflow:hidden
+// ancestors (.tab-content), which would drag the whole pane around.
+function scrollQuestionIntoView(qIndex) {
+  const scroller = document.querySelector('#question-content .question-scroll');
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  if (!scroller || !block) return;
+  const top = block.getBoundingClientRect().top
+    - scroller.getBoundingClientRect().top
+    + scroller.scrollTop;
+  scroller.scrollTo({ top: Math.max(0, top - 4), behavior: 'smooth' });
+}
+
+// Answered = a selected option or non-empty free text (same rule as
+// collectQuestionAnswers). Drives the index chips' tick state and the
+// "N of M answered" counter; both exist only for multi-question panels,
+// so single-question panels no-op here.
+function updateQuestionProgress() {
+  if (!pendingQuestion) return;
+  const content = document.getElementById('question-content');
+  const progress = document.getElementById('question-progress');
+  if (!progress && !content.querySelector('.question-index-chip')) return;
+  const total = pendingQuestion.questions.length;
+  let answered = 0;
+  for (let i = 0; i < total; i++) {
+    const block = content.querySelector(`.question-block[data-q="${i}"]`);
+    const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
+    const done = !!(block && (typed || block.querySelector('.question-option.selected')));
+    if (done) answered++;
+    const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
+    if (chip) {
+      chip.classList.toggle('answered', done);
+      const header = pendingQuestion.questions[i]?.header || `Q${i + 1}`;
+      chip.setAttribute('aria-label', done ? `${header} (answered)` : header);
+    }
+  }
+  if (progress) progress.textContent = `${answered} of ${total} answered`;
 }
 
 function showUserQuestion(id, questions, sessionId) {
@@ -57590,10 +57734,38 @@ function showUserQuestion(id, questions, sessionId) {
 
   const content = document.getElementById('question-content');
   content.innerHTML = '';
+  const multi = list.length > 1;
   const title = document.createElement('div');
   title.className = 'approval-title';
-  title.textContent = 'The agent has a question';
+  title.textContent = multi
+    ? `The agent has ${list.length} questions`
+    : 'The agent has a question';
   content.appendChild(title);
+
+  // Pinned index (2+ questions): one chip per header, kept above the
+  // scroll region; tapping a chip jumps to its question, and
+  // updateQuestionProgress ticks chips as answers land.
+  if (multi) {
+    const index = document.createElement('div');
+    index.className = 'question-index';
+    list.forEach((q, qIndex) => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'question-index-chip';
+      chip.dataset.q = String(qIndex);
+      chip.textContent = q.header || `Q${qIndex + 1}`;
+      chip.title = q.question;
+      chip.addEventListener('click', () => scrollQuestionIntoView(qIndex));
+      index.appendChild(chip);
+    });
+    content.appendChild(index);
+  }
+
+  // The question list is the only scrolling region: the panel caps at the
+  // pane height (CSS max-height) and title/index/actions stay pinned, so
+  // Submit remains reachable however many questions arrived.
+  const scroll = document.createElement('div');
+  scroll.className = 'question-scroll';
 
   list.forEach((q, qIndex) => {
     const block = document.createElement('div');
@@ -57642,9 +57814,11 @@ function showUserQuestion(id, questions, sessionId) {
     free.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
     });
+    free.addEventListener('input', () => updateQuestionProgress());
     block.appendChild(free);
-    content.appendChild(block);
+    scroll.appendChild(block);
   });
+  content.appendChild(scroll);
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
@@ -57658,7 +57832,14 @@ function showUserQuestion(id, questions, sessionId) {
   skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
   skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
   actions.appendChild(skip);
+  if (multi) {
+    const progress = document.createElement('span');
+    progress.className = 'question-progress';
+    progress.id = 'question-progress';
+    actions.appendChild(progress);
+  }
   content.appendChild(actions);
+  updateQuestionProgress();
 
   // Station surfaces the question through the existing human-question rail.
   const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';
