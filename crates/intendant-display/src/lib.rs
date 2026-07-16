@@ -713,7 +713,11 @@ pub struct DisplayMetricsCounters {
     pub tile_dirty_tiles: AtomicU64,
     /// Sum of dirty fractions in parts-per-million for averaging.
     pub tile_dirty_fraction_ppm_sum: AtomicU64,
-    /// Dirty tile updates skipped by the source cadence cap.
+    /// Capture ticks the delta cadence gate deferred while known
+    /// (OS-reported or in-frame) damage was pending. On platforms
+    /// using the frame-diff fallback the diff itself runs at the
+    /// delta cadence, so deferred ticks there carry no known damage
+    /// and are not counted.
     pub tile_delta_cadence_skips: AtomicU64,
     /// Tile records packed into delta frames.
     pub tile_delta_records: AtomicU64,
@@ -1184,8 +1188,20 @@ pub struct DisplaySession {
 /// time, so heartbeat re-sends of a static desktop still carry a fresh marker
 /// timestamp and downscaled layers get a marker in their final output
 /// resolution.
-fn convert_for_pool_feed(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
-    let i420 = encode::bgra_to_i420(bgra, width, height, stride);
+///
+/// `reuse` is a retired I420 buffer to convert into (pass an empty
+/// `Vec` when none is available) — the bridge recycles buffers whose
+/// broadcast refcount has drained so the steady state performs no
+/// multi-MB allocation per frame.
+fn convert_for_pool_feed(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    reuse: Vec<u8>,
+) -> Vec<u8> {
+    let mut i420 = reuse;
+    encode::bgra_to_i420_into(bgra, width, height, stride, &mut i420);
 
     // Windows black-frame diagnostic (hop A of the capture → encoder chain):
     // log the average byte of the BGRA going INTO bgra_to_i420 and the I420
@@ -2764,8 +2780,11 @@ impl DisplaySession {
 
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
-            let mut frame_diff =
-                capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX);
+            // `Option` so the tracker can round-trip through the
+            // spawn_blocking diff below (moved in, moved back out).
+            let mut frame_diff: Option<capture::frame_diff::FrameDiffDamageTracker> = Some(
+                capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX),
+            );
             let mut grid: Option<tile::grid::TileGrid> = None;
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new()
                 .with_marker((0, 0), visual_marker::MARKER_W as u32);
@@ -2773,7 +2792,12 @@ impl DisplaySession {
             let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
             let mut tile_mode = tile::policy::TileMode::Tiles;
             let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
-            let mut last_delta_sent_at: Option<Instant> = None;
+            let mut last_delta_tick_at: Option<Instant> = None;
+            // Damage collected from the cheap per-frame sources
+            // (in-frame dirty rects, OS damage events) on ticks the
+            // delta cadence gate skipped; flushed into the next
+            // allowed tick so no damage is ever dropped by the gate.
+            let mut pending_rects: Vec<capture::damage::Rect> = Vec::new();
             let mut seq: u32 = 1;
 
             loop {
@@ -2796,7 +2820,8 @@ impl DisplaySession {
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
+                            pending_rects.clear();
                             continue;
                         }
 
@@ -2810,7 +2835,8 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
+                            pending_rects.clear();
                             synthetic_dirty.reset_cursor();
                             last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
@@ -2852,41 +2878,109 @@ impl DisplaySession {
                             continue;
                         }
 
-                        let cursor_pos = damage.cursor_position();
-                        let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
-                        if cursor_changed {
-                            last_cursor = cursor_pos;
-                        }
-
-                        let mut rects = if let Some(rects) = frame.dirty_rects.clone() {
-                            rects
-                        } else {
-                            match damage.capability() {
-                                capture::damage::DamageCapability::OsLevel => {
-                                    match damage.poll_damage() {
-                                        Ok(rects) => rects,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[display/tile] display {display_id} damage poll failed: {e}"
-                                            );
-                                            Vec::new()
-                                        }
-                                    }
-                                }
+                        // Collect the cheap damage sources on every
+                        // captured frame so nothing is lost across
+                        // delta-cadence skips: in-frame dirty rects are
+                        // per-frame data, and polling the OS damage
+                        // backend clears its server-side accumulation.
+                        // Skipped ticks accumulate into `pending_rects`;
+                        // the next allowed tick flushes the union.
+                        // (Before this accumulator the cadence gate sat
+                        // *after* the damage poll and discarded its
+                        // rects on skipped ticks — a change landing on
+                        // a skipped frame stayed stale until the 30s
+                        // snapshot.)
+                        let uses_frame_diff = frame.dirty_rects.is_none()
+                            && matches!(
+                                damage.capability(),
                                 capture::damage::DamageCapability::FrameDiff
-                                | capture::damage::DamageCapability::None => {
-                                    match frame_diff.diff_frame(&frame) {
-                                        Ok(rects) => rects,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[display/tile] display {display_id} frame-diff failed: {e}"
-                                            );
-                                            Vec::new()
-                                        }
-                                    }
+                                    | capture::damage::DamageCapability::None
+                            );
+                        if let Some(rects) = frame.dirty_rects.clone() {
+                            pending_rects.extend(rects);
+                        } else if !uses_frame_diff {
+                            match damage.poll_damage() {
+                                Ok(rects) => pending_rects.extend(rects),
+                                Err(e) => {
+                                    eprintln!(
+                                        "[display/tile] display {display_id} damage poll failed: {e}"
+                                    );
                                 }
                             }
-                        };
+                        }
+
+                        // Delta cadence gate — ahead of the frame-diff
+                        // fallback and the per-tick policy work, so both
+                        // run at the delta cadence (≤15fps), not at
+                        // capture rate. The clock advances on every
+                        // allowed tick (idle ones included): the gate
+                        // bounds the whole diff+encode pipeline, and
+                        // deltas can only be emitted on allowed ticks,
+                        // so the wire cadence cap is unchanged.
+                        let now = Instant::now();
+                        if !should_emit_tile_delta(
+                            now,
+                            last_delta_tick_at,
+                            tile_delta_min_interval(),
+                        ) {
+                            if tile_mode == tile::policy::TileMode::Tiles
+                                && !pending_rects.is_empty()
+                            {
+                                counters.record_tile_delta_cadence_skip();
+                            }
+                            continue;
+                        }
+                        last_delta_tick_at = Some(now);
+
+                        let mut rects = std::mem::take(&mut pending_rects);
+
+                        // Frame-diff fallback (macOS/Windows/Wayland —
+                        // the platforms without an OS damage source):
+                        // hash every tile of the frame and diff against
+                        // the previous baseline. This walks the whole
+                        // frame, so it runs on the blocking pool, never
+                        // inline on the runtime, and only on allowed
+                        // ticks. Skipping frames is safe: the baseline
+                        // only advances when a diff runs, so a change
+                        // landing on a skipped frame is caught by the
+                        // next diff.
+                        if uses_frame_diff {
+                            let tracker = frame_diff.take().unwrap_or_else(|| {
+                                capture::frame_diff::FrameDiffDamageTracker::new(
+                                    TILE_STREAM_TILE_SIZE_PX,
+                                )
+                            });
+                            let diff_result = tokio::task::spawn_blocking({
+                                let frame = Arc::clone(&frame);
+                                move || {
+                                    let mut tracker = tracker;
+                                    let rects = tracker.diff_frame(&frame);
+                                    (tracker, rects)
+                                }
+                            })
+                            .await;
+                            match diff_result {
+                                Ok((tracker, Ok(diff_rects))) => {
+                                    frame_diff = Some(tracker);
+                                    rects.extend(diff_rects);
+                                }
+                                Ok((tracker, Err(e))) => {
+                                    frame_diff = Some(tracker);
+                                    eprintln!(
+                                        "[display/tile] display {display_id} frame-diff failed: {e}"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Tracker lost with the cancelled/
+                                    // panicked task; the replacement
+                                    // re-baselines (all tiles dirty) on
+                                    // the next allowed tick.
+                                    eprintln!(
+                                        "[display/tile] display {display_id} frame-diff task failed: {e}"
+                                    );
+                                }
+                            }
+                        }
 
                         let policy_dirty = next_grid.dirty_tiles(&rects);
                         let dirty_fraction = next_grid.dirty_fraction(policy_dirty.len());
@@ -2895,7 +2989,7 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             tile_mode = next_mode;
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             match tile_mode {
                                 tile::policy::TileMode::Video => {
@@ -2946,6 +3040,18 @@ impl DisplaySession {
                             continue;
                         }
 
+                        // Cursor: sampled at the delta cadence, not at
+                        // capture rate — on X11 this is a synchronous
+                        // QueryPointer round-trip per sample, and both
+                        // consumers (the CursorState control frame and
+                        // the synthetic dirty boxes) only act on
+                        // allowed ticks anyway.
+                        let cursor_pos = damage.cursor_position();
+                        let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
+                        if cursor_changed {
+                            last_cursor = cursor_pos;
+                        }
+
                         synthetic_dirty.set_marker_enabled(visual_marker_value.is_some());
                         rects.extend(
                             synthetic_dirty.collect(cursor_pos, visual_marker_value.is_some()),
@@ -2992,17 +3098,6 @@ impl DisplaySession {
                             dirty.len(),
                             next_grid.dirty_fraction(dirty.len()),
                         );
-
-                        let now = Instant::now();
-                        if !should_emit_tile_delta(
-                            now,
-                            last_delta_sent_at,
-                            tile_delta_min_interval(),
-                        ) {
-                            counters.record_tile_delta_cadence_skip();
-                            continue;
-                        }
-                        last_delta_sent_at = Some(now);
 
                         let epoch = tile_epoch.load(Ordering::Relaxed);
                         let encode_result = tokio::task::spawn_blocking({
@@ -3217,6 +3312,15 @@ impl DisplaySession {
             let mut generation: u64 = 0;
             let mut last_sent_gen: Option<u64> = None;
             let mut last_send_at = Instant::now();
+            // Retired `latest_i420` buffers awaiting their broadcast
+            // refcount to drain. The pool's I420 broadcast ring holds
+            // the last I420_BROADCAST_CAPACITY (4) sent frames, so an
+            // entry becomes reclaimable (`Arc::try_unwrap`) once ~4
+            // newer frames have shipped; one extra slot of headroom
+            // keeps the steady state allocation-free.
+            const I420_RECYCLE_DEPTH: usize = 5;
+            let mut i420_recycle: std::collections::VecDeque<Arc<Vec<u8>>> =
+                std::collections::VecDeque::with_capacity(I420_RECYCLE_DEPTH + 1);
             // 3c.3b.4b: peer-join burst window. `None` outside a
             // burst; `Some(deadline)` while clocking the encoder
             // through to a natural keyframe regardless of dirty
@@ -3345,6 +3449,11 @@ impl DisplaySession {
                             // to be replaced by this frame anyway.)
                             latest_i420 = None;
                             last_sent_gen = None;
+                            // Old-dimension buffers would be resized on
+                            // reuse anyway; drop them rather than hold
+                            // multi-MB stale allocations across what may
+                            // be a downsize.
+                            i420_recycle.clear();
                         }
 
                         // F2 idle gate: do NOT convert here. Stash the
@@ -3392,12 +3501,30 @@ impl DisplaySession {
                         if let Some((frame, arrived)) = pending_bgra.take() {
                             let frame_w = frame.width & !1;
                             let frame_h = frame.height & !1;
+                            // Reclaim the oldest retired buffer whose
+                            // broadcast refcount has drained; fall back
+                            // to a fresh allocation when every retiree
+                            // is still referenced.
+                            let mut reuse = Vec::new();
+                            for _ in 0..i420_recycle.len() {
+                                let candidate = i420_recycle
+                                    .pop_front()
+                                    .expect("iteration bounded by queue length");
+                                match Arc::try_unwrap(candidate) {
+                                    Ok(buf) => {
+                                        reuse = buf;
+                                        break;
+                                    }
+                                    Err(still_shared) => i420_recycle.push_back(still_shared),
+                                }
+                            }
                             let i420_result = tokio::task::spawn_blocking(
                                 move || convert_for_pool_feed(
                                     &frame.data,
                                     frame_w,
                                     frame_h,
                                     frame.stride,
+                                    reuse,
                                 )
                             )
                             .await;
@@ -3406,7 +3533,14 @@ impl DisplaySession {
                                     .pool_feed_conversions
                                     .fetch_add(1, Ordering::Relaxed);
                                 generation = generation.wrapping_add(1);
-                                latest_i420 = Some((Arc::new(i420), arrived));
+                                if let Some((old, _)) =
+                                    latest_i420.replace((Arc::new(i420), arrived))
+                                {
+                                    i420_recycle.push_back(old);
+                                    while i420_recycle.len() > I420_RECYCLE_DEPTH {
+                                        i420_recycle.pop_front();
+                                    }
+                                }
                             }
                         }
 
