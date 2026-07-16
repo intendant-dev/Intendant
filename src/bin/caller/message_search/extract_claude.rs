@@ -17,7 +17,7 @@
 //! cursor check means a full re-extract, never a generation bump — record
 //! identity is the duplicate-free record `uuid`.
 
-use super::cursor::{for_each_complete_line_from, SourceCursor};
+use super::cursor::{for_each_complete_line_from, CursorCheck, SourceCursor};
 use super::record::{cap_text, Locator, MessageRecord, Role, Source};
 use super::store::SessionShard;
 use crate::external_agent::transcript_text::{is_injected_external_user_text, message_prose_text};
@@ -128,11 +128,12 @@ fn walk_transcript(
 ///
 /// Returns `Ok(None)` when the prior shard does not have the expected
 /// main-then-agents partition (never produced by this extractor, but a
-/// foreign store must fall back to the full parse, never mis-splice).
+/// foreign store must fall back to the full parse, never mis-splice), or
+/// when the post-fold revalidation shows the source moved under us.
 pub(crate) fn fold_claude_main_append(
     session_id: &str,
     main_path: &Path,
-    resume_offset: u64,
+    saved: &SourceCursor,
     prior: &SessionShard,
 ) -> std::io::Result<Option<(SessionShard, SourceCursor)>> {
     if !is_strict_jsonl(main_path) {
@@ -159,14 +160,31 @@ pub(crate) fn fold_claude_main_append(
         return Ok(None);
     }
     let mut suffix_records = Vec::new();
-    let consumed = for_each_complete_line_from(main_path, resume_offset, |line| {
-        if let Some(record) = record_from_line(line, session_id, false) {
-            suffix_records.push(record);
-        }
-    })?;
+    let consumed =
+        for_each_complete_line_from(main_path, saved.last_complete_line_offset, |line| {
+            if let Some(record) = record_from_line(line, session_id, false) {
+                suffix_records.push(record);
+            }
+        })?;
     let Some(cursor) = SourceCursor::capture(main_path, consumed) else {
         return Ok(None);
     };
+    // TOCTOU guard: the caller validated the SAVED cursor's windows, then
+    // we read the suffix — a rewrite landing in between would splice new
+    // bytes onto stale prior records, and the freshly captured cursor
+    // above (hashed from the rewritten file) would legitimize the corrupt
+    // shard permanently. Re-running the saved cursor's own check AFTER
+    // the read costs two ≤4 KiB window reads and closes the laundering:
+    // anything but a still-plain append discards the fold. (A rewrite
+    // racing the capture itself leaves a cursor that mismatches the file,
+    // so the next sweep full-rebuilds — either way, no corrupt steady
+    // state.)
+    if !matches!(
+        saved.check(),
+        CursorCheck::Appended | CursorCheck::Unchanged
+    ) {
+        return Ok(None);
+    }
     let mut records = Vec::with_capacity(prior.records.len().saturating_add(suffix_records.len()));
     records.extend_from_slice(&prior.records[..main_block_end]);
     records.append(&mut suffix_records);
@@ -802,6 +820,57 @@ mod tests {
         assert!(read.marks.is_empty());
     }
 
+    /// The post-fold TOCTOU guard: a fold attempted with a saved cursor
+    /// whose windows no longer describe the file (the "rewrite landed
+    /// after the caller validated" interleaving, pinned here by simply
+    /// rewriting before the call) must be discarded — `Ok(None)` — never
+    /// spliced and legitimized.
+    #[test]
+    fn fold_discards_when_the_saved_cursor_no_longer_matches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join(format!("{SESSION}.jsonl"));
+        write_transcript(
+            &main,
+            &[message_line(
+                "user",
+                "u-1",
+                "2026-07-15T12:00:00.000Z",
+                serde_json::json!("original history"),
+                &[],
+            )],
+        );
+        let (prior, cursors) = extract_claude_session(SESSION, &main, &[]).unwrap();
+        let saved = cursors[0].clone();
+
+        // The file is rewritten (head mutated, grown) after validation
+        // "happened": the fold must refuse to splice.
+        write_transcript(
+            &main,
+            &[
+                message_line(
+                    "user",
+                    "u-9",
+                    "2026-07-15T12:05:00.000Z",
+                    serde_json::json!("replaced history"),
+                    &[],
+                ),
+                message_line(
+                    "user",
+                    "u-10",
+                    "2026-07-15T12:06:00.000Z",
+                    serde_json::json!("second replaced"),
+                    &[],
+                ),
+            ],
+        );
+        assert!(
+            fold_claude_main_append(SESSION, &main, &saved, &prior)
+                .unwrap()
+                .is_none(),
+            "a fold against a moved source must be discarded"
+        );
+    }
+
     /// The incremental fold's soundness invariant: for a main-only append
     /// with an unchanged subagent set, the folded shard and cursor are
     /// exactly what a full re-extraction would produce.
@@ -882,14 +951,9 @@ mod tests {
         drop(file);
         assert_eq!(main_cursor.check(), CursorCheck::Appended);
 
-        let (folded, folded_cursor) = fold_claude_main_append(
-            SESSION,
-            &main,
-            main_cursor.last_complete_line_offset,
-            &prior,
-        )
-        .unwrap()
-        .expect("main-only append is foldable");
+        let (folded, folded_cursor) = fold_claude_main_append(SESSION, &main, &main_cursor, &prior)
+            .unwrap()
+            .expect("main-only append is foldable");
         let (full, full_cursors) = extract_claude_session(SESSION, &main, &agents).unwrap();
         assert_eq!(folded.records, full.records);
         assert_eq!(folded.marks, full.marks);

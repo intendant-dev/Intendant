@@ -276,17 +276,33 @@ impl Store {
                     .cursors
                     .iter()
                     .all(|old| cursors.iter().any(|new| new.path == old.path));
-            let same_source_state = same_paths
-                && existing.cursors.iter().all(|old| {
-                    cursors
-                        .iter()
-                        .find(|new| new.path == old.path)
-                        .is_none_or(|new| {
-                            new.prefix_hash16 == old.prefix_hash16 && new.identity == old.identity
-                        })
+            // Same cursor set with a LOWER watermark: either a stale
+            // writer (lost race — an older snapshot of the same growing
+            // byte stream) or a legitimate rebuild after the source
+            // itself changed under the stored cursors. Snapshot-to-
+            // snapshot field comparison cannot tell those apart — two
+            // honest snapshots of a growing file differ in len and in
+            // tail-hash-at-offset, while a prefix-preserving in-place
+            // TRUNCATION kept head hash + identity equal and was
+            // rejected as stale forever (every sweep re-derived and
+            // re-rejected it). Ask the STORED cursors about the live
+            // files instead: while every one still describes its file
+            // (Unchanged/Appended), the incoming lower watermark is a
+            // stale view — once any reads Rewritten/Gone, the source
+            // genuinely changed and the rebuild is the fresher truth.
+            // (Two ≤4 KiB window reads per stored cursor, only on the
+            // rare lower-watermark path, under the writer lock.)
+            if watermark < existing.source_watermark && same_paths {
+                let stored_still_current = existing.cursors.iter().all(|old| {
+                    matches!(
+                        old.check(),
+                        super::cursor::CursorCheck::Unchanged
+                            | super::cursor::CursorCheck::Appended
+                    )
                 });
-            if watermark < existing.source_watermark && same_source_state {
-                return Ok(PublishOutcome::RejectedStale);
+                if stored_still_current {
+                    return Ok(PublishOutcome::RejectedStale);
+                }
             }
         }
 
@@ -487,6 +503,75 @@ mod tests {
             std::fs::write(&path, "line\n".repeat(64)).unwrap();
         }
         SourceCursor::capture(&path, offset).unwrap()
+    }
+
+    /// A prefix-preserving in-place TRUNCATION legitimately lowers the
+    /// watermark: the rebuild must be ACCEPTED (the tail window / len
+    /// prove the source changed), not rejected as a stale writer forever.
+    #[test]
+    fn truncated_source_rebuild_with_lower_watermark_is_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let path = tmp.path().join("truncating.jsonl");
+        // Head fills the 4 KiB prefix window so truncation preserves it.
+        let head = format!("{}\n", "h".repeat(4096));
+        std::fs::write(&path, format!("{head}tail-one\ntail-two\n")).unwrap();
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        let full_cursor = SourceCursor::capture(&path, full_len).unwrap();
+        let shard = SessionShard {
+            records: vec![record(100, "before truncation")],
+            marks: vec![],
+        };
+        assert!(matches!(
+            store
+                .publish_session("intendant:trunc", &shard, vec![full_cursor], false)
+                .unwrap(),
+            PublishOutcome::Published
+        ));
+
+        // In-place truncation, first 4 KiB intact, same inode.
+        let truncated = format!("{head}tail-one\n");
+        std::fs::write(&path, &truncated).unwrap();
+        let short_len = std::fs::metadata(&path).unwrap().len();
+        assert!(short_len < full_len);
+        let short_cursor = SourceCursor::capture(&path, short_len).unwrap();
+        let rebuilt = SessionShard {
+            records: vec![record(101, "after truncation")],
+            marks: vec![],
+        };
+        assert!(
+            matches!(
+                store
+                    .publish_session(
+                        "intendant:trunc",
+                        &rebuilt,
+                        vec![short_cursor.clone()],
+                        false
+                    )
+                    .unwrap(),
+                PublishOutcome::Published
+            ),
+            "a genuinely changed source must accept the lower-watermark rebuild"
+        );
+        // Steady state afterwards: the stored cursor matches the disk, so
+        // the next sweep reads Unchanged — no rebuild loop.
+        assert_eq!(
+            short_cursor.check(),
+            super::super::cursor::CursorCheck::Unchanged
+        );
+        // And a REAL stale writer (same source state, lower watermark)
+        // is still rejected.
+        let stale = SessionShard {
+            records: vec![record(99, "stale race loser")],
+            marks: vec![],
+        };
+        let stale_cursor = SourceCursor::capture(&path, short_len - 9).unwrap();
+        assert!(matches!(
+            store
+                .publish_session("intendant:trunc", &stale, vec![stale_cursor], false)
+                .unwrap(),
+            PublishOutcome::RejectedStale
+        ));
     }
 
     #[test]

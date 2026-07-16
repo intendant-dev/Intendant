@@ -550,7 +550,7 @@ impl Indexer {
                         match super::extract_claude::fold_claude_main_append(
                             &session_id,
                             &main_path,
-                            main_cursor.last_complete_line_offset,
+                            main_cursor,
                             &prior,
                         ) {
                             Ok(Some((shard, new_main_cursor))) => {

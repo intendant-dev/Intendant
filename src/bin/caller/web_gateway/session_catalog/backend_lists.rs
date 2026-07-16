@@ -840,12 +840,42 @@ pub(crate) fn claude_session_list_row_from_file(path: &Path) -> Option<serde_jso
         Some(saved) if saved.resumable_for(path, current_len) => saved,
         _ => ClaudeRowAccumulator::default(),
     };
-    let consumed = crate::message_search::cursor::for_each_complete_line_from(
+    // TOCTOU guard facts: what `resumable_for` just validated. Re-checked
+    // AFTER the fold below — a rewrite landing between the validation and
+    // the suffix read would merge new bytes onto stale fold state, and
+    // re-hashing the rewritten file afterwards would legitimize the
+    // corrupt checkpoint permanently.
+    let resume_guard = (acc.consumed_len > 0).then(|| {
+        (
+            acc.prefix_hash_bytes,
+            acc.prefix_hash16.clone(),
+            acc.consumed_tail_hash16.clone(),
+            acc.consumed_len,
+        )
+    });
+    let mut consumed = crate::message_search::cursor::for_each_complete_line_from(
         path,
         acc.consumed_len,
         |line| acc.fold_line(line),
     )
     .ok()?;
+    if let Some((saved_prefix_bytes, saved_prefix, saved_tail, saved_consumed)) = resume_guard {
+        let still_plain_append =
+            crate::message_search::cursor::prefix_hash16_bytes(path, saved_prefix_bytes).as_deref()
+                == Some(saved_prefix.as_str())
+                && crate::message_search::cursor::tail_hash16_ending_at(path, saved_consumed)
+                    .as_deref()
+                    == Some(saved_tail.as_str());
+        if !still_plain_append {
+            // Discard the merged fold; parse the whole file fresh.
+            acc = ClaudeRowAccumulator::default();
+            consumed =
+                crate::message_search::cursor::for_each_complete_line_from(path, 0, |line| {
+                    acc.fold_line(line)
+                })
+                .ok()?;
+        }
+    }
     acc.consumed_len = consumed;
     acc.identity = crate::platform::FileIdentity::from_path(path).ok();
     acc.prefix_hash_bytes =
@@ -935,17 +965,79 @@ fn read_unterminated_tail(path: &Path, from: u64) -> UnterminatedTail {
     UnterminatedTail::Tail(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Full streaming render including a final unterminated line of any size
-/// (the historical `.lines()` semantics) — the oversized-tail fallback.
+/// Largest single record the full-render fallback will buffer. Records
+/// beyond it are SKIPPED with a warning instead of being materialized —
+/// the fallback exists to bound memory, so it must not itself allocate an
+/// arbitrarily large line the way `.lines()` would. Tradeoff, documented:
+/// a >32 MiB record does not contribute to that row's turns/usage/preview
+/// (row-level metadata; message search and transcript serving still see
+/// the file through their own lanes).
+const CLAUDE_ROW_MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
+
+/// Full streaming render including a final unterminated line (the
+/// historical `.lines()` semantics) — the oversized-tail fallback —
+/// with per-record memory bounded at `max_record_bytes`.
 fn claude_row_full_render(path: &Path, session_id: String) -> Option<serde_json::Value> {
+    claude_row_full_render_with_record_cap(path, session_id, CLAUDE_ROW_MAX_RECORD_BYTES)
+}
+
+fn claude_row_full_render_with_record_cap(
+    path: &Path,
+    session_id: String,
+    max_record_bytes: usize,
+) -> Option<serde_json::Value> {
     use std::io::BufRead as _;
     let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
     let mut acc = ClaudeRowAccumulator::default();
-    for line in std::io::BufReader::new(file).lines() {
-        let Ok(line) = line else {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut skipped_oversized = 0u64;
+    loop {
+        buf.clear();
+        // Capped read: at most max_record_bytes + 1, so an over-cap line
+        // is detected without ever buffering it whole.
+        let bytes = std::io::Read::take(&mut reader, max_record_bytes as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .ok()?;
+        if bytes == 0 {
+            break;
+        }
+        if buf.len() > max_record_bytes {
+            skipped_oversized += 1;
+            if buf.last() != Some(&b'\n') {
+                // Discard the rest of the over-cap line without buffering.
+                loop {
+                    let available = reader.fill_buf().ok()?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    match available.iter().position(|&byte| byte == b'\n') {
+                        Some(position) => {
+                            reader.consume(position + 1);
+                            break;
+                        }
+                        None => {
+                            let discard = available.len();
+                            reader.consume(discard);
+                        }
+                    }
+                }
+            }
+            buf.clear();
+            // fold_line numbering: the skipped record still occupies a
+            // line slot so `line-{idx}` usage-dedup keys stay aligned
+            // with a hypothetical uncapped parse.
+            acc.lines_consumed += 1;
             continue;
-        };
-        acc.fold_line(&line);
+        }
+        let line = String::from_utf8_lossy(&buf);
+        acc.fold_line(line.trim_end_matches(['\n', '\r']));
+    }
+    if skipped_oversized > 0 {
+        eprintln!(
+            "[session-catalog] {}: skipped {skipped_oversized} record(s) over {max_record_bytes} bytes in the full-render fallback (row metadata omits them)",
+            path.display()
+        );
     }
     Some(acc.render(path, session_id))
 }
@@ -2869,6 +2961,53 @@ mod tests {
         let preview = row["preview"].to_string();
         assert!(preview.contains("new second"), "{preview}");
         assert!(!preview.contains("old second"), "{preview}");
+    }
+
+    /// The full-render fallback is memory-bounded: records over the cap
+    /// are skipped (with a warning), never buffered whole — terminated or
+    /// not — and the surrounding records still fold.
+    #[test]
+    fn full_render_fallback_skips_records_over_the_record_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capped-abc.jsonl");
+        let small = |uuid: &str, text: &str| {
+            serde_json::json!({
+                "timestamp": "2026-07-15T11:00:00Z",
+                "type": "user",
+                "message": {"content": text},
+                "uuid": uuid,
+            })
+        };
+        let giant_terminated = serde_json::json!({
+            "timestamp": "2026-07-15T11:01:00Z",
+            "type": "user",
+            "message": {"content": "g".repeat(2048)}
+        });
+        let giant_unterminated = serde_json::json!({
+            "timestamp": "2026-07-15T11:03:00Z",
+            "type": "user",
+            "message": {"content": "u".repeat(2048)}
+        });
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{giant_terminated}\n{}\n{giant_unterminated}",
+                small("u-1", "first"),
+                small("u-2", "second"),
+            ),
+        )
+        .unwrap();
+
+        let row =
+            claude_row_full_render_with_record_cap(&path, "capped-abc".to_string(), 512).unwrap();
+        assert_eq!(
+            row["turns"].as_u64(),
+            Some(2),
+            "both small records fold; both over-cap records are skipped"
+        );
+        let preview = row["preview"].to_string();
+        assert!(!preview.contains("ggg"), "{preview}");
+        assert!(!preview.contains("uuu"), "{preview}");
     }
 
     #[test]

@@ -72,7 +72,10 @@ pub(crate) fn store_external_transcript_entries(
     // and a live writer can grow the file past the cap (or past the
     // keyed snapshot) while we parse — caching that parse would pin an
     // oversized vec under a key no future lookup matches. Only cache
-    // when the file still IS the keyed snapshot.
+    // when the file still IS the keyed snapshot. (A metadata-preserving
+    // replacement between parse and re-stat — same len AND mtime with
+    // different bytes — is outside this cache's benign-writer model,
+    // like every (len, mtime)-keyed cache in the catalog.)
     match std::fs::metadata(Path::new(&key.path)) {
         Ok(metadata)
             if metadata.len() == key.len && metadata_mtime_nanos(&metadata) == key.mtime_nanos => {}
@@ -1052,7 +1055,10 @@ pub(crate) fn find_gemini_session_file_for_transcript(
     home: &Path,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let cache_key = (home.to_path_buf(), session_id.to_string());
+    // Normalized once so symlinked/relative spellings of the same home
+    // share one entry instead of duplicating the cache per alias.
+    let home_key = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let cache_key = (home_key, session_id.to_string());
     if let Some(cached) = gemini_transcript_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
