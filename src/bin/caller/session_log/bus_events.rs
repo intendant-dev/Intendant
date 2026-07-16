@@ -1748,9 +1748,6 @@ impl SessionLog {
         output_id: Option<&str>,
         item_id: Option<&str>,
     ) {
-        // Invalidates the gateway's negative agent-output memo for this
-        // logs root (see `replay::agent_output_generation`).
-        super::replay::note_agent_output_appended(self.dir());
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
         } else {
@@ -1806,6 +1803,16 @@ impl SessionLog {
             file: stdout_span.map(|span| span.relative),
             file2: stderr_span.map(|span| span.relative),
         });
+        // Invalidate the gateway's negative agent-output memo for this logs
+        // root — strictly AFTER the flushed row above. The generation must
+        // publish only once the row is readable: bumping before the
+        // (potentially multi-MB) sidecar writes let a concurrent fetch read
+        // the new generation, miss the not-yet-emitted row, and memoize
+        // that miss under a generation this write would never move again —
+        // reinstating the full-TTL blind window for exactly the racing
+        // case. Post-emit, a fetch that misses the row memoizes under the
+        // OLD generation, which this bump immediately invalidates.
+        super::replay::note_agent_output_appended(self.dir());
     }
 
     /// Log reasoning content from the model (full reasoning, not just summary).

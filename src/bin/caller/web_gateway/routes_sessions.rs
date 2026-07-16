@@ -67,12 +67,15 @@ fn agent_output_negative_memo_reset() {
 /// (`session_log::agent_output_generation`): an entry recorded under an
 /// older generation is stale — output was appended somewhere under the
 /// root since the sweep that missed — and must not veto a re-sweep.
+/// Keys are canonicalized like the generation map's, so a miss memoized
+/// under one spelling of a root is found (and invalidated) under another.
 fn agent_output_negative_memo_fresh(logs_dir: &Path, id: &str, generation: u64) -> bool {
+    let root = crate::session_log::canonical_logs_root(logs_dir);
     let memo = AGENT_OUTPUT_NEGATIVE_MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     memo.as_ref()
-        .and_then(|memo| memo.get(&(logs_dir.to_path_buf(), id.to_string())))
+        .and_then(|memo| memo.get(&(root, id.to_string())))
         .is_some_and(|entry| {
             entry.generation == generation && entry.expires_at > std::time::Instant::now()
         })
@@ -89,6 +92,7 @@ fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String], generation
     if ids.is_empty() {
         return;
     }
+    let root = crate::session_log::canonical_logs_root(logs_dir);
     let mut memo = AGENT_OUTPUT_NEGATIVE_MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -98,7 +102,7 @@ fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String], generation
         memo.retain(|_, entry| entry.expires_at > now);
     }
     for id in ids {
-        let key = (logs_dir.to_path_buf(), id.clone());
+        let key = (root.clone(), id.clone());
         if memo.len() >= AGENT_OUTPUT_NEGATIVE_MEMO_CAP && !memo.contains_key(&key) {
             continue;
         }
@@ -6567,6 +6571,16 @@ mod tests {
             "memo-probe-other",
             7
         ));
+
+        // Two spellings of ONE root share the memo: keys are canonical, so
+        // a miss recorded under the plain spelling is found (and later
+        // invalidated) through a dotted spelling of the same directory.
+        std::fs::create_dir_all(root_a.path().join("subprobe")).unwrap();
+        let dotted_spelling = root_a.path().join("subprobe").join("..");
+        assert!(
+            agent_output_negative_memo_fresh(&dotted_spelling, &ids[0], 7),
+            "memo keys must agree across path spellings of the same root"
+        );
     }
 
     /// The insertion-enforced cap never clears other entries: an oversized
