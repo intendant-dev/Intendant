@@ -1479,12 +1479,18 @@ async fn encode_tile_snapshot_frames(
 
 /// Send already-encoded snapshot wire frames to one peer (refcount
 /// bumps per frame; see [`encode_tile_snapshot_frames`]).
+/// `snapshot_id` tags every chunk so the driver's pre-open queue can
+/// supersede stale snapshots at whole-group granularity.
 async fn send_tile_snapshot_frames_to_peer(
     peer: &Arc<webrtc::WebRtcPeer>,
     frames: &[bytes::Bytes],
+    snapshot_id: u32,
 ) {
     for bytes in frames {
-        if let Err(e) = peer.send_tile_snapshot_frame(bytes.clone()).await {
+        if let Err(e) = peer
+            .send_tile_snapshot_frame(bytes.clone(), snapshot_id)
+            .await
+        {
             eprintln!("[display/tile] send snapshot failed: {e}");
         }
     }
@@ -1501,7 +1507,7 @@ async fn send_tile_snapshot_to_peer(
     if let Some(frames) =
         encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters).await
     {
-        send_tile_snapshot_frames_to_peer(&peer, &frames).await;
+        send_tile_snapshot_frames_to_peer(&peer, &frames, snapshot_id).await;
     }
 }
 
@@ -2909,7 +2915,7 @@ impl DisplaySession {
                             .await
                             {
                                 for peer in &peers_now {
-                                    send_tile_snapshot_frames_to_peer(peer, &frames).await;
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id).await;
                                 }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -2929,7 +2935,7 @@ impl DisplaySession {
                             .await
                             {
                                 for peer in &peers_now {
-                                    send_tile_snapshot_frames_to_peer(peer, &frames).await;
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id).await;
                                 }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -3089,8 +3095,12 @@ impl DisplaySession {
                                     .await
                                     {
                                         for peer in &peers_now {
-                                            send_tile_snapshot_frames_to_peer(peer, &frames)
-                                                .await;
+                                            send_tile_snapshot_frames_to_peer(
+                                                peer,
+                                                &frames,
+                                                snapshot_id,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -3102,12 +3112,16 @@ impl DisplaySession {
                             continue;
                         }
 
-                        // Cursor: sampled at the delta cadence, not at
-                        // capture rate — on X11 this is a synchronous
-                        // QueryPointer round-trip per sample, and both
-                        // consumers (the CursorState control frame and
-                        // the synthetic dirty boxes) only act on
-                        // allowed ticks anyway.
+                        // Cursor: sampled at the delta cadence. This
+                        // deliberately HALVES the cursor rate relative
+                        // to the pre-gate-first pipeline, where the
+                        // poll and the CursorState control frame ran
+                        // at capture rate (~30fps) ahead of the old
+                        // gate. ≤15fps matches the cadence tile paints
+                        // actually happen at, and on X11 it halves the
+                        // synchronous QueryPointer round-trips this
+                        // sample costs (and stops them entirely in
+                        // video mode, where no CursorState is sent).
                         let cursor_pos = damage.cursor_position();
                         let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
                         if cursor_changed {

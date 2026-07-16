@@ -54,11 +54,14 @@ pub(crate) struct DriverState {
     /// commit 2 lights up multi-encoding), the map has exactly one
     /// entry per active spec — same shape as the previous keying,
     /// just with the RID dimension along for the ride.
-    /// Keyed by `(PayloadSpec, SimulcastRid)` — see the data-shape pin
-    /// test. Stored as a small linear vector (a handful of entries at
-    /// most: codecs × rids for one peer) so the per-frame lookup
-    /// compares by reference instead of cloning the spec + rid into an
-    /// owned `HashMap` key on every frame.
+    /// Keyed by `(PayloadSpec, SimulcastRid)` via
+    /// [`video_spec_key_matches`] — the per-RID independence contract
+    /// is pinned by `video_specs_lookup_distinguishes_rids_sharing_a_spec`,
+    /// which exercises this container shape through that same
+    /// predicate. Stored as a small linear vector (a handful of
+    /// entries at most: codecs × rids for one peer) so the per-frame
+    /// lookup compares by reference instead of cloning the spec + rid
+    /// into an owned `HashMap` key on every frame.
     video_specs: Vec<((crate::encode::PayloadSpec, SimulcastRid), SpecState)>,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
@@ -84,17 +87,20 @@ pub(crate) struct DriverState {
     /// Byte-capped drop-oldest (see [`push_pending_tile_bounded`]): a
     /// channel that closed (OnClose removes its label) while the peer
     /// stays a tile subscriber would otherwise grow this without
-    /// bound, and for control frames the latest state wins anyway.
+    /// bound, and control frames are self-contained — the latest
+    /// state wins.
     pending_tile_control: VecDeque<Bytes>,
     /// D-3b: queued snapshot chunks awaiting `tile-snapshot` channel
-    /// open. Reliable snapshot delivery is allowed to delay rather
-    /// than drop — but bounded: snapshots re-queue every ~30s
-    /// (multi-MB each), so a never-opening channel would otherwise
-    /// accumulate them indefinitely. Oldest chunks are dropped first;
-    /// a late-opening client still receives the newest snapshot and
-    /// self-heals on the next periodic one. Tile deltas intentionally
-    /// have no queue.
-    pending_tile_snapshot: VecDeque<Bytes>,
+    /// open, tagged with their producer snapshot id. A snapshot is
+    /// only decodable as a complete chunk set, so eviction happens at
+    /// whole-snapshot granularity (see
+    /// [`push_pending_snapshot_group`]): when a newer snapshot starts
+    /// queueing, every older snapshot's chunks are superseded and
+    /// dropped — the queue never holds a partial group, and it is
+    /// bounded at ~one snapshot's bytes without any byte-cap eviction
+    /// that could strand the browser on an unassemblable baseline.
+    /// Tile deltas intentionally have no queue.
+    pending_tile_snapshot: VecDeque<(u32, Bytes)>,
     /// D-4c: event-driven backpressure state for the supersedable
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
@@ -1479,7 +1485,7 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     let spec_idx = match state
         .video_specs
         .iter()
-        .position(|((spec, spec_rid), _)| *spec == frame.payload_spec && spec_rid == rid)
+        .position(|(key, _)| video_spec_key_matches(key, &frame.payload_spec, rid))
     {
         Some(idx) => idx,
         None => {
@@ -1619,6 +1625,19 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     }
 }
 
+/// Identity predicate for [`DriverState::video_specs`] entries: an
+/// entry matches only its exact `(payload_spec, rid)` pair. Extracted
+/// so the per-RID keyframe-gate independence (VP8 simulcast layers
+/// share one `PayloadSpec`; each RID's gate must stay independent) is
+/// pinned by a test exercising the *same* predicate production uses.
+pub(crate) fn video_spec_key_matches(
+    key: &(crate::encode::PayloadSpec, SimulcastRid),
+    spec: &crate::encode::PayloadSpec,
+    rid: &SimulcastRid,
+) -> bool {
+    key.0 == *spec && key.1 == *rid
+}
+
 pub(crate) fn payload_spec_matches_codec(
     spec: &crate::encode::PayloadSpec,
     codec: &RTCRtpCodec,
@@ -1724,7 +1743,11 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                 state.pending_authority_state.push((display_id, auth_state));
             }
         }
-        Command::SendTileFrame { channel, data } => {
+        Command::SendTileFrame {
+            channel,
+            data,
+            snapshot_group,
+        } => {
             let label = channel.label();
             let data_len = data.len();
             if channel == TileDataChannel::Deltas
@@ -1755,11 +1778,10 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                         );
                     }
                     TileDataChannel::Snapshot => {
-                        push_pending_tile_bounded(
+                        push_pending_snapshot_group(
                             &mut state.pending_tile_snapshot,
+                            snapshot_group.unwrap_or_default(),
                             data,
-                            PENDING_TILE_SNAPSHOT_MAX_BYTES,
-                            label,
                         );
                     }
                     TileDataChannel::Deltas => {}
@@ -1904,27 +1926,28 @@ pub(crate) fn drain_pending_tile_for_label(
 ) -> VecDeque<Bytes> {
     match label {
         TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
-        TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot),
+        TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot)
+            .into_iter()
+            .map(|(_, bytes)| bytes)
+            .collect(),
         _ => VecDeque::new(),
     }
 }
 
-/// Byte caps for the queued-before-open reliable tile channels. A
-/// channel that closes (its label leaves `state.channels`) while the
-/// peer remains a tile subscriber keeps producing into these queues —
-/// snapshots at a multi-MB burst every ~30s — so an uncapped queue is
-/// an unbounded memory leak on a wedged channel.
+/// Byte cap for the queued-before-open `tile-control` queue. A channel
+/// that closes (its label leaves `state.channels`) while the peer
+/// remains a tile subscriber keeps producing into the queue, so an
+/// uncapped queue is an unbounded memory leak on a wedged channel.
+/// Sized far above what any real negotiation delay could accumulate.
 ///
-/// Sized to hold roughly one-to-two full 1440p snapshots (snapshot)
-/// and far more control frames than any real negotiation delay could
-/// accumulate (control). Drop-oldest is the correct bias for both:
-/// control frames are superseded by later state, and a late-opening
-/// snapshot channel wants the *newest* chunks.
-pub(crate) const PENDING_TILE_SNAPSHOT_MAX_BYTES: usize = 24 * 1024 * 1024;
+/// Drop-oldest is correct **only** for control frames, which are
+/// self-contained and superseded by later state. Snapshot chunks are
+/// not self-contained — see [`push_pending_snapshot_group`] for the
+/// whole-snapshot policy that bounds that queue instead.
 pub(crate) const PENDING_TILE_CONTROL_MAX_BYTES: usize = 1024 * 1024;
 
-/// Push onto a queued-before-open tile queue, dropping oldest entries
-/// until the queue (including `data`) fits under `max_bytes`.
+/// Push onto the queued-before-open control queue, dropping oldest
+/// entries until the queue (including `data`) fits under `max_bytes`.
 pub(crate) fn push_pending_tile_bounded(
     queue: &mut VecDeque<Bytes>,
     data: Bytes,
@@ -1947,6 +1970,57 @@ pub(crate) fn push_pending_tile_bounded(
         );
     }
     queue.push_back(data);
+}
+
+/// Push one snapshot chunk onto the queued-before-open snapshot queue.
+///
+/// A snapshot is only decodable from its complete chunk set, so this
+/// queue evicts at **whole-snapshot granularity** — byte-capped
+/// drop-oldest here would shed a snapshot's *leading* chunks and leave
+/// the browser unable to assemble any baseline until the next periodic
+/// snapshot (~30s of blank/partial canvas):
+///
+/// - Chunks of the same group as the newest queued entry append.
+/// - A chunk of a **newer** group supersedes: every older group's
+///   chunks are dropped whole (a late-opening channel wants the newest
+///   baseline; stale ones would be repainted immediately anyway).
+/// - A chunk of an **older** group than the newest queued is dropped:
+///   its snapshot is already superseded, and enqueueing it would
+///   recreate a partial group.
+///
+/// The queue therefore never holds a partial group and is bounded at
+/// ~one snapshot's bytes — even a single snapshot larger than any
+/// fixed cap is kept whole, because it is one bounded burst, and the
+/// leak this policy guards against (a wedged channel re-queueing every
+/// periodic snapshot forever) is exactly what supersession caps.
+pub(crate) fn push_pending_snapshot_group(
+    queue: &mut VecDeque<(u32, Bytes)>,
+    group: u32,
+    data: Bytes,
+) {
+    if let Some(&(newest, _)) = queue.back() {
+        if group != newest {
+            // Producer snapshot ids are monotonically allocated;
+            // wrapping-aware comparison so the policy survives id
+            // wraparound on very long sessions.
+            let incoming_is_newer = (group.wrapping_sub(newest) as i32) > 0;
+            if incoming_is_newer {
+                let dropped = queue.len();
+                queue.clear();
+                eprintln!(
+                    "[display/webrtc] pending tile-snapshot queue: snapshot \
+                     {group} supersedes {dropped} queued chunk(s) of older \
+                     snapshot(s) before the channel opened"
+                );
+            } else {
+                // Stale chunk of an already-superseded snapshot
+                // (interleaved producer): keeping it would recreate a
+                // partial group.
+                return;
+            }
+        }
+    }
+    queue.push_back((group, data));
 }
 
 pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
@@ -2027,67 +2101,94 @@ mod tests {
         assert_eq!(resolved, c);
     }
 
-    /// **Phase-4c-prep**: `DriverState::video_specs` keying changed
-    /// from `PayloadSpec` to `(PayloadSpec, SimulcastRid)`. This is a
-    /// data-shape pin: a HashMap with `(spec, rid)` keys treats two
-    /// distinct rids as distinct entries even when they share the
-    /// same payload_spec — which is exactly the VP8 simulcast case
-    /// where every layer has the same `PayloadSpec` but each layer's
-    /// keyframe gate must remain independent.
-    ///
+    /// **Phase-4c-prep** contract: `DriverState::video_specs` is keyed
+    /// by `(PayloadSpec, SimulcastRid)`, not `PayloadSpec` alone — the
+    /// VP8 simulcast case gives every layer the same `PayloadSpec`,
+    /// but each layer's keyframe gate must remain independent.
     /// Without per-RID keying, a keyframe seen on RID `full` would
-    /// open the gate for P-frames on RIDs `half` and `quarter`. Those
-    /// P-frames would reference keyframes the half/quarter
-    /// subscribers never received, decoding to garbage.
+    /// open the gate for P-frames on RIDs `half` and `quarter`, which
+    /// would reference keyframes those subscribers never received and
+    /// decode to garbage.
     ///
-    /// This test pins the keying directly. It can't easily exercise
-    /// `write_video_frame` end-to-end without an `RTCPeerConnection`,
-    /// but the data-shape contract is what matters — if the keying
-    /// regresses to `PayloadSpec`-only the map would conflate the
-    /// three layers and this test would compile-fail (or assert).
+    /// This test exercises the **production shape**: the linear
+    /// `Vec<((PayloadSpec, SimulcastRid), SpecState)>` container that
+    /// `DriverState::video_specs` holds, probed and inserted through
+    /// [`video_spec_key_matches`] — the same predicate
+    /// `write_video_frame` uses for its per-frame lookup. A predicate
+    /// regression that matched spec but ignored rid would collapse
+    /// the three layers here and fail the assertions.
     #[test]
-    fn driver_state_video_specs_keys_by_spec_and_rid() {
+    fn video_specs_lookup_distinguishes_rids_sharing_a_spec() {
         use crate::encode::PayloadSpec;
         let spec = PayloadSpec::vp8();
-        let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> = HashMap::new();
-        // Insert under three distinct rids with the same spec. They
-        // must be three distinct entries — pre-fix keying by
-        // `PayloadSpec` alone would have collapsed them to one.
+        let mut specs: Vec<((PayloadSpec, SimulcastRid), SpecState)> = Vec::new();
+        // Same insert-if-absent walk as write_video_frame.
         for rid in [
             SimulcastRid::full(),
             SimulcastRid::half(),
             SimulcastRid::quarter(),
         ] {
-            specs.insert(
-                (spec.clone(), rid),
-                SpecState::Ready {
-                    keyframe_seen: false,
-                },
-            );
+            if !specs
+                .iter()
+                .any(|(key, _)| video_spec_key_matches(key, &spec, &rid))
+            {
+                specs.push((
+                    (spec.clone(), rid),
+                    SpecState::Ready {
+                        keyframe_seen: false,
+                    },
+                ));
+            }
         }
         assert_eq!(
             specs.len(),
             3,
-            "(PayloadSpec, SimulcastRid) keying must keep three rids \
-             with the same spec as three distinct entries; got {} \
-             entries — keying regressed to spec-only?",
+            "three rids sharing one spec must be three distinct \
+             entries; got {} — predicate regressed to spec-only?",
             specs.len(),
         );
-        // Flipping one rid's keyframe_seen must not affect the others.
-        if let Some(SpecState::Ready { keyframe_seen }) =
-            specs.get_mut(&(spec.clone(), SimulcastRid::full()))
-        {
+
+        // The predicate matches only the exact (spec, rid) pair:
+        // same spec + wrong rid and wrong spec + same rid both miss.
+        let h264 = PayloadSpec::h264_constrained_baseline();
+        assert!(video_spec_key_matches(
+            &specs[0].0,
+            &spec,
+            &SimulcastRid::full()
+        ));
+        assert!(!video_spec_key_matches(
+            &specs[0].0,
+            &spec,
+            &SimulcastRid::half()
+        ));
+        assert!(!video_spec_key_matches(
+            &specs[0].0,
+            &h264,
+            &SimulcastRid::full()
+        ));
+
+        // Flipping one rid's gate through the production lookup must
+        // not affect the other rids.
+        let full_idx = specs
+            .iter()
+            .position(|(key, _)| video_spec_key_matches(key, &spec, &SimulcastRid::full()))
+            .expect("full entry present");
+        if let (_, SpecState::Ready { keyframe_seen }) = &mut specs[full_idx] {
             *keyframe_seen = true;
         }
         for rid in [SimulcastRid::half(), SimulcastRid::quarter()] {
-            match specs.get(&(spec.clone(), rid.clone())) {
-                Some(SpecState::Ready { keyframe_seen }) => assert!(
+            let idx = specs
+                .iter()
+                .position(|(key, _)| video_spec_key_matches(key, &spec, &rid))
+                .unwrap_or_else(|| panic!("rid {} entry missing", rid.as_str()));
+            match &specs[idx].1 {
+                SpecState::Ready { keyframe_seen } => assert!(
                     !keyframe_seen,
-                    "rid {} keyframe_seen leaked across rids — keying \
-                     is wrong",
+                    "rid {} keyframe_seen leaked across rids — \
+                     predicate is wrong",
                     rid.as_str(),
                 ),
-                _ => panic!("rid {} entry missing", rid.as_str()),
+                _ => panic!("rid {} entry in wrong state", rid.as_str()),
             }
         }
     }
@@ -2939,5 +3040,95 @@ mod tests {
         assert_eq!(watermark_to_u32(1024), 1024);
         assert_eq!(watermark_to_u32(u32::MAX as usize), u32::MAX);
         assert_eq!(watermark_to_u32(u32::MAX as usize + 1), u32::MAX);
+    }
+
+    fn chunk(byte: u8, len: usize) -> Bytes {
+        Bytes::from(vec![byte; len])
+    }
+
+    /// Pre-open snapshot queue: a newer snapshot's chunks supersede
+    /// every older snapshot's chunks **whole** — the queue never holds
+    /// a partial group. Byte-capped drop-oldest here would shed a
+    /// snapshot's leading chunks and leave the browser unable to
+    /// assemble any baseline until the next periodic snapshot.
+    #[test]
+    fn pending_snapshot_queue_never_holds_a_partial_group() {
+        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
+        for _ in 0..4 {
+            push_pending_snapshot_group(&mut q, 7, chunk(7, 100));
+        }
+        assert_eq!(q.len(), 4);
+
+        // A newer snapshot begins queueing: all of snapshot 7 drops.
+        push_pending_snapshot_group(&mut q, 8, chunk(8, 100));
+        assert_eq!(q.len(), 1, "older snapshot must be dropped whole");
+        assert!(
+            q.iter().all(|(g, _)| *g == 8),
+            "queue must only hold the newest snapshot's chunks"
+        );
+
+        // Remaining chunks of the newest snapshot keep appending.
+        push_pending_snapshot_group(&mut q, 8, chunk(8, 100));
+        assert_eq!(q.len(), 2);
+        assert!(q.iter().all(|(g, _)| *g == 8));
+    }
+
+    /// A single snapshot larger than any nominal cap is kept whole:
+    /// it is one bounded burst, and evicting any of its chunks would
+    /// make the whole group undecodable.
+    #[test]
+    fn pending_snapshot_queue_keeps_single_oversize_snapshot_whole() {
+        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
+        // 64 chunks x 1MB = 64MB, far above any byte cap this queue
+        // ever had — every chunk must survive.
+        for _ in 0..64 {
+            push_pending_snapshot_group(&mut q, 3, chunk(3, 1024 * 1024));
+        }
+        assert_eq!(q.len(), 64, "one snapshot is never partially evicted");
+        assert!(q.iter().all(|(g, _)| *g == 3));
+    }
+
+    /// Supersession drops stale baselines: chunks of an
+    /// already-superseded snapshot (an interleaved late producer)
+    /// must not re-enter the queue — that would recreate a partial
+    /// group. Wrapping ids compare monotonically.
+    #[test]
+    fn pending_snapshot_queue_supersedes_stale_baselines() {
+        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
+        push_pending_snapshot_group(&mut q, 10, chunk(10, 50));
+        push_pending_snapshot_group(&mut q, 11, chunk(11, 50));
+        // Late chunk of superseded snapshot 10: dropped, not queued.
+        push_pending_snapshot_group(&mut q, 10, chunk(10, 50));
+        assert_eq!(q.len(), 1);
+        assert!(q.iter().all(|(g, _)| *g == 11));
+
+        // Monotonic comparison survives id wraparound.
+        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
+        push_pending_snapshot_group(&mut q, u32::MAX, chunk(1, 50));
+        push_pending_snapshot_group(&mut q, 0, chunk(2, 50));
+        assert_eq!(q.len(), 1, "wrapped id 0 supersedes u32::MAX");
+        assert!(q.iter().all(|(g, _)| *g == 0));
+    }
+
+    /// Pre-open control queue: self-contained frames under a byte
+    /// cap, oldest dropped first (later control state supersedes
+    /// earlier).
+    #[test]
+    fn pending_control_queue_drops_oldest_over_byte_cap() {
+        let mut q: VecDeque<Bytes> = VecDeque::new();
+        // Cap of 250 bytes: four 100-byte frames can never all fit.
+        for byte in 1..=4u8 {
+            push_pending_tile_bounded(&mut q, chunk(byte, 100), 250, "tile-control");
+        }
+        assert_eq!(q.len(), 2, "queue must stay under the byte cap");
+        // The two newest frames survive.
+        assert_eq!(q[0][0], 3);
+        assert_eq!(q[1][0], 4);
+
+        // An oversize single frame empties the queue but is itself
+        // kept (a frame can never fit by dropping others).
+        push_pending_tile_bounded(&mut q, chunk(9, 400), 250, "tile-control");
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0][0], 9);
     }
 }

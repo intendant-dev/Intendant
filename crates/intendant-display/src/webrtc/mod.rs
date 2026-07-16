@@ -587,9 +587,16 @@ pub(crate) enum Command {
     /// `Bytes` end-to-end: one wire frame is encoded once and fanned
     /// out to every subscriber as refcount bumps; the only remaining
     /// copy is rtc's `BytesMut` boundary at the datachannel write.
+    ///
+    /// `snapshot_group` is the producer's snapshot id for
+    /// [`TileDataChannel::Snapshot`] frames (`None` on the other
+    /// channels). The pre-open snapshot queue evicts at whole-group
+    /// granularity — a snapshot is only decodable as a complete chunk
+    /// set, so the queue must never hold (or deliver) a partial one.
     SendTileFrame {
         channel: TileDataChannel,
         data: bytes::Bytes,
+        snapshot_group: Option<u32>,
     },
 }
 
