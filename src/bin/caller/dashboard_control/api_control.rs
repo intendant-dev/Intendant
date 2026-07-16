@@ -957,6 +957,65 @@ pub(crate) async fn api_worktrees_merge_response(
     }
 }
 
+pub(crate) async fn api_session_fork_points_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // Transport edge: resolve the real home once; tests drive the
+    // `_from_home` variant with an injected temp home.
+    api_session_fork_points_response_from_home(id, params, &crate::platform::home_dir()).await
+}
+
+pub(crate) async fn api_session_fork_points_response_from_home(
+    id: String,
+    params: Option<&serde_json::Value>,
+    home: &std::path::Path,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(session_id) = params
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return missing_param_response(id, "session_id");
+    };
+    // The synthesized request line reuses the HTTP builder verbatim, so a
+    // session id that cannot form a single path segment is refused here.
+    if session_id.contains(['/', '?', '#', ' ']) {
+        return missing_param_response(id, "session_id");
+    }
+    let mut query = String::new();
+    for key in ["include_non_recovery", "offset", "limit"] {
+        if let Some(value) = params.get(key) {
+            let value = match value {
+                serde_json::Value::String(value) => value.clone(),
+                other => other.to_string(),
+            };
+            query.push(if query.is_empty() { '?' } else { '&' });
+            query.push_str(&format!("{key}={value}"));
+        }
+    }
+    let request_line = format!("GET /api/session/{session_id}/fork-points{query} HTTP/1.1");
+    let home = home.to_path_buf();
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_fork_points_response(&request_line, &home)
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("fork-points task failed: {e}"),
+            });
+        }
+    };
+    frame_api_response(id, response, "session fork points")
+}
+
 pub(crate) async fn api_managed_context_response(
     id: String,
     kind: &'static str,

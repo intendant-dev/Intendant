@@ -236,6 +236,7 @@ pub(crate) enum RouteHandlerId {
     /// leaves is a follow-up behavior decision, not part of the
     /// mechanical migration.
     SessionSubRouter,
+    SessionForkPoints,
     McAnchors,
     McRecords,
     McFission,
@@ -964,6 +965,24 @@ pub(crate) static ROUTES: &[Route] = &[
         "Fetch a session's persisted agent output by id (POST-shaped read)",
     )
     .with_tunnel(tunnel_method("api_session_agent_output")),
+    // Declared ahead of the sub-router group: the `{id}/fork-points` leaf
+    // must win before the group's `Under("/api/session")` catch-all, and
+    // shared-handler groups must stay contiguous.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("fork-points"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionForkPoints,
+        "Unified fork-point catalog for a session (anchors + eligibility, backend-tagged)",
+    )
+    .with_tunnel(tunnel_method("api_session_fork_points")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
     //    split (current/* manage-gated on every method; {id} inspect on
