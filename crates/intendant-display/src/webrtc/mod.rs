@@ -157,13 +157,15 @@ const TCP_MAX_FRAME_LEN: usize = 65535;
 /// channel: each group owns every wire chunk of one snapshot (multi-MB),
 /// and a command queue of them retains up to its capacity in full
 /// generations — plus unboundedly more in any producer tasks parked on
-/// a full channel's `send().await`. This slot caps upstream retention
-/// at **exactly one group per peer by construction**: `publish` is a
-/// synchronous replace (never an await holding a group), and a newer
-/// group simply overwrites an unconsumed older one — which is correct,
-/// because a snapshot is a full-screen baseline and only the newest
-/// matters. Admission (the driver's persisted watermark) still gates
-/// at consume time.
+/// a full channel's `send().await`. This slot caps retention at **one
+/// group by construction**: `publish` is a synchronous replace (never
+/// an await holding a group), and the id-newest group supersedes any
+/// unconsumed one — correct, because a snapshot is a full-screen
+/// baseline and only the newest matters. Per peer, retention is ≤1
+/// group per stage (this mailbox + the driver's pre-open store), ≤2
+/// total during the hand-off window, both stages superseded
+/// latest-wins. Admission (the driver's persisted watermark) still
+/// gates at consume time.
 ///
 /// A producer cancelled mid-encode never calls `publish`, so — like the
 /// downstream pre-open queue — this slot can never hold a partial group.
@@ -184,14 +186,30 @@ impl SnapshotMailbox {
         }
     }
 
-    /// Replace the pending group with a newer one and wake the driver.
-    /// Synchronous by design — see the type docs.
+    /// Publish one complete group and wake the driver. Synchronous by
+    /// design — see the type docs.
+    ///
+    /// **Id-latest, not arrival-latest:** producers mint their
+    /// snapshot id *before* the (async, blocking-pool) encode, and run
+    /// as independent tasks, so completion order can invert id order —
+    /// a slow older snapshot must not overwrite a faster newer one
+    /// that may be the only correct-epoch baseline (e.g. right after a
+    /// resize). An incoming group at or below the resident id is
+    /// dropped here; the resident group's own `notify_one` permit is
+    /// still pending, so no extra wake is needed.
     pub(crate) fn publish(&self, snapshot_id: u32, chunks: Vec<bytes::Bytes>) {
-        *self
-            .slot
-            .lock()
-            .expect("snapshot mailbox mutex poisoned (no panics hold it)") =
-            Some((snapshot_id, chunks));
+        {
+            let mut slot = self
+                .slot
+                .lock()
+                .expect("snapshot mailbox mutex poisoned (no panics hold it)");
+            if let Some((resident_id, _)) = slot.as_ref() {
+                if snapshot_id <= *resident_id {
+                    return;
+                }
+            }
+            *slot = Some((snapshot_id, chunks));
+        }
         self.notify.notify_one();
     }
 
@@ -655,7 +673,7 @@ pub(crate) enum Command {
     ///
     /// Snapshot chunks do NOT travel through this command — a snapshot
     /// is only decodable as a complete chunk set, so it crosses the
-    /// boundary atomically via [`Command::SendTileSnapshot`]; a
+    /// boundary atomically via the peer's [`SnapshotMailbox`]; a
     /// per-chunk snapshot path would let a cancelled producer publish
     /// a partial (unassemblable) baseline into the pre-open queue.
     SendTileFrame {

@@ -2078,8 +2078,9 @@ impl PendingTileQueues {
 ///
 /// Drop-oldest is correct **only** for control frames, which are
 /// self-contained and superseded by later state. Snapshot chunks are
-/// not self-contained — see [`push_pending_snapshot_group`] for the
-/// whole-snapshot policy that bounds that queue instead.
+/// not self-contained — see
+/// [`PendingTileQueues::place_snapshot_group`] for the whole-snapshot
+/// policy that bounds that store instead.
 pub(crate) const PENDING_TILE_CONTROL_MAX_BYTES: usize = 1024 * 1024;
 
 /// Push onto the queued-before-open control queue, dropping oldest
@@ -3262,6 +3263,28 @@ mod tests {
         assert_eq!(id, 63);
         assert_eq!(chunks.len(), 4, "retained group is complete");
         assert!(mailbox.take().is_none(), "exactly one group retained");
+    }
+
+    /// The mailbox keeps the **id-newest** group, not the
+    /// arrival-newest: producers mint ids before their (independently
+    /// scheduled) encodes, so an older snapshot can finish after a
+    /// newer one — it must not overwrite the newer baseline, which may
+    /// be the only correct-epoch one after a resize.
+    #[test]
+    fn snapshot_mailbox_keeps_newest_id_regardless_of_arrival_order() {
+        let mailbox = SnapshotMailbox::new();
+        // Snapshot 8 encodes fast and publishes first...
+        mailbox.publish(8, vec![chunk(8, 10); 4]);
+        // ...then the slower, older snapshot 7 finishes: dropped.
+        mailbox.publish(7, vec![chunk(7, 10); 2]);
+        let (id, chunks) = mailbox.take().expect("newest-id group retained");
+        assert_eq!(id, 8, "stale arrival must not overwrite a newer id");
+        assert_eq!(chunks.len(), 4, "retained group is the complete newer one");
+        assert!(mailbox.take().is_none());
+
+        // After a drain, a genuinely newer publish lands normally.
+        mailbox.publish(9, vec![chunk(9, 10)]);
+        assert_eq!(mailbox.take().expect("newer id accepted").0, 9);
     }
 
     /// Plain increasing admission: ids only ever move forward (the

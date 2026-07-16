@@ -931,7 +931,9 @@ impl WebRtcPeer {
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
         // Latest-wins snapshot hand-off, deliberately outside the
         // command channel — see `SnapshotMailbox` for the retention
-        // argument (one complete group per peer, end to end).
+        // argument (≤1 complete group per stage — mailbox + the
+        // driver's pre-open store — ≤2 per peer total, both stages
+        // superseded latest-wins).
         let snapshot_mailbox = Arc::new(SnapshotMailbox::new());
         // Phase 4d.1: per-peer observed send bitrate (`bytes_sent`
         // delta, local egress only — see WebRtcPeer::observed_send_bitrate_rx
@@ -1359,12 +1361,13 @@ impl WebRtcPeer {
     /// D-3b: publish one **complete** tile snapshot (every wire chunk
     /// of `snapshot_id`, in send order) to this peer's latest-wins
     /// mailbox. Synchronous by design: the producer never awaits while
-    /// holding a group, and a newer snapshot replaces an unconsumed
-    /// older one, so upstream retention is one group per peer — see
-    /// [`SnapshotMailbox`]. The driver admits (watermark) and either
-    /// writes the whole set to an open `tile-snapshot` channel or
-    /// queues it whole for the pre-open flush; a partial snapshot is
-    /// unassemblable, so no per-chunk snapshot boundary exists.
+    /// holding a group, and the id-newest snapshot supersedes an
+    /// unconsumed one, so mailbox retention is one group (≤2 per peer
+    /// across the mailbox + pre-open stages) — see [`SnapshotMailbox`].
+    /// The driver admits (watermark) and either writes the whole set
+    /// to an open `tile-snapshot` channel or queues it whole for the
+    /// pre-open flush; a partial snapshot is unassemblable, so no
+    /// per-chunk snapshot boundary exists.
     pub fn send_tile_snapshot_group(&self, snapshot_id: u32, chunks: Vec<bytes::Bytes>) {
         self.snapshot_mailbox.publish(snapshot_id, chunks);
     }
