@@ -10,13 +10,13 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | Path | What |
 |---|---|
 | `agenda-owner-plane-rfc.md` | The umbrella RFC, **v3.1 — FROZEN** (changes belong in gate specs, never here) |
-| `owner-plane-d0a-spec.md` | **D0-A, v0.5.23 — the terminal cut plus the owner's ratification amendments** (D-201..D-206; SHA-256 `22f09e43ee59284e1c0903fd638dc8563b655443904b40e439582395159bb240`; v0.5.19 through v0.5.22 archived byte-exact; D-204 narrows D-202's convergence carrier; D-205 completes it with the self-evidence exception — kept by explicit owner ratification; D-206 is the Gate-A closure rule, filed with the freeze-time D4/D9 prose and the D-151 row correction). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
+| `owner-plane-d0a-spec.md` | **D0-A, v0.5.24 — the Gate-A STAMPED cut** (§16 stamped by the owner 2026-07-16 on the D-206 zero-blocker closure review at pin `44b56f96`; D-201..D-206; SHA-256 `2f20cceb85b5c6518eb27a35135b707c5a8aef5b711472b9e738b9daa6293d61`; v0.5.19 through v0.5.23 archived byte-exact; D-204 narrows D-202's convergence carrier; D-205 completes it with the self-evidence exception — kept by explicit owner ratification; D-206 is the Gate-A closure rule). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
 | `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91, amendments #1–#7; #7 = the machine-readable `evidence_class` on evidence-lifecycle vectors): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
-| `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.19) — the red baselines |
+| `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.23) — the red baselines (residual R2 repaired at the stamp) |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
 | `vectors/` | Committed vector fixtures (`f{family:02}-{name}.json`), minted by `cargo run --bin mint` in `core/`; a drift-gate test pins these bytes to the builders — edit builders, never these files |
-| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, an independent BIP-39 leg, B.2/B.3 transcription). `cargo run --bin harness` is a real gate: nonzero exit on any structural failure, semantic FAIL, or Unimplemented. The full 168-vector corpus is reproduced; `--bin storage_lane` executes every storage-annotated vector on real files (the delivered per-OS lane: all streams through the durable flush+rename path onto pre-seeded destinations, plus the flush failpoint control) |
+| `reducer/` | The **independent reducer + differential harness** — shares NO code with `core/` (own strict CBOR reader, domains, envelope, fold engine incl. the D-138 control re-fold, journal machine, erase-crash replayer, edge predicate, an independent BIP-39 leg, B.2/B.3 transcription). `cargo run --bin harness` is a real gate: nonzero exit on any structural failure, semantic FAIL, or Unimplemented. The full 170-vector corpus is reproduced; `--bin storage_lane` executes every storage-annotated vector on real files (the delivered per-OS lane: all streams through the durable flush+rename path onto pre-seeded destinations, plus the flush failpoint control) |
 | `browser-lane/` | The **browser execution lane** (delivered): the schema-less reducer + a WebCrypto backend compiled to wasm; `driver.cjs` runs every browser-annotated vector in headless Chromium over raw CDP — semantics via `crypto.subtle`, the family-13 substrate over real IndexedDB transactions + Web Locks — and exits nonzero unless all green |
 | `gate-a-audit.md` | **The Gate-A discrepancy audit, amended after the repair tranche** (2026-07-14): the differential scoreboard incl. the tranche's findings (a real D-185 engine gap among them), the twelve D-items with per-item status, the conventions, the machine-enforced coverage pointers — and the **FAIL verdict** (re-amended 2026-07-15 on the reconciled verification review — the interim predicate-satisfied claim is withdrawn — and 2026-07-16 after the criterion-12 tranche: D-99 body-before-placement in full, the D-130 exact-reference rule, both D-202 worlds vectored, the storage proof made discriminating) |
 | `coverage/` | The **machine-enforced coverage inventory**: `outcomes-map.json` (generated §10.4 outcome → vector map; 12/59 uncovered — explicit Gate-B deferrals, pinned shrink-only) and `obligations-13-3.json` (the §13.3 obligation ledger — verbatim quote pins + full line coverage of the section; 14 vectored / 26 partial / 42 pending / 2 structural). Both declare the six executed surfaces (2 Rust + Chromium + 3 storage OSes) |
@@ -37,7 +37,23 @@ review record, and the byte-exact baseline outranks path cosmetics.
 
 ## Status
 
-- **Gate A: FAIL — not stamped** (`gate-a-audit.md` §5). The repair
+- **GATE A: PASS — STAMPED by the owner 2026-07-16** (spec §16;
+  `gate-a-audit.md` verdict) on the D-206 zero-blocker closure review
+  at pin `44b56f96`
+  (`reviews/2026-07-16-gate-a-44b56f96-closure-review.md`): a
+  no-prior-authorship reviewer re-executed the full battery in an
+  isolated checkout — core 141/141, reducer 37/37, strict gate
+  170/170, storage 19/19 with the counter-equality and failpoint
+  controls, browser 56/56, every discrimination and negative control
+  red exactly where required — zero blockers, eight residuals
+  (`residuals.md`: R1–R7 repaired at the stamp, R8 open). **Durable
+  P1 Memory writes remain barred until Gate B** plus the umbrella's
+  P0.5/tombed-cutover prerequisites — the stamp does not move that
+  bar. The frozen asset (spec v0.5.24 + companion + corpus + the two
+  reference implementations + the execution lanes) is the program's
+  handover to the P1 track. The history below is preserved as the
+  record of how the gate closed.
+- Gate A's repair history: the original audit returned **FAIL**. The repair
   tranche closed the artifact-side clauses (strict gate, real
   convergence + the D-185 fix, D1/D4/D6, the verified reopen-kill
   trace, machine-enforced coverage, advisory CI), and the owner's

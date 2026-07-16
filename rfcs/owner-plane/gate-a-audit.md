@@ -2,14 +2,28 @@
 
 **Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn; **re-amended 2026-07-16 after the criterion-12 tranche** (the synthesized criterion-12 review, `reviews/2026-07-15-gate-a-criterion12-synthesized-review.md`, found three executable protocol counterexamples — F1 D-99, F2 D-130, F3 D-202 — plus the criterion-8 proof gaps and this document's own drift; the owner directed the bounded repairs 2026-07-15 and they are executed below); **re-amended 2026-07-16 after the ff23f1cd review round** (`reviews/2026-07-16-gate-a-ff23f1cd-review.md` — the fresh independent review at the pinned head returned FAIL with five findings, every one verified and repaired under the owner's delegated adjudication: F1 = the D-205 self-evidence exception completing D-204; F2 = closed key sets in the intrinsic body stage; F3 = three-coordinate registry dispatch; F4 = the storage proof's count-equality, verified pre-seed, and stated sync limit; F5 = this truth sweep)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
-**Spec:** `owner-plane-d0a-spec.md` v0.5.23, SHA-256 `22f09e43ee59284e1c0903fd638dc8563b655443904b40e439582395159bb240` (v0.5.22 = `30c91f94…`, v0.5.21 = `5ca12fe7…`, v0.5.20 = `ec3a9a6d…`, v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (the D-202 convergence carrier narrowed to shared evidence-arrival structure); v0.5.22 = D-205 under the owner's delegated adjudication of the ff23f1cd review round (the self-evidence exception to same-coordinate fork registration; KEPT by explicit owner ratification 2026-07-16); v0.5.23 = the owner's closure filing (D-206, the Gate-A closure rule; the freeze-time D4 and D9 prose sentences; the D-151 row correction and its c.enroll registry-row mirror — all owner-ratified 2026-07-16 via the head-session brief)
+**Spec:** `owner-plane-d0a-spec.md` v0.5.24 — **the Gate-A stamped cut**, SHA-256 `2f20cceb85b5c6518eb27a35135b707c5a8aef5b711472b9e738b9daa6293d61` (v0.5.23 = `22f09e43…` — the inspection pin's cut, v0.5.22 = `30c91f94…`, v0.5.21 = `5ca12fe7…`, v0.5.20 = `ec3a9a6d…`, v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (the D-202 convergence carrier narrowed to shared evidence-arrival structure); v0.5.22 = D-205 under the owner's delegated adjudication of the ff23f1cd review round (the self-evidence exception to same-coordinate fork registration; KEPT by explicit owner ratification 2026-07-16); v0.5.23 = the owner's closure filing (D-206, the Gate-A closure rule; the freeze-time D4 and D9 prose sentences; the D-151 row correction and its c.enroll registry-row mirror — all owner-ratified 2026-07-16 via the head-session brief)
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `8d2f880006502563b528b64f70eb2f0fd3ccdb721b894df93596dc6bfab8d859` (amendments #1–#7; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; #7 = the machine-readable `evidence_class` required on evidence-lifecycle vectors, the ff23f1cd review's F1; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10)
 **Corpus:** 170 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×31, f08×4, f09×13, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated after the ff23f1cd round: +1 extra-field × C2 multi-fault, +1 operation_version negative; the late-first lifecycle vector gains its re-proposal-first third delivery and both lifecycle vectors declare `evidence_class`)
 **Suites at this amendment:** core 141/141 · reducer 37/37 (incl. the metamorphic-convergence corpus test, the arrival-order restoration control, and the D-202 cross-world pin) · the strict harness 170/170 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files (EVERY stream through the durable path with counter EQUALITY against the corpus-derived stream count — `sync_all=14 rename=14` of 14 — each rename replacing a read-back-verified pre-seeded destination, plus the flush failpoint control) · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
 
-> **VERDICT: FAIL — both repair tranches executed; awaiting the
-> fresh independent review the acceptance criteria require.** Gate A
-> is **not** stamped. The history in one paragraph: the original
+> **VERDICT: PASS — Gate A STAMPED by the owner 2026-07-16** on the
+> D-206 zero-blocker closure review at pin `44b56f96`
+> (`reviews/2026-07-16-gate-a-44b56f96-closure-review.md`): a
+> no-prior-authorship reviewer re-executed the full battery in an
+> isolated checkout at the single owner-named pin — core 141/141,
+> reducer 37/37, strict gate 170/170, storage 19/19 with the
+> counter-equality and failpoint controls, browser 56/56, every
+> discrimination and negative control red exactly where required —
+> and found zero blockers. Eight residuals are logged in
+> `residuals.md` (R1–R7 repaired by the stamp filing, R8 open —
+> none gate-reopening). The §16 stamp is filed in the spec
+> (v0.5.24, the stamped cut). Durable P1 Memory writes remain
+> barred until Gate B plus the umbrella's P0.5/tombed-cutover
+> prerequisites — Gate A's closure does not move that bar.
+>
+> The history that led here (each verdict below superseded by the
+> stamp above, preserved as the record): the original
 > audit FAILED; an interim 2026-07-15 amendment claimed the predicate
 > satisfied and was REFUTED by the reconciled verification review
 > (filed in `reviews/`), whose findings the owner-directed repair
@@ -47,8 +61,9 @@
 > text); all other findings are residuals — filed in
 > `residuals.md`, repaired in ordinary follow-ups, never
 > gate-reopening. This document never self-stamps; the verdict
-> stays FAIL until that review's PASS report, and the §16 stamp
-> remains the owner's act.
+> stayed FAIL until that review's PASS report. That review — the
+> D-206 closure review at pin `44b56f96` — then reported **PASS,
+> zero blockers**, and the owner stamped: the verdict above.
 
 ## 0. Scope and method
 
@@ -220,7 +235,8 @@ Pinned by the trio `f07-c2-post-freeze-valid-op-frozen` (`ctrl-fork`,
 `f07-c2-post-freeze-cddl-invalid-kept` (`body-invariant`,
 `reject-permanent`), with the consumed-request-ID sibling
 `f07-consumed-request-id-cddl-invalid` pinning body-before-replay.
-The prose sentence remains worth adding at freeze.
+The prose sentence was ADDED at the closure filing (§7.4 C2,
+owner-ratified 2026-07-16; residual R3 discharged).
 
 **D5. [#57] `lease-stale`'s firing condition is never stated.**
 **CLOSED — RULED (D-202, owner 2026-07-14): alternative (ii), sticky
@@ -266,7 +282,9 @@ read's established partition.** **CLOSED (implemented + vectored):**
 five conflict vectors (duplicate chunk index, changed principal,
 changed scope, changed count, overlapping result sets), each
 `(body-invariant, reject-permanent)`, arrival-order-proof via the
-chain. The prose row remains worth adding at freeze.
+chain. The prose row was ADDED at the closure filing (the
+`m.audit` registry row, owner-ratified 2026-07-16; residual R4
+discharged).
 
 **D10. [#22] The companion's "fresh fold of the union" names no
 arrival order.** **CLOSED — ratified (D-203):** §13.1 now states the
@@ -425,7 +443,9 @@ freeze-time pass (R8.11): the spec's D-151 decision row still says
 "two renewal-after-revocation vectors" — renewal machinery is
 fail-closed in the ratified P1 v1 profile and no such vectors
 exist; the row's claim is stale prose in an owner document, so it
-is RECORDED here rather than edited unilaterally.
+was RECORDED here rather than edited unilaterally — and is now
+DISCHARGED: the owner's closure filing (2026-07-16) corrected the
+row and its `c.enroll` registry mirror (residual R5).
 
 ## 5. Gate-A verdict
 
