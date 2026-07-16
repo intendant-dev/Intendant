@@ -188,6 +188,24 @@ pub(crate) async fn run_daemon(
     };
     let (vitals_git_targets, _vitals_producer) =
         session_vitals::spawn_session_vitals_producer(bus.clone(), vitals_git_seed);
+    // Restored sessions: a restart empties the target registry, so idle
+    // session windows lose their git/health chips until the next resume.
+    // Re-register the store's non-ended sessions (bounded, newest-first,
+    // insert-if-absent — see register_restored_session_targets) off the
+    // startup path; the first probe tick re-emits each session's rows and
+    // the bootstrap caches carry them to later-connecting dashboards.
+    {
+        let registry = vitals_git_targets.clone();
+        tokio::task::spawn_blocking(move || {
+            let restored = session_vitals::register_restored_session_targets(
+                &crate::platform::home_dir(),
+                &registry,
+            );
+            if restored > 0 {
+                eprintln!("Session vitals: git targets restored for {restored} session(s)");
+            }
+        });
+    }
     // Native usage rail: derive per-session UsageSnapshots from
     // ModelResponse events (dashboard meter + cache/limits vitals).
     // Covers supervisor-spawned native children too.
