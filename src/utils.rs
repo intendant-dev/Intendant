@@ -43,6 +43,32 @@ pub fn agent_shell_command(command: &str) -> (&'static str, Vec<String>) {
     }
 }
 
+/// Marker-emission dialect of a PTY shell: how `exec_pty` writes its
+/// sentinel `echo` lines so that the *typed input* never contains the
+/// assembled marker string while the executed output does. The tty driver
+/// echoes raw input bytes whenever they arrive before (or without) a line
+/// editor that has turned echo off — so a marker scanner that accepts the
+/// echoed input would treat a command as complete before it ran.
+// On non-Windows builds only `Posix` is ever constructed outside tests —
+// the marker-emission code still matches every variant on all platforms,
+// and the Windows build constructs the other two, so keep the lint live
+// there.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PtyShellFlavor {
+    /// POSIX-family (`bash`): adjacent double-quoted strings concatenate,
+    /// so `echo "A""B"` types split but prints joined.
+    Posix,
+    /// PowerShell: parenthesized `+` string concatenation,
+    /// `echo ("A" + "B")`.
+    PowerShell,
+    /// `cmd.exe`: no inline concatenation — assemble via a variable set on
+    /// a *preceding* line (`set X=A` then `echo %X%B`; a same-line
+    /// `set … && echo %X%…` would expand `%X%` at parse time, before the
+    /// set runs).
+    Cmd,
+}
+
 /// Select the interactive shell program and argument vector for a PTY-backed
 /// session (the `execPty` path in the runtime).
 ///
@@ -61,13 +87,15 @@ pub fn agent_shell_command(command: &str) -> (&'static str, Vec<String>) {
 ///   analogue of `--norc --noprofile`: it skips profile scripts so the prompt
 ///   and env are deterministic.
 ///
-/// Returns `(program, args)`.
-pub fn pty_shell_command() -> (&'static str, Vec<String>) {
+/// Returns `(program, args, flavor)`; the flavor drives marker emission
+/// (see [`PtyShellFlavor`]).
+pub fn pty_shell_command() -> (&'static str, Vec<String>, PtyShellFlavor) {
     #[cfg(windows)]
     {
         (
             "powershell.exe",
             vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
+            PtyShellFlavor::PowerShell,
         )
     }
     #[cfg(not(windows))]
@@ -75,6 +103,7 @@ pub fn pty_shell_command() -> (&'static str, Vec<String>) {
         (
             "bash",
             vec!["--norc".to_string(), "--noprofile".to_string()],
+            PtyShellFlavor::Posix,
         )
     }
 }
@@ -85,10 +114,10 @@ pub fn pty_shell_command() -> (&'static str, Vec<String>) {
 /// Unix primary (`bash`) has no separate fallback — its absence is a genuine
 /// configuration error there, not a routine condition.
 #[allow(dead_code)]
-pub fn pty_shell_fallback() -> Option<(&'static str, Vec<String>)> {
+pub fn pty_shell_fallback() -> Option<(&'static str, Vec<String>, PtyShellFlavor)> {
     #[cfg(windows)]
     {
-        Some(("cmd.exe", Vec::new()))
+        Some(("cmd.exe", Vec::new(), PtyShellFlavor::Cmd))
     }
     #[cfg(not(windows))]
     {
@@ -155,17 +184,19 @@ mod tests {
 
     #[test]
     fn pty_shell_command_suppresses_startup_files() {
-        let (program, args) = pty_shell_command();
+        let (program, args, flavor) = pty_shell_command();
         #[cfg(windows)]
         {
             assert_eq!(program, "powershell.exe");
             assert!(args.iter().any(|a| a == "-NoProfile"));
+            assert_eq!(flavor, PtyShellFlavor::PowerShell);
         }
         #[cfg(not(windows))]
         {
             assert_eq!(program, "bash");
             assert!(args.iter().any(|a| a == "--norc"));
             assert!(args.iter().any(|a| a == "--noprofile"));
+            assert_eq!(flavor, PtyShellFlavor::Posix);
         }
     }
 
@@ -173,8 +204,9 @@ mod tests {
     fn pty_shell_fallback_is_windows_only() {
         #[cfg(windows)]
         {
-            let (program, _) = pty_shell_fallback().expect("windows has a fallback");
+            let (program, _, flavor) = pty_shell_fallback().expect("windows has a fallback");
             assert_eq!(program, "cmd.exe");
+            assert_eq!(flavor, PtyShellFlavor::Cmd);
         }
         #[cfg(not(windows))]
         {
