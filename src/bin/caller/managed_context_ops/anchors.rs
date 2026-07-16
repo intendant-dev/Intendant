@@ -912,6 +912,55 @@ pub(crate) struct ContextRewindAnchorScan {
 /// thrash each other.
 const ANCHOR_SCAN_CACHE_SLOTS: usize = 4;
 
+/// Racy-write distrust window, the file watcher's established pattern
+/// (`FINGERPRINT_RACY_WINDOW_NANOS`): change stamps carry nanosecond
+/// FIELDS but come from the kernel's coarse file-timestamp clock (Linux
+/// jiffies ~4-10 ms, NTFS ~15 ms, FAT up to 2 s), so a same-length rewrite
+/// landing in the same granule as the cached stamp is metadata-invisible —
+/// proven live by the Linux CI leg, where write → scan → rewrite →
+/// mtime-restore all fit in one jiffy and the cache served the old
+/// catalog. A stamp younger than this window is therefore treated as no
+/// signal: the scan is neither cached nor served from cache until the file
+/// has been quiescent past the coarsest real granule, after which any
+/// later write is guaranteed a distinct stamp.
+const ANCHOR_SCAN_RACY_WINDOW_NANOS: i128 = 2_000_000_000;
+
+/// Test hook mirroring the file watcher's `set_racy_window_for_tests`:
+/// negative = use the production window. The cache is process-global, so
+/// tests that override this serialize on their own lock.
+#[cfg(test)]
+static ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+fn anchor_scan_racy_window_nanos() -> i128 {
+    #[cfg(test)]
+    {
+        let override_nanos =
+            ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+        if override_nanos >= 0 {
+            return i128::from(override_nanos);
+        }
+    }
+    ANCHOR_SCAN_RACY_WINDOW_NANOS
+}
+
+/// Whether the stamp is old enough to trust for caching: the file's last
+/// change predates now by at least the racy window, so any subsequent
+/// write must land in a later clock granule and produce a distinct stamp.
+/// A pre-epoch clock reads as 0 → nothing is quiescent → rescan, the safe
+/// direction. The change signal (unlike mtime) cannot be backdated by
+/// writers, so it is the honest quiescence referent.
+fn anchor_scan_stamp_is_quiescent(stamp: &crate::platform::FileChangeStamp) -> bool {
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i128)
+        .unwrap_or(0);
+    stamp
+        .change_signal_unix_nanos()
+        .saturating_add(anchor_scan_racy_window_nanos())
+        <= now_nanos
+}
+
 struct CachedAnchorScan {
     path: PathBuf,
     len: u64,
@@ -940,6 +989,9 @@ pub(crate) fn shared_context_rewind_anchor_scan(
     source_rollout_path: &Path,
 ) -> io::Result<std::sync::Arc<ContextRewindAnchorScan>> {
     let (len, stamp) = anchor_scan_fingerprint(source_rollout_path)?;
+    // A stamp inside the racy window is no signal (see the window's doc):
+    // neither served from cache nor cached.
+    let stamp = stamp.filter(anchor_scan_stamp_is_quiescent);
     if let Some(stamp) = stamp {
         let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = cache.iter().position(|entry| {
@@ -2226,13 +2278,27 @@ mod tests {
             .collect()
     }
 
+    /// Serializes the two tests that override the process-global racy
+    /// window (each sets the value it needs at start, so ordering and
+    /// panics cannot leak the wrong window into the other).
+    static ANCHOR_SCAN_RACY_WINDOW_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A same-fingerprint burst answers identically, and an append
-    /// invalidates the cached scan. Content equality, not `Arc::ptr_eq`:
-    /// the cache is a 4-slot process-global LRU, so parallel tests scanning
-    /// other rollouts can evict this entry between the two calls — a miss
-    /// re-derives the same content, which is the contract under test.
+    /// invalidates the cached scan. Runs with the racy window shrunk to
+    /// zero so the just-written file is cacheable and the hit path is
+    /// actually exercised (under the production window a fresh file is
+    /// deliberately uncacheable for 2 s). Content equality, not
+    /// `Arc::ptr_eq`: the cache is a 4-slot process-global LRU, so parallel
+    /// tests scanning other rollouts can evict this entry between the two
+    /// calls — a miss re-derives the same content, which is the contract
+    /// under test.
     #[test]
     fn anchor_scan_cache_serves_burst_and_invalidates_on_append() {
+        let _guard = ANCHOR_SCAN_RACY_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(&path, format!("{}\n", cache_probe_item("call_cache_probe"))).unwrap();
@@ -2252,16 +2318,27 @@ mod tests {
             vec!["call_cache_probe", "call_cache_probe_2"],
             "append must invalidate the cached scan"
         );
+
+        ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS.store(-1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The stale shape the change-stamp key exists for: a same-length
-    /// in-place rewrite whose mtime is restored to the original (the Codex
-    /// same-thread restore class — `message_search/extract_codex.rs`
-    /// detects the rewrite; a (len, mtime) key would serve the old
-    /// catalog). The change stamp moves on every write, so the rewritten
-    /// content must be re-scanned.
+    /// The stale shape the change-stamp key + racy window exist for: a
+    /// same-length in-place rewrite whose mtime is restored to the original
+    /// (the Codex same-thread restore class — `message_search/
+    /// extract_codex.rs` detects the rewrite; a (len, mtime) key would
+    /// serve the old catalog). Runs under the PRODUCTION window: the change
+    /// stamp alone is not sufficient on coarse-granule clocks — the Linux
+    /// CI leg proved a write → scan → rewrite → restore sequence fits in
+    /// one jiffy and ties the stamps — so the racy window keeps the
+    /// just-written file uncacheable and the rewritten content is re-read
+    /// deterministically on every platform's real clock.
     #[test]
     fn anchor_scan_cache_rescans_same_size_mtime_restored_rewrite() {
+        let _guard = ANCHOR_SCAN_RACY_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS.store(-1, std::sync::atomic::Ordering::Relaxed);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         std::fs::write(&path, format!("{}\n", cache_probe_item("call_rewrite_a"))).unwrap();
@@ -2290,6 +2367,45 @@ mod tests {
             scan_item_ids(&after),
             vec!["call_rewrite_b"],
             "an mtime-restored same-size rewrite must not be served stale"
+        );
+    }
+
+    /// The quiescence gate itself: a stamp younger than the window is not
+    /// trusted, one comfortably older is.
+    #[test]
+    fn anchor_scan_stamp_quiescence_tracks_the_window() {
+        let _guard = ANCHOR_SCAN_RACY_WINDOW_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ANCHOR_SCAN_RACY_WINDOW_OVERRIDE_NANOS.store(-1, std::sync::atomic::Ordering::Relaxed);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let Some(stamp) = crate::platform::file_change_stamp(&path, &meta) else {
+            // No signal on this filesystem: the cache is already fully
+            // disabled for such files; nothing to gate.
+            return;
+        };
+        assert!(
+            !anchor_scan_stamp_is_quiescent(&stamp),
+            "a just-written file must sit inside the racy window"
+        );
+        // Backdate past the window, in the platform's native signal scale
+        // (Unix: nanoseconds; Windows: 100 ns FILETIME units).
+        let mut old = stamp;
+        #[cfg(windows)]
+        {
+            old.change_signal -= (ANCHOR_SCAN_RACY_WINDOW_NANOS * 2) / 100;
+        }
+        #[cfg(not(windows))]
+        {
+            old.change_signal -= ANCHOR_SCAN_RACY_WINDOW_NANOS * 2;
+        }
+        assert!(
+            anchor_scan_stamp_is_quiescent(&old),
+            "a stamp older than the window must be trusted"
         );
     }
 

@@ -1357,6 +1357,29 @@ pub struct FileChangeStamp {
     pub identity: FileIdentity,
 }
 
+impl FileChangeStamp {
+    /// The change signal normalized to nanoseconds since the Unix epoch —
+    /// one clock domain for wall-clock comparisons (racy-write quiescence
+    /// windows) regardless of platform. The signal's *fields* are
+    /// nanosecond-precision, but the value comes from the kernel's coarse
+    /// file-timestamp clock (Linux jiffies ~4-10 ms, NTFS ~15 ms, FAT up to
+    /// 2 s), so equal stamps only prove "no change observed at that
+    /// granularity" — quiescence callers must allow for the coarsest real
+    /// granule.
+    pub fn change_signal_unix_nanos(&self) -> i128 {
+        #[cfg(windows)]
+        {
+            // FILETIME epoch (1601-01-01) precedes the Unix epoch by
+            // 11_644_473_600 s; the signal is in 100 ns units.
+            (self.change_signal - 116_444_736_000_000_000) * 100
+        }
+        #[cfg(not(windows))]
+        {
+            self.change_signal
+        }
+    }
+}
+
 /// Best-available change stamp for the file at `path`.
 ///
 /// Unix reads both fields from `metadata` (no extra I/O). Windows needs an
