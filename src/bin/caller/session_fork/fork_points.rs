@@ -62,6 +62,8 @@ pub(crate) fn codex_fork_points_from_parts(
                 seq: None,
                 item_id: None,
                 position: None,
+                message_uuid: None,
+                pre_compaction: false,
                 preview: fork_point_preview(&turn.text),
                 eligible: true,
                 eligibility_reasons: Vec::new(),
@@ -100,6 +102,8 @@ pub(crate) fn codex_fork_points_from_parts(
                 seq: None,
                 item_id: Some(entry.item_id.clone()),
                 position: Some(entry.position_hint),
+                message_uuid: None,
+                pre_compaction: false,
                 preview: fork_point_preview(&entry.summary),
                 eligible,
                 eligibility_reasons: reasons,
@@ -222,6 +226,8 @@ pub(crate) fn native_fork_points(
             seq: Some(last.seq),
             item_id: None,
             position: None,
+            message_uuid: None,
+            pre_compaction: false,
             preview: format!("{}: {}", last.role, last.preview),
             eligible,
             eligibility_reasons: if eligible {
@@ -248,6 +254,8 @@ pub(crate) fn native_fork_points(
             seq: Some(prev.seq),
             item_id: None,
             position: None,
+            message_uuid: None,
+            pre_compaction: false,
             preview: lines[msg_index].preview.clone(),
             eligible,
             eligibility_reasons: if eligible {
@@ -259,6 +267,128 @@ pub(crate) fn native_fork_points(
         });
     }
 
+    page_fork_points(&mut catalog, points, query);
+    Ok(catalog)
+}
+
+/// Fork points for a Claude Code session, derived from its transcript
+/// tree: the active head, inactive sibling branch tips, and user-turn
+/// boundaries on the active chain. Every anchor is a chain-slice target
+/// (the fork keeps the anchor's ancestor chain), so pre-compaction
+/// anchors are fully eligible and only flagged informationally.
+pub(crate) fn claude_fork_points(
+    session_id: &str,
+    backend_session_id: &str,
+    transcript_path: &Path,
+    query: &ForkPointQuery,
+) -> io::Result<ForkPointCatalog> {
+    let tree = shared_claude_tree_scan(transcript_path)?;
+    let mut keyed: Vec<(usize, ForkPoint)> = Vec::new();
+
+    if let Some(leaf_uuid) = tree.active_leaf.as_deref() {
+        if let Some(leaf) = tree.node(leaf_uuid) {
+            keyed.push((
+                leaf.line_no,
+                ForkPoint {
+                    id: "head".to_string(),
+                    kind: "head",
+                    granularity: "message",
+                    turn: None,
+                    seq: None,
+                    item_id: None,
+                    position: None,
+                    message_uuid: Some(leaf.uuid.clone()),
+                    pre_compaction: false,
+                    preview: format!("{}: {}", leaf.kind, leaf.preview),
+                    eligible: true,
+                    eligibility_reasons: Vec::new(),
+                    effective_cut: None,
+                },
+            ));
+        }
+
+        // User-turn boundaries on the active chain: forking "before this
+        // user turn" keeps the chain through the turn's parent.
+        let chain = tree.ancestor_chain(leaf_uuid);
+        let user_turns = chain
+            .iter()
+            .rev()
+            .filter(|node| node.kind == "user")
+            .count() as u32;
+        let mut ordinal = user_turns;
+        for node in &chain {
+            if node.kind != "user" {
+                continue;
+            }
+            let turn_ordinal = ordinal;
+            ordinal = ordinal.saturating_sub(1);
+            let Some(parent_uuid) = node.parent_uuid.as_deref() else {
+                continue; // the first turn: keeping nothing has no value
+            };
+            keyed.push((
+                node.line_no,
+                ForkPoint {
+                    id: format!("msg:{parent_uuid}"),
+                    kind: "message",
+                    granularity: "message",
+                    turn: Some(turn_ordinal.saturating_sub(1)),
+                    seq: None,
+                    item_id: None,
+                    position: None,
+                    message_uuid: Some(parent_uuid.to_string()),
+                    pre_compaction: tree.anchor_is_pre_compaction(parent_uuid),
+                    preview: node.preview.clone(),
+                    eligible: true,
+                    eligibility_reasons: Vec::new(),
+                    effective_cut: None,
+                },
+            ));
+        }
+    }
+
+    for tip in tree.message_leaves() {
+        if Some(tip.uuid.as_str()) == tree.active_leaf.as_deref() {
+            continue;
+        }
+        keyed.push((
+            tip.line_no,
+            ForkPoint {
+                id: format!("tip:{}", tip.uuid),
+                kind: "branch-tip",
+                granularity: "message",
+                turn: None,
+                seq: None,
+                item_id: None,
+                position: None,
+                message_uuid: Some(tip.uuid.clone()),
+                pre_compaction: tree.anchor_is_pre_compaction(&tip.uuid),
+                preview: format!("{}: {}", tip.kind, tip.preview),
+                eligible: true,
+                eligibility_reasons: Vec::new(),
+                effective_cut: None,
+            },
+        ));
+    }
+
+    keyed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let points: Vec<ForkPoint> = keyed.into_iter().map(|(_, point)| point).collect();
+
+    let mut catalog = ForkPointCatalog {
+        session_id: session_id.to_string(),
+        source: "claude-code".to_string(),
+        backend_session_id: Some(backend_session_id.to_string()),
+        supported: true,
+        unsupported_reason: None,
+        notes: vec![
+            "anchors chain-slice the transcript: a fork keeps the anchor's ancestor chain in a new session file".to_string(),
+            "pre_compaction anchors fork with full pre-compaction history (the slice omits the compact boundary)".to_string(),
+        ],
+        total: 0,
+        offset: 0,
+        limit: 0,
+        next_offset: None,
+        fork_points: Vec::new(),
+    };
     page_fork_points(&mut catalog, points, query);
     Ok(catalog)
 }
@@ -511,5 +641,74 @@ mod tests {
         assert_eq!(catalog.total, 4);
         assert_eq!(catalog.fork_points.len(), 2);
         assert_eq!(catalog.next_offset, Some(3));
+    }
+
+    fn write_claude_transcript(lines: &[String]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir
+            .path()
+            .join("22222222-0000-0000-0000-000000000000.jsonl");
+        std::fs::write(&path, lines.join("\n") + "\n").expect("write");
+        (dir, path)
+    }
+
+    #[test]
+    fn claude_points_cover_head_turns_and_branch_tips() {
+        use crate::session_fork::test_fixtures::message_line;
+        let (_dir, path) = write_claude_transcript(&[
+            message_line("u1", None, "user", "round one", false),
+            message_line("a1", Some("u1"), "assistant", "answer one", false),
+            message_line("a1b", Some("u1"), "assistant", "abandoned sibling", false),
+            message_line("u2", Some("a1b"), "user", "round two", false),
+            message_line("a2", Some("u2"), "assistant", "answer two", false),
+        ]);
+        let catalog =
+            claude_fork_points("wrapper", "backend-id", &path, &ForkPointQuery::default())
+                .expect("catalog");
+        assert!(catalog.supported);
+        let ids: Vec<&str> = catalog
+            .fork_points
+            .iter()
+            .map(|point| point.id.as_str())
+            .collect();
+        // head (a2), before round two (anchor a1b), branch tip (a1),
+        // newest-first by transcript line.
+        assert_eq!(ids, vec!["head", "msg:a1b", "tip:a1"]);
+        assert_eq!(catalog.fork_points[1].message_uuid.as_deref(), Some("a1b"));
+        assert_eq!(catalog.fork_points[1].preview, "round two");
+        assert!(catalog.fork_points.iter().all(|point| point.eligible));
+    }
+
+    #[test]
+    fn claude_pre_compaction_anchors_are_flagged_and_eligible() {
+        use crate::session_fork::test_fixtures::{boundary_line, message_line};
+        // Append-only chronology: the abandoned pre-compact sibling was
+        // written before the compaction happened.
+        let (_dir, path) = write_claude_transcript(&[
+            message_line("u1", None, "user", "old round", false),
+            message_line("a1", Some("u1"), "assistant", "old answer", false),
+            message_line("tip", Some("a1"), "assistant", "pre-compact tip", false),
+            boundary_line("b1", "a1"),
+            message_line("u2", Some("b1"), "user", "post-compact round", false),
+            message_line("a2", Some("u2"), "assistant", "post answer", false),
+        ]);
+        let catalog =
+            claude_fork_points("wrapper", "backend-id", &path, &ForkPointQuery::default())
+                .expect("catalog");
+        let tip = catalog
+            .fork_points
+            .iter()
+            .find(|point| point.id == "tip:tip")
+            .expect("pre-compact tip listed");
+        assert!(tip.pre_compaction);
+        assert!(tip.eligible);
+        // The post-compact turn's anchor is the boundary itself — not
+        // flagged pre-compaction.
+        let post = catalog
+            .fork_points
+            .iter()
+            .find(|point| point.id == "msg:b1")
+            .expect("post-compact turn boundary listed");
+        assert!(!post.pre_compaction);
     }
 }
