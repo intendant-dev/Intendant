@@ -149,6 +149,66 @@ const UDP_BUF_LEN: usize = 2000;
 /// memory allocation from a malicious peer.
 const TCP_MAX_FRAME_LEN: usize = 65535;
 
+/// Latest-wins hand-off slot for **complete** tile-snapshot groups,
+/// shared between one peer's [`WebRtcPeer`] handle (producer side) and
+/// its driver task (consumer side).
+///
+/// Snapshot groups deliberately bypass the ordinary bounded command
+/// channel: each group owns every wire chunk of one snapshot (multi-MB),
+/// and a command queue of them retains up to its capacity in full
+/// generations — plus unboundedly more in any producer tasks parked on
+/// a full channel's `send().await`. This slot caps upstream retention
+/// at **exactly one group per peer by construction**: `publish` is a
+/// synchronous replace (never an await holding a group), and a newer
+/// group simply overwrites an unconsumed older one — which is correct,
+/// because a snapshot is a full-screen baseline and only the newest
+/// matters. Admission (the driver's persisted watermark) still gates
+/// at consume time.
+///
+/// A producer cancelled mid-encode never calls `publish`, so — like the
+/// downstream pre-open queue — this slot can never hold a partial group.
+pub(crate) struct SnapshotMailbox {
+    /// The newest unconsumed complete group: `(snapshot_id, chunks)`.
+    slot: std::sync::Mutex<Option<(u32, Vec<bytes::Bytes>)>>,
+    /// Wakes the driver's drain arm. `notify_one` stores a permit when
+    /// no drain is waiting, so a publish that lands before the driver
+    /// reaches its select loop is not lost.
+    notify: tokio::sync::Notify,
+}
+
+impl SnapshotMailbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Replace the pending group with a newer one and wake the driver.
+    /// Synchronous by design — see the type docs.
+    pub(crate) fn publish(&self, snapshot_id: u32, chunks: Vec<bytes::Bytes>) {
+        *self
+            .slot
+            .lock()
+            .expect("snapshot mailbox mutex poisoned (no panics hold it)") =
+            Some((snapshot_id, chunks));
+        self.notify.notify_one();
+    }
+
+    /// Take the pending group, if any.
+    pub(crate) fn take(&self) -> Option<(u32, Vec<bytes::Bytes>)> {
+        self.slot
+            .lock()
+            .expect("snapshot mailbox mutex poisoned (no panics hold it)")
+            .take()
+    }
+
+    /// Wait until a publish has occurred since the last drain.
+    pub(crate) async fn ready(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// Public handle to a single WebRTC peer.
 ///
 /// All operations route to the driver task via channels; the driver owns the
@@ -157,6 +217,9 @@ pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
     command_tx: mpsc::Sender<Command>,
+    /// Latest-wins snapshot hand-off to this peer's driver — see
+    /// [`SnapshotMailbox`] for why snapshots do not ride `command_tx`.
+    snapshot_mailbox: Arc<SnapshotMailbox>,
     /// Live capability gate for both directions of clipboard sync. Display
     /// viewing alone must not disclose or mutate the host clipboard; callers
     /// bind this to the same authority that admits interactive display input.
@@ -377,6 +440,7 @@ impl WebRtcPeer {
         Self {
             peer_id,
             command_tx,
+            snapshot_mailbox: Arc::new(SnapshotMailbox::new()),
             clipboard_authorized: crate::BrowserInputAuthorization::new(Arc::new(|| true)),
             interactive_source: None,
             observed_send_bitrate_rx,
@@ -597,20 +661,6 @@ pub(crate) enum Command {
     SendTileFrame {
         channel: TileDataChannel,
         data: bytes::Bytes,
-    },
-    /// D-3b: one **complete** tile snapshot — every wire chunk of one
-    /// producer snapshot id, in send order, in a single command.
-    ///
-    /// Atomic whole-group hand-off is the partial-baseline defense: a
-    /// producer cancelled mid-encode (peer detach, resize mid-send)
-    /// simply never issues the command, so a partial chunk set cannot
-    /// reach the driver's pre-open queue; supersession there swaps
-    /// complete-for-complete. The chunk vector is finite by
-    /// construction (the packer caps chunks at a u16 count of ≤32KiB
-    /// messages).
-    SendTileSnapshot {
-        snapshot_id: u32,
-        chunks: Vec<bytes::Bytes>,
     },
 }
 

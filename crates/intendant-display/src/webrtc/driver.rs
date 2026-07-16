@@ -82,38 +82,12 @@ pub(crate) struct DriverState {
     /// producer side is not throttled by the channel's send-await
     /// semantics.
     pending_authority_state: Vec<(u32, DisplayInputAuthorityState)>,
-    /// D-3b: queued tile control frames awaiting `tile-control`
-    /// channel open. Low-rate reliable control only; never per-frame.
-    /// Byte-capped drop-oldest (see [`push_pending_tile_bounded`]): a
-    /// channel that closed (OnClose removes its label) while the peer
-    /// stays a tile subscriber would otherwise grow this without
-    /// bound, and control frames are self-contained — the latest
-    /// state wins.
-    pending_tile_control: VecDeque<Bytes>,
-    /// D-3b: the **one complete snapshot** (producer snapshot id +
-    /// every wire chunk, in send order) awaiting `tile-snapshot`
-    /// channel open. A snapshot is only decodable as a complete chunk
-    /// set, and [`Command::SendTileSnapshot`] hands groups over
-    /// atomically, so this holds at most one complete group *by
-    /// construction*: a newer accepted group replaces the old one
-    /// whole, and a producer cancelled mid-encode never issues the
-    /// command at all — no partial baseline can be published here.
-    ///
-    /// Bound story: ≤1 complete group by construction. No sanity
-    /// byte-cap on that group — it is one bounded burst from our own
-    /// packer (a u16 chunk count of ≤32KiB messages, in practice a
-    /// few MB), and dropping any of it would strand the browser on an
-    /// unassemblable baseline, which is exactly the failure this
-    /// design exists to prevent. Tile deltas intentionally have no
-    /// queue.
-    pending_tile_snapshot: Option<(u32, Vec<Bytes>)>,
-    /// Newest snapshot id ever accepted by this driver (written or
-    /// queued). Persisted here — NOT derived from queue contents — so
-    /// it survives open/drain/close cycles: a late group from an
-    /// older, superseded producer is rejected even when the queue is
-    /// empty, instead of resurrecting a stale baseline. See
-    /// [`admit_snapshot_group`].
-    tile_snapshot_watermark: Option<u32>,
+    /// D-3b: the queued-before-open reliable tile state (control
+    /// queue, the one complete pending snapshot, and the snapshot
+    /// admission watermark). Grouped in [`PendingTileQueues`] so the
+    /// production placement/drain policy is directly unit-testable —
+    /// tests call the same methods this driver calls, not a mirror.
+    pending_tiles: PendingTileQueues,
     /// D-4c: event-driven backpressure state for the supersedable
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
@@ -223,6 +197,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
+    snapshot_mailbox: Arc<SnapshotMailbox>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     interactive_source: Option<Arc<crate::BrowserInputSource>>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -294,9 +269,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
         video_specs: Vec::new(),
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
-        pending_tile_control: VecDeque::new(),
-        pending_tile_snapshot: None,
-        tile_snapshot_watermark: None,
+        pending_tiles: PendingTileQueues::default(),
         tile_delta_backpressure: TileDeltaBackpressure::new(),
         first_frame_at: None,
         rtp: RtpSendState {
@@ -745,6 +718,26 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_timeout after command failed: {e:?}"
+                    );
+                    shutdown.cancel();
+                    for h in forwarder_handles {
+                        let _ = h.await;
+                    }
+                    return;
+                }
+            }
+            // Latest-wins snapshot mailbox: complete groups bypass the
+            // bounded command channel (a queue of multi-MB groups would
+            // retain up to its capacity in full generations — see
+            // `SnapshotMailbox`). At most one group is ever pending;
+            // the drain loop below empties whatever raced in.
+            _ = snapshot_mailbox.ready() => {
+                while let Some((snapshot_id, chunks)) = snapshot_mailbox.take() {
+                    handle_snapshot_group(&mut rtc, &mut state, snapshot_id, chunks);
+                }
+                if let Err(e) = rtc.handle_timeout(Instant::now()) {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: handle_timeout after snapshot failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -1781,7 +1774,7 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                 match channel {
                     TileDataChannel::Control => {
                         push_pending_tile_bounded(
-                            &mut state.pending_tile_control,
+                            &mut state.pending_tiles.control,
                             data,
                             PENDING_TILE_CONTROL_MAX_BYTES,
                             label,
@@ -1789,59 +1782,55 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                     }
                     TileDataChannel::Snapshot => {
                         // Unreachable via the public boundary: snapshot
-                        // chunks travel as whole groups through
-                        // `Command::SendTileSnapshot`. Queueing a lone
+                        // chunks travel as whole groups through the
+                        // peer's `SnapshotMailbox`. Queueing a lone
                         // chunk here would publish a partial
                         // (unassemblable) baseline, so drop it.
                         eprintln!(
                             "[display/webrtc] dropping per-chunk snapshot \
                              frame queued before open — snapshots must use \
-                             SendTileSnapshot (whole-group boundary)"
+                             the whole-group snapshot mailbox"
                         );
                     }
                     TileDataChannel::Deltas => {}
                 }
             }
         }
-        Command::SendTileSnapshot {
-            snapshot_id,
-            chunks,
-        } => {
-            // Admission first, shared by the open and pre-open paths:
-            // stale groups are rejected against the persisted
-            // watermark (which survives drains), so a late producer
-            // for a superseded snapshot can neither hit the wire after
-            // a newer baseline nor resurrect itself into an emptied
-            // queue.
-            if !admit_snapshot_group(&mut state.tile_snapshot_watermark, snapshot_id) {
-                return;
-            }
-            if let Some(cid) = state.channels.get(TILE_SNAPSHOT_CHANNEL_LABEL).copied() {
-                if let Some(mut dc) = rtc.data_channel(cid) {
-                    for chunk in &chunks {
-                        if let Err(e) = dc.send(BytesMut::from(&chunk[..])) {
-                            eprintln!(
-                                "[display/webrtc] tile channel write failed on \
-                                 {TILE_SNAPSHOT_CHANNEL_LABEL}: {e:?}"
-                            );
-                        }
-                    }
-                }
-            } else {
-                // Pre-open: swap complete-for-complete. The queue holds
-                // at most one complete group by construction — see the
-                // `pending_tile_snapshot` field doc for the bound story.
-                if let Some((old_id, old_chunks)) =
-                    state.pending_tile_snapshot.replace((snapshot_id, chunks))
-                {
-                    eprintln!(
-                        "[display/webrtc] pending tile-snapshot: snapshot \
-                         {snapshot_id} supersedes queued snapshot {old_id} \
-                         ({} chunks) before the channel opened",
-                        old_chunks.len(),
-                    );
-                }
-            }
+    }
+}
+
+/// Consume one complete snapshot group from the peer's
+/// [`SnapshotMailbox`]: admission against the persisted watermark,
+/// then write-now (channel open) or queue-whole (pre-open) — the
+/// decision lives in the production
+/// [`PendingTileQueues::place_snapshot_group`], which the unit tests
+/// exercise directly.
+fn handle_snapshot_group<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    state: &mut DriverState,
+    snapshot_id: u32,
+    chunks: Vec<Bytes>,
+) {
+    let open_cid = state.channels.get(TILE_SNAPSHOT_CHANNEL_LABEL).copied();
+    let Some(deliver) =
+        state
+            .pending_tiles
+            .place_snapshot_group(open_cid.is_some(), snapshot_id, chunks)
+    else {
+        return;
+    };
+    let Some(cid) = open_cid else {
+        return;
+    };
+    let Some(mut dc) = rtc.data_channel(cid) else {
+        return;
+    };
+    for chunk in &deliver {
+        if let Err(e) = dc.send(BytesMut::from(&chunk[..])) {
+            eprintln!(
+                "[display/webrtc] tile channel write failed on \
+                 {TILE_SNAPSHOT_CHANNEL_LABEL}: {e:?}"
+            );
         }
     }
 }
@@ -1979,20 +1968,105 @@ pub(crate) fn drain_pending_tile_for_label(
     state: &mut DriverState,
     label: &str,
 ) -> VecDeque<Bytes> {
-    match label {
-        TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
-        // Draining the queued snapshot deliberately leaves
-        // `tile_snapshot_watermark` in place: the watermark is the
-        // stale-group rejector and must survive open/drain/close
-        // cycles (deriving it from queue contents would let a late
-        // producer of a superseded snapshot repopulate the emptied
-        // queue with a stale baseline).
-        TILE_SNAPSHOT_CHANNEL_LABEL => state
-            .pending_tile_snapshot
-            .take()
-            .map(|(_, chunks)| chunks.into())
-            .unwrap_or_default(),
-        _ => VecDeque::new(),
+    state.pending_tiles.drain_for_label(label)
+}
+
+/// The queued-before-open reliable tile state for one driver: the
+/// control frame queue, the (at most one, complete) pending snapshot,
+/// and the snapshot admission watermark. Grouped in one plainly
+/// constructible struct so the unit tests exercise the **production**
+/// placement/drain methods below — not a re-implementation.
+#[derive(Default)]
+pub(crate) struct PendingTileQueues {
+    /// D-3b: queued tile control frames awaiting `tile-control`
+    /// channel open. Low-rate reliable control only; never per-frame.
+    /// Byte-capped drop-oldest (see [`push_pending_tile_bounded`]): a
+    /// channel that closed (OnClose removes its label) while the peer
+    /// stays a tile subscriber would otherwise grow this without
+    /// bound, and control frames are self-contained — the latest
+    /// state wins.
+    pub(crate) control: VecDeque<Bytes>,
+    /// D-3b: the **one complete snapshot** (producer snapshot id +
+    /// every wire chunk, in send order) awaiting `tile-snapshot`
+    /// channel open. A snapshot is only decodable as a complete chunk
+    /// set, and the peer's `SnapshotMailbox` hands groups over
+    /// atomically, so this holds at most one complete group *by
+    /// construction*: a newer accepted group replaces the old one
+    /// whole, and a producer cancelled mid-encode never publishes at
+    /// all — no partial baseline can exist here.
+    ///
+    /// Bound story: ≤1 complete group by construction. No sanity
+    /// byte-cap on that group — it is one bounded burst from our own
+    /// packer (a u16 chunk count of ≤32KiB messages, in practice a
+    /// few MB), and dropping any of it would strand the browser on an
+    /// unassemblable baseline, which is exactly the failure this
+    /// design exists to prevent. Tile deltas intentionally have no
+    /// queue.
+    snapshot: Option<(u32, Vec<Bytes>)>,
+    /// Newest snapshot id ever accepted by this driver (written or
+    /// queued). Persisted here — NOT derived from queue contents — so
+    /// it survives open/drain/close cycles: a late group from an
+    /// older, superseded producer is rejected even when the queue is
+    /// empty, instead of resurrecting a stale baseline. See
+    /// [`admit_snapshot_group`].
+    snapshot_watermark: Option<u32>,
+}
+
+impl PendingTileQueues {
+    /// Production admission + placement for one complete snapshot
+    /// group — the single code path [`handle_snapshot_group`] calls.
+    ///
+    /// Admission first, shared by both paths: stale groups (id at or
+    /// below the persisted watermark) are rejected, so a late producer
+    /// for a superseded snapshot can neither hit the wire after a
+    /// newer baseline nor resurrect itself into an emptied queue.
+    /// Returns `Some(chunks)` when the group was admitted and the
+    /// channel is open (the caller writes them now); `None` when the
+    /// group was rejected as stale or queued whole for the pre-open
+    /// flush.
+    pub(crate) fn place_snapshot_group(
+        &mut self,
+        snapshot_open: bool,
+        snapshot_id: u32,
+        chunks: Vec<Bytes>,
+    ) -> Option<Vec<Bytes>> {
+        if !admit_snapshot_group(&mut self.snapshot_watermark, snapshot_id) {
+            return None;
+        }
+        if snapshot_open {
+            return Some(chunks);
+        }
+        // Pre-open: swap complete-for-complete — see the `snapshot`
+        // field doc for the bound story.
+        if let Some((old_id, old_chunks)) = self.snapshot.replace((snapshot_id, chunks)) {
+            eprintln!(
+                "[display/webrtc] pending tile-snapshot: snapshot \
+                 {snapshot_id} supersedes queued snapshot {old_id} \
+                 ({} chunks) before the channel opened",
+                old_chunks.len(),
+            );
+        }
+        None
+    }
+
+    /// Production drain for a just-opened reliable tile channel:
+    /// returns every queued frame for `label` in send order.
+    ///
+    /// Draining the snapshot deliberately leaves `snapshot_watermark`
+    /// in place: the watermark is the stale-group rejector and must
+    /// survive open/drain/close cycles (deriving it from queue
+    /// contents would let a late producer of a superseded snapshot
+    /// repopulate the emptied queue with a stale baseline).
+    pub(crate) fn drain_for_label(&mut self, label: &str) -> VecDeque<Bytes> {
+        match label {
+            TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut self.control),
+            TILE_SNAPSHOT_CHANNEL_LABEL => self
+                .snapshot
+                .take()
+                .map(|(_, chunks)| chunks.into())
+                .unwrap_or_default(),
+            _ => VecDeque::new(),
+        }
     }
 }
 
@@ -3080,113 +3154,114 @@ mod tests {
         Bytes::from(vec![byte; len])
     }
 
-    /// Mirror of the `Command::SendTileSnapshot` pre-open arm's policy
-    /// (admission against the persisted watermark, then a
-    /// complete-for-complete swap), operating on the same state fields
-    /// the driver holds. Returns whether the group was accepted.
-    fn admit_and_queue(
-        watermark: &mut Option<u32>,
-        pending: &mut Option<(u32, Vec<Bytes>)>,
-        snapshot_id: u32,
-        chunks: Vec<Bytes>,
-    ) -> bool {
-        if !admit_snapshot_group(watermark, snapshot_id) {
-            return false;
-        }
-        *pending = Some((snapshot_id, chunks));
-        true
-    }
-
     /// The pre-open snapshot store holds at most **one complete
-    /// group**: supersession swaps complete-for-complete, and a
-    /// cancelled producer never publishes anything at all — the
-    /// whole-group `SendTileSnapshot` boundary means "cancelled
-    /// mid-group" is simply "the command was never sent", so no
-    /// partial baseline can exist here. (v1 of this queue accepted
-    /// per-chunk pushes; a producer cancelled after one chunk left an
-    /// unassemblable baseline queued.)
+    /// group**, exercised through the production
+    /// [`PendingTileQueues::place_snapshot_group`] /
+    /// [`PendingTileQueues::drain_for_label`] — the same methods the
+    /// driver's mailbox drain and OnOpen flush call. "Cancelled
+    /// mid-group" needs no queue-side handling by construction: the
+    /// whole-group boundary means a cancelled producer never publishes,
+    /// so nothing partial and nothing stale-partial can exist here.
     #[test]
     fn pending_snapshot_holds_only_complete_groups() {
-        let mut watermark: Option<u32> = None;
-        let mut pending: Option<(u32, Vec<Bytes>)> = None;
+        let mut q = PendingTileQueues::default();
 
-        // A complete snapshot queues whole...
-        assert!(admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            7,
-            vec![chunk(7, 100); 3],
-        ));
-        // ...and a cancelled newer producer (id 8 minted, command
-        // never sent) leaves it fully intact: nothing to enqueue means
-        // nothing partial and nothing lost.
-        let (id, chunks) = pending.clone().expect("snapshot 7 queued");
-        assert_eq!(id, 7);
-        assert_eq!(chunks.len(), 3, "complete group retained");
+        // A complete snapshot queues whole (channel not open).
+        assert!(q
+            .place_snapshot_group(false, 7, vec![chunk(7, 100); 3])
+            .is_none());
 
         // A newer complete snapshot swaps complete-for-complete.
-        assert!(admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            9,
-            vec![chunk(9, 100); 2],
-        ));
-        let (id, chunks) = pending.clone().expect("snapshot 9 queued");
-        assert_eq!(id, 9);
-        assert_eq!(chunks.len(), 2);
+        assert!(q
+            .place_snapshot_group(false, 9, vec![chunk(9, 100); 2])
+            .is_none());
+
+        // The production drain yields exactly the newest complete
+        // group, in order — never a partial mix.
+        let drained = q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL);
+        assert_eq!(drained.len(), 2);
         assert!(
-            chunks.iter().all(|c| c[0] == 9),
+            drained.iter().all(|c| c[0] == 9),
             "no chunk of the superseded group survives"
         );
     }
 
-    /// The watermark persists in DriverState across drains: a late
-    /// group from an older, superseded producer must be rejected even
-    /// when the queue is empty — deriving freshness from queue
-    /// contents would let it resurrect a stale baseline between a
-    /// drain and the next channel open.
+    /// An open channel delivers the admitted group to the caller for
+    /// immediate write; nothing is queued and the watermark still
+    /// advances (a stale group arriving while open is rejected too).
+    #[test]
+    fn open_channel_snapshot_delivers_and_advances_watermark() {
+        let mut q = PendingTileQueues::default();
+
+        let delivered = q
+            .place_snapshot_group(true, 5, vec![chunk(5, 10); 2])
+            .expect("admitted group on an open channel is delivered");
+        assert_eq!(delivered.len(), 2);
+        assert!(
+            q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).is_empty(),
+            "open-path delivery must not also queue"
+        );
+
+        // Stale group while open: rejected by the same watermark.
+        assert!(q
+            .place_snapshot_group(true, 5, vec![chunk(5, 10)])
+            .is_none());
+        assert!(q
+            .place_snapshot_group(true, 4, vec![chunk(4, 10)])
+            .is_none());
+    }
+
+    /// The watermark persists across drains: a late group from an
+    /// older, superseded producer must be rejected even when the queue
+    /// is empty — deriving freshness from queue contents would let it
+    /// resurrect a stale baseline between a drain and the next channel
+    /// open.
     #[test]
     fn stale_snapshot_group_rejected_after_drain() {
-        let mut watermark: Option<u32> = None;
-        let mut pending: Option<(u32, Vec<Bytes>)> = None;
+        let mut q = PendingTileQueues::default();
 
-        assert!(admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            5,
-            vec![chunk(5, 10); 2],
-        ));
-        // Channel opens: the queue drains, the watermark stays.
-        let drained = pending.take().expect("snapshot 5 drained");
-        assert_eq!(drained.1.len(), 2);
+        assert!(q
+            .place_snapshot_group(false, 5, vec![chunk(5, 10); 2])
+            .is_none());
+        // Channel opens: the production drain empties the queue, the
+        // watermark stays.
+        assert_eq!(q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).len(), 2);
 
         // Late group from an older producer: rejected, queue stays empty.
-        assert!(!admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            4,
-            vec![chunk(4, 10)],
-        ));
+        assert!(q
+            .place_snapshot_group(false, 4, vec![chunk(4, 10)])
+            .is_none());
         // Same id as already accepted: also rejected (<=).
-        assert!(!admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            5,
-            vec![chunk(5, 10)],
-        ));
+        assert!(q
+            .place_snapshot_group(false, 5, vec![chunk(5, 10)])
+            .is_none());
         assert!(
-            pending.is_none(),
+            q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).is_empty(),
             "stale groups must not repopulate the queue"
         );
 
-        // A genuinely newer group is admitted.
-        assert!(admit_and_queue(
-            &mut watermark,
-            &mut pending,
-            6,
-            vec![chunk(6, 10)],
-        ));
-        assert_eq!(pending.expect("snapshot 6 queued").0, 6);
+        // A genuinely newer group is admitted and queued.
+        assert!(q
+            .place_snapshot_group(false, 6, vec![chunk(6, 10)])
+            .is_none());
+        let drained = q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0][0], 6);
+    }
+
+    /// N rapid publishes retain at most one group upstream: the
+    /// mailbox is latest-wins, so a snapshot-request storm holds one
+    /// complete generation per peer — never a queue of them.
+    #[test]
+    fn snapshot_mailbox_retains_only_latest_group() {
+        let mailbox = SnapshotMailbox::new();
+        for id in 0..64u32 {
+            mailbox.publish(id, vec![chunk(id as u8, 10); 4]);
+        }
+        let (id, chunks) = mailbox.take().expect("latest group retained");
+        assert_eq!(id, 63);
+        assert_eq!(chunks.len(), 4, "retained group is complete");
+        assert!(mailbox.take().is_none(), "exactly one group retained");
     }
 
     /// Plain increasing admission: ids only ever move forward (the

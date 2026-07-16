@@ -1477,22 +1477,18 @@ async fn encode_tile_snapshot_frames(
     Some(out)
 }
 
-/// Send already-encoded snapshot wire frames to one peer as one
+/// Publish already-encoded snapshot wire frames to one peer as one
 /// **complete group** (refcount bumps per chunk; see
-/// [`encode_tile_snapshot_frames`]). The atomic hand-off is what keeps
-/// a partial baseline out of the driver's pre-open queue: a producer
-/// cancelled before this call publishes nothing.
-async fn send_tile_snapshot_frames_to_peer(
+/// [`encode_tile_snapshot_frames`]). Synchronous latest-wins hand-off:
+/// the producer never awaits while holding a group, and a cancelled
+/// producer publishes nothing — a partial baseline can exist neither
+/// upstream (the peer's mailbox) nor in the driver's pre-open queue.
+fn send_tile_snapshot_frames_to_peer(
     peer: &Arc<webrtc::WebRtcPeer>,
     frames: &[bytes::Bytes],
     snapshot_id: u32,
 ) {
-    if let Err(e) = peer
-        .send_tile_snapshot_group(snapshot_id, frames.to_vec())
-        .await
-    {
-        eprintln!("[display/tile] send snapshot failed: {e}");
-    }
+    peer.send_tile_snapshot_group(snapshot_id, frames.to_vec());
 }
 
 async fn send_tile_snapshot_to_peer(
@@ -1506,7 +1502,7 @@ async fn send_tile_snapshot_to_peer(
     if let Some(frames) =
         encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters).await
     {
-        send_tile_snapshot_frames_to_peer(&peer, &frames, snapshot_id).await;
+        send_tile_snapshot_frames_to_peer(&peer, &frames, snapshot_id);
     }
 }
 
@@ -2914,7 +2910,7 @@ impl DisplaySession {
                             .await
                             {
                                 for peer in &peers_now {
-                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id).await;
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id);
                                 }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -2934,7 +2930,7 @@ impl DisplaySession {
                             .await
                             {
                                 for peer in &peers_now {
-                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id).await;
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id);
                                 }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
@@ -3098,8 +3094,7 @@ impl DisplaySession {
                                                 peer,
                                                 &frames,
                                                 snapshot_id,
-                                            )
-                                            .await;
+                                            );
                                         }
                                     }
                                 }
