@@ -5,6 +5,8 @@ members = [
     "crates/intendant-core",
     "crates/intendant-display",
     "crates/intendant-platform",
+    "crates/owner-plane-core",
+    "crates/owner-plane-reducer",
     "crates/presence-core",
     "crates/presence-web",
     "crates/rustc-governor",

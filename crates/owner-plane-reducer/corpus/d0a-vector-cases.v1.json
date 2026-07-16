@@ -1,0 +1,2826 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://intendant.dev/schemas/d0a-vector-cases.v1.json",
+  "title": "D0-A vector case contracts (normative companion, D-91)",
+  "description": "Companion to d0a-vector.v1.json (the container schema, spec §13.1). A vector is valid only if it validates against BOTH schemas; a harness never invents family semantics. This file closes the per-family case_kind vocabulary and pins, per case_kind, the exact `inputs` and `expected.result` field schemas. Object inputs are lowercase hex of canonical CBOR bytes; results are canonical encodings or closed-enum strings; `outcome`/`disposition` strings are cross-validated by the harness against spec §10.4/§10.5 (no duplicated enum to drift). Authored before any fixture (D-91). In scope for the Gate-A prose↔vector discrepancy audit: behavior a fixture needs that this file cannot express folds back into the specification first. Authored against spec v0.5.19, SHA-256 410880e04433b629d5d11956e322f59832494d8f25042b3dfcf34d8b694c6748.",
+  "x-informative": {
+    "opening-tranche": [
+      "family 11 journal-replay: deferral schedules (erase request vs nonterminal journal; retrieval exclusion immediate; adopted-erasure residual) — D-198",
+      "family 7 fold: C1→I→C2 vs C1→C2→I delayed-reference convergence (unheld ref pends, admits on arrival) — D-199",
+      "family 11 journal-replay: statement-kind XferReopen.basis fails at parse; statement-kind invalidation verifies — D-193/D-200",
+      "family 13 journal-replay: Abort/Reopen and competing terminals inside one Txn — (frame ordinal, record index) order — D-200",
+      "family 7 fold: pending c.revoke_device → grant issued in the window → completing continuation (cessation = completing carrier) — D-195",
+      "family 7 fold: staged frontier → revoke last grant → regrant (the frontier consumed the stage; no resurrection) — D-196",
+      "family 11 fold: frozen owner → collision loser → freeze-basis death → loser re-enters the claimant fold — D-196",
+      "family 7 fold: negation-residual acceptance (P enrolled/burned first; candidate −P accepted under a named role and device) — D-190"
+    ],
+    "notes": [
+      "case_kind names are contract names; the scenario lives in `name` and `source`.",
+      "Contracts shared across families dispatch on case_kind alone; the family tier closes which kinds each family may use.",
+      "`converge: true` obligates the harness to run EVERY listed delivery order PLUS a fresh fold of the union and assert identical final state (the three-run standard)."
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "#/$defs/family_vocabulary"
+    },
+    {
+      "$ref": "#/$defs/case_contracts"
+    },
+    {
+      "if": {
+        "properties": {
+          "case_kind": {
+            "const": "sign-then-verify"
+          }
+        },
+        "required": [
+          "case_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "surfaces": {
+            "items": {
+              "not": {
+                "const": "browser"
+              }
+            }
+          }
+        },
+        "$comment": "The sign-then-verify lane draws P-256 signing nonces from the vector RNG, and WebCrypto's ECDSA cannot inject them (Ed25519 signing is deterministic — the constraint is P-256's, review R8.10): browsers get verify-fixed, never signing draws."
+      }
+    }
+  ],
+  "$defs": {
+    "hex": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{2})*$"
+    },
+    "hexnz": {
+      "type": "string",
+      "pattern": "^([0-9a-f]{2})+$"
+    },
+    "hex32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hexcbor": {
+      "$ref": "#/$defs/hexnz",
+      "$comment": "lowercase hex of canonical CBOR bytes (E1–E10)"
+    },
+    "itemname": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "items_map": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/itemname"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/hexcbor"
+      },
+      "$comment": "named canonical operation/statement/record bytes referenced by deliveries and results"
+    },
+    "delivery": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/itemname"
+      }
+    },
+    "deliveries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/delivery"
+      }
+    },
+    "per_item_result": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "item"
+        ],
+        "dependentRequired": {
+          "outcome": [
+            "disposition"
+          ],
+          "disposition": [
+            "outcome"
+          ]
+        },
+        "properties": {
+          "item": {
+            "$ref": "#/$defs/itemname"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "disposition": {
+            "type": "string"
+          }
+        }
+      },
+      "$comment": "FINAL per-item classification — arrival-invariant, one list for all deliveries: exactly one row per delivered item; a row WITHOUT the (outcome, disposition) pair asserts the item finally ADMITS (is in effect) — E10 pins the closed enums to failures, so admission carries no failure pair (same optional-classification design as journal-replay per_record)"
+    },
+    "state_probes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "value": {
+            "$ref": "#/$defs/hex"
+          }
+        }
+      },
+      "$comment": "named canonical-encoding probes of derived state (frontier hash, admit_bound value, owner, …); probe names cite the spec construct they encode"
+    },
+    "trace": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "delivery",
+          "after",
+          "item",
+          "outcome",
+          "disposition"
+        ],
+        "properties": {
+          "delivery": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "after": {
+            "$ref": "#/$defs/itemname"
+          },
+          "item": {
+            "$ref": "#/$defs/itemname"
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "disposition": {
+            "type": "string"
+          }
+        }
+      },
+      "$comment": "optional INTERMEDIATE assertions: in delivery #d, immediately after `after` folds, `item` holds (outcome, disposition)"
+    },
+    "expected_negative": {
+      "properties": {
+        "expected": {
+          "required": [
+            "outcome",
+            "disposition"
+          ]
+        }
+      }
+    },
+    "fold_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items",
+        "deliveries"
+      ],
+      "properties": {
+        "items": {
+          "$ref": "#/$defs/items_map"
+        },
+        "deliveries": {
+          "$ref": "#/$defs/deliveries"
+        },
+        "as_of_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "genesis": {
+          "$ref": "#/$defs/hexcbor"
+        },
+        "aux": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/itemname"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/hexcbor"
+          },
+          "$comment": "non-delivered context bytes (installed descriptors, policies) — never folded, only resolved"
+        },
+        "evidence_class": {
+          "enum": [
+            "late-first",
+            "timely-first"
+          ],
+          "$comment": "amendment #7 (the ff23f1cd review's F1): the evidence-lifecycle lane's machine-readable arrival-structure declaration — which qualified evidence (late or timely) is held at the ORIGINAL operation's first evaluation in every listed delivery. Required on evidence-lifecycle vectors (the case-kind contract pins it); meaningless elsewhere. Within one declared class the listed deliveries must derive identical final verdicts on every relative delivery order of original and re-proposal (D-204 + D-205); convergence across classes is not promised (the D-204 residual)."
+        }
+      }
+    },
+    "fold_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "per_item",
+        "converge"
+      ],
+      "properties": {
+        "per_item": {
+          "$ref": "#/$defs/per_item_result"
+        },
+        "converge": {
+          "const": true
+        },
+        "state_probes": {
+          "$ref": "#/$defs/state_probes"
+        },
+        "trace": {
+          "$ref": "#/$defs/trace"
+        }
+      }
+    },
+    "family_vocabulary": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 1
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "canonical-encode",
+                  "canonical-reject",
+                  "cap-fit",
+                  "cap-exceed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 2
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "hash-domain",
+                  "key-id-derive",
+                  "separation-negative"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 3
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "sign-then-verify",
+                  "verify-fixed"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 4
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "hpke-seal-open",
+                  "hpke-negative"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 5
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "item-seal-open",
+                  "rewrap-idempotence",
+                  "crypto-negative"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 6
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "frontier-fold",
+                  "frontier-negative"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 7
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "fold",
+                  "walkthrough",
+                  "admission-negative"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 8
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "phrase-derive",
+                  "commitment-derive"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 9
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "fold",
+                  "admission-negative",
+                  "evidence-lifecycle"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 10
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "fold",
+                  "admission-negative",
+                  "equation-probe"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 11
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "fold",
+                  "admission-negative",
+                  "status-derive",
+                  "journal-replay",
+                  "export-import",
+                  "merkle-proof",
+                  "audit-partition"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 12
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "fold",
+                  "admission-negative",
+                  "edge-admission"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 13
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "frame-roundtrip",
+                  "crash-replay",
+                  "corruption-negative",
+                  "lock-matrix",
+                  "erase-crash-matrix",
+                  "journal-replay"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": 14
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "case_kind": {
+                "enum": [
+                  "reencapsulation",
+                  "projection",
+                  "offline-confirmation"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "case_contracts": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "canonical-encode"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "bytes": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "template": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "params": {
+                    "type": "object"
+                  }
+                },
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "template"
+                    ]
+                  }
+                ]
+              },
+              "expected": {
+                "required": [
+                  "bytes"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "canonical-reject"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "bytes"
+                ],
+                "properties": {
+                  "bytes": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "cap-fit"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "template"
+                ],
+                "properties": {
+                  "template": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "params": {
+                    "type": "object"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "sizes"
+                    ],
+                    "properties": {
+                      "sizes": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "additionalProperties": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "$comment": "encoder-exact byte sizes (the pinned worst-width figures, joint fits)"
+                      },
+                      "fits": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "cap-exceed"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "bytes": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "template": {
+                    "type": "string",
+                    "maxLength": 80
+                  },
+                  "params": {
+                    "type": "object"
+                  }
+                },
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "template"
+                    ]
+                  }
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "hash-domain"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tag",
+                  "preimage"
+                ],
+                "properties": {
+                  "tag": {
+                    "enum": [
+                      "genesis",
+                      "cert",
+                      "grant",
+                      "op",
+                      "body",
+                      "frontier",
+                      "receipt",
+                      "lease",
+                      "drill",
+                      "kek",
+                      "item",
+                      "policy",
+                      "key",
+                      "evrec",
+                      "genstart",
+                      "assertreq",
+                      "reauth",
+                      "cutoffreq",
+                      "abandonreq",
+                      "stmtid",
+                      "recips",
+                      "survivors",
+                      "brec",
+                      "bnode",
+                      "mat"
+                    ]
+                  },
+                  "preimage": {
+                    "$ref": "#/$defs/hex"
+                  }
+                },
+                "$comment": "the CLOSED §2 tag inventory — a new tag is a spec change, never a fixture change"
+              },
+              "expected": {
+                "required": [
+                  "bytes"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "key-id-derive"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "pk"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "key_id",
+                      "mat_id"
+                    ]
+                  },
+                  "alg": {
+                    "enum": [
+                      "p256",
+                      "hpke-p256-v1"
+                    ]
+                  },
+                  "pk": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                },
+                "$comment": "key_id = H_key({alg, pk}) (alg REQUIRED by the harness for kind=key_id); mat_id = H_mat(SEC1 point bytes) (alg absent)"
+              },
+              "expected": {
+                "required": [
+                  "bytes"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "separation-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tag_a",
+                  "tag_b",
+                  "preimage"
+                ],
+                "properties": {
+                  "tag_a": {
+                    "type": "string",
+                    "maxLength": 20
+                  },
+                  "tag_b": {
+                    "type": "string",
+                    "maxLength": 20
+                  },
+                  "preimage": {
+                    "$ref": "#/$defs/hex"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "distinct"
+                    ],
+                    "properties": {
+                      "distinct": {
+                        "const": true
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "sign-then-verify"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "msg"
+                ],
+                "properties": {
+                  "sk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "msg": {
+                    "$ref": "#/$defs/hex"
+                  }
+                },
+                "$comment": "sk absent ⇒ key material comes from rng draws (draw_order names it)"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "valid",
+                      "low_s"
+                    ],
+                    "properties": {
+                      "valid": {
+                        "const": true
+                      },
+                      "low_s": {
+                        "const": true
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "verify-fixed"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "pk",
+                  "msg",
+                  "sig"
+                ],
+                "properties": {
+                  "pk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "msg": {
+                    "$ref": "#/$defs/hex"
+                  },
+                  "sig": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "valid"
+                    ],
+                    "properties": {
+                      "valid": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "hpke-seal-open"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "plaintext"
+                ],
+                "properties": {
+                  "recipient_pk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "recipient_sk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "plaintext": {
+                    "$ref": "#/$defs/hex"
+                  },
+                  "aad": {
+                    "$ref": "#/$defs/hex"
+                  },
+                  "info": {
+                    "$ref": "#/$defs/hex"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "opened"
+                    ],
+                    "properties": {
+                      "enc": {
+                        "$ref": "#/$defs/hexnz"
+                      },
+                      "ct": {
+                        "$ref": "#/$defs/hexnz"
+                      },
+                      "opened": {
+                        "$ref": "#/$defs/hex"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "hpke-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "recipient_sk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "pk": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "enc": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "ct": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "aad": {
+                    "$ref": "#/$defs/hex"
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "item-seal-open"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "kek": {
+                    "$ref": "#/$defs/hex32"
+                  },
+                  "dek": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "item_addr": {
+                    "$ref": "#/$defs/hex32"
+                  },
+                  "kek_epoch": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "plaintext": {
+                    "$ref": "#/$defs/hex"
+                  },
+                  "core": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "wrap": {
+                    "$ref": "#/$defs/hexcbor"
+                  }
+                }
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "result": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "plaintext"
+                        ],
+                        "properties": {
+                          "plaintext": {
+                            "$ref": "#/$defs/hex"
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "rewrap-idempotence"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "item_addr",
+                  "kek_epoch"
+                ],
+                "properties": {
+                  "item_addr": {
+                    "$ref": "#/$defs/hex32"
+                  },
+                  "kek_epoch": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "kek": {
+                    "$ref": "#/$defs/hex32"
+                  },
+                  "dek": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "identical"
+                    ],
+                    "properties": {
+                      "identical": {
+                        "const": true
+                      },
+                      "wrapper": {
+                        "$ref": "#/$defs/hexnz"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "crypto-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "minProperties": 1
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "frontier-fold"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "events"
+                ],
+                "properties": {
+                  "initial": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "events": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/hexcbor"
+                    }
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "frontier": {
+                        "$ref": "#/$defs/hexcbor"
+                      },
+                      "frontier_hash": {
+                        "$ref": "#/$defs/hex32"
+                      },
+                      "noop": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "frontier-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "events"
+                ],
+                "properties": {
+                  "initial": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "events": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/hexcbor"
+                    }
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "fold"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "$ref": "#/$defs/fold_result"
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "walkthrough"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/fold_result"
+                      },
+                      {
+                        "required": [
+                          "state_probes"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "equation-probe"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "allOf": [
+                      {
+                        "$ref": "#/$defs/fold_result"
+                      },
+                      {
+                        "required": [
+                          "state_probes"
+                        ]
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "admission-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "items"
+                ],
+                "properties": {
+                  "items": {
+                    "$ref": "#/$defs/items_map"
+                  },
+                  "delivery": {
+                    "$ref": "#/$defs/delivery"
+                  },
+                  "subject": {
+                    "$ref": "#/$defs/itemname"
+                  },
+                  "as_of_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "genesis": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "aux": {
+                    "type": "object",
+                    "propertyNames": {
+                      "$ref": "#/$defs/itemname"
+                    },
+                    "additionalProperties": {
+                      "$ref": "#/$defs/hexcbor"
+                    }
+                  }
+                },
+                "$comment": "delivery defaults to items in the listed order; subject defaults to the last delivered item — the op whose (outcome, disposition) is asserted"
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "phrase-derive"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "phrase": {
+                    "type": "string",
+                    "maxLength": 200
+                  },
+                  "entropy": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              },
+              "expected": {
+                "$comment": "Amendment 3 (repair tranche): the negative arm — a checksum-invalid mnemonic is rejected BEFORE derivation (spec 2.4), so a phrase-derive case may carry an (outcome, disposition) pair instead of derived keys.",
+                "anyOf": [
+                  {
+                    "properties": {
+                      "result": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "keys"
+                        ],
+                        "properties": {
+                          "keys": {
+                            "type": "object",
+                            "minProperties": 1,
+                            "additionalProperties": {
+                              "$ref": "#/$defs/hexnz"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "outcome",
+                      "disposition"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "commitment-derive"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "minProperties": 1
+              },
+              "expected": {
+                "required": [
+                  "bytes"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "journal-replay"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "items": {
+                    "$ref": "#/$defs/items_map"
+                  },
+                  "frames": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/hexnz"
+                    }
+                  },
+                  "deliveries": {
+                    "$ref": "#/$defs/deliveries"
+                  },
+                  "crash_cuts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "aux": {
+                    "type": "object",
+                    "propertyNames": {
+                      "$ref": "#/$defs/itemname"
+                    },
+                    "additionalProperties": {
+                      "$ref": "#/$defs/hexcbor"
+                    }
+                  }
+                },
+                "anyOf": [
+                  {
+                    "required": [
+                      "items"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "frames"
+                    ]
+                  }
+                ],
+                "$comment": "semantic journal folds supply items+deliveries; byte-level replays supply frames (+ crash_cuts as byte offsets into the concatenated stream)"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "intervals",
+                      "converge"
+                    ],
+                    "properties": {
+                      "intervals": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "incarnation",
+                            "terminal"
+                          ],
+                          "properties": {
+                            "incarnation": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "terminal": {
+                              "enum": [
+                                "open",
+                                "done",
+                                "abort"
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "per_record": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "rec"
+                          ],
+                          "dependentRequired": {
+                            "outcome": [
+                              "disposition"
+                            ],
+                            "disposition": [
+                              "outcome"
+                            ]
+                          },
+                          "properties": {
+                            "rec": {
+                              "$ref": "#/$defs/itemname"
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "disposition": {
+                              "type": "string"
+                            },
+                            "missing": {
+                              "type": "boolean"
+                            },
+                            "basis": {
+                              "$ref": "#/$defs/itemname"
+                            }
+                          }
+                        }
+                      },
+                      "converge": {
+                        "const": true
+                      },
+                      "state_probes": {
+                        "$ref": "#/$defs/state_probes"
+                      },
+                      "trace": {
+                        "$ref": "#/$defs/trace"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "export-import"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "per_item",
+                      "converge"
+                    ],
+                    "properties": {
+                      "per_item": {
+                        "$ref": "#/$defs/per_item_result"
+                      },
+                      "converge": {
+                        "const": true
+                      },
+                      "content_digest": {
+                        "$ref": "#/$defs/hex32"
+                      },
+                      "release_op": {
+                        "$ref": "#/$defs/hex32"
+                      },
+                      "state_probes": {
+                        "$ref": "#/$defs/state_probes"
+                      },
+                      "trace": {
+                        "$ref": "#/$defs/trace"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            },
+            "$comment": "the construct-and-rederive contract (D-127/D-156): fixtures start from sources + keys; the harness independently re-derives the root, paths, and release_op"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "merkle-proof"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "root",
+                  "proof"
+                ],
+                "properties": {
+                  "bundleleaf": {
+                    "$ref": "#/$defs/hexcbor"
+                  },
+                  "rec_index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 127
+                  },
+                  "proof": {
+                    "type": "array",
+                    "maxItems": 7,
+                    "items": {
+                      "$ref": "#/$defs/hex32"
+                    }
+                  },
+                  "root": {
+                    "$ref": "#/$defs/hex32"
+                  }
+                }
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "result": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "valid"
+                        ],
+                        "properties": {
+                          "valid": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "outcome",
+                      "disposition"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "status-derive"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/fold_inputs"
+                  },
+                  {
+                    "required": [
+                      "as_of_ms"
+                    ]
+                  }
+                ]
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "derived",
+                      "converge"
+                    ],
+                    "properties": {
+                      "derived": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "item",
+                            "value"
+                          ],
+                          "properties": {
+                            "item": {
+                              "$ref": "#/$defs/itemname"
+                            },
+                            "value": {
+                              "type": "string",
+                              "maxLength": 40
+                            }
+                          }
+                        }
+                      },
+                      "converge": {
+                        "const": true
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "audit-partition"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs_with_release"
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "chunks",
+                      "converge"
+                    ],
+                    "properties": {
+                      "chunks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "index",
+                            "count"
+                          ],
+                          "properties": {
+                            "index": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "count": {
+                              "type": "integer",
+                              "minimum": 0
+                            }
+                          }
+                        }
+                      },
+                      "converge": {
+                        "const": true
+                      },
+                      "state_probes": {
+                        "$ref": "#/$defs/state_probes"
+                      },
+                      "released": {
+                        "type": "boolean",
+                        "$comment": "amendment #5 (review R4): the reducer's DERIVED release verdict over the independent read-release input — completeness (indexes exactly 0..count-1), disjointness, exact union with the released result_ids, and one-Txn membership; REQUIRED whenever inputs.release is present"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "edge-admission"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "context",
+                  "request"
+                ],
+                "properties": {
+                  "context": {
+                    "type": "object"
+                  },
+                  "request": {
+                    "type": "object"
+                  }
+                }
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "result": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "allowed"
+                        ],
+                        "properties": {
+                          "allowed": {
+                            "const": true
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "outcome",
+                      "disposition"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "frame-roundtrip"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "stream": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "frames": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/hexnz"
+                    }
+                  }
+                }
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "result": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "stream"
+                        ],
+                        "properties": {
+                          "stream": {
+                            "$ref": "#/$defs/hexnz"
+                          }
+                        }
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "crash-replay"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "stream",
+                  "cuts"
+                ],
+                "properties": {
+                  "stream": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "cuts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "machine_state": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 6
+                  },
+                  "mutations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "offset",
+                        "bytes"
+                      ],
+                      "properties": {
+                        "offset": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "bytes": {
+                          "$ref": "#/$defs/hexnz"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "outcomes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "outcome",
+                            "disposition"
+                          ],
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "maxLength": 60
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "disposition": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      },
+                      "truncated_at": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "state_probes": {
+                        "$ref": "#/$defs/state_probes"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "corruption-negative"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "stream",
+                  "mutations"
+                ],
+                "properties": {
+                  "stream": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "mutations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "offset",
+                        "bytes"
+                      ],
+                      "properties": {
+                        "offset": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "bytes": {
+                          "$ref": "#/$defs/hexnz"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "$ref": "#/$defs/expected_negative"
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "lock-matrix"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "script"
+                ],
+                "properties": {
+                  "script": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "actor",
+                        "action"
+                      ],
+                      "properties": {
+                        "actor": {
+                          "type": "string",
+                          "maxLength": 20
+                        },
+                        "action": {
+                          "type": "string",
+                          "maxLength": 40
+                        },
+                        "target": {
+                          "type": "string",
+                          "maxLength": 60
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "outcomes"
+                    ],
+                    "properties": {
+                      "outcomes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "step",
+                            "outcome",
+                            "disposition"
+                          ],
+                          "properties": {
+                            "step": {
+                              "type": "integer",
+                              "minimum": 0
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "disposition": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "erase-crash-matrix"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "stream",
+                  "cuts",
+                  "machine_state",
+                  "rotation_ops"
+                ],
+                "properties": {
+                  "stream": {
+                    "$ref": "#/$defs/hexnz"
+                  },
+                  "cuts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "machine_state": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 6
+                  },
+                  "rotation_ops": {
+                    "$comment": "Amendment #4 (D6): the signed c.kek_rotate operations the control plane accepted, as canonical triple bytes. Every durable Fence must resolve its rotation through Fence.rotation_op = H_op over one of these entries (the hash covers the signature bytes); state-5 tombstone re-derivation and durable-tombstone content validation bind to the resolved op's typed erase_manifest — never to unsigned stream content.",
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "$ref": "#/$defs/hexnz"
+                    }
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "outcomes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": [
+                            "outcome",
+                            "disposition"
+                          ],
+                          "properties": {
+                            "name": {
+                              "type": "string",
+                              "maxLength": 60
+                            },
+                            "outcome": {
+                              "type": "string"
+                            },
+                            "disposition": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      },
+                      "state_probes": {
+                        "$ref": "#/$defs/state_probes"
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "reencapsulation"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "p1"
+                ],
+                "properties": {
+                  "p1": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "identical"
+                    ],
+                    "properties": {
+                      "identical": {
+                        "const": true
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "projection"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "bytes"
+                ],
+                "properties": {
+                  "bytes": {
+                    "$ref": "#/$defs/hexnz"
+                  }
+                }
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "bytes"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "result"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "outcome",
+                      "disposition"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "offline-confirmation"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "procedure"
+                ],
+                "properties": {
+                  "procedure": {
+                    "type": "string",
+                    "maxLength": 120
+                  },
+                  "params": {
+                    "type": "object"
+                  }
+                }
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "recorded"
+                    ],
+                    "properties": {
+                      "recorded": {
+                        "type": "string",
+                        "maxLength": 400
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            },
+            "$comment": "family 14: the umbrella RFC App C #2 offline confirmation — the run's result is recorded in spec §15 when performed"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "case_kind": {
+                "const": "evidence-lifecycle"
+              }
+            },
+            "required": [
+              "case_kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "$ref": "#/$defs/fold_inputs",
+                "required": [
+                  "items",
+                  "deliveries",
+                  "evidence_class"
+                ]
+              },
+              "expected": {
+                "properties": {
+                  "result": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "per_item",
+                      "arrival_is_semantic"
+                    ],
+                    "properties": {
+                      "per_item": {
+                        "$ref": "#/$defs/per_item_result"
+                      },
+                      "arrival_is_semantic": {
+                        "const": true,
+                        "$comment": "amendment #6 (review R7, the D-202 ruling): evidence-arrival order is this lane's SEMANTIC INPUT — an issued lease-stale is terminal where issued and later timely evidence revives nothing; per-replica divergence on the original op is ruled, convergence rides the re-proposed op. The listed deliveries share one declared arrival structure and must agree; no fresh-fold or generated-order convergence applies."
+                      }
+                    }
+                  }
+                },
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "fold_inputs_with_release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "items",
+        "deliveries"
+      ],
+      "properties": {
+        "items": {
+          "$ref": "#/$defs/items_map"
+        },
+        "deliveries": {
+          "$ref": "#/$defs/deliveries"
+        },
+        "as_of_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "genesis": {
+          "$ref": "#/$defs/hexcbor"
+        },
+        "aux": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/itemname"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/hexcbor"
+          },
+          "$comment": "non-delivered context bytes (installed descriptors, policies) — never folded, only resolved"
+        },
+        "release": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "read_id",
+            "result_ids",
+            "txn_rows"
+          ],
+          "properties": {
+            "read_id": {
+              "$ref": "#/$defs/hex"
+            },
+            "result_ids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/hex"
+              }
+            },
+            "txn_rows": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/itemname"
+              }
+            }
+          },
+          "$comment": "amendment #5 (review R4): the INDEPENDENT read-release event — the result ids released to the caller and the audit rows (by item name) that rode the read's one Txn; the reducer derives `released` from held rows against these, never from the vector's own chunk table"
+        }
+      }
+    }
+  }
+}
