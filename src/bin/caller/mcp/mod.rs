@@ -171,22 +171,14 @@ impl IntendantServer {
     async fn agenda_op_inner(
         &self,
         cmd: crate::agenda::AgendaCommand,
-        session_id: Option<&str>,
+        actor: &crate::access::actor::ActorBinding,
     ) -> Result<serde_json::Value, String> {
         let Some(agenda) = self.agenda_handle().await else {
             return Err("agenda unavailable on this daemon".to_string());
         };
-        // MCP-lane attribution (A1 best-effort): supervised sessions call
-        // through their injected INTENDANT_MCP_URL, which binds a session
-        // id here. Principal binding arrives with the shared token (A2).
-        let actor = crate::agenda::AgendaActor {
-            principal: None,
-            session_id: session_id
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string),
-        };
-        match agenda.apply(cmd, Some(actor)) {
+        // Attribution comes from the gate-resolved actor the dispatch
+        // carried in — never from tool arguments or query echoes.
+        match agenda.apply(cmd, crate::agenda::AgendaActor::from_binding(actor)) {
             Ok(item) => Ok(serde_json::json!({ "item": item })),
             Err(err) => Err(err.to_string()),
         }
@@ -334,15 +326,15 @@ impl IntendantServer {
         managed_context_override: Option<bool>,
     ) -> Result<CallToolResult, String> {
         // Fail-closed default: a dispatch path that doesn't state its surface
-        // is scoped (internal self-calls, tests). The HTTP gate and the
-        // dashboard tunnel pass their bound principal's surface explicitly
-        // via `call_tool_by_name_as_caller`.
+        // is scoped (internal self-calls, tests) and its actor is explicitly
+        // unattributed. The HTTP gate and the dashboard tunnel pass their
+        // bound principal's surface via `call_tool_by_name_as_caller`.
         self.call_tool_by_name_as_caller(
             name,
             args,
             session_id,
             managed_context_override,
-            ToolCallerTrust::Scoped,
+            ToolCaller::scoped_unattributed(),
         )
         .await
     }
@@ -353,8 +345,15 @@ impl IntendantServer {
         args: serde_json::Value,
         session_id: Option<&str>,
         managed_context_override: Option<bool>,
-        caller: ToolCallerTrust,
+        caller: ToolCaller,
     ) -> Result<CallToolResult, String> {
+        // Trust keeps the historical `caller` name (it rides into display
+        // and shared-view tools); the actor feeds attribution-recording
+        // tools (agenda ops, Memory P1 proposals next).
+        let ToolCaller {
+            trust: caller,
+            actor,
+        } = caller;
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -453,7 +452,7 @@ impl IntendantServer {
                 // the same shape the HTTP body and tunnel params carry.
                 let cmd: crate::agenda::AgendaCommand =
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(match self.agenda_op_inner(cmd, session_id).await {
+                Ok(match self.agenda_op_inner(cmd, &actor).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("agenda_op failed: {message}")),
                 })
@@ -1875,6 +1874,42 @@ impl ToolCallerTrust {
     /// autonomy guard's grant state.
     pub fn allows_user_session(self, user_display_granted: bool) -> bool {
         user_display_granted || self == ToolCallerTrust::OwnerSurface
+    }
+}
+
+/// The authenticated caller of a tool dispatch: coarse trust posture plus
+/// resolved actor identity, derived together from the same gate output so
+/// the two cannot skew (`access::actor` module docs carry the contract:
+/// `McpTokenBinding` classifies the token, [`ActorBinding`] is the resolved
+/// identity, [`ToolCallerTrust`] is the trust posture).
+#[derive(Debug, Clone)]
+pub struct ToolCaller {
+    pub trust: ToolCallerTrust,
+    pub actor: crate::access::actor::ActorBinding,
+}
+
+impl ToolCaller {
+    /// Fail-closed default for dispatch paths that don't state a surface:
+    /// scoped trust, explicitly unattributed actor.
+    pub fn scoped_unattributed() -> Self {
+        Self {
+            trust: ToolCallerTrust::Scoped,
+            actor: crate::access::actor::ActorBinding::unattributed(),
+        }
+    }
+
+    /// Derive both facets from the one principal a gate bound.
+    /// `gate_session` is the session identity the gate itself bound by
+    /// token possession — never a bare request field (see
+    /// `access::actor::ActorBinding::from_principal`).
+    pub fn from_gate(
+        principal: &crate::access::iam::AccessPrincipal,
+        gate_session: Option<String>,
+    ) -> Self {
+        Self {
+            trust: ToolCallerTrust::from_principal(principal),
+            actor: crate::access::actor::ActorBinding::from_principal(principal, gate_session),
+        }
     }
 }
 

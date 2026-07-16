@@ -112,14 +112,23 @@ function agendaDueChip(item) {
   return `<span class="agenda-chip due${overdue ? ' overdue' : ''}">due ${escapeHtml(label)}</span>`;
 }
 
+function agendaActorLabel(p) {
+  // Gate-attributed actor (A2): kind + session/principal, rendered for
+  // humans. Data only — never markup.
+  if (p.session_id) return `session ${p.session_id.slice(0, 12)}`;
+  if (p.kind === 'dashboard') return 'you';
+  if (p.kind === 'local_process') return 'local ctl';
+  if (p.kind === 'peer') return 'a peer daemon';
+  if (p.kind === 'agent_session') return 'an agent session';
+  return p.principal || '';
+}
+
 function agendaProvenanceLine(item) {
   const p = item.provenance || {};
   const created = p.created_ms
     ? new Date(p.created_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
     : '';
-  const who = p.session_id
-    ? `session ${p.session_id.slice(0, 12)}`
-    : (p.principal || '');
+  const who = agendaActorLabel(p);
   const parts = [];
   if (created) parts.push(`parked ${created}`);
   if (who) parts.push(`by ${who}`);
@@ -259,11 +268,17 @@ function agendaRenderCard() {
     return;
   }
   // Oldest first: long-parked intent stays visible instead of scrolling away.
-  const rows = open.slice(0, 5).map((item) =>
-    `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
+  const rows = open.slice(0, 5).map((item) => {
+    const p = item.provenance || {};
+    // Agent-parked items carry their session provenance right on the card.
+    const who = p.session_id
+      ? `<span class="agenda-card-row-who">· sess ${escapeHtml(p.session_id.slice(0, 8))}</span>`
+      : '';
+    return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
       <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
-      <span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>
-    </div>`);
+      <span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
+    </div>`;
+  });
   const more = open.length > 5
     ? `<div class="agenda-card-more">+${open.length - 5} more…</div>`
     : '';
