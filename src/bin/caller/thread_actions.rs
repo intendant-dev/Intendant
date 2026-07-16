@@ -3102,6 +3102,15 @@ pub(crate) fn persist_native_backend_session_id(config: &DrainConfig<'_>, native
     if launch.source.is_none() {
         launch.source = Some(backend.as_short_str().to_string());
     }
+    // The codex anchor-fork staging parameters are one-shot spawn inputs:
+    // the announced child must never carry them into its durable overlay,
+    // or a later resume could observe stale staging paths. The lineage
+    // fields (`forked_from`/`fork_relationship`/`fork_anchor`) stay — they
+    // document the edge.
+    launch.codex_fork_rollout_path = None;
+    launch.codex_fork_rollback_turns = None;
+    launch.codex_fork_rollback_item_id = None;
+    launch.codex_fork_rollback_position = None;
     if let Err(e) = crate::session_config::write_external_overlay(
         &platform::home_dir(),
         backend.as_short_str(),

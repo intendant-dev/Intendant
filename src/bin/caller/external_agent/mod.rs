@@ -1136,6 +1136,15 @@ pub struct AgentConfig {
     /// Only meaningful together with `resume_session`; backends whose fork
     /// is an in-process thread action ignore it.
     pub fork_resume: bool,
+    /// Anchor-fork staging (codex only): seed the spawned thread from this
+    /// staged rollout copy via `thread/fork{path}` instead of resuming, then
+    /// trim it per `fork_cut` before the first turn. One-shot spawn
+    /// parameters — the supervisor sets them only while the wrapper still
+    /// resumes the parent id.
+    pub fork_from_rollout_path: Option<PathBuf>,
+    /// Trim applied to the freshly forked thread (codex only; `None` = the
+    /// anchor was the parent's head).
+    pub fork_cut: Option<crate::session_fork::CodexForkCut>,
     /// Codex state directory to use for this session's app-server process.
     /// Codex-only; other backends ignore.
     pub codex_home: Option<PathBuf>,

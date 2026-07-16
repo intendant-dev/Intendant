@@ -202,6 +202,8 @@ pub struct CodexAgent {
     mcp_auth_token: Option<String>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
+    fork_from_rollout_path: Option<PathBuf>,
+    fork_cut: Option<crate::session_fork::CodexForkCut>,
     codex_home: Option<PathBuf>,
     /// Working directory used to resolve Codex project config for config/read.
     working_dir: Option<PathBuf>,
@@ -712,6 +714,8 @@ impl CodexAgent {
             mcp_auth_token: None,
             mcp_session_id: None,
             resume_session: None,
+            fork_from_rollout_path: None,
+            fork_cut: None,
             codex_home: None,
             working_dir: None,
             config_working_dir: None,
@@ -1222,6 +1226,8 @@ impl ExternalAgent for CodexAgent {
         self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
+        self.fork_from_rollout_path = config.fork_from_rollout_path;
+        self.fork_cut = config.fork_cut;
         self.codex_home = config.codex_home;
         self.working_dir = Some(config.working_dir.clone());
         let protocol_watch = config.protocol_watch;
@@ -1383,14 +1389,28 @@ impl ExternalAgent for CodexAgent {
         let mut params = self
             .thread_lifecycle_params_with_developer_instructions(managed_developer_instructions);
 
-        let method = if let Some(ref thread_id) = self.resume_session {
+        // Anchor fork: seed a NEW thread from the staged rollout copy
+        // instead of resuming the parent; the trim to the anchor happens
+        // right after the thread id is known, before any turn runs. The
+        // lifecycle params are skipped deliberately — the forked thread
+        // carries its history from the seed file.
+        let (method, params) = if let Some(fork_path) = self.fork_from_rollout_path.clone() {
+            let mut fork_params = serde_json::Map::new();
+            fork_params.insert("threadId".into(), serde_json::Value::String(String::new()));
+            fork_params.insert(
+                "path".into(),
+                serde_json::Value::String(fork_path.to_string_lossy().into_owned()),
+            );
+            self.insert_service_tier_override(&mut fork_params);
+            ("thread/fork", fork_params)
+        } else if let Some(ref thread_id) = self.resume_session {
             params.insert(
                 "threadId".into(),
                 serde_json::Value::String(thread_id.clone()),
             );
-            "thread/resume"
+            ("thread/resume", params)
         } else {
-            "thread/start"
+            ("thread/start", params)
         };
 
         let result = self
@@ -1410,6 +1430,27 @@ impl ExternalAgent for CodexAgent {
         // Cache the thread id so interrupt_turn() can build the
         // `turn/interrupt` params without requiring a thread handle.
         *self.active_thread_id.lock().await = Some(thread_id.clone());
+
+        if self.fork_from_rollout_path.is_some() {
+            match self.fork_cut.clone() {
+                Some(crate::session_fork::CodexForkCut::Turns(turns)) => {
+                    self.rollback_turns_inner(
+                        &serde_json::json!({ "threadId": thread_id.clone() }),
+                        turns,
+                    )
+                    .await?;
+                }
+                Some(crate::session_fork::CodexForkCut::ItemAnchor { item_id, position }) => {
+                    let position = match position.as_str() {
+                        "before" => RollbackAnchorPosition::Before,
+                        _ => RollbackAnchorPosition::After,
+                    };
+                    self.rollback_item_anchor_rpc(&thread_id, &item_id, position)
+                        .await?;
+                }
+                Some(crate::session_fork::CodexForkCut::None) | None => {}
+            }
+        }
 
         if self.resume_session.is_some() {
             self.apply_resumed_thread_settings(&thread_id).await?;
@@ -3462,6 +3503,8 @@ enabled = true
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
             fork_resume: false,
+            fork_from_rollout_path: None,
+            fork_cut: None,
             codex_home: None,
             protocol_watch: None,
         };
