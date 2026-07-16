@@ -775,6 +775,7 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
     // command channel fills, and the disk readers' `send().await` parks.
     // Cleared by the OnBufferedAmountLow event in `drain_transfer_outputs`.
     let mut send_paused = false;
+    let mut error_budget = crate::dashboard_control::DirectErrorBudget::new("peer-file-transfer");
     let mut authority_tick = tokio::time::interval(LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL);
     authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -993,13 +994,18 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                 &mut next_read_generation,
             ) {
                 // Rejections bypass the (possibly watermark-paused) command
-                // lane: the driver owns the rtc right here, and a dropped
-                // rejection would leave the client waiting forever.
-                send_transfer_text(&mut rtc, &channels, reply);
+                // lane: the driver owns the rtc right here. The budget keeps
+                // rejection spam from growing the reliable SCTP queue while
+                // the wire is congested — best-effort error delivery under
+                // abuse, bounded memory always.
+                if error_budget.allow(send_paused) {
+                    send_transfer_text(&mut rtc, &channels, reply);
+                }
             }
         }
     }
 
+    error_budget.log_teardown();
     for (_, read) in active_reads {
         read.cancel.cancel();
     }

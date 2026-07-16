@@ -119,18 +119,19 @@ fn load_client_identity(
 /// the PEMs (and, on the no-pin path, the whole native root store) per
 /// connect attempt.
 ///
-/// Same identity vocabulary as the peer-record cache
-/// (`access_policy::PeerRecordFingerprint`): certificate writes replace
-/// files atomically, so a fresh `(dev, ino)` distinguishes a
-/// same-length, timestamp-preserving replacement (`cp -p` rollback,
-/// same-granule rewrite) that length+mtime alone would miss;
-/// nanosecond mtime and length are the portable fallback.
+/// Same identity vocabulary as the repo's file-identity callers
+/// ([`crate::platform::FileIdentity`]): certificate writes replace files
+/// atomically, so a fresh identity — Unix `(dev, ino)`, Windows volume
+/// serial + 64-bit file index — distinguishes a same-length,
+/// timestamp-preserving replacement (`cp -p` rollback, same-granule
+/// rewrite) that length+mtime alone would miss ON EVERY PLATFORM;
+/// nanosecond mtime and length are the fallback where no reliable
+/// identity exists (`identity: None` compares equal to itself only).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     len: u64,
     mtime_nanos: u128,
-    dev: u64,
-    ino: u64,
+    identity: Option<crate::platform::FileIdentity>,
 }
 
 fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
@@ -138,18 +139,22 @@ fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
     if !metadata.is_file() {
         return None;
     }
-    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
     let mtime_nanos = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    // Unix reads the identity off the metadata already in hand; Windows
+    // needs an open handle (`from_path`). An unavailable or unreliable
+    // identity stores `None` — the len+mtime fallback.
+    let identity = crate::platform::FileIdentity::from_metadata(&metadata)
+        .or_else(|| crate::platform::FileIdentity::from_path(path).ok())
+        .filter(|identity| identity.is_reliable());
     Some(FileStamp {
         len: metadata.len(),
         mtime_nanos,
-        dev,
-        ino,
+        identity,
     })
 }
 
@@ -375,11 +380,27 @@ mod tests {
 
     /// An atomic certificate replacement that preserves BOTH length and
     /// mtime (a `cp -p`-style rollback, a same-granule rewrite) must
-    /// still invalidate the cache: the fresh inode is the discriminator
-    /// (`PeerRecordFingerprint`'s identity vocabulary).
+    /// still invalidate the cache: the fresh file identity is the
+    /// discriminator — Unix `(dev, ino)`, Windows volume serial + file
+    /// index (`FileIdentity`).
     #[cfg(unix)]
     #[test]
     fn tls_cache_detects_same_length_preserved_mtime_rotation() {
+        same_length_preserved_mtime_rotation_rebuilds();
+    }
+
+    /// Windows mirror of the rotation test: the merge group runs full
+    /// tests on the Windows leg, and `metadata_dev_ino`'s degenerate
+    /// `(0, 0)` there was exactly the gap — `FileIdentity` carries the
+    /// volume serial + file index instead.
+    #[cfg(windows)]
+    #[test]
+    fn tls_cache_detects_same_length_preserved_mtime_rotation_windows() {
+        same_length_preserved_mtime_rotation_rebuilds();
+    }
+
+    #[cfg(any(unix, windows))]
+    fn same_length_preserved_mtime_rotation_rebuilds() {
         let dir = tempfile::tempdir().unwrap();
         let names = crate::access::certs::ServerNames::new(
             "127.0.0.1".parse().unwrap(),
