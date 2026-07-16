@@ -19,15 +19,22 @@
 //!    real `std::fs::File` advisory locks (`try_lock`/`unlock`) on
 //!    per-target files, and the denial steps must match the
 //!    vector's outcome rows exactly.
-//! 4. **Flush + atomic replacement (review R6)** — the §13.2 cell
-//!    names `framing, flush, locks, crash/corruption`, and the
-//!    funded plan names portable `open/write/rename`: every stream
-//!    materialization goes write-temp → `sync_all` (fsync /
-//!    FlushFileBuffers) → `rename` onto the final path, so BOTH
-//!    primitives are load-bearing (bypass the rename and the final
-//!    path never exists — the read fails red), and end-of-run
-//!    invocation counters additionally fail the lane if either
-//!    primitive executed zero times.
+//! 4. **Flush + atomic replacement (review R6; criterion-12
+//!    criterion 8)** — the §13.2 cell names `framing, flush, locks,
+//!    crash/corruption`, and the funded plan names portable
+//!    `open/write/rename`: EVERY `inputs.stream` (the cut-carrying
+//!    vectors AND the framing-only ones) materializes through
+//!    write-temp → the sync seam (`sync_all`: fsync /
+//!    FlushFileBuffers) → `rename` onto a PRE-SEEDED final path, so
+//!    both primitives are load-bearing (bypass the rename and the
+//!    stale sentinel survives — the read-back fails red) and every
+//!    rename is a real replacement of an existing file on all three
+//!    OSes. End-of-run invocation counters fail the lane if either
+//!    primitive executed zero times, and the flush observation is
+//!    COUPLED to the call: a `--flush-probe` re-exec under the
+//!    `STORAGE_LANE_FAIL_SYNC` failpoint must go red — a durable
+//!    path that stopped calling (or stopped honoring) the sync seam
+//!    leaves the failpoint probe green and the lane fails.
 //! 5. **Semantics** — the unmodified harness dispatch must report
 //!    PASS on the vector.
 //!
@@ -92,16 +99,33 @@ fn roundtrip_inputs(node: &Json, dir: &Path, n: &mut u32, bytes: &mut u64) -> Re
     Ok(())
 }
 
+/// The sync seam — the ONE flush call the lane's proof rides
+/// (`File::sync_all`: fsync on Unix, FlushFileBuffers on Windows).
+/// The `STORAGE_LANE_FAIL_SYNC` failpoint forces the seam to report
+/// failure; the end-of-run control re-execs a probe write under it
+/// and REQUIRES red, coupling the flush observation to the call's
+/// RESULT — an invocation counter alone survives deletion of the
+/// call it counts (the criterion-12 review demonstrated exactly
+/// that mutation staying green).
+fn sync_seam(f: &std::fs::File) -> std::io::Result<()> {
+    if std::env::var_os("STORAGE_LANE_FAIL_SYNC").is_some() {
+        return Err(std::io::Error::other(
+            "STORAGE_LANE_FAIL_SYNC forced failure",
+        ));
+    }
+    f.sync_all()
+}
+
 /// Durably materialize `bytes` at `path` through the PORTABLE
-/// flush + atomic-replacement pair: write a temp sibling, fsync it
-/// (`File::sync_all` — fsync on Unix, FlushFileBuffers on Windows),
-/// then `rename` onto the final path. The rename is load-bearing:
-/// callers read the FINAL path, so a bypassed rename fails red.
+/// flush + atomic-replacement pair: write a temp sibling, flush it
+/// through the sync seam, then `rename` onto the final path. The
+/// rename is load-bearing: callers pre-seed and read the FINAL
+/// path, so a bypassed rename leaves the sentinel and fails red.
 fn durable_write(path: &Path, bytes: &[u8], counters: &mut (u64, u64)) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
     std::io::Write::write_all(&mut f, bytes).map_err(|e| format!("write tmp: {e}"))?;
-    f.sync_all().map_err(|e| format!("sync_all: {e}"))?;
+    sync_seam(&f).map_err(|e| format!("sync_all: {e}"))?;
     counters.0 += 1;
     drop(f);
     std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
@@ -109,28 +133,51 @@ fn durable_write(path: &Path, bytes: &[u8], counters: &mut (u64, u64)) -> Result
     Ok(())
 }
 
-/// Real truncation per cut: the stream lands via the durable
-/// write-sync-rename path, then each cut is a `set_len` on a fresh
-/// copy, read back against the in-memory prefix.
-fn truncate_cuts(vector: &Json, dir: &Path, counters: &mut (u64, u64)) -> Result<u32, String> {
+/// The stale bytes every stream destination is pre-seeded with —
+/// distinguishable from any real stream, so a rename that failed to
+/// replace leaves them behind for the read-back to catch.
+const PRESEED: &[u8] = b"stale sentinel: the rename must replace this file";
+
+/// Materialize `inputs.stream` at its final path through the durable
+/// pair. EVERY stream-carrying vector routes here — the framing-only
+/// vectors included (criterion 8: no raw stream bypasses the durable
+/// abstraction) — and the destination is PRE-SEEDED so each rename
+/// really replaces an existing file on all three OSes.
+fn materialize_stream(
+    vector: &Json,
+    dir: &Path,
+    counters: &mut (u64, u64),
+) -> Result<Option<(PathBuf, Vec<u8>)>, String> {
     let Some(stream_hex) = vector["inputs"]["stream"].as_str() else {
-        return Ok(0);
-    };
-    let Some(cuts) = vector["inputs"]["cuts"].as_array() else {
-        return Ok(0);
+        return Ok(None);
     };
     let stream = unhex(stream_hex).ok_or("stream hex")?;
     let full = dir.join("stream.bin");
+    std::fs::write(&full, PRESEED).map_err(|e| format!("pre-seed: {e}"))?;
     durable_write(&full, &stream, counters)?;
     let back = std::fs::read(&full).map_err(|e| format!("read after rename: {e}"))?;
+    if back == PRESEED {
+        return Err("rename did not replace the pre-seeded destination".into());
+    }
     if back != stream {
         return Err("durable stream read-back differs".into());
     }
+    Ok(Some((full, stream)))
+}
+
+/// Real truncation per cut: each cut is a `set_len` on a fresh copy
+/// of the durably materialized stream, read back against the
+/// in-memory prefix.
+fn truncate_cuts(vector: &Json, full: &Path, stream: &[u8]) -> Result<u32, String> {
+    let dir = full.parent().expect("stream has a parent dir");
+    let Some(cuts) = vector["inputs"]["cuts"].as_array() else {
+        return Ok(0);
+    };
     let mut done = 0;
     for (i, c) in cuts.iter().enumerate() {
         let cut = c.as_u64().ok_or("cut")? as usize;
         let path = dir.join(format!("cut-{i}.bin"));
-        std::fs::copy(&full, &path).map_err(|e| format!("copy: {e}"))?;
+        std::fs::copy(full, &path).map_err(|e| format!("copy: {e}"))?;
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -326,6 +373,21 @@ fn main() {
     if args.first().map(String::as_str) == Some("--lock-agent") {
         lock_agent();
     }
+    if args.first().map(String::as_str) == Some("--flush-probe") {
+        // One durable write, exit 0 iff it fully succeeded — the
+        // parent runs this twice (plain: must be green; under
+        // STORAGE_LANE_FAIL_SYNC: must be red).
+        let dir =
+            std::env::temp_dir().join(format!("owner-plane-flush-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let path = dir.join("probe.bin");
+        std::fs::write(&path, PRESEED).expect("probe pre-seed");
+        let mut counters = (0u64, 0u64);
+        let ok = durable_write(&path, b"fresh probe bytes", &mut counters).is_ok()
+            && std::fs::read(&path).ok().as_deref() == Some(b"fresh probe bytes" as &[u8]);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     if !args.is_empty() {
         eprintln!("USAGE: storage-lane        run the portable-storage execution lane");
         std::process::exit(2);
@@ -383,13 +445,15 @@ fn main() {
         if let Err(e) = roundtrip_inputs(&v["inputs"], &vdir, &mut nfiles, &mut nbytes) {
             fails.push(format!("roundtrip: {e}"));
         }
-        let cuts = match truncate_cuts(&v, &vdir, &mut durable) {
-            Ok(n) => n,
-            Err(e) => {
-                fails.push(format!("cuts: {e}"));
-                0
-            }
-        };
+        let mut cuts = 0;
+        match materialize_stream(&v, &vdir, &mut durable) {
+            Ok(Some((full, stream))) => match truncate_cuts(&v, &full, &stream) {
+                Ok(n) => cuts = n,
+                Err(e) => fails.push(format!("cuts: {e}")),
+            },
+            Ok(None) => {}
+            Err(e) => fails.push(format!("stream: {e}")),
+        }
         let mut locks = String::new();
         if v["case_kind"].as_str() == Some("lock-matrix") {
             match run_lock_script(&v, &vdir) {
@@ -446,6 +510,35 @@ fn main() {
             durable.0, durable.1
         );
         std::process::exit(1);
+    }
+    // The flush-observation coupling (criterion 8): the invocation
+    // counter alone survives deletion of the call it counts, so the
+    // lane re-execs one probe write plain (must be green) and under
+    // the STORAGE_LANE_FAIL_SYNC failpoint (must be red) — a durable
+    // path that stopped calling, or stopped honoring, the sync seam
+    // leaves the failpoint probe green and fails here.
+    if std::env::var_os("STORAGE_LANE_FAIL_SYNC").is_none() {
+        let exe = std::env::current_exe().expect("current exe");
+        let plain = Command::new(&exe)
+            .arg("--flush-probe")
+            .status()
+            .expect("flush probe spawn");
+        let failpoint = Command::new(&exe)
+            .arg("--flush-probe")
+            .env("STORAGE_LANE_FAIL_SYNC", "1")
+            .status()
+            .expect("flush probe spawn");
+        if !plain.success() || failpoint.success() {
+            eprintln!(
+                "STORAGE LANE RED: flush failpoint control (plain probe green={}, \
+                 failpoint probe green={}) — the durable path no longer calls or \
+                 honors the sync seam",
+                plain.success(),
+                failpoint.success()
+            );
+            std::process::exit(1);
+        }
+        println!("flush failpoint control: probe green plain, red under STORAGE_LANE_FAIL_SYNC");
     }
     // R5 manifest equality, both directions.
     executed.sort();
