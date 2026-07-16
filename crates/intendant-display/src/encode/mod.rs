@@ -1575,4 +1575,94 @@ a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
             );
         }
     }
+
+    /// Deterministic pseudo-random plane bytes (LCG) — non-constant
+    /// input for the exact-2× equivalence pins below.
+    fn lcg_plane(len: usize, mut seed: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            out.push((seed >> 24) as u8);
+        }
+        out
+    }
+
+    /// Pin for `downscale_plane_box2x`'s bilinear equivalence claim: at
+    /// an exact 2× reduction the integer box filter must produce
+    /// byte-identical output to the pixel-center bilinear sampler on
+    /// arbitrary (non-constant) content. The constant-color tests never
+    /// reach the interesting rounding paths; this randomized plane does
+    /// — and pins the equivalence against future edits to either
+    /// implementation.
+    #[test]
+    fn downscale_plane_box2x_matches_bilinear_bit_for_bit() {
+        let (src_w, src_h, dst_w, dst_h) = (64usize, 32usize, 32usize, 16usize);
+        let src = lcg_plane(src_w * src_h, 0xD15C0DE);
+
+        let mut via_box = vec![0u8; dst_w * dst_h];
+        downscale_plane_box2x(&src, src_w, &mut via_box, dst_w, dst_h);
+
+        let mut via_bilinear = vec![0u8; dst_w * dst_h];
+        downscale_plane_bilinear(&src, src_w, src_h, &mut via_bilinear, dst_w, dst_h);
+
+        assert_eq!(
+            via_box, via_bilinear,
+            "exact-2× box filter must be bit-identical to bilinear",
+        );
+    }
+
+    /// End-to-end exact-2× I420 downscale on a gradient: every plane
+    /// (Y and the half-size U/V) satisfies `src == 2*dst`, so all
+    /// three take the box2x path, and every output byte must be the
+    /// rounded 2×2 box average of its source block.
+    #[test]
+    fn downscale_i420_exact_2x_gradient_takes_box_average() {
+        let (src_w, src_h, dst_w, dst_h) = (16u32, 8u32, 8u32, 4u32);
+        let y_size = (src_w * src_h) as usize;
+        let uv_size = (src_w / 2 * src_h / 2) as usize;
+        let src = lcg_plane(y_size + 2 * uv_size, 0xBEEF);
+
+        let out = downscale_i420(&src, src_w, src_h, dst_w, dst_h);
+
+        // Reference: rounded equal-weight 2×2 box average per plane.
+        let box_avg = |plane: &[u8], w: usize, dx: usize, dy: usize| -> u8 {
+            let s0 = (dy * 2) * w + dx * 2;
+            let s1 = s0 + w;
+            let sum =
+                plane[s0] as u16 + plane[s0 + 1] as u16 + plane[s1] as u16 + plane[s1 + 1] as u16;
+            ((sum + 2) >> 2) as u8
+        };
+
+        let (src_y, src_uv) = src.split_at(y_size);
+        let (src_u, src_v) = src_uv.split_at(uv_size);
+        let dst_y_size = (dst_w * dst_h) as usize;
+        let dst_uv_size = (dst_w / 2 * dst_h / 2) as usize;
+        let (out_y, out_uv) = out.split_at(dst_y_size);
+        let (out_u, out_v) = out_uv.split_at(dst_uv_size);
+
+        for dy in 0..dst_h as usize {
+            for dx in 0..dst_w as usize {
+                assert_eq!(
+                    out_y[dy * dst_w as usize + dx],
+                    box_avg(src_y, src_w as usize, dx, dy),
+                    "Y plane ({dx},{dy})",
+                );
+            }
+        }
+        for dy in 0..(dst_h / 2) as usize {
+            for dx in 0..(dst_w / 2) as usize {
+                let idx = dy * (dst_w / 2) as usize + dx;
+                assert_eq!(
+                    out_u[idx],
+                    box_avg(src_u, (src_w / 2) as usize, dx, dy),
+                    "U plane ({dx},{dy})",
+                );
+                assert_eq!(
+                    out_v[idx],
+                    box_avg(src_v, (src_w / 2) as usize, dx, dy),
+                    "V plane ({dx},{dy})",
+                );
+            }
+        }
+    }
 }
