@@ -322,20 +322,18 @@ pub(crate) async fn serve_http_request(
     // payload signature is the authority and they receive role:none below.
     let request_origin = extract_origin_header(header_text);
     let mut fleet_cors_origin: Option<String> = None;
-    if let Some(origin) = request_origin
-        .as_deref()
-        .filter(|_| !authority_free_request)
-    {
+    if let Some(origin) = request_origin.as_deref() {
         match cross_origin_request_decision(
             origin,
             req_path,
+            authority_free_request,
             peer_addr,
             is_tls,
             header_text,
             peer_registry.as_ref(),
             &cert_dir,
         ) {
-            CrossOriginDecision::OwnOrigin => {}
+            CrossOriginDecision::AuthorityFree | CrossOriginDecision::OwnOrigin => {}
             CrossOriginDecision::EchoOrigin(allowed) => {
                 fleet_cors_origin = Some(allowed);
             }
@@ -566,15 +564,14 @@ pub(crate) async fn serve_http_request(
                     }
                     Err((status, body)) => {
                         use tokio::io::AsyncWriteExt;
-                        let base = HttpResponse::json(status_reason(status), body);
-                        let response = match crate::gateway_routes::preflight_posture(req_path) {
-                            Some(crate::gateway_routes::CorsPosture::Public) => base.public_cors(),
-                            Some(
-                                crate::gateway_routes::CorsPosture::FleetAllowlist
-                                | crate::gateway_routes::CorsPosture::FleetOrLoopback,
-                            ) => base.fleet_cors(fleet_cors_origin.as_deref()),
-                            _ => base,
-                        };
+                        // The matched row's posture, through the one
+                        // renderer — identical treatment to the
+                        // handler's own response.
+                        let response = apply_cors_posture(
+                            HttpResponse::json(status_reason(status), body),
+                            route.cors,
+                            fleet_cors_origin.as_deref(),
+                        );
                         let _ = stream.write_all(&response.into_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -738,7 +735,14 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::WorktreesMerge => {
-                return handle_worktrees_merge(stream, route_body, worktree_inventory_cache).await;
+                return handle_worktrees_merge(
+                    stream,
+                    route_body,
+                    worktree_inventory_cache,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::WorktreesScan => {
                 return handle_worktrees_scan(
@@ -960,8 +964,15 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::SessionSubRouter => {
-                return handle_session_sub_router(stream, request_line, session_log, query_ctx)
-                    .await;
+                return handle_session_sub_router(
+                    stream,
+                    request_line,
+                    session_log,
+                    query_ctx,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::SessionForkPoints => {
                 return handle_session_fork_points(
@@ -1336,13 +1347,17 @@ pub(crate) async fn serve_http_request(
         })
         .to_string();
         let base = HttpResponse::json("405 Method Not Allowed", body).header("Allow", &allow);
-        let response = match crate::gateway_routes::preflight_posture(req_path) {
-            Some(crate::gateway_routes::CorsPosture::Public) => base.public_cors(),
-            Some(crate::gateway_routes::CorsPosture::FleetAllowlist) => {
-                base.fleet_cors(fleet_cors_origin.as_deref())
-            }
-            _ => base,
-        };
+        // The path's declared posture through the one renderer, so an
+        // admitted cross-origin caller (fleet/loopback rows included)
+        // can read the structured 405 instead of hitting an opaque
+        // CORS failure. `allowed_methods_for_path` just matched, so a
+        // posture always exists; fall closed to own-origin regardless.
+        let response = apply_cors_posture(
+            base,
+            crate::gateway_routes::preflight_posture(req_path)
+                .unwrap_or(crate::gateway_routes::CorsPosture::OwnOrigin),
+            fleet_cors_origin.as_deref(),
+        );
         let reuse = stream.exchange_reusable();
         let response = response.connection_reuse(reuse);
         let write_ok = stream.write_all(&response.into_bytes()).await.is_ok();
@@ -1952,7 +1967,7 @@ pub(crate) fn api_response_http_bytes(
 /// `Access-Control-Allow-Origin` a legacy response shape still bakes
 /// in, so cross-origin readability can only ever come from the row's
 /// declaration, never from a handler's header vec.
-fn apply_cors_posture(
+pub(crate) fn apply_cors_posture(
     http: HttpResponse,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,

@@ -528,16 +528,20 @@ pub(crate) fn app_html_override_response(
             )
         }
         Err(err) => {
+            // The configured path and the OS error stay server-side:
+            // this response is served certificate-free from the shell
+            // lane, so a body echoing the absolute override path would
+            // hand any reachable page a local username/project layout
+            // whenever the dev override is broken.
             eprintln!(
                 "[web_gateway] INTENDANT_APP_HTML_PATH read failed ({}): {err}",
                 path.display()
             );
-            let body = format!(
-                "INTENDANT_APP_HTML_PATH override is active but unreadable.\n\n\
-                 path: {}\nerror: {err}\n\n\
-                 Fix the path (or unset INTENDANT_APP_HTML_PATH) and refresh.\n",
-                path.display()
-            );
+            let body = "INTENDANT_APP_HTML_PATH override is active but its \
+                 configured app.html could not be read. Check the daemon log \
+                 for the path and error, then fix the path (or unset \
+                 INTENDANT_APP_HTML_PATH) and refresh.\n"
+                .to_string();
             let mut response = HttpResponse::new("500 Internal Server Error")
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .header("Content-Length", body.len().to_string())
@@ -1200,7 +1204,12 @@ mod tests {
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 500"));
         assert!(text.contains("INTENDANT_APP_HTML_PATH"));
-        assert!(text.contains("missing.html"));
+        // The configured absolute path (and the OS error) must never
+        // reach the body — this page is readable certificate-free, and
+        // the path leaks a local username/project layout. It is logged
+        // server-side instead.
+        assert!(!text.contains("missing.html"));
+        assert!(!text.contains(&dir.path().display().to_string()));
         // HEAD keeps the status but sends headers only.
         let head = app_html_override_response("HEAD", "", "", &path, false);
         let head = String::from_utf8_lossy(&head);

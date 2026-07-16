@@ -3170,6 +3170,8 @@ pub(crate) async fn handle_session_sub_router(
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<WebQueryCtx>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // Transport edge: resolve the real home once; the golden transcripts
     // drive the `_from_home` variant with an injected temp home.
@@ -3178,6 +3180,8 @@ pub(crate) async fn handle_session_sub_router(
         request_line,
         session_log,
         query_ctx,
+        cors,
+        fleet_origin,
         &crate::platform::home_dir(),
     )
     .await;
@@ -3188,9 +3192,17 @@ pub(crate) async fn handle_session_sub_router_from_home(
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<WebQueryCtx>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
     home: &Path,
 ) {
     use tokio::io::AsyncWriteExt;
+    // Every write below — the ApiResponse renders AND the hand-rolled
+    // segment/frame/text shapes — funnels through the row's declared
+    // posture, so a future baked ACAO cannot bypass the CORS sanitizer
+    // (`apply_cors_posture` is authoritative; see its docs).
+    let posture_bytes =
+        |http: HttpResponse| apply_cors_posture(http, cors, fleet_origin).into_bytes();
     // Extract the rest after /api/session/ and split into parts
     let rest = request_line
         .split("/api/session/")
@@ -3231,11 +3243,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 Err(error) => ApiResponse::json_error(400, error),
             }
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     } else if rest_parts.len() >= 2 && route_name == "recordings" {
         // Session recording sub-routes: /api/session/{id}/recordings[/...]
@@ -3243,8 +3251,11 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let rec_rest = &rest_parts[2..]; // parts after "recordings"
 
         if !session_lookup_id_is_safe(session_id) {
-            let response = upload_error_response("400 Bad Request", "invalid session id");
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(upload_error_response(
+                "400 Bad Request",
+                "invalid session id",
+            ));
+            let _ = stream.write_all(&response).await;
         } else if rec_rest.len() == 2
             && (rec_rest[1] == "segments" || rec_rest[1] == "playlist.m3u8")
         {
@@ -3257,11 +3268,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 rec_rest[0],
                 rec_rest[1],
             );
-            let bytes = api_response_http_bytes(
-                response,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            );
+            let bytes = api_response_http_bytes(response, cors, fleet_origin);
             let _ = stream.write_all(&bytes).await;
         } else if rec_rest.len() == 2 {
             // GET /api/session/{id}/recordings/{stream}/{filename}
@@ -3282,49 +3289,49 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 if let Some(path) = seg_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", seg_ct)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
+                            let header = posture_bytes(
+                                HttpResponse::new("200 OK")
+                                    .header("Content-Type", seg_ct)
+                                    .header("Content-Length", data.len().to_string())
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&header).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read segment";
-                            let response = HttpResponse::with_content(
-                                "500 Internal Server Error",
-                                "text/plain",
-                                body,
-                            )
-                            .header("Connection", "close")
-                            .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
+                            let response = posture_bytes(
+                                HttpResponse::with_content(
+                                    "500 Internal Server Error",
+                                    "text/plain",
+                                    body,
+                                )
+                                .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&response).await;
                         }
                     }
                 } else {
                     let body = "Segment not found";
-                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                        .header("Connection", "close")
-                        .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    let response = posture_bytes(
+                        HttpResponse::with_content("404 Not Found", "text/plain", body)
+                            .header("Connection", "close"),
+                    );
+                    let _ = stream.write_all(&response).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let response = posture_bytes(
+                    HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                        .header("Connection", "close"),
+                );
+                let _ = stream.write_all(&response).await;
             }
         } else {
             // GET /api/session/{id}/recordings — list streams
             let response = session_recordings_api_response(home, session_id);
-            let bytes = api_response_http_bytes(
-                response,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            );
+            let bytes = api_response_http_bytes(response, cors, fleet_origin);
             let _ = stream.write_all(&bytes).await;
         }
     } else if rest_parts.len() >= 2 && route_name == "report" {
@@ -3353,11 +3360,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 session_text_plain_response(500, format!("Failed to build report: {}", e))
             }
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     } else if rest_parts.len() >= 2 && route_name == "frames" {
         // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
@@ -3366,8 +3369,11 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let frame_rest = &rest_parts[2..];
 
         if !session_lookup_id_is_safe(session_id) {
-            let response = upload_error_response("400 Bad Request", "invalid session id");
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(upload_error_response(
+                "400 Bad Request",
+                "invalid session id",
+            ));
+            let _ = stream.write_all(&response).await;
         } else if frame_rest.len() == 1 {
             // GET /api/session/{id}/frames/{filename}
             let filename = frame_rest[0];
@@ -3385,40 +3391,44 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 if let Some(path) = frame_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", ct)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
+                            let header = posture_bytes(
+                                HttpResponse::new("200 OK")
+                                    .header("Content-Type", ct)
+                                    .header("Content-Length", data.len().to_string())
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&header).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read frame";
-                            let response = HttpResponse::with_content(
-                                "500 Internal Server Error",
-                                "text/plain",
-                                body,
-                            )
-                            .header("Connection", "close")
-                            .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
+                            let response = posture_bytes(
+                                HttpResponse::with_content(
+                                    "500 Internal Server Error",
+                                    "text/plain",
+                                    body,
+                                )
+                                .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&response).await;
                         }
                     }
                 } else {
                     let body = "Frame not found";
-                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                        .header("Connection", "close")
-                        .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    let response = posture_bytes(
+                        HttpResponse::with_content("404 Not Found", "text/plain", body)
+                            .header("Connection", "close"),
+                    );
+                    let _ = stream.write_all(&response).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let response = posture_bytes(
+                    HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                        .header("Connection", "close"),
+                );
+                let _ = stream.write_all(&response).await;
             }
         } else {
             // GET /api/session/{id}/frames — list frame filenames
@@ -3441,11 +3451,12 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 } else {
                     "[]".to_string()
                 };
-            let response = HttpResponse::with_content("200 OK", "application/json", body)
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(
+                HttpResponse::with_content("200 OK", "application/json", body)
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "close"),
+            );
+            let _ = stream.write_all(&response).await;
         }
     } else {
         // GET /api/session/{id} — session detail
@@ -3482,11 +3493,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 ),
             ),
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     }
     finalize_http_stream(&mut stream).await;
@@ -4087,9 +4094,11 @@ pub(crate) async fn handle_worktrees_clean(
 }
 
 pub(crate) async fn handle_worktrees_merge(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     let home = crate::platform::home_dir();
     let cache = worktree_inventory_cache.clone();
@@ -4116,10 +4125,11 @@ pub(crate) async fn handle_worktrees_merge(
             .to_string(),
         ),
     };
-    let response = json_response(status, body);
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    // The canonical json tail under the row posture, like the rest of
+    // the worktree family (this handler used to write a raw
+    // `json_response` string past the CORS renderer).
+    let response = ApiResponse::json(status_line_code(status), JsonBody::PreSerialized(body));
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_worktrees_scan(
@@ -6301,6 +6311,13 @@ mod tests {
             .cors
     }
 
+    /// The session sub-router rows' declared posture (all four `Under`
+    /// rows agree — the posture-consistency invariant), read from the
+    /// table for the same reason as [`session_route_cors`].
+    fn sub_router_cors() -> crate::gateway_routes::CorsPosture {
+        session_route_cors("GET", "/api/session/golden-id/recordings")
+    }
+
     #[tokio::test]
     async fn golden_sessions_list_empty_ids_filter_transcript() {
         // A present-but-empty ids filter answers the empty list without
@@ -6421,7 +6438,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/.. HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6436,7 +6461,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/golden-detail-missing HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6456,7 +6489,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}?limit=5 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         // Body from the store layer (untouched by the conversion); the
@@ -6695,7 +6736,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6712,7 +6761,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6730,7 +6787,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6747,7 +6812,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6762,7 +6835,15 @@ mod tests {
         let request_line =
             "GET /api/session/golden-snapshot-missing/context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6862,7 +6943,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6876,7 +6965,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/golden-report-missing/report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6929,7 +7026,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         // Zip bytes from the store layer (same-run mtimes make the two
@@ -6969,6 +7074,8 @@ mod tests {
                 "GET /api/session/../recordings HTTP/1.1",
                 None,
                 None,
+                sub_router_cors(),
+                None,
                 home.path(),
             )
         })
@@ -6981,7 +7088,15 @@ mod tests {
         // Missing session: empty list under the canonical tail.
         let request_line = "GET /api/session/golden-recordings-missing/recordings HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6994,7 +7109,15 @@ mod tests {
         let (_log_dir, _seg) = golden_recordings_fixture(&home, session_id);
         let request_line = format!("GET /api/session/{session_id}/recordings HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let (status, body) = session_recordings_list_response_body(home.path(), session_id);
@@ -7015,7 +7138,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/segments HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let body = r#"[{"end_secs":2.0,"filename":"seg_00001.mp4","start_secs":0.0}]"#;
@@ -7028,7 +7159,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/playlist.m3u8 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\nseg_00001.mp4\n#EXT-X-ENDLIST\n";
@@ -7049,7 +7188,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_00001.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7061,7 +7208,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/evil.txt HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7072,7 +7227,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_09999.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7092,7 +7255,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_0001.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7102,7 +7273,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/evil.exe HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7112,7 +7291,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_9.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(

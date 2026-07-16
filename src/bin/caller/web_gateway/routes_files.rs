@@ -2152,13 +2152,14 @@ pub(crate) fn status_line_u16(status_line: &str) -> u16 {
         .unwrap_or(500)
 }
 
-/// Build an HTTP response for an upload endpoint error.
-pub(crate) fn upload_error_response(status: &str, message: &str) -> String {
+/// Build an HTTP response for an upload endpoint error. Returns the
+/// builder so the caller finishes it through the row's CORS posture
+/// (`apply_cors_posture`) before writing.
+pub(crate) fn upload_error_response(status: &str, message: &str) -> HttpResponse {
     let body = serde_json::json!({"error": message}).to_string();
     HttpResponse::with_content(status, "application/json", body)
         .header("Cache-Control", "no-cache")
         .header("Connection", "close")
-        .into_string()
 }
 
 /// Transport-neutral core of `POST /api/fs/write` (tunnel twin

@@ -1671,8 +1671,9 @@ function renderSessionStatsFallback(sessions) {
 // Load and render the "All Sessions" + "Disk Usage" cards for a
 // specific host. Defaults to self (same-origin fetch). When `hostId`
 // is a secondary, the fetch targets that daemon's base URL — which
-// means the browser needs CORS on the remote's /api/sessions (we set
-// `Access-Control-Allow-Origin: *` on that endpoint in web_gateway.rs)
+// means the browser needs CORS on the remote's /api/sessions: the
+// daemon echoes fleet-allowlisted and same-box loopback origins
+// exactly (never a wildcard; anything else gets no CORS header) —
 // and, for HTTPS primaries, the remote must also be HTTPS because of
 // mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId, options = {}) {

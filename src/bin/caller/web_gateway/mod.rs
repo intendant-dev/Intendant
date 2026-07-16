@@ -2125,6 +2125,28 @@ mod tests {
             !resp.contains("Access-Control-Allow-Origin"),
             "origin-less preflight must get no ACAO header: {resp}"
         );
+        // An admitted sibling origin sending an undeclared method gets
+        // the structured 405 WITH the echo (the row's posture applies to
+        // the dispatch-level error too), instead of an opaque CORS
+        // failure. Pre-handler, so still hermetic.
+        let resp = http_request(
+            port,
+            "POST /api/sessions HTTP/1.1\r\nHost: localhost\r\nOrigin: http://127.0.0.1:9321\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "undeclared method should answer 405: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            resp.contains("Access-Control-Allow-Origin: http://127.0.0.1:9321\r\n"),
+            "the 405 must stay readable to the admitted origin: {resp}"
+        );
+        assert!(
+            resp.contains("Vary: Origin\r\n") && resp.contains("Allow: "),
+            "the 405 keeps its Allow header and origin-varies: {resp}"
+        );
         handle.abort();
     }
 

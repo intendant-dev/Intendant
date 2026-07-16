@@ -1805,15 +1805,29 @@ pub(crate) fn fleet_access_origin_allowed(
 
 /// Whether `origin` is a loopback-host page origin: an `http`/`https`
 /// page served from `localhost`, `127.0.0.0/8`, or `[::1]` on any port.
-/// Only real page-origin schemes qualify; `null`, custom schemes, and
-/// anything unparseable are refused (fail closed). A page can only carry
-/// such an origin if something on the browser's own machine served it —
-/// remote DNS names never produce a loopback `Origin` value.
+/// Only canonical `scheme://host[:port]` serializations qualify — the
+/// same bar the direct-loopback authority parser sets for Host values:
+/// userinfo, a path, a query, or a fragment disqualifies the value even
+/// when its host is loopback (browsers never serialize `Origin` with
+/// any of those). `null`, custom schemes, and anything unparseable are
+/// refused (fail closed). A page can only carry a loopback origin if
+/// something on the browser's own machine served it — remote DNS names
+/// never produce one.
 pub(crate) fn origin_is_loopback_host(origin: &str) -> bool {
     let Ok(url) = url::Url::parse(origin.trim()) else {
         return false;
     };
     if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    // An http(s) URL with no path component parses to "/"; anything
+    // else means the value carried more than an origin.
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return false;
     }
     match url.host() {
@@ -1833,9 +1847,16 @@ pub(crate) fn origin_is_loopback_host(origin: &str) -> bool {
 /// port fetching this daemon for the Stats tab. The loopback half
 /// requires the connection itself to arrive over loopback with no
 /// reverse-proxy provenance, so a remote browser (whose loopback pages
-/// belong to a *different* machine) never qualifies. Like the fleet
-/// gate, this only decides which pages may read; authentication stays
-/// with mTLS/IAM.
+/// belong to a *different* machine) never qualifies.
+///
+/// This gate decides CORS **readability only** — which pages a browser
+/// may hand the response bytes to. It deliberately performs no
+/// authentication of its own and relies on the auth layer running on
+/// the same request: `remote_dashboard_client_auth_missing` (Host +
+/// client-cert/peer-identity checks) and the per-route IAM decision
+/// still decide whether any data is produced at all. Do not "harden"
+/// this predicate with auth concerns or relax that layer because this
+/// one looks strict — each covers exactly its half.
 pub(crate) fn session_data_origin_allowed(
     origin: &str,
     peer_addr: std::net::SocketAddr,
@@ -1856,10 +1877,16 @@ pub(crate) fn session_data_origin_allowed(
 /// origins are refused unless the path's declared CORS posture admits
 /// them, and an admitted foreign origin is echoed back exactly (with
 /// `Vary: Origin`) by the response renderer. Extracted so the gate's
-/// admission logic is unit-testable; behavior is the gate's historical
-/// ladder plus the [`session_data_origin_allowed`] lane.
+/// whole ladder — including the authority-free exclusion and the
+/// `/config` carve-out — is unit-testable; behavior is the gate's
+/// historical ladder plus the [`session_data_origin_allowed`] lane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CrossOriginDecision {
+    /// An authority-free route (public doorbells/bootstrap/shell):
+    /// deliberately cross-origin by design, so the gate does not apply
+    /// and no origin is echoed here (those responses carry their own
+    /// public CORS decision).
+    AuthorityFree,
     /// The daemon's own origin or the packaged-app scheme: proceed, no
     /// echo needed.
     OwnOrigin,
@@ -1874,12 +1901,16 @@ pub(crate) enum CrossOriginDecision {
 pub(crate) fn cross_origin_request_decision(
     origin: &str,
     req_path: &str,
+    authority_free_request: bool,
     peer_addr: std::net::SocketAddr,
     is_tls: bool,
     header_text: &str,
     peer_registry: Option<&crate::peer::PeerRegistry>,
     cert_dir: &std::path::Path,
 ) -> CrossOriginDecision {
+    if authority_free_request {
+        return CrossOriginDecision::AuthorityFree;
+    }
     if is_own_or_app_origin(origin, is_tls, header_text) {
         return CrossOriginDecision::OwnOrigin;
     }
@@ -3296,6 +3327,20 @@ mod tests {
         assert!(!origin_is_loopback_host("null"));
         assert!(!origin_is_loopback_host(""));
         assert!(!origin_is_loopback_host("http://192.0.2.1:8080"));
+        // Non-canonical serializations fail closed too — a real Origin
+        // is exactly scheme://host[:port]; userinfo, a path, a query,
+        // or a fragment means the value is not a browser origin (the
+        // same bar the direct-loopback authority parser sets).
+        assert!(!origin_is_loopback_host("http://user@localhost:3000"));
+        assert!(!origin_is_loopback_host("http://user:pw@127.0.0.1:3000"));
+        assert!(!origin_is_loopback_host("http://localhost:3000/path"));
+        assert!(!origin_is_loopback_host("http://127.0.0.1:3000?q=1"));
+        assert!(!origin_is_loopback_host("http://[::1]:3000#frag"));
+        assert!(!origin_is_loopback_host("http://user@localhost/path?x=1#y"));
+        // The bare-slash form is indistinguishable from the canonical
+        // origin after parsing (http URLs normalize the empty path to
+        // "/") and stays admitted.
+        assert!(origin_is_loopback_host("http://localhost:3000/"));
     }
 
     #[test]
@@ -3394,6 +3439,7 @@ mod tests {
             cross_origin_request_decision(
                 origin,
                 path,
+                false,
                 loopback_conn,
                 false,
                 headers,
@@ -3437,6 +3483,70 @@ mod tests {
             CrossOriginDecision::Refuse
         );
         assert_eq!(decide("null", "/api/sessions"), CrossOriginDecision::Refuse);
+
+        // The authority-free exclusion: public doorbell/bootstrap
+        // requests bypass the gate entirely — even a foreign origin is
+        // neither refused nor echoed here (those responses carry their
+        // own public CORS decision).
+        let authority_free = |origin: &str, path: &str| {
+            cross_origin_request_decision(
+                origin,
+                path,
+                true,
+                loopback_conn,
+                false,
+                headers,
+                None,
+                cert_dir.path(),
+            )
+        };
+        assert_eq!(
+            authority_free("https://evil.example", "/api/peers/access-requests"),
+            CrossOriginDecision::AuthorityFree
+        );
+        assert_eq!(
+            authority_free("https://evil.example", "/api/sessions"),
+            CrossOriginDecision::AuthorityFree
+        );
+
+        // The fleet-allowlist branch and the /config carve-out: an
+        // approved inbound peer identity's origin is echoed on fleet
+        // Access APIs and on /config — and only there among the
+        // own-origin-postured surface.
+        let fp = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            fp,
+            "peer-f",
+            "peer-operator",
+            Some("https://peer-box.local:9900/.well-known/agent-card.json"),
+            Some("req-f"),
+        )
+        .unwrap();
+        let fleet_origin = "https://peer-box.local:9900";
+        assert_eq!(
+            decide(fleet_origin, "/api/access/overview"),
+            CrossOriginDecision::EchoOrigin(fleet_origin.to_string())
+        );
+        assert_eq!(
+            decide(fleet_origin, "/config"),
+            CrossOriginDecision::EchoOrigin(fleet_origin.to_string())
+        );
+        // The fleet half also serves the session-data rows …
+        assert_eq!(
+            decide(fleet_origin, "/api/sessions"),
+            CrossOriginDecision::EchoOrigin(fleet_origin.to_string())
+        );
+        // … but never the own-origin default, and a non-fleet loopback
+        // origin gets no /config echo (the carve-out is fleet-only).
+        assert_eq!(
+            decide(fleet_origin, "/api/settings"),
+            CrossOriginDecision::Refuse
+        );
+        assert_eq!(
+            decide("http://127.0.0.1:9321", "/config"),
+            CrossOriginDecision::Refuse
+        );
     }
 
     #[test]
