@@ -402,6 +402,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
+    // Sub-agent auto-minimize bookkeeping (in-memory, like minimized):
+    // autoMinimized marks a collapse the derivation applied (only those
+    // auto-restore when the session goes active again); userRestoredWhileDone
+    // marks an explicit user restore of a done sub-agent, which the auto
+    // rule must never re-collapse.
+    autoMinimized: false,
+    userRestoredWhileDone: false,
     followOutput: true,
     pendingOutput: false,
     logHistory: [],
@@ -414,6 +421,11 @@ function ensureSessionWindow(sessionId, meta = {}) {
   updateSessionWindowHeaderCollapseState(sid);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
+  // A window can be (re)built for an already-finished sub-agent with no
+  // phase in the build meta (metadata-only rebuilds, ended flag carried by
+  // sessionMetadataById) — updateSessionWindow only reaches the phase
+  // applier when meta.phase is set, so derive the auto-minimize here too.
+  maybeAutoMinimizeSubagentWindow(sid);
   updateSessionWindowMaximizeState();
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
@@ -439,6 +451,11 @@ function applySessionWindowPhase(win, sid, phase) {
   const cls = sessionPhaseClass(win.phase);
   if (cls) win.status.classList.add(cls);
   maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+  // Done sub-agents collapse on their own (and auto-applied collapses
+  // reopen when the session goes active again). Rides every phase
+  // application for the same reason the approval hook above does: the
+  // active→done crossing arrives via the fast path AND the wide render.
+  maybeAutoMinimizeSubagentWindow(sid);
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -639,7 +656,95 @@ function toggleSessionWindowMinimized(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
-  setSessionWindowMinimized(sid, !win.minimized);
+  const next = !win.minimized;
+  // Explicit toggle: the user owns this window's minimize state now. A
+  // restore of a done sub-agent is recorded so the auto rule never
+  // re-collapses it; a manual minimize clears autoMinimized so the
+  // done→active crossing never pops it back open.
+  win.autoMinimized = false;
+  win.userRestoredWhileDone = !next && sessionWindowIsDoneSubagent(sid);
+  setSessionWindowMinimized(sid, next);
+}
+
+// ── Sub-agent auto-minimize (derived state) ────────────────────────────
+// A finished sub-agent's window collapses on its own so the grid stays
+// readable while a parent fans out work. The rule is a DERIVATION, not a
+// one-shot event handler: it re-runs on every phase application (both
+// updateSessionWindow paths route through applySessionWindowPhase), at
+// window build, and when relationship metadata arrives late
+// (applySessionRelationshipMetadata) — so the collapsed state reproduces
+// after a reload even though win.minimized is never persisted (the
+// replayed session_ended re-derives it).
+//
+// Scope: sub-agent windows ONLY — top-level sessions are never touched.
+
+// The bulk-control predicate — the SAME active boundary the parent
+// window's "N sub" badge counts with (sessionRelationshipSubagentIsActive),
+// so the "Minimize done" pill and the badges always agree on what "done"
+// means.
+function sessionWindowIsDoneSubagent(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid)) return false;
+  return sessionWindowIsSubagent(sid) && !sessionRelationshipSubagentIsActive(sid);
+}
+
+// The AUTO rule demands HARD done-evidence — ended, or phase
+// done/interrupted. Bare 'idle' is deliberately NOT enough here: replayed
+// windows are built at 'idle' before their real phase arrives
+// (onSessionStarted during log replay, when update_status_bar is not
+// applied), and waiting_followup normalizes to 'idle' — auto-collapsing
+// either would hide a live window. The bulk pill uses the broader badge
+// predicate above: an explicit click may collapse idle-parked sub-agents
+// too.
+//
+// User intent always wins: a maximized window is never touched, and a
+// window the user explicitly restored while done (userRestoredWhileDone —
+// set by the minimize toggle, maximize, and worktree-card paths) stays
+// open until the session goes active again. Only collapses THIS rule
+// applied (autoMinimized) reopen on the done→active crossing — a manual
+// minimize is never popped open.
+function maybeAutoMinimizeSubagentWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !sessionWindowIsSubagent(sid)) return;
+  if (sessionRelationshipSubagentIsActive(sid)) {
+    // Active again: retire the restore override so a future completion
+    // re-derives, and reopen a window only the auto rule closed.
+    win.userRestoredWhileDone = false;
+    if (win.minimized && win.autoMinimized) {
+      win.autoMinimized = false;
+      setSessionWindowMinimized(sid, false);
+    }
+    return;
+  }
+  if (win.minimized || win.userRestoredWhileDone) return;
+  if (maximizedSessionWindowId === sid) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  const phase = normalizeSessionPhase(win.phase || meta.phase || '');
+  const hardDone = !!(win.ended || meta.ended)
+    || phase === 'done' || phase === 'interrupted';
+  if (!hardDone) return;
+  win.autoMinimized = true;
+  setSessionWindowMinimized(sid, true);
+}
+
+// Bulk action behind the "Minimize done" pill (ui2-activity.js owns the
+// button + live count): collapse every done sub-agent window. An explicit
+// click is explicit intent — it overrides per-window restore flags (and
+// re-arms them false), and marks the collapse auto-managed so a sub-agent
+// that goes active again still pops back open. Returns how many windows
+// it collapsed.
+function minimizeDoneSubagentWindows() {
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (!sessionWindowIsDoneSubagent(sid)) continue;
+    win.userRestoredWhileDone = false;
+    win.autoMinimized = true;
+    setSessionWindowMinimized(sid, true);
+    changed += 1;
+  }
+  return changed;
 }
 
 function updateSessionWindowMaximizeState() {
@@ -667,6 +772,14 @@ function setSessionWindowMaximized(sessionId, maximized) {
   const sid = String(sessionId || '').trim();
   if (maximized) {
     if (!sid || !sessionWindows.has(sid)) return;
+    // Maximizing a minimized done sub-agent is an explicit restore: mark
+    // it user-intent so the auto-minimize derivation doesn't re-collapse
+    // the window the moment it is un-maximized.
+    const win = sessionWindows.get(sid);
+    if (win?.minimized && sessionWindowIsDoneSubagent(sid)) {
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
+    }
     setSessionWindowMinimized(sid, false);
     maximizedSessionWindowId = sid;
     focusSessionWindow(sid);
