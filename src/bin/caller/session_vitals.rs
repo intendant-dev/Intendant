@@ -17,11 +17,17 @@
 //!   hysteresis, registered root kept as the fallback identity.
 //! - **Cache segment**: a bus listener over `AppEvent::UsageSnapshot` —
 //!   every backend's usage rail converges there (external drains, the
-//!   native derivation in `tui/app.rs`), so one listener covers Claude
+//!   native derivation in `usage_rail.rs`), so one listener covers Claude
 //!   Code, Codex, and native sessions uniformly. Computes the latest
 //!   request's cache-hit receipt and carries the TTL anchor; the countdown
 //!   itself derives client-side from `last_activity_epoch + ttl_seconds`
 //!   (no per-second events).
+//! - **Activity segment**: the same listener folds
+//!   `AppEvent::SessionActivity` — each backend's wire-fact activity
+//!   machine (`session_activity.rs`) publishes through its drain (or the
+//!   native loop directly), and this one consumer covers them all.
+//!   Epochs + raw state ride the wire; elapsed/stall derivation ticks
+//!   client-side.
 //!
 //! The two producers arrive keyed by different members of an external
 //! session's identity group (git = wrapper/log id, usage = backend-native
@@ -322,6 +328,9 @@ impl SessionVitalsHub {
                 if vitals.limits.is_empty() {
                     vitals.limits = orphan.limits;
                 }
+                if vitals.activity.is_none() {
+                    vitals.activity = orphan.activity;
+                }
             });
         }
     }
@@ -396,8 +405,9 @@ fn cache_vitals_from_usage(
     })
 }
 
-/// Bus listener feeding the cache section: every backend's usage rail
-/// converges on `AppEvent::UsageSnapshot`, so this one consumer covers
+/// Bus listener feeding the cache and activity sections: every backend's
+/// usage rail converges on `AppEvent::UsageSnapshot` and every activity
+/// machine on `AppEvent::SessionActivity`, so this one consumer covers
 /// native, Claude Code, and Codex sessions alike. `SessionIdentity`
 /// linkages feed the hub's alias map so usage keyed by the backend-native
 /// id and git probes keyed by the wrapper id land in one entry (split
@@ -429,6 +439,12 @@ fn spawn_cache_vitals_listener(
                             vitals.limits = main.limits.clone();
                         }
                     });
+                }
+                Ok(AppEvent::SessionActivity {
+                    session_id: Some(session_id),
+                    activity,
+                }) => {
+                    hub.apply(&session_id, |vitals| vitals.activity = Some(activity));
                 }
                 Ok(AppEvent::SessionIdentity {
                     session_id,
@@ -545,7 +561,10 @@ impl GitTarget {
 /// daemon seeds the primary session at startup; the session supervisor
 /// registers every managed session at launch — which is what puts the
 /// dirty-count / merge-parity / unpushed rows on dashboard-spawned
-/// sessions and on projectless daemons (whose primary has no repo).
+/// sessions and on projectless daemons (whose primary has no repo) —
+/// and a boot-time scan restores targets for the store's non-ended
+/// sessions (see [`register_restored_session_targets`]) so idle
+/// session windows keep their chips across daemon restarts.
 /// `SessionEnded` prunes entries, so a handle owner only has to register.
 ///
 /// Each entry also tracks the session's activity locus: write paths from
@@ -572,6 +591,31 @@ impl GitVitalsTargets {
             .lock()
             .expect("git vitals targets lock")
             .insert(session_id.to_string(), GitTarget::new(cwd));
+    }
+
+    /// Register a session RESTORED from the on-disk session store at
+    /// daemon boot, unless the id already has a live registration —
+    /// launch/resume registrations (and the primary seed) carry the
+    /// freshest root and an explicit statement of where the session
+    /// lives, so the restore scan must never clobber one or reset its
+    /// activity locus. Returns whether the target was inserted.
+    pub(crate) fn register_restored(&self, session_id: &str, cwd: PathBuf) -> bool {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return false;
+        }
+        match self
+            .targets
+            .lock()
+            .expect("git vitals targets lock")
+            .entry(session_id.to_string())
+        {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(GitTarget::new(cwd));
+                true
+            }
+        }
     }
 
     pub(crate) fn remove(&self, session_id: &str) {
@@ -616,6 +660,100 @@ impl GitVitalsTargets {
     }
 }
 
+/// Cap on boot-time registration of restored sessions. A long-lived
+/// store accumulates thousands of non-ended session dirs (a real store
+/// measured ~2.1k across ~100 distinct roots), and every registered
+/// target costs a per-tick probe plus an emission — and a session-log
+/// write — for every session sharing a root whenever that root's git
+/// state changes. The newest N by meta mtime cover the session windows
+/// a dashboard realistically shows; older idle sessions regain their
+/// chips the moment they are resumed (launch-time registration, as
+/// before).
+const RESTORED_TARGET_CAP: usize = 64;
+
+/// Register git-probe targets for sessions RESTORED from the on-disk
+/// session store (`<home>/.intendant/logs`) — the daemon-boot
+/// complement to the supervisor's launch/resume registration. Without
+/// it a restart empties the registry, and idle session windows lose
+/// their git/health chips until the next resume touches them.
+///
+/// Scope mirrors the `SessionEnded` prune: a `completed` meta means the
+/// session ended before the restart (the prune would have dropped it),
+/// so it stays unregistered; `idle` / `interrupted` / stale `running`
+/// sessions were live in a daemon's registry when it died and come
+/// back. Worktree sessions register their CHECKOUT
+/// (`meta.worktree.path`), exactly like launch-time registration.
+/// The newest [`RESTORED_TARGET_CAP`] sessions win (meta-file mtime —
+/// re-stamped on every lifecycle transition — is the recency key), and
+/// registration is insert-if-absent so the primary seed and any
+/// launch/resume racing the scan keep their fresher roots.
+///
+/// Returns how many sessions were registered. Synchronous filesystem
+/// walk — call it from a blocking context.
+pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVitalsTargets) -> usize {
+    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
+    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
+        return 0;
+    };
+    // (meta mtime, session id, effective root)
+    let mut restored: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let meta_path = entry.path().join("session_meta.json");
+        let Ok(raw) = std::fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<crate::session_log::SessionMeta>(&raw) else {
+            continue;
+        };
+        // Parity with the SessionEnded prune: completed = ended.
+        if meta.status.as_deref() == Some("completed") {
+            continue;
+        }
+        let root = meta
+            .worktree
+            .as_ref()
+            .map(|worktree| worktree.path.clone())
+            .or(meta.project_root);
+        let Some(root) = root.filter(|root| !root.trim().is_empty()) else {
+            continue;
+        };
+        let session_id = meta.session_id.trim().to_string();
+        if session_id.is_empty() {
+            continue;
+        }
+        let mtime = meta_path
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        restored.push((mtime, session_id, PathBuf::from(root)));
+    }
+    // Newest first; the cap keeps probe work and emission fan-out bounded.
+    restored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    restored
+        .into_iter()
+        .take(RESTORED_TARGET_CAP)
+        .filter(|(_, session_id, root)| registry.register_restored(session_id, root.clone()))
+        .count()
+}
+
+/// Probe `cwd` through the per-tick cache: sessions sharing a checkout
+/// (the common shape once restored sessions register at boot — many
+/// idle sessions per project root) pay for one probe per tick instead
+/// of one per session. Git state is a pure function of the cwd within
+/// a tick, so the shared result is exact.
+async fn probe_cached(
+    prober: &mut GitVitalsProber,
+    tick_cache: &mut HashMap<PathBuf, Option<SessionGitVitals>>,
+    cwd: &Path,
+) -> Option<SessionGitVitals> {
+    if let Some(cached) = tick_cache.get(cwd) {
+        return cached.clone();
+    }
+    let probed = prober.probe(cwd).await;
+    tick_cache.insert(cwd.to_path_buf(), probed.clone());
+    probed
+}
+
 /// Vitals producer: spawns the cache listener and runs the periodic git
 /// prober over the live target registry (seeded with the primary session,
 /// fed by the session supervisor as sessions launch). All emission flows
@@ -642,14 +780,15 @@ pub(crate) fn spawn_session_vitals_producer(
         async move {
             let mut prober = GitVitalsProber::default();
             loop {
+                let mut tick_cache: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
                 for (session_id, cwd) in registry.snapshot() {
-                    let mut probed = prober.probe(&cwd).await;
+                    let mut probed = probe_cached(&mut prober, &mut tick_cache, &cwd).await;
                     if probed.is_none() {
                         // A dead activity locus (worktree deleted, checkout
                         // gone) falls back to the registered root in the
                         // same tick so the chip never blanks.
                         if let Some(root) = registry.demote_locus(&session_id, &cwd) {
-                            probed = prober.probe(&root).await;
+                            probed = probe_cached(&mut prober, &mut tick_cache, &root).await;
                         }
                     }
                     hub.apply(&session_id, |vitals| vitals.git = probed);
@@ -1121,6 +1260,219 @@ mod tests {
         assert_eq!(targets.demote_locus("nope", &worktree), None);
     }
 
+    /// Seed one restored-session record (`session_meta.json`) under
+    /// `<home>/.intendant/logs/<id>/`, the store layout the boot scan
+    /// walks. Returns the meta path (tests stagger its mtime).
+    fn write_restored_meta(
+        home: &Path,
+        session_id: &str,
+        status: &str,
+        project_root: Option<&Path>,
+        worktree_path: Option<&Path>,
+    ) -> PathBuf {
+        let dir = home.join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = crate::session_log::SessionMeta {
+            session_id: session_id.to_string(),
+            created_at: "2026-07-16T00:00:00".to_string(),
+            created_at_ms: None,
+            project_root: project_root.map(|p| p.to_string_lossy().to_string()),
+            name: None,
+            task: None,
+            status: Some(status.to_string()),
+            last_turn: None,
+            role: None,
+            rounds: None,
+            worktree: worktree_path.map(|p| crate::session_log::SessionWorktreeMeta {
+                branch: "wt-branch".to_string(),
+                path: p.to_string_lossy().to_string(),
+                base_root: home.to_string_lossy().to_string(),
+                base_branch: None,
+                base_sha: None,
+            }),
+        };
+        let meta_path = dir.join("session_meta.json");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+        meta_path
+    }
+
+    #[tokio::test]
+    async fn restore_scan_registers_non_ended_sessions_and_first_tick_emits() {
+        // The daemon-restart gap: sessions restored from the store used to
+        // stay unregistered until resumed, so idle windows lost their git
+        // chips. The boot scan must register every non-ended session (the
+        // SessionEnded-prune parity) and the first probe tick must emit a
+        // git section for it — registration alone repopulates the hub.
+        let home = tempfile::tempdir().expect("tempdir");
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        git_cmd(repo.path(), &["add", "."]);
+        git_cmd(repo.path(), &["commit", "-qm", "base"]);
+
+        write_restored_meta(
+            home.path(),
+            "restored-idle",
+            "idle",
+            Some(repo.path()),
+            None,
+        );
+        // Ended before the restart: the prune would have dropped it.
+        write_restored_meta(home.path(), "ended", "completed", Some(repo.path()), None);
+        // No root recorded: nothing to probe.
+        write_restored_meta(home.path(), "rootless", "idle", None, None);
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        assert_eq!(
+            register_restored_session_targets(home.path(), &targets),
+            1,
+            "only the non-ended rooted session registers"
+        );
+        let snapshot = targets.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0, "restored-idle");
+        assert_eq!(snapshot[0].1, repo.path());
+
+        let deadline = std::time::Duration::from_secs(20);
+        let vitals = tokio::time::timeout(deadline, async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    assert_eq!(
+                        session_id, "restored-idle",
+                        "only the restored session emits"
+                    );
+                    return vitals;
+                }
+            }
+        })
+        .await
+        .expect("restored session emits git vitals on the first tick");
+        assert_eq!(vitals.git.expect("git section").branch, "main");
+    }
+
+    #[test]
+    fn restore_scan_prefers_worktree_checkout_over_project_root() {
+        // Worktree sessions must register their CHECKOUT (a `.git`-FILE
+        // linked worktree), mirroring launch-time registration — even when
+        // a later resume rewrote meta.project_root to the base root.
+        let home = tempfile::tempdir().expect("tempdir");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let checkout = repo.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        write_restored_meta(
+            home.path(),
+            "wt-session",
+            "idle",
+            Some(&repo),
+            Some(&checkout),
+        );
+
+        let targets = GitVitalsTargets::default();
+        assert_eq!(register_restored_session_targets(home.path(), &targets), 1);
+        let snapshot = targets.snapshot();
+        assert_eq!(snapshot[0].0, "wt-session");
+        assert_eq!(
+            snapshot[0].1, checkout,
+            "the worktree checkout wins over the recorded project root"
+        );
+    }
+
+    #[test]
+    fn restore_scan_caps_at_newest_and_never_clobbers_live_registrations() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let root = tempfile::tempdir().expect("tempdir");
+        // CAP + 3 non-ended sessions with deterministic, strictly
+        // increasing mtimes: s-0..s-2 are the oldest and must lose.
+        let total = RESTORED_TARGET_CAP + 3;
+        for i in 0..total {
+            let meta_path = write_restored_meta(
+                home.path(),
+                &format!("s-{i}"),
+                "idle",
+                Some(root.path()),
+                None,
+            );
+            let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + i as u64);
+            std::fs::File::options()
+                .write(true)
+                .open(&meta_path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        }
+
+        // One of the newest ids is already live-registered (launch/resume
+        // raced the scan): the restore pass must not clobber its root.
+        let live_root = tempfile::tempdir().expect("tempdir");
+        let targets = GitVitalsTargets::default();
+        let live_id = format!("s-{}", total - 1);
+        targets.register(&live_id, live_root.path().to_path_buf());
+
+        let registered = register_restored_session_targets(home.path(), &targets);
+        assert_eq!(
+            registered,
+            RESTORED_TARGET_CAP - 1,
+            "cap slots minus the already-live session"
+        );
+        let snapshot: HashMap<String, PathBuf> = targets.snapshot().into_iter().collect();
+        assert_eq!(snapshot.len(), RESTORED_TARGET_CAP);
+        for i in 0..3 {
+            assert!(
+                !snapshot.contains_key(&format!("s-{i}")),
+                "oldest sessions fall past the cap"
+            );
+        }
+        assert_eq!(
+            snapshot.get(&live_id),
+            Some(&live_root.path().to_path_buf()),
+            "live registration survives the restore scan"
+        );
+        assert_eq!(
+            snapshot.get(&format!("s-{}", total - 2)),
+            Some(&root.path().to_path_buf()),
+            "newest restored sessions register their recorded root"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_root_sessions_share_one_probe_and_both_emit() {
+        // Restored stores routinely hold many idle sessions per project
+        // root; the per-tick probe cache must serve them all one probe's
+        // worth of git state without dropping anyone's emission.
+        let repo = tempfile::tempdir().expect("tempdir");
+        git_cmd(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        git_cmd(repo.path(), &["add", "."]);
+        git_cmd(repo.path(), &["commit", "-qm", "base"]);
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        targets.register("shared-a", repo.path().to_path_buf());
+        targets.register("shared-b", repo.path().to_path_buf());
+
+        let deadline = std::time::Duration::from_secs(20);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        tokio::time::timeout(deadline, async {
+            while seen.len() < 2 {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    let git = vitals.git.expect("git section probed");
+                    assert_eq!(git.branch, "main");
+                    seen.insert(session_id);
+                }
+            }
+        })
+        .await
+        .expect("both same-root sessions emit git vitals");
+        assert!(seen.contains("shared-a") && seen.contains("shared-b"));
+    }
+
     #[tokio::test]
     async fn activity_locus_follows_worktree_and_falls_back_when_deleted() {
         // End-to-end through the producer: a session registered at the
@@ -1328,6 +1680,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_listener_folds_snapshots_without_blanking_sections() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+        let mut rx = bus.subscribe();
+
+        // Seed another producer's section first.
+        hub.apply("s9", |v| {
+            v.git = Some(SessionGitVitals {
+                branch: "main".into(),
+                ..Default::default()
+            })
+        });
+        let activity = crate::types::SessionActivityVitals {
+            state: crate::types::SessionActivityState::Reasoning,
+            since_epoch: 100,
+            last_stream_byte_epoch: 104,
+            stalled_after_seconds: Some(20),
+            effort: Some("max".into()),
+            resets_at_epoch: None,
+        };
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: activity.clone(),
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9" && vitals.activity.is_some() {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the activity section");
+        assert_eq!(vitals.activity.as_ref(), Some(&activity));
+        assert!(
+            vitals.git.is_some(),
+            "activity writes must not blank other sections"
+        );
+
+        // Id-less snapshots (a native loop without a session id) are
+        // skipped, not folded under an empty key.
+        bus.send(AppEvent::SessionActivity {
+            session_id: None,
+            activity: activity.clone(),
+        });
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: crate::types::SessionActivityVitals {
+                state: crate::types::SessionActivityState::Idle,
+                since_epoch: 200,
+                last_stream_byte_epoch: 104,
+                ..Default::default()
+            },
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9"
+                        && vitals.activity.as_ref().map(|a| a.since_epoch) == Some(200)
+                    {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the follow-up snapshot");
+        assert_eq!(
+            vitals.activity.as_ref().map(|a| a.state),
+            Some(crate::types::SessionActivityState::Idle)
+        );
+    }
+
+    #[tokio::test]
     async fn probe_flags_conflicting_divergence() {
         if !merge_tree_supported() {
             return; // old git: the preview is skipped by design
@@ -1380,6 +1809,7 @@ mod tests {
         let catalog = &fragment[begin..end];
         for key in [
             "health:",
+            "activity:",
             "branch:",
             "worktree:",
             "dirty:",
@@ -1394,7 +1824,8 @@ mod tests {
             assert!(catalog.contains(key), "catalog lost symbol {key}");
         }
         // The serde-camelCase wire fields of SessionVitals/SessionGitVitals/
-        // SessionCacheVitals/SessionLimitWindow the catalog must consume.
+        // SessionCacheVitals/SessionLimitWindow/SessionActivityVitals the
+        // catalog must consume.
         for field in [
             "branch",
             "dirtyFiles",
@@ -1411,10 +1842,30 @@ mod tests {
             "resetsAtEpoch",
             "status",
             "label",
+            "state",
+            "sinceEpoch",
+            "lastStreamByteEpoch",
+            "stalledAfterSeconds",
+            "effort",
         ] {
             assert!(
                 catalog.contains(field),
                 "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
+            );
+        }
+        // The wire spellings of the activity states the catalog renders —
+        // and the derived-only `stalled` — must all be explained.
+        for state in [
+            "reasoning",
+            "responding",
+            "tool-running",
+            "awaiting-api",
+            "rate-limited",
+            "stalled",
+        ] {
+            assert!(
+                catalog.contains(state),
+                "catalog stopped handling activity state {state}"
             );
         }
     }

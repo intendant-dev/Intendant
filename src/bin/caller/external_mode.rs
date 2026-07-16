@@ -457,6 +457,17 @@ pub(crate) async fn run_external_agent_mode(
                                             presence: None,
                                         });
                                     }
+                                    // Ambient bookkeeping like Usage/Log:
+                                    // forward to the vitals hub, never into
+                                    // the observe drain (an idle activity
+                                    // snapshot implies no turn and must not
+                                    // open a spontaneous round).
+                                    external_agent::AgentEvent::ActivityUpdate { activity } => {
+                                        bus.send(AppEvent::SessionActivity {
+                                            session_id: drain_config.session_id.clone(),
+                                            activity,
+                                        });
+                                    }
                                     external_agent::AgentEvent::BackendError {
                                         message,
                                         code,

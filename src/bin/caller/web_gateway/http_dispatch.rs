@@ -879,7 +879,24 @@ pub(crate) async fn serve_http_request(
                 .await;
             }
             RouteHandlerId::MemoryPropose => {
+                // The authenticated edge: the pre-dispatch IAM gate bound
+                // this principal; no token names a session on this lane.
+                let actor = crate::access::actor::ActorBinding::from_principal(
+                    &http_access_context.principal,
+                    None,
+                );
                 return handle_memory_propose(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    actor,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AgendaReminderPolicy => {
+                return handle_agenda_reminder_policy(
                     stream,
                     route_body,
                     mcp_server,

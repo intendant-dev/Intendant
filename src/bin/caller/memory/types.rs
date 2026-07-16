@@ -53,6 +53,47 @@ impl Default for SearchArgs {
     }
 }
 
+/// Who authored a claim, as the daemon's gates attributed it. This is
+/// Memory's **own versioned provenance shape** (`v` names the shape
+/// revision), mapped from `access::actor::ActorBinding` at the tenant
+/// edge — per the seam contract the raw seam type is never serialized
+/// into records; these fields are the record, and they evolve
+/// additively. Unlike the claim body's `session`/`project` fields
+/// (writer-stated context claims), every field here is gate-derived:
+/// never parsed from tool arguments, request bodies, or query echoes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ClaimProvenance {
+    /// Provenance shape revision (this build writes 1).
+    pub v: u32,
+    /// Actor class, snake_case (`agent_session`, `dashboard`,
+    /// `local_process`, `peer`, `unattributed`). An unauthenticated or
+    /// unstated caller is recorded EXPLICITLY as `unattributed` —
+    /// fail-closed, never a defaulted principal.
+    pub actor: String,
+    /// The IAM principal exactly as the gate named it (verbatim — the
+    /// P1 exit criterion asserts recorded actor == token-bound
+    /// principal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The supervised session the write acted as — bound by the gate
+    /// through token possession, never echoed from request fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
+impl ClaimProvenance {
+    /// Map the shared seam type into Memory's own record shape at the
+    /// tenant edge (the only place the seam type is consumed).
+    pub(crate) fn from_binding(binding: &crate::access::actor::ActorBinding) -> Self {
+        ClaimProvenance {
+            v: 1,
+            actor: binding.kind.as_str().to_string(),
+            principal: binding.principal_id.clone(),
+            session: binding.session_id.clone(),
+        }
+    }
+}
+
 /// A provenance-labeled claim view. This is DATA for surfaces to
 /// render as quoted content — never instructions (§6.5).
 #[derive(Debug, Clone, Serialize)]
@@ -66,11 +107,16 @@ pub(crate) struct ClaimView {
     /// (`candidate` / `accepted` / `disputed` / `superseded` /
     /// `retired`) — status is a derived view, never a mutable field.
     pub status: String,
+    /// Writer-stated session context (a claim about the claim; when
+    /// the writer states none, the service fills it from the
+    /// gate-bound session). Attribution lives in `proposed_by`.
     pub session: Option<String>,
     pub project: Option<String>,
     pub model: Option<String>,
     pub labels: Vec<String>,
     pub created_ms: u64,
+    /// Gate-derived authorship — see [`ClaimProvenance`].
+    pub proposed_by: ClaimProvenance,
     /// Always `"ephemeral"` in this build (the P1 write bar): the
     /// claim does not survive a daemon restart.
     pub durability: &'static str,
@@ -100,6 +146,17 @@ pub(crate) enum MemoryError {
         what: &'static str,
         got: String,
         allowed: String,
+    },
+    /// The tenant-edge authorization outcome (named, fail-closed —
+    /// §C.2 discipline applies to service-side denials too): the
+    /// resolved actor class may not perform this write verb. Ring-2
+    /// writers (supervised agent sessions, peers, unattributed
+    /// callers) are propose-only; every other write verb needs an
+    /// owner surface.
+    #[error("rejected: actor-not-permitted ({actor} may not {verb}; owner surface required)")]
+    NotPermitted {
+        verb: &'static str,
+        actor: &'static str,
     },
     #[error("no claim matches id prefix {0:?}")]
     NotFound(String),

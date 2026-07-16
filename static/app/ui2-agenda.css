@@ -61,6 +61,31 @@ html.ui-v2 .agenda-compose button:hover {
   border-color: var(--iris);
   color: var(--iris);
 }
+html.ui-v2 .agenda-reminders-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .agenda-reminders-bar:empty {
+  display: none;
+}
+html.ui-v2 .agenda-rem-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-reminders-bar select,
+html.ui-v2 .agenda-bell {
+  background: var(--surface);
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11.5px;
+  padding: 3px 6px;
+}
 html.ui-v2 .agenda-filters {
   display: flex;
   gap: 6px;

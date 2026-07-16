@@ -247,9 +247,11 @@ pub fn spawn_event_listener(
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
+                    | AppEvent::SessionForkResult { .. }
                     | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
+                    | AppEvent::SessionActivity { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }

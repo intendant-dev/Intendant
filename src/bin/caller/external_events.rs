@@ -1239,6 +1239,16 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     presence: None,
                 });
             }
+            external_agent::AgentEvent::ActivityUpdate { activity } => {
+                // Wire-fact activity snapshot → the vitals hub (keyed like
+                // usage; the hub's identity aliasing folds it into the
+                // session's one entry). Pure bookkeeping — never opens or
+                // completes a turn.
+                config.bus.send(AppEvent::SessionActivity {
+                    session_id: config.session_id.clone(),
+                    activity,
+                });
+            }
             external_agent::AgentEvent::GoalUpdated { goal } => {
                 emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }

@@ -292,6 +292,8 @@ pub(crate) enum RouteHandlerId {
     AgendaList,
     /// Apply one agenda command (add/patch/complete/reopen/retire).
     AgendaOp,
+    /// Merge-patch the owner's reminder delivery policy.
+    AgendaReminderPolicy,
     /// Bounded Memory claim search (q/limit/candidates query params).
     MemorySearch,
     /// Read one Memory claim by id prefix (id query param).
@@ -791,6 +793,19 @@ pub(crate) static ROUTES: &[Route] = &[
         "Apply one agenda command (add, patch, complete, reopen, or retire)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
+    // Reminder delivery policy is owner policy, not agenda authorship:
+    // it rides the Settings operation (quiet hours and urgency decide how
+    // loudly the daemon speaks — the same class as its other knobs), so
+    // an agenda.write holder cannot raise its own reminder's loudness.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/agenda/reminders/policy"),
+        PeerOperation::Settings,
+        BodyPolicy::Default,
+        RouteHandlerId::AgendaReminderPolicy,
+        "Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_reminder_policy")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/memory/search"),

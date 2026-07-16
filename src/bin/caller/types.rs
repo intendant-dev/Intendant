@@ -134,7 +134,8 @@ pub struct SessionGoal {
 // Session-vitals family: hoisted to intendant-core; re-exported here so
 // existing `crate::types::Session*Vitals` paths keep working.
 pub use intendant_core::vitals::{
-    SessionCacheVitals, SessionGitVitals, SessionLimitWindow, SessionVitals,
+    SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionGitVitals,
+    SessionLimitWindow, SessionVitals,
 };
 
 /// Normalized region in a shared display view.
@@ -346,6 +347,18 @@ pub enum OutboundEvent {
         child_session_id: String,
         relationship: String,
         ephemeral: bool,
+    },
+    SessionForkResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        parent_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_session_id: Option<String>,
+        source: String,
+        relationship: String,
+        anchor_summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     SessionCapabilities {
         session_id: String,

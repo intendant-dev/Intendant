@@ -143,11 +143,12 @@ impl AgendaPatch {
 
 /// `Option<Option<T>>` as JSON merge-patch: field absent → outer `None`
 /// (keep), field `null` → `Some(None)` (clear), value → `Some(Some(v))`.
-mod double_option {
+/// Shared by [`AgendaPatch::due_ms`] and the reminder-policy patch.
+pub(crate) mod double_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub(super) fn serialize<S: Serializer>(
-        v: &Option<Option<u64>>,
+    pub(crate) fn serialize<T: Serialize, S: Serializer>(
+        v: &Option<Option<T>>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
         // Outer `None` is skipped via `skip_serializing_if`; only the inner
@@ -158,10 +159,10 @@ mod double_option {
         }
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
         d: D,
-    ) -> Result<Option<Option<u64>>, D::Error> {
-        Ok(Some(Option::<u64>::deserialize(d)?))
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Ok(Some(Option::<T>::deserialize(d)?))
     }
 }
 

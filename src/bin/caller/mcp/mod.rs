@@ -226,25 +226,19 @@ impl IntendantServer {
 
     async fn memory_propose_inner(
         &self,
-        mut args: crate::memory::ProposeArgs,
-        session_id: Option<&str>,
+        args: crate::memory::ProposeArgs,
+        actor: &crate::access::actor::ActorBinding,
     ) -> Result<serde_json::Value, String> {
         let Some(memory) = self.memory_handle().await else {
             return Err("memory service unavailable on this daemon".to_string());
         };
-        // MCP-lane attribution (best-effort, pre-A2): supervised
-        // sessions call through their injected INTENDANT_MCP_URL,
-        // which binds a session id here — it rides the claim's
-        // provenance unless the caller stated one explicitly. The
-        // principal-bound ActorBinding seam (A2) upgrades this
-        // honestly rather than stamping a fabricated label.
-        if args.session.is_none() {
-            args.session = session_id
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string);
-        }
-        match memory.propose(args) {
+        // Attribution comes from the gate-resolved actor the dispatch
+        // carried in — never from tool arguments or the dispatch
+        // session parameter (which tokenless lanes fill from query
+        // echoes). The service maps the binding into the claim's own
+        // provenance fields and defaults unstated session CONTEXT
+        // from the gate-bound session.
+        match memory.propose(args, actor) {
             Ok(claim) => Ok(serde_json::json!({ "claim": claim })),
             Err(err) => Err(err.to_string()),
         }
@@ -542,7 +536,7 @@ impl IntendantServer {
                 // shape the HTTP body and tunnel params carry.
                 let args: crate::memory::ProposeArgs =
                     serde_json::from_value(args).map_err(|e| e.to_string())?;
-                Ok(match self.memory_propose_inner(args, session_id).await {
+                Ok(match self.memory_propose_inner(args, &actor).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("memory_propose failed: {message}")),
                 })

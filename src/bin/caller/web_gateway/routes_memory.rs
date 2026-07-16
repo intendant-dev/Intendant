@@ -48,9 +48,13 @@ pub(crate) async fn memory_claim_api_response(
 /// Transport-neutral core of `POST /api/memory/propose` (tunnel twin
 /// `api_memory_propose`): the body is one [`crate::memory::ProposeArgs`]
 /// JSON object; success returns the claim view (status `candidate`).
+/// `actor` is the gate-resolved binding from whichever authenticated
+/// edge dispatched this (the pre-dispatch HTTP IAM gate or the
+/// dashboard-control grant) — attribution never rides the body.
 pub(crate) async fn memory_propose_api_response(
     body_text: &str,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+    actor: &crate::access::actor::ActorBinding,
 ) -> ApiResponse {
     let Some(memory) = memory_handle(mcp_server).await else {
         return ApiResponse::json_error(503, "memory service unavailable on this daemon");
@@ -61,7 +65,7 @@ pub(crate) async fn memory_propose_api_response(
             return ApiResponse::json_error(400, format!("invalid memory proposal: {err}"));
         }
     };
-    match memory.propose(args) {
+    match memory.propose(args, actor) {
         Ok(claim) => ApiResponse::json(200, JsonBody::Value(serde_json::json!({ "claim": claim }))),
         Err(err) => ApiResponse::json_error(memory_error_status(&err), err.to_string()),
     }
@@ -77,12 +81,13 @@ async fn memory_handle(
 }
 
 /// Kernel rejections/pends are semantic verdicts (422), not malformed
-/// requests (400); the named outcome/disposition rides the message
-/// verbatim. `Unimplemented` is a kernel-boundary bug report (500).
+/// requests (400); the tenant-edge ring denial is a forbidden action
+/// (403); `Unimplemented` is a kernel-boundary bug report (500).
 fn memory_error_status(err: &crate::memory::MemoryError) -> u16 {
     use crate::memory::MemoryError as E;
     match err {
         E::NotFound(_) => 404,
+        E::NotPermitted { .. } => 403,
         E::Ambiguous(..) | E::Vocabulary { .. } | E::InvalidArg(_) => 400,
         E::Rejected { .. } | E::Pending { .. } => 422,
         E::Unimplemented(_) => 500,
@@ -128,9 +133,10 @@ pub(crate) async fn handle_memory_propose(
     stream: DemuxStream,
     body_text: String,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    actor: crate::access::actor::ActorBinding,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = memory_propose_api_response(&body_text, mcp_server.as_ref()).await;
+    let response = memory_propose_api_response(&body_text, mcp_server.as_ref(), &actor).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }

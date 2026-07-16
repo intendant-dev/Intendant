@@ -485,6 +485,20 @@ pub(crate) async fn run_headless_mode(
         None
     };
     let vitals_git_targets = vitals.as_ref().map(|(targets, _)| targets.clone());
+    // Restored sessions, mirroring daemon boot: with the dashboard on,
+    // the store's idle session windows keep their git/health chips here
+    // too (this shape falls through to run_daemon_loop after the task).
+    if let Some(registry) = vitals_git_targets.clone() {
+        tokio::task::spawn_blocking(move || {
+            let restored = session_vitals::register_restored_session_targets(
+                &crate::platform::home_dir(),
+                &registry,
+            );
+            if restored > 0 {
+                eprintln!("Session vitals: git targets restored for {restored} session(s)");
+            }
+        });
+    }
 
     // Dashboard-driven CreateSession / ResumeSession while the foreground
     // session runs: parallel sessions are owned by the session supervisor
