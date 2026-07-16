@@ -216,7 +216,10 @@ struct MonitorState {
     pending: HashMap<(String, IdSpace, u64), PendingRequest>,
     /// session key → oldest undelivered urgent-notification escalation
     /// (unix-ms it appeared). One slot per session: an urgent burst
-    /// collapses into one nudge like every other burst.
+    /// collapses into one nudge like every other burst. An entry outlives
+    /// TaskComplete/Interrupted (the final-turn escalation race) and leaves
+    /// only by dispatch, by dashboard-seen, or with its session
+    /// (SessionEnded).
     escalations: HashMap<String, u64>,
     /// session key → last nudge unix-ms.
     last_nudge: HashMap<String, u64>,
@@ -282,19 +285,27 @@ impl MonitorState {
                 self.pending
                     .remove(&(session_key(session_id), IdSpace::Approval, *id));
             }
-            // A finished/ended/interrupted session cannot still be waiting:
-            // its blocked loop returned. Some exit paths (interrupt drain,
-            // headless deny) skip ApprovalResolved, so clear by session.
-            // Display requests deliberately survive TaskComplete/Interrupted
-            // — their waiter is the blocked MCP call, not the agent loop's
-            // turn — and clear on SessionEnded like everything else. A dead
-            // session's undelivered escalation dies with it too.
+            // A finished/interrupted task cannot still be waiting on an
+            // approval or question: its blocked loop returned. Some exit
+            // paths (interrupt drain, headless deny) skip ApprovalResolved,
+            // so clear those by session. Two kinds deliberately survive
+            // TaskComplete/Interrupted: display requests — their waiter is
+            // the blocked MCP call, not the agent loop's turn — and
+            // undelivered urgent escalations, which have no waiter at all.
+            // `notify_user` is fire-and-forget, so the canonical final-turn
+            // urgent "come look, I'm done/blocked" is chased by TaskComplete
+            // (or an interrupt — those can fire with nobody attending:
+            // external-agent aborts, automation) within one monitor tick,
+            // and an away owner must still get the push. Survival cannot
+            // re-deliver: dispatch stays one-shot ([`Self::take_due_escalations`]
+            // removes an escalation when it fires or a dashboard sees it).
+            // Both kinds clear on SessionEnded like everything else — a
+            // dead session's undelivered escalation dies with it.
             AppEvent::TaskComplete { session_id, .. }
             | AppEvent::Interrupted { session_id, .. } => {
                 let key = session_key(session_id);
                 self.pending
                     .retain(|(k, space, _), _| *k != key || *space == IdSpace::DisplayRequest);
-                self.escalations.remove(&key);
             }
             AppEvent::SessionEnded { session_id, .. } => {
                 self.pending.retain(|(k, _, _), _| k != session_id);
@@ -767,6 +778,87 @@ mod tests {
         let later = now + NUDGE_SESSION_COOLDOWN_MS;
         assert_eq!(state.take_due_escalations(later, false, None).len(), 1);
         assert!(state.escalations.is_empty());
+    }
+
+    #[test]
+    fn final_turn_escalations_survive_task_complete_and_still_deliver() {
+        // The canonical race: `notify_user` is fire-and-forget, so an
+        // urgent "come look, I'm done/blocked" in the final turn is chased
+        // by TaskComplete within the same monitor tick. The escalation
+        // must survive it and still reach the away owner.
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc12345-XYZ"));
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("abc12345-XYZ".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert_eq!(state.escalations.len(), 1);
+        let now = now_unix_ms() + 1;
+        assert_eq!(
+            state.take_due_escalations(now, false, None),
+            vec![("abc12345-XYZ".to_string(), "session abc12345".to_string())]
+        );
+
+        // Interrupts share the teardown arm and can fire with nobody
+        // attending (external-agent aborts, automation): same survival.
+        state.observe(&urgent_notification("def"));
+        state.observe(&AppEvent::Interrupted {
+            session_id: Some("def".to_string()),
+            reason: "user requested".to_string(),
+        });
+        assert_eq!(state.take_due_escalations(now, false, None).len(), 1);
+    }
+
+    #[test]
+    fn task_complete_survivors_deliver_exactly_once() {
+        // One-shot: dispatch removes the escalation, so later ticks —
+        // even past the cooldown — and later TaskCompletes cannot turn
+        // the survival into a re-push loop.
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc"));
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("abc".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        let now = now_unix_ms() + 1;
+        assert_eq!(state.take_due_escalations(now, false, None).len(), 1);
+        assert!(state.escalations.is_empty());
+        assert!(state.take_due_escalations(now, false, None).is_empty());
+        let later = now + NUDGE_SESSION_COOLDOWN_MS + 1;
+        assert!(state.take_due_escalations(later, false, None).is_empty());
+
+        // A TaskComplete arriving after delivery resurrects nothing.
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("abc".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert!(state.take_due_escalations(later, false, None).is_empty());
+    }
+
+    #[test]
+    fn session_ended_clears_a_task_complete_survivor_undelivered() {
+        // SessionEnded stays the teardown: a survivor that has not fired
+        // by the time its session dies is dropped, never pushed.
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification("abc"));
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("abc".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert_eq!(state.escalations.len(), 1);
+        state.observe(&AppEvent::SessionEnded {
+            session_id: "abc".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(state.escalations.is_empty());
+        assert!(state
+            .take_due_escalations(now_unix_ms() + 1, false, None)
+            .is_empty());
     }
 
     #[test]
