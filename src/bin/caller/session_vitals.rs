@@ -17,11 +17,17 @@
 //!   hysteresis, registered root kept as the fallback identity.
 //! - **Cache segment**: a bus listener over `AppEvent::UsageSnapshot` —
 //!   every backend's usage rail converges there (external drains, the
-//!   native derivation in `tui/app.rs`), so one listener covers Claude
+//!   native derivation in `usage_rail.rs`), so one listener covers Claude
 //!   Code, Codex, and native sessions uniformly. Computes the latest
 //!   request's cache-hit receipt and carries the TTL anchor; the countdown
 //!   itself derives client-side from `last_activity_epoch + ttl_seconds`
 //!   (no per-second events).
+//! - **Activity segment**: the same listener folds
+//!   `AppEvent::SessionActivity` — each backend's wire-fact activity
+//!   machine (`session_activity.rs`) publishes through its drain (or the
+//!   native loop directly), and this one consumer covers them all.
+//!   Epochs + raw state ride the wire; elapsed/stall derivation ticks
+//!   client-side.
 //!
 //! The two producers arrive keyed by different members of an external
 //! session's identity group (git = wrapper/log id, usage = backend-native
@@ -322,6 +328,9 @@ impl SessionVitalsHub {
                 if vitals.limits.is_empty() {
                     vitals.limits = orphan.limits;
                 }
+                if vitals.activity.is_none() {
+                    vitals.activity = orphan.activity;
+                }
             });
         }
     }
@@ -396,8 +405,9 @@ fn cache_vitals_from_usage(
     })
 }
 
-/// Bus listener feeding the cache section: every backend's usage rail
-/// converges on `AppEvent::UsageSnapshot`, so this one consumer covers
+/// Bus listener feeding the cache and activity sections: every backend's
+/// usage rail converges on `AppEvent::UsageSnapshot` and every activity
+/// machine on `AppEvent::SessionActivity`, so this one consumer covers
 /// native, Claude Code, and Codex sessions alike. `SessionIdentity`
 /// linkages feed the hub's alias map so usage keyed by the backend-native
 /// id and git probes keyed by the wrapper id land in one entry (split
@@ -429,6 +439,12 @@ fn spawn_cache_vitals_listener(
                             vitals.limits = main.limits.clone();
                         }
                     });
+                }
+                Ok(AppEvent::SessionActivity {
+                    session_id: Some(session_id),
+                    activity,
+                }) => {
+                    hub.apply(&session_id, |vitals| vitals.activity = Some(activity));
                 }
                 Ok(AppEvent::SessionIdentity {
                     session_id,
@@ -1664,6 +1680,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_listener_folds_snapshots_without_blanking_sections() {
+        let bus = EventBus::new();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+        let mut rx = bus.subscribe();
+
+        // Seed another producer's section first.
+        hub.apply("s9", |v| {
+            v.git = Some(SessionGitVitals {
+                branch: "main".into(),
+                ..Default::default()
+            })
+        });
+        let activity = crate::types::SessionActivityVitals {
+            state: crate::types::SessionActivityState::Reasoning,
+            since_epoch: 100,
+            last_stream_byte_epoch: 104,
+            stalled_after_seconds: Some(20),
+            effort: Some("max".into()),
+            resets_at_epoch: None,
+        };
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: activity.clone(),
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9" && vitals.activity.is_some() {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the activity section");
+        assert_eq!(vitals.activity.as_ref(), Some(&activity));
+        assert!(
+            vitals.git.is_some(),
+            "activity writes must not blank other sections"
+        );
+
+        // Id-less snapshots (a native loop without a session id) are
+        // skipped, not folded under an empty key.
+        bus.send(AppEvent::SessionActivity {
+            session_id: None,
+            activity: activity.clone(),
+        });
+        bus.send(AppEvent::SessionActivity {
+            session_id: Some("s9".into()),
+            activity: crate::types::SessionActivityVitals {
+                state: crate::types::SessionActivityState::Idle,
+                since_epoch: 200,
+                last_stream_byte_epoch: 104,
+                ..Default::default()
+            },
+        });
+        let vitals = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    if session_id == "s9"
+                        && vitals.activity.as_ref().map(|a| a.since_epoch) == Some(200)
+                    {
+                        return vitals;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("listener folds the follow-up snapshot");
+        assert_eq!(
+            vitals.activity.as_ref().map(|a| a.state),
+            Some(crate::types::SessionActivityState::Idle)
+        );
+    }
+
+    #[tokio::test]
     async fn probe_flags_conflicting_divergence() {
         if !merge_tree_supported() {
             return; // old git: the preview is skipped by design
@@ -1716,6 +1809,7 @@ mod tests {
         let catalog = &fragment[begin..end];
         for key in [
             "health:",
+            "activity:",
             "branch:",
             "worktree:",
             "dirty:",
@@ -1730,7 +1824,8 @@ mod tests {
             assert!(catalog.contains(key), "catalog lost symbol {key}");
         }
         // The serde-camelCase wire fields of SessionVitals/SessionGitVitals/
-        // SessionCacheVitals/SessionLimitWindow the catalog must consume.
+        // SessionCacheVitals/SessionLimitWindow/SessionActivityVitals the
+        // catalog must consume.
         for field in [
             "branch",
             "dirtyFiles",
@@ -1747,10 +1842,30 @@ mod tests {
             "resetsAtEpoch",
             "status",
             "label",
+            "state",
+            "sinceEpoch",
+            "lastStreamByteEpoch",
+            "stalledAfterSeconds",
+            "effort",
         ] {
             assert!(
                 catalog.contains(field),
                 "catalog stopped consuming wire field {field} — SessionVitals and VITALS_SYMBOLS drifted"
+            );
+        }
+        // The wire spellings of the activity states the catalog renders —
+        // and the derived-only `stalled` — must all be explained.
+        for state in [
+            "reasoning",
+            "responding",
+            "tool-running",
+            "awaiting-api",
+            "rate-limited",
+            "stalled",
+        ] {
+            assert!(
+                catalog.contains(state),
+                "catalog stopped handling activity state {state}"
             );
         }
     }

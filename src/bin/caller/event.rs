@@ -355,6 +355,16 @@ pub enum AppEvent {
         session_id: String,
         vitals: crate::types::SessionVitals,
     },
+    /// One backend's honest activity snapshot (wire-fact state machine in
+    /// `session_activity.rs`), keyed like `UsageSnapshot` by whatever id
+    /// the producer runs under. Hub-internal: the vitals hub folds it into
+    /// the session's `SessionVitals.activity` section, which is what
+    /// reaches frontends and the session log — this event itself has no
+    /// outbound twin and is never persisted.
+    SessionActivity {
+        session_id: Option<String>,
+        activity: crate::types::SessionActivityVitals,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -2382,6 +2392,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             vitals: vitals.clone(),
         }),
+        // Hub-internal: the vitals hub folds it into SessionVitals, which
+        // is the outbound (and session-logged) carrier.
+        AppEvent::SessionActivity { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),

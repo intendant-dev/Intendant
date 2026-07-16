@@ -432,6 +432,28 @@ function ensureSessionWindow(sessionId, meta = {}) {
   return win;
 }
 
+// The status pill's honest upgrade: while a session is in an active phase
+// AND its vitals carry a live activity section (wire facts from the
+// backend's own stream), show the derived state — "Thinking" only while
+// reasoning is actually streaming, "Stalled"/"Rate-limited" when that is
+// the truth. Without wire activity the optimistic dispatch guess survives
+// only as the generic "Awaiting model…" (PHASE_LABELS.thinking) until
+// bytes confirm or the session settles.
+function sessionWindowPhaseDisplayLabel(sessionId, phase) {
+  const p = normalizeSessionPhase(phase);
+  if (isAgentActivePhase(p)
+      && typeof deriveSessionActivity === 'function'
+      && typeof sessionWireActivity === 'function') {
+    const act = deriveSessionActivity(sessionWireActivity(sessionId));
+    if (act) {
+      const label = (typeof ACTIVITY_STATE_LABELS === 'object' && ACTIVITY_STATE_LABELS[act.state])
+        || act.state;
+      return act.state === 'reasoning' && act.effort ? `${label} (${act.effort})` : label;
+    }
+  }
+  return sessionPhaseLabel(phase);
+}
+
 // Applies a phase change to the window chrome: status chip repaint plus the
 // approval-confirm hook. Shared by the wide render below and the phase-only
 // fast path — the hook (maybeConfirmApprovalSendFromWindowPhase) must fire
@@ -445,8 +467,9 @@ function applySessionWindowPhase(win, sid, phase) {
   if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
     win.pendingActiveUntil = 0;
   }
-  win.status.textContent = sessionPhaseLabel(win.phase);
-  win.status.title = sessionPhaseLabel(win.phase);
+  const label = sessionWindowPhaseDisplayLabel(sid, win.phase);
+  win.status.textContent = label;
+  win.status.title = label;
   win.status.className = 'session-window-status';
   const cls = sessionPhaseClass(win.phase);
   if (cls) win.status.classList.add(cls);
@@ -3026,8 +3049,12 @@ function normalizeAutonomyLabel(raw) {
 // the per-window status chips (keys are the collapsed "np" form: waiting_*
 // \u2192 waiting*, running_* \u2192 running*). Extracted from setPhase so the chips
 // stop rendering raw keys like `waiting_approval`.
+// `thinking` is deliberately labeled "Awaiting model…": the phase is an
+// optimistic dispatch guess, and the honest "Thinking" claim now comes
+// only from the wire-fact activity section (sessionWindowPhaseDisplayLabel
+// upgrades the pill when live evidence exists).
 const PHASE_LABELS = {
-  idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
+  idle: 'Idle', thinking: 'Awaiting model…', running: 'Running Agent', runningagent: 'Running Agent',
   waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
   waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
   orchestrating: 'Orchestrating', done: 'Done',
