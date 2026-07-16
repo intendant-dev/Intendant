@@ -1536,7 +1536,7 @@ mod tests {
     #[test]
     fn transfer_authority_fresh_check_ignores_memo() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let authority = LiveTransferAuthority::new(approved_authorization(&tmp, fingerprint));
         assert!(authority.is_current());
         assert!(authority.verified_at.lock().unwrap().is_some());
@@ -1551,7 +1551,7 @@ mod tests {
     #[test]
     fn transfer_authority_memo_detects_revocation_after_ttl() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let fingerprint = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let fingerprint = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let authority = LiveTransferAuthority::new(approved_authorization(&tmp, fingerprint));
         assert!(authority.is_current());
         crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
