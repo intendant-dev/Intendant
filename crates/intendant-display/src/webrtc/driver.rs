@@ -4,6 +4,7 @@
 //! the data-channel message codecs it speaks.
 
 use super::*;
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Driver task
@@ -80,11 +81,20 @@ pub(crate) struct DriverState {
     pending_authority_state: Vec<(u32, DisplayInputAuthorityState)>,
     /// D-3b: queued tile control frames awaiting `tile-control`
     /// channel open. Low-rate reliable control only; never per-frame.
-    pending_tile_control: Vec<Vec<u8>>,
+    /// Byte-capped drop-oldest (see [`push_pending_tile_bounded`]): a
+    /// channel that closed (OnClose removes its label) while the peer
+    /// stays a tile subscriber would otherwise grow this without
+    /// bound, and for control frames the latest state wins anyway.
+    pending_tile_control: VecDeque<Bytes>,
     /// D-3b: queued snapshot chunks awaiting `tile-snapshot` channel
     /// open. Reliable snapshot delivery is allowed to delay rather
-    /// than drop. Tile deltas intentionally have no queue.
-    pending_tile_snapshot: Vec<Vec<u8>>,
+    /// than drop — but bounded: snapshots re-queue every ~30s
+    /// (multi-MB each), so a never-opening channel would otherwise
+    /// accumulate them indefinitely. Oldest chunks are dropped first;
+    /// a late-opening client still receives the newest snapshot and
+    /// self-heals on the next periodic one. Tile deltas intentionally
+    /// have no queue.
+    pending_tile_snapshot: VecDeque<Bytes>,
     /// D-4c: event-driven backpressure state for the supersedable
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
@@ -263,8 +273,8 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
         video_specs: Vec::new(),
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
-        pending_tile_control: Vec::new(),
-        pending_tile_snapshot: Vec::new(),
+        pending_tile_control: VecDeque::new(),
+        pending_tile_snapshot: VecDeque::new(),
         tile_delta_backpressure: TileDeltaBackpressure::new(),
         first_frame_at: None,
         rtp: RtpSendState {
@@ -1733,10 +1743,20 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
             } else if channel.queues_before_open() {
                 match channel {
                     TileDataChannel::Control => {
-                        state.pending_tile_control.push(data);
+                        push_pending_tile_bounded(
+                            &mut state.pending_tile_control,
+                            data,
+                            PENDING_TILE_CONTROL_MAX_BYTES,
+                            label,
+                        );
                     }
                     TileDataChannel::Snapshot => {
-                        state.pending_tile_snapshot.push(data);
+                        push_pending_tile_bounded(
+                            &mut state.pending_tile_snapshot,
+                            data,
+                            PENDING_TILE_SNAPSHOT_MAX_BYTES,
+                            label,
+                        );
                     }
                     TileDataChannel::Deltas => {}
                 }
@@ -1874,12 +1894,55 @@ pub(crate) fn drain_pending_authority_for_label(
     }
 }
 
-pub(crate) fn drain_pending_tile_for_label(state: &mut DriverState, label: &str) -> Vec<Vec<u8>> {
+pub(crate) fn drain_pending_tile_for_label(
+    state: &mut DriverState,
+    label: &str,
+) -> VecDeque<Bytes> {
     match label {
         TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
         TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot),
-        _ => Vec::new(),
+        _ => VecDeque::new(),
     }
+}
+
+/// Byte caps for the queued-before-open reliable tile channels. A
+/// channel that closes (its label leaves `state.channels`) while the
+/// peer remains a tile subscriber keeps producing into these queues —
+/// snapshots at a multi-MB burst every ~30s — so an uncapped queue is
+/// an unbounded memory leak on a wedged channel.
+///
+/// Sized to hold roughly one-to-two full 1440p snapshots (snapshot)
+/// and far more control frames than any real negotiation delay could
+/// accumulate (control). Drop-oldest is the correct bias for both:
+/// control frames are superseded by later state, and a late-opening
+/// snapshot channel wants the *newest* chunks.
+pub(crate) const PENDING_TILE_SNAPSHOT_MAX_BYTES: usize = 24 * 1024 * 1024;
+pub(crate) const PENDING_TILE_CONTROL_MAX_BYTES: usize = 1024 * 1024;
+
+/// Push onto a queued-before-open tile queue, dropping oldest entries
+/// until the queue (including `data`) fits under `max_bytes`.
+pub(crate) fn push_pending_tile_bounded(
+    queue: &mut VecDeque<Bytes>,
+    data: Bytes,
+    max_bytes: usize,
+    label: &str,
+) {
+    let mut total: usize = queue.iter().map(Bytes::len).sum::<usize>() + data.len();
+    let mut dropped = 0usize;
+    while total > max_bytes {
+        let Some(oldest) = queue.pop_front() else {
+            break;
+        };
+        total -= oldest.len();
+        dropped += 1;
+    }
+    if dropped > 0 {
+        eprintln!(
+            "[display/webrtc] pending {label} queue exceeded {max_bytes}B \
+             before the channel opened; dropped {dropped} oldest frame(s)"
+        );
+    }
+    queue.push_back(data);
 }
 
 pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {

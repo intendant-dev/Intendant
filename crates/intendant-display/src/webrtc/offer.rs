@@ -1346,27 +1346,27 @@ impl WebRtcPeer {
 
     /// D-3b: send a reliable tile-control binary frame to the browser.
     /// Queues in the driver until `tile-control` opens.
-    pub async fn send_tile_control_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+    pub async fn send_tile_control_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
         self.send_tile_frame(TileDataChannel::Control, data).await
     }
 
     /// D-3b: send a reliable tile-snapshot binary frame to the browser.
     /// Queues in the driver until `tile-snapshot` opens.
-    pub async fn send_tile_snapshot_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+    pub async fn send_tile_snapshot_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
         self.send_tile_frame(TileDataChannel::Snapshot, data).await
     }
 
     /// D-3b: send an unreliable/supersedable tile-delta binary frame
     /// to the browser. If the channel is not open, the driver drops
     /// the frame rather than queueing stale deltas.
-    pub async fn send_tile_delta_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+    pub async fn send_tile_delta_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
         self.send_tile_frame(TileDataChannel::Deltas, data).await
     }
 
     pub(crate) async fn send_tile_frame(
         &self,
         channel: TileDataChannel,
-        data: Vec<u8>,
+        data: bytes::Bytes,
     ) -> Result<bool, CallerError> {
         match self
             .command_tx

@@ -1416,29 +1416,33 @@ fn make_damage_backend(
     Box::new(capture::damage::NullDamageBackend::new(width, height))
 }
 
-async fn send_tile_snapshot_to_peer(
-    peer: Arc<webrtc::WebRtcPeer>,
+/// Encode a full-screen tile snapshot into wire frames **once**; the
+/// caller fans the refcounted frames out to any number of peers. The
+/// raw-copy + RLE + lossless-WebP encode of the whole screen is the
+/// expensive part of a snapshot, and it is identical for every peer —
+/// per-peer re-encoding scaled that cost with viewer count.
+///
+/// Returns `None` (after logging) when encoding or packing fails.
+/// Records one `record_tile_snapshot_source` sample per snapshot
+/// encoded (not per peer served — the counters measure generated wire
+/// frames/bytes).
+async fn encode_tile_snapshot_frames(
     frame: Arc<Frame>,
     epoch: u32,
     snapshot_id: u32,
     visual_marker_value: Option<u32>,
-    counters: Arc<DisplayMetricsCounters>,
-) {
-    let Some(grid) = tile_grid_for_frame(&frame) else {
-        return;
-    };
-    let encode_result = tokio::task::spawn_blocking({
-        let frame = Arc::clone(&frame);
-        move || {
-            let records = encode_tile_records(&frame, all_tile_ids(&grid), visual_marker_value)?;
-            Ok::<_, tile::encode::TileEncodeError>((grid, records))
-        }
+    counters: &DisplayMetricsCounters,
+) -> Option<Vec<bytes::Bytes>> {
+    let grid = tile_grid_for_frame(&frame)?;
+    let encode_result = tokio::task::spawn_blocking(move || {
+        let records = encode_tile_records(&frame, all_tile_ids(&grid), visual_marker_value)?;
+        Ok::<_, tile::encode::TileEncodeError>((grid, records))
     })
     .await;
 
     let Ok(Ok((grid, records))) = encode_result else {
         eprintln!("[display/tile] snapshot tile encode failed");
-        return;
+        return None;
     };
 
     let record_count = records.len();
@@ -1453,24 +1457,52 @@ async fn send_tile_snapshot_to_peer(
         Ok(frames) => frames,
         Err(e) => {
             eprintln!("[display/tile] snapshot pack failed: {e}");
-            return;
+            return None;
         }
     };
 
-    let frame_count = frames.len();
+    let mut out = Vec::with_capacity(frames.len());
     let mut byte_count = 0usize;
     for frame in frames {
         match tile::transport::encode_frame(&frame) {
             Ok(bytes) => {
                 byte_count = byte_count.saturating_add(bytes.len());
-                if let Err(e) = peer.send_tile_snapshot_frame(bytes).await {
-                    eprintln!("[display/tile] send snapshot failed: {e}");
-                }
+                out.push(bytes::Bytes::from(bytes));
             }
             Err(e) => eprintln!("[display/tile] snapshot wire encode failed: {e}"),
         }
     }
-    counters.record_tile_snapshot_source(record_count, frame_count, byte_count);
+    counters.record_tile_snapshot_source(record_count, out.len(), byte_count);
+    Some(out)
+}
+
+/// Send already-encoded snapshot wire frames to one peer (refcount
+/// bumps per frame; see [`encode_tile_snapshot_frames`]).
+async fn send_tile_snapshot_frames_to_peer(
+    peer: &Arc<webrtc::WebRtcPeer>,
+    frames: &[bytes::Bytes],
+) {
+    for bytes in frames {
+        if let Err(e) = peer.send_tile_snapshot_frame(bytes.clone()).await {
+            eprintln!("[display/tile] send snapshot failed: {e}");
+        }
+    }
+}
+
+async fn send_tile_snapshot_to_peer(
+    peer: Arc<webrtc::WebRtcPeer>,
+    frame: Arc<Frame>,
+    epoch: u32,
+    snapshot_id: u32,
+    visual_marker_value: Option<u32>,
+    counters: Arc<DisplayMetricsCounters>,
+) {
+    if let Some(frames) =
+        encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters)
+            .await
+    {
+        send_tile_snapshot_frames_to_peer(&peer, &frames).await;
+    }
 }
 
 async fn send_tile_control_to_peers(
@@ -1480,6 +1512,7 @@ async fn send_tile_control_to_peers(
 ) {
     match tile::transport::encode_frame(&frame) {
         Ok(bytes) => {
+            let bytes = bytes::Bytes::from(bytes);
             for peer in peers {
                 if let Err(e) = peer.send_tile_control_frame(bytes.clone()).await {
                     eprintln!("[display/tile] {context} send failed: {e}");
@@ -2851,15 +2884,22 @@ impl DisplaySession {
                             };
                             send_tile_control_to_peers(&peers_now, resize, "resize").await;
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                            for peer in peers_now {
-                                send_tile_snapshot_to_peer(
-                                    peer,
-                                    Arc::clone(&frame),
-                                    epoch,
-                                    snapshot_id,
-                                    visual_marker_value,
-                                    Arc::clone(&counters),
-                                ).await;
+                            // Encode the snapshot once, fan the wire
+                            // frames out refcounted — a full-screen
+                            // lossless encode per peer scaled with
+                            // viewer count for identical output.
+                            if let Some(frames) = encode_tile_snapshot_frames(
+                                Arc::clone(&frame),
+                                epoch,
+                                snapshot_id,
+                                visual_marker_value,
+                                &counters,
+                            )
+                            .await
+                            {
+                                for peer in &peers_now {
+                                    send_tile_snapshot_frames_to_peer(peer, &frames).await;
+                                }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
@@ -2868,15 +2908,18 @@ impl DisplaySession {
                         if Instant::now() >= next_snapshot_at {
                             let epoch = tile_epoch.load(Ordering::Relaxed);
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                            for peer in peers_now {
-                                send_tile_snapshot_to_peer(
-                                    peer,
-                                    Arc::clone(&frame),
-                                    epoch,
-                                    snapshot_id,
-                                    visual_marker_value,
-                                    Arc::clone(&counters),
-                                ).await;
+                            if let Some(frames) = encode_tile_snapshot_frames(
+                                Arc::clone(&frame),
+                                epoch,
+                                snapshot_id,
+                                visual_marker_value,
+                                &counters,
+                            )
+                            .await
+                            {
+                                for peer in &peers_now {
+                                    send_tile_snapshot_frames_to_peer(peer, &frames).await;
+                                }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
@@ -3025,15 +3068,19 @@ impl DisplaySession {
                                     ).await;
                                     let snapshot_id =
                                         tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                                    for peer in peers_now {
-                                        send_tile_snapshot_to_peer(
-                                            peer,
-                                            Arc::clone(&frame),
-                                            epoch,
-                                            snapshot_id,
-                                            visual_marker_value,
-                                            Arc::clone(&counters),
-                                        ).await;
+                                    if let Some(frames) = encode_tile_snapshot_frames(
+                                        Arc::clone(&frame),
+                                        epoch,
+                                        snapshot_id,
+                                        visual_marker_value,
+                                        &counters,
+                                    )
+                                    .await
+                                    {
+                                        for peer in &peers_now {
+                                            send_tile_snapshot_frames_to_peer(peer, &frames)
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -3072,6 +3119,7 @@ impl DisplaySession {
                                 };
                                 match tile::transport::encode_frame(&cursor) {
                                     Ok(bytes) => {
+                                        let bytes = bytes::Bytes::from(bytes);
                                         let peers_now =
                                             tile_subscriber_peer_handles(&peers, &subscribers).await;
                                         for peer in peers_now {
@@ -3135,7 +3183,7 @@ impl DisplaySession {
                             match tile::transport::encode_frame(&frame) {
                                 Ok(bytes) => {
                                     byte_count = byte_count.saturating_add(bytes.len());
-                                    encoded.push((frame_seq, bytes));
+                                    encoded.push((frame_seq, bytes::Bytes::from(bytes)));
                                 }
                                 Err(e) => eprintln!("[display/tile] update wire encode failed: {e}"),
                             }

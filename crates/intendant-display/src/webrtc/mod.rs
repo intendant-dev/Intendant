@@ -584,9 +584,12 @@ pub(crate) enum Command {
     /// D-3b: binary tile-stream frame. Control/snapshot frames queue
     /// until their reliable data channel opens; delta frames are
     /// latest-wins and are dropped when the channel is unavailable.
+    /// `Bytes` end-to-end: one wire frame is encoded once and fanned
+    /// out to every subscriber as refcount bumps; the only remaining
+    /// copy is rtc's `BytesMut` boundary at the datachannel write.
     SendTileFrame {
         channel: TileDataChannel,
-        data: Vec<u8>,
+        data: bytes::Bytes,
     },
 }
 
