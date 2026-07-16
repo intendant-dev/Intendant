@@ -145,6 +145,7 @@ html.ui-v2 .agenda-glyph {
 html.ui-v2 .agenda-glyph.open { color: var(--iris); }
 html.ui-v2 .agenda-glyph.done { color: var(--green); }
 html.ui-v2 .agenda-glyph.retired { color: var(--text-3); }
+html.ui-v2 .agenda-glyph.question { color: var(--amber); font-weight: 700; }
 html.ui-v2 .agenda-item-kind {
   font-family: var(--mono);
   font-size: 9.5px;
@@ -181,6 +182,40 @@ html.ui-v2 .agenda-item-body {
   overflow-y: auto;
   border-left: 2px solid var(--line);
   padding-left: 9px;
+}
+html.ui-v2 .agenda-answer-row {
+  display: flex;
+  gap: 8px;
+}
+html.ui-v2 .agenda-answer-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 5px 9px;
+}
+html.ui-v2 .agenda-answer-input:focus {
+  outline: none;
+  border-color: var(--amber);
+}
+/* Replies are quoted data, like bodies. */
+html.ui-v2 .agenda-item-answer {
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-left: 2px solid var(--green);
+  padding-left: 9px;
+}
+html.ui-v2 .agenda-card-q {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--amber);
+  flex-shrink: 0;
 }
 html.ui-v2 .agenda-item-foot {
   display: flex;
