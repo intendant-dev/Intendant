@@ -3377,17 +3377,31 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
-    static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PIXEL_OFFLOAD_PERMITS);
-    // Held across the spawn_blocking await, releasing when the job's result
-    // is in. acquire() only errors if the semaphore is closed, which this
-    // static never is — degrade with an error rather than unwrap regardless.
-    let _permit = GATE
-        .acquire()
+    static GATE: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(tokio::sync::Semaphore::new(PIXEL_OFFLOAD_PERMITS))
+        });
+    // The permit must ride INSIDE the blocking closure: spawn_blocking work
+    // cannot be aborted once started, so if the permit stayed with this
+    // future, a caller cancelled mid-job would release it while the
+    // detached job kept running — repeated cancelled CU/MCP requests could
+    // then stack unbounded pixel jobs and defeat the cap. Owned by the
+    // closure, the permit lives exactly as long as the work does. The
+    // acquire is non-recursive by construction: no pixel closure calls
+    // back into `offload_pixels`. acquire only errors if the semaphore is
+    // closed, which this static never is — degrade with an error rather
+    // than unwrap regardless.
+    let permit = GATE
+        .clone()
+        .acquire_owned()
         .await
         .map_err(|e| format!("pixel gate closed: {e}"))?;
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| format!("screenshot task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| format!("screenshot task failed: {e}"))?
 }
 
 /// Finalize a raw RGBA capture into a [`ScreenshotData`]: optional
