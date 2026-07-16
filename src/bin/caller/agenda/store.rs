@@ -38,7 +38,14 @@ pub(crate) struct AgendaStore {
     log_path: PathBuf,
     log: std::fs::File,
     items: BTreeMap<String, AgendaItem>,
-    id_gen: ulid::Generator,
+    /// The largest item id this store has ever seen — folded from disk or
+    /// minted here. Fresh mints are floored against it (same-millisecond
+    /// mints increment it), so id order equals creation order across
+    /// restarts and refolds, not just within one process's generator.
+    /// (A fresh `ulid::Generator` per open is only monotonic within
+    /// itself — CI's warm Linux runner reopened the store fast enough to
+    /// mint a smaller id in the same millisecond.)
+    last_id: Option<ulid::Ulid>,
     /// Records folded from disk plus records appended this process.
     ops: u64,
     /// Load-time lines preserved but not folded (torn tail, unknown op
@@ -105,11 +112,12 @@ impl AgendaStore {
             log.write_all(b"\n")?;
             folded_len += 1;
         }
+        let last_id = max_item_id(&items);
         Ok(Self {
             log_path,
             log,
             items,
-            id_gen: ulid::Generator::new(),
+            last_id,
             ops,
             skipped_lines,
             folded_len,
@@ -138,6 +146,10 @@ impl AgendaStore {
         self.ops = ops;
         self.skipped_lines = skipped_lines;
         self.folded_len = bytes.len() as u64;
+        // Never lower the mint floor: our own last mint is on disk, so the
+        // folded max normally covers it, but a shrunk/tampered file must
+        // not let a future mint sort below an id we already handed out.
+        self.last_id = self.last_id.max(max_item_id(&self.items));
         // Another instance's torn tail: terminate it (as `open` does) so
         // our next append starts on a fresh line.
         if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
@@ -249,13 +261,20 @@ impl AgendaStore {
             .ok_or_else(|| AgendaError::NotFound(id.to_string()))
     }
 
+    /// Mint the next item id: a fresh ULID, floored against the largest id
+    /// ever seen so mint order equals id order even when the clock has not
+    /// advanced past the previous mint (same-millisecond restarts, refolds
+    /// of another instance's appends).
     fn mint_id(&mut self) -> Result<String, AgendaError> {
-        // Monotonic within the process: same-millisecond ids still sort in
-        // mint order, so id order is creation order.
-        self.id_gen
-            .generate()
-            .map(|id| id.to_string())
-            .map_err(|_| AgendaError::Invalid("id generator overflow; retry".into()))
+        let candidate = ulid::Ulid::new();
+        let minted = match self.last_id {
+            Some(prev) if candidate <= prev => prev
+                .increment()
+                .ok_or_else(|| AgendaError::Invalid("id space exhausted; retry".into()))?,
+            _ => candidate,
+        };
+        self.last_id = Some(minted);
+        Ok(minted.to_string())
     }
 
     #[cfg(test)]
@@ -286,6 +305,19 @@ impl AgendaStore {
     pub(crate) fn log_path(&self) -> &Path {
         &self.log_path
     }
+
+    #[cfg(test)]
+    pub(crate) fn force_last_id_for_tests(&mut self, id: &str) {
+        self.last_id = ulid::Ulid::from_string(id).ok();
+    }
+}
+
+/// The largest item id in the fold, as the mint floor. BTreeMap keys are
+/// canonical ULID strings, whose lexicographic max is the numeric max.
+fn max_item_id(items: &BTreeMap<String, AgendaItem>) -> Option<ulid::Ulid> {
+    items
+        .last_key_value()
+        .and_then(|(id, _)| ulid::Ulid::from_string(id).ok())
 }
 
 /// Two-phase line parse: shape-check the envelope before the typed parse so
@@ -428,6 +460,42 @@ mod tests {
         assert_eq!(items[0].title, "remember the milk");
         assert_eq!(store.ops(), 2);
         assert_eq!(store.skipped_lines(), 0);
+    }
+
+    /// Mint order must equal id order even when the wall clock has not
+    /// advanced past the largest id already on disk — the
+    /// same-millisecond store reopen a warm CI runner caught live
+    /// (fresh `Generator` per open has no cross-instance monotonicity).
+    /// Deterministic here: the floor is forced into the far future, so
+    /// every fresh ULID sorts below it and must take the increment path;
+    /// the floor must also survive a reopen via the folded max.
+    #[test]
+    fn mint_floor_keeps_ids_ordered_when_clock_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let future = "7ZZZZZZZZZ0000000000000000";
+        store.force_last_id_for_tests(future);
+
+        let first = store.apply_command(add_cmd("first"), None, 1).unwrap().id;
+        let second = store.apply_command(add_cmd("second"), None, 2).unwrap().id;
+        assert!(first.as_str() > future, "{first} must be above the floor");
+        assert!(second > first);
+
+        // Reopen: the floor is re-derived from the folded max, so a mint
+        // in the (real-clock) past still sorts after everything on disk.
+        drop(store);
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let third = store.apply_command(add_cmd("third"), None, 3).unwrap().id;
+        assert!(third > second);
+        let titles: Vec<String> = store.snapshot().into_iter().map(|i| i.title).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ]
+        );
     }
 
     #[test]
