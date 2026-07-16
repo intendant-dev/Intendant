@@ -700,13 +700,17 @@ fn run_journal_vector(vector: &Json) -> Result<SemStatus, String> {
     Ok(SemStatus::Pass)
 }
 
-/// The D-202 evidence-lifecycle lane: arrival order is SEMANTIC
-/// INPUT (the ruled per-replica stickiness), so no fresh-fold or
-/// metamorphic convergence applies — instead every LISTED delivery
-/// must agree on the final per-item verdicts (the vector lists only
-/// orders with the same declared evidence-arrival structure), and
-/// they must match the expectation. The re-proposal's admission in
-/// every order is the ruled convergence carrier.
+/// The D-202/D-204 evidence-lifecycle lane: arrival order is
+/// SEMANTIC INPUT (the ruled per-replica stickiness), so no
+/// fresh-fold or metamorphic convergence applies — instead every
+/// LISTED delivery must agree on the final per-item verdicts, and
+/// they must match the expectation. The shared-structure rule is
+/// NORMATIVE since D-204 (a vector's listed orders must share the
+/// declared evidence-arrival structure): the narrowed convergence
+/// promise holds only within one structure — late-first, the
+/// re-proposal admits at the freed coordinate; timely-first, the
+/// contested pair freezes pending selection. The committed vector
+/// pair pins both worlds.
 fn run_evidence_lifecycle(vector: &Json) -> Result<SemStatus, String> {
     use std::collections::BTreeMap;
     let mut items: BTreeMap<String, Vec<u8>> = BTreeMap::new();

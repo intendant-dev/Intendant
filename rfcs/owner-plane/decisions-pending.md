@@ -1,15 +1,18 @@
-# Owner decisions — rulings record + pending drafts
+# Owner decisions — rulings record
 
-Status: **D2 and D5 are RULED (owner, 2026-07-14) and recorded in
-the spec's decision table** (this file survives as the alternatives
-record the rulings chose from). **D6 below is a PENDING DRAFT** —
-the owner directed its preparation (2026-07-15, the criterion-12
-send-back) but has not ratified the wording; the frozen spec is
-untouched until ratification.
+Status: **D2 and D5 are RULED (owner, 2026-07-14) and D6 is RULED
+(owner, 2026-07-16), all recorded in the spec's decision table**
+(this file survives as the alternatives record the rulings chose
+from). D6's wording below was drafted at the owner's direction
+(2026-07-15, the criterion-12 send-back), shown verbatim, and
+ratified 2026-07-16 — folded into spec v0.5.21 as the T5 prose
+amendment, the D-204 decision row, and the D-202 row's supersession
+rider, byte-equal to the draft below (the row's date placeholder
+filled `2026-07-16`).
 
 ---
 
-## D6 (PENDING — DRAFT for owner ratification) — narrow D-202's convergence carrier (proposed D-204)
+## D6 (RULED 2026-07-16 — ratified as D-204) — narrow D-202's convergence carrier
 
 ### Why
 
@@ -79,18 +82,21 @@ Proposed:
 > reducer's `d202_two_worlds_derive_ruled_states` test) | Ratified,
 > owner, 2026-07-__ |
 
-### Mechanical consequences on ratification (owner's act, not this tranche's)
+### Mechanical consequences on ratification (EXECUTED 2026-07-16)
 
-- Spec version v0.5.20 → v0.5.21; the spec SHA-256 re-pins in
-  `gate-a-audit.md`, `README.md`, and the program ledger.
+- Spec version v0.5.20 → v0.5.21 (v0.5.20 archived byte-exact,
+  `archive/2026-07-14-d0a-v0.5.20-as-reviewed.md`); the spec SHA-256
+  re-pinned in `gate-a-audit.md`, `README.md`, and the program
+  ledger (new hash `5ca12fe7…`).
 - The harness's listed-deliveries rule ("the listed orders must
-  share the declared evidence-arrival structure") becomes the
+  share the declared evidence-arrival structure") is now the
   normative precondition of the narrowed promise rather than a
-  harness convention.
-- Both worlds are ALREADY vector-pinned by this tranche (the
-  committed late-first vector and the new timely-first sibling, plus
-  a reducer cross-world test asserting each world's derived Memory
-  state) — ratification changes prose only, no artifact bytes.
+  harness convention (the D-204 row states it).
+- Both worlds were ALREADY vector-pinned by the tranche (the
+  committed late-first vector and the timely-first sibling, plus
+  the reducer cross-world test asserting each world's derived
+  Memory state) — ratification changed prose only, no artifact
+  bytes.
 
 ---
 

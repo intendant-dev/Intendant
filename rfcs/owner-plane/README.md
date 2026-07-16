@@ -10,7 +10,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | Path | What |
 |---|---|
 | `agenda-owner-plane-rfc.md` | The umbrella RFC, **v3.1 — FROZEN** (changes belong in gate specs, never here) |
-| `owner-plane-d0a-spec.md` | **D0-A, v0.5.20 — the terminal cut plus the owner's ratification amendments** (D-201..D-203; SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef`; v0.5.19 archived byte-exact). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
+| `owner-plane-d0a-spec.md` | **D0-A, v0.5.21 — the terminal cut plus the owner's ratification amendments** (D-201..D-204; SHA-256 `5ca12fe7a049ea223130c470e3b1234ad2b96e90f4b54c792e31d7dc1de4909a`; v0.5.19 and v0.5.20 archived byte-exact; D-204 ratified 2026-07-16 narrows D-202's convergence carrier to shared evidence-arrival structure). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
 | `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
 | `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.19) — the red baselines |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
@@ -20,7 +20,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `browser-lane/` | The **browser execution lane** (delivered): the schema-less reducer + a WebCrypto backend compiled to wasm; `driver.cjs` runs every browser-annotated vector in headless Chromium over raw CDP — semantics via `crypto.subtle`, the family-13 substrate over real IndexedDB transactions + Web Locks — and exits nonzero unless all green |
 | `gate-a-audit.md` | **The Gate-A discrepancy audit, amended after the repair tranche** (2026-07-14): the differential scoreboard incl. the tranche's findings (a real D-185 engine gap among them), the twelve D-items with per-item status, the conventions, the machine-enforced coverage pointers — and the **FAIL verdict** (re-amended 2026-07-15 on the reconciled verification review — the interim predicate-satisfied claim is withdrawn — and 2026-07-16 after the criterion-12 tranche: D-99 body-before-placement in full, the D-130 exact-reference rule, both D-202 worlds vectored, the storage proof made discriminating) |
 | `coverage/` | The **machine-enforced coverage inventory**: `outcomes-map.json` (generated §10.4 outcome → vector map; 12/59 uncovered — explicit Gate-B deferrals, pinned shrink-only) and `obligations-13-3.json` (the §13.3 obligation ledger — verbatim quote pins + full line coverage of the section; 14 vectored / 26 partial / 42 pending / 2 structural). Both declare the six executed surfaces (2 Rust + Chromium + 3 storage OSes) |
-| `decisions-pending.md` | The **decision record**: D2/D5 both RULED 2026-07-14 (D-201 no-class/no-vote; D-202 sticky + re-proposal) with the alternatives preserved — plus the **PENDING D-204 draft** (the criterion-12 D-202 convergence narrowing, awaiting the owner's ratification) |
+| `decisions-pending.md` | The **decision record**: D2/D5 RULED 2026-07-14 (D-201 no-class/no-vote; D-202 sticky + re-proposal) and D6 RULED 2026-07-16 (D-204: the criterion-12 D-202 convergence narrowing, folded into spec v0.5.21) — the alternatives and drafts preserved as chosen-from records |
 | `p1-v1-profile.md` | The **P1 v1 profile — RATIFIED as drafted (D-203)**: five implement-before-Gate-A mechanisms; every other unimplemented normative mechanism fail-closed with a named outcome |
 | `execution-lanes-plan.md` | The **execution-lanes plan — BOTH lanes DELIVERED** (per-OS portable storage 2026-07-15; Chromium WebCrypto/IndexedDB 2026-07-15); the Gate-B production concerns stay named and excluded |
 
@@ -100,9 +100,8 @@ review record, and the byte-exact baseline outranks path cosmetics.
   with the f07 fixture re-authored to the pend expectation and full
   fork selection honestly deferred (F2); BOTH ruled D-202 evidence
   worlds are vectored with the cross-world divergence pinned from
-  one byte source, and the convergence-promise narrowing (proposed
-  D-204) is DRAFTED in `decisions-pending.md` awaiting the owner
-  (F3); the storage proof now covers every stream, replaces
+  one byte source, and the convergence-promise narrowing is RATIFIED
+  (D-204, owner 2026-07-16, folded into spec v0.5.21) (F3); the storage proof now covers every stream, replaces
   pre-seeded destinations, and couples the flush observation to a
   failpoint control that the review's own mutation turns red (F4);
   and this round's truth pass re-verified counts, comments, and

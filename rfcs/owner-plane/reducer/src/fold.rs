@@ -5391,7 +5391,9 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
     // before any pipeline stage runs (were the pipeline re-entered,
     // the re-proposal now holding the freed position would read as
     // fork evidence; the issue decided this op for good, and the
-    // re-proposed op is the convergence carrier).
+    // re-proposed op is the convergence carrier WITHIN this
+    // evidence-arrival structure — D-204: a timely-first replica
+    // admits the original instead, and the pair freezes there).
     if state.stale_issued.contains(&op.op_hash()) {
         return Ok(Verdict::Rejected("lease-stale", "quarantine-reproposal"));
     }

@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn; **re-amended 2026-07-16 after the criterion-12 tranche** (the synthesized criterion-12 review, `reviews/2026-07-15-gate-a-criterion12-synthesized-review.md`, found three executable protocol counterexamples — F1 D-99, F2 D-130, F3 D-202 — plus the criterion-8 proof gaps and this document's own drift; the owner directed the bounded repairs 2026-07-15 and they are executed below)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
-**Spec:** `owner-plane-d0a-spec.md` v0.5.20, SHA-256 `ec3a9a6dda8f8c839b6c6eb7fb3322b439bf3976a8cd8ac0f6297838102dedef` (the ratification amendments; v0.5.19 = `410880e0…`, archived byte-exact) — UNCHANGED by the criterion-12 tranche; the D-202-narrowing wording (proposed D-204) is DRAFTED in `decisions-pending.md` awaiting the owner's ratification
+**Spec:** `owner-plane-d0a-spec.md` v0.5.21, SHA-256 `5ca12fe7a049ea223130c470e3b1234ad2b96e90f4b54c792e31d7dc1de4909a` (v0.5.20 = `ec3a9a6d…` and v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (2026-07-16): the D-202 convergence carrier narrowed to shared evidence-arrival structure — the T5 prose amendment, the D-204 decision row, and the D-202 row's supersession rider, exactly the wording the owner approved from `decisions-pending.md`; prose only, no artifact bytes changed
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `11dd88972220cac3a120f6f729c9b3eb9cd9e6a9a332bff75b4765efd178aaba` (amendments #1–#6; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10; the criterion-12 tranche's three new vectors ride existing case kinds — no amendment #7)
 **Corpus:** 168 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×29, f08×4, f09×13, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated from the vectors directory after the criterion-12 tranche: +2 D-99 multi-fault regressions, +1 D-202 timely-first world; the f07 unheld-head fixture re-authored in place)
 **Suites at this amendment:** core 141/141 · reducer 37/37 (incl. the metamorphic-convergence corpus test, the arrival-order restoration control, and the D-202 cross-world pin) · the strict harness 168/168 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files (EVERY stream through the durable path — `sync_all=14 rename=14` — each rename replacing a pre-seeded destination, plus the flush failpoint control) · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
@@ -22,13 +22,14 @@
 > its two ruled evidence worlds (F3) — plus an under-proven
 > criterion-8 storage claim (F4) and documentation drift (criterion
 > 11). The owner directed the bounded criterion-12 tranche
-> 2026-07-15 (D-202 resolved by narrowing the promise — the D-204
-> draft awaits ratification; D-130 honest-defer; criterion 8 by code;
-> D-99 in full), and §5 records its execution. The one criterion this
-> repository cannot satisfy from inside remains: a FRESH independent
-> reviewer rerunning the gate from a pinned commit. This document
-> never self-stamps; the verdict stays FAIL until that review
-> reports.
+> 2026-07-15 (D-202 resolved by narrowing the promise; D-130
+> honest-defer; criterion 8 by code; D-99 in full), §5 records its
+> execution, and the owner RATIFIED the D-204 narrowing 2026-07-16
+> (spec v0.5.21 — the one protocol-text consequence of the round).
+> The one criterion this repository cannot satisfy from inside
+> remains: a FRESH independent reviewer rerunning the gate from a
+> pinned commit. This document never self-stamps; the verdict stays
+> FAIL until that review reports.
 
 ## 0. Scope and method
 
@@ -204,10 +205,10 @@ The prose sentence remains worth adding at freeze.
 
 **D5. [#57] `lease-stale`'s firing condition is never stated.**
 **CLOSED — RULED (D-202, owner 2026-07-14): alternative (ii), sticky
-rejection + writer re-proposal — with the convergence sentence's
-NARROWING drafted (proposed D-204) after the criterion-12 review's F3
+rejection + writer re-proposal — with the convergence sentence
+NARROWED (D-204, owner 2026-07-16) after the criterion-12 review's F3
 counterexample.** The firing condition and lifecycle are in the T5
-prose (v0.5.20): a held qualified receipt outside every valid window
+prose: a held qualified receipt outside every valid window
 classifies `(lease-stale, quarantine-reproposal)` on the evidence
 held at evaluation, terminal where issued; the original op's verdict
 is knowingly evidence-order-relative. The review proved v0.5.20's
@@ -215,9 +216,9 @@ unqualified "convergence rides the re-proposed op" cannot hold ACROSS
 the two ruled evidence worlds (timely-first replicas admit the
 original, so the same-coordinate re-proposal is D-130 fork evidence
 and BOTH variants freeze pending selection); the owner chose
-narrowing the promise to shared evidence-arrival structure — the
-D-204 wording sits in `decisions-pending.md` awaiting ratification,
-and the spec is untouched until then. Both worlds are vectored
+narrowing the promise to shared evidence-arrival structure and
+ratified the wording into spec v0.5.21 (the T5 amendment + the D-204
+row + the D-202 rider). Both worlds are vectored
 (`f09-lease-lifecycle-sticky-reproposal` late-first /
 `f09-lease-lifecycle-timely-first-forks` timely-first), the
 cross-world relationship is pinned from one byte source by the
@@ -470,14 +471,16 @@ verified condition after BOTH owner-directed repair tranches:
    BOTH variants freeze pending selection), with the cross-world
    relationship pinned from one byte source
    (`d202_two_worlds_derive_ruled_states`). The convergence
-   sentence\'s narrowing (proposed D-204) is DRAFTED in
-   `decisions-pending.md` — an owner act, not this tranche\'s.
+   sentence's narrowing is RATIFIED (D-204, owner 2026-07-16, spec
+   v0.5.21) — the harness's shared-structure rule for listed
+   deliveries is now the narrowed promise's normative precondition,
+   not a harness convention.
 10. *Empty-corpus and non-permutation controls red* — the bin exits
     2 on an empty directory; every delivery must be a true
     permutation of the item set.
 11. *Ledgers, comments, counts, prose match* — this amendment: the
     README counts and D-130 wording, the coverage/surfaces source
-    comments, the P1-profile frontier-head row, this document\'s
+    comments, the P1-profile frontier-head row, this document's
     header/histogram/suite counts, the D4/D5 records, the §4
     executed-surfaces and storage-lane paragraphs, the
     execution-lanes-plan note, and the PR description were all
@@ -487,16 +490,16 @@ verified condition after BOTH owner-directed repair tranches:
     construction: this document cannot satisfy it, and the verdict
     stands FAIL until that review reports.
 
-**The additional D-130 blocker (the review\'s un-rowed finding)** is
-repaired honest-defer per the owner\'s direction: `parse_heads`
+**The additional D-130 blocker (the review's un-rowed finding)** is
+repaired honest-defer per the owner's direction: `parse_heads`
 selects only byte-variants genuinely HELD at the named coordinate
 (the accepted op or a registered fork variant); an unheld named hash
-pends `ref-unresolved` under §7.1\'s referenced-Head lifecycle. The
+pends `ref-unresolved` under §7.1's referenced-Head lifecycle. The
 ninth-fixture history closes accordingly: the original
 `…-head-hash-mismatch-rejects` encoded the superseded v0.5.9
 rejection; the first tranche over-rotated it to admit-and-select
-against a randomly drawn hash; the criterion-12 review\'s F2 refuted
-that with the fixture\'s own bytes, and it now stands as
+against a randomly drawn hash; the criterion-12 review's F2 refuted
+that with the fixture's own bytes, and it now stands as
 `f07-revoke-cutoff-unheld-head-pends` (the revoke pends, the held
 `i` stays admitted, later control ops pass the pending reference).
 Full two-variant fork selection stays honestly deferred (the
@@ -505,7 +508,8 @@ remains an `Unimplemented` marker), and the README/profile say
 exactly that.
 
 Nothing in this verdict stamps the spec, opens P1, or amends the
-Gate-A predicate silently; the D-204 ratification, the freeze-time
-prose ratifications (the D4/D9 sentences, the recorded D-151 row
-fix), and the §16 stamp are the OWNER\'s acts; P1 writes stay barred
-until Gate B and the P0.5/tombed-cutover sequence regardless.
+Gate-A predicate silently; D-204 is RATIFIED (owner, 2026-07-16 —
+spec v0.5.21), while the freeze-time prose ratifications (the D4/D9
+sentences, the recorded D-151 row fix) and the §16 stamp remain the
+OWNER's acts; P1 writes stay barred until Gate B and the
+P0.5/tombed-cutover sequence regardless.
