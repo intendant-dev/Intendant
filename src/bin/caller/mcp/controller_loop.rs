@@ -338,8 +338,14 @@ impl ControllerLoopRawStatus {
     }
 }
 
+/// `wrapper_index_home`: the home whose external-wrapper index may be
+/// consulted for live codex processes (hermetic-tests convention — the
+/// caller supplies the root; state-scoped callers pass
+/// [`mcp_state_session_logs_home`], stateless transport edges resolve the
+/// real home dir).
 pub(crate) fn collect_controller_loop_raw_status(
     loop_dir: &std::path::Path,
+    wrapper_index_home: &std::path::Path,
 ) -> ControllerLoopRawStatus {
     let halt = loop_dir.join("request_halt").exists();
     let halt_after_cycle = loop_dir.join("request_halt_after_cycle").exists();
@@ -388,6 +394,7 @@ pub(crate) fn collect_controller_loop_raw_status(
     ));
     active_wrappers.extend(active_external_wrappers_from_index_for_processes(
         loop_dir,
+        wrapper_index_home,
         &process_tree_codex,
     ));
 
@@ -529,7 +536,7 @@ pub(crate) fn collect_controller_loop_status_for_mcp_state(
     state: &McpAppState,
 ) -> serde_json::Value {
     let (_, generation) = state.probe_controller_loop_raw_status(loop_dir);
-    let raw = collect_controller_loop_raw_status(loop_dir);
+    let raw = collect_controller_loop_raw_status(loop_dir, &mcp_state_session_logs_home(state));
     if state.controller_loop_status_override.is_none()
         && mcp_state_controller_loop_dir(state) == loop_dir
     {
@@ -542,7 +549,13 @@ pub(crate) fn collect_controller_loop_status_inner(
     loop_dir: &std::path::Path,
     live_state: Option<(&McpAppState, u64)>,
 ) -> serde_json::Value {
-    finish_controller_loop_status(collect_controller_loop_raw_status(loop_dir), live_state)
+    // Stateless transport edge: no state-scoped home override exists here,
+    // so the real home dir is resolved at this boundary.
+    let wrapper_index_home = crate::platform::home_dir();
+    finish_controller_loop_status(
+        collect_controller_loop_raw_status(loop_dir, &wrapper_index_home),
+        live_state,
+    )
 }
 
 pub(crate) fn controller_loop_dir_has_observable_state(loop_dir: &std::path::Path) -> bool {
@@ -609,8 +622,12 @@ pub(crate) fn mcp_state_session_source_for_id(
                 .insert(session_id.to_string(), source.clone());
             Some(source)
         }
+        // NotFound and Unreadable are both uncached: the log may appear (or
+        // become readable) a moment later. Only a successfully READ log
+        // with no external identity memoizes as non-external.
         PersistedStartTarget::ExternalMissingResume { source: None }
-        | PersistedStartTarget::NotFound => None,
+        | PersistedStartTarget::NotFound
+        | PersistedStartTarget::Unreadable => None,
         PersistedStartTarget::NonExternal => {
             s.session_known_non_external.insert(session_id.to_string());
             None
@@ -645,7 +662,8 @@ pub(crate) fn mcp_state_controller_loop_status(s: &McpAppState) -> serde_json::V
             // probe and store, the pre-mutation sample is discarded.
             let (hit, generation) = s.probe_controller_loop_raw_status(&loop_dir);
             let raw = hit.unwrap_or_else(|| {
-                let raw = collect_controller_loop_raw_status(&loop_dir);
+                let raw =
+                    collect_controller_loop_raw_status(&loop_dir, &mcp_state_session_logs_home(s));
                 s.store_controller_loop_raw_status_at(generation, raw.clone());
                 raw
             });
@@ -910,10 +928,15 @@ pub(crate) fn controller_loop_active_wrapper_is_idle_external_app_server(
 #[allow(dead_code)]
 pub(crate) fn active_external_wrappers_from_index(
     loop_dir: &std::path::Path,
+    wrapper_index_home: &std::path::Path,
     live_codex_pids: &[u32],
 ) -> Vec<serde_json::Value> {
     let live_codex_processes = live_codex_processes_from_pids(live_codex_pids);
-    active_external_wrappers_from_index_for_processes(loop_dir, &live_codex_processes)
+    active_external_wrappers_from_index_for_processes(
+        loop_dir,
+        wrapper_index_home,
+        &live_codex_processes,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -924,9 +947,10 @@ pub(crate) struct LiveCodexAppServerProcess {
 
 pub(crate) fn active_external_wrappers_from_index_for_processes(
     loop_dir: &std::path::Path,
+    wrapper_index_home: &std::path::Path,
     live_codex_processes: &[LiveCodexAppServerProcess],
 ) -> Vec<serde_json::Value> {
-    let candidate_homes = controller_loop_wrapper_index_homes(loop_dir);
+    let candidate_homes = controller_loop_wrapper_index_homes(loop_dir, wrapper_index_home);
     active_external_wrappers_from_index_homes_for_processes(
         candidate_homes.iter(),
         live_codex_processes,
@@ -1583,14 +1607,21 @@ pub(crate) fn controller_loop_home(loop_dir: &std::path::Path) -> Option<std::pa
     intendant_dir.parent().map(std::path::Path::to_path_buf)
 }
 
+/// Candidate homes whose external-wrapper indexes may describe the live
+/// codex processes: the home the loop dir belongs to, then the caller's
+/// `wrapper_index_home`. Hermetic-tests convention: the home is a
+/// PARAMETER — state-scoped callers thread [`mcp_state_session_logs_home`]
+/// (test-overridable) and only the stateless transport edges resolve the
+/// real `home_dir()`.
 pub(crate) fn controller_loop_wrapper_index_homes(
     loop_dir: &std::path::Path,
+    wrapper_index_home: &std::path::Path,
 ) -> Vec<std::path::PathBuf> {
     let mut homes = Vec::new();
     let mut seen = HashSet::new();
     for home in [
         controller_loop_home(loop_dir),
-        Some(crate::platform::home_dir()),
+        Some(wrapper_index_home.to_path_buf()),
     ]
     .into_iter()
     .flatten()
@@ -2471,7 +2502,7 @@ mod tests {
         )
         .unwrap();
 
-        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        let wrappers = active_external_wrappers_from_index(&loop_dir, home, &[1084559]);
         assert_eq!(wrappers.len(), 1);
         assert_eq!(
             wrappers[0]
@@ -3250,7 +3281,7 @@ mod tests {
         )
         .unwrap();
 
-        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        let wrappers = active_external_wrappers_from_index(&loop_dir, home, &[1084559]);
         assert_eq!(wrappers.len(), 1);
         assert_eq!(
             wrappers[0]
@@ -3414,7 +3445,7 @@ mod tests {
             .unwrap();
         }
 
-        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        let wrappers = active_external_wrappers_from_index(&loop_dir, home, &[1084559]);
         assert_eq!(wrappers.len(), 1);
         assert_eq!(
             wrappers[0]

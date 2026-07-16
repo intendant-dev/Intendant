@@ -1056,13 +1056,14 @@ impl IntendantServer {
             if has_target && s.controller_loop_status_override.is_none() {
                 let loop_dir = mcp_state_controller_loop_dir(&s);
                 let (hit, generation) = s.probe_controller_loop_raw_status(&loop_dir);
-                hit.is_none().then_some((loop_dir, generation))
+                hit.is_none()
+                    .then(|| (loop_dir, mcp_state_session_logs_home(&s), generation))
             } else {
                 None
             }
         };
-        if let Some((loop_dir, generation)) = needs_collect {
-            let raw = collect_controller_loop_raw_status(&loop_dir);
+        if let Some((loop_dir, wrapper_index_home, generation)) = needs_collect {
+            let raw = collect_controller_loop_raw_status(&loop_dir, &wrapper_index_home);
             // Store at the pre-collection generation: if a lifecycle or
             // marker mutation invalidated the cache while we collected
             // unlocked, this pre-mutation sample is discarded rather than
@@ -1449,6 +1450,16 @@ impl IntendantServer {
                             session_id
                         );
                     }
+                    // An unreadable persisted log is an error, not a
+                    // fall-through: the generic start path below discards
+                    // the requested session id and would silently launch a
+                    // FRESH session in its place.
+                    PersistedStartTarget::Unreadable => {
+                        return format!(
+                            "Cannot start task: session {}'s persisted log exists but could not be read; retry, or resume from the dashboard with an explicit source/resume_id",
+                            session_id
+                        );
+                    }
                     PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
                 }
             }
@@ -1587,8 +1598,18 @@ struct PersistedExternalStartTarget {
 enum PersistedStartTarget {
     NotFound,
     NonExternal,
+    /// The session's log dir exists but its `session.jsonl` could not be
+    /// read (partially materialized, transient I/O failure) and no other
+    /// signal named a source. Distinct from both `NotFound` (nothing there)
+    /// and `NonExternal` (successfully read, provably native): source
+    /// memoization may retry it later (never negative-cached), but an
+    /// explicit resume request must surface an error instead of silently
+    /// falling through to a fresh session.
+    Unreadable,
     External(PersistedExternalStartTarget),
-    ExternalMissingResume { source: Option<String> },
+    ExternalMissingResume {
+        source: Option<String>,
+    },
 }
 
 fn resolve_persisted_start_target(
@@ -1640,7 +1661,7 @@ fn resolve_persisted_start_target(
 
     let Some(source) = source else {
         return if log_read_failed {
-            PersistedStartTarget::NotFound
+            PersistedStartTarget::Unreadable
         } else {
             PersistedStartTarget::NonExternal
         };
@@ -2006,7 +2027,7 @@ impl ServerHandler for IntendantServer {
         if !RESOURCE_URIS.contains(&request.uri.as_str()) {
             return Err(McpError::invalid_params(
                 format!("Unknown resource URI: {}", request.uri),
-                None,
+                Some(serde_json::json!({ "uri": request.uri })),
             ));
         }
         self.state
@@ -2340,15 +2361,23 @@ pub(crate) mod tests {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
         let mut state =
             McpAppState::new("openai".to_string(), "gpt-5".to_string(), autonomy, log_dir);
-        // Hermetic default: status paths collect controller-loop reality
-        // (run-dir scans, wrapper-index reads, `ps`) from the REAL machine
-        // when unset — on a live box that scan costs seconds and its
-        // duration becomes machine state. Point it at a never-existing dir
-        // (deterministically empty, no tempdir guard needed); tests that
-        // exercise loop-dir behavior override this themselves.
+        // Hermetic defaults: status paths otherwise collect controller-loop
+        // reality from the REAL machine — run-dir scans under the real loop
+        // dir, wrapper-index reads under the real home — and on a live box
+        // that costs seconds and makes test duration machine state. Point
+        // both roots at never-existing dirs (deterministically empty, no
+        // tempdir guard needed); tests that exercise loop-dir or persisted
+        // -log behavior override these themselves. Honest scope: the
+        // collection still spawns one `ps` to probe THIS process's
+        // descendants (platform probe, not overridable state) — its result
+        // for a test process is deterministically empty (tests spawn no
+        // codex children), and with the wrapper-index home threaded above
+        // even a match could no longer read the real home's index.
         state.controller_loop_dir_override = Some(std::path::PathBuf::from(
             "/nonexistent/intendant-test-controller-loop",
         ));
+        state.session_logs_home_override =
+            Some(std::path::PathBuf::from("/nonexistent/intendant-test-home"));
         Arc::new(RwLock::new(state))
     }
 
@@ -3778,6 +3807,60 @@ pub(crate) mod tests {
     fn resource_definitions_has_seven_entries() {
         let defs = resource_definitions();
         assert_eq!(defs.len(), 7);
+    }
+
+    #[test]
+    fn unreadable_persisted_log_errors_instead_of_spawning_a_fresh_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-unreadable-log";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({ "session_id": session_id }).to_string(),
+            )
+            .unwrap();
+            // A session.jsonl that cannot be read as a file (a directory in
+            // its place — the partially-materialized / transient-IO class).
+            std::fs::create_dir_all(log_dir.join("session.jsonl")).unwrap();
+
+            assert_eq!(
+                resolve_persisted_start_target(home.path(), session_id),
+                PersistedStartTarget::Unreadable
+            );
+
+            let state = test_state();
+            state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
+            let bus = EventBus::new();
+            let mut bus_rx = bus.subscribe();
+            let server =
+                IntendantServer::new_with_home(state, bus.clone(), home.path().to_path_buf());
+            let result = server
+                .start_task(Parameters(StartTaskParams {
+                    session_id: Some(session_id.to_string()),
+                    task: "resume the work".to_string(),
+                    orchestrate: None,
+                    reference_frame_ids: Vec::new(),
+                    display_target: None,
+                }))
+                .await;
+            assert!(
+                result.contains("could not be read"),
+                "expected an unreadable-log error, got: {result}"
+            );
+            // No StartTask/ResumeSession may have been dispatched: the
+            // requested session id must never be silently replaced by a
+            // fresh session.
+            assert!(matches!(
+                bus_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        });
     }
 
     #[test]

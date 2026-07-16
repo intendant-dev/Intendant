@@ -884,7 +884,12 @@ fn session_jsonl_prefix_hash(bytes: &[u8]) -> u64 {
 /// `min(consumed, SESSION_JSONL_PREFIX_WINDOW)` bytes when it is first
 /// established from a full read. Append-only writers never rewrite that
 /// window, so the frozen hash stays comparable as the cursor advances;
-/// a mismatch on resume forces a full replay.
+/// a mismatch on resume forces a full replay. The claim is exactly the
+/// window: a same-or-longer-length rewrite that preserves the frozen
+/// window (and the boundary byte) but diverges only beyond it is NOT
+/// detected — acceptable because the in-repo writer is append-only, so
+/// any real replacement (a different session's log) diverges from its
+/// first line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionJsonlCursor {
     pub(crate) lines: u64,

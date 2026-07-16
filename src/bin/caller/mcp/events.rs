@@ -133,10 +133,17 @@ pub(crate) fn codex_thread_action_result_targets_session(
 /// carries the same information.
 const RESOURCE_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Upper bound on one notification flush. Notifications are best-effort by
+/// design: an open-but-not-draining peer (a wedged stdio reader) must not
+/// park the listener — and especially not a teardown flush — indefinitely;
+/// on expiry the remaining notifications are dropped.
+const RESOURCE_NOTIFY_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Send `notifications/resources/updated` for every dirty URI the client
 /// subscribed to, then clear the dirty set. Unsubscribed URIs are dropped:
 /// resource notifications are subscription-scoped in MCP, so a client that
 /// never subscribes no longer receives (and re-reads on) unsolicited spam.
+/// Bounded by [`RESOURCE_NOTIFY_FLUSH_BUDGET`] — best effort, never a park.
 async fn flush_resource_notifications(
     state: &SharedMcpState,
     peer: &Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
@@ -158,15 +165,18 @@ async fn flush_resource_notifications(
         return;
     }
     subscribed.sort();
-    let peer_guard = peer.lock().await;
-    let Some(ref p) = *peer_guard else {
-        return;
+    let send_all = async {
+        let peer_guard = peer.lock().await;
+        let Some(ref p) = *peer_guard else {
+            return;
+        };
+        for uri in subscribed {
+            let _ = p
+                .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
+                .await;
+        }
     };
-    for uri in subscribed {
-        let _ = p
-            .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
-            .await;
-    }
+    let _ = tokio::time::timeout(RESOURCE_NOTIFY_FLUSH_BUDGET, send_all).await;
 }
 
 pub fn spawn_event_listener(
@@ -558,6 +568,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::SafetyCapReached => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Error,
@@ -567,6 +578,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::LoopError(msg) => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Error, format!("Error: {}", msg));
                         resource_changed = Some("intendant://status");
@@ -1404,6 +1416,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             true
         }
         AppEvent::LoopError(_) => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Done);
             true
         }
@@ -1611,10 +1624,11 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         let Some((tail, base)) = read_session_jsonl_tail(&path, prior) else {
             continue;
         };
-        // Mark the replay kind for the fold: full replays must not
-        // overwrite live-marked session status (freshness watermark) and
-        // must not trigger the over-cap prune (see note_session_ended).
-        s.hydration_replay = Some(if base.bytes == 0 {
+        // Enter the replay scope (RAII — a panic mid-fold must not leave
+        // the state stuck in "hydrating" mode): full replays apply the
+        // freshness-watermark lattice and never trigger the over-cap prune
+        // (see note_session_phase / note_session_ended).
+        let mut replay = s.begin_hydration_replay(if base.bytes == 0 {
             HydrationReplayKind::Full
         } else {
             HydrationReplayKind::Tail
@@ -1627,10 +1641,10 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
             else {
                 return true;
             };
-            changed |= apply_observed_event_to_mcp_state(s, &event);
+            changed |= apply_observed_event_to_mcp_state(replay.state(), &event);
             true
         });
-        s.hydration_replay = None;
+        drop(replay);
         s.session_log_hydration_cursors.insert(path, advanced);
     }
 
@@ -1758,6 +1772,75 @@ mod tests {
             // Done from the requested session's own state — never fall
             // through to the daemon's current (unrelated) session because a
             // re-prune erased the rebuild while the cursor sat at EOF.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
+
+    #[test]
+    fn full_replay_applies_newer_terminal_phase_over_lossy_live_mark() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-lossy-live";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("lossy live task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "edit files",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+
+            let state = test_state();
+            let mut s = state.write().await;
+            // The live lane observed the session running (marked) but
+            // MISSED the SessionEnded — the listener is a lossy broadcast,
+            // the log is lossless. The full replay's terminal fact must
+            // apply over the stale live mark; a suppress-all watermark left
+            // the session permanently stuck at the live phase with the
+            // cursor committed at EOF.
+            s.note_session_phase(Some(session_id), Some(1), Phase::Thinking, None);
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+
+            // And it stays Done on the next (tail) hydration.
             hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
             assert_eq!(
                 s.session_status_for_id(session_id)

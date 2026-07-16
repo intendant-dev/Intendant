@@ -1123,6 +1123,9 @@ pub(crate) async fn handle_control_command_mcp(
             if let Some(ref tx) = s.follow_up_tx {
                 let tx = tx.clone();
                 s.set_phase(Phase::Thinking);
+                // Follow-up dispatch resumes work: drop any pre-dispatch
+                // controller-loop sample.
+                s.note_live_session_lifecycle_change();
                 s.push_log(LogLevel::Info, format!("Follow-up via socket: {}", text));
                 drop(s);
                 if tx.send(FollowUpMessage::text(text)).await.is_err() {
