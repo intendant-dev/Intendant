@@ -179,7 +179,10 @@ pub(crate) struct InboundPacket {
 /// single error owner that tears the peer down on the first write failure
 /// rather than re-flooding a dead socket.
 pub(crate) const TCP_OUT_QUEUE: usize = 256;
-pub(crate) type TcpFrameSender = mpsc::Sender<Vec<u8>>;
+/// Payloads are `Bytes`: `drain_outputs` freezes the engine's
+/// `BytesMut` transmit (zero-copy) instead of `to_vec`-copying every
+/// media packet onto the TCP lane.
+pub(crate) type TcpFrameSender = mpsc::Sender<Bytes>;
 
 struct InteractiveSourceGuard(Option<Arc<crate::BrowserInputSource>>);
 
@@ -473,7 +476,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     // Once the allocation lands, this is the relayed address ICE advertises
     // and the channel that routes relay-destined RTC output to the relay task.
     let mut relay_addr: Option<SocketAddr> = None;
-    let mut relay_out_tx: Option<mpsc::Sender<(SocketAddr, Vec<u8>)>> = None;
+    let mut relay_out_tx: Option<mpsc::Sender<(SocketAddr, Bytes)>> = None;
 
     // Phase 4d.1: poll-driven observed-send-bitrate computation.
     // Each tick samples `bytes_sent` per outbound stream and computes
@@ -608,7 +611,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 // the peer's shutdown token, tearing the connection down
                 // instead of letting every later transmit re-flood the log
                 // on a dead socket.
-                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Vec<u8>>(TCP_OUT_QUEUE);
+                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Bytes>(TCP_OUT_QUEUE);
                 tcp_senders.insert(remote_addr, tcp_out_tx);
                 let writer_shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -926,7 +929,7 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     // TURN relay task, which wraps it toward coturn. `None` until/unless a
     // relay allocation succeeds.
     relay_addr: Option<SocketAddr>,
-    relay_out_tx: Option<&mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    relay_out_tx: Option<&mpsc::Sender<(SocketAddr, Bytes)>>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -948,8 +951,9 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             if let Some(tx) = relay_out_tx {
                 // try_send keeps the rtc poll loop non-blocking; a full relay
                 // queue drops this packet as backpressure (RTP recovery /
-                // ICE retransmit covers the loss).
-                let _ = tx.try_send((t.transport.peer_addr, t.message.to_vec()));
+                // ICE retransmit covers the loss). freeze() hands the
+                // engine's own buffer over without copying the packet.
+                let _ = tx.try_send((t.transport.peer_addr, t.message.freeze()));
             }
             continue;
         }
@@ -964,7 +968,9 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         // transmits key on our relayed *local* address, which is never a
         // TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
-            let contents: Vec<u8> = t.message.to_vec();
+            // freeze() is zero-copy: the writer task borrows the
+            // engine's own transmit buffer for the RFC 4571 write.
+            let contents: Bytes = t.message.freeze();
             // Enqueue onto the connection's ordered writer channel.
             // `try_send` (never `send().await`) keeps the rtc poll loop
             // non-blocking: a full queue means the writer task can't

@@ -413,7 +413,7 @@ pub(crate) struct RelayAllocation {
     /// relayed address. Each item is `(peer_addr, bytes)`; the relay task
     /// ensures a permission exists for `peer_addr` then sends via the TURN
     /// client (Send indication → ChannelData once a channel is bound).
-    pub(crate) relay_out_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    pub(crate) relay_out_tx: mpsc::Sender<(SocketAddr, Bytes)>,
 }
 
 /// Drive a sans-I/O TURN client to allocate a relay on `server`, then run the
@@ -580,7 +580,7 @@ pub(crate) async fn run_turn_relay(
 
     // Hand the allocation back to the driver: it adds the relay candidate and
     // begins routing relay-destined RTC output to us.
-    let (relay_out_tx, mut relay_out_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(256);
+    let (relay_out_tx, mut relay_out_rx) = mpsc::channel::<(SocketAddr, Bytes)>(256);
     if alloc_tx
         .send(RelayAllocation {
             relayed_addr,
