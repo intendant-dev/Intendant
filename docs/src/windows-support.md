@@ -172,11 +172,14 @@ Wayland, and macOS backends use. The Windows-specific backends are:
 
 `display/windows.rs` ships two capture paths behind the same `DisplayBackend`
 seam, selected at runtime by the `INTENDANT_WINDOWS_CAPTURE` environment
-variable (`gdi` | `dxgi`, case-insensitive). Unset or unrecognized picks the
-default policy: **DXGI first, with automatic GDI fallback if DXGI init
-fails.** An *explicit* `dxgi` is fail-loud — no silent substitution, the
-operator asked for DXGI specifically — and an explicit `gdi` forces the GDI
-path.
+variable (`gdi` | `dxgi`; values are trimmed, then matched
+case-insensitively, so a CRLF-edited `.env` or a stray-whitespace `setx`
+never demotes an explicit pin). Unset picks the default policy: **DXGI
+first, with automatic GDI fallback if DXGI init fails.** A value that is set
+but unrecognized also gets the default policy — but is loudly ignored, with
+a warning naming the ignored value and the resulting policy. An *explicit*
+`dxgi` is fail-loud — no silent substitution, the operator asked for DXGI
+specifically — and an explicit `gdi` forces the GDI path.
 
 **DXGI Desktop Duplication — the default.** `IDXGIOutputDuplication` is the
 GPU-accelerated path (zero-copy from the GPU into a CPU-readable staging

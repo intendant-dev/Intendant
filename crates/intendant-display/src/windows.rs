@@ -54,14 +54,18 @@
 //!
 //! ### Selection and fallback
 //!
-//! `INTENDANT_WINDOWS_CAPTURE` (case-insensitive) picks the path at runtime:
+//! `INTENDANT_WINDOWS_CAPTURE` picks the path at runtime. Values are trimmed
+//! before matching -- a CRLF-edited `.env` or `setx` whitespace artifact
+//! never demotes an explicit pin -- then compared case-insensitively:
 //!
-//! - **unset / unrecognized (the default):** DXGI is tried first. If DXGI
-//!   init fails -- no output duplication available (RDP or service session),
-//!   access denied, driver reset, another process already holding the
-//!   duplication -- the backend logs one warning naming the concrete cause
-//!   and falls back to GDI for the session. Every `start_capture` re-runs
-//!   the policy, so a later restart re-tries DXGI.
+//! - **unset / unrecognized (the default):** DXGI is tried first. A value
+//!   that is *set* but names neither method is loudly ignored -- one warning
+//!   naming the raw value and the resulting policy -- rather than silently
+//!   reinterpreted. If DXGI init fails -- no output duplication available
+//!   (RDP or service session), access denied, driver reset, another process
+//!   already holding the duplication -- the backend logs one warning naming
+//!   the concrete cause and falls back to GDI for the session. Every
+//!   `start_capture` re-runs the policy, so a later restart re-tries DXGI.
 //! - **`dxgi` (explicit):** fail-loud. The operator asked for DXGI
 //!   specifically, so an init failure surfaces as an error instead of being
 //!   silently substituted with GDI.
@@ -217,23 +221,56 @@ enum CaptureSelection {
 }
 
 impl CaptureSelection {
-    /// Selection policy for a raw `INTENDANT_WINDOWS_CAPTURE` value (`None` =
-    /// unset; matching is case-insensitive). Pure, so the precedence --
-    /// explicit `gdi` > explicit fail-loud `dxgi` > default DXGI with GDI
-    /// fallback (unset or unrecognized) -- is unit-testable.
-    fn from_env_value(raw: Option<&str>) -> Self {
-        match raw {
-            Some(v) if v.eq_ignore_ascii_case("gdi") => Self::Explicit(CaptureMethod::Gdi),
-            Some(v) if v.eq_ignore_ascii_case("dxgi") => Self::Explicit(CaptureMethod::Dxgi),
-            _ => Self::DxgiWithGdiFallback,
+    /// Parse one *set* `INTENDANT_WINDOWS_CAPTURE` value. Surrounding
+    /// whitespace is trimmed first -- a CRLF-edited `.env` or a `setx`
+    /// artifact (`"gdi\r"`, `" gdi "`) must still count as the operator's
+    /// explicit pin, because on a black-duplicating adapter a demotion to
+    /// the default policy would silently re-enable DXGI-first -- then the
+    /// value is matched case-insensitively. `None` means the value names
+    /// neither method. Pure, so the recognized/unrecognized classification
+    /// is unit-testable and the warning stays at the impure
+    /// [`Self::from_env`] edge.
+    fn parse_env_value(raw: &str) -> Option<Self> {
+        let v = raw.trim();
+        if v.eq_ignore_ascii_case("gdi") {
+            Some(Self::Explicit(CaptureMethod::Gdi))
+        } else if v.eq_ignore_ascii_case("dxgi") {
+            Some(Self::Explicit(CaptureMethod::Dxgi))
+        } else {
+            None
         }
+    }
+
+    /// Selection policy for a raw `INTENDANT_WINDOWS_CAPTURE` value (`None` =
+    /// unset). Pure, so the precedence -- explicit `gdi` > explicit
+    /// fail-loud `dxgi` > default DXGI with GDI fallback (unset or
+    /// unrecognized) -- is unit-testable.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        raw.and_then(Self::parse_env_value)
+            .unwrap_or(Self::DxgiWithGdiFallback)
     }
 
     /// Resolve the selection from the process environment, honoring the
     /// `INTENDANT_WINDOWS_CAPTURE` override (`gdi` | `dxgi`) so either path
-    /// can be forced at runtime without a code change.
+    /// can be forced at runtime without a code change. A value that is set
+    /// but names neither method is loudly ignored -- one warning per
+    /// resolution naming the raw value and the resulting policy, styled
+    /// after the `INTENDANT_MOCK_DISPLAY` precedent -- because silently
+    /// applying the default would re-enable DXGI-first on exactly the hosts
+    /// where an operator pinned `gdi` against black duplication.
     fn from_env() -> Self {
-        Self::from_env_value(std::env::var("INTENDANT_WINDOWS_CAPTURE").ok().as_deref())
+        let raw = std::env::var("INTENDANT_WINDOWS_CAPTURE").ok();
+        if let Some(v) = raw.as_deref() {
+            if Self::parse_env_value(v).is_none() {
+                eprintln!(
+                    "[display/windows] INTENDANT_WINDOWS_CAPTURE={v:?} is not a \
+                     recognized capture method (expected \"gdi\" or \"dxgi\"); \
+                     ignoring -- using the default policy (DXGI with automatic \
+                     GDI fallback)"
+                );
+            }
+        }
+        Self::from_env_value(raw.as_deref())
     }
 
     /// The capture method attempted first.
@@ -2368,6 +2405,54 @@ mod tests {
             assert_eq!(sel.initial_method(), CaptureMethod::Dxgi, "raw={raw:?}");
             assert!(sel.falls_back_to_gdi(), "raw={raw:?}");
         }
+    }
+
+    #[test]
+    fn capture_env_value_is_trimmed_before_matching() {
+        // A CRLF-edited `.env` or a `setx` artifact ("gdi\r", " gdi ") must
+        // still count as the operator's explicit pin: on a black-duplicating
+        // adapter, demoting it to the default policy would silently
+        // re-enable DXGI-first. Trim happens before the (still
+        // case-insensitive) match.
+        for raw in [" gdi ", "gdi\r", "GDI\r\n", "\tGdI\n"] {
+            assert_eq!(
+                CaptureSelection::from_env_value(Some(raw)),
+                CaptureSelection::Explicit(CaptureMethod::Gdi),
+                "raw={raw:?}"
+            );
+        }
+        for raw in ["dxgi ", " DXGI\r\n"] {
+            assert_eq!(
+                CaptureSelection::from_env_value(Some(raw)),
+                CaptureSelection::Explicit(CaptureMethod::Dxgi),
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_env_unrecognized_is_classified_for_the_warning() {
+        // `parse_env_value` is the pure classifier the env edge consults
+        // before warning: a set-but-unrecognized value (typo, empty,
+        // whitespace-only) parses to `None` -- and the policy still lands on
+        // the default selection rather than silently picking a method.
+        for raw in ["nonsense", "gdo", "", "   ", "gdi dxgi"] {
+            assert_eq!(CaptureSelection::parse_env_value(raw), None, "raw={raw:?}");
+            assert_eq!(
+                CaptureSelection::from_env_value(Some(raw)),
+                CaptureSelection::DxgiWithGdiFallback,
+                "raw={raw:?}"
+            );
+        }
+        // Recognized values classify as Some(explicit) -- no warning fires.
+        assert_eq!(
+            CaptureSelection::parse_env_value("gdi"),
+            Some(CaptureSelection::Explicit(CaptureMethod::Gdi))
+        );
+        assert_eq!(
+            CaptureSelection::parse_env_value(" DXGI\r\n"),
+            Some(CaptureSelection::Explicit(CaptureMethod::Dxgi))
+        );
     }
 
     #[test]
