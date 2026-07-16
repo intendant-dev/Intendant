@@ -64,26 +64,36 @@ pub fn encode_raw_bgra_payload(
     if tile_size_px == 0 || raw.len() != expected {
         return Err(TileEncodeError::InvalidGeometry);
     }
-    let rle = rle_bgra(&raw);
+    // Bounded RLE: the moment the encoding reaches raw size it can no
+    // longer win, so stop — noisy tiles (the ones that dominate real
+    // content) abort after a fraction of the tile instead of building
+    // an up-to-5/4-raw encoding that gets discarded.
+    let rle = rle_bgra_bounded(&raw, raw.len());
 
-    let (mut encoding, mut payload) = if rle.len() < raw.len() {
-        (TileEncoding::RleBgra, rle)
-    } else {
-        (TileEncoding::RawBgra, raw.clone())
-    };
-
-    if should_try_webp_lossless(payload.len(), raw.len()) {
+    let best_len = rle.as_ref().map_or(raw.len(), Vec::len);
+    let webp = if should_try_webp_lossless(best_len, raw.len()) {
         match webp_lossless_bgra(&raw, tile_size_px as u32, tile_size_px as u32) {
-            Ok(webp) if webp.len() < payload.len() => {
-                encoding = TileEncoding::WebpLossless;
-                payload = webp;
-            }
-            Ok(_) => {}
+            Ok(webp) if webp.len() < best_len => Some(webp),
+            Ok(_) => None,
             Err(e) => {
                 eprintln!("[display/tile] lossless WebP encode skipped: {e}");
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+
+    // Preference order (unchanged): WebP only when strictly smaller
+    // than the best simple encoding; RLE only when strictly smaller
+    // than raw; otherwise raw — moved, not cloned.
+    let (encoding, payload) = if let Some(webp) = webp {
+        (TileEncoding::WebpLossless, webp)
+    } else if let Some(rle) = rle {
+        (TileEncoding::RleBgra, rle)
+    } else {
+        (TileEncoding::RawBgra, raw)
+    };
 
     Ok(TileRecord::new(tile.x, tile.y, encoding, payload))
 }
@@ -91,10 +101,6 @@ pub fn encode_raw_bgra_payload(
 pub fn raw_bgra_tile(src: &TileSource<'_>, tile: TileId) -> Result<Vec<u8>, TileEncodeError> {
     validate_source(src)?;
     let ts = src.tile_size_px as usize;
-    let mut out = vec![0u8; ts * ts * 4];
-    for px in out.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
 
     let start_x = tile.x as u32 * src.tile_size_px as u32;
     let start_y = tile.y as u32 * src.tile_size_px as u32;
@@ -107,21 +113,34 @@ pub fn raw_bgra_tile(src: &TileSource<'_>, tile: TileId) -> Result<Vec<u8>, Tile
         .saturating_sub(start_y)
         .min(src.tile_size_px as u32) as usize;
 
+    let mut out = vec![0u8; ts * ts * 4];
+    // Opaque-black padding is only observable on partial right/bottom
+    // edge tiles; interior tiles are fully overwritten below, so the
+    // alpha prefill would be pure waste there.
+    if copy_w < ts || copy_h < ts {
+        for px in out.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+    }
+
     for y in 0..copy_h {
-        let src_row = (start_y as usize + y) * src.stride as usize;
+        let src_row = (start_y as usize + y) * src.stride as usize + start_x as usize * 4;
         let dst_row = y * ts * 4;
-        for x in 0..copy_w {
-            let si = src_row + (start_x as usize + x) * 4;
-            let di = dst_row + x * 4;
-            match src.format {
-                TilePixelFormat::Bgra => {
-                    out[di..di + 4].copy_from_slice(&src.data[si..si + 4]);
-                }
-                TilePixelFormat::Rgba => {
-                    out[di] = src.data[si + 2];
-                    out[di + 1] = src.data[si + 1];
-                    out[di + 2] = src.data[si];
-                    out[di + 3] = src.data[si + 3];
+        match src.format {
+            TilePixelFormat::Bgra => {
+                // One memcpy per row instead of a bounds-checked
+                // 4-byte copy per pixel.
+                out[dst_row..dst_row + copy_w * 4]
+                    .copy_from_slice(&src.data[src_row..src_row + copy_w * 4]);
+            }
+            TilePixelFormat::Rgba => {
+                let src_px = src.data[src_row..src_row + copy_w * 4].chunks_exact(4);
+                let dst_px = out[dst_row..dst_row + copy_w * 4].chunks_exact_mut(4);
+                for (dst, px) in dst_px.zip(src_px) {
+                    dst[0] = px[2];
+                    dst[1] = px[1];
+                    dst[2] = px[0];
+                    dst[3] = px[3];
                 }
             }
         }
@@ -132,10 +151,25 @@ pub fn raw_bgra_tile(src: &TileSource<'_>, tile: TileId) -> Result<Vec<u8>, Tile
 
 /// Encode `[B, G, R, A, run_len]` records. `run_len` is 1..=255.
 pub fn rle_bgra(raw_bgra: &[u8]) -> Vec<u8> {
+    rle_bgra_bounded(raw_bgra, usize::MAX).unwrap_or_default()
+}
+
+/// [`rle_bgra`], aborting with `None` as soon as the encoding reaches
+/// `max_len` bytes (at which point it cannot beat an alternative of
+/// that size, so finishing it would be wasted work).
+fn rle_bgra_bounded(raw_bgra: &[u8], max_len: usize) -> Option<Vec<u8>> {
     if raw_bgra.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    let mut out = Vec::new();
+    // Every record is 5 bytes and the abort check runs per record, so
+    // the output stays within max_len + 5; reserve the worst case the
+    // bound allows (5/4 of raw for a run-free tile) so the loop never
+    // reallocates.
+    let cap = raw_bgra
+        .len()
+        .saturating_add(raw_bgra.len() / 4)
+        .min(max_len.saturating_add(5));
+    let mut out = Vec::with_capacity(cap);
     let mut i = 0;
     while i + 4 <= raw_bgra.len() {
         let px = &raw_bgra[i..i + 4];
@@ -149,9 +183,12 @@ pub fn rle_bgra(raw_bgra: &[u8]) -> Vec<u8> {
         }
         out.extend_from_slice(px);
         out.push(run);
+        if out.len() >= max_len {
+            return None;
+        }
         i += run as usize * 4;
     }
-    out
+    Some(out)
 }
 
 pub fn webp_lossless_bgra(
@@ -167,9 +204,12 @@ pub fn webp_lossless_bgra(
         return Err(TileEncodeError::InvalidGeometry);
     }
 
-    let mut rgba = Vec::with_capacity(raw_bgra.len());
-    for px in raw_bgra.chunks_exact(4) {
-        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    let mut rgba = vec![0u8; raw_bgra.len()];
+    for (dst, px) in rgba.chunks_exact_mut(4).zip(raw_bgra.chunks_exact(4)) {
+        dst[0] = px[2];
+        dst[1] = px[1];
+        dst[2] = px[0];
+        dst[3] = px[3];
     }
 
     let mut out = Vec::new();

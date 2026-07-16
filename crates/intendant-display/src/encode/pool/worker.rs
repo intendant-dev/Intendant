@@ -297,6 +297,10 @@ pub(crate) fn spawn_encoder_thread_with(
         // encoder's lifetime is owned entirely by this thread from here.
         drop(startup_tx);
         let mut watchdog = WatchdogState::new();
+        // Per-thread downscale scratch, reused across frames — the
+        // half/quarter layers otherwise allocate a fresh multi-hundred-
+        // KB buffer per frame at capture rate.
+        let mut scaled_buf: Vec<u8> = Vec::new();
         // Windows black-frame diagnostic: count encode calls so the
         // hop-by-hop avg-byte logging below self-limits to the first few
         // frames (then stays off the hot path).
@@ -399,15 +403,15 @@ pub(crate) fn spawn_encoder_thread_with(
             // check is computed once at thread spawn, so the hot path
             // for the source-dim layer (always-on full + every
             // on-demand on-source-dim layer) pays nothing.
-            let mut scaled_buf;
             let mut stamped_buf;
             let i420_for_encode: &[u8] = if needs_downscale {
-                scaled_buf = crate::encode::downscale_i420(
+                crate::encode::downscale_i420_into(
                     &frame.data,
                     downscale_src_w,
                     downscale_src_h,
                     downscale_dst_w,
                     downscale_dst_h,
+                    &mut scaled_buf,
                 );
                 if let Some(value) = frame.visual_marker_value {
                     let y_len = (downscale_dst_w as usize) * (downscale_dst_h as usize);

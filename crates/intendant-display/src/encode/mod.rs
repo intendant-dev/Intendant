@@ -765,6 +765,24 @@ fn rounded_fixed_avg_clamped_u8(n: i32, count: i32) -> u8 {
 /// CPU budget actually binds, swapping the per-plane loop to a libyuv call
 /// is local — the function signature and output shape don't change.
 pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    downscale_i420_into(src, src_w, src_h, dst_w, dst_h, &mut out);
+    out
+}
+
+/// [`downscale_i420`] into a caller-provided buffer (resized to fit; a
+/// buffer already at the right length is overwritten in place) — the
+/// per-layer encoder threads call this per frame, and a fresh
+/// multi-hundred-KB zeroed allocation per frame per layer was pure
+/// allocator churn.
+pub fn downscale_i420_into(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    out: &mut Vec<u8>,
+) {
     debug_assert!(
         src_w.is_multiple_of(2) && src_h.is_multiple_of(2),
         "downscale_i420: src dims must be even, got {src_w}x{src_h}"
@@ -791,15 +809,19 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
 
     let dst_y_size = dst_w * dst_h;
     let dst_uv_size = (dst_w / 2) * (dst_h / 2);
-    let mut out = vec![0u8; dst_y_size + 2 * dst_uv_size];
+    let total = dst_y_size + 2 * dst_uv_size;
+    if out.len() != total {
+        out.clear();
+        out.resize(total, 0);
+    }
 
     let (src_y, src_uv) = src.split_at(src_y_size);
     let (src_u, src_v) = src_uv.split_at(src_uv_size);
     let (dst_y_plane, dst_uv) = out.split_at_mut(dst_y_size);
     let (dst_u_plane, dst_v_plane) = dst_uv.split_at_mut(dst_uv_size);
 
-    downscale_plane_bilinear(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
-    downscale_plane_bilinear(
+    downscale_plane(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
+    downscale_plane(
         src_u,
         src_w / 2,
         src_h / 2,
@@ -807,7 +829,7 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         dst_w / 2,
         dst_h / 2,
     );
-    downscale_plane_bilinear(
+    downscale_plane(
         src_v,
         src_w / 2,
         src_h / 2,
@@ -815,8 +837,40 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         dst_w / 2,
         dst_h / 2,
     );
+}
 
-    out
+/// Per-plane downscale dispatch: the common simulcast case is an exact
+/// integer 2× reduction (full → half layer), where bilinear sampling
+/// at pixel centers degenerates to an equal-weight 2×2 box average —
+/// the integer box filter computes the identical bytes (the +0.5
+/// sampling puts every weight at exactly ¼, and `(sum + 2) >> 2`
+/// rounds the same direction as `f32::round` on the only possible
+/// fractions .0/.25/.5/.75) several times faster and without per-pixel
+/// float math. Everything else takes the generic bilinear path.
+fn downscale_plane(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize, dst_h: usize) {
+    if src_w == dst_w * 2 && src_h == dst_h * 2 && dst_w > 0 && dst_h > 0 {
+        downscale_plane_box2x(src, src_w, dst, dst_w, dst_h);
+    } else {
+        downscale_plane_bilinear(src, src_w, src_h, dst, dst_w, dst_h);
+    }
+}
+
+/// Exact 2× reduction: equal-weight 2×2 box average in integer math.
+/// See [`downscale_plane`] for the bilinear-equivalence argument.
+fn downscale_plane_box2x(src: &[u8], src_w: usize, dst: &mut [u8], dst_w: usize, dst_h: usize) {
+    for dy in 0..dst_h {
+        let s0 = (dy * 2) * src_w;
+        let s1 = s0 + src_w;
+        let d = dy * dst_w;
+        for dx in 0..dst_w {
+            let sx = dx * 2;
+            let sum = src[s0 + sx] as u16
+                + src[s0 + sx + 1] as u16
+                + src[s1 + sx] as u16
+                + src[s1 + sx + 1] as u16;
+            dst[d + dx] = ((sum + 2) >> 2) as u8;
+        }
+    }
 }
 
 /// Bilinear single-plane downscale. The `dst` slice is written in
