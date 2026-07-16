@@ -1691,12 +1691,28 @@ impl AppState {
                     cmds.extend(self.add_log("model", "Model response", None, source));
                 }
                 if let Some(rs) = reasoning {
+                    let rs = rs.trim();
                     if !rs.is_empty() {
-                        cmds.extend(self.add_log(
-                            "detail",
-                            &format!("Reasoning: {}", rs),
+                        // First-class thinking row: level "model" (visible at
+                        // Normal verbosity) + kind "reasoning". The dashboard
+                        // renders it as a calm one-line summary that expands
+                        // to the full text (41b-reasoning-log.js); the
+                        // transcript-sync and replay record builders emit the
+                        // same level/kind/content grammar so the dedupe
+                        // signatures collapse live and hydrated copies.
+                        cmds.extend(self.add_log_with_metadata(
+                            "model",
+                            rs,
                             None,
                             source,
+                            Vec::new(),
+                            Some("reasoning"),
+                            None,
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
                         ));
                     }
                 }
@@ -4949,7 +4965,6 @@ mod tests {
         // But with reasoning-only (replay path for a bare `reasoning`
         // session.jsonl event) we get only the reasoning row.
         let mut s2 = AppState::new();
-        s2.verbosity = "verbose".to_string();
         let msg2 = json!({
             "event": "model_response",
             "turn": 1,
@@ -4962,12 +4977,22 @@ mod tests {
         let lines2: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
-                UiCommand::AddLogEntry { content, .. } => Some(content.clone()),
+                UiCommand::AddLogEntry {
+                    content,
+                    kind,
+                    level,
+                    ..
+                } => Some((content.clone(), kind.clone(), level.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(lines2.len(), 1);
-        assert!(lines2[0].starts_with("Reasoning: "));
+        // First-class thinking row: raw text (no "Reasoning:" prefix),
+        // level model (visible at Normal — s2 stays at default verbosity),
+        // kind "reasoning" so the renderer dispatches the thinking row.
+        assert_eq!(lines2[0].0, "thinking about X");
+        assert_eq!(lines2[0].1.as_deref(), Some("reasoning"));
+        assert_eq!(lines2[0].2, "model");
     }
 
     #[test]

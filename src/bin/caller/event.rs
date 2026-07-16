@@ -920,6 +920,22 @@ pub enum AppEvent {
         lines_removed: u32,
     },
 
+    /// Structured write-activity signal: the file paths a session's tool
+    /// call is about to mutate (Write/Edit/file-op shapes), verbatim as the
+    /// tool input stated them. Emitted only where the pipeline knows the
+    /// paths structurally — the native loop's parsed command batch, the
+    /// external drain's file-change items — never recovered from rendered
+    /// previews or log text. Feeds the git-vitals activity-locus tracker
+    /// (`session_vitals`): when a session's recent writes resolve inside a
+    /// different git checkout than its registered project root, the git
+    /// chip's probe target follows the activity. The tracker ignores
+    /// relative entries (they resolve against the registered root anyway).
+    /// Internal event: not broadcast to frontends, not persisted.
+    SessionFileActivity {
+        session_id: Option<String>,
+        paths: Vec<String>,
+    },
+
     /// A user-uploaded file was committed to the upload store. Emitted by
     /// the `POST /api/upload` handler after the bytes land on disk. The
     /// dashboard keeps a list of these to let the user attach one or more
@@ -2977,6 +2993,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Internal events — not broadcast to external consumers
         AppEvent::Tick
         | AppEvent::JsonExtracted { .. }
+        | AppEvent::SessionFileActivity { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::PresenceReady
@@ -3568,7 +3585,12 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 );
             }
             if let Some(ref r) = reasoning {
-                log.reasoning_content(Some(r.as_str()), None);
+                log.reasoning_content_for_session(
+                    session_id.as_deref(),
+                    source.as_deref(),
+                    Some(r.as_str()),
+                    None,
+                );
             }
         }
 

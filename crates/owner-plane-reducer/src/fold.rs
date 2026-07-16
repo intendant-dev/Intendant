@@ -5209,7 +5209,11 @@ impl State {
     /// bare-writer judgment participates like any other admitted
     /// judgment EXCEPT that its `None` class matches no policy rule
     /// (the D2 ruling: recorded, never counting).
-    pub(crate) fn claim_status(&self, target_hash: &[u8; 32], as_of: u64) -> Option<&'static str> {
+    ///
+    /// Visibility widened `pub(crate)` → `pub` at vendor time: the
+    /// daemon's Memory service derives claim status through this exact
+    /// fold (never a third implementation). No semantic change.
+    pub fn claim_status(&self, target_hash: &[u8; 32], as_of: u64) -> Option<&'static str> {
         self.claim_status_inner(target_hash, as_of, &mut Vec::new())
     }
 
@@ -5393,6 +5397,37 @@ pub fn run_delivery_with_state(
     order: &[String],
 ) -> Result<(Run, State), Unimplemented> {
     run_delivery_full(items, &BTreeMap::new(), order)
+}
+
+/// Vendoring addition (not part of the frozen source): fold the FULL
+/// delivered set once, without materializing [`run_delivery_full`]'s
+/// per-prefix snapshots. Behaviorally identical to that entry's final
+/// snapshot — the fold is set-based and arrival-order-free by
+/// construction (review R1), so the only difference is skipping the
+/// intermediate prefix folds a replaying vector needs and an
+/// append-only service does not. Consistency is pinned by
+/// `fold_set_matches_run_delivery_full`. No semantic change.
+pub fn fold_set(
+    items: &BTreeMap<String, Vec<u8>>,
+    aux: &BTreeMap<String, Vec<u8>>,
+) -> Result<(BTreeMap<String, Verdict>, State), Unimplemented> {
+    let mut group_of: BTreeMap<&String, &String> = BTreeMap::new();
+    {
+        let mut by_bytes: BTreeMap<&[u8], &String> = BTreeMap::new();
+        let mut names: Vec<&String> = items.keys().collect();
+        names.sort();
+        for name in names {
+            let canon = by_bytes.entry(items[name].as_slice()).or_insert(name);
+            group_of.insert(name, canon);
+        }
+    }
+    if items.is_empty() {
+        let mut state = State::default();
+        state.install_aux(aux)?;
+        return Ok((BTreeMap::new(), state));
+    }
+    let order: Vec<String> = items.keys().cloned().collect();
+    canonical_fold(items, aux, &order, &group_of)
 }
 
 /// The full fold entry: `aux` = the vector's HELD context (§5.6
@@ -5905,6 +5940,26 @@ mod tests {
         let run = run_delivery(&items, &["c1".into(), "c2".into()]).unwrap();
         assert_eq!(run.final_verdicts["c1"], Verdict::Admitted);
         assert_eq!(run.final_verdicts["c2"], Verdict::Admitted);
+    }
+
+    /// The vendoring-addition pin: [`fold_set`] must be behaviorally
+    /// identical to [`run_delivery_full`]'s final snapshot — verdicts
+    /// AND derived claim status — on a committed multi-op vector.
+    #[test]
+    fn fold_set_matches_run_delivery_full() {
+        let (items, _) = load("f11-status-owner-accept.json");
+        let order: Vec<String> = items.keys().cloned().collect();
+        let (run, full_state) = run_delivery_full(&items, &BTreeMap::new(), &order).unwrap();
+        let (verdicts, set_state) = fold_set(&items, &BTreeMap::new()).unwrap();
+        assert_eq!(verdicts, run.final_verdicts);
+        for bytes in items.values() {
+            let hash = crate::domains::h("op", bytes);
+            assert_eq!(
+                set_state.claim_status(&hash, u64::MAX),
+                full_state.claim_status(&hash, u64::MAX),
+                "derived status must agree between the two entries"
+            );
+        }
     }
 
     #[test]

@@ -1268,7 +1268,9 @@ pub(crate) async fn run_agent_loop(
         // Log reasoning content if available
         if response.reasoning_summary.is_some() || response.reasoning_content.is_some() {
             slog(&session_log, |l| {
-                l.reasoning_content(
+                l.reasoning_content_for_session(
+                    local_session_id.as_deref(),
+                    None,
                     response.reasoning_summary.as_deref(),
                     response.reasoning_content.as_deref(),
                 )
@@ -2065,6 +2067,15 @@ pub(crate) async fn run_agent_loop(
                 item_id: None,
                 source: None,
             });
+            if !batch_facts.write_paths.is_empty() {
+                // Structured write-path signal for the git-vitals
+                // activity-locus tracker (sourced from the parsed batch,
+                // not the rendered preview).
+                bus.send(AppEvent::SessionFileActivity {
+                    session_id: local_session_id.clone(),
+                    paths: batch_facts.write_paths.clone(),
+                });
+            }
 
             // Read the grant fresh from the autonomy guard at every runtime
             // spawn so a mid-session grant/revoke reaches the next child.
@@ -2602,6 +2613,15 @@ Proceed with explicit assumptions and continue without additional questions."
                 item_id: None,
                 source: None,
             });
+            if !batch_facts.write_paths.is_empty() {
+                // Structured write-path signal for the git-vitals
+                // activity-locus tracker (sourced from the parsed batch,
+                // not the rendered preview).
+                bus.send(AppEvent::SessionFileActivity {
+                    session_id: local_session_id.clone(),
+                    paths: batch_facts.write_paths.clone(),
+                });
+            }
 
             // Read the grant fresh from the autonomy guard at every runtime
             // spawn so a mid-session grant/revoke reaches the next child.

@@ -1192,17 +1192,24 @@ pub(crate) async fn api_agenda_list_response(
     )
 }
 
-/// Tunnel twin of `POST /api/agenda/op` — the command rides `params`.
+/// Tunnel twin of `POST /api/agenda/op` — the command rides `params`;
+/// attribution comes from the authenticated dashboard-control grant.
 pub(crate) async fn api_agenda_op_response(
     id: String,
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
     frame_api_response(
         id,
-        crate::web_gateway::agenda_op_api_response(&body_text, runtime.mcp_server.as_ref(), None)
-            .await,
+        crate::web_gateway::agenda_op_api_response(
+            &body_text,
+            runtime.mcp_server.as_ref(),
+            crate::agenda::AgendaActor::from_binding(&actor),
+        )
+        .await,
         "agenda op",
     )
 }

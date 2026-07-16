@@ -2076,6 +2076,14 @@ function buildSessionDetailRows(entries) {
       if (!notification) continue;
       e = { ...e, ...notification };
     }
+    // Reasoning-only model_response events (replayed `reasoning` rows from
+    // session.jsonl) normalize into the first-class thinking-row grammar;
+    // without this the empty-content skip below dropped them entirely.
+    if (e && e.event === 'model_response' && !String(e.content || e.summary || '').trim()) {
+      const reasoning = String(e.reasoning_summary || e.reasoningSummary || '').trim();
+      if (!reasoning) continue;
+      e = { ...e, level: 'model', kind: 'reasoning', content: reasoning, source: e.source || 'model' };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -2298,6 +2306,13 @@ function materializeSessionDetailRow(view, row, index) {
     if (!outputEntry) return null;
     outputEntry.dataset.detailRowIndex = String(index);
     return outputEntry;
+  }
+  if (isReasoningLog(e)) {
+    const reasoningEntry = buildReasoningLogEntryNode(e);
+    if (reasoningEntry) {
+      reasoningEntry.dataset.detailRowIndex = String(index);
+      return reasoningEntry;
+    }
   }
 
   const entry = document.createElement('div');

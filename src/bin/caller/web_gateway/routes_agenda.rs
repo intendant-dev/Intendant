@@ -30,9 +30,9 @@ pub(crate) async fn agenda_list_api_response(
 /// Transport-neutral core of `POST /api/agenda/op` (tunnel twin
 /// `api_agenda_op`): the body is one [`crate::agenda::AgendaCommand`];
 /// success returns the item as it now stands (with its minted id for
-/// `add`). Attribution: the HTTP/tunnel lane passes no actor in A1 — the
-/// session principal-binding token (slice A2) upgrades this honestly
-/// rather than stamping a fabricated label.
+/// `add`). `actor` is the caller's gate-resolved attribution, mapped at
+/// the authenticated edge (HTTP dispatch / tunnel grant) — never parsed
+/// from the request body.
 pub(crate) async fn agenda_op_api_response(
     body_text: &str,
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
@@ -84,9 +84,10 @@ pub(crate) async fn handle_agenda_op(
     stream: DemuxStream,
     body_text: String,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    actor: Option<crate::agenda::AgendaActor>,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    let response = agenda_op_api_response(&body_text, mcp_server.as_ref(), None).await;
+    let response = agenda_op_api_response(&body_text, mcp_server.as_ref(), actor).await;
     write_api_response(stream, response, cors, fleet_origin).await;
 }

@@ -2971,6 +2971,8 @@ dependencies = [
  "landlock",
  "libc",
  "notify",
+ "owner-plane-core",
+ "owner-plane-reducer",
  "p12-keystore",
  "passkey-auth",
  "pem",
