@@ -225,23 +225,19 @@ impl AgendaStore {
             }
             AgendaCommand::Complete { id } => match self.require(&id)?.status {
                 AgendaStatus::Open => Ok(AgendaOp::Complete { id }),
-                AgendaStatus::Done => Err(AgendaError::Transition(format!(
-                    "{id} is already done"
-                ))),
+                AgendaStatus::Done => Err(AgendaError::Transition(format!("{id} is already done"))),
                 AgendaStatus::Retired => Err(AgendaError::Transition(format!(
                     "{id} is retired — reopen it first"
                 ))),
             },
             AgendaCommand::Reopen { id } => match self.require(&id)?.status {
                 AgendaStatus::Done | AgendaStatus::Retired => Ok(AgendaOp::Reopen { id }),
-                AgendaStatus::Open => {
-                    Err(AgendaError::Transition(format!("{id} is already open")))
-                }
+                AgendaStatus::Open => Err(AgendaError::Transition(format!("{id} is already open"))),
             },
             AgendaCommand::Retire { id } => match self.require(&id)?.status {
-                AgendaStatus::Retired => Err(AgendaError::Transition(format!(
-                    "{id} is already retired"
-                ))),
+                AgendaStatus::Retired => {
+                    Err(AgendaError::Transition(format!("{id} is already retired")))
+                }
                 AgendaStatus::Open | AgendaStatus::Done => Ok(AgendaOp::Retire { id }),
             },
         }
@@ -262,6 +258,7 @@ impl AgendaStore {
             .map_err(|_| AgendaError::Invalid("id generator overflow; retry".into()))
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, id: &str) -> Option<&AgendaItem> {
         self.items.get(id)
     }
@@ -276,6 +273,7 @@ impl AgendaStore {
         counts(&self.items)
     }
 
+    #[cfg(test)]
     pub(crate) fn ops(&self) -> u64 {
         self.ops
     }
@@ -411,7 +409,13 @@ mod tests {
         assert_eq!(item.id.len(), 26);
 
         store
-            .apply_command(AgendaCommand::Complete { id: item.id.clone() }, None, 2000)
+            .apply_command(
+                AgendaCommand::Complete {
+                    id: item.id.clone(),
+                },
+                None,
+                2000,
+            )
             .unwrap();
 
         // The A1 acceptance property at unit level: restart ⇒ history intact.
@@ -458,7 +462,13 @@ mod tests {
         let retire = AgendaCommand::Retire { id: id.clone() };
 
         assert!(matches!(
-            store.apply_command(AgendaCommand::Complete { id: "01UNKNOWN".into() }, None, 2),
+            store.apply_command(
+                AgendaCommand::Complete {
+                    id: "01UNKNOWN".into()
+                },
+                None,
+                2
+            ),
             Err(AgendaError::NotFound(_))
         ));
         assert!(matches!(
@@ -591,7 +601,8 @@ mod tests {
             .append(true)
             .open(&log_path)
             .unwrap();
-        file.write_all(b"{\"v\":1,\"at_ms\":9,\"op\":{\"ty").unwrap();
+        file.write_all(b"{\"v\":1,\"at_ms\":9,\"op\":{\"ty")
+            .unwrap();
         drop(file);
 
         let mut store = AgendaStore::open(dir.path()).unwrap();

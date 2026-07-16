@@ -45,6 +45,9 @@ pub(crate) use routes_files::*;
 mod routes_transfers;
 pub(crate) use routes_transfers::*;
 
+mod routes_agenda;
+pub(crate) use routes_agenda::*;
+
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
 

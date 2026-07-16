@@ -832,6 +832,25 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::AgendaList => {
+                return handle_agenda_list(
+                    stream,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::AgendaOp => {
+                return handle_agenda_op(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::CurrentRedo => {
                 return handle_current_redo(
                     stream,

@@ -28131,7 +28131,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '4f27f6ff2bcb5ddb';
+const INTENDANT_APP_BUILD = '898a194eb11709bc';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -29576,6 +29576,8 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_session_current_changes: { verb: 'GET', path: '/api/session/current/changes', pathSuffix: 'path', rawQuery: 'query' },
   api_session_current_history: { verb: 'GET', path: '/api/session/current/history' },
   api_session_current_rollback: { verb: 'POST', path: '/api/session/current/rollback' },
+  api_agenda_list: { verb: 'GET', path: '/api/agenda' },
+  api_agenda_op: { verb: 'POST', path: '/api/agenda/op' },
   api_session_current_redo: { verb: 'POST', path: '/api/session/current/redo' },
   api_session_current_prune: { verb: 'POST', path: '/api/session/current/prune' },
   api_session_current_agent_output: { verb: 'POST', path: '/api/session/current/agent-output' },
@@ -58871,7 +58873,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -58905,7 +58907,7 @@ function accessFallbackIamRoles() {
     label: 'Observer',
     status: 'enforced',
     summary: 'Read-only dashboard visibility without files, terminal, task control, or settings.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'access.inspect', 'peer.inspect', 'session.inspect'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'access.inspect', 'peer.inspect', 'session.inspect', 'agenda.read'],
     source: 'builtin',
   }, {
     id: 'role:session-reader',
@@ -58947,7 +58949,7 @@ function accessFallbackIamRoles() {
     label: 'Operator',
     status: 'enforced',
     summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write'],
     source: 'builtin',
   }];
 }
@@ -59013,6 +59015,8 @@ function accessFallbackPermissions() {
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as media and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
+    'agenda.read': ['Agenda read', 'agenda', 'Read the daemon\'s agenda ledger (parked items and counts).'],
+    'agenda.write': ['Agenda write', 'agenda', 'Park, edit, complete, reopen, and retire agenda items.'],
   };
   return Object.entries(summaries).map(([id, [label, domain, summary]]) => ({
     id,

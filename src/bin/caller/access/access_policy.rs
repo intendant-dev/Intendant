@@ -271,6 +271,10 @@ pub enum PeerOperation {
     RuntimeControl,
     FilesystemRead,
     FilesystemWrite,
+    /// Read the daemon's agenda ledger (items + counts).
+    AgendaRead,
+    /// Park, patch, and transition agenda items.
+    AgendaWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +304,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 22] = [
+pub const ALL_OPERATIONS: [PeerOperation; 24] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -323,6 +327,8 @@ pub const ALL_OPERATIONS: [PeerOperation; 22] = [
     PeerOperation::RuntimeControl,
     PeerOperation::FilesystemRead,
     PeerOperation::FilesystemWrite,
+    PeerOperation::AgendaRead,
+    PeerOperation::AgendaWrite,
 ];
 
 /// True when `granted` allows no operation that `cap` does not. Profiles

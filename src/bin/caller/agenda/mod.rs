@@ -33,9 +33,7 @@ mod types;
 
 pub(crate) use handle::AgendaHandle;
 pub(crate) use store::{AgendaError, AgendaStore};
-pub(crate) use types::{
-    AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaKind, AgendaPatch, AgendaStatus,
-};
+pub(crate) use types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus};
 
 use std::path::{Path, PathBuf};
 
