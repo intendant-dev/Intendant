@@ -260,6 +260,11 @@ incremental = true
 [dev-dependencies]
 # The gateway's dashboard-control tests drive WebRtcPeer::new_for_test.
 intendant-display = { path = "crates/intendant-display", features = ["test-util"] }
+# Pins the dashboard WASM reducer's swallowed-event list (JS_HANDLED_EVENTS)
+# to the daemon's OutboundEvent vocabulary — see the parity test in
+# src/bin/caller/types.rs. Only the target-agnostic app_state module is used;
+# the wasm-only modules stay cfg'd out on native.
+presence-web = { path = "crates/presence-web" }
 # Enable tokio's `test-util` feature in test builds so `#[tokio::test(start_paused = true)]`
 # and `tokio::time::advance` are available. Cargo merges features additively between
 # [dependencies] and [dev-dependencies] for test/example builds — release builds still

@@ -260,36 +260,9 @@ impl OpenAIProvider {
     /// Uses conversation.item.create with both the image and a frame ID text label.
     pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
         if let Some(ref ws) = self.ws {
-            // Fixed-shape envelope with the base64 payload spliced in
-            // verbatim: the old path copied the frame three times (the
-            // data: URL format!, the Value, and the escape-scanning
-            // to_string). The frame label still goes through serde
-            // escaping (arbitrary caller string).
-            let label = serde_json::to_string(&format!("[frame:{}]", frame_id))
-                .unwrap_or_else(|_| "\"[frame:?]\"".to_string());
-            let msg = if crate::json_safe_base64(base64_jpeg) {
-                format!(
-                    r#"{{"type":"conversation.item.create","item":{{"type":"message","role":"user","content":[{{"type":"input_text","text":{}}},{{"type":"input_image","image_url":"data:image/jpeg;base64,{}"}}]}}}}"#,
-                    label, base64_jpeg
-                )
-            } else {
-                // Non-base64 payload (caller bug): fall back to full escaping.
-                serde_json::json!({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            { "type": "input_text", "text": format!("[frame:{}]", frame_id) },
-                            {
-                                "type": "input_image",
-                                "image_url": format!("data:image/jpeg;base64,{}", base64_jpeg)
-                            }
-                        ]
-                    }
-                })
-                .to_string()
-            };
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::openai_frame(base64_jpeg, frame_id);
             let _ = ws.send_with_str(&msg);
             self.callbacks.invoke_diagnostic(
                 "video_send",
@@ -300,19 +273,9 @@ impl OpenAIProvider {
 
     pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
-            // Fixed-shape envelope, base64 spliced verbatim (see send_frame).
-            let msg = if crate::json_safe_base64(base64_pcm) {
-                format!(
-                    r#"{{"type":"input_audio_buffer.append","audio":"{}"}}"#,
-                    base64_pcm
-                )
-            } else {
-                serde_json::json!({
-                    "type": "input_audio_buffer.append",
-                    "audio": base64_pcm
-                })
-                .to_string()
-            };
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::openai_audio(base64_pcm);
             let _ = ws.send_with_str(&msg);
         }
     }

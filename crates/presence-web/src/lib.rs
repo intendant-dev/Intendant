@@ -10,6 +10,11 @@
 // app_state is pure Rust (no WASM deps) — available on all targets for testing.
 pub mod app_state;
 
+// Pure-Rust envelope builders for the voice media send paths — compiled on
+// native too so their template-parity tests run in `cargo test`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod media_envelopes;
+
 // Everything below is WASM-only: browser WebSocket transport, voice providers, bindings.
 #[cfg(target_arch = "wasm32")]
 mod callbacks;
@@ -1351,10 +1356,12 @@ mod wasm_impl {
 // ---------------------------------------------------------------------------
 // Native-buildable wire-format invariant tests (Phase 5a.1)
 //
-// The actual dispatch arm in `connect_server`'s message handler is
-// gated on `#[cfg(target_arch = "wasm32")]`, so it can't be exercised
-// directly from a native `cargo test`.  Instead we pin the *wire
-// contract* the dispatch reads — same shape that
+// The actual dispatch arm lives in `route_server_message` (the shared
+// router behind both `connect_server`'s WebSocket handler and
+// `handle_tunneled_server_message`), which is gated on
+// `#[cfg(target_arch = "wasm32")]`, so it can't be exercised directly
+// from a native `cargo test`.  Instead we pin the *wire contract* the
+// dispatch reads — same shape that
 // `web_gateway::apply_grant_input_authority` (and friends) emit.  If
 // either side drifts (server changes the field name, dispatch reads a
 // different field), one of these tests fires and the integration

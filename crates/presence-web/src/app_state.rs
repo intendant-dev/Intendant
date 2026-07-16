@@ -1104,6 +1104,52 @@ const MAX_LOG_ENTRIES: usize = 10000;
 /// cost to every UpdateUsage command without adding legibility.
 const MAX_TOKEN_HISTORY: usize = 120;
 
+/// Daemon events this reducer deliberately ignores: they are consumed by
+/// plain-JS dashboard layers (vitals chips, goal rail, transport/WebRTC
+/// signaling, display metrics, config panels, …) or carry nothing this
+/// state renders. Swallowed like the `cu_action` arm so the unknown-event
+/// catch-all doesn't serialize each one (`session_vitals` fires on a 5s
+/// cadence, `context_snapshot` per turn with payloads up to 128KB,
+/// `webrtc_signal` carries full SDP) into an invisible debug row — over
+/// hours those rows pin the buffer at cap with junk, evicting real
+/// activity.
+///
+/// Every name must be a real `OutboundEvent` wire name: a caller-side
+/// parity test (`js_handled_events_match_outbound_event_vocabulary` in
+/// `src/bin/caller/types.rs`) deserializes each one and fails on drift,
+/// so a daemon-side rename can't silently turn a swallow back into
+/// debug-row noise.
+pub const JS_HANDLED_EVENTS: &[&str] = &[
+    "session_vitals",
+    "session_goal",
+    "session_relationship",
+    "session_capabilities",
+    "session_note",
+    "session_agent_config_result",
+    "approval_resolved",
+    "user_message_edit_status",
+    "follow_up_status",
+    "webrtc_signal",
+    "peer_file_transfer_signal",
+    "peer_dashboard_control_signal",
+    "display_metrics",
+    "display_resize",
+    "display_request_raised",
+    "display_request_resolved",
+    "display_capture_lost",
+    "display_approval_pending",
+    "user_display_granted",
+    "user_display_revoked",
+    "shared_view",
+    "browser_workspace_changed",
+    "autonomy_changed",
+    "codex_thread_action_requested",
+    "context_snapshot",
+    "model_summary",
+    "task_received",
+    "user_notification",
+];
+
 // ── Log entry (stored for re-filtering) ────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1260,26 +1306,43 @@ impl AppState {
                 .map(|u| u.tokens_used)
                 .unwrap_or(0);
         }
+        let switched = self.session_id != session_id;
         self.session_id = session_id.to_string();
         let mut cmds = Vec::new();
-        if let Some(usage) = self.session_main_usage.get(session_id).cloned() {
-            self.budget_pct = usage.usage_pct;
-            self.main_usage = Some(usage.clone());
-            cmds.push(UiCommand::UpdateStatusBar {
-                provider: None,
-                model: None,
-                turn: None,
-                budget_pct: Some(usage.usage_pct),
-                autonomy: None,
-                // Attributed to the selected session: the dashboard's status
-                // gate only lets the focused session drive the header meter,
-                // so an unattributed push would be dropped whenever any
-                // window is focused — exactly when selection happens.
-                session_id: Some(session_id.to_string()),
-                external_agent: None,
-            });
+        match self.session_main_usage.get(session_id).cloned() {
+            Some(usage) => {
+                self.budget_pct = usage.usage_pct;
+                self.main_usage = Some(usage.clone());
+                cmds.push(UiCommand::UpdateStatusBar {
+                    provider: None,
+                    model: None,
+                    turn: None,
+                    budget_pct: Some(usage.usage_pct),
+                    autonomy: None,
+                    // Attributed to the selected session: the dashboard's status
+                    // gate only lets the focused session drive the header meter,
+                    // so an unattributed push would be dropped whenever any
+                    // window is focused — exactly when selection happens.
+                    session_id: Some(session_id.to_string()),
+                    external_agent: None,
+                });
+            }
+            None => {
+                // Switching to a session with no cached usage must not carry
+                // the previous session's snapshot: it would be re-emitted
+                // tagged as the new session, and the next turn_started would
+                // push a giant cross-session delta against the re-based
+                // anchor. `main_usage` repopulates from the destination's
+                // first usage event. (Deselecting to the empty/global id
+                // keeps the aggregate snapshot — old behavior.)
+                if switched && !session_id.is_empty() {
+                    self.main_usage = None;
+                }
+            }
         }
-        cmds.push(self.build_usage_command_for_session(Some(session_id)));
+        cmds.push(
+            self.build_usage_command_for_session((!session_id.is_empty()).then_some(session_id)),
+        );
         cmds
     }
 
@@ -2956,44 +3019,10 @@ impl AppState {
                 cmds.extend(render_peer_event(&host_id, payload));
             }
 
-            // Known daemon events this reducer deliberately ignores: they are
-            // consumed by plain-JS dashboard layers (vitals chips, goal rail,
-            // transport/WebRTC signaling, display metrics, config panels, …)
-            // or carry nothing this state renders. Swallowed like the
-            // `cu_action` arm above so the unknown-event catch-all below
-            // doesn't serialize each one (session_vitals fires on a 5s
-            // cadence, context_snapshot per turn with payloads up to 128KB,
-            // webrtc_signal carries full SDP) into an invisible debug row —
-            // over hours those rows pin the buffer at cap with junk,
-            // evicting real activity.
-            "session_vitals"
-            | "session_goal"
-            | "session_relationship"
-            | "session_capabilities"
-            | "session_note"
-            | "session_agent_config_result"
-            | "approval_resolved"
-            | "user_message_edit_status"
-            | "follow_up_status"
-            | "webrtc_signal"
-            | "peer_file_transfer_signal"
-            | "peer_dashboard_control_signal"
-            | "display_metrics"
-            | "display_resize"
-            | "display_request_raised"
-            | "display_request_resolved"
-            | "display_capture_lost"
-            | "display_approval_pending"
-            | "user_display_granted"
-            | "user_display_revoked"
-            | "shared_view"
-            | "browser_workspace_changed"
-            | "autonomy_changed"
-            | "codex_thread_action_requested"
-            | "context_snapshot"
-            | "model_summary"
-            | "task_received"
-            | "user_notification" => {}
+            // Known JS-handled/ignored daemon events — see the
+            // `JS_HANDLED_EVENTS` doc for why they must be swallowed here
+            // and how the list is pinned against the daemon vocabulary.
+            e if JS_HANDLED_EVENTS.contains(&e) => {}
 
             _ => {
                 // Genuinely unknown events (new daemon broadcasts this build
@@ -3255,9 +3284,15 @@ impl AppState {
     }
 
     fn build_usage_command_for_session(&self, session_id: Option<&str>) -> UiCommand {
-        let selected_main = session_id
-            .and_then(|sid| self.session_main_usage.get(sid))
-            .or(self.main_usage.as_ref());
+        // Strict per-session resolution: an explicitly named session gets
+        // its own cached usage or nothing — falling back to the global
+        // snapshot here re-emitted the previously selected session's
+        // numbers tagged as the named one. `None` (no session context)
+        // keeps the aggregate/global snapshot for the single-session path.
+        let selected_main = match session_id {
+            Some(sid) => self.session_main_usage.get(sid),
+            None => self.main_usage.as_ref(),
+        };
         let main_json = selected_main.and_then(|u| serde_json::to_string(u).ok());
         let presence_json = self
             .presence_usage
@@ -5052,6 +5087,82 @@ mod tests {
     }
 
     #[test]
+    fn uncached_session_switch_drops_previous_usage() {
+        let mut s = AppState::new();
+        // Session A's usage is live (cached + global snapshot).
+        s.handle_message(&json!({
+            "event": "usage", "session_id": "sess-a",
+            "main": {
+                "provider": "anthropic", "model": "m",
+                "tokens_used": 50_000, "context_window": 200_000, "usage_pct": 25.0
+            }
+        }));
+        s.select_session("sess-a");
+        assert!(s.main_usage.is_some());
+
+        // Switch to a session with no cached usage: A's snapshot must not
+        // ride along...
+        let cmds = s.select_session("sess-b");
+        assert!(s.main_usage.is_none());
+        // ...the emitted usage command must not present A's numbers as B's...
+        match cmds
+            .iter()
+            .find(|c| matches!(c, UiCommand::UpdateUsage { .. }))
+        {
+            Some(UiCommand::UpdateUsage {
+                session_id,
+                main_json,
+                ..
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("sess-b"));
+                assert!(main_json.is_none(), "must not emit A's usage as B's");
+            }
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+        // ...and B's next turn_started must not spike a cross-session
+        // delta into the history chart.
+        s.handle_message(
+            &json!({"event": "turn_started", "session_id": "sess-b", "turn": 4, "budget_pct": 1.0}),
+        );
+        assert!(
+            s.token_history.is_empty(),
+            "no delta may be derived from A's snapshot: {:?}",
+            s.token_history
+        );
+    }
+
+    #[test]
+    fn usage_command_for_uncached_session_has_no_main_payload() {
+        let mut s = AppState::new();
+        // Global snapshot exists (e.g. from the previously selected
+        // session), but the named session has no cached usage.
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 12_345,
+            ..Default::default()
+        });
+        let cmd = s.build_usage_command_for_session(Some("sess-uncached"));
+        match cmd {
+            UiCommand::UpdateUsage {
+                session_id,
+                main_json,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-uncached"));
+                assert!(
+                    main_json.is_none(),
+                    "an explicitly named session must not fall back to the global snapshot"
+                );
+            }
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+        // The no-session path keeps the global snapshot.
+        match s.build_usage_command_for_session(None) {
+            UiCommand::UpdateUsage { main_json, .. } => assert!(main_json.is_some()),
+            other => panic!("expected UpdateUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn log_buffer_cap_evicts_front() {
         let mut s = AppState::new();
         for i in 0..(MAX_LOG_ENTRIES + 3) {
@@ -5073,14 +5184,7 @@ mod tests {
     fn known_ignored_events_are_swallowed() {
         let mut s = AppState::new();
         s.set_verbosity("debug");
-        for event in [
-            "session_vitals",
-            "session_goal",
-            "approval_resolved",
-            "webrtc_signal",
-            "display_metrics",
-            "context_snapshot",
-        ] {
+        for event in JS_HANDLED_EVENTS {
             let cmds = s.handle_message(&json!({"event": event, "payload": "x".repeat(4096)}));
             assert!(
                 cmds.is_empty(),

@@ -1117,6 +1117,7 @@ impl StationInner {
         if !scene_static {
             self.build_frame(anim_ms, time_ms);
         }
+        let mut gpu_render_ok = true;
         if let Some(gpu) = self.gpu.as_mut() {
             // The canvas backing store can be resized by JS (or by a missed
             // resize event) after the surface was configured; presenting at a
@@ -1124,6 +1125,7 @@ impl StationInner {
             // attribute reads are layout-free, so guard each frame.
             gpu.resize(self.scene_canvas.width(), self.scene_canvas.height());
             if let Err(err) = gpu.render(&self.frame, self.text_atlas.as_ref(), !scene_static) {
+                gpu_render_ok = false;
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
                 )));
@@ -1134,7 +1136,16 @@ impl StationInner {
 
         if full_hud {
             self.draw_hud(anim_ms);
-            self.hud_dirty = false;
+            // Clear the dirty latch only when the scene actually made it
+            // onto the GPU: `GpuState::render` bails before its upload
+            // block on surface-acquire failure, so clearing on a failed
+            // upload tick would launder pre-change vertex buffers through
+            // the present-only path (scene_static) indefinitely at
+            // motion 0. A failed present-only tick keeps the latch
+            // untouched anyway (scene_static implies !full_hud).
+            if gpu_render_ok {
+                self.hud_dirty = false;
+            }
             self.hud_camera_sig = Some(camera_sig);
             self.last_full_hud_ms = time_ms;
         } else {

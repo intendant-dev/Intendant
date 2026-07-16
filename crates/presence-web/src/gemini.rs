@@ -388,6 +388,13 @@ impl GeminiProvider {
             if response.get("interrupted").is_some() {
                 callbacks.invoke_diagnostic("gemini_msg", "interrupted");
                 callbacks.invoke_voice_interrupted();
+                // An interruption ends the model's turn without a
+                // turnComplete: reset all per-turn diagnostic state so the
+                // counters (and the audio_msgs rollup) don't bleed into
+                // the next turn's line.
+                turn_tool_calls.set(0);
+                turn_has_speech.set(false);
+                turn_audio_msgs.set(0);
                 return;
             }
             if let Some(model_turn) = response.get("modelTurn") {
@@ -457,34 +464,9 @@ impl GeminiProvider {
     /// `turn_complete: true` annotation could cancel an in-progress tool call.
     pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
         if let Some(ref ws) = self.ws {
-            // Fixed-shape envelope with the base64 payload (frames run to
-            // hundreds of KB) spliced in verbatim: the json! + to_string
-            // path copied the payload into a Value and again through a
-            // full escape scan. The frame label still goes through serde
-            // escaping (arbitrary caller string).
-            let label = serde_json::to_string(&format!("[frame:{}]", frame_id))
-                .unwrap_or_else(|_| "\"[frame:?]\"".to_string());
-            let msg = if crate::json_safe_base64(base64_jpeg) {
-                format!(
-                    r#"{{"client_content":{{"turns":[{{"role":"user","parts":[{{"inlineData":{{"mimeType":"image/jpeg","data":"{}"}}}},{{"text":{}}}]}}],"turn_complete":false}}}}"#,
-                    base64_jpeg, label
-                )
-            } else {
-                // Non-base64 payload (caller bug): fall back to full escaping.
-                serde_json::json!({
-                    "client_content": {
-                        "turns": [{
-                            "role": "user",
-                            "parts": [
-                                { "inlineData": { "mimeType": "image/jpeg", "data": base64_jpeg } },
-                                { "text": format!("[frame:{}]", frame_id) }
-                            ]
-                        }],
-                        "turn_complete": false
-                    }
-                })
-                .to_string()
-            };
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::gemini_frame(base64_jpeg, frame_id);
             let _ = ws.send_with_str(&msg);
             self.callbacks.invoke_diagnostic(
                 "video_send",
@@ -500,23 +482,9 @@ impl GeminiProvider {
 
     pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
-            // Fixed-shape envelope, base64 spliced verbatim (see send_frame).
-            let msg = if crate::json_safe_base64(base64_pcm) {
-                format!(
-                    r#"{{"realtime_input":{{"media_chunks":[{{"mime_type":"audio/pcm;rate={}","data":"{}"}}]}}}}"#,
-                    self.input_sample_rate, base64_pcm
-                )
-            } else {
-                serde_json::json!({
-                    "realtime_input": {
-                        "media_chunks": [{
-                            "mime_type": format!("audio/pcm;rate={}", self.input_sample_rate),
-                            "data": base64_pcm
-                        }]
-                    }
-                })
-                .to_string()
-            };
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::gemini_audio(base64_pcm, self.input_sample_rate);
             let _ = ws.send_with_str(&msg);
             let count = self.audio_send_count.get() + 1;
             self.audio_send_count.set(count);
