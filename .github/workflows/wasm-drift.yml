@@ -10,8 +10,12 @@ name: WASM drift
 # against the committed artifacts.
 #
 # Required-track triggers (unfiltered — a paths-filtered required check
-# blocks queue entry); the in-job relevance skip keeps per-PR cost at
-# ~zero unless wasm inputs actually changed.
+# blocks queue entry). Relevance is two-tier: a GitHub-hosted classifier
+# job reads the diff first, so irrelevant diffs skip the Mac leg without
+# ever occupying a fleet runner slot (or queueing behind the heavy
+# cross-platform Mac job); the in-job relevance check is retained as the
+# fail-open backstop — if the classifier fails, the Mac job runs anyway
+# and decides locally, exactly like the old single-job scheme.
 #
 # The rebuild runs on the MAC fleet leg deliberately: wasm output is NOT
 # byte-deterministic across host triples (proven live 2026-07-11 — a
@@ -35,8 +39,65 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Tier 1: hosted relevance classifier. Runs on GitHub-hosted
+  # ubuntu-latest (free for a public repo; fork-safe — it only reads the
+  # diff) so the ~88% of PRs that touch no wasm input never occupy a Mac
+  # fleet slot at all.
+  classify:
+    name: wasm-relevance
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      relevant: ${{ steps.relevance.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        # The default persisted token grants every later step push access;
+        # nothing here pushes.
+        with:
+          persist-credentials: false
+
+      # Only wasm inputs can drift the artifacts; everything else
+      # green-skips. Cargo.lock is in the list because dependency bumps
+      # (wasm-bindgen above all) change the emitted bytes;
+      # scripts/build-wasm.sh because the canonical builder's flags shape
+      # the bytes too; and this workflow file itself so edits to the gate
+      # validate the full fleet path live instead of green-skipping
+      # themselves. Keep the pattern list identical to the in-job
+      # backstop copy in the wasm-drift job below.
+      - name: Detect wasm-relevant changes
+        id: relevance
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.merge_group.base_sha }}"
+          fi
+          git fetch --quiet --depth=1 origin "$base"
+          relevant=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
+                relevant=true; break ;;
+            esac
+          done < <(git diff --name-only "$base" HEAD)
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+          echo "wasm-relevant change detected: $relevant"
+
+  # Tier 2: the drift gate proper, on the Mac fleet, gated on the hosted
+  # classifier: an irrelevant diff skips this job entirely, and a job
+  # skipped via `if:` reports a "skipped" check run, which the ruleset
+  # reads as satisfied — correct for irrelevant diffs. The gate fails
+  # OPEN to testing: if classify fails or is cancelled, `always()` plus
+  # the result check below run this job anyway, and the retained in-job
+  # relevance step decides locally exactly like the old single-job
+  # scheme — a silent classifier crash can never mask a relevant diff,
+  # which is what makes the skipped-equals-satisfied semantics safe here.
   wasm-drift:
     name: wasm-drift (${{ matrix.os }})
+    needs: classify
+    if: always() && (needs.classify.result != 'success' || needs.classify.outputs.relevant == 'true')
     # Trust-based routing — same rule as windows.yml: trusted refs on the
     # self-hosted fleet, fork PRs on GitHub-hosted runners.
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && matrix.os || matrix.runner }}
@@ -54,9 +115,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Only wasm inputs can drift the artifacts; everything else
-      # green-skips. Cargo.lock is in the list because dependency bumps
-      # (wasm-bindgen above all) change the emitted bytes.
+      # In-job backstop for the fail-open path: when classify fails,
+      # this job runs unconditionally and this step decides relevance
+      # locally, exactly like the pre-classifier scheme. Keep the pattern
+      # list identical to the classify copy above (per-entry rationale
+      # lives there).
       - name: Detect wasm-relevant changes
         id: relevance
         shell: bash
@@ -71,7 +134,7 @@ jobs:
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             case "$f" in
-              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock)
+              crates/presence-web/*|crates/station-web/*|crates/presence-core/*|static/wasm-web/*|static/wasm-station/*|.wasm-pack-version|rust-toolchain.toml|Cargo.lock|.github/workflows/wasm-drift.yml|scripts/build-wasm.sh)
                 relevant=true; break ;;
             esac
           done < <(git diff --name-only "$base" HEAD)
