@@ -1055,19 +1055,22 @@ impl IntendantServer {
                 || !s.session_id.is_empty();
             if has_target && s.controller_loop_status_override.is_none() {
                 let loop_dir = mcp_state_controller_loop_dir(&s);
-                s.cached_controller_loop_raw_status(&loop_dir)
-                    .is_none()
-                    .then_some(loop_dir)
+                let (hit, generation) = s.probe_controller_loop_raw_status(&loop_dir);
+                hit.is_none().then_some((loop_dir, generation))
             } else {
                 None
             }
         };
-        if let Some(loop_dir) = needs_collect {
+        if let Some((loop_dir, generation)) = needs_collect {
             let raw = collect_controller_loop_raw_status(&loop_dir);
+            // Store at the pre-collection generation: if a lifecycle or
+            // marker mutation invalidated the cache while we collected
+            // unlocked, this pre-mutation sample is discarded rather than
+            // reinstated.
             self.state
                 .read()
                 .await
-                .store_controller_loop_raw_status(raw);
+                .store_controller_loop_raw_status_at(generation, raw);
         }
         {
             let mut s = self.state.write().await;
@@ -1608,7 +1611,14 @@ fn resolve_persisted_start_target(
     // Preference order for identity facts: a structured event naming this
     // wrapper (else the log's sole identity), then the launch config's
     // source, then — pre-2026-07 dirs only — the legacy prose scrape.
-    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap_or_default();
+    // A read FAILURE is not evidence of anything: a partially materialized
+    // or transiently unreadable log must resolve as NotFound-class (which
+    // callers never negative-cache), not as NonExternal — otherwise a
+    // still-appearing external session gets memoized as native forever.
+    let (contents, log_read_failed) = match std::fs::read_to_string(log_dir.join("session.jsonl")) {
+        Ok(contents) => (contents, false),
+        Err(_) => (String::new(), true),
+    };
     let scan = crate::session_identity::scan_session_log(
         &contents,
         session_id,
@@ -1629,7 +1639,11 @@ fn resolve_persisted_start_target(
     };
 
     let Some(source) = source else {
-        return PersistedStartTarget::NonExternal;
+        return if log_read_failed {
+            PersistedStartTarget::NotFound
+        } else {
+            PersistedStartTarget::NonExternal
+        };
     };
     // The scan above is target DISCOVERY; the supervisor's resolver is the
     // authority on resume identity (canonical backend-id filtering plus the
@@ -1788,6 +1802,20 @@ const RESOURCE_APPROVAL_URI: &str = "intendant://pending-approval";
 const RESOURCE_INPUT_URI: &str = "intendant://pending-input";
 const RESOURCE_RESTART_URI: &str = "intendant://controller-restart";
 const RESOURCE_LOOP_URI: &str = "intendant://controller-loop";
+
+/// Every resource URI this server serves — the subscription vocabulary.
+/// `subscribe` validates against this set (rejecting unknown URIs), which
+/// also caps the subscription set at this fixed size; a parity test pins it
+/// to [`resource_definitions`].
+const RESOURCE_URIS: [&str; 7] = [
+    RESOURCE_STATUS_URI,
+    RESOURCE_USAGE_URI,
+    RESOURCE_LOGS_URI,
+    RESOURCE_APPROVAL_URI,
+    RESOURCE_INPUT_URI,
+    RESOURCE_RESTART_URI,
+    RESOURCE_LOOP_URI,
+];
 
 fn make_resource(uri: &str, name: &str, description: &str) -> Resource {
     Resource {
@@ -1971,6 +1999,16 @@ impl ServerHandler for IntendantServer {
         // (resource notifications are subscription-scoped in MCP; the
         // historical behavior of broadcasting every change to every client
         // regardless made each fold-loop event a stdout JSON-RPC write).
+        // Unknown URIs are rejected — nothing would ever notify them, and
+        // validating against the served vocabulary keeps the subscription
+        // set bounded at the resource count instead of growing with
+        // whatever strings a client sends.
+        if !RESOURCE_URIS.contains(&request.uri.as_str()) {
+            return Err(McpError::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                None,
+            ));
+        }
         self.state
             .write()
             .await
@@ -2300,12 +2338,18 @@ pub(crate) mod tests {
 
     pub(crate) fn test_state_with_log_dir(log_dir: std::path::PathBuf) -> SharedMcpState {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
-        Arc::new(RwLock::new(McpAppState::new(
-            "openai".to_string(),
-            "gpt-5".to_string(),
-            autonomy,
-            log_dir,
-        )))
+        let mut state =
+            McpAppState::new("openai".to_string(), "gpt-5".to_string(), autonomy, log_dir);
+        // Hermetic default: status paths collect controller-loop reality
+        // (run-dir scans, wrapper-index reads, `ps`) from the REAL machine
+        // when unset — on a live box that scan costs seconds and its
+        // duration becomes machine state. Point it at a never-existing dir
+        // (deterministically empty, no tempdir guard needed); tests that
+        // exercise loop-dir behavior override this themselves.
+        state.controller_loop_dir_override = Some(std::path::PathBuf::from(
+            "/nonexistent/intendant-test-controller-loop",
+        ));
+        Arc::new(RwLock::new(state))
     }
 
     /// Test server over an injected temp home. Session-id-driven paths
@@ -3734,6 +3778,21 @@ pub(crate) mod tests {
     fn resource_definitions_has_seven_entries() {
         let defs = resource_definitions();
         assert_eq!(defs.len(), 7);
+    }
+
+    #[test]
+    fn resource_uris_pin_resource_definitions() {
+        // The subscription vocabulary (RESOURCE_URIS) must be exactly the
+        // set resource_definitions() serves — a new resource that forgets
+        // the vocabulary would be silently unsubscribable.
+        let served: std::collections::BTreeSet<String> = resource_definitions()
+            .iter()
+            .map(|resource| resource.raw.uri.clone())
+            .collect();
+        let vocabulary: std::collections::BTreeSet<String> =
+            RESOURCE_URIS.iter().map(|uri| uri.to_string()).collect();
+        assert_eq!(served, vocabulary);
+        assert_eq!(RESOURCE_URIS.len(), resource_definitions().len());
     }
 
     #[test]

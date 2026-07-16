@@ -858,23 +858,48 @@ pub(crate) fn read_persisted_log_entries_for_session(
     read_persisted_log_entries_from_dir(&log_dir, params)
 }
 
+/// Bytes covered by a cursor's frozen prefix-identity window (mirrors the
+/// message-search `SourceCursor` discipline, `PREFIX_HASH_BYTES`).
+const SESSION_JSONL_PREFIX_WINDOW: usize = 4096;
+
+/// First-8-bytes-of-SHA-256 as a number — the same fingerprint shape as
+/// message-search's `prefix_hash16` / `session_log::content_hash_hex16`,
+/// kept numeric because these cursors live in memory only.
+fn session_jsonl_prefix_hash(bytes: &[u8]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or([0u8; 8]))
+}
+
 /// Byte/line cursor into an append-only `session.jsonl`.
 ///
 /// `lines` counts the newline-terminated lines fully consumed from the start
 /// of the file and `bytes` is the offset just past the last consumed
 /// terminator, so a later pass can resume at a stable line id without
 /// re-reading (or re-parsing) the whole log.
+///
+/// Identity: length + a newline at the boundary cannot detect a
+/// same-or-longer-length replacement (log rotation, dir reuse), so the
+/// cursor also freezes a hash over the file's first
+/// `min(consumed, SESSION_JSONL_PREFIX_WINDOW)` bytes when it is first
+/// established from a full read. Append-only writers never rewrite that
+/// window, so the frozen hash stays comparable as the cursor advances;
+/// a mismatch on resume forces a full replay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionJsonlCursor {
     pub(crate) lines: u64,
     pub(crate) bytes: u64,
+    pub(crate) prefix_len: u32,
+    pub(crate) prefix_hash: u64,
 }
 
 /// Read `path` from `cursor` when the cursor still describes a valid prefix
-/// of the (append-only) file: the offset must sit inside the file and land
-/// just past a `\n`. Any mismatch — a truncated or replaced file — falls back
-/// to a full read from byte 0 so callers self-heal with one full pass.
-/// Returns the unread tail plus the validated base cursor it starts at.
+/// of the (append-only) file: the offset must sit inside the file, the
+/// frozen prefix-identity window must hash to the same value, and the byte
+/// before the offset must be a `\n`. Any mismatch — a truncated, replaced,
+/// or rotated file — falls back to a full read from byte 0 so callers
+/// self-heal with one full pass. Returns the unread tail plus the validated
+/// base cursor it starts at.
 pub(crate) fn read_session_jsonl_tail(
     path: &std::path::Path,
     cursor: Option<SessionJsonlCursor>,
@@ -882,11 +907,21 @@ pub(crate) fn read_session_jsonl_tail(
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path).ok()?;
     let mut base = cursor.unwrap_or_default();
+    // A consumed prefix always has an identity window (frozen at first
+    // capture); a cursor without one is not trustworthy.
     let mut valid = base.bytes > 0
+        && base.prefix_len > 0
+        && u64::from(base.prefix_len) <= base.bytes
         && file
             .metadata()
             .map(|meta| meta.len() >= base.bytes)
             .unwrap_or(false);
+    if valid {
+        let mut window = vec![0u8; base.prefix_len as usize];
+        valid = file.seek(SeekFrom::Start(0)).is_ok()
+            && file.read_exact(&mut window).is_ok()
+            && session_jsonl_prefix_hash(&window) == base.prefix_hash;
+    }
     if valid {
         let mut byte = [0u8; 1];
         valid = file.seek(SeekFrom::Start(base.bytes - 1)).is_ok()
@@ -929,16 +964,23 @@ pub(crate) fn walk_session_jsonl_tail(
             line = stripped;
         }
         if !visit(line_id, line) {
-            return cursor;
+            break;
         }
         line_id += 1;
         if terminated {
-            cursor = SessionJsonlCursor {
-                lines: line_id,
-                bytes: base.bytes + next_start as u64,
-            };
+            cursor.lines = line_id;
+            cursor.bytes = base.bytes + next_start as u64;
         }
         line_start = next_start;
+    }
+    // First establishment (base at byte 0): freeze the prefix-identity
+    // window over the consumed head bytes. Tail walks (base.bytes > 0)
+    // carry the frozen identity forward untouched — the window bytes are
+    // immutable under an append-only writer.
+    if base.bytes == 0 && cursor.bytes > 0 {
+        let window = &bytes[..(cursor.bytes as usize).min(SESSION_JSONL_PREFIX_WINDOW)];
+        cursor.prefix_len = window.len() as u32;
+        cursor.prefix_hash = session_jsonl_prefix_hash(window);
     }
     cursor
 }
@@ -1292,6 +1334,53 @@ mod tests {
                 .map(|entry| (entry.id, entry.content.clone()))
                 .collect::<Vec<_>>(),
             vec![(1, "partial".to_string()), (2, "next".to_string())]
+        );
+    }
+
+    #[test]
+    fn same_length_replacement_is_detected_by_the_prefix_identity_window() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+
+        // Replacement: four short lines.
+        let replacement_lines: Vec<String> = ["r0", "r1", "r2", "r3"]
+            .iter()
+            .map(|msg| info_line(msg))
+            .collect();
+        let replacement = replacement_lines.join("\n") + "\n";
+
+        // Original: two lines padded to EXACTLY the replacement's byte
+        // length, so metadata length and the newline at the cursor
+        // boundary both still match after the swap.
+        let first = info_line("orig-0");
+        let overhead = info_line("").len();
+        let second_message_len = replacement.len() - (first.len() + 1) - 1 - overhead;
+        let second = info_line(&"p".repeat(second_message_len));
+        let original = format!("{first}\n{second}\n");
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&log_path, &original).unwrap();
+
+        // Seed the cursor with a full pass (2 lines consumed).
+        let seeded =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(seeded.len(), 2);
+
+        // Rotate: same total length, same trailing newline — only the
+        // frozen prefix hash can tell the file was replaced. A resumed
+        // cursor would report "nothing new"; the heal is a full replay
+        // that serves the replacement's lines past since_id.
+        std::fs::write(&log_path, &replacement).unwrap();
+        let healed = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(seeded[1].id), None),
+        )
+        .unwrap();
+        assert_eq!(
+            healed
+                .iter()
+                .map(|entry| (entry.id, entry.content.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, "r2".to_string()), (3, "r3".to_string())]
         );
     }
 

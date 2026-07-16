@@ -528,11 +528,12 @@ pub(crate) fn collect_controller_loop_status_for_mcp_state(
     loop_dir: &std::path::Path,
     state: &McpAppState,
 ) -> serde_json::Value {
+    let (_, generation) = state.probe_controller_loop_raw_status(loop_dir);
     let raw = collect_controller_loop_raw_status(loop_dir);
     if state.controller_loop_status_override.is_none()
         && mcp_state_controller_loop_dir(state) == loop_dir
     {
-        state.store_controller_loop_raw_status(raw.clone());
+        state.store_controller_loop_raw_status_at(generation, raw.clone());
     }
     finish_controller_loop_status(raw, Some((state, current_unix_timestamp_secs())))
 }
@@ -639,14 +640,15 @@ pub(crate) fn mcp_state_controller_loop_status(s: &McpAppState) -> serde_json::V
             // to three times per call (promote + active/stale checks), and
             // supervised gates poll it continuously. Enrichment always runs
             // against the live state, so folded session phases are never
-            // stale even on a cache hit.
-            let raw = s
-                .cached_controller_loop_raw_status(&loop_dir)
-                .unwrap_or_else(|| {
-                    let raw = collect_controller_loop_raw_status(&loop_dir);
-                    s.store_controller_loop_raw_status(raw.clone());
-                    raw
-                });
+            // stale even on a cache hit. Stores carry the probe generation:
+            // if an invalidation (lifecycle/marker mutation) lands between
+            // probe and store, the pre-mutation sample is discarded.
+            let (hit, generation) = s.probe_controller_loop_raw_status(&loop_dir);
+            let raw = hit.unwrap_or_else(|| {
+                let raw = collect_controller_loop_raw_status(&loop_dir);
+                s.store_controller_loop_raw_status_at(generation, raw.clone());
+                raw
+            });
             finish_controller_loop_status(raw, Some((s, current_unix_timestamp_secs())))
         })
 }

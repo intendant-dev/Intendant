@@ -62,9 +62,11 @@ pub struct McpAppState {
     /// collection — the `ps` spawn + run-dir/wrapper-index scan half of
     /// [`collect_controller_loop_status_inner`]. Interior mutability so the
     /// polled read paths (which only hold `&McpAppState`) can serve and
-    /// re-seed it; see [`CONTROLLER_LOOP_RAW_STATUS_TTL`].
-    controller_loop_raw_status_cache:
-        std::sync::Mutex<Option<(std::time::Instant, ControllerLoopRawStatus)>>,
+    /// re-seed it; see [`CONTROLLER_LOOP_RAW_STATUS_TTL`]. Guarded by a
+    /// generation counter: invalidation bumps it, and a collection started
+    /// before the bump refuses to store — otherwise a lock-free pre-warm
+    /// racing a lifecycle mutation could reinstate a pre-mutation sample.
+    controller_loop_raw_status_cache: std::sync::Mutex<ControllerLoopRawStatusCache>,
     /// Per-`session.jsonl` replay cursors for
     /// [`hydrate_requested_session_status_from_logs`]: session-scoped
     /// `get_status` used to re-read and re-fold the whole log on every call;
@@ -73,6 +75,21 @@ pub struct McpAppState {
     /// with one full replay.
     pub(crate) session_log_hydration_cursors:
         std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>,
+    /// Set while [`hydrate_requested_session_status_from_logs`] folds a log
+    /// into this state, naming the replay kind. It gates two hazards: a
+    /// FULL replay must not overwrite a live-observed session status with
+    /// older log-derived state (see `session_status_live_marks`), and a
+    /// replayed `session_ended` line must not re-run the over-cap prune
+    /// (the rebuild the query is performing would erase itself and record
+    /// an EOF cursor against absent state).
+    pub(crate) hydration_replay: Option<HydrationReplayKind>,
+    /// Session ids whose status was written by a LIVE observation (event
+    /// listener fold, promote) rather than log replay. A full hydration
+    /// replay re-applies the entire history, and the log's final phase can
+    /// lag the live-observed one (flush skew) — sessions marked here keep
+    /// their live status through full replays. Appended-tail replays still
+    /// apply: those lines are new information by construction.
+    pub(crate) session_status_live_marks: std::collections::HashSet<String>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -195,7 +212,28 @@ pub(crate) struct DensityMaintenanceSatisfaction {
 /// id and alias ever observed used to accumulate for the daemon's lifetime;
 /// once the status map outgrows this, ended sessions are pruned on
 /// [`McpAppState::note_session_ended`] instead of lingering.
-const ENDED_SESSION_PRUNE_THRESHOLD: usize = 1024;
+pub(crate) const ENDED_SESSION_PRUNE_THRESHOLD: usize = 1024;
+
+/// Which kind of log replay a hydration pass is performing. See
+/// [`McpAppState::hydration_replay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HydrationReplayKind {
+    /// Replaying from byte 0 — re-applies history that live observation may
+    /// already have superseded.
+    Full,
+    /// Replaying only bytes appended past a validated cursor — new
+    /// information by construction.
+    Tail,
+}
+
+/// Cache slot for the raw controller-loop sample, with the invalidation
+/// generation. See the field doc on
+/// [`McpAppState::controller_loop_raw_status_cache`].
+#[derive(Default)]
+pub(crate) struct ControllerLoopRawStatusCache {
+    generation: u64,
+    entry: Option<(std::time::Instant, ControllerLoopRawStatus)>,
+}
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
 pub struct PendingApprovalState {
@@ -240,8 +278,12 @@ impl McpAppState {
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
             session_logs_home_override: None,
-            controller_loop_raw_status_cache: std::sync::Mutex::new(None),
+            controller_loop_raw_status_cache: std::sync::Mutex::new(
+                ControllerLoopRawStatusCache::default(),
+            ),
             session_log_hydration_cursors: std::collections::HashMap::new(),
+            hydration_replay: None,
+            session_status_live_marks: std::collections::HashSet::new(),
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -285,39 +327,70 @@ impl McpAppState {
         }
     }
 
-    /// A still-fresh raw controller-loop sample for `loop_dir`, if one is
-    /// cached. A stale entry or one collected for a different loop dir
-    /// (dir overrides in tests) misses.
-    pub(crate) fn cached_controller_loop_raw_status(
+    /// Probe the raw controller-loop cache: a still-fresh sample for
+    /// `loop_dir` (a stale entry or one collected for a different loop dir
+    /// misses) plus the current invalidation generation. Callers that miss
+    /// collect WITHOUT any lock held, then store through
+    /// [`Self::store_controller_loop_raw_status_at`] with this generation —
+    /// if a lifecycle mutation invalidated meanwhile, the pre-mutation
+    /// sample is discarded instead of reinstated.
+    pub(crate) fn probe_controller_loop_raw_status(
         &self,
         loop_dir: &std::path::Path,
-    ) -> Option<ControllerLoopRawStatus> {
+    ) -> (Option<ControllerLoopRawStatus>, u64) {
         let cache = self
             .controller_loop_raw_status_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let (collected_at, raw) = cache.as_ref()?;
-        (collected_at.elapsed() < CONTROLLER_LOOP_RAW_STATUS_TTL && raw.loop_dir() == loop_dir)
-            .then(|| raw.clone())
+        let hit = cache.entry.as_ref().and_then(|(collected_at, raw)| {
+            (collected_at.elapsed() < CONTROLLER_LOOP_RAW_STATUS_TTL && raw.loop_dir() == loop_dir)
+                .then(|| raw.clone())
+        });
+        (hit, cache.generation)
     }
 
-    pub(crate) fn store_controller_loop_raw_status(&self, raw: ControllerLoopRawStatus) {
+    /// Store a raw sample collected while the cache was at `generation`.
+    /// A no-op when the generation has moved (an invalidation raced the
+    /// collection): the sample predates the mutation that bumped it.
+    pub(crate) fn store_controller_loop_raw_status_at(
+        &self,
+        generation: u64,
+        raw: ControllerLoopRawStatus,
+    ) {
         let mut cache = self
             .controller_loop_raw_status_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *cache = Some((std::time::Instant::now(), raw));
+        if cache.generation == generation {
+            cache.entry = Some((std::time::Instant::now(), raw));
+        }
     }
 
-    /// Drop the cached raw controller-loop sample. Marker-mutating paths
-    /// (halt/intervene/clear) call this so a status poll right after the
-    /// mutation observes the new flags instead of a sub-TTL stale sample.
+    /// Invalidate the raw controller-loop cache for a LIVE-observed session
+    /// lifecycle transition (task dispatch, session start/end, completion,
+    /// interruption): process reality just changed, so a pre-transition
+    /// sample must not answer the next poll. Hydration replays of historic
+    /// logs pass through the same fold arms and are ignored here — they do
+    /// not change process reality.
+    pub(crate) fn note_live_session_lifecycle_change(&self) {
+        if self.hydration_replay.is_none() {
+            self.invalidate_controller_loop_raw_status_cache();
+        }
+    }
+
+    /// Drop the cached raw controller-loop sample and bump the generation.
+    /// Called wherever process/marker reality changes — loop-marker tools
+    /// (halt/intervene/clear), task dispatch, and observed session
+    /// lifecycle transitions — so a status poll right after the mutation
+    /// re-collects instead of serving a sub-TTL stale sample, and so an
+    /// in-flight unlocked collection cannot reinstate one.
     pub(crate) fn invalidate_controller_loop_raw_status_cache(&self) {
         let mut cache = self
             .controller_loop_raw_status_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *cache = None;
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.entry = None;
     }
 
     pub(crate) fn push_log(&mut self, level: LogLevel, content: String) {
@@ -591,7 +664,19 @@ impl McpAppState {
         self.remove_pending_rewind_pressure_check_for_key(session_id);
         self.remove_insufficient_rewind_notice_for_key(session_id);
         self.remove_density_maintenance_satisfied_for_key(session_id);
-        if self.session_status.len() > ENDED_SESSION_PRUNE_THRESHOLD {
+        // A session ending changes process reality: a cached raw
+        // controller-loop sample from before the exit must not answer the
+        // next status poll. (No-op during hydration replays.)
+        self.note_live_session_lifecycle_change();
+        // Never prune from a hydration replay: the replayed `session_ended`
+        // line belongs to the very session a query is rebuilding — pruning
+        // here would erase the rebuild and leave an EOF cursor pointing at
+        // absent state, so a later query would answer with the daemon's
+        // current (unrelated) status under the requested id. Query-driven
+        // rebuilds stay resident instead.
+        if self.hydration_replay.is_none()
+            && self.session_status.len() > ENDED_SESSION_PRUNE_THRESHOLD
+        {
             self.prune_ended_session_bookkeeping(session_id);
         }
     }
@@ -611,14 +696,30 @@ impl McpAppState {
             self.session_sources.remove(id);
             self.session_codex_managed_context.remove(id);
             self.session_known_non_external.remove(id);
+            self.session_status_live_marks.remove(id);
             self.session_aliases.remove(id);
         }
-        // Hydration cursors are keyed by log dir, not session id, and a
-        // pruned session's next hydration must be a full replay (its folded
-        // state is gone). Dropping them all is safe — every cursor
-        // self-heals with one full pass — and this branch is rare by
-        // construction.
-        self.session_log_hydration_cursors.clear();
+        // Drop ONLY the ended component's hydration cursors (log-dir
+        // basenames carry the session id, with the store's prefix-match
+        // semantics), so live sessions keep theirs — on a long-lived daemon
+        // permanently over the cap, wiping every cursor on every session
+        // end would re-trigger the full-replay-under-write-lock cost this
+        // module exists to avoid. A cursor a rename/meta mismatch leaves
+        // behind is caught by hydration's pruned-state backstop, which
+        // forces a full replay whenever the requested session has no folded
+        // status.
+        self.session_log_hydration_cursors.retain(|path, _| {
+            let Some(dir_name) = path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+            else {
+                return false;
+            };
+            !ids.iter().any(|id| {
+                !id.is_empty() && (dir_name == id.as_str() || dir_name.starts_with(id.as_str()))
+            })
+        });
     }
 
     pub(crate) fn session_id_applies_to_current_session(&self, session_id: Option<&str>) -> bool {
@@ -685,6 +786,26 @@ impl McpAppState {
                 related
             }
         };
+        // Freshness watermark: a FULL log replay re-applies history, and the
+        // log's final phase can lag what this state already observed live —
+        // never let it overwrite a live-marked session. Tail replays and
+        // live observations pass through; live observations set the mark.
+        match self.hydration_replay {
+            Some(HydrationReplayKind::Full) => {
+                if keys
+                    .iter()
+                    .any(|key| self.session_status_live_marks.contains(key))
+                {
+                    return;
+                }
+            }
+            Some(HydrationReplayKind::Tail) => {}
+            None => {
+                for key in &keys {
+                    self.session_status_live_marks.insert(key.clone());
+                }
+            }
+        }
         let existing = keys
             .iter()
             .find_map(|key| self.session_status.get(key))
@@ -749,6 +870,15 @@ impl McpAppState {
                 related
             }
         };
+        // Same full-replay watermark as note_session_phase: rounds ride the
+        // status entry, so a full replay must not regress a live-marked one.
+        if self.hydration_replay == Some(HydrationReplayKind::Full)
+            && keys
+                .iter()
+                .any(|key| self.session_status_live_marks.contains(key))
+        {
+            return;
+        }
         for key in &keys {
             let entry =
                 self.session_status
@@ -1709,6 +1839,76 @@ mod tests {
             assert_eq!(snap.id, 42);
             assert_eq!(snap.category, "destructive");
         });
+    }
+
+    #[test]
+    fn over_cap_prune_drops_only_the_ended_components_cursors() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        let cursor = SessionJsonlCursor {
+            lines: 2,
+            bytes: 64,
+            prefix_len: 32,
+            prefix_hash: 7,
+        };
+        let ended_path = std::path::PathBuf::from("/tmp/logs/sess-ended/session.jsonl");
+        let live_path = std::path::PathBuf::from("/tmp/logs/sess-live/session.jsonl");
+        s.session_log_hydration_cursors
+            .insert(ended_path.clone(), cursor);
+        s.session_log_hydration_cursors
+            .insert(live_path.clone(), cursor);
+        s.link_session_aliases("sess-ended", "backend-ended");
+
+        for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+            s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+        }
+        s.note_session_phase(Some("sess-ended"), Some(2), Phase::Thinking, None);
+        s.note_session_ended("sess-ended");
+
+        // Only the ended component's cursor is dropped; a long-lived daemon
+        // permanently over the cap must not wipe live sessions' cursors on
+        // every unrelated session end.
+        assert!(!s.session_log_hydration_cursors.contains_key(&ended_path));
+        assert!(s.session_log_hydration_cursors.contains_key(&live_path));
+        assert!(!s.session_status_live_marks.contains("sess-ended"));
+        assert!(!s.session_status_live_marks.contains("backend-ended"));
+    }
+
+    #[test]
+    fn raw_status_cache_store_respects_invalidation_generation() {
+        let s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        let loop_dir = tempfile::tempdir().unwrap();
+        let (hit, generation) = s.probe_controller_loop_raw_status(loop_dir.path());
+        assert!(hit.is_none());
+
+        let raw = collect_controller_loop_raw_status(loop_dir.path());
+        s.store_controller_loop_raw_status_at(generation, raw.clone());
+        assert!(s
+            .probe_controller_loop_raw_status(loop_dir.path())
+            .0
+            .is_some());
+
+        // Invalidation bumps the generation; a sample collected before the
+        // bump (a lock-free pre-warm racing a lifecycle mutation) must not
+        // be reinstated.
+        s.invalidate_controller_loop_raw_status_cache();
+        let (hit, new_generation) = s.probe_controller_loop_raw_status(loop_dir.path());
+        assert!(hit.is_none());
+        assert_ne!(generation, new_generation);
+        s.store_controller_loop_raw_status_at(generation, raw);
+        assert!(s
+            .probe_controller_loop_raw_status(loop_dir.path())
+            .0
+            .is_none());
     }
 
     #[test]

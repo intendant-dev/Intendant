@@ -76,6 +76,9 @@ pub(crate) async fn start_task_with_state(
                     LogLevel::Info,
                     format!("Follow-up submitted via {}: {}", source, task),
                 );
+                // Dispatch changes process reality (the loop resumes work):
+                // drop any pre-dispatch controller-loop sample.
+                s.note_live_session_lifecycle_change();
                 drop(s);
                 tx.send(FollowUpMessage::text(task_clone))
                     .await
@@ -110,6 +113,11 @@ pub(crate) async fn start_task_with_state(
         LogLevel::Info,
         format!("Task started via {}: {}", source, task),
     );
+    // Task dispatch changes process reality (a session/agent is about to
+    // spawn): a cached no-process sample from before the dispatch must not
+    // answer the first post-start status poll (which could otherwise
+    // commit the session to Done via the stale-controller check).
+    s.note_live_session_lifecycle_change();
 
     let bus = bus.clone();
     drop(s);
@@ -920,6 +928,13 @@ pub(crate) async fn handle_control_command_mcp(
             let persistent = persistent.unwrap_or(true);
             match request_loop_halt_marker(&loop_dir, persistent) {
                 Ok(()) => {
+                    // Bump the cache generation before re-collecting: a
+                    // concurrent pre-warm holding a pre-mutation sample
+                    // must not store over the fresh one below.
+                    state
+                        .read()
+                        .await
+                        .invalidate_controller_loop_raw_status_cache();
                     let data = collect_controller_loop_status_with_state(&loop_dir, state).await;
                     emit_control_result(
                         control_tx,
@@ -943,6 +958,10 @@ pub(crate) async fn handle_control_command_mcp(
             let loop_dir = controller_loop_dir();
             match clear_loop_halt_markers(&loop_dir) {
                 Ok(()) => {
+                    state
+                        .read()
+                        .await
+                        .invalidate_controller_loop_raw_status_cache();
                     let data = collect_controller_loop_status_with_state(&loop_dir, state).await;
                     emit_control_result(
                         control_tx,
@@ -962,6 +981,10 @@ pub(crate) async fn handle_control_command_mcp(
             let loop_dir = controller_loop_dir();
             match request_loop_intervention_marker(&loop_dir, &mode) {
                 Ok(intervention) => {
+                    state
+                        .read()
+                        .await
+                        .invalidate_controller_loop_raw_status_cache();
                     let mut data =
                         collect_controller_loop_status_with_state(&loop_dir, state).await;
                     add_controller_loop_intervention_report(&mut data, &intervention);

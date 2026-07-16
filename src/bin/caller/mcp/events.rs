@@ -187,8 +187,19 @@ pub fn spawn_event_listener(
                     Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Flush anything still pending before exiting so a
-                        // final state change is not silently dropped.
+                        // Liveness note: this arm is UNREACHABLE in the
+                        // production wiring. This task owns `bus` (an
+                        // EventBus holding a `broadcast::Sender<AppEvent>`)
+                        // for its whole life to serve deferred control
+                        // commands, and a broadcast receiver only reports
+                        // Closed once every sender is dropped — our own
+                        // clone keeps the channel open. Real teardown is
+                        // process exit (`run_mcp_server` detaches the
+                        // JoinHandle), where the stdio peer is gone anyway;
+                        // the reachable final-flush seam is the should_quit
+                        // check after control commands below. Kept as
+                        // defense in depth for a future wiring where the
+                        // listener no longer holds a sender.
                         flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
                         break;
                     }
@@ -453,6 +464,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         message,
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(
@@ -517,6 +529,7 @@ pub fn spawn_event_listener(
                         reason,
                         ..
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(LogLevel::Info, format!("Task complete: {}", reason));
@@ -844,6 +857,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref task,
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.session_id = session_id.clone();
                         s.task_description = task.clone().unwrap_or_default();
                         s.turn = 0;
@@ -989,6 +1003,7 @@ pub fn spawn_event_listener(
                         ref reason,
                         ..
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Interrupted);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
@@ -1118,13 +1133,23 @@ pub fn spawn_event_listener(
             if let Some(uri) = resource_changed {
                 dirty_resources.insert(uri.to_string());
             }
+            let mut control_processed = false;
             if let Some(msg) = deferred_control_msg {
+                control_processed = true;
                 if let Some(uri) = handle_control_command_mcp(&state, &bus, &control_tx, msg).await
                 {
                     dirty_resources.insert(uri.to_string());
                 }
             }
-            if !dirty_resources.is_empty() && flush_deadline.is_none() {
+            // The Quit control command is the only in-process teardown seam
+            // this task can observe (the channel cannot close under us —
+            // see the Closed-arm note): flush pending notifications now
+            // instead of letting the process exit inside the debounce
+            // window.
+            if control_processed && state.read().await.should_quit {
+                flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                flush_deadline = None;
+            } else if !dirty_resources.is_empty() && flush_deadline.is_none() {
                 flush_deadline = Some(tokio::time::Instant::now() + RESOURCE_NOTIFY_DEBOUNCE);
             }
         }
@@ -1212,6 +1237,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             raw,
         ),
         AppEvent::SessionStarted { session_id, task } => {
+            s.note_live_session_lifecycle_change();
             s.session_id = session_id.clone();
             s.task_description = task.clone().unwrap_or_default();
             s.turn = 0;
@@ -1342,6 +1368,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             true
         }
         AppEvent::DoneSignal { session_id, .. } | AppEvent::TaskComplete { session_id, .. } => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Done);
             s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
             true
@@ -1371,6 +1398,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             true
         }
         AppEvent::Interrupted { session_id, .. } => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Interrupted);
             s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
             true
@@ -1567,10 +1595,30 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         // past an unterminated final line, so partially flushed writes are
         // re-read (and re-applied, idempotently) once complete.
         let path = dir.join("session.jsonl");
-        let prior = s.session_log_hydration_cursors.get(&path).copied();
+        let mut prior = s.session_log_hydration_cursors.get(&path).copied();
+        // Coherence backstop: a cursor is only meaningful together with the
+        // folded state its consumed prefix produced. If this session has no
+        // folded status (pruned bookkeeping, or a cursor left behind by a
+        // dir whose basename didn't match the pruned ids), skipping the
+        // prefix would answer the query from absent state — force a full
+        // replay instead.
+        if prior.is_some_and(|cursor| cursor.bytes > 0)
+            && s.session_status_for_id(session_id).is_none()
+        {
+            prior = None;
+            s.session_log_hydration_cursors.remove(&path);
+        }
         let Some((tail, base)) = read_session_jsonl_tail(&path, prior) else {
             continue;
         };
+        // Mark the replay kind for the fold: full replays must not
+        // overwrite live-marked session status (freshness watermark) and
+        // must not trigger the over-cap prune (see note_session_ended).
+        s.hydration_replay = Some(if base.bytes == 0 {
+            HydrationReplayKind::Full
+        } else {
+            HydrationReplayKind::Tail
+        });
         let advanced = walk_session_jsonl_tail(&tail, base, |_, line| {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
                 return true;
@@ -1582,6 +1630,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
             changed |= apply_observed_event_to_mcp_state(s, &event);
             true
         });
+        s.hydration_replay = None;
         s.session_log_hydration_cursors.insert(path, advanced);
     }
 
@@ -1637,6 +1686,136 @@ mod tests {
     use crate::mcp::tests::test_state;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn pruned_ended_session_rehydrates_to_done_and_stays_consistent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-prune-poison";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("prune poison task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "do things",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+
+            let state = test_state();
+            let mut s = state.write().await;
+            // The daemon is busy with an unrelated live session.
+            s.session_id = "live-session".to_string();
+            s.note_session_phase(Some("live-session"), Some(9), Phase::Thinking, None);
+            // Blow past the cap, then end the requested session live: its
+            // component is pruned.
+            for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+                s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+            }
+            s.note_session_phase(Some(session_id), Some(1), Phase::Thinking, None);
+            s.note_session_ended(session_id);
+            assert!(s.session_status_for_id(session_id).is_none());
+
+            // Query-driven rebuild: hydration must fold the whole log,
+            // leave the rebuilt component RESIDENT (no re-prune from the
+            // replayed session_ended), and answer Done.
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+
+            // The poisoning regression: a second query must still answer
+            // Done from the requested session's own state — never fall
+            // through to the daemon's current (unrelated) session because a
+            // re-prune erased the rebuild while the cursor sat at EOF.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
+
+    #[test]
+    fn full_replay_does_not_regress_live_observed_phase() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-watermark";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("watermark task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                3,
+                "edit files",
+                None,
+                Some("Codex"),
+            );
+
+            let state = test_state();
+            let mut s = state.write().await;
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+
+            // A LIVE observation supersedes the log (flush skew: the log's
+            // final phase lags what the listener already folded).
+            s.note_session_phase(Some(session_id), None, Phase::Interrupted, None);
+
+            // Force a FULL replay (cursor lost — rotation, prune of an
+            // unrelated component that shared the dir, …): the replayed
+            // history must not overwrite the live-marked status.
+            s.session_log_hydration_cursors.clear();
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Interrupted)
+            );
+        });
+    }
 
     #[test]
     fn hydration_replays_only_the_appended_log_tail() {
