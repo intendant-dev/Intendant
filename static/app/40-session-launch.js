@@ -2086,6 +2086,13 @@ function applySessionRelationshipMetadata(rel) {
   if (rel.kind === 'subagent' && !childHadRelationship && sessionWindows.has(rel.childId)) {
     setSessionWindowHeaderCollapsed(rel.childId, true);
   }
+  // Relationship identity can land AFTER the window and its terminal
+  // phase (catalog hydration, replayed relationship events) — the window
+  // only just became known to be a sub-agent, so re-derive its
+  // auto-minimize now.
+  if (rel.kind === 'subagent') {
+    maybeAutoMinimizeSubagentWindow(rel.childId);
+  }
   updateSessionWindowActionMenuVisibility(rel.childId);
   updateSessionWindowRelationshipStyle(rel.childId);
 }
@@ -2156,6 +2163,12 @@ function sessionRelationshipSubagentIsActive(childId) {
 }
 
 function updateSessionRelationshipBadges(sessionId) {
+  // The "Minimize done" pill counts across the same active boundary this
+  // badge renders with — refresh it (rAF-deduped) wherever the badge
+  // refreshes, which is exactly the set of phase/relationship crossings
+  // that can change the count. Before the early-outs: the count is a
+  // global derivation, not a property of this window.
+  ui2QueueMinimizeDoneRefresh();
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.relationStrip) return;
@@ -2341,6 +2354,10 @@ function scheduleSessionRelationshipRender() {
   sessionRelationshipRenderHandle = requestAnimationFrame(() => {
     sessionRelationshipRenderHandle = 0;
     renderSessionRelationships();
+    // Grid membership / minimize / maximize changes all schedule this
+    // pass — piggyback the "Minimize done" pill recount (cheap sweep of
+    // sessionWindows) so it stays fresh without per-call-site wiring.
+    ui2RefreshMinimizeDoneControl();
   });
 }
 

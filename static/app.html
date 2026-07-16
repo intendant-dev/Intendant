@@ -12734,6 +12734,42 @@ html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
   box-shadow: inset 0 0 0 1px var(--line);
 }
 
+/* ── "Minimize done" bulk pill: one click collapses every finished
+   sub-agent window. Activity-tab-scoped like the layout toggle it sits
+   beside; JS keeps the `hidden` attribute on until the count is > 0, and
+   `:not([hidden])` keeps this display rule from overriding it. ── */
+html.ui-v2 .ui2-minimize-done { display: none; }
+html.ui-v2[data-ui2-tab="activity"] .ui2-minimize-done:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-minimize-done:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+html.ui-v2 .ui2-minimize-done-count {
+  min-width: 16px;
+  padding: 1px 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--text);
+  font-size: 10.5px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 /* ── v1 strips absorbed (post-flip): the status bar and token ticker
    duplicated the oversight bar; their unique facts (provider·model,
    turn, tok/cost) now live in #ui2-ovs-facts as mirrors. The elements
@@ -26578,6 +26614,15 @@ html.ui-v2 .ui2-tsw-foot .ui2-tsw-row:hover { color: var(--text); }
     <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
             title="Grid — session windows with the concurrent stream below">Grid</button>
   </div>
+  <!-- Bulk minimize for finished sub-agent windows (grid hygiene). Hidden
+       (JS `hidden` attr) until at least one done sub-agent window is still
+       expanded; the count chip says how many one click will collapse.
+       ui2-activity.js owns the count + click (minimizeDoneSubagentWindows
+       in 41-session-window-actions.js does the collapsing). -->
+  <button type="button" class="ui2-minimize-done" id="ui2-minimize-done-btn" hidden
+          title="Minimize every finished sub-agent window">
+    Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
+  </button>
   <!-- Session switcher (the decision's missing half): picks the Focus
        session / composer target. Populated from the live session set by
        ui2-chrome.js; drives the same focus/target mechanism as clicking a
@@ -28127,6 +28172,57 @@ function ui2WireLayoutToggle() {
   }
 }
 
+// ── "Minimize done" bulk pill ──────────────────────────────────────────
+// Sits beside the layout toggle; visible only while at least one done
+// sub-agent window is still expanded, with the count of what one click
+// will collapse. The predicate is 41's sessionWindowIsDoneSubagent — the
+// same active boundary the parent "N sub" badge counts with — and the
+// click delegates to minimizeDoneSubagentWindows. Freshness: 40's badge
+// refreshes and the relationship render pass both call the rAF-deduped
+// refresher below.
+function ui2CollectExpandedDoneSubagents() {
+  const out = [];
+  if (typeof sessionWindows === 'undefined'
+      || typeof sessionWindowIsDoneSubagent !== 'function') return out;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (sessionWindowIsDoneSubagent(sid)) out.push(sid);
+  }
+  return out;
+}
+
+function ui2RefreshMinimizeDoneControl() {
+  const btn = document.getElementById('ui2-minimize-done-btn');
+  if (!btn) return;
+  const count = ui2CollectExpandedDoneSubagents().length;
+  const countEl = document.getElementById('ui2-minimize-done-count');
+  if (countEl) countEl.textContent = String(count);
+  btn.hidden = count === 0;
+  btn.title = count === 1
+    ? 'Minimize the finished sub-agent window'
+    : `Minimize all ${count} finished sub-agent windows`;
+}
+
+let ui2MinimizeDoneRefreshQueued = false;
+function ui2QueueMinimizeDoneRefresh() {
+  if (ui2MinimizeDoneRefreshQueued) return;
+  ui2MinimizeDoneRefreshQueued = true;
+  requestAnimationFrame(() => {
+    ui2MinimizeDoneRefreshQueued = false;
+    ui2RefreshMinimizeDoneControl();
+  });
+}
+
+function ui2WireMinimizeDoneControl() {
+  const btn = document.getElementById('ui2-minimize-done-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof minimizeDoneSubagentWindows === 'function') minimizeDoneSubagentWindows();
+    ui2RefreshMinimizeDoneControl();
+  });
+  ui2RefreshMinimizeDoneControl();
+}
+
 // Composer dressing: placeholder copy + the attach glyph. The send
 // button's TEXT is state (Send / ↗ Steer / Save & rerun) — left alone.
 function ui2DressComposer() {
@@ -28227,6 +28323,27 @@ window.qa = Object.assign(window.qa || {}, {
       );
       return log ? log.querySelectorAll('.log-entry').length : 0;
     })(),
+  }),
+  // Sub-agent auto-minimize + the "Minimize done" pill: the count the
+  // pill shows, its visibility, and the per-subagent-window flag state
+  // the derivation runs on (the failure modes — a live window collapsed,
+  // a user-restored window re-collapsed — are silent without this).
+  minimizeDone: () => ({
+    count: ui2CollectExpandedDoneSubagents().length,
+    visible: !(document.getElementById('ui2-minimize-done-btn')?.hidden ?? true),
+    subagents: (typeof sessionWindows !== 'undefined'
+      && typeof sessionWindowIsSubagent === 'function')
+      ? [...sessionWindows.entries()]
+        .filter(([sid]) => sessionWindowIsSubagent(sid))
+        .map(([sid, w]) => ({
+          sid,
+          phase: w.phase || '',
+          ended: !!w.ended,
+          minimized: !!w.minimized,
+          autoMinimized: !!w.autoMinimized,
+          userRestoredWhileDone: !!w.userRestoredWhileDone,
+        }))
+      : [],
   }),
 });
 
@@ -28484,6 +28601,7 @@ function ui2RailTick(force) {
   const wire = () => {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
+    ui2WireMinimizeDoneControl();
     ui2DressComposer();
     ui2BuildVitalsRail();
     ui2RailTick(true);
@@ -28552,7 +28670,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '1ad66f7946f2908a';
+const INTENDANT_APP_BUILD = '87651a47a9c9bc48';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -49261,6 +49379,11 @@ function openSessionWorktreeMergeCard(sessionId) {
       return;
     }
     if (win.minimized && typeof setSessionWindowMinimized === 'function') {
+      // Explicit open of the finish card: record the restore so the
+      // done-subagent auto-minimize rule doesn't re-collapse the window
+      // (and its card) on the next phase/metadata application.
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
       setSessionWindowMinimized(sid, false);
     }
     try { worktreeFinishCardDismissed.delete(sid); } catch (_) {}
@@ -53730,6 +53853,13 @@ function applySessionRelationshipMetadata(rel) {
   if (rel.kind === 'subagent' && !childHadRelationship && sessionWindows.has(rel.childId)) {
     setSessionWindowHeaderCollapsed(rel.childId, true);
   }
+  // Relationship identity can land AFTER the window and its terminal
+  // phase (catalog hydration, replayed relationship events) — the window
+  // only just became known to be a sub-agent, so re-derive its
+  // auto-minimize now.
+  if (rel.kind === 'subagent') {
+    maybeAutoMinimizeSubagentWindow(rel.childId);
+  }
   updateSessionWindowActionMenuVisibility(rel.childId);
   updateSessionWindowRelationshipStyle(rel.childId);
 }
@@ -53800,6 +53930,12 @@ function sessionRelationshipSubagentIsActive(childId) {
 }
 
 function updateSessionRelationshipBadges(sessionId) {
+  // The "Minimize done" pill counts across the same active boundary this
+  // badge renders with — refresh it (rAF-deduped) wherever the badge
+  // refreshes, which is exactly the set of phase/relationship crossings
+  // that can change the count. Before the early-outs: the count is a
+  // global derivation, not a property of this window.
+  ui2QueueMinimizeDoneRefresh();
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.relationStrip) return;
@@ -53985,6 +54121,10 @@ function scheduleSessionRelationshipRender() {
   sessionRelationshipRenderHandle = requestAnimationFrame(() => {
     sessionRelationshipRenderHandle = 0;
     renderSessionRelationships();
+    // Grid membership / minimize / maximize changes all schedule this
+    // pass — piggyback the "Minimize done" pill recount (cheap sweep of
+    // sessionWindows) so it stays fresh without per-call-site wiring.
+    ui2RefreshMinimizeDoneControl();
   });
 }
 
@@ -54699,6 +54839,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
+    // Sub-agent auto-minimize bookkeeping (in-memory, like minimized):
+    // autoMinimized marks a collapse the derivation applied (only those
+    // auto-restore when the session goes active again); userRestoredWhileDone
+    // marks an explicit user restore of a done sub-agent, which the auto
+    // rule must never re-collapse.
+    autoMinimized: false,
+    userRestoredWhileDone: false,
     followOutput: true,
     pendingOutput: false,
     logHistory: [],
@@ -54711,6 +54858,11 @@ function ensureSessionWindow(sessionId, meta = {}) {
   updateSessionWindowHeaderCollapseState(sid);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
+  // A window can be (re)built for an already-finished sub-agent with no
+  // phase in the build meta (metadata-only rebuilds, ended flag carried by
+  // sessionMetadataById) — updateSessionWindow only reaches the phase
+  // applier when meta.phase is set, so derive the auto-minimize here too.
+  maybeAutoMinimizeSubagentWindow(sid);
   updateSessionWindowMaximizeState();
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
@@ -54736,6 +54888,11 @@ function applySessionWindowPhase(win, sid, phase) {
   const cls = sessionPhaseClass(win.phase);
   if (cls) win.status.classList.add(cls);
   maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+  // Done sub-agents collapse on their own (and auto-applied collapses
+  // reopen when the session goes active again). Rides every phase
+  // application for the same reason the approval hook above does: the
+  // active→done crossing arrives via the fast path AND the wide render.
+  maybeAutoMinimizeSubagentWindow(sid);
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -54936,7 +55093,95 @@ function toggleSessionWindowMinimized(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
-  setSessionWindowMinimized(sid, !win.minimized);
+  const next = !win.minimized;
+  // Explicit toggle: the user owns this window's minimize state now. A
+  // restore of a done sub-agent is recorded so the auto rule never
+  // re-collapses it; a manual minimize clears autoMinimized so the
+  // done→active crossing never pops it back open.
+  win.autoMinimized = false;
+  win.userRestoredWhileDone = !next && sessionWindowIsDoneSubagent(sid);
+  setSessionWindowMinimized(sid, next);
+}
+
+// ── Sub-agent auto-minimize (derived state) ────────────────────────────
+// A finished sub-agent's window collapses on its own so the grid stays
+// readable while a parent fans out work. The rule is a DERIVATION, not a
+// one-shot event handler: it re-runs on every phase application (both
+// updateSessionWindow paths route through applySessionWindowPhase), at
+// window build, and when relationship metadata arrives late
+// (applySessionRelationshipMetadata) — so the collapsed state reproduces
+// after a reload even though win.minimized is never persisted (the
+// replayed session_ended re-derives it).
+//
+// Scope: sub-agent windows ONLY — top-level sessions are never touched.
+
+// The bulk-control predicate — the SAME active boundary the parent
+// window's "N sub" badge counts with (sessionRelationshipSubagentIsActive),
+// so the "Minimize done" pill and the badges always agree on what "done"
+// means.
+function sessionWindowIsDoneSubagent(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid)) return false;
+  return sessionWindowIsSubagent(sid) && !sessionRelationshipSubagentIsActive(sid);
+}
+
+// The AUTO rule demands HARD done-evidence — ended, or phase
+// done/interrupted. Bare 'idle' is deliberately NOT enough here: replayed
+// windows are built at 'idle' before their real phase arrives
+// (onSessionStarted during log replay, when update_status_bar is not
+// applied), and waiting_followup normalizes to 'idle' — auto-collapsing
+// either would hide a live window. The bulk pill uses the broader badge
+// predicate above: an explicit click may collapse idle-parked sub-agents
+// too.
+//
+// User intent always wins: a maximized window is never touched, and a
+// window the user explicitly restored while done (userRestoredWhileDone —
+// set by the minimize toggle, maximize, and worktree-card paths) stays
+// open until the session goes active again. Only collapses THIS rule
+// applied (autoMinimized) reopen on the done→active crossing — a manual
+// minimize is never popped open.
+function maybeAutoMinimizeSubagentWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !sessionWindowIsSubagent(sid)) return;
+  if (sessionRelationshipSubagentIsActive(sid)) {
+    // Active again: retire the restore override so a future completion
+    // re-derives, and reopen a window only the auto rule closed.
+    win.userRestoredWhileDone = false;
+    if (win.minimized && win.autoMinimized) {
+      win.autoMinimized = false;
+      setSessionWindowMinimized(sid, false);
+    }
+    return;
+  }
+  if (win.minimized || win.userRestoredWhileDone) return;
+  if (maximizedSessionWindowId === sid) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  const phase = normalizeSessionPhase(win.phase || meta.phase || '');
+  const hardDone = !!(win.ended || meta.ended)
+    || phase === 'done' || phase === 'interrupted';
+  if (!hardDone) return;
+  win.autoMinimized = true;
+  setSessionWindowMinimized(sid, true);
+}
+
+// Bulk action behind the "Minimize done" pill (ui2-activity.js owns the
+// button + live count): collapse every done sub-agent window. An explicit
+// click is explicit intent — it overrides per-window restore flags (and
+// re-arms them false), and marks the collapse auto-managed so a sub-agent
+// that goes active again still pops back open. Returns how many windows
+// it collapsed.
+function minimizeDoneSubagentWindows() {
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (!sessionWindowIsDoneSubagent(sid)) continue;
+    win.userRestoredWhileDone = false;
+    win.autoMinimized = true;
+    setSessionWindowMinimized(sid, true);
+    changed += 1;
+  }
+  return changed;
 }
 
 function updateSessionWindowMaximizeState() {
@@ -54964,6 +55209,14 @@ function setSessionWindowMaximized(sessionId, maximized) {
   const sid = String(sessionId || '').trim();
   if (maximized) {
     if (!sid || !sessionWindows.has(sid)) return;
+    // Maximizing a minimized done sub-agent is an explicit restore: mark
+    // it user-intent so the auto-minimize derivation doesn't re-collapse
+    // the window the moment it is un-maximized.
+    const win = sessionWindows.get(sid);
+    if (win?.minimized && sessionWindowIsDoneSubagent(sid)) {
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
+    }
     setSessionWindowMinimized(sid, false);
     maximizedSessionWindowId = sid;
     focusSessionWindow(sid);
