@@ -1588,11 +1588,15 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     // direct write and note_session_round), budget_pct, phase (+
     // phase_entered_at via set_phase), task_description, session_id,
     // active_session_source, codex_managed_context, provider/model names,
-    // and the usage scalars (tokens x5, context/hard windows). Globals the
-    // applier can write but no replayable row reaches (presence_*,
-    // external_agent, configured_codex_managed_context, log_dir,
-    // pending_approval, human_question) are safe by unreachability, not by
-    // this bracket — re-audit when the replay converter grows a producer.
+    // and the usage scalars (tokens x5, context/hard windows). Two other
+    // buckets are safe WITHOUT this bracket, each with its own re-audit
+    // trigger: globals the applier can write but no replayable row reaches
+    // (presence_*, external_agent, configured_codex_managed_context,
+    // log_dir) — re-audit when the replay converter grows a producer; and
+    // fields with replayable producers that the hydration applier never
+    // writes (pending_approval, human_question — ApprovalRequired's arm
+    // writes only phase state, HumanQuestionDetected has no applier arm) —
+    // re-audit when the applier grows a write to them.
     let provider_name = s.provider_name.clone();
     let model_name = s.model_name.clone();
     let turn = s.turn;
