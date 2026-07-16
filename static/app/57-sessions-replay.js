@@ -1348,6 +1348,7 @@ function renderSessionDetailTitle(session) {
   if (stats.children.length > 0) titleEl.appendChild(stats);
 
   renderSessionDetailLineage(titleEl, session);
+  renderSessionForkPanel(titleEl, session);
 
   const renameBtn = document.getElementById('session-detail-rename');
   if (renameBtn) {
