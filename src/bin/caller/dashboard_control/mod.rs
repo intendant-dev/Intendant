@@ -1973,10 +1973,125 @@ pub(crate) struct ControlByteStream {
     result: serde_json::Value,
 }
 
+/// Where an in-flight tunnel upload accumulates.
+///
+/// Payloads whose declared size fits [`UPLOAD_MEMORY_SPOOL_MAX_BYTES`]
+/// accumulate in memory: every payload — including each recurring
+/// presence webcam frame (~30–100 KB) — used to pay a tempfile
+/// create/write/seek/read/unlink round-trip, with the per-chunk blocking
+/// `write_all` running on the tunnel's wire-driver task (latency jitter
+/// for everything multiplexed on the connection). Larger uploads spool
+/// to a tempfile as before, with chunk writes batched through a small
+/// buffer instead of one blocking write per 16 KiB frame.
+pub(crate) enum UploadSpool {
+    Memory(Vec<u8>),
+    Disk {
+        tmp: tempfile::NamedTempFile,
+        /// Chunk bytes not yet written to `tmp`; flushed at
+        /// [`UPLOAD_DISK_SPOOL_BUFFER_BYTES`] and at upload end.
+        buf: Vec<u8>,
+    },
+}
+
+/// Uploads at or under this declared size accumulate in memory. The
+/// declared size is enforced by the chunk-lane byte checks, so the spool
+/// can never grow past it.
+const UPLOAD_MEMORY_SPOOL_MAX_BYTES: usize = 1024 * 1024;
+/// Batch size for disk-spool writes on the wire-driver task.
+const UPLOAD_DISK_SPOOL_BUFFER_BYTES: usize = 256 * 1024;
+
+impl UploadSpool {
+    fn for_declared_size(total_bytes: usize) -> std::io::Result<Self> {
+        if total_bytes <= UPLOAD_MEMORY_SPOOL_MAX_BYTES {
+            Ok(Self::Memory(Vec::with_capacity(total_bytes)))
+        } else {
+            Ok(Self::Disk {
+                tmp: tempfile::NamedTempFile::new()?,
+                buf: Vec::with_capacity(UPLOAD_DISK_SPOOL_BUFFER_BYTES),
+            })
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Memory(data) => {
+                data.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::Disk { tmp, buf } => {
+                buf.extend_from_slice(bytes);
+                if buf.len() >= UPLOAD_DISK_SPOOL_BUFFER_BYTES {
+                    tmp.as_file_mut().write_all(buf)?;
+                    buf.clear();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Settle the spool at upload end: drain the write buffer and flush.
+    fn finish(&mut self) -> std::io::Result<()> {
+        if let Self::Disk { tmp, buf } = self {
+            if !buf.is_empty() {
+                tmp.as_file_mut().write_all(buf)?;
+                buf.clear();
+            }
+            tmp.as_file_mut().flush()?;
+        }
+        Ok(())
+    }
+
+    /// The whole payload as bytes (the media handlers' shape): a memory
+    /// spool moves out with zero I/O; a disk spool settles and reads
+    /// back, exactly as the tempfile path always did.
+    pub(crate) fn take_bytes(&mut self, expected_len: usize) -> Result<Vec<u8>, String> {
+        self.finish()
+            .map_err(|e| format!("flush upload spool: {e}"))?;
+        let bytes = match self {
+            Self::Memory(data) => std::mem::take(data),
+            Self::Disk { tmp, .. } => {
+                tmp.as_file_mut()
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| format!("seek upload tempfile: {e}"))?;
+                let mut bytes = Vec::with_capacity(expected_len);
+                tmp.as_file_mut()
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("read upload tempfile: {e}"))?;
+                bytes
+            }
+        };
+        if bytes.len() != expected_len {
+            return Err(format!(
+                "upload byte count changed while committing: expected {}, got {}",
+                expected_len,
+                bytes.len()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The whole payload as a [`crate::web_gateway::SpooledBody`]
+    /// tempfile (the staged-upload / transfer-chunk / fs-write commit
+    /// shape): a disk spool settles and hands over its tempfile; a
+    /// memory spool writes once.
+    fn into_spooled_tempfile(mut self) -> std::io::Result<tempfile::NamedTempFile> {
+        self.finish()?;
+        match self {
+            Self::Memory(data) => {
+                let mut tmp = tempfile::NamedTempFile::new()?;
+                tmp.as_file_mut().write_all(&data)?;
+                tmp.as_file_mut().flush()?;
+                Ok(tmp)
+            }
+            Self::Disk { tmp, .. } => Ok(tmp),
+        }
+    }
+}
+
 pub(crate) struct InboundUploadState {
     method: String,
     params: serde_json::Value,
-    tmp: tempfile::NamedTempFile,
+    spool: UploadSpool,
     total_bytes: usize,
     expected_chunks: usize,
     next_seq: usize,
@@ -1988,16 +2103,13 @@ impl InboundUploadState {
     /// (transport-unification S8): the frame params plus the spooled
     /// bytes, for handlers that commit the spool wholesale — the staged
     /// upload today, the S9 transfer-chunk appends next. The media
-    /// handlers keep reading the tempfile in-memory instead (their
-    /// stores take byte slices).
-    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
-        (
-            self.params,
-            crate::web_gateway::SpooledBody {
-                tmp: self.tmp,
-                len: self.received_bytes,
-            },
-        )
+    /// handlers read bytes out instead ([`UploadSpool::take_bytes`]).
+    pub(crate) fn into_spooled_body(
+        self,
+    ) -> std::io::Result<(serde_json::Value, crate::web_gateway::SpooledBody)> {
+        let len = self.received_bytes;
+        let tmp = self.spool.into_spooled_tempfile()?;
+        Ok((self.params, crate::web_gateway::SpooledBody { tmp, len }))
     }
 }
 
@@ -3672,17 +3784,61 @@ mod tests {
         params: serde_json::Value,
         bytes: &[u8],
     ) -> InboundUploadState {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.as_file_mut().write_all(bytes).unwrap();
-        tmp.as_file_mut().flush().unwrap();
+        let mut spool = UploadSpool::for_declared_size(bytes.len()).unwrap();
+        spool.append(bytes).unwrap();
+        spool.finish().unwrap();
         InboundUploadState {
             method: method.to_string(),
             params,
-            tmp,
+            spool,
             total_bytes: bytes.len(),
             expected_chunks: if bytes.is_empty() { 0 } else { 1 },
             next_seq: if bytes.is_empty() { 0 } else { 1 },
             received_bytes: bytes.len(),
+        }
+    }
+
+    /// Both spool variants round-trip bytes identically through both
+    /// consumption shapes (take_bytes for the media handlers, the
+    /// SpooledBody tempfile for the commit handlers), and the memory
+    /// threshold routes small payloads off disk.
+    #[test]
+    fn upload_spool_round_trips_both_variants() {
+        for (len, expect_memory) in [
+            (16usize, true),
+            (UPLOAD_MEMORY_SPOOL_MAX_BYTES, true),
+            (UPLOAD_MEMORY_SPOOL_MAX_BYTES + 1, false),
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            assert_eq!(
+                matches!(spool, UploadSpool::Memory(_)),
+                expect_memory,
+                "threshold routing for {len} bytes"
+            );
+            // Chunked appends like the wire delivers them.
+            for chunk in payload.chunks(7 * 1024) {
+                spool.append(chunk).unwrap();
+            }
+            assert_eq!(spool.take_bytes(len).unwrap(), payload);
+
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            for chunk in payload.chunks(7 * 1024) {
+                spool.append(chunk).unwrap();
+            }
+            let mut tmp = spool.into_spooled_tempfile().unwrap();
+            let mut on_disk = Vec::new();
+            tmp.as_file_mut()
+                .seek(std::io::SeekFrom::Start(0))
+                .unwrap();
+            tmp.as_file_mut().read_to_end(&mut on_disk).unwrap();
+            assert_eq!(on_disk, payload);
+
+            // A short payload is caught by the byte-count guard.
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            spool.append(&payload[..len - 1]).unwrap();
+            assert!(spool.take_bytes(len).is_err());
         }
     }
 

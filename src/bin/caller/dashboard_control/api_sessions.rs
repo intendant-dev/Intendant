@@ -921,7 +921,22 @@ pub(crate) async fn api_session_current_upload_task_response(
     // The tunnel edge of the Streaming lane (S8): frame params parsed
     // here in their wire form, the spool handed to the same neutral
     // commit the HTTP staged-upload POST feeds its socket spool.
-    let (params, body) = upload.into_spooled_body();
+    let (params, body) = match upload.into_spooled_body() {
+        Ok(spooled) => spooled,
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("spool upload: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
     let name = optional_string_param(&params, &["name", "filename", "file_name"])
         .unwrap_or_else(|| "upload.bin".to_string());
     let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
@@ -2502,17 +2517,11 @@ mod tests {
         // Tunnel commit: the upload lane's spooled frames end in the
         // same shared neutral fn the HTTP POST runs (difference #3 —
         // only the carriage differs).
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(&payload).unwrap();
-        let upload = InboundUploadState {
-            method: "api_session_current_upload".to_string(),
-            params: serde_json::json!({ "name": "parity.txt", "mime": "text/plain" }),
-            tmp,
-            total_bytes: payload.len(),
-            expected_chunks: 1,
-            next_seq: 1,
-            received_bytes: payload.len(),
-        };
+        let upload = crate::dashboard_control::tests::test_upload_state(
+            "api_session_current_upload",
+            serde_json::json!({ "name": "parity.txt", "mime": "text/plain" }),
+            &payload,
+        );
         let commit = api_session_current_upload_task_response(
             "parity-upload-commit".to_string(),
             upload,

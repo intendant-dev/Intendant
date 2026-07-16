@@ -1058,8 +1058,8 @@ pub(crate) fn control_upload_start_frame(
             "empty upload declared chunks",
         ));
     }
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(tmp) => tmp,
+    let spool = match UploadSpool::for_declared_size(total_bytes) {
+        Ok(spool) => spool,
         Err(e) => {
             return Some(control_upload_error_response(
                 id,
@@ -1081,7 +1081,7 @@ pub(crate) fn control_upload_start_frame(
                 .get("params")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
-            tmp,
+            spool,
             total_bytes,
             expected_chunks,
             next_seq: 0,
@@ -1149,7 +1149,7 @@ pub(crate) fn control_upload_chunk_frame(
             "upload exceeded declared size",
         ));
     }
-    if let Err(e) = upload.tmp.as_file_mut().write_all(&bytes) {
+    if let Err(e) = upload.spool.append(&bytes) {
         inbound_uploads.remove(&id);
         pending_requests.remove(&id);
         return Some(control_upload_error_response(
@@ -1186,7 +1186,7 @@ pub(crate) fn control_upload_end_frame(
         pending_requests.remove(&id);
         return Some(control_upload_error_response(id, 400, "incomplete upload"));
     }
-    if let Err(e) = upload.tmp.as_file_mut().flush() {
+    if let Err(e) = upload.spool.finish() {
         pending_requests.remove(&id);
         return Some(control_upload_error_response(
             id,
