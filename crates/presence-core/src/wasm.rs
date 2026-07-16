@@ -79,8 +79,8 @@ impl WasmPresence {
         let Ok(event_json) = serde_wasm_bindgen::from_value::<serde_json::Value>(event) else {
             return JsValue::NULL;
         };
-        match self.state.update_from_server_event(&event_json) {
-            Some(pe) => JsValue::from_str(&format_event(&pe)),
+        match self.update_from_value(&event_json) {
+            Some(narration) => JsValue::from_str(&narration),
             None => JsValue::NULL,
         }
     }
@@ -114,5 +114,29 @@ impl WasmPresence {
     #[wasm_bindgen]
     pub fn phase(&self) -> String {
         self.state.phase.clone()
+    }
+}
+
+// Rust-native surface (not exported to JS): presence-web's message handler
+// already holds every server message as a parsed `serde_json::Value`, so
+// these twins let it update presence state without the Value → JsValue →
+// Value bounce the `JsValue` entry points pay per event (hot on the
+// per-event path and on multi-MB `presence_welcome` replay bundles).
+impl WasmPresence {
+    /// Rust-native twin of `set_state`: replace the entire agent state from
+    /// an already-parsed JSON value.
+    pub fn set_state_value(&mut self, state: &serde_json::Value) {
+        if let Ok(s) = serde_json::from_value::<AgentStateSnapshot>(state.clone()) {
+            self.state = s;
+        }
+    }
+
+    /// Rust-native twin of `update_from_event`: update state from an
+    /// already-parsed OutboundEvent value. Returns the narration string when
+    /// the event should be narrated to the live model.
+    pub fn update_from_value(&mut self, event_json: &serde_json::Value) -> Option<String> {
+        self.state
+            .update_from_server_event(event_json)
+            .map(|pe| format_event(&pe))
     }
 }

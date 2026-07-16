@@ -136,7 +136,10 @@ impl StationInner {
     /// camera is unchanged, so the cached frame geometry still matches):
     /// the glass frame, label, and every other panel stay as previously
     /// rasterized, and the opaque video pixels overwrite themselves in
-    /// place — no clearing, no translucent-fill accumulation.
+    /// place — no clearing, no translucent-fill accumulation. This is the
+    /// steady-state tick at default visuals: with `motion > 0` the full
+    /// raster runs only at the ambient cadence (`AMBIENT_HUD_INTERVAL_MS`)
+    /// and every other tick lands here.
     pub(crate) fn paint_display_videos(&self) {
         if self.display_sources.is_empty() {
             return;

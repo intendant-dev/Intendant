@@ -545,10 +545,15 @@ struct StationInner {
     raf_pending: bool,
     /// One-shot render latch set by external state changes; see `frame_due`.
     needs_render: bool,
-    /// Timestamp of the previously rendered frame, for frame-rate-independent
-    /// accumulation (auto-orbit drift).
-    last_tick_ms: f64,
     last_present_ms: f64,
+    /// Timestamp of the last full HUD raster; ambient (motion-driven)
+    /// repaints are throttled to `AMBIENT_HUD_INTERVAL_MS` against it.
+    last_full_hud_ms: f64,
+    /// Timestamp of the last auto-orbit application. The drift is stepped
+    /// at the ambient-HUD cadence (not per tick) so the camera signature
+    /// stays stable between ambient paints; dt-scaling against this keeps
+    /// the drift rate unchanged.
+    last_orbit_ms: f64,
     /// Present timestamps within the trailing 2s, for the fps figure in
     /// `debug_state` — the probe-visible render-health eval.
     present_history: Vec<f64>,
@@ -653,8 +658,9 @@ impl StationInner {
             raf_cb: None,
             raf_pending: false,
             needs_render: false,
-            last_tick_ms: 0.0,
             last_present_ms: 0.0,
+            last_full_hud_ms: 0.0,
+            last_orbit_ms: 0.0,
             present_history: Vec::new(),
         };
         inner.rebuild_layout_cache();
@@ -886,9 +892,11 @@ impl StationInner {
     /// configured-but-unpresented WebGPU surface (after a resize, tab switch,
     /// or display grant) reads back as uninitialized GPU memory — visually a
     /// garbage/inverted frame, and ultimately a GPU-process crash. Presenting
-    /// every frame keeps the surface valid. Per-frame cost is bounded by the
-    /// cached layout/targets/fonts and persistent vertex buffers. The 2D-canvas
-    /// fallback has no SharedImage hazard, so it still parks on idle.
+    /// every frame keeps the surface valid, but the keepalive ticks are
+    /// present-only when the scene is static (`render`'s `scene_static`
+    /// path re-presents the persistent vertex buffers without rebuilding or
+    /// re-uploading the frame). The 2D-canvas fallback has no SharedImage
+    /// hazard, so it still parks on idle.
     fn is_animating(&self) -> bool {
         self.active
             && (self.gpu.is_some()
@@ -1014,6 +1022,16 @@ impl StationInner {
         }
     }
 
+    /// Ambient repaint cadence (~10fps): how often the breathing chrome and
+    /// the auto-orbit drift advance while the only animation driver is
+    /// `motion > 0`. Interactive input, explicit state changes, and camera
+    /// moves still repaint at display rate; live video thumbnails refresh
+    /// every tick via `paint_display_videos`. The full Canvas2D HUD raster
+    /// is the dominant per-tick CPU cost on an idle-but-active Station tab,
+    /// and the pulses it animates are slow sinusoids — stepping them at
+    /// ~10fps is visually equivalent at a third of the raster work.
+    const AMBIENT_HUD_INTERVAL_MS: f64 = 100.0;
+
     fn render(&mut self, time_ms: f64) {
         if !self.active {
             return;
@@ -1028,15 +1046,23 @@ impl StationInner {
         // schedule one-shot frames through schedule_frame.
         let anim_ms = if self.motion > 0.0 { time_ms } else { 0.0 };
         let idle_ms = time_ms - self.last_input_ms;
-        // dt-scaled so the drift rate is frame-rate independent (tuned
-        // against the old ~250ms tick); clamped to absorb parked gaps.
-        let dt_ms = (time_ms - self.last_tick_ms).clamp(0.0, 1000.0);
-        self.last_tick_ms = time_ms;
+        let ambient_due = time_ms - self.last_full_hud_ms >= Self::AMBIENT_HUD_INTERVAL_MS;
+        // Ambient auto-orbit drift, stepped at the ambient-HUD cadence so
+        // the camera (and everything anchored to it) stays put between
+        // ambient repaints. dt-scaled against the last application so the
+        // drift rate is cadence-independent (tuned against the old ~250ms
+        // tick); clamped to absorb parked gaps.
         if self.motion > 0.0 && idle_ms > 2400.0 {
-            self.yaw -= 0.000055
-                * self.motion
-                * (idle_ms.min(5000.0) as f32 / 1000.0)
-                * (dt_ms as f32 / 250.0);
+            if ambient_due {
+                let orbit_dt = (time_ms - self.last_orbit_ms).clamp(0.0, 1000.0);
+                self.yaw -= 0.000055
+                    * self.motion
+                    * (idle_ms.min(5000.0) as f32 / 1000.0)
+                    * (orbit_dt as f32 / 250.0);
+                self.last_orbit_ms = time_ms;
+            }
+        } else {
+            self.last_orbit_ms = time_ms;
         }
         if let Some(focus_id) = self.focus_id.take() {
             if let Some(pos) = self.layout_cache.get(&focus_id).copied() {
@@ -1053,14 +1079,51 @@ impl StationInner {
             self.targets_dirty = false;
         }
 
-        self.build_frame(anim_ms, time_ms);
+        // HUD repaint split: the full HUD (vignette, panels, text, chrome)
+        // is rasterized only when something it shows could have changed —
+        // explicit state (`hud_dirty`), the interactive input window (drag /
+        // hover feedback), a camera move (thumbnails, compass, and
+        // node-anchored chrome track it), or — throttled to the ambient
+        // cadence — the breathing chrome that `motion > 0` animates. On the
+        // other ticks only live video thumbnail pixels are refreshed over
+        // the previously drawn HUD — that turns the steady-state
+        // "monitoring a display" cost from a full-canvas repaint into N
+        // small drawImage calls. The WebGPU-failed underlay mode paints the
+        // scene on the HUD canvas, so it always repaints fully.
+        let camera_sig = (self.yaw, self.pitch, self.distance, self.ar_x, self.ar_y);
+        let scene_on_hud = self.gpu.is_none() && self.scene_ctx.is_none();
+        let full_hud = self.hud_dirty
+            || idle_ms < 150.0
+            || self.hud_camera_sig != Some(camera_sig)
+            || scene_on_hud
+            || (self.motion > 0.0 && ambient_due);
+
+        // Scene rebuild split: with motion at zero every ambient phase is
+        // frozen, so between state changes the built frame is byte-identical
+        // — skip the rebuild and vertex re-upload and just re-present the
+        // persistent GPU buffers (the WebGPU loop keeps presenting for
+        // surface keepalive; see `is_animating`). Every scene-affecting
+        // input routes through `hud_dirty` (snapshot, layout, visuals,
+        // selection, sources, resize), the camera signature, the
+        // interactive window, or live particles; world panes can carry
+        // per-second content (cache TTL countdown), so a visible pane keeps
+        // the rebuild on.
+        let scene_static = self.motion <= 0.0
+            && !full_hud
+            && self.particles.is_empty()
+            && self.gpu.is_some()
+            && !self.pane_content_live();
+
+        if !scene_static {
+            self.build_frame(anim_ms, time_ms);
+        }
         if let Some(gpu) = self.gpu.as_mut() {
             // The canvas backing store can be resized by JS (or by a missed
             // resize event) after the surface was configured; presenting at a
             // stale size makes every frame's swapchain texture invalid. The
             // attribute reads are layout-free, so guard each frame.
             gpu.resize(self.scene_canvas.width(), self.scene_canvas.height());
-            if let Err(err) = gpu.render(&self.frame, self.text_atlas.as_ref()) {
+            if let Err(err) = gpu.render(&self.frame, self.text_atlas.as_ref(), !scene_static) {
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
                 )));
@@ -1069,31 +1132,27 @@ impl StationInner {
             self.draw_scene_lines(scene_ctx);
         }
 
-        // HUD repaint split: the full HUD (vignette, panels, text, chrome)
-        // is rasterized only when something it shows could have changed —
-        // explicit state (`hud_dirty`), the interactive input window (drag /
-        // hover feedback), ambient animation (`motion > 0` drives breathing
-        // chrome and orbit drift), or a camera move (thumbnails, compass,
-        // and node-anchored chrome track it). When only live video
-        // thumbnails are animating, just their pixels are refreshed over
-        // the previously drawn HUD — that turns the steady-state
-        // "monitoring a display" cost from a full-canvas repaint into N
-        // small drawImage calls. The WebGPU-failed underlay mode paints the
-        // scene on the HUD canvas, so it always repaints fully.
-        let camera_sig = (self.yaw, self.pitch, self.distance, self.ar_x, self.ar_y);
-        let scene_on_hud = self.gpu.is_none() && self.scene_ctx.is_none();
-        let full_hud = self.hud_dirty
-            || self.motion > 0.0
-            || idle_ms < 150.0
-            || self.hud_camera_sig != Some(camera_sig)
-            || scene_on_hud;
         if full_hud {
             self.draw_hud(anim_ms);
             self.hud_dirty = false;
             self.hud_camera_sig = Some(camera_sig);
+            self.last_full_hud_ms = time_ms;
         } else {
             self.paint_display_videos();
         }
+    }
+
+    /// True when a world pane with time-varying content is being drawn:
+    /// the selected agent's focus pane re-derives its rows against the
+    /// current epoch second (cache TTL countdown), so the scene must keep
+    /// rebuilding while one is visible. Mirrors `build_frame`'s pane gate.
+    fn pane_content_live(&self) -> bool {
+        self.panes_enabled
+            && self.css_width() >= 820.0
+            && self
+                .selected_id
+                .as_ref()
+                .is_some_and(|id| self.snapshot.agents.iter().any(|a| &a.id == id))
     }
 
     fn activity_event(&self, event_id: &str) -> Option<StationEvent> {

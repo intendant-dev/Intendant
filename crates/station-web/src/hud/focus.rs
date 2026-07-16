@@ -1016,38 +1016,21 @@ impl StationInner {
             ),
             C_IRIS_CSS,
         );
-        let cpu_pct = (host.cpu / 100.0).clamp(0.0, 1.0);
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "cpu",
-            &pct_label(cpu_pct),
-            pressure_color(cpu_pct),
-        );
-        self.meter(
-            x + 156.0,
-            row_y - 12.0,
-            panel_w - 176.0,
-            cpu_pct,
-            pressure_color(cpu_pct),
-        );
-        let mem_pct = (host.mem / 100.0).clamp(0.0, 1.0);
-        row_y = self.focus_row(
-            x,
-            row_y,
-            panel_w,
-            "memory",
-            &pct_label(mem_pct),
-            pressure_color(mem_pct),
-        );
-        self.meter(
-            x + 156.0,
-            row_y - 12.0,
-            panel_w - 176.0,
-            mem_pct,
-            pressure_color(mem_pct),
-        );
+        // Metrics without a real reading render as "n/a" with an empty
+        // meter track — never as a fabricated percentage.
+        let metric_row = |metric: Option<f32>| match metric {
+            Some(v) => {
+                let pct = (v / 100.0).clamp(0.0, 1.0);
+                (pct_label(pct), pressure_color(pct), pct)
+            }
+            None => ("n/a".to_string(), C_TEXT2_CSS, 0.0),
+        };
+        let (cpu_text, cpu_color, cpu_pct) = metric_row(host.cpu);
+        row_y = self.focus_row(x, row_y, panel_w, "cpu", &cpu_text, cpu_color);
+        self.meter(x + 156.0, row_y - 12.0, panel_w - 176.0, cpu_pct, cpu_color);
+        let (mem_text, mem_color, mem_pct) = metric_row(host.mem);
+        row_y = self.focus_row(x, row_y, panel_w, "memory", &mem_text, mem_color);
+        self.meter(x + 156.0, row_y - 12.0, panel_w - 176.0, mem_pct, mem_color);
         let agents = self
             .snapshot
             .agents
