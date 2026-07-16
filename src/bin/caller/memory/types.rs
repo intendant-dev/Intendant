@@ -9,17 +9,29 @@ pub(crate) fn hex32(b: &[u8; 32]) -> String {
 
 /// Arguments for a `propose` (claim authoring). The service maps
 /// `kind`/`sensitivity` onto the kernel's closed vocabularies and
-/// rejects unknown words — never a defaulted or downgraded value.
-#[derive(Debug, Clone)]
+/// rejects unknown words — never a silently coerced value. One
+/// documented SERVICE default (stated in every schema and help text,
+/// and echoed back on the view): a surface that omits `sensitivity`
+/// proposes at `private`. The kernel itself never defaults.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProposeArgs {
     pub kind: String,
     pub statement: String,
     /// Writer's sensitivity claim (a claim, never export authority).
+    #[serde(default = "default_sensitivity")]
     pub sensitivity: String,
+    #[serde(default)]
     pub session: Option<String>,
+    #[serde(default)]
     pub project: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
     pub labels: Vec<String>,
+}
+
+fn default_sensitivity() -> String {
+    "private".into()
 }
 
 /// Bounded search arguments (§6.5: bounded retrieval, candidates

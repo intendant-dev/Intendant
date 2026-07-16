@@ -131,7 +131,12 @@ pub(crate) struct EphemeralPlane {
     pub home_space: [u8; 16],
     #[allow(dead_code)]
     pub audit_space: [u8; 16],
+    /// Held for post-genesis CONTROL ops (space creation, grants,
+    /// curation ceremonies — later P1 slices); the genesis itself is
+    /// sealed inside [`Self::bootstrap`].
+    #[allow(dead_code)]
     root_seed: [u8; 32],
+    #[allow(dead_code)]
     pub root_pk: [u8; 32],
     pub dev: WriterDevice,
     grant: Grant,

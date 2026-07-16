@@ -858,6 +858,36 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::MemorySearch => {
+                return handle_memory_search(
+                    stream,
+                    request_line,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::MemoryClaim => {
+                return handle_memory_claim(
+                    stream,
+                    request_line,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::MemoryPropose => {
+                return handle_memory_propose(
+                    stream,
+                    route_body,
+                    mcp_server,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::CurrentRedo => {
                 return handle_current_redo(
                     stream,
