@@ -266,6 +266,13 @@ html.ui-v2 .agenda-card-row-title {
   cursor: pointer;
 }
 html.ui-v2 .agenda-card-row-title:hover { color: var(--text); }
+html.ui-v2 .agenda-card-row-who {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
 html.ui-v2 .agenda-card-more,
 html.ui-v2 .agenda-card-empty {
   font-size: 11px;

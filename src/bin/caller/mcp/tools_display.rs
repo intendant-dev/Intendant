@@ -1861,7 +1861,10 @@ mod tests {
                     }),
                     Some("session-a"),
                     None,
-                    ToolCallerTrust::OwnerSurface,
+                    ToolCaller {
+                        trust: ToolCallerTrust::OwnerSurface,
+                        actor: crate::access::actor::ActorBinding::unattributed(),
+                    },
                 )
                 .await
                 .expect("tool should dispatch");
@@ -2479,7 +2482,10 @@ mod tests {
                     serde_json::json!({ "display_id": 2 }),
                     Some("managed-session"),
                     Some(true),
-                    ToolCallerTrust::OwnerSurface,
+                    ToolCaller {
+                        trust: ToolCallerTrust::OwnerSurface,
+                        actor: crate::access::actor::ActorBinding::unattributed(),
+                    },
                 )
                 .await
                 .expect("grant_user_display should route");
@@ -2723,7 +2729,10 @@ mod tests {
                     serde_json::json!({ "display_id": 0 }),
                     Some("managed-session"),
                     Some(true),
-                    ToolCallerTrust::OwnerSurface,
+                    ToolCaller {
+                        trust: ToolCallerTrust::OwnerSurface,
+                        actor: crate::access::actor::ActorBinding::unattributed(),
+                    },
                 )
                 .await
                 .expect("grant_user_display should route");
