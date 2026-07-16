@@ -250,6 +250,9 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
+        "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
+        "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
+        "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
         "api_session_current_uploads" => api_session_current_uploads_response(id, &runtime).await,
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
@@ -1211,6 +1214,69 @@ pub(crate) async fn api_agenda_op_response(
         )
         .await,
         "agenda op",
+    )
+}
+
+/// Tunnel twin of `GET /api/memory/search` — args ride `params`.
+pub(crate) async fn api_memory_search_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let args = crate::memory::SearchArgs {
+        query: params
+            .and_then(|p| p.get("q").or_else(|| p.get("query")))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        limit: params
+            .and_then(|p| p.get("limit"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(10),
+        include_candidates: params
+            .and_then(|p| p.get("candidates").or_else(|| p.get("include_candidates")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    };
+    frame_api_response(
+        id,
+        crate::web_gateway::memory_search_api_response(runtime.mcp_server.as_ref(), &args).await,
+        "memory search",
+    )
+}
+
+/// Tunnel twin of `GET /api/memory/claim` — the id rides `params`.
+pub(crate) async fn api_memory_claim_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let claim_id = params
+        .and_then(|p| p.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    frame_api_response(
+        id,
+        crate::web_gateway::memory_claim_api_response(runtime.mcp_server.as_ref(), &claim_id).await,
+        "memory claim",
+    )
+}
+
+/// Tunnel twin of `POST /api/memory/propose` — the proposal rides
+/// `params` (the same JSON shape as the HTTP body).
+pub(crate) async fn api_memory_propose_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::memory_propose_api_response(&body_text, runtime.mcp_server.as_ref())
+            .await,
+        "memory propose",
     )
 }
 

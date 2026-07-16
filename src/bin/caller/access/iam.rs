@@ -2395,6 +2395,8 @@ fn permission_label(id: &str) -> &'static str {
         "filesystem.write" => "Filesystem write",
         "agenda.read" => "Agenda read",
         "agenda.write" => "Agenda write",
+        "memory.read" => "Memory read",
+        "memory.write" => "Memory propose",
         _ => "Permission",
     }
 }
@@ -2438,6 +2440,8 @@ fn permission_summary(id: &str) -> &'static str {
         "filesystem.write" => "Create directories or write uploaded file content.",
         "agenda.read" => "Read the daemon's agenda ledger (parked items and counts).",
         "agenda.write" => "Park, edit, complete, reopen, and retire agenda items.",
+        "memory.read" => "Search and read Memory claims (bounded, provenance-labeled).",
+        "memory.write" => "Propose Memory claims (the candidate lane; ephemeral in P1.1).",
         _ => "Operation permission.",
     }
 }
@@ -2965,6 +2969,8 @@ pub fn operation_permission_id(op: crate::access::access_policy::PeerOperation) 
         PeerOperation::FilesystemWrite => "filesystem.write",
         PeerOperation::AgendaRead => "agenda.read",
         PeerOperation::AgendaWrite => "agenda.write",
+        PeerOperation::MemoryRead => "memory.read",
+        PeerOperation::MemoryWrite => "memory.write",
     }
 }
 
@@ -3174,6 +3180,8 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 // Observing the daemon includes seeing what's parked on
                 // its agenda — read only.
                 "agenda.read".to_string(),
+                // Memory: observers may search/read, never propose.
+                "memory.read".to_string(),
             ],
             source: "builtin".to_string(),
         },
@@ -3286,6 +3294,8 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "filesystem.write".to_string(),
                 "agenda.read".to_string(),
                 "agenda.write".to_string(),
+                "memory.read".to_string(),
+                "memory.write".to_string(),
             ],
             source: "builtin".to_string(),
         },
@@ -3318,6 +3328,8 @@ fn root_permission_ids() -> Vec<String> {
         "filesystem.write",
         "agenda.read",
         "agenda.write",
+        "memory.read",
+        "memory.write",
     ]
     .iter()
     .map(|permission| (*permission).to_string())

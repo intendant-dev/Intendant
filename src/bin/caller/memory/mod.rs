@@ -23,9 +23,10 @@
 //! identifiers, so the cutover's exact-denylist CI absence test stays
 //! exact while the two coexist.
 
+pub(crate) mod handle;
 pub(crate) mod plane;
 pub(crate) mod service;
 pub(crate) mod types;
 
-#[allow(unused_imports)]
-pub(crate) use service::MemoryService;
+pub(crate) use handle::MemoryHandle;
+pub(crate) use types::{MemoryError, ProposeArgs, SearchArgs};
