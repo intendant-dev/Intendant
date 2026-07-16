@@ -154,6 +154,12 @@ impl ActorBinding {
     /// possession, or root-equivalent process-token possession naming a
     /// session) — never a bare request field. Authenticated-edge use only,
     /// per the module contract.
+    ///
+    /// Classification order: the gates' own `authn` statements first —
+    /// several gate constructors derive from `root_dashboard_session`
+    /// (whose `kind` stays `root_session`) and state the real class in the
+    /// authn record they push (`agent_session`, `loopback_mcp`) — then the
+    /// principal `kind` for everything that names its class directly.
     pub fn from_principal(
         principal: &crate::access::iam::AccessPrincipal,
         gate_session: Option<String>,
@@ -161,6 +167,21 @@ impl ActorBinding {
         let id = Some(principal.id.clone());
         if let Some(session_id) = gate_session {
             return Self::agent_session(id, session_id);
+        }
+        let authn_kind = |wanted: &str| {
+            principal.authn.iter().any(|statement| {
+                statement.get("kind").and_then(serde_json::Value::as_str) == Some(wanted)
+            })
+        };
+        if authn_kind("loopback_mcp") {
+            return Self::local_process(id);
+        }
+        if authn_kind("agent_session") {
+            return Self {
+                kind: ActorKind::AgentSession,
+                principal_id: id,
+                session_id: None,
+            };
         }
         match principal.kind.as_str() {
             // An agent-session principal without a gate-bound session id
@@ -216,6 +237,32 @@ mod tests {
         let agent = ActorBinding::agent_session(None, "sess-1".into());
         assert_eq!(agent.session_id.as_deref(), Some("sess-1"));
         assert_eq!(agent.kind, ActorKind::AgentSession);
+    }
+
+    /// Gate constructors that derive from `root_dashboard_session` keep
+    /// `kind: root_session` and state their real class in the authn
+    /// record — classification must read it (live bug: a bare-ctl
+    /// loopback write recorded `dashboard` instead of `local_process`).
+    #[test]
+    fn root_derived_principals_classify_by_authn_statement() {
+        let loopback = crate::access::iam::AccessPrincipal::local_loopback_mcp_default("http");
+        let actor = ActorBinding::from_principal(&loopback, None);
+        assert_eq!(actor.kind, ActorKind::LocalProcess);
+        assert_eq!(actor.principal_id.as_deref(), Some(loopback.id.as_str()));
+
+        let session = crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+            "sess-x", "http", true,
+        );
+        // Even without a gate-bound sid, the class stays agent-session.
+        let actor = ActorBinding::from_principal(&session, None);
+        assert_eq!(actor.kind, ActorKind::AgentSession);
+        assert_eq!(actor.session_id, None);
+
+        // The genuine trusted-local dashboard stays a dashboard actor.
+        let dashboard =
+            crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https");
+        let actor = ActorBinding::from_principal(&dashboard, None);
+        assert_eq!(actor.kind, ActorKind::Dashboard);
     }
 
     /// In-process plumbing serialization round-trips; the shape is NOT a
