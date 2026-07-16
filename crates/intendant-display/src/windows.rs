@@ -1149,6 +1149,14 @@ fn run_dxgi_capture(
     // Consecutive hard errors before giving up (display gone, device removed).
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 60;
+    // Heartbeat cadence for WAIT_TIMEOUT re-emission. Matches the pool
+    // bridge's 1s IDLE_HEARTBEAT: re-emitting the cached frame at every
+    // capture tick made an *idle* desktop look like a 30fps stream to
+    // everything downstream (a fresh multi-MB clone per tick, then full
+    // convert + hash + encode per re-emit), defeating the idle gates
+    // that make macOS/Wayland idle sessions nearly free.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut last_emit_at = std::time::Instant::now();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -1186,15 +1194,20 @@ fn run_dxgi_capture(
 
                 // Cache a clone for heartbeat re-emission, then send.
                 last_frame = Some(clone_frame(&frame));
+                last_emit_at = std::time::Instant::now();
                 let _ = tx.try_send(frame);
             }
             Ok(None) => {
-                // WAIT_TIMEOUT: desktop unchanged. Re-emit the last frame with
-                // a fresh timestamp so the encoder's freshness clock advances.
-                if let Some(prev) = &last_frame {
-                    let mut hb = clone_frame(prev);
-                    hb.timestamp = std::time::Instant::now();
-                    let _ = tx.try_send(hb);
+                // WAIT_TIMEOUT: desktop unchanged. Re-emit the last frame
+                // with a fresh timestamp so the encoder's freshness clock
+                // advances — but at the 1s heartbeat cadence, not per tick.
+                if last_emit_at.elapsed() >= HEARTBEAT_INTERVAL {
+                    if let Some(prev) = &last_frame {
+                        let mut hb = clone_frame(prev);
+                        hb.timestamp = std::time::Instant::now();
+                        last_emit_at = hb.timestamp;
+                        let _ = tx.try_send(hb);
+                    }
                 }
             }
             Err(CaptureError::AccessLost) => {
@@ -1922,37 +1935,58 @@ fn run_gdi_capture(
     let mut frame_count: u64 = 0;
     let mut consecutive_errors: u32 = 0;
     const MAX_CONSECUTIVE_ERRORS: u32 = 60;
+    // Re-resolve the capture rect every N healthy iterations (mirrors
+    // the X11 backend's GEOMETRY_CHECK_INTERVAL): resolving display
+    // topology per iteration was a per-frame syscall spent re-learning
+    // a value that changes on the order of monitor re-arranges.
+    const GEOMETRY_CHECK_INTERVAL: u64 = 60;
+    // Error-path heartbeat cadence — matches the pool bridge's 1s
+    // IDLE_HEARTBEAT (see run_dxgi_capture) so a transient error storm
+    // re-emits the cached frame once a second, not per retry.
+    const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    let mut last_emit_at = std::time::Instant::now();
+    let mut loop_iter: u64 = 0;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
         let start = std::time::Instant::now();
+        loop_iter = loop_iter.wrapping_add(1);
 
         // Detect a primary-resolution change and rebuild the cached resources.
         // For a targeted output we re-resolve its rect too, so a monitor
-        // re-arrange / mode switch is picked up.
-        if let Ok((nx, ny, nw, nh)) = resolve_capture_rect(target_output) {
-            if nw != capture.width || nh != capture.height || nx != rect_x || ny != rect_y {
-                match GdiCapture::new(nx, ny, nw, nh) {
-                    Ok(c) => {
-                        eprintln!(
-                            "[display/windows] GDI resize: {}x{} -> {nw}x{nh}",
-                            capture.width, capture.height,
-                        );
-                        capture = c;
-                        rect_x = nx;
-                        rect_y = ny;
-                        shared_width.store(nw, Ordering::SeqCst);
-                        shared_height.store(nh, Ordering::SeqCst);
-                        // Keep the capture-rect origin current too, so input
-                        // injection follows a monitor re-arrange / mode switch.
-                        shared_left.store(nx, Ordering::SeqCst);
-                        shared_top.store(ny, Ordering::SeqCst);
-                        last_frame = None;
-                    }
-                    Err(e) => {
-                        eprintln!("[display/windows] GDI resize rebuild failed: {e}");
+        // re-arrange / mode switch is picked up. Checked on an
+        // iteration cadence while healthy — but on EVERY iteration of
+        // an error streak: a display-mode switch is exactly what makes
+        // `capture.grab()`'s BitBlt fail persistently, and errors don't
+        // advance `frame_count`, so a frame-count gate would never
+        // re-resolve and the thread would ride the streak to the
+        // 60-error give-up. Error iterations sleep 100ms, so the
+        // re-resolve syscall is off the hot path there by construction.
+        if consecutive_errors > 0 || loop_iter.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
+            if let Ok((nx, ny, nw, nh)) = resolve_capture_rect(target_output) {
+                if nw != capture.width || nh != capture.height || nx != rect_x || ny != rect_y {
+                    match GdiCapture::new(nx, ny, nw, nh) {
+                        Ok(c) => {
+                            eprintln!(
+                                "[display/windows] GDI resize: {}x{} -> {nw}x{nh}",
+                                capture.width, capture.height,
+                            );
+                            capture = c;
+                            rect_x = nx;
+                            rect_y = ny;
+                            shared_width.store(nw, Ordering::SeqCst);
+                            shared_height.store(nh, Ordering::SeqCst);
+                            // Keep the capture-rect origin current too, so input
+                            // injection follows a monitor re-arrange / mode switch.
+                            shared_left.store(nx, Ordering::SeqCst);
+                            shared_top.store(ny, Ordering::SeqCst);
+                            last_frame = None;
+                        }
+                        Err(e) => {
+                            eprintln!("[display/windows] GDI resize rebuild failed: {e}");
+                        }
                     }
                 }
             }
@@ -1995,16 +2029,21 @@ fn run_gdi_capture(
                 }
 
                 last_frame = Some(clone_frame(&frame));
+                last_emit_at = std::time::Instant::now();
                 let _ = tx.try_send(frame);
             }
             Err(e) => {
                 consecutive_errors += 1;
                 eprintln!("[display/windows] GDI capture error ({consecutive_errors}): {e}");
-                // Keep the encoder's heartbeat alive with the last good frame.
-                if let Some(prev) = &last_frame {
-                    let mut hb = clone_frame(prev);
-                    hb.timestamp = std::time::Instant::now();
-                    let _ = tx.try_send(hb);
+                // Keep the encoder's heartbeat alive with the last good
+                // frame — at the 1s heartbeat cadence, not per retry.
+                if last_emit_at.elapsed() >= HEARTBEAT_INTERVAL {
+                    if let Some(prev) = &last_frame {
+                        let mut hb = clone_frame(prev);
+                        hb.timestamp = std::time::Instant::now();
+                        last_emit_at = hb.timestamp;
+                        let _ = tx.try_send(hb);
+                    }
                 }
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
                     eprintln!("[display/windows] GDI giving up after {consecutive_errors} errors",);

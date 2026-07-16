@@ -149,6 +149,84 @@ const UDP_BUF_LEN: usize = 2000;
 /// memory allocation from a malicious peer.
 const TCP_MAX_FRAME_LEN: usize = 65535;
 
+/// Latest-wins hand-off slot for **complete** tile-snapshot groups,
+/// shared between one peer's [`WebRtcPeer`] handle (producer side) and
+/// its driver task (consumer side).
+///
+/// Snapshot groups deliberately bypass the ordinary bounded command
+/// channel: each group owns every wire chunk of one snapshot (multi-MB),
+/// and a command queue of them retains up to its capacity in full
+/// generations — plus unboundedly more in any producer tasks parked on
+/// a full channel's `send().await`. This slot caps retention at **one
+/// group by construction**: `publish` is a synchronous replace (never
+/// an await holding a group), and the id-newest group supersedes any
+/// unconsumed one — correct, because a snapshot is a full-screen
+/// baseline and only the newest matters. Per peer, retention is ≤1
+/// group per stage (this mailbox + the driver's pre-open store), ≤2
+/// total during the hand-off window, both stages superseded
+/// latest-wins. Admission (the driver's persisted watermark) still
+/// gates at consume time.
+///
+/// A producer cancelled mid-encode never calls `publish`, so — like the
+/// downstream pre-open queue — this slot can never hold a partial group.
+pub(crate) struct SnapshotMailbox {
+    /// The newest unconsumed complete group: `(snapshot_id, chunks)`.
+    slot: std::sync::Mutex<Option<(u32, Vec<bytes::Bytes>)>>,
+    /// Wakes the driver's drain arm. `notify_one` stores a permit when
+    /// no drain is waiting, so a publish that lands before the driver
+    /// reaches its select loop is not lost.
+    notify: tokio::sync::Notify,
+}
+
+impl SnapshotMailbox {
+    pub(crate) fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Publish one complete group and wake the driver. Synchronous by
+    /// design — see the type docs.
+    ///
+    /// **Id-latest, not arrival-latest:** producers mint their
+    /// snapshot id *before* the (async, blocking-pool) encode, and run
+    /// as independent tasks, so completion order can invert id order —
+    /// a slow older snapshot must not overwrite a faster newer one
+    /// that may be the only correct-epoch baseline (e.g. right after a
+    /// resize). An incoming group at or below the resident id is
+    /// dropped here; the resident group's own `notify_one` permit is
+    /// still pending, so no extra wake is needed.
+    pub(crate) fn publish(&self, snapshot_id: u32, chunks: Vec<bytes::Bytes>) {
+        {
+            let mut slot = self
+                .slot
+                .lock()
+                .expect("snapshot mailbox mutex poisoned (no panics hold it)");
+            if let Some((resident_id, _)) = slot.as_ref() {
+                if snapshot_id <= *resident_id {
+                    return;
+                }
+            }
+            *slot = Some((snapshot_id, chunks));
+        }
+        self.notify.notify_one();
+    }
+
+    /// Take the pending group, if any.
+    pub(crate) fn take(&self) -> Option<(u32, Vec<bytes::Bytes>)> {
+        self.slot
+            .lock()
+            .expect("snapshot mailbox mutex poisoned (no panics hold it)")
+            .take()
+    }
+
+    /// Wait until a publish has occurred since the last drain.
+    pub(crate) async fn ready(&self) {
+        self.notify.notified().await;
+    }
+}
+
 /// Public handle to a single WebRTC peer.
 ///
 /// All operations route to the driver task via channels; the driver owns the
@@ -157,6 +235,9 @@ pub struct WebRtcPeer {
     #[allow(dead_code)]
     pub peer_id: PeerId,
     command_tx: mpsc::Sender<Command>,
+    /// Latest-wins snapshot hand-off to this peer's driver — see
+    /// [`SnapshotMailbox`] for why snapshots do not ride `command_tx`.
+    snapshot_mailbox: Arc<SnapshotMailbox>,
     /// Live capability gate for both directions of clipboard sync. Display
     /// viewing alone must not disclose or mutate the host clipboard; callers
     /// bind this to the same authority that admits interactive display input.
@@ -377,6 +458,7 @@ impl WebRtcPeer {
         Self {
             peer_id,
             command_tx,
+            snapshot_mailbox: Arc::new(SnapshotMailbox::new()),
             clipboard_authorized: crate::BrowserInputAuthorization::new(Arc::new(|| true)),
             interactive_source: None,
             observed_send_bitrate_rx,
@@ -581,12 +663,22 @@ pub(crate) enum Command {
         display_id: u32,
         state: DisplayInputAuthorityState,
     },
-    /// D-3b: binary tile-stream frame. Control/snapshot frames queue
-    /// until their reliable data channel opens; delta frames are
-    /// latest-wins and are dropped when the channel is unavailable.
+    /// D-3b: binary tile-stream frame for the **control** and
+    /// **deltas** channels. Control frames queue until their reliable
+    /// data channel opens; delta frames are latest-wins and are
+    /// dropped when the channel is unavailable. `Bytes` end-to-end:
+    /// one wire frame is encoded once and fanned out to every
+    /// subscriber as refcount bumps; the only remaining copy is rtc's
+    /// `BytesMut` boundary at the datachannel write.
+    ///
+    /// Snapshot chunks do NOT travel through this command — a snapshot
+    /// is only decodable as a complete chunk set, so it crosses the
+    /// boundary atomically via the peer's [`SnapshotMailbox`]; a
+    /// per-chunk snapshot path would let a cancelled producer publish
+    /// a partial (unassemblable) baseline into the pre-open queue.
     SendTileFrame {
         channel: TileDataChannel,
-        data: Vec<u8>,
+        data: bytes::Bytes,
     },
 }
 

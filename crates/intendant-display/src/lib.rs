@@ -276,7 +276,11 @@ pub enum FrameFormat {
 /// sets, not just codec names.
 #[derive(Clone)]
 pub struct EncodedFrame {
-    pub data: Vec<u8>,
+    /// Encoded payload. `Bytes` (not `Vec<u8>`) so the per-peer WebRTC
+    /// drivers can hand the payload to the RTP packetizer with a
+    /// refcount bump instead of copying the whole frame once per peer
+    /// per frame.
+    pub data: bytes::Bytes,
     pub pts_ms: u64,
     pub duration_ms: u64,
     pub is_keyframe: bool,
@@ -713,7 +717,11 @@ pub struct DisplayMetricsCounters {
     pub tile_dirty_tiles: AtomicU64,
     /// Sum of dirty fractions in parts-per-million for averaging.
     pub tile_dirty_fraction_ppm_sum: AtomicU64,
-    /// Dirty tile updates skipped by the source cadence cap.
+    /// Capture ticks the delta cadence gate deferred while known
+    /// (OS-reported or in-frame) damage was pending. On platforms
+    /// using the frame-diff fallback the diff itself runs at the
+    /// delta cadence, so deferred ticks there carry no known damage
+    /// and are not counted.
     pub tile_delta_cadence_skips: AtomicU64,
     /// Tile records packed into delta frames.
     pub tile_delta_records: AtomicU64,
@@ -1180,12 +1188,25 @@ pub struct DisplaySession {
 
 /// Convert one BGRA frame to I420 for the pool-feed bridge.
 ///
-/// Phase 0 visual-freshness stamps are applied later, at pool send/encoder
-/// time, so heartbeat re-sends of a static desktop still carry a fresh marker
-/// timestamp and downscaled layers get a marker in their final output
-/// resolution.
-fn convert_for_pool_feed(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
-    let i420 = encode::bgra_to_i420(bgra, width, height, stride);
+/// Phase 0 visual-freshness stamps are applied later, at pool *push* time
+/// (into a per-push copy of the cached buffer), so heartbeat re-sends of a
+/// static desktop still carry a fresh marker timestamp; encoder threads
+/// re-stamp only after per-layer downscale so shrunken markers are redrawn
+/// at final output resolution.
+///
+/// `reuse` is a retired I420 buffer to convert into (pass an empty
+/// `Vec` when none is available) — the bridge recycles buffers whose
+/// broadcast refcount has drained so the steady state performs no
+/// multi-MB allocation per frame.
+fn convert_for_pool_feed(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    reuse: Vec<u8>,
+) -> Vec<u8> {
+    let mut i420 = reuse;
+    encode::bgra_to_i420_into(bgra, width, height, stride, &mut i420);
 
     // Windows black-frame diagnostic (hop A of the capture → encoder chain):
     // log the average byte of the BGRA going INTO bgra_to_i420 and the I420
@@ -1396,29 +1417,33 @@ fn make_damage_backend(
     Box::new(capture::damage::NullDamageBackend::new(width, height))
 }
 
-async fn send_tile_snapshot_to_peer(
-    peer: Arc<webrtc::WebRtcPeer>,
+/// Encode a full-screen tile snapshot into wire frames **once**; the
+/// caller fans the refcounted frames out to any number of peers. The
+/// raw-copy + RLE + lossless-WebP encode of the whole screen is the
+/// expensive part of a snapshot, and it is identical for every peer —
+/// per-peer re-encoding scaled that cost with viewer count.
+///
+/// Returns `None` (after logging) when encoding or packing fails.
+/// Records one `record_tile_snapshot_source` sample per snapshot
+/// encoded (not per peer served — the counters measure generated wire
+/// frames/bytes).
+async fn encode_tile_snapshot_frames(
     frame: Arc<Frame>,
     epoch: u32,
     snapshot_id: u32,
     visual_marker_value: Option<u32>,
-    counters: Arc<DisplayMetricsCounters>,
-) {
-    let Some(grid) = tile_grid_for_frame(&frame) else {
-        return;
-    };
-    let encode_result = tokio::task::spawn_blocking({
-        let frame = Arc::clone(&frame);
-        move || {
-            let records = encode_tile_records(&frame, all_tile_ids(&grid), visual_marker_value)?;
-            Ok::<_, tile::encode::TileEncodeError>((grid, records))
-        }
+    counters: &DisplayMetricsCounters,
+) -> Option<Vec<bytes::Bytes>> {
+    let grid = tile_grid_for_frame(&frame)?;
+    let encode_result = tokio::task::spawn_blocking(move || {
+        let records = encode_tile_records(&frame, all_tile_ids(&grid), visual_marker_value)?;
+        Ok::<_, tile::encode::TileEncodeError>((grid, records))
     })
     .await;
 
     let Ok(Ok((grid, records))) = encode_result else {
         eprintln!("[display/tile] snapshot tile encode failed");
-        return;
+        return None;
     };
 
     let record_count = records.len();
@@ -1433,24 +1458,52 @@ async fn send_tile_snapshot_to_peer(
         Ok(frames) => frames,
         Err(e) => {
             eprintln!("[display/tile] snapshot pack failed: {e}");
-            return;
+            return None;
         }
     };
 
-    let frame_count = frames.len();
+    let mut out = Vec::with_capacity(frames.len());
     let mut byte_count = 0usize;
     for frame in frames {
         match tile::transport::encode_frame(&frame) {
             Ok(bytes) => {
                 byte_count = byte_count.saturating_add(bytes.len());
-                if let Err(e) = peer.send_tile_snapshot_frame(bytes).await {
-                    eprintln!("[display/tile] send snapshot failed: {e}");
-                }
+                out.push(bytes::Bytes::from(bytes));
             }
             Err(e) => eprintln!("[display/tile] snapshot wire encode failed: {e}"),
         }
     }
-    counters.record_tile_snapshot_source(record_count, frame_count, byte_count);
+    counters.record_tile_snapshot_source(record_count, out.len(), byte_count);
+    Some(out)
+}
+
+/// Publish already-encoded snapshot wire frames to one peer as one
+/// **complete group** (refcount bumps per chunk; see
+/// [`encode_tile_snapshot_frames`]). Synchronous latest-wins hand-off:
+/// the producer never awaits while holding a group, and a cancelled
+/// producer publishes nothing — a partial baseline can exist neither
+/// upstream (the peer's mailbox) nor in the driver's pre-open queue.
+fn send_tile_snapshot_frames_to_peer(
+    peer: &Arc<webrtc::WebRtcPeer>,
+    frames: &[bytes::Bytes],
+    snapshot_id: u32,
+) {
+    peer.send_tile_snapshot_group(snapshot_id, frames.to_vec());
+}
+
+async fn send_tile_snapshot_to_peer(
+    peer: Arc<webrtc::WebRtcPeer>,
+    frame: Arc<Frame>,
+    epoch: u32,
+    snapshot_id: u32,
+    visual_marker_value: Option<u32>,
+    counters: Arc<DisplayMetricsCounters>,
+) {
+    if let Some(frames) =
+        encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters).await
+    {
+        send_tile_snapshot_frames_to_peer(&peer, &frames, snapshot_id);
+    }
 }
 
 async fn send_tile_control_to_peers(
@@ -1460,6 +1513,7 @@ async fn send_tile_control_to_peers(
 ) {
     match tile::transport::encode_frame(&frame) {
         Ok(bytes) => {
+            let bytes = bytes::Bytes::from(bytes);
             for peer in peers {
                 if let Err(e) = peer.send_tile_control_frame(bytes.clone()).await {
                     eprintln!("[display/tile] {context} send failed: {e}");
@@ -1922,6 +1976,12 @@ impl DisplaySession {
             let mut frame_counter = 0u64;
             let reg_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // The frame the cached JPEG was encoded from, so an
+                // unchanged `latest_frame` (event-driven backends emit
+                // nothing while the desktop is idle) re-registers the
+                // cached bytes instead of re-encoding the identical
+                // image every second.
+                let mut last_jpeg: Option<(Arc<Frame>, Vec<u8>)> = None;
                 loop {
                     tokio::select! {
                         _ = shutdown_reg.cancelled() => break,
@@ -1937,57 +1997,41 @@ impl DisplaySession {
                             let Some(frame) = frame else { continue };
                             let w = frame.width;
                             let h = frame.height;
-                            // Encode BGRA/RGBA → JPEG on blocking pool
-                            let jpeg = tokio::task::spawn_blocking(move || {
-                                // Strip row padding if stride > width * 4
-                                let row_bytes = w as usize * 4;
-                                let stride = frame.stride as usize;
-                                let rgba_data = match frame.format {
-                                    FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-                                    FrameFormat::Rgba => {
-                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                                        for row in 0..h as usize {
-                                            let start = row * stride;
-                                            tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-                                        }
-                                        tight
-                                    }
-                                    FrameFormat::Bgra => {
-                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                                        for row in 0..h as usize {
-                                            let start = row * stride;
-                                            for col in 0..w as usize {
-                                                let px = start + col * 4;
-                                                tight.push(frame.data[px + 2]); // R
-                                                tight.push(frame.data[px + 1]); // G
-                                                tight.push(frame.data[px]);      // B
-                                                tight.push(frame.data[px + 3]); // A
-                                            }
-                                        }
-                                        tight
-                                    }
-                                };
-                                let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
-                                let mut buf = std::io::Cursor::new(Vec::new());
-                                img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
-                                Some(buf.into_inner())
-                            }).await.ok().flatten();
-                            if let Some(jpeg_bytes) = jpeg {
-                                frame_counter += 1;
-                                let stream = format!("display_{}", display_id);
-                                let frame_id = format!("{}-f{}", stream, frame_counter);
-                                let meta = presence_core::FrameMeta {
-                                    frame_id,
-                                    stream,
-                                    timestamp: chrono::Utc::now().to_rfc3339(),
-                                    sent_to_live: false,
-                                    live_resolution: None,
-                                    hq_resolution: Some(format!("{}x{}", w, h)),
-                                    note: None,
-                                };
-                                let mut reg = registry.write().await;
-                                let _ = reg.register(meta, &jpeg_bytes);
+                            let cache_hit = last_jpeg
+                                .as_ref()
+                                .is_some_and(|(cached, _)| Arc::ptr_eq(cached, &frame));
+                            if !cache_hit {
+                                // Encode BGRA/RGBA → JPEG on blocking pool
+                                let encode_frame = Arc::clone(&frame);
+                                let jpeg = tokio::task::spawn_blocking(move || {
+                                    let rgba_data = frame_to_tight_rgba(&encode_frame);
+                                    let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
+                                    let mut buf = std::io::Cursor::new(Vec::new());
+                                    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+                                    Some(buf.into_inner())
+                                }).await.ok().flatten();
+                                // On encode failure, register nothing this
+                                // tick (matching the old behavior) rather
+                                // than re-publishing a stale cache entry
+                                // as if it were this frame.
+                                let Some(jpeg) = jpeg else { continue };
+                                last_jpeg = Some((frame, jpeg));
                             }
+                            let Some((_, jpeg_bytes)) = last_jpeg.as_ref() else { continue };
+                            frame_counter += 1;
+                            let stream = format!("display_{}", display_id);
+                            let frame_id = format!("{}-f{}", stream, frame_counter);
+                            let meta = presence_core::FrameMeta {
+                                frame_id,
+                                stream,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                sent_to_live: false,
+                                live_resolution: None,
+                                hq_resolution: Some(format!("{}x{}", w, h)),
+                                note: None,
+                            };
+                            let mut reg = registry.write().await;
+                            let _ = reg.register(meta, jpeg_bytes);
                         }
                     }
                 }
@@ -2307,8 +2351,16 @@ impl DisplaySession {
     }
 
     /// Encode the latest frame as a PNG screenshot.
+    ///
+    /// The PNG encode of a multi-MB frame is 50-200ms of pure CPU, so
+    /// it runs on the blocking pool — inline it would stall unrelated
+    /// tasks on the async runtime for every CU action / dashboard /
+    /// MCP screenshot.
     pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
-        encode_frame_png(&*self.current_frame().await?)
+        let frame = self.current_frame().await?;
+        tokio::task::spawn_blocking(move || encode_frame_png(&frame))
+            .await
+            .map_err(|e| CallerError::Display(format!("screenshot encode task failed: {e}")))?
     }
 
     /// The freshest raw frame captured at or after `min_timestamp`, waiting up
@@ -2368,13 +2420,60 @@ impl DisplaySession {
 
     /// Encode a PNG screenshot from a frame captured at or after
     /// `min_timestamp`, waiting up to `timeout` for one to arrive (the
-    /// [`Self::fresh_frame`] contract).
+    /// [`Self::fresh_frame`] contract). Encode runs on the blocking
+    /// pool — see [`Self::screenshot`].
     pub async fn screenshot_fresh(
         &self,
         min_timestamp: Instant,
         timeout: Duration,
     ) -> Result<Vec<u8>, CallerError> {
-        encode_frame_png(&*self.fresh_frame(min_timestamp, timeout).await?)
+        let frame = self.fresh_frame(min_timestamp, timeout).await?;
+        tokio::task::spawn_blocking(move || encode_frame_png(&frame))
+            .await
+            .map_err(|e| CallerError::Display(format!("screenshot encode task failed: {e}")))?
+    }
+}
+
+/// Convert a raw captured frame to tightly-packed RGBA bytes: stride
+/// padding stripped, BGRA swizzled to RGBA.
+///
+/// The one shared pixel converter for every screenshot/JPEG path (PNG
+/// screenshots, the FrameRegistry sampler). Row-wise with indexed
+/// writes into a pre-sized buffer — the previous per-site loops pushed
+/// four bounds-checked bytes per pixel (~15M pushes per 1440p frame),
+/// which defeated autovectorization and cost tens of milliseconds per
+/// conversion on the CU screenshot path.
+fn frame_to_tight_rgba(frame: &Frame) -> Vec<u8> {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let row_bytes = w * 4;
+    let stride = (frame.stride as usize).max(row_bytes);
+
+    match frame.format {
+        FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+        FrameFormat::Rgba => {
+            let mut tight = Vec::with_capacity(row_bytes * h);
+            for row in 0..h {
+                let start = row * stride;
+                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
+            }
+            tight
+        }
+        FrameFormat::Bgra => {
+            let mut tight = vec![0u8; row_bytes * h];
+            for (dst_row, src_row) in tight
+                .chunks_exact_mut(row_bytes)
+                .zip(frame.data.chunks(stride))
+            {
+                let src_row = &src_row[..row_bytes];
+                for (dst, px) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                    dst[0] = px[2];
+                    dst[1] = px[1];
+                    dst[2] = px[0];
+                    dst[3] = px[3];
+                }
+            }
+            tight
+        }
     }
 }
 
@@ -2384,41 +2483,7 @@ impl DisplaySession {
 /// consumers can transform the raw pixels (resize, crop, annotate) and encode
 /// PNG exactly once, instead of decoding a PNG this crate just encoded.
 pub fn frame_to_rgba_image(frame: &Frame) -> Result<image::RgbaImage, CallerError> {
-    let (w, h) = (frame.width, frame.height);
-
-    // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
-    // If stride > width * 4 the rows have alignment padding that must be stripped.
-    let row_bytes = w as usize * 4;
-    let stride = frame.stride as usize;
-
-    let rgba_data = match frame.format {
-        FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-        FrameFormat::Rgba => {
-            let mut tight = Vec::with_capacity(row_bytes * h as usize);
-            for row in 0..h as usize {
-                let start = row * stride;
-                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-            }
-            tight
-        }
-        FrameFormat::Bgra => {
-            let mut tight = Vec::with_capacity(row_bytes * h as usize);
-            for row in 0..h as usize {
-                let start = row * stride;
-                for col in 0..w as usize {
-                    let px = start + col * 4;
-                    // Swap B <-> R while copying
-                    tight.push(frame.data[px + 2]); // R
-                    tight.push(frame.data[px + 1]); // G
-                    tight.push(frame.data[px]); // B
-                    tight.push(frame.data[px + 3]); // A
-                }
-            }
-            tight
-        }
-    };
-
-    image::RgbaImage::from_raw(w, h, rgba_data)
+    image::RgbaImage::from_raw(frame.width, frame.height, frame_to_tight_rgba(frame))
         .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))
 }
 
@@ -2764,8 +2829,11 @@ impl DisplaySession {
 
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
-            let mut frame_diff =
-                capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX);
+            // `Option` so the tracker can round-trip through the
+            // spawn_blocking diff below (moved in, moved back out).
+            let mut frame_diff: Option<capture::frame_diff::FrameDiffDamageTracker> = Some(
+                capture::frame_diff::FrameDiffDamageTracker::new(TILE_STREAM_TILE_SIZE_PX),
+            );
             let mut grid: Option<tile::grid::TileGrid> = None;
             let mut synthetic_dirty = tile::synthetic_dirty::SyntheticDirtySources::new()
                 .with_marker((0, 0), visual_marker::MARKER_W as u32);
@@ -2773,7 +2841,12 @@ impl DisplaySession {
             let mut tile_policy = tile::policy::TilePolicy::new(Instant::now());
             let mut tile_mode = tile::policy::TileMode::Tiles;
             let mut next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
-            let mut last_delta_sent_at: Option<Instant> = None;
+            let mut last_delta_tick_at: Option<Instant> = None;
+            // Damage collected from the cheap per-frame sources
+            // (in-frame dirty rects, OS damage events) on ticks the
+            // delta cadence gate skipped; flushed into the next
+            // allowed tick so no damage is ever dropped by the gate.
+            let mut pending_rects: Vec<capture::damage::Rect> = Vec::new();
             let mut seq: u32 = 1;
 
             loop {
@@ -2796,7 +2869,8 @@ impl DisplaySession {
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
+                            pending_rects.clear();
                             continue;
                         }
 
@@ -2810,7 +2884,8 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
+                            pending_rects.clear();
                             synthetic_dirty.reset_cursor();
                             last_cursor = None;
                             let resize = tile::transport::TileFrame::Resize {
@@ -2821,15 +2896,22 @@ impl DisplaySession {
                             };
                             send_tile_control_to_peers(&peers_now, resize, "resize").await;
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                            for peer in peers_now {
-                                send_tile_snapshot_to_peer(
-                                    peer,
-                                    Arc::clone(&frame),
-                                    epoch,
-                                    snapshot_id,
-                                    visual_marker_value,
-                                    Arc::clone(&counters),
-                                ).await;
+                            // Encode the snapshot once, fan the wire
+                            // frames out refcounted — a full-screen
+                            // lossless encode per peer scaled with
+                            // viewer count for identical output.
+                            if let Some(frames) = encode_tile_snapshot_frames(
+                                Arc::clone(&frame),
+                                epoch,
+                                snapshot_id,
+                                visual_marker_value,
+                                &counters,
+                            )
+                            .await
+                            {
+                                for peer in &peers_now {
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id);
+                                }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
@@ -2838,55 +2920,126 @@ impl DisplaySession {
                         if Instant::now() >= next_snapshot_at {
                             let epoch = tile_epoch.load(Ordering::Relaxed);
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                            for peer in peers_now {
-                                send_tile_snapshot_to_peer(
-                                    peer,
-                                    Arc::clone(&frame),
-                                    epoch,
-                                    snapshot_id,
-                                    visual_marker_value,
-                                    Arc::clone(&counters),
-                                ).await;
+                            if let Some(frames) = encode_tile_snapshot_frames(
+                                Arc::clone(&frame),
+                                epoch,
+                                snapshot_id,
+                                visual_marker_value,
+                                &counters,
+                            )
+                            .await
+                            {
+                                for peer in &peers_now {
+                                    send_tile_snapshot_frames_to_peer(peer, &frames, snapshot_id);
+                                }
                             }
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             continue;
                         }
 
-                        let cursor_pos = damage.cursor_position();
-                        let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
-                        if cursor_changed {
-                            last_cursor = cursor_pos;
-                        }
-
-                        let mut rects = if let Some(rects) = frame.dirty_rects.clone() {
-                            rects
-                        } else {
-                            match damage.capability() {
-                                capture::damage::DamageCapability::OsLevel => {
-                                    match damage.poll_damage() {
-                                        Ok(rects) => rects,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[display/tile] display {display_id} damage poll failed: {e}"
-                                            );
-                                            Vec::new()
-                                        }
-                                    }
-                                }
+                        // Collect the cheap damage sources on every
+                        // captured frame so nothing is lost across
+                        // delta-cadence skips: in-frame dirty rects are
+                        // per-frame data, and polling the OS damage
+                        // backend clears its server-side accumulation.
+                        // Skipped ticks accumulate into `pending_rects`;
+                        // the next allowed tick flushes the union.
+                        // (Before this accumulator the cadence gate sat
+                        // *after* the damage poll and discarded its
+                        // rects on skipped ticks — a change landing on
+                        // a skipped frame stayed stale until the 30s
+                        // snapshot.)
+                        let uses_frame_diff = frame.dirty_rects.is_none()
+                            && matches!(
+                                damage.capability(),
                                 capture::damage::DamageCapability::FrameDiff
-                                | capture::damage::DamageCapability::None => {
-                                    match frame_diff.diff_frame(&frame) {
-                                        Ok(rects) => rects,
-                                        Err(e) => {
-                                            eprintln!(
-                                                "[display/tile] display {display_id} frame-diff failed: {e}"
-                                            );
-                                            Vec::new()
-                                        }
-                                    }
+                                    | capture::damage::DamageCapability::None
+                            );
+                        if let Some(rects) = frame.dirty_rects.clone() {
+                            pending_rects.extend(rects);
+                        } else if !uses_frame_diff {
+                            match damage.poll_damage() {
+                                Ok(rects) => pending_rects.extend(rects),
+                                Err(e) => {
+                                    eprintln!(
+                                        "[display/tile] display {display_id} damage poll failed: {e}"
+                                    );
                                 }
                             }
-                        };
+                        }
+
+                        // Delta cadence gate — ahead of the frame-diff
+                        // fallback and the per-tick policy work, so both
+                        // run at the delta cadence (≤15fps), not at
+                        // capture rate. The clock advances on every
+                        // allowed tick (idle ones included): the gate
+                        // bounds the whole diff+encode pipeline, and
+                        // deltas can only be emitted on allowed ticks,
+                        // so the wire cadence cap is unchanged.
+                        let now = Instant::now();
+                        if !should_emit_tile_delta(
+                            now,
+                            last_delta_tick_at,
+                            tile_delta_min_interval(),
+                        ) {
+                            if tile_mode == tile::policy::TileMode::Tiles
+                                && !pending_rects.is_empty()
+                            {
+                                counters.record_tile_delta_cadence_skip();
+                            }
+                            continue;
+                        }
+                        last_delta_tick_at = Some(now);
+
+                        let mut rects = std::mem::take(&mut pending_rects);
+
+                        // Frame-diff fallback (macOS/Windows/Wayland —
+                        // the platforms without an OS damage source):
+                        // hash every tile of the frame and diff against
+                        // the previous baseline. This walks the whole
+                        // frame, so it runs on the blocking pool, never
+                        // inline on the runtime, and only on allowed
+                        // ticks. Skipping frames is safe: the baseline
+                        // only advances when a diff runs, so a change
+                        // landing on a skipped frame is caught by the
+                        // next diff.
+                        if uses_frame_diff {
+                            let tracker = frame_diff.take().unwrap_or_else(|| {
+                                capture::frame_diff::FrameDiffDamageTracker::new(
+                                    TILE_STREAM_TILE_SIZE_PX,
+                                )
+                            });
+                            let diff_result = tokio::task::spawn_blocking({
+                                let frame = Arc::clone(&frame);
+                                move || {
+                                    let mut tracker = tracker;
+                                    let rects = tracker.diff_frame(&frame);
+                                    (tracker, rects)
+                                }
+                            })
+                            .await;
+                            match diff_result {
+                                Ok((tracker, Ok(diff_rects))) => {
+                                    frame_diff = Some(tracker);
+                                    rects.extend(diff_rects);
+                                }
+                                Ok((tracker, Err(e))) => {
+                                    frame_diff = Some(tracker);
+                                    eprintln!(
+                                        "[display/tile] display {display_id} frame-diff failed: {e}"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Tracker lost with the cancelled/
+                                    // panicked task; the replacement
+                                    // re-baselines (all tiles dirty) on
+                                    // the next allowed tick.
+                                    eprintln!(
+                                        "[display/tile] display {display_id} frame-diff task failed: {e}"
+                                    );
+                                }
+                            }
+                        }
 
                         let policy_dirty = next_grid.dirty_tiles(&rects);
                         let dirty_fraction = next_grid.dirty_fraction(policy_dirty.len());
@@ -2895,7 +3048,7 @@ impl DisplaySession {
                             let epoch = tile_epoch.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                             seq = 1;
                             tile_mode = next_mode;
-                            last_delta_sent_at = None;
+                            last_delta_tick_at = None;
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             match tile_mode {
                                 tile::policy::TileMode::Video => {
@@ -2927,15 +3080,22 @@ impl DisplaySession {
                                     ).await;
                                     let snapshot_id =
                                         tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
-                                    for peer in peers_now {
-                                        send_tile_snapshot_to_peer(
-                                            peer,
-                                            Arc::clone(&frame),
-                                            epoch,
-                                            snapshot_id,
-                                            visual_marker_value,
-                                            Arc::clone(&counters),
-                                        ).await;
+                                    if let Some(frames) = encode_tile_snapshot_frames(
+                                        Arc::clone(&frame),
+                                        epoch,
+                                        snapshot_id,
+                                        visual_marker_value,
+                                        &counters,
+                                    )
+                                    .await
+                                    {
+                                        for peer in &peers_now {
+                                            send_tile_snapshot_frames_to_peer(
+                                                peer,
+                                                &frames,
+                                                snapshot_id,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2944,6 +3104,22 @@ impl DisplaySession {
 
                         if tile_mode == tile::policy::TileMode::Video {
                             continue;
+                        }
+
+                        // Cursor: sampled at the delta cadence. This
+                        // deliberately HALVES the cursor rate relative
+                        // to the pre-gate-first pipeline, where the
+                        // poll and the CursorState control frame ran
+                        // at capture rate (~30fps) ahead of the old
+                        // gate. ≤15fps matches the cadence tile paints
+                        // actually happen at, and on X11 it halves the
+                        // synchronous QueryPointer round-trips this
+                        // sample costs (and stops them entirely in
+                        // video mode, where no CursorState is sent).
+                        let cursor_pos = damage.cursor_position();
+                        let cursor_changed = cursor_pos.is_some() && cursor_pos != last_cursor;
+                        if cursor_changed {
+                            last_cursor = cursor_pos;
                         }
 
                         synthetic_dirty.set_marker_enabled(visual_marker_value.is_some());
@@ -2962,6 +3138,7 @@ impl DisplaySession {
                                 };
                                 match tile::transport::encode_frame(&cursor) {
                                     Ok(bytes) => {
+                                        let bytes = bytes::Bytes::from(bytes);
                                         let peers_now =
                                             tile_subscriber_peer_handles(&peers, &subscribers).await;
                                         for peer in peers_now {
@@ -2992,17 +3169,6 @@ impl DisplaySession {
                             dirty.len(),
                             next_grid.dirty_fraction(dirty.len()),
                         );
-
-                        let now = Instant::now();
-                        if !should_emit_tile_delta(
-                            now,
-                            last_delta_sent_at,
-                            tile_delta_min_interval(),
-                        ) {
-                            counters.record_tile_delta_cadence_skip();
-                            continue;
-                        }
-                        last_delta_sent_at = Some(now);
 
                         let epoch = tile_epoch.load(Ordering::Relaxed);
                         let encode_result = tokio::task::spawn_blocking({
@@ -3036,7 +3202,7 @@ impl DisplaySession {
                             match tile::transport::encode_frame(&frame) {
                                 Ok(bytes) => {
                                     byte_count = byte_count.saturating_add(bytes.len());
-                                    encoded.push((frame_seq, bytes));
+                                    encoded.push((frame_seq, bytes::Bytes::from(bytes)));
                                 }
                                 Err(e) => eprintln!("[display/tile] update wire encode failed: {e}"),
                             }
@@ -3217,6 +3383,15 @@ impl DisplaySession {
             let mut generation: u64 = 0;
             let mut last_sent_gen: Option<u64> = None;
             let mut last_send_at = Instant::now();
+            // Retired `latest_i420` buffers awaiting their broadcast
+            // refcount to drain. The pool's I420 broadcast ring holds
+            // the last I420_BROADCAST_CAPACITY (4) sent frames, so an
+            // entry becomes reclaimable (`Arc::try_unwrap`) once ~4
+            // newer frames have shipped; one extra slot of headroom
+            // keeps the steady state allocation-free.
+            const I420_RECYCLE_DEPTH: usize = 5;
+            let mut i420_recycle: std::collections::VecDeque<Arc<Vec<u8>>> =
+                std::collections::VecDeque::with_capacity(I420_RECYCLE_DEPTH + 1);
             // 3c.3b.4b: peer-join burst window. `None` outside a
             // burst; `Some(deadline)` while clocking the encoder
             // through to a natural keyframe regardless of dirty
@@ -3345,6 +3520,11 @@ impl DisplaySession {
                             // to be replaced by this frame anyway.)
                             latest_i420 = None;
                             last_sent_gen = None;
+                            // Old-dimension buffers would be resized on
+                            // reuse anyway; drop them rather than hold
+                            // multi-MB stale allocations across what may
+                            // be a downsize.
+                            i420_recycle.clear();
                         }
 
                         // F2 idle gate: do NOT convert here. Stash the
@@ -3392,12 +3572,30 @@ impl DisplaySession {
                         if let Some((frame, arrived)) = pending_bgra.take() {
                             let frame_w = frame.width & !1;
                             let frame_h = frame.height & !1;
+                            // Reclaim the oldest retired buffer whose
+                            // broadcast refcount has drained; fall back
+                            // to a fresh allocation when every retiree
+                            // is still referenced.
+                            let mut reuse = Vec::new();
+                            for _ in 0..i420_recycle.len() {
+                                let candidate = i420_recycle
+                                    .pop_front()
+                                    .expect("iteration bounded by queue length");
+                                match Arc::try_unwrap(candidate) {
+                                    Ok(buf) => {
+                                        reuse = buf;
+                                        break;
+                                    }
+                                    Err(still_shared) => i420_recycle.push_back(still_shared),
+                                }
+                            }
                             let i420_result = tokio::task::spawn_blocking(
                                 move || convert_for_pool_feed(
                                     &frame.data,
                                     frame_w,
                                     frame_h,
                                     frame.stride,
+                                    reuse,
                                 )
                             )
                             .await;
@@ -3406,7 +3604,14 @@ impl DisplaySession {
                                     .pool_feed_conversions
                                     .fetch_add(1, Ordering::Relaxed);
                                 generation = generation.wrapping_add(1);
-                                latest_i420 = Some((Arc::new(i420), arrived));
+                                if let Some((old, _)) =
+                                    latest_i420.replace((Arc::new(i420), arrived))
+                                {
+                                    i420_recycle.push_back(old);
+                                    while i420_recycle.len() > I420_RECYCLE_DEPTH {
+                                        i420_recycle.pop_front();
+                                    }
+                                }
                             }
                         }
 
@@ -3449,8 +3654,35 @@ impl DisplaySession {
                             } else {
                                 None
                             };
+                        // Marker stamping happens here, once per push,
+                        // into a per-push copy: the cached buffer stays
+                        // unstamped (it is Arc-shared with in-flight
+                        // encoders and future re-pushes), and stamping
+                        // at push time keeps the heartbeat property —
+                        // every re-push of a static desktop carries a
+                        // fresh marker value. One copy per *push*
+                        // replaces the old one copy per *source-dim
+                        // encoder per frame* (workers now only re-stamp
+                        // after downscale, where they already own a
+                        // buffer). Marker off (the default): no copy.
+                        let push_buf = match visual_marker_value {
+                            Some(value) => {
+                                let mut stamped = i420.as_ref().clone();
+                                let y_len = enc_w as usize * enc_h as usize;
+                                if let Some(y) = stamped.get_mut(0..y_len) {
+                                    visual_marker::stamp_y_plane(
+                                        y,
+                                        enc_w as usize,
+                                        enc_h as usize,
+                                        value,
+                                    );
+                                }
+                                Arc::new(stamped)
+                            }
+                            None => Arc::clone(i420),
+                        };
                         pool.push_i420_frame_with_visual_marker(
-                            Arc::clone(i420),
+                            push_buf,
                             arrived,
                             visual_marker_value,
                         );

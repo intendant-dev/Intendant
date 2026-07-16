@@ -686,10 +686,13 @@ impl EncoderPool {
 
     /// Push one I420 frame with an optional diagnostic visual-marker value.
     ///
-    /// The bridge stamps the source I420 frame before broadcasting to the pool.
-    /// Downscaled layers would otherwise shrink that marker, so encoder
-    /// threads re-stamp the same value after per-layer downscale when this is
-    /// `Some`.
+    /// When this is `Some`, the bridge has already stamped the marker into
+    /// `data` (a per-push copy of its cache, so heartbeat re-pushes of a
+    /// static desktop each carry a fresh value). Downscaling shrinks that
+    /// stamp, so encoder threads re-stamp the same value after per-layer
+    /// downscale — and only then: source-dimension encoders must use the
+    /// shared frame as-is (it is already stamped, and cloning it per
+    /// encoder is exactly the cost this contract removes).
     pub fn push_i420_frame_with_visual_marker(
         &self,
         data: Arc<Vec<u8>>,

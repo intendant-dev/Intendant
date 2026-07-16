@@ -9,7 +9,6 @@
 use super::super::tile::grid::{TileGrid, TileId};
 use super::super::{Frame, FrameFormat};
 use super::damage::Rect;
-use std::collections::HashMap;
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -34,7 +33,14 @@ impl std::error::Error for FrameDiffError {}
 pub struct FrameDiffDamageTracker {
     tile_size_px: u16,
     last_geometry: Option<(u32, u32, u32, FrameFormat)>,
-    last_hashes: HashMap<TileId, u64>,
+    /// Per-tile hash of the previous frame, indexed
+    /// `ty * width_tiles + tx`. A flat vector (not a map): the grid is
+    /// dense and this runs for every tile of every diffed frame, so
+    /// hashing a `TileId` key per tile would dominate the bookkeeping.
+    last_hashes: Vec<u64>,
+    /// False until the first full pass after construction or a geometry
+    /// change; while false every tile is dirty regardless of its hash.
+    has_baseline: bool,
 }
 
 impl FrameDiffDamageTracker {
@@ -42,7 +48,8 @@ impl FrameDiffDamageTracker {
         Self {
             tile_size_px,
             last_geometry: None,
-            last_hashes: HashMap::new(),
+            last_hashes: Vec::new(),
+            has_baseline: false,
         }
     }
 
@@ -54,6 +61,9 @@ impl FrameDiffDamageTracker {
         let geometry_changed = self.last_geometry != Some(geometry);
         if geometry_changed {
             self.last_hashes.clear();
+            self.last_hashes
+                .resize(grid.width_tiles as usize * grid.height_tiles as usize, 0);
+            self.has_baseline = false;
             self.last_geometry = Some(geometry);
         }
 
@@ -62,13 +72,15 @@ impl FrameDiffDamageTracker {
             for tx in 0..grid.width_tiles {
                 let tile = TileId::new(tx, ty);
                 let hash = hash_tile(frame, &grid, tile)?;
-                let changed = self.last_hashes.get(&tile).is_none_or(|prev| *prev != hash);
-                self.last_hashes.insert(tile, hash);
+                let idx = ty as usize * grid.width_tiles as usize + tx as usize;
+                let changed = !self.has_baseline || self.last_hashes[idx] != hash;
+                self.last_hashes[idx] = hash;
                 if changed {
                     dirty.push(tile_rect(&grid, tile));
                 }
             }
         }
+        self.has_baseline = true;
         Ok(dirty)
     }
 }
@@ -93,12 +105,29 @@ fn hash_tile(frame: &Frame, grid: &TileGrid, tile: TileId) -> Result<u64, FrameD
     let copy_w = frame.width.saturating_sub(start_x).min(ts) as usize;
     let copy_h = frame.height.saturating_sub(start_y).min(ts) as usize;
 
+    // FNV-1a over 8-byte words instead of single bytes: the multiply is
+    // the serial dependency, so folding 8 bytes per round is ~8× fewer
+    // dependent multiplies over the same pixels. This changes the hash
+    // *values* relative to byte-wise FNV, which is fine — hashes are
+    // only ever compared against hashes of the previous frame computed
+    // by the same code in the same process.
     let mut hash = FNV_OFFSET;
     for y in 0..copy_h {
         let row_start = (start_y as usize + y) * frame.stride as usize + start_x as usize * 4;
         let row = &frame.data[row_start..row_start + copy_w * 4];
-        for b in row {
-            hash ^= *b as u64;
+        let mut words = row.chunks_exact(8);
+        for w in words.by_ref() {
+            // Native endianness: the hash never leaves this process.
+            hash ^= u64::from_ne_bytes(w.try_into().expect("chunks_exact(8) yields 8 bytes"));
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        let rem = words.remainder();
+        if !rem.is_empty() {
+            // Tail (row byte width not a multiple of 8): zero-pad into
+            // one final word. Rows of equal content still hash equal.
+            let mut tail = [0u8; 8];
+            tail[..rem.len()].copy_from_slice(rem);
+            hash ^= u64::from_ne_bytes(tail);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
     }
