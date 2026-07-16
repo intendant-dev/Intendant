@@ -223,6 +223,10 @@ pub(crate) fn log_sth_payload(size: usize, root_b64u: &str, unix_ms: u64) -> Str
     format!("intendant-log-sth-v1\n{size}\n{root_b64u}\n{unix_ms}")
 }
 
+/// Hash every leaf from scratch — the reference implementation the cache
+/// parity tests compare `cached_log_leaves` against; production reads go
+/// through the cache.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn log_leaves(store: &Store) -> Vec<[u8; 32]> {
     store
         .log_entries
@@ -231,11 +235,112 @@ pub(crate) fn log_leaves(store: &Store) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Derived read caches over the transparency log. The log is strictly
+/// append-only in a live process (`append_log_entry` pushes; nothing edits
+/// or truncates entries), so caches keyed by length extend incrementally;
+/// a shorter log than the cache — impossible live, conceivable only through
+/// offline state surgery — triggers a defensive full rebuild.
+#[derive(Default)]
+pub(crate) struct LogCaches {
+    /// `leaf_hashes[i] = log_leaf_hash(log_entries[i].leaf_json)`. Re-hashing
+    /// every entry's JSON body per read was the O(log bytes) cost on every
+    /// STH / proof / consistency request; combining cached 32-byte pairs
+    /// into roots stays per-request work and is cheap.
+    leaf_hashes: Arc<Vec<[u8; 32]>>,
+    find: LogFindIndex,
+}
+
+#[derive(Default)]
+struct LogFindIndex {
+    built_len: usize,
+    /// daemon_id → last index among `kind == "daemon_claimed"` entries.
+    daemon_claimed_last: HashMap<String, usize>,
+    /// handle → last index among entries of any kind carrying that handle.
+    handle_last: HashMap<String, usize>,
+}
+
+/// Leaf hashes for the current log, hashing only entries appended since the
+/// last call. Callers hold the store lock, which is what keeps
+/// `store.log_entries` stable across the extend; the cache lock is a short
+/// synchronous hold nested inside it (always store → cache order).
+pub(crate) fn cached_log_leaves(state: &AppState, store: &Store) -> Arc<Vec<[u8; 32]>> {
+    // Derived, rebuildable state: recover from a poisoned lock instead of
+    // propagating the panic — a partially extended cache re-extends (or
+    // fully rebuilds) idempotently from the store under the caller's lock.
+    let mut caches = state
+        .log_caches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let total = store.log_entries.len();
+    if caches.leaf_hashes.len() != total {
+        let mut hashes = Vec::with_capacity(total);
+        if caches.leaf_hashes.len() < total {
+            hashes.extend_from_slice(&caches.leaf_hashes);
+        }
+        for entry in &store.log_entries[hashes.len()..] {
+            hashes.push(log_leaf_hash(&entry.leaf_json));
+        }
+        caches.leaf_hashes = Arc::new(hashes);
+    }
+    caches.leaf_hashes.clone()
+}
+
+fn extend_find_index(index: &mut LogFindIndex, store: &Store) {
+    let total = store.log_entries.len();
+    if index.built_len > total {
+        *index = LogFindIndex::default();
+    }
+    for (offset, entry) in store.log_entries[index.built_len..].iter().enumerate() {
+        let position = index.built_len + offset;
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&entry.leaf_json) else {
+            continue;
+        };
+        if entry.kind == "daemon_claimed" {
+            if let Some(daemon_id) = data.get("daemon_id").and_then(|v| v.as_str()) {
+                index
+                    .daemon_claimed_last
+                    .insert(daemon_id.to_string(), position);
+            }
+        }
+        if let Some(handle) = data.get("handle").and_then(|v| v.as_str()) {
+            index.handle_last.insert(handle.to_string(), position);
+        }
+    }
+    index.built_len = total;
+}
+
+/// The `log_find` lookup over the maintained index — each entry is
+/// JSON-parsed once per process instead of once per request during a
+/// reverse scan. Semantics match the original linear scan exactly: a
+/// non-empty daemon_id matches only the latest `daemon_claimed` entry for
+/// that daemon (a handle argument is then ignored, as before); a handle
+/// query matches the latest entry of ANY kind carrying that handle.
+pub(crate) fn find_log_entry_indexed(
+    state: &AppState,
+    store: &Store,
+    daemon_id: &str,
+    handle: &str,
+) -> Option<usize> {
+    // Same poison-recovery rationale as `cached_log_leaves`.
+    let mut caches = state
+        .log_caches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    extend_find_index(&mut caches.find, store);
+    if !daemon_id.is_empty() {
+        caches.find.daemon_claimed_last.get(daemon_id).copied()
+    } else if !handle.is_empty() {
+        caches.find.handle_last.get(handle).copied()
+    } else {
+        None
+    }
+}
+
 /// The signed tree head as a bare object (no `ok` envelope) — nested by
 /// responses that carry an STH alongside other data.
 pub(crate) fn signed_tree_head_fields(state: &AppState, store: &Store) -> serde_json::Value {
     use ring::signature::KeyPair as _;
-    let leaves = log_leaves(store);
+    let leaves = cached_log_leaves(state, store);
     let root = b64u(&log_tree_root(&leaves));
     let unix_ms = now_unix_ms();
     let payload = log_sth_payload(leaves.len(), &root, unix_ms);
@@ -324,7 +429,7 @@ pub(crate) async fn log_proof(
 ) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
-    let leaves = log_leaves(&store);
+    let leaves = cached_log_leaves(&state, &store);
     let size = if query.size == 0 {
         leaves.len()
     } else {
@@ -363,7 +468,7 @@ pub(crate) async fn log_consistency(
 ) -> ApiResult<Response> {
     check_rate_limit(&state, &headers, "log_read", 240, 60_000).await?;
     let store = state.store.lock().await;
-    let leaves = log_leaves(&store);
+    let leaves = cached_log_leaves(&state, &store);
     let new_size = if query.new == 0 {
         leaves.len()
     } else {
@@ -411,22 +516,8 @@ pub(crate) async fn log_find(
         return Err(ApiError::bad_request("daemon_id or handle is required"));
     }
     let store = state.store.lock().await;
-    let found = store
-        .log_entries
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| {
-            let Ok(data) = serde_json::from_str::<serde_json::Value>(&entry.leaf_json) else {
-                return false;
-            };
-            let daemon_match = !daemon_id.is_empty()
-                && entry.kind == "daemon_claimed"
-                && data.get("daemon_id").and_then(|v| v.as_str()) == Some(daemon_id);
-            let handle_match =
-                !handle.is_empty() && data.get("handle").and_then(|v| v.as_str()) == Some(handle);
-            daemon_match || (daemon_id.is_empty() && handle_match)
-        });
+    let found = find_log_entry_indexed(&state, &store, daemon_id, handle)
+        .map(|index| (index, &store.log_entries[index]));
     let Some((index, entry)) = found else {
         return Ok(orl_cors(
             Json(json!({ "ok": true, "found": false })).into_response(),
@@ -634,7 +725,7 @@ pub(crate) async fn log_artifact_manifest(
             Json(json!({ "ok": true, "found": false })).into_response(),
         ));
     };
-    let leaves = log_leaves(&store);
+    let leaves = cached_log_leaves(&state, &store);
     let proof: Vec<String> = log_inclusion_proof(index, &leaves)
         .iter()
         .map(|hash| b64u(hash))
@@ -1017,7 +1108,7 @@ pub(crate) async fn log_release_manifest(
             Json(json!({ "ok": true, "found": false })).into_response(),
         ));
     };
-    let leaves = log_leaves(&store);
+    let leaves = cached_log_leaves(&state, &store);
     let proof: Vec<String> = log_inclusion_proof(index, &leaves)
         .iter()
         .map(|hash| b64u(hash))
@@ -1323,6 +1414,124 @@ mod tests {
             dns_ns_name: None,
             dns_listen: None,
         }
+    }
+
+    /// The leaf-hash cache must be indistinguishable from hashing the log
+    /// fresh, across appends (incremental extend) and across an
+    /// impossible-live shrink (defensive rebuild).
+    #[tokio::test]
+    async fn cached_log_leaves_extend_matches_fresh_hashing() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let mut store = state.store.lock().await;
+        for index in 0..3 {
+            append_log_entry(
+                &mut store,
+                "account_created",
+                json!({ "handle": format!("user-{index}") }),
+            );
+        }
+        let first = cached_log_leaves(&state, &store);
+        assert_eq!(*first, log_leaves(&store));
+
+        append_log_entry(&mut store, "account_created", json!({ "handle": "late" }));
+        let extended = cached_log_leaves(&state, &store);
+        assert_eq!(extended.len(), 4);
+        assert_eq!(*extended, log_leaves(&store));
+
+        // Same length → the cached Arc is reused, not recomputed.
+        let again = cached_log_leaves(&state, &store);
+        assert!(Arc::ptr_eq(&extended, &again));
+
+        // Defensive rebuild when the log is shorter than the cache.
+        store.log_entries.truncate(2);
+        let rebuilt = cached_log_leaves(&state, &store);
+        assert_eq!(*rebuilt, log_leaves(&store));
+    }
+
+    /// The find index must answer exactly like the reverse linear scan it
+    /// replaced, including the precedence rule (daemon_id wins; handle is
+    /// consulted only when daemon_id is empty).
+    #[tokio::test]
+    async fn log_find_index_matches_the_linear_scan() {
+        fn scan(store: &Store, daemon_id: &str, handle: &str) -> Option<usize> {
+            store
+                .log_entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, entry)| {
+                    let Ok(data) = serde_json::from_str::<serde_json::Value>(&entry.leaf_json)
+                    else {
+                        return false;
+                    };
+                    let daemon_match = !daemon_id.is_empty()
+                        && entry.kind == "daemon_claimed"
+                        && data.get("daemon_id").and_then(|v| v.as_str()) == Some(daemon_id);
+                    let handle_match = !handle.is_empty()
+                        && data.get("handle").and_then(|v| v.as_str()) == Some(handle);
+                    daemon_match || (daemon_id.is_empty() && handle_match)
+                })
+                .map(|(index, _)| index)
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let mut store = state.store.lock().await;
+        append_log_entry(&mut store, "account_created", json!({ "handle": "alice" }));
+        append_log_entry(
+            &mut store,
+            "daemon_claimed",
+            json!({ "daemon_id": "daemon-1", "handle": "alice" }),
+        );
+        append_log_entry(
+            &mut store,
+            "daemon_unclaimed",
+            json!({ "daemon_id": "daemon-1", "handle": "alice" }),
+        );
+        append_log_entry(
+            &mut store,
+            "daemon_claimed",
+            json!({ "daemon_id": "daemon-1", "handle": "bob" }),
+        );
+        append_log_entry(
+            &mut store,
+            "daemon_claimed",
+            json!({ "daemon_id": "daemon-2", "handle": "alice" }),
+        );
+
+        let cases: &[(&str, &str)] = &[
+            ("daemon-1", ""),
+            ("daemon-2", ""),
+            ("daemon-9", ""),
+            ("", "alice"),
+            ("", "bob"),
+            ("", "nobody"),
+            ("daemon-1", "alice"), // daemon precedence: handle ignored
+            ("daemon-9", "alice"), // unknown daemon does NOT fall back to handle
+        ];
+        for (daemon_id, handle) in cases {
+            assert_eq!(
+                find_log_entry_indexed(&state, &store, daemon_id, handle),
+                scan(&store, daemon_id, handle),
+                "query daemon_id={daemon_id:?} handle={handle:?}"
+            );
+        }
+
+        // Appends after the first build are picked up incrementally.
+        append_log_entry(
+            &mut store,
+            "daemon_claimed",
+            json!({ "daemon_id": "daemon-1", "handle": "carol" }),
+        );
+        assert_eq!(
+            find_log_entry_indexed(&state, &store, "daemon-1", ""),
+            scan(&store, "daemon-1", ""),
+        );
+        assert_eq!(
+            find_log_entry_indexed(&state, &store, "", "carol"),
+            scan(&store, "", "carol"),
+        );
     }
 
     /// Golden manifest hash — TWINNED byte-for-byte in

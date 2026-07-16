@@ -444,6 +444,13 @@ struct DaemonRegistrationOutcome {
     claimed_by: Option<(Uuid, String)>,
     claim_code_expires_unix_ms: Option<u64>,
     stale_daemon_ids: Vec<String>,
+    /// Whether this registration changed durable state: a new record, a
+    /// route-code rotation, a stale-record sweep, or a proof-watermark
+    /// advance (the anti-replay floor for daemon-session issuance — see the
+    /// comment at the advance site). Only mutations with no security effect
+    /// — presence fields on a proof-less operator probe — report false and
+    /// ride the debounced flusher.
+    durable_change: bool,
 }
 
 /// Apply one daemon registration to a candidate Store. The caller persists
@@ -481,9 +488,11 @@ fn apply_daemon_registration(
         ));
     }
     let active_claim_hashes = active_claim_code_hashes(store, daemon_id, now);
+    let mut durable_change = !stale_daemon_ids.is_empty();
     // Re-registering the same hash does not refresh its TTL, so a code remains
-    // genuinely short-lived even while the daemon keeps polling.
-    let apply_claim_hash = |record: &mut DaemonRecord| -> ApiResult<()> {
+    // genuinely short-lived even while the daemon keeps polling. Returns
+    // whether the record's code generation changed.
+    let apply_claim_hash = |record: &mut DaemonRecord| -> ApiResult<bool> {
         if active_claim_hashes.contains(claim_code_hash) {
             return Err(ApiError::conflict(
                 "claim code hash collides with another active route code",
@@ -492,10 +501,13 @@ fn apply_daemon_registration(
         if record.claim_code_hash.as_deref() != Some(claim_code_hash) {
             record.claim_code_hash = Some(claim_code_hash.to_string());
             record.claim_code_created_unix_ms = Some(now);
+            Ok(true)
         } else if record.claim_code_created_unix_ms.is_none() {
             record.claim_code_created_unix_ms = Some(now);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     };
     let (owner_user_id, code_created_unix_ms) = if let Some(existing) = store
         .daemons
@@ -512,15 +524,24 @@ fn apply_daemon_registration(
                 }
             }
             existing.last_registration_proof_unix_ms = Some(issued_at_unix_ms);
+            // The watermark is the anti-replay floor for a TOKEN-MINTING
+            // side effect: every accepted proof earns the caller a fresh
+            // daemon-session credential. If an advance were only debounced,
+            // a restart inside the window would roll it back and a captured
+            // refresh (valid for the 5-minute skew) could replay and win
+            // the sole post-restart daemon session. An advance is therefore
+            // always a durable change, persisted before the token is issued.
+            durable_change = true;
         }
         existing.last_seen_unix_ms = now;
         record_presence_hour(&mut existing.presence_hours, now);
         existing.updated_unix_ms = now;
-        if existing.owner_user_id.is_none() {
-            apply_claim_hash(existing)?;
+        if existing.owner_user_id.is_none() && apply_claim_hash(existing)? {
+            durable_change = true;
         }
         (existing.owner_user_id, existing.claim_code_created_unix_ms)
     } else {
+        durable_change = true;
         let mut record = DaemonRecord {
             daemon_id: daemon_id.to_string(),
             label: None,
@@ -561,6 +582,7 @@ fn apply_daemon_registration(
             None
         },
         stale_daemon_ids,
+        durable_change,
     })
 }
 
@@ -608,7 +630,11 @@ pub(crate) async fn daemon_register(
     if !known_daemon {
         // Refreshes arrive once a minute and must not spend the creation
         // budget. New identities are separately bounded per observed source;
-        // the production proxy overwrites forwarded-address headers.
+        // the production proxy overwrites forwarded-address headers. This
+        // check runs deliberately BEFORE signature verification: the budget
+        // exists to bound signature-verification CPU, so it must gate the
+        // expensive check rather than run behind it (its bucket allocation
+        // is confined to this scope's own capacity partition).
         check_rate_limit(
             &state,
             &headers,
@@ -625,20 +651,38 @@ pub(crate) async fn daemon_register(
     let registration = {
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
-        update_store_transaction(
+        let durable_change = std::cell::Cell::new(true);
+        let registration = update_store_transaction(
             &mut store,
             |next| {
-                apply_daemon_registration(
+                let outcome = apply_daemon_registration(
                     next,
                     &daemon_id,
                     &daemon_public_key,
                     &claim_code_hash,
                     proof_verified.then_some(body.issued_at_unix_ms),
                     now,
-                )
+                )?;
+                durable_change.set(outcome.durable_change);
+                Ok(outcome)
             },
-            |next| persist_locked(&state, next),
-        )?
+            // Everything with a security effect — including the proof
+            // watermark that floors replay for the daemon-session token
+            // minted below — persists before publication, exactly as
+            // before. Only proof-less presence refreshes (operator probes)
+            // skip the fsync and ride the debounced flusher.
+            |next| {
+                if durable_change.get() {
+                    persist_locked(&state, next)
+                } else {
+                    Ok(())
+                }
+            },
+        )?;
+        if !registration.durable_change {
+            mark_store_dirty(&state);
+        }
+        registration
     };
     // DNS is an external live index. Publish deletions only after the Store
     // commit succeeds so a failed state-file write remains exactly retryable.
@@ -794,7 +838,10 @@ pub(crate) async fn daemon_next(
     require_daemon_session(&state, &headers, &daemon_id).await?;
     check_rate_limit(&state, &headers, "daemon_next", 240, 60_000).await?;
     touch_daemon(&state, &daemon_id).await?;
-    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(30_000));
+    // Cap below main's global REQUEST_TIMEOUT so a parked poll always ends
+    // naturally inside the shutdown drain (NO_CONTENT at any moment is
+    // protocol-normal — the daemon simply re-polls).
+    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(15_000));
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(event) = pop_event(&state, &daemon_id).await {
@@ -814,6 +861,14 @@ pub(crate) async fn daemon_next(
     }
 }
 
+/// Refresh a polling daemon's presence. This runs on every `daemon_next`
+/// long-poll (~4/min/daemon), so it never persists synchronously: every
+/// field it touches is presence-display data (`last_seen`, `updated`,
+/// presence hours) whose crash-loss window is bounded by the debounced
+/// flusher — the mark fires on every touch, and in practice each daemon's
+/// once-a-minute re-register persists the whole store anyway (its proof
+/// watermark is durable), so disk staleness stays well inside the
+/// stale-unclaimed sweep's 24h TTL.
 pub(crate) async fn touch_daemon(state: &AppState, daemon_id: &str) -> ApiResult<()> {
     let mut store = state.store.lock().await;
     if let Some(daemon) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) {
@@ -821,7 +876,7 @@ pub(crate) async fn touch_daemon(state: &AppState, daemon_id: &str) -> ApiResult
         daemon.last_seen_unix_ms = now;
         daemon.updated_unix_ms = now;
         record_presence_hour(&mut daemon.presence_hours, now);
-        persist_locked(state, &store)?;
+        mark_store_dirty(state);
         Ok(())
     } else {
         Err(ApiError::not_found("daemon is not registered"))
@@ -1175,37 +1230,31 @@ pub(crate) async fn daemon_dry(
         let Some(daemon) = store.daemons.iter().find(|d| d.daemon_id == daemon_id) else {
             return Err(ApiError::not_found("unknown daemon"));
         };
+        // Clone only the owner's opted-in rows, not the whole table.
+        let subscriptions: Vec<PushSubscriptionRecord> = daemon
+            .owner_user_id
+            .map(|owner| {
+                store
+                    .push_subscriptions
+                    .iter()
+                    .filter(|s| s.notify_presence && s.user_id == owner)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         (
             daemon.label.clone().unwrap_or_else(|| daemon_id.clone()),
             daemon.owner_user_id,
-            store.push_subscriptions.clone(),
+            subscriptions,
         )
     };
-    let Some(owner) = owner else {
+    if owner.is_none() {
         // Nobody has claimed this daemon — nobody to notify.
         return Ok(Json(json!({ "ok": true, "notified": 0 })));
     };
     let payload = dry_push_payload(&daemon_id, &label, &body.credentials);
-    let mut notified = 0usize;
-    let mut dead = Vec::new();
-    for subscription in subscriptions
-        .iter()
-        .filter(|s| s.notify_presence && s.user_id == owner)
-    {
-        match send_web_push(
-            &state.push_http,
-            &state.vapid,
-            &state.config.public_origin,
-            subscription,
-            &payload,
-        )
-        .await
-        {
-            Ok(true) => notified += 1,
-            Ok(false) => dead.push(subscription.endpoint.clone()),
-            Err(e) => eprintln!("[push] dry-daemon alert failed: {e}"),
-        }
-    }
+    let (notified, dead) =
+        send_web_push_fanout(&state, &subscriptions, &payload, "dry-daemon alert").await;
     if !dead.is_empty() {
         let mut store = state.store.lock().await;
         store
@@ -2024,6 +2073,7 @@ mod tests {
         store.daemons.push(daemon);
         let vapid = load_or_create_vapid_keypair(&mut store).unwrap();
         let log_key = load_or_create_log_keypair(&mut store).unwrap();
+        let static_pages = StaticPages::render(&config);
         Arc::new(AppState {
             config,
             webauthn,
@@ -2036,8 +2086,11 @@ mod tests {
             event_queues: Mutex::new(HashMap::new()),
             event_notify: Notify::new(),
             daemon_sessions: Mutex::new(HashMap::new()),
-            rate_limits: Mutex::new(HashMap::new()),
+            rate_limits: Mutex::new(RateLimitTable::default()),
             active_sessions: Mutex::new(HashMap::new()),
+            store_dirty: StoreDirty::default(),
+            log_caches: std::sync::Mutex::new(LogCaches::default()),
+            static_pages,
             vapid,
             log_key,
             push_http: reqwest::Client::new(),
@@ -2147,7 +2200,7 @@ mod tests {
             .lock()
             .await
             .contains_key("legacy-session"));
-        assert!(state.rate_limits.lock().await.is_empty());
+        assert!(state.rate_limits.lock().await.scopes.is_empty());
     }
 
     #[test]
@@ -2236,6 +2289,152 @@ mod tests {
             store.daemons[0].claim_code_hash.as_deref(),
             Some(claim_hash.as_str())
         );
+    }
+
+    /// Pins which registrations may skip the synchronous persist: ONLY
+    /// proof-less operator probes that change nothing but presence fields.
+    /// Every security-effective mutation — record creation, code rotation,
+    /// stale sweep, and every proof-watermark advance (the anti-replay
+    /// floor for daemon-session issuance) — must report durable and take
+    /// the persist-before-publish path.
+    #[test]
+    fn registration_durability_classification_is_pinned() {
+        let now = 1_700_000_000_000u64;
+        let mut store = Store::default();
+        let hash_a = "A".repeat(43);
+        let hash_b = "B".repeat(43);
+
+        let first = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_a,
+            Some(now),
+            now,
+        )
+        .unwrap();
+        assert!(first.durable_change, "record creation is durable");
+
+        let refresh = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_a,
+            Some(now + 60_000),
+            now + 60_000,
+        )
+        .unwrap();
+        assert!(
+            refresh.durable_change,
+            "a proof-watermark advance is durable — it floors replay for the session token"
+        );
+        assert_eq!(
+            store.daemons[0].last_registration_proof_unix_ms,
+            Some(now + 60_000)
+        );
+
+        let probe = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_a,
+            None,
+            now + 90_000,
+        )
+        .unwrap();
+        assert!(
+            !probe.durable_change,
+            "a proof-less operator probe touching only presence fields defers"
+        );
+
+        let rotated = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_b,
+            Some(now + 120_000),
+            now + 120_000,
+        )
+        .unwrap();
+        assert!(rotated.durable_change, "route-code rotation is durable");
+
+        store.daemons.push(daemon_record("stale", None, None, None));
+        let sweeping = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_b,
+            None,
+            now + 180_000,
+        )
+        .unwrap();
+        assert_eq!(sweeping.stale_daemon_ids, vec!["stale".to_string()]);
+        assert!(
+            sweeping.durable_change,
+            "even a probe that swept stale records must persist the removal"
+        );
+
+        store.daemons[0].owner_user_id = Some(Uuid::new_v4());
+        let claimed_probe = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &"C".repeat(43),
+            None,
+            now + 240_000,
+        )
+        .unwrap();
+        assert!(
+            !claimed_probe.durable_change,
+            "claimed daemons never touch code state; a proof-less refresh defers"
+        );
+    }
+
+    /// FIX for the restart-replay hole: a registration proof accepted just
+    /// before a restart must stay consumed across that restart — otherwise
+    /// a captured refresh (valid for the 5-minute skew window) replays
+    /// against the reloaded store and wins the sole post-restart daemon
+    /// session. The watermark advance is durable, so the reloaded state
+    /// already knows the proof.
+    #[test]
+    fn restart_cannot_resurrect_a_consumed_registration_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let now = 1_700_000_000_000u64;
+        let hash = "A".repeat(43);
+        let mut store = Store::default();
+        apply_daemon_registration(&mut store, "daemon-1", "daemon-key", &hash, Some(now), now)
+            .unwrap();
+        save_store(&path, &store).unwrap();
+
+        // The once-a-minute refresh: durable, persisted before the daemon
+        // session token would be issued.
+        let refresh = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash,
+            Some(now + 60_000),
+            now + 60_000,
+        )
+        .unwrap();
+        assert!(refresh.durable_change);
+        save_store(&path, &store).unwrap();
+
+        // Simulated restart: reload from disk. The exact captured proof
+        // must be dead against the reloaded state.
+        let mut reloaded = load_store(&path).unwrap();
+        let replay = apply_daemon_registration(
+            &mut reloaded,
+            "daemon-1",
+            "daemon-key",
+            &hash,
+            Some(now + 60_000),
+            now + 60_001,
+        );
+        let error = replay.expect_err("replayed proof must be rejected after restart");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("not newer"));
     }
 
     #[test]

@@ -168,6 +168,51 @@ pub(crate) async fn send_web_push(
     }
 }
 
+/// Deliver one payload to many subscriptions concurrently. Push relays are
+/// remote HTTP endpoints behind a 15s client timeout, so a serial loop could
+/// stall its caller (including the presence monitor's tick) for minutes on a
+/// fan-out. Concurrency is inherently bounded: every call site filters to
+/// one account's rows, and `push_subscribe` caps an account at 10.
+/// Returns (delivered, dead_endpoints); failures are logged under `context`
+/// exactly like the serial loops this replaces.
+pub(crate) async fn send_web_push_fanout(
+    state: &AppState,
+    subscriptions: &[PushSubscriptionRecord],
+    payload: &serde_json::Value,
+    context: &str,
+) -> (usize, Vec<String>) {
+    use futures_util::stream::{FuturesUnordered, StreamExt as _};
+    // Built with a plain loop: a closure returning an async block that
+    // borrows its argument trips the higher-ranked lifetime check inside
+    // axum handlers; loop-created async blocks have concrete lifetimes.
+    let mut sends = FuturesUnordered::new();
+    for subscription in subscriptions {
+        sends.push(async move {
+            (
+                send_web_push(
+                    &state.push_http,
+                    &state.vapid,
+                    &state.config.public_origin,
+                    subscription,
+                    payload,
+                )
+                .await,
+                subscription,
+            )
+        });
+    }
+    let mut sent = 0;
+    let mut dead = Vec::new();
+    while let Some((result, subscription)) = sends.next().await {
+        match result {
+            Ok(true) => sent += 1,
+            Ok(false) => dead.push(subscription.endpoint.clone()),
+            Err(e) => eprintln!("[push] {context} failed: {e}"),
+        }
+    }
+    (sent, dead)
+}
+
 pub(crate) fn load_or_create_vapid_keypair(
     store: &mut Store,
 ) -> Result<ring::signature::EcdsaKeyPair, String> {
@@ -527,23 +572,8 @@ pub(crate) async fn daemon_notify(
     let session_label = clean_fleet_text(&body.session_label, FLEET_LABEL_MAX);
     let push_payload =
         attention_push_payload(&body.kind, &daemon_label, &session_label, &daemon_id);
-    let mut sent = 0;
-    let mut dead = Vec::new();
-    for subscription in &subscriptions {
-        match send_web_push(
-            &state.push_http,
-            &state.vapid,
-            &state.config.public_origin,
-            subscription,
-            &push_payload,
-        )
-        .await
-        {
-            Ok(true) => sent += 1,
-            Ok(false) => dead.push(subscription.endpoint.clone()),
-            Err(e) => eprintln!("[push] attention nudge failed: {e}"),
-        }
-    }
+    let (sent, dead) =
+        send_web_push_fanout(&state, &subscriptions, &push_payload, "attention nudge").await;
     {
         let mut store = state.store.lock().await;
         if !dead.is_empty() {
@@ -593,23 +623,7 @@ pub(crate) async fn push_test(
         "body": "Test notification — this is what a computer alert will look like.",
         "url": "/connect",
     });
-    let mut sent = 0;
-    let mut dead = Vec::new();
-    for subscription in &subscriptions {
-        match send_web_push(
-            &state.push_http,
-            &state.vapid,
-            &state.config.public_origin,
-            subscription,
-            &payload,
-        )
-        .await
-        {
-            Ok(true) => sent += 1,
-            Ok(false) => dead.push(subscription.endpoint.clone()),
-            Err(e) => eprintln!("[push] test send failed: {e}"),
-        }
-    }
+    let (sent, dead) = send_web_push_fanout(&state, &subscriptions, &payload, "test send").await;
     if !dead.is_empty() {
         let mut store = state.store.lock().await;
         store
@@ -666,7 +680,23 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
                     }
                 }
             }
-            (transitions, store.push_subscriptions.clone())
+            // The steady-state tick has no transitions: clone nothing. When
+            // it does, clone only the affected owners' opted-in rows.
+            let subscriptions: Vec<PushSubscriptionRecord> = if transitions.is_empty() {
+                Vec::new()
+            } else {
+                let owners: HashSet<Uuid> = transitions
+                    .iter()
+                    .filter_map(|(_, _, owner, _, _)| *owner)
+                    .collect();
+                store
+                    .push_subscriptions
+                    .iter()
+                    .filter(|s| s.notify_presence && owners.contains(&s.user_id))
+                    .cloned()
+                    .collect()
+            };
+            (transitions, subscriptions)
         };
         seeded = true;
         if transitions.is_empty() {
@@ -683,24 +713,14 @@ pub(crate) async fn presence_alert_monitor(state: Arc<AppState>) {
                 },
                 "url": "/connect",
             });
-            for subscription in subscriptions
+            let targets: Vec<PushSubscriptionRecord> = subscriptions
                 .iter()
-                .filter(|s| s.notify_presence && Some(s.user_id) == owner)
-            {
-                match send_web_push(
-                    &state.push_http,
-                    &state.vapid,
-                    &state.config.public_origin,
-                    subscription,
-                    &payload,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => dead.push(subscription.endpoint.clone()),
-                    Err(e) => eprintln!("[push] presence alert failed: {e}"),
-                }
-            }
+                .filter(|s| Some(s.user_id) == owner)
+                .cloned()
+                .collect();
+            let (_sent, newly_dead) =
+                send_web_push_fanout(&state, &targets, &payload, "presence alert").await;
+            dead.extend(newly_dead);
         }
         if !dead.is_empty() {
             let mut store = state.store.lock().await;
