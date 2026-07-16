@@ -682,7 +682,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
         }
     }
 
-    drain_queued_control_frames(rtc, channels, outbound_queue);
+    drain_queued_control_frames(rtc, channels, outbound_queue, *control_wire_congested);
 
     Ok(rtc
         .poll_timeout()
@@ -768,7 +768,13 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
     text: String,
 ) {
     if text.len() <= CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES || request_id.is_empty() {
-        if response_credit_enabled && !outbound_queue.is_empty() && !request_id.is_empty() {
+        // Queue whenever the wire is congested (bounding spam through the
+        // queue caps — a full queue answers a budgeted error) or the
+        // queue is non-empty (FIFO fairness behind earlier responses);
+        // direct-send only on an uncongested, empty queue. Credit is not
+        // required: immediate frames drain creditlessly.
+        let must_queue = !request_id.is_empty() && (wire_congested || !outbound_queue.is_empty());
+        if must_queue {
             if !outbound_queue.enqueue_immediate(request_id.clone(), text) {
                 // Admission control at the queue caps (see
                 // `send_control_frame`).
@@ -787,7 +793,7 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
         } else {
             send_control_text(rtc, channels, text);
         }
-        drain_queued_control_frames(rtc, channels, outbound_queue);
+        drain_queued_control_frames(rtc, channels, outbound_queue, wire_congested);
         return;
     }
     let total_bytes = text.len();
@@ -818,7 +824,7 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
     );
     if response_credit_enabled {
         if outbound_queue.enqueue_chunked(plan) {
-            drain_queued_control_frames(rtc, channels, outbound_queue);
+            drain_queued_control_frames(rtc, channels, outbound_queue, wire_congested);
         } else {
             // Admission control at the queue caps (see
             // `send_control_frame`).
@@ -902,12 +908,12 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
                     send_control_text(rtc, channels, text);
                 }
             }
-            drain_queued_control_frames(rtc, channels, outbound_queue);
+            drain_queued_control_frames(rtc, channels, outbound_queue, wire_congested);
         }
         ControlFrameTexts::Chunked(plan) => {
             if response_credit_enabled {
                 if outbound_queue.enqueue_chunked(plan) {
-                    drain_queued_control_frames(rtc, channels, outbound_queue);
+                    drain_queued_control_frames(rtc, channels, outbound_queue, wire_congested);
                 } else {
                     // Admission control: the per-connection queue caps are
                     // exhausted — answer the request instead of pinning
@@ -967,7 +973,7 @@ pub(crate) fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
             let request_id = plan.request_id.clone();
             if response_credit_enabled {
                 if outbound_queue.enqueue_chunked(plan) {
-                    drain_queued_control_frames(rtc, channels, outbound_queue);
+                    drain_queued_control_frames(rtc, channels, outbound_queue, wire_congested);
                 } else {
                     // Admission control at the queue caps (see
                     // `send_control_frame`).
@@ -1153,7 +1159,16 @@ pub(crate) fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
     outbound_queue: &mut OutboundControlQueue,
+    wire_congested: bool,
 ) {
+    // Above the high watermark nothing drains: queued frames wait under
+    // the queue caps (that is what makes the caps BIND — draining while
+    // congested would forward the backlog straight into the unbounded
+    // SCTP pending queue). The driver re-runs this every loop, so the
+    // Low-watermark event resumes the flush.
+    if wire_congested {
+        return;
+    }
     loop {
         let mut pop_front = false;
         let mut completed = false;

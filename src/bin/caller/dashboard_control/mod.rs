@@ -2075,11 +2075,18 @@ pub(crate) struct PendingControlRequests {
     entries: HashMap<String, PendingControlRequest>,
     /// Live-work ledger: strong count − 1 = slots currently held.
     live_work: Arc<()>,
-    /// Committing-upload ledger: strong count − 1 = commits in flight
-    /// (they left `inbound_uploads` but their work — and spool — lives
-    /// until the commit finishes; the upload 8-cap counts them).
-    committing_uploads: Arc<()>,
+    /// Committing-upload ledger: commits in flight with their byte
+    /// weights (they left `inbound_uploads` but their work — and spool —
+    /// lives until the commit finishes; the upload 8-cap counts them and
+    /// the 256 MiB aggregate counts their bytes).
+    committing_uploads: Arc<UploadCommitLedger>,
     next_generation: u64,
+}
+
+#[derive(Default)]
+struct UploadCommitLedger {
+    count: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
 }
 
 struct PendingControlRequest {
@@ -2092,15 +2099,31 @@ struct PendingControlRequest {
 /// the upload state that becomes one) and live until the work ends.
 pub(crate) struct LiveWorkSlot(#[allow(dead_code)] Arc<()>);
 
-/// RAII committing-upload slot (see `committing_uploads`).
-pub(crate) struct UploadCommitSlot(#[allow(dead_code)] Arc<()>);
+/// RAII committing-upload slot (see `committing_uploads`): carries the
+/// commit's byte weight, debited from the ledger only when the commit
+/// actually finishes.
+pub(crate) struct UploadCommitSlot {
+    ledger: Arc<UploadCommitLedger>,
+    bytes: usize,
+}
+
+impl Drop for UploadCommitSlot {
+    fn drop(&mut self) {
+        self.ledger
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.ledger
+            .bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 impl PendingControlRequests {
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
             live_work: Arc::new(()),
-            committing_uploads: Arc::new(()),
+            committing_uploads: Arc::new(UploadCommitLedger::default()),
             next_generation: 0,
         }
     }
@@ -2134,14 +2157,34 @@ impl PendingControlRequests {
         Arc::strong_count(&self.live_work).saturating_sub(1)
     }
 
-    /// One committing upload's cap presence (held until the commit ends).
-    pub(crate) fn upload_commit_slot(&self) -> UploadCommitSlot {
-        UploadCommitSlot(Arc::clone(&self.committing_uploads))
+    /// One committing upload's cap + byte presence (held until the
+    /// commit ends; `bytes` is the upload's actual received size).
+    pub(crate) fn upload_commit_slot(&self, bytes: usize) -> UploadCommitSlot {
+        self.committing_uploads
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.committing_uploads
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        UploadCommitSlot {
+            ledger: Arc::clone(&self.committing_uploads),
+            bytes,
+        }
     }
 
     /// Commits currently in flight.
     pub(crate) fn committing_uploads(&self) -> usize {
-        Arc::strong_count(&self.committing_uploads).saturating_sub(1)
+        self.committing_uploads
+            .count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes held by commits in flight (counted against the aggregate
+    /// declared-bytes budget until each commit completes).
+    pub(crate) fn committing_upload_bytes(&self) -> usize {
+        self.committing_uploads
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The client's `cancel` frame: cancel and free the reservation.
@@ -2241,11 +2284,19 @@ const MAX_INBOUND_UPLOADS_PER_CONNECTION: usize = 8;
 /// reserve unbounded spool space regardless of the per-upload cap.
 const MAX_INBOUND_UPLOAD_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 /// LIVE spawned-work slots per tunnel connection (request tasks, stream
-/// framers, upload states and their commit tasks). Each spawned handler
-/// may construct a response as large as the fs-read cap before queue
-/// admission runs, so the reservation happens at spawn time and — via
-/// the RAII [`LiveWorkSlot`] — frees only when the work actually ends,
-/// covering cancelled-but-draining predecessors too.
+/// framers + their line producers, upload states and their commit
+/// tasks). Each spawned handler may construct a response as large as the
+/// fs-read cap before queue admission runs, so the reservation happens
+/// at spawn time and — via the RAII [`LiveWorkSlot`] — frees only when
+/// the work actually ends, covering cancelled-but-draining predecessors.
+///
+/// Deliberate fail-closed occupancy: a WEDGED operation (an fs read
+/// stuck on a dead mount, a producer that never finishes) legitimately
+/// HOLDS its slot — slots measure live work, so 64 wedged operations
+/// mean a fully occupied connection until teardown. That is the design:
+/// the bound guarantees bounded memory, not bounded latency, and a
+/// connection that has genuinely wedged 64 operations has no business
+/// admitting more work it also cannot finish.
 const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
 
 impl UploadSpool {
@@ -4020,6 +4071,79 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Committing uploads hold their BYTE weight against the aggregate
+    /// declared-bytes budget until the commit completes: with enough
+    /// bytes mid-commit, a new upload_start is refused on bytes even
+    /// though `inbound_uploads` itself is empty.
+    #[tokio::test]
+    async fn committing_upload_bytes_count_against_the_aggregate() {
+        let mut rt = runtime();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        // Two slow 90 MiB commits still in flight (left inbound_uploads,
+        // commit not finished): 180 MiB held by the ledger.
+        let weight = 90 * 1024 * 1024;
+        let _slow_commits = [
+            pending.upload_commit_slot(weight),
+            pending.upload_commit_slot(weight),
+        ];
+        assert_eq!(pending.committing_upload_bytes(), 2 * weight);
+
+        // A third 90 MiB upload_start busts the 256 MiB aggregate.
+        let start = serde_json::json!({
+            "t": "upload_start",
+            "id": "u-agg",
+            "method": "api_session_current_upload",
+            "params": { "name": "big.bin", "mime": "application/octet-stream" },
+            "total_bytes": weight,
+            "chunks": 90 * 64,
+        });
+        let refused = test_control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("over-budget upload_start must answer");
+        assert_eq!(refused["result"]["_httpStatus"], 429, "{refused}");
+        assert!(refused["result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("declared-bytes budget"));
+
+        // Commits finishing (slots dropping) release the budget.
+        drop(_slow_commits);
+        assert_eq!(pending.committing_upload_bytes(), 0);
+        let admitted = test_control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(
+            admitted.is_none(),
+            "with the commits finished the same start admits: {admitted:?}"
+        );
+    }
+
+    /// Immediate-frame spam is bounded by the queue's frame-count cap —
+    /// the seam R4-3 routes congested pre-serialized frames through.
+    #[test]
+    fn immediate_frame_cap_bounds_queued_spam() {
+        let mut queue = OutboundControlQueue::new();
+        for index in 0..CONTROL_OUTBOUND_QUEUE_MAX_FRAMES {
+            assert!(queue.enqueue_immediate(format!("r{index}"), "{\"ok\":true}".to_string()));
+        }
+        assert!(
+            !queue.enqueue_immediate("over".to_string(), "{}".to_string()),
+            "the frame-count cap must refuse the next enqueue"
+        );
+    }
+
     /// The direct-error budget: while congested, exactly
     /// [`DIRECT_ERROR_BUDGET_FRAMES`] error frames pass, further ones drop
     /// and are counted; an uncongested beat (the wire drained) refills.
@@ -4124,11 +4248,14 @@ mod tests {
         drop(draining);
         assert_eq!(pending.live_work(), 0);
 
-        // The committing-upload ledger is RAII the same way.
-        let commit_slot = pending.upload_commit_slot();
+        // The committing-upload ledger is RAII the same way, bytes
+        // included.
+        let commit_slot = pending.upload_commit_slot(1024);
         assert_eq!(pending.committing_uploads(), 1);
+        assert_eq!(pending.committing_upload_bytes(), 1024);
         drop(commit_slot);
         assert_eq!(pending.committing_uploads(), 0);
+        assert_eq!(pending.committing_upload_bytes(), 0);
     }
 
     /// The pre-serialized response carrier: byte-verbatim body embedding,

@@ -1104,7 +1104,8 @@ pub(crate) fn control_upload_start_frame(
         .iter()
         .filter(|(key, _)| *key != &id)
         .map(|(_, upload)| upload.total_bytes)
-        .sum();
+        .sum::<usize>()
+        .saturating_add(pending_requests.committing_upload_bytes());
     if declared_elsewhere.saturating_add(total_bytes) > MAX_INBOUND_UPLOAD_TOTAL_BYTES {
         return Some(control_upload_error_response(
             id,
@@ -1263,7 +1264,7 @@ pub(crate) fn control_upload_end_frame(
     // upload slot that the upload 8-cap counts, both until the commit
     // actually finishes.
     let generation = upload.generation;
-    let commit_slot = pending_requests.upload_commit_slot();
+    let commit_slot = pending_requests.upload_commit_slot(upload.received_bytes);
     tokio::spawn(async move {
         let mut upload = upload;
         let _slot = upload.slot.take();
