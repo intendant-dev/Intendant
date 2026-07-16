@@ -863,6 +863,9 @@ mod tests {
 
     #[test]
     fn session_teardown_clears_escalations() {
+        // SessionEnded is the teardown that drops an undelivered
+        // escalation: the session is gone, there is nothing left to come
+        // look at.
         let mut state = MonitorState::new();
         state.observe(&urgent_notification("abc"));
         state.observe(&AppEvent::SessionEnded {
@@ -872,13 +875,17 @@ mod tests {
         });
         assert!(state.escalations.is_empty());
 
+        // TaskComplete is NOT teardown: the session lives on, and the
+        // final-turn urgent escalation racing it must survive to reach an
+        // away owner (delivery itself is pinned by
+        // final_turn_escalations_survive_task_complete_and_still_deliver).
         state.observe(&urgent_notification("def"));
         state.observe(&AppEvent::TaskComplete {
             session_id: Some("def".to_string()),
             reason: "done".to_string(),
             summary: None,
         });
-        assert!(state.escalations.is_empty());
+        assert_eq!(state.escalations.len(), 1);
     }
 
     /// The daemon-side kind vocabulary is CLOSED and must match the
