@@ -20,21 +20,27 @@
 //!    per-target files, and the denial steps must match the
 //!    vector's outcome rows exactly.
 //! 4. **Flush + atomic replacement (review R6; criterion-12
-//!    criterion 8)** — the §13.2 cell names `framing, flush, locks,
-//!    crash/corruption`, and the funded plan names portable
-//!    `open/write/rename`: EVERY `inputs.stream` (the cut-carrying
-//!    vectors AND the framing-only ones) materializes through
-//!    write-temp → the sync seam (`sync_all`: fsync /
-//!    FlushFileBuffers) → `rename` onto a PRE-SEEDED final path, so
-//!    both primitives are load-bearing (bypass the rename and the
-//!    stale sentinel survives — the read-back fails red) and every
-//!    rename is a real replacement of an existing file on all three
-//!    OSes. End-of-run invocation counters fail the lane if either
-//!    primitive executed zero times, and the flush observation is
-//!    COUPLED to the call: a `--flush-probe` re-exec under the
-//!    `STORAGE_LANE_FAIL_SYNC` failpoint must go red — a durable
-//!    path that stopped calling (or stopped honoring) the sync seam
-//!    leaves the failpoint probe green and the lane fails.
+//!    criterion 8; ff23f1cd F4)** — the §13.2 cell names `framing,
+//!    flush, locks, crash/corruption`, and the funded plan names
+//!    portable `open/write/rename`: EVERY `inputs.stream` (the
+//!    cut-carrying vectors AND the framing-only ones) materializes
+//!    through write-temp → the sync seam (`sync_all`: fsync /
+//!    FlushFileBuffers) → `rename` onto a PRE-SEEDED final path.
+//!    What the executable controls PROVE, exactly: the end-of-run
+//!    counters must EQUAL the corpus-derived stream count (a path
+//!    that skips any stream — the ff23f1cd F4-B mutation — goes
+//!    red, not just a zero count); the pre-seed is read back before
+//!    the durable write and the sentinel must be gone after it, so
+//!    every rename is a verified REPLACEMENT of an existing file on
+//!    all three OSes (deleting the pre-seed — F4-C — goes red); and
+//!    the `--flush-probe` re-exec under `STORAGE_LANE_FAIL_SYNC`
+//!    must go red, proving the seam is INVOKED on the durable path
+//!    and its error propagates. Stated limit (F4-A): no portable
+//!    runtime observation distinguishes a seam whose real
+//!    `sync_all` body was replaced by a no-op — that the seam calls
+//!    the OS flush is source-inspection territory
+//!    (`fn sync_seam`), and the OS-level durability of the flush
+//!    itself is Gate B.
 //! 5. **Semantics** — the unmodified harness dispatch must report
 //!    PASS on the vector.
 //!
@@ -103,10 +109,15 @@ fn roundtrip_inputs(node: &Json, dir: &Path, n: &mut u32, bytes: &mut u64) -> Re
 /// (`File::sync_all`: fsync on Unix, FlushFileBuffers on Windows).
 /// The `STORAGE_LANE_FAIL_SYNC` failpoint forces the seam to report
 /// failure; the end-of-run control re-execs a probe write under it
-/// and REQUIRES red, coupling the flush observation to the call's
-/// RESULT — an invocation counter alone survives deletion of the
-/// call it counts (the criterion-12 review demonstrated exactly
-/// that mutation staying green).
+/// and REQUIRES red — proving the seam is invoked on the durable
+/// path and its error propagates (an invocation counter alone
+/// survives deletion of the call it counts — the criterion-12
+/// review demonstrated that mutation staying green). Stated limit
+/// (ff23f1cd F4-A): replacing THIS function's `f.sync_all()` body
+/// with a no-op is not detectable by any portable runtime
+/// observation — that the seam performs the OS flush is
+/// source-inspection ground truth, kept honest by this comment
+/// sitting on the seam itself.
 fn sync_seam(f: &std::fs::File) -> std::io::Result<()> {
     if std::env::var_os("STORAGE_LANE_FAIL_SYNC").is_some() {
         return Err(std::io::Error::other(
@@ -154,6 +165,13 @@ fn materialize_stream(
     let stream = unhex(stream_hex).ok_or("stream hex")?;
     let full = dir.join("stream.bin");
     std::fs::write(&full, PRESEED).map_err(|e| format!("pre-seed: {e}"))?;
+    // Verified-present pre-seed (ff23f1cd F4-C): the destination
+    // must really EXIST with the sentinel before the durable write,
+    // or the rename below proves publication, not replacement.
+    let seeded = std::fs::read(&full).map_err(|e| format!("pre-seed read-back: {e}"))?;
+    if seeded != PRESEED {
+        return Err("pre-seed read-back differs — replacement is unproven".into());
+    }
     durable_write(&full, &stream, counters)?;
     let back = std::fs::read(&full).map_err(|e| format!("read after rename: {e}"))?;
     if back == PRESEED {
@@ -409,6 +427,11 @@ fn main() {
     // (sync_all invocations, rename invocations) — the R6 proof that
     // both primitives actually executed.
     let mut durable = (0u64, 0u64);
+    // The corpus-derived stream count (ff23f1cd F4-B): counted from
+    // the vector JSON alone, independent of the durable path, so the
+    // end gate can require counter EQUALITY — a path that quietly
+    // skips any stream (e.g. the framing-only ones) goes red.
+    let mut n_streams = 0u64;
     // The R5 manifest pin: the run set must equal the committed
     // lane manifest exactly — an annotation edit cannot silently
     // shrink this lane.
@@ -444,6 +467,9 @@ fn main() {
         let (mut nfiles, mut nbytes) = (0u32, 0u64);
         if let Err(e) = roundtrip_inputs(&v["inputs"], &vdir, &mut nfiles, &mut nbytes) {
             fails.push(format!("roundtrip: {e}"));
+        }
+        if v["inputs"]["stream"].is_string() {
+            n_streams += 1;
         }
         let mut cuts = 0;
         match materialize_stream(&v, &vdir, &mut durable) {
@@ -501,12 +527,15 @@ fn main() {
         eprintln!("STORAGE LANE RED: {red} failing vector(s)");
         std::process::exit(1);
     }
-    // R6 invocation proof: a run in which either portable primitive
-    // never executed is red — flush and atomic replacement are part
-    // of the §13.2 cell, not decoration.
-    if durable.0 == 0 || durable.1 == 0 {
+    // R6 invocation proof, hardened to EQUALITY (ff23f1cd F4-B): the
+    // counters must equal the corpus-derived stream count — flush and
+    // atomic replacement are part of the §13.2 cell for EVERY stream,
+    // and a durable path that skips one goes red, not just one that
+    // never runs.
+    if durable != (n_streams, n_streams) || n_streams == 0 {
         eprintln!(
-            "STORAGE LANE RED: flush/replacement never executed (sync_all={} rename={})",
+            "STORAGE LANE RED: durable materializations (sync_all={} rename={}) != \
+             the corpus's {n_streams} stream(s)",
             durable.0, durable.1
         );
         std::process::exit(1);
