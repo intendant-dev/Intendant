@@ -44,12 +44,19 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
 /// reach the runtime. `INTENDANT_*` names are the controller→runtime
 /// control channel (the mock-provider e2e rig rides `PROVIDER` +
 /// `INTENDANT_MOCK_*` into children) and are never treated as credentials.
+///
+/// Classification is done on the ASCII-uppercased name: Windows environment
+/// names are case-insensitive (`%mistral_api_key%` and `%MISTRAL_API_KEY%`
+/// resolve identically inside the runtime's shells), and dotenvy preserves
+/// whatever casing the `.env` file used — a lowercase spelling must not
+/// slip past the scrub.
 fn is_provider_credential_env(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
     if name.starts_with("INTENDANT_") {
         return false;
     }
-    crate::provider::PROVIDER_KEY_ENV_VARS.contains(&name)
-        || EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.contains(&name)
+    crate::provider::PROVIDER_KEY_ENV_VARS.contains(&name.as_str())
+        || EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.contains(&name.as_str())
         || name.ends_with("_API_KEY")
         || name.ends_with("_API_TOKEN")
 }
@@ -358,12 +365,11 @@ async fn run_agent_inner(
         Err(_) => {
             let _ = child.kill().await;
             // Everything that finished before the deadline is intact JSONL
-            // in the buffer (a possibly truncated trailing line is skipped
-            // by the caller's line-tolerant parser). Salvage it instead of
-            // discarding completed work the model would just redo; commands
-            // with no result line surface as missing downstream.
-            if has_parseable_runtime_output(&stdout_buf) {
-                let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+            // in the buffer. Salvage it instead of discarding completed
+            // work the model would just redo; commands with no result line
+            // surface as missing downstream.
+            if let Some(salvaged) = salvage_partial_stdout(stdout_buf) {
+                let stdout = String::from_utf8_lossy(&salvaged).to_string();
                 let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
                 if !stderr.ends_with('\n') && !stderr.is_empty() {
                     stderr.push('\n');
@@ -380,6 +386,28 @@ async fn run_agent_inner(
                 )))
             }
         }
+    }
+}
+
+/// Prepare a timed-out batch's stdout for salvage: drop the partial
+/// trailing line first — the kill can land mid-write, and the result mapper
+/// folds any unparseable line into ordinary output text, so an untruncated
+/// buffer would broadcast a malformed JSON fragment into every tool
+/// response. Complete result lines always end in a newline (the runtime
+/// writes line-buffered JSONL), so cutting at the last newline never drops
+/// a finished command's result. Returns None when nothing parseable
+/// remains (the batch keeps its timeout error).
+fn salvage_partial_stdout(mut stdout_buf: Vec<u8>) -> Option<Vec<u8>> {
+    let cut = stdout_buf
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    stdout_buf.truncate(cut);
+    if has_parseable_runtime_output(&stdout_buf) {
+        Some(stdout_buf)
+    } else {
+        None
     }
 }
 
@@ -437,6 +465,15 @@ mod tests {
             "MISTRAL_API_KEY",
             "SOME_SERVICE_API_TOKEN",
             "ANTHROPIC_AUTH_TOKEN",
+            // Windows env names are case-insensitive and dotenvy preserves
+            // the .env file's casing — %mistral_api_key% resolves as
+            // %MISTRAL_API_KEY% inside the runtime, so casing must not
+            // dodge the scrub.
+            "mistral_api_key",
+            "Anthropic_Api_Key",
+            "openai_api_key",
+            "custom_api_token",
+            "anthropic_auth_token",
         ] {
             assert!(is_provider_credential_env(name), "{name} must be scrubbed");
         }
@@ -449,6 +486,7 @@ mod tests {
             "INTENDANT_MOCK_DISPLAY",
             "INTENDANT_LOG_DIR",
             "INTENDANT_FAKE_API_KEY", // the INTENDANT_* namespace is never scrubbed
+            "intendant_fake_api_key", // …in any casing
             "OPENAI_BASE_URL",
         ] {
             assert!(!is_provider_credential_env(name), "{name} must survive");
@@ -473,19 +511,32 @@ mod tests {
                 "GEMINI_API_KEY",
                 "MISTRAL_API_KEY",
                 "CUSTOM_API_TOKEN",
+                "mistral_api_key",
+                "Custom_Api_Token",
                 "PATH",
                 "HOME",
                 "PROVIDER",
                 "INTENDANT_MOCK_SCRIPT",
             ],
         );
-        let envs: std::collections::HashMap<OsString, Option<OsString>> = cmd
+        let envs: Vec<(OsString, Option<OsString>)> = cmd
             .as_std()
             .get_envs()
             .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
             .collect();
+        // Windows' Command env map is case-insensitive (case-variant keys
+        // collapse into one entry), so match names case-insensitively.
+        let removal_entry_for = |name: &str| {
+            envs.iter()
+                .any(|(k, v)| v.is_none() && k.to_string_lossy().eq_ignore_ascii_case(name))
+        };
+        let any_entry_for = |name: &str| {
+            envs.iter()
+                .any(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case(name))
+        };
 
-        // Removed vars appear as explicit (name, None) child-env entries.
+        // Removed vars appear as explicit (name, None) child-env entries;
+        // mixed-case inherited names are removed too.
         for name in [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -493,25 +544,59 @@ mod tests {
             "GOOGLE_API_KEY",
             "MISTRAL_API_KEY",
             "CUSTOM_API_TOKEN",
+            "mistral_api_key",
+            "Custom_Api_Token",
         ] {
-            assert_eq!(
-                envs.get(OsStr::new(name)),
-                Some(&None),
+            assert!(
+                removal_entry_for(name),
                 "{name} must be removed from the child env"
             );
         }
         // Preserved vars have no explicit entry at all: they inherit.
         for name in ["PATH", "HOME", "PROVIDER", "INTENDANT_MOCK_SCRIPT"] {
             assert!(
-                !envs.contains_key(OsStr::new(name)),
+                !any_entry_for(name),
                 "{name} must inherit untouched (no explicit entry)"
             );
         }
-        assert_eq!(
-            envs.get(OsStr::new("INTENDANT_LOG_DIR")),
-            Some(&Some(OsString::from("/tmp/logs"))),
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == OsStr::new("INTENDANT_LOG_DIR")
+                    && v.as_deref() == Some(OsStr::new("/tmp/logs"))),
             "runtime control vars set at the spawn boundary must survive the scrub"
         );
+    }
+
+    /// Timeout salvage must drop a partial trailing line (a mid-write kill
+    /// otherwise leaks a malformed JSON fragment into the tool responses as
+    /// ordinary text) while keeping every complete result line, and must
+    /// decline when nothing parseable remains.
+    #[test]
+    fn salvage_truncates_partial_trailing_line() {
+        let complete = br#"{"type":"result","nonce":1,"data":"first ok"}"#;
+        let mut buf = complete.to_vec();
+        buf.push(b'\n');
+        buf.extend_from_slice(br#"{"type":"result","nonce":2,"da"#); // killed mid-write
+
+        let salvaged = salvage_partial_stdout(buf).expect("first result must be salvaged");
+        let text = String::from_utf8(salvaged).unwrap();
+        assert_eq!(text.as_bytes().last(), Some(&b'\n'));
+        assert!(text.contains("first ok"));
+        assert!(
+            !text.contains(r#""nonce":2"#),
+            "no fragment of the killed second result may remain: {text}"
+        );
+
+        // Only a partial line: nothing to salvage.
+        assert!(salvage_partial_stdout(br#"{"type":"result","non"#.to_vec()).is_none());
+
+        // A complete-looking line without its trailing newline is
+        // indistinguishable from a truncated longer line — conservatively
+        // dropped.
+        assert!(salvage_partial_stdout(complete.to_vec()).is_none());
+
+        // Unparseable noise lines alone don't qualify for salvage.
+        assert!(salvage_partial_stdout(b"panic: something\n".to_vec()).is_none());
     }
 
     /// The spawn boundary is the only place the user-display grant becomes
