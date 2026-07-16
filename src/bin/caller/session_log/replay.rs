@@ -2306,7 +2306,9 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 100_000);
-        log.reasoning_content(
+        log.reasoning_content_for_session(
+            None,
+            None,
             Some("The model is thinking about X"),
             Some("Full detailed reasoning about X and Y spanning many lines"),
         );

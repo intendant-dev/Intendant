@@ -1842,16 +1842,13 @@ impl SessionLog {
         }
     }
 
-    /// Log reasoning content from the model (full reasoning, not just summary).
-    pub fn reasoning_content(&mut self, summary: Option<&str>, full_content: Option<&str>) {
-        self.reasoning_content_for_session(None, None, summary, full_content);
-    }
-
-    /// [`Self::reasoning_content`] with session/source attribution persisted
-    /// into `data` (same keys `model_response_for_session` writes), so replay
-    /// rebuilds the reasoning row with the identity the live broadcast had —
-    /// without them a reloaded dashboard rendered reasoning unattributed and
-    /// the session-window dedupe signatures never matched the live copies.
+    /// Log reasoning content from the model (full reasoning, not just
+    /// summary), with session/source attribution persisted into `data`
+    /// (same keys `model_response_for_session` writes) so replay rebuilds
+    /// the reasoning row with the identity the live broadcast had —
+    /// without them a reloaded dashboard rendered reasoning unattributed
+    /// and the session-window dedupe signatures never matched the live
+    /// copies. Pass `None, None` for an unattributed head-session row.
     pub fn reasoning_content_for_session(
         &mut self,
         session_id: Option<&str>,
@@ -2535,7 +2532,9 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.reasoning_content(
+        log.reasoning_content_for_session(
+            None,
+            None,
             Some("The model is thinking about X"),
             Some("Full detailed reasoning about X and Y"),
         );
@@ -2557,7 +2556,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.reasoning_content(Some("Summary only"), None);
+        log.reasoning_content_for_session(None, None, Some("Summary only"), None);
         drop(log);
 
         // No reasoning file created when no full content
