@@ -1,8 +1,92 @@
-# Owner decisions (repair tranche, D2 / D5) — RULED
+# Owner decisions — rulings record + pending drafts
 
-Status: **both decisions are RULED (owner, 2026-07-14) and recorded
-in the spec's decision table.** This file survives as the
-alternatives record the rulings chose from.
+Status: **D2 and D5 are RULED (owner, 2026-07-14) and recorded in
+the spec's decision table** (this file survives as the alternatives
+record the rulings chose from). **D6 below is a PENDING DRAFT** —
+the owner directed its preparation (2026-07-15, the criterion-12
+send-back) but has not ratified the wording; the frozen spec is
+untouched until ratification.
+
+---
+
+## D6 (PENDING — DRAFT for owner ratification) — narrow D-202's convergence carrier (proposed D-204)
+
+### Why
+
+The criterion-12 review produced an executable counterexample
+against D-202's unqualified sentence "convergence rides the
+writer's re-proposed operation": using only the committed
+`f09-lease-lifecycle-sticky-reproposal` bytes, a replica that holds
+the TIMELY receipt at the original operation's first evaluation
+admits the original — so the same-coordinate re-proposal reaching
+it is D-130 fork evidence (`fork`, `freeze-writer`), not an
+admission. The re-proposal therefore cannot carry convergence
+across the two evidence-arrival worlds D-202 itself legitimizes: a
+same-lineage sequence-1 retry cannot satisfy both histories, and a
+sequence-2 retry cannot follow a rejected sequence-1 without new
+chain semantics. The owner chose narrowing the promise over
+changing coordinate-consumption semantics or minting a new carrier.
+
+### Proposed T5 prose amendment (§4, T5 — replaces the ruled sentence)
+
+Current (v0.5.20):
+
+> — terminal where issued; a later timely receipt does not re-open
+> the verdict, and convergence rides the writer's re-proposed
+> operation. Held timely evidence beats held late evidence at first
+> evaluation.
+
+Proposed:
+
+> — terminal where issued; a later timely receipt does not re-open
+> the verdict. **The re-proposal carrier is structure-relative
+> (D-204)**: among replicas sharing the original operation's
+> evidence-arrival structure (which qualified evidence — timely or
+> late — is held at its first evaluation), convergence rides the
+> writer's re-proposed operation at the freed coordinate. A replica
+> holding timely evidence at first evaluation admits the ORIGINAL
+> operation, and the same-coordinate re-proposal reaching it is
+> D-130 fork evidence (`fork`, `freeze-writer`) — the pair is
+> reconcilable only by a committed boundary selection (the D-130
+> lane). The cross-structure divergence of the pair's verdicts is a
+> stated, owner-visible residual of alternative (ii). Held timely
+> evidence beats held late evidence at first evaluation.
+
+### Proposed decision row
+
+> | D-204 | D-202's convergence carrier narrowed to shared
+> evidence-arrival structure: the re-proposed operation carries
+> convergence only among replicas holding the same qualified-evidence
+> class (timely vs late) at the original operation's first evaluation
+> — late-first replicas issue sticky `lease-stale` and admit the
+> re-proposal at the freed coordinate; timely-first replicas admit
+> the original, and the arriving re-proposal is D-130 same-coordinate
+> fork evidence (`fork`, `freeze-writer`), the pair reconcilable only
+> by a committed boundary selection. The cross-structure verdict
+> divergence is a stated owner-visible residual of alternative (ii)
+> (v0.5.20's unqualified carrier sentence promised a cross-structure
+> convergence no same-coordinate retry can honor — the Gate-A
+> criterion-12 review's executable trace); harness enforcement: a
+> fold vector's listed deliveries MUST share the declared
+> evidence-arrival structure, and the structure pair is vector-pinned
+> (`f9-lease-lifecycle-sticky-reproposal` late-first /
+> `f9-lease-lifecycle-timely-first-forks` timely-first) | Ratified,
+> owner, 2026-07-__ |
+
+### Mechanical consequences on ratification (owner's act, not this tranche's)
+
+- Spec version v0.5.20 → v0.5.21; the spec SHA-256 re-pins in
+  `gate-a-audit.md`, `README.md`, and the program ledger.
+- The harness's listed-deliveries rule ("the listed orders must
+  share the declared evidence-arrival structure") becomes the
+  normative precondition of the narrowed promise rather than a
+  harness convention.
+- Both worlds are ALREADY vector-pinned by this tranche (the
+  committed late-first vector and the new timely-first sibling, plus
+  a reducer cross-world test asserting each world's derived Memory
+  state) — ratification changes prose only, no artifact bytes.
+
+---
 
 - **D2 → alternative (c), no class / no vote (D-201).** Bare
   non-human unattested writers never count toward status; their
