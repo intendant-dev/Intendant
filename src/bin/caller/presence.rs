@@ -1091,6 +1091,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DisplayTaken { .. }
         | AppEvent::DisplayReleased { .. }
         | AppEvent::SessionDirChanged { .. }
+        | AppEvent::SessionFileActivity { .. }
         | AppEvent::PresenceUsageUpdate { .. }
         | AppEvent::PresenceLog { .. }
         | AppEvent::PresenceReady
@@ -1120,9 +1121,11 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::CodexThreadActionResult { .. }
         | AppEvent::SessionIdentity { .. }
         | AppEvent::SessionRelationship { .. }
+        | AppEvent::SessionForkResult { .. }
         | AppEvent::SessionCapabilities { .. }
         | AppEvent::SessionGoal { .. }
         | AppEvent::SessionVitals { .. }
+        | AppEvent::SessionActivity { .. }
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }

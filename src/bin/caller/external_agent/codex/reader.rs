@@ -20,13 +20,19 @@ pub(crate) async fn reader_task(
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
     context_pressure_floor: Arc<Mutex<Option<CodexContextPressureFloor>>>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     protocol_watch: Option<crate::external_agent::protocol_watch::ProtocolWatchHandle>,
     writer: SharedCodexWriter,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut terminal_turns_observed = CodexTerminalObserved::default();
-    let mut notification_state = CodexNotificationState::default();
+    let mut notification_state = CodexNotificationState {
+        // Configured effort, first-hand: the value Intendant itself passes
+        // at spawn (`-c model_reasoning_effort=…`) — never inferred.
+        activity: crate::session_activity::ActivityMachine::new(reasoning_effort),
+        ..Default::default()
+    };
 
     loop {
         let line = match lines.next_line().await {
@@ -39,6 +45,14 @@ pub(crate) async fn reader_task(
                 }
                 active_turn_id.lock().await.take();
                 active_turns.lock().await.clear();
+                // A dead process never settles its turn — retire the
+                // activity claim so no phantom "thinking" survives it.
+                if let Some(activity) = notification_state.activity.observe(
+                    crate::session_activity::ActivityObservation::TurnSettled,
+                    crate::session_activity::epoch_seconds(),
+                ) {
+                    let _ = event_tx.send(AgentEvent::ActivityUpdate { activity });
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: "Process stdout closed".into(),
                     exit_code: None,
@@ -51,6 +65,12 @@ pub(crate) async fn reader_task(
                 }
                 active_turn_id.lock().await.take();
                 active_turns.lock().await.clear();
+                if let Some(activity) = notification_state.activity.observe(
+                    crate::session_activity::ActivityObservation::TurnSettled,
+                    crate::session_activity::epoch_seconds(),
+                ) {
+                    let _ = event_tx.send(AgentEvent::ActivityUpdate { activity });
+                }
                 let _ = event_tx.send(AgentEvent::Terminated {
                     reason: format!("IO error reading stdout: {}", e),
                     exit_code: None,
@@ -391,6 +411,30 @@ pub(crate) async fn reader_task(
                 }
             }
             _ => {}
+        }
+
+        // Activity machine: primary-thread notifications only (the stale
+        // and terminal guards above already dropped out-of-turn noise;
+        // child collab threads say nothing about this session's phase).
+        let targets_primary_thread = match (thread_id.as_deref(), active_thread_snapshot.as_deref())
+        {
+            (None, _) | (_, None) => true,
+            (Some(thread), Some(active)) => thread == active,
+        };
+        if targets_primary_thread {
+            if let Some(activity) = observe_codex_activity(
+                &mut notification_state,
+                method,
+                &params,
+                crate::session_activity::epoch_seconds(),
+            ) {
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::ActivityUpdate { activity },
+                );
+            }
         }
 
         translate_notification_with_scope(
@@ -739,7 +783,11 @@ pub(crate) fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> 
     })
 }
 
-pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
+/// Structured file paths of a Codex `fileChange` item, verbatim as the wire
+/// item stated them (single-path fields, `paths`/`files` arrays, or the
+/// `changes` map's keys — same precedence the preview always used). Feeds
+/// both the human preview and `AgentEvent::FileActivity`.
+pub(crate) fn codex_file_change_paths(params: &serde_json::Value) -> Vec<String> {
     if let Some(path) = non_empty_string_at(
         params,
         &[
@@ -752,7 +800,7 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
             "/file_path",
         ],
     ) {
-        return Some(path);
+        return vec![path];
     }
 
     let item = params.get("item").unwrap_or(params);
@@ -773,7 +821,7 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
                 }
             }
             if !paths.is_empty() {
-                return Some(paths.join(", "));
+                return paths;
             }
         }
     }
@@ -782,11 +830,11 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
         let mut paths: Vec<String> = changes.keys().cloned().collect();
         paths.sort();
         if !paths.is_empty() {
-            return Some(paths.join(", "));
+            return paths;
         }
     }
 
-    None
+    Vec::new()
 }
 
 pub(crate) fn codex_web_search_preview(params: &serde_json::Value) -> String {
@@ -986,6 +1034,13 @@ pub(crate) struct CodexNotificationState {
     /// outgoing usage snapshots for the vitals limit gauges.
     limit_windows: Vec<crate::types::SessionLimitWindow>,
     command_output_hygiene: HashMap<String, CodexCommandOutputHygiene>,
+    /// Wire-fact activity machine for the primary conversation thread
+    /// (vitals `activity` section) — fed by [`observe_codex_activity`].
+    activity: crate::session_activity::ActivityMachine,
+    /// Item ids of the primary thread's currently executing tool items,
+    /// so `item/completed` can tell "a tool settled, more still run" from
+    /// "all tools settled → awaiting the model again".
+    open_tool_items: HashSet<String>,
 }
 
 /// Parse an `account/rateLimits/updated` payload (app-server v2 shape:
@@ -1026,6 +1081,114 @@ pub(crate) fn codex_rate_limit_windows(
         });
     }
     windows
+}
+
+/// Map one app-server notification onto the primary thread's activity
+/// machine (vitals `activity` section). Callers pre-filter to the primary
+/// thread and the active turn — child collab threads say nothing about
+/// this session's phase.
+///
+/// Wire evidence per state: `turn/started` dispatches;
+/// `item/started type=reasoning` opens a reasoning claim — the observed
+/// app-server vocabulary has NO mid-item reasoning deltas (no
+/// `item/reasoning/*` method exists here or in the protocol references),
+/// so the claim carries no delta heartbeat and never degrades to
+/// "stalled" (honest item-level evidence over guessing); message deltas
+/// are response bytes; command/mcp/webSearch/fileChange items run tools;
+/// turn terminals settle. Liveness rides every notification's arrival
+/// timestamp — the "last-received-notification" clock.
+pub(crate) fn observe_codex_activity(
+    state: &mut CodexNotificationState,
+    method: &str,
+    params: &serde_json::Value,
+    now_epoch: u64,
+) -> Option<crate::types::SessionActivityVitals> {
+    use crate::session_activity::ActivityObservation as Obs;
+    let item = params.get("item").unwrap_or(params);
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let obs = match method {
+        "turn/started" => {
+            state.open_tool_items.clear();
+            Obs::TurnDispatched
+        }
+        "item/started" => match item_type {
+            "reasoning" => Obs::ReasoningStarted {
+                delta_heartbeat: false,
+            },
+            "agentMessage" => Obs::ResponseDelta,
+            "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "webSearch"
+            | "collabAgentToolCall" => {
+                if let Some(id) = codex_item_event_id(params, item) {
+                    state.open_tool_items.insert(id.to_string());
+                }
+                Obs::ToolsRunning
+            }
+            _ => Obs::StreamByte,
+        },
+        "item/agentMessage/delta" => Obs::ResponseDelta,
+        "item/commandExecution/outputDelta" => Obs::ToolsRunning,
+        "item/completed" => {
+            let was_open_tool = codex_item_event_id(params, item)
+                .map(|id| state.open_tool_items.remove(id))
+                .unwrap_or(false);
+            if item_type == "agentMessage" && codex_item_completed_final_answer(params) {
+                state.open_tool_items.clear();
+                Obs::TurnSettled
+            } else if item_type == "reasoning"
+                || (was_open_tool && state.open_tool_items.is_empty())
+            {
+                // The segment settled and the model must produce the next
+                // item — honestly back to awaiting the API.
+                Obs::SegmentSettled
+            } else {
+                Obs::StreamByte
+            }
+        }
+        "turn/completed" | "turn/interrupted" | "turn/failed" => {
+            state.open_tool_items.clear();
+            Obs::TurnSettled
+        }
+        "thread/status/changed" => {
+            if codex_thread_status_type(params)
+                .is_some_and(|status| matches!(status, "completed" | "idle"))
+            {
+                state.open_tool_items.clear();
+                Obs::TurnSettled
+            } else {
+                Obs::StreamByte
+            }
+        }
+        // Rate-limit pauses surface as error notifications carrying the
+        // backend's own classification label — first-hand evidence; the
+        // periodic `account/rateLimits/updated` gauges carry no status and
+        // never claim a pause on their own.
+        "error" => {
+            let label = params
+                .pointer("/error/codexErrorInfo")
+                .or_else(|| params.pointer("/error/codex_error_info"))
+                .and_then(codex_error_info_label)
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .replace(['_', '-'], "");
+            if label.contains("ratelimit") || label.contains("usagelimit") {
+                // Countdown from the backend's own gauges: the fullest
+                // window's reported reset is the binding one.
+                let resets_at_epoch = state
+                    .limit_windows
+                    .iter()
+                    .max_by_key(|w| w.used_pct.unwrap_or(0))
+                    .and_then(|w| w.resets_at_epoch);
+                Obs::RateLimited { resets_at_epoch }
+            } else {
+                Obs::StreamByte
+            }
+        }
+        _ => Obs::StreamByte,
+    };
+    state.activity.observe(obs, now_epoch)
 }
 
 /// Compact gauge label for a Codex rate-limit window duration.
@@ -2240,7 +2403,8 @@ pub(crate) fn translate_notification_with_scope(
                     // path metadata is attached. Avoid showing a blank
                     // "file_change:" activity row; the filesystem watcher
                     // will still report the actual changed files.
-                    if let Some(preview) = codex_file_change_preview(params) {
+                    let paths = codex_file_change_paths(params);
+                    if !paths.is_empty() {
                         send_scoped_agent_event(
                             event_tx,
                             thread_id,
@@ -2248,8 +2412,16 @@ pub(crate) fn translate_notification_with_scope(
                             AgentEvent::ToolStarted {
                                 item_id,
                                 tool_name: "file_change".to_string(),
-                                preview,
+                                preview: paths.join(", "),
                             },
+                        );
+                        // Same paths, structured — the drain forwards them
+                        // to the git-vitals activity-locus tracker.
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::FileActivity { paths },
                         );
                     }
                 }
@@ -3431,6 +3603,58 @@ mod tests {
                 assert!(preview.contains("src/main.rs"));
             }
             other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_started_file_change_emits_structured_file_activity() {
+        // The preview's ToolStarted is followed by a structured
+        // FileActivity carrying the same paths — the git-vitals
+        // activity-locus signal (never parsed back out of the preview).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "item": {
+                "type": "fileChange",
+                "changes": {
+                    "/abs/checkout/src/main.rs": {},
+                    "/abs/checkout/src/lib.rs": {}
+                }
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted { tool_name, .. } => assert_eq!(tool_name, "file_change"),
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::FileActivity { paths } => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        "/abs/checkout/src/lib.rs".to_string(),
+                        "/abs/checkout/src/main.rs".to_string(),
+                    ],
+                    "changes-map keys arrive sorted and verbatim"
+                );
+            }
+            other => panic!("expected FileActivity, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "exactly two events per fileChange");
+
+        // Single-path items carry that path structurally too.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-3",
+            "item": {"type": "fileChange", "path": "/tmp/test.txt"}
+        });
+        translate_notification("item/started", &params, &tx);
+        let _tool_started = rx.try_recv().unwrap();
+        match rx.try_recv().unwrap() {
+            AgentEvent::FileActivity { paths } => {
+                assert_eq!(paths, vec!["/tmp/test.txt".to_string()]);
+            }
+            other => panic!("expected FileActivity, got {:?}", other),
         }
     }
 
@@ -5115,6 +5339,139 @@ error: build failed
             rx.try_recv().is_err(),
             "reasoning start should emit nothing"
         );
+    }
+
+    /// The Codex wire → activity mapping: turn start dispatches; a
+    /// reasoning item opens an honest delta-less reasoning claim (the
+    /// observed app-server vocabulary has no mid-item reasoning deltas,
+    /// so it must never degrade to "stalled"); message deltas respond;
+    /// tool items run until the last one settles; turn terminals idle.
+    #[test]
+    fn codex_activity_follows_item_transitions() {
+        use crate::types::SessionActivityState as S;
+        let mut state = CodexNotificationState::default();
+        let none = serde_json::Value::Null;
+
+        let s = observe_codex_activity(&mut state, "turn/started", &none, 100)
+            .expect("dispatch publishes");
+        assert_eq!(s.state, S::AwaitingApi);
+        assert!(
+            s.stalled_after_seconds.is_some(),
+            "an unanswered turn can stall"
+        );
+
+        let reasoning = serde_json::json!({"item": {"id": "r1", "type": "reasoning"}});
+        let s = observe_codex_activity(&mut state, "item/started", &reasoning, 101)
+            .expect("state flip publishes");
+        assert_eq!(s.state, S::Reasoning);
+        assert_eq!(
+            s.stalled_after_seconds, None,
+            "no mid-item reasoning bytes are promised — quiet must stay an honest reasoning-item claim"
+        );
+
+        // Long silence: the claim holds (liveness-only honesty, no fake stall).
+        assert!(
+            observe_codex_activity(&mut state, "item/completed", &reasoning, 400)
+                .is_some_and(|s| s.state == S::AwaitingApi)
+        );
+
+        let delta = serde_json::json!({"itemId": "m1", "delta": "hel"});
+        let s = observe_codex_activity(&mut state, "item/agentMessage/delta", &delta, 401)
+            .expect("state flip publishes");
+        assert_eq!(s.state, S::Responding);
+        assert!(
+            s.stalled_after_seconds.is_some(),
+            "message deltas are a live stream"
+        );
+
+        // Two tools open; the first settling keeps tool-running, the last
+        // settles back to awaiting the model.
+        let tool_a =
+            serde_json::json!({"item": {"id": "c1", "type": "commandExecution", "command": "ls"}});
+        let tool_b = serde_json::json!({"item": {"id": "c2", "type": "mcpToolCall", "tool": "take_screenshot"}});
+        let s = observe_codex_activity(&mut state, "item/started", &tool_a, 402)
+            .expect("state flip publishes");
+        assert_eq!(s.state, S::ToolRunning);
+        assert!(observe_codex_activity(&mut state, "item/started", &tool_b, 403).is_none());
+        assert!(
+            observe_codex_activity(&mut state, "item/completed", &tool_a, 404).is_none(),
+            "one of two tools settling changes nothing"
+        );
+        let s = observe_codex_activity(&mut state, "item/completed", &tool_b, 405)
+            .expect("last tool settling publishes");
+        assert_eq!(s.state, S::AwaitingApi);
+
+        let s = observe_codex_activity(&mut state, "turn/completed", &none, 500)
+            .expect("terminal publishes");
+        assert_eq!(s.state, S::Idle);
+
+        // Ambient between-turn notifications resurrect nothing.
+        assert!(
+            observe_codex_activity(&mut state, "thread/tokenUsage/updated", &none, 501).is_none()
+        );
+        assert_eq!(state.activity.snapshot().state, S::Idle);
+    }
+
+    #[test]
+    fn codex_activity_final_answer_settles_turn() {
+        use crate::types::SessionActivityState as S;
+        let mut state = CodexNotificationState::default();
+        let none = serde_json::Value::Null;
+        observe_codex_activity(&mut state, "turn/started", &none, 100);
+        let final_answer = serde_json::json!({
+            "item": {"id": "m9", "type": "agentMessage", "phase": "final_answer", "text": "done"}
+        });
+        let s = observe_codex_activity(&mut state, "item/completed", &final_answer, 110)
+            .expect("final answer publishes");
+        assert_eq!(s.state, S::Idle);
+    }
+
+    #[test]
+    fn codex_activity_rate_limit_error_uses_backend_label_and_gauge_reset() {
+        use crate::types::SessionActivityState as S;
+        let mut state = CodexNotificationState::default();
+        state.limit_windows = vec![
+            crate::types::SessionLimitWindow {
+                label: "5h".into(),
+                used_pct: Some(40),
+                resets_at_epoch: Some(2000),
+                status: None,
+            },
+            crate::types::SessionLimitWindow {
+                label: "7d".into(),
+                used_pct: Some(100),
+                resets_at_epoch: Some(9000),
+                status: None,
+            },
+        ];
+        let none = serde_json::Value::Null;
+        observe_codex_activity(&mut state, "turn/started", &none, 100);
+
+        // A plain stream error is NOT a rate-limit claim.
+        let plain = serde_json::json!({"error": {"message": "boom", "codexErrorInfo": "streamDisconnected"}});
+        assert!(observe_codex_activity(&mut state, "error", &plain, 101).is_none());
+
+        let limited = serde_json::json!({
+            "error": {"message": "usage limit reached", "codexErrorInfo": "rateLimitExceeded"},
+            "willRetry": true
+        });
+        let s = observe_codex_activity(&mut state, "error", &limited, 102)
+            .expect("rate-limit claim publishes");
+        assert_eq!(s.state, S::RateLimited);
+        assert_eq!(
+            s.resets_at_epoch,
+            Some(9000),
+            "the fullest gauge's reset is the countdown"
+        );
+    }
+
+    #[test]
+    fn codex_activity_carries_configured_effort() {
+        let mut state = CodexNotificationState::default();
+        state.activity.set_effort(Some("high".into()));
+        let s = observe_codex_activity(&mut state, "turn/started", &serde_json::Value::Null, 100)
+            .expect("dispatch publishes");
+        assert_eq!(s.effort.as_deref(), Some("high"));
     }
 
     #[test]

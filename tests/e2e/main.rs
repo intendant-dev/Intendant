@@ -4213,3 +4213,218 @@ async fn headless_rollback_writes_a_conversation_rewound_cut() {
          supersede round 2 (seq {round2_seq})"
     );
 }
+
+/// Fork-from-anchor, native lane: a two-round scripted session forked at
+/// the round boundary before round two. The child must materialize as a
+/// prefix-only session (round one, nothing of round two), the parent's
+/// persisted conversation must be byte-identical afterwards, the
+/// `anchor-fork` lineage edge must be durable in the child's spine, and
+/// the `session_fork_result` must ride the event lane with the request's
+/// correlation id. A stale anchor must fail as a structured result, not
+/// a dead session.
+#[tokio::test]
+async fn native_session_forks_at_a_round_boundary() {
+    use futures_util::SinkExt;
+
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Round one answer.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round one complete" } }] },
+                { "content": "Round two answer.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "round two complete" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::new();
+    let mut daemon = spawn_daemon(&client, &script, free_loopback_port()).await;
+    let port = daemon.port;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+
+    // Round one (retry the first send: it can race daemon startup).
+    let mut started = None;
+    for _ in 0..6 {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "action": "create_session",
+                "task": "fork-anchor round one",
+                "direct": true,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send create_session");
+        started = next_matching_ws_event(&mut ws, Duration::from_secs(30), |json| {
+            json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+                && json
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|task| task.contains("fork-anchor round one"))
+        })
+        .await;
+        if started.is_some() {
+            break;
+        }
+    }
+    let started = started.unwrap_or_else(|| {
+        panic!(
+            "create_session never started; daemon log:\n{}",
+            daemon.log_tail()
+        )
+    });
+    let parent_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+    next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("round_complete")
+    })
+    .await
+    .unwrap_or_else(|| panic!("round one never completed:\n{}", daemon.log_tail()));
+
+    // Round two via follow-up, so the boundary between the rounds exists.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "follow_up",
+            "session_id": parent_id,
+            "text": "fork-anchor round two",
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send follow_up");
+    // Stop the parent after round two: the native conversation persists at
+    // session stop, and the Recent-tab fork UX targets cold sessions.
+    complete_and_stop_session(&mut ws, &parent_id, || daemon.log_tail()).await;
+
+    // The catalog must offer the boundary before round two.
+    let fork_points = http_get_json(
+        &client,
+        &format!("http://127.0.0.1:{port}/api/session/{parent_id}/fork-points"),
+    )
+    .await
+    .expect("fork-points response");
+    assert_eq!(fork_points["source"], "intendant", "{fork_points}");
+    assert_eq!(fork_points["supported"], true, "{fork_points}");
+    let round_point = fork_points["fork_points"]
+        .as_array()
+        .expect("fork_points array")
+        .iter()
+        .find(|point| point["kind"] == "round" && point["eligible"] == true)
+        .unwrap_or_else(|| panic!("no eligible round boundary in {fork_points}"))
+        .clone();
+    let cut_seq = round_point["seq"].as_u64().expect("round point seq");
+
+    // Parent's persisted conversation, byte-pinned across the fork.
+    let logs_root = daemon.rig.home.path().join(".intendant").join("logs");
+    let parent_conversation = logs_root.join(&parent_id).join("conversation.jsonl");
+    let parent_bytes_before =
+        std::fs::read(&parent_conversation).expect("parent conversation exists");
+
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "fork_session_at_anchor",
+            "source": "intendant",
+            "session_id": parent_id,
+            "anchor": { "kind": "round", "seq": cut_seq },
+            "request_id": "e2e-fork-1",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send fork_session_at_anchor");
+    let result = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_fork_result")
+            && json.get("request_id").and_then(|v| v.as_str()) == Some("e2e-fork-1")
+    })
+    .await
+    .unwrap_or_else(|| panic!("no session_fork_result; daemon log:\n{}", daemon.log_tail()));
+    assert!(
+        result.get("error").and_then(|v| v.as_str()).is_none(),
+        "fork failed: {result}"
+    );
+    assert_eq!(result["relationship"], "anchor-fork", "{result}");
+    let child_id = result["child_session_id"]
+        .as_str()
+        .expect("fork result carries the child id")
+        .to_string();
+
+    // Child = strict prefix; parent untouched; durable lineage edge.
+    let child_dir = logs_root.join(&child_id);
+    let child_conversation =
+        std::fs::read_to_string(child_dir.join("conversation.jsonl")).expect("child conversation");
+    let parent_text = String::from_utf8_lossy(&parent_bytes_before).to_string();
+    assert!(
+        child_conversation.lines().count() < parent_text.lines().count(),
+        "child must be a strict prefix: child\n{child_conversation}\nparent\n{parent_text}"
+    );
+    assert!(
+        !child_conversation.contains("round two"),
+        "child leaked round two:\n{child_conversation}"
+    );
+    assert_eq!(
+        std::fs::read(&parent_conversation).expect("parent conversation still exists"),
+        parent_bytes_before,
+        "parent conversation mutated by the fork"
+    );
+    let child_spine =
+        std::fs::read_to_string(child_dir.join("session.jsonl")).expect("child spine");
+    assert!(
+        child_spine.contains("\"anchor-fork\"") && child_spine.contains(&parent_id),
+        "child spine missing the anchor-fork edge:\n{child_spine}"
+    );
+
+    // The child is visible in the catalog.
+    let sessions = http_get_json(&client, &format!("http://127.0.0.1:{port}/api/sessions"))
+        .await
+        .expect("sessions list");
+    let rows = sessions["sessions"]
+        .as_array()
+        .cloned()
+        .or_else(|| sessions.as_array().cloned())
+        .expect("sessions array");
+    assert!(
+        rows.iter()
+            .any(|row| row["session_id"].as_str() == Some(child_id.as_str())),
+        "child session missing from the catalog: {sessions}"
+    );
+
+    // A stale anchor fails as a structured result.
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "fork_session_at_anchor",
+            "source": "intendant",
+            "session_id": parent_id,
+            "anchor": { "kind": "round", "seq": 999_999 },
+            "request_id": "e2e-fork-stale",
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send stale fork");
+    let stale = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_fork_result")
+            && json.get("request_id").and_then(|v| v.as_str()) == Some("e2e-fork-stale")
+    })
+    .await
+    .unwrap_or_else(|| panic!("no stale-fork result; daemon log:\n{}", daemon.log_tail()));
+    assert!(
+        stale
+            .get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|err| err.contains("not found")),
+        "stale fork should fail with a not-found error: {stale}"
+    );
+
+    daemon.child.kill().await.expect("stop the daemon");
+}

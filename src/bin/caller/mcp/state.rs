@@ -130,6 +130,11 @@ pub struct McpAppState {
     /// the gateway/daemon shapes or when the store failed to open — agenda
     /// surfaces then answer "unavailable" instead of failing the daemon.
     pub agenda: Option<std::sync::Arc<crate::agenda::AgendaHandle>>,
+    /// The P1 Memory service (single-writer handle over the EPHEMERAL
+    /// plane). `None` outside the gateway/daemon shapes or when the
+    /// bootstrap ceremony failed — memory surfaces then answer
+    /// "unavailable" instead of failing the daemon.
+    pub memory: Option<std::sync::Arc<crate::memory::MemoryHandle>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -310,6 +315,7 @@ impl McpAppState {
             session_registry: None,
             peer_registry: None,
             agenda: None,
+            memory: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

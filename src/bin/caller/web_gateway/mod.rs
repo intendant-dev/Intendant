@@ -47,6 +47,8 @@ pub(crate) use routes_transfers::*;
 
 mod routes_agenda;
 pub(crate) use routes_agenda::*;
+mod routes_memory;
+pub(crate) use routes_memory::*;
 
 mod routes_fork_points;
 pub(crate) use routes_fork_points::*;

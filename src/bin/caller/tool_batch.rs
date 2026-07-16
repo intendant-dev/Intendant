@@ -29,6 +29,11 @@ pub struct BatchFacts {
     /// the raw JSON when the batch is unparseable or previews to nothing
     /// (the UI handles collapsing).
     pub commands_preview: String,
+    /// `file_path` of every file-mutating command (`editFile`/`writeFile`)
+    /// in the batch, verbatim and in batch order. Feeds
+    /// `AppEvent::SessionFileActivity` — the git-vitals activity-locus
+    /// signal; the consumer ignores relative entries.
+    pub write_paths: Vec<String>,
 }
 
 impl BatchFacts {
@@ -59,6 +64,11 @@ impl BatchFacts {
                 }
                 "captureScreen" => facts.has_capture_screen = true,
                 "execAsAgent" | "execPty" => facts.has_exec = true,
+                "editFile" | "writeFile" => {
+                    if let Some(path) = cmd.get("file_path").and_then(|v| v.as_str()) {
+                        facts.write_paths.push(path.to_string());
+                    }
+                }
                 _ => {}
             }
             if function != "askHuman" {
@@ -485,6 +495,35 @@ mod tests {
         assert_eq!(
             BatchFacts::from_json(empty_parts).commands_preview,
             empty_parts
+        );
+    }
+
+    #[test]
+    fn batch_facts_collects_write_paths_from_file_mutations() {
+        let facts = BatchFacts::from_json(
+            r#"{"commands":[
+                {"function":"editFile","nonce":1,"file_path":"/abs/checkout/src/lib.rs","operation":"replace"},
+                {"function":"writeFile","nonce":2,"file_path":"relative/notes.md"},
+                {"function":"execAsAgent","nonce":3,"command":"cargo test"},
+                {"function":"inspectPath","nonce":4,"path":"/abs/checkout/README.md"},
+                {"function":"editFile","nonce":5}
+            ]}"#,
+        );
+        // Verbatim, batch order, mutations only (inspectPath is a read;
+        // a pathless editFile contributes nothing).
+        assert_eq!(
+            facts.write_paths,
+            vec![
+                "/abs/checkout/src/lib.rs".to_string(),
+                "relative/notes.md".to_string(),
+            ]
+        );
+
+        assert!(BatchFacts::from_json("not json").write_paths.is_empty());
+        assert!(
+            BatchFacts::from_json(r#"{"commands":[{"function":"captureScreen","nonce":1}]}"#)
+                .write_paths
+                .is_empty()
         );
     }
 

@@ -858,6 +858,21 @@ impl Conversation {
         removed
     }
 
+    /// Length of the message prefix ending at the message whose `seq` is
+    /// exactly `cut_after_seq` — the `truncate_to` target for a fork that
+    /// keeps history through that message. `None` when no message carries
+    /// the seq: a stale anchor (history moved since it was read) or legacy
+    /// `seq == 0` messages, both of which must refuse rather than guess.
+    pub fn prefix_len_through_seq(&self, cut_after_seq: u64) -> Option<usize> {
+        if cut_after_seq == 0 {
+            return None;
+        }
+        self.messages
+            .iter()
+            .position(|message| message.seq == cut_after_seq)
+            .map(|index| index + 1)
+    }
+
     pub fn drop_turns(&mut self, indices: &[usize]) {
         let len = self.messages.len();
         let protected_min = if len >= 2 { len - 2 } else { len };

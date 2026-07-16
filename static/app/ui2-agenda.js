@@ -14,6 +14,7 @@ let agendaSkippedLines = 0;
 let agendaFilter = 'open';
 let agendaFetchInFlight = null;
 let agendaLoadError = '';
+let agendaReminderPolicy = null; // owner delivery policy (Settings-gated)
 
 async function agendaRefresh() {
   if (agendaFetchInFlight) return agendaFetchInFlight;
@@ -24,6 +25,7 @@ async function agendaRefresh() {
         agendaItems = resp.body.items;
         agendaCounts = resp.body.counts || agendaCounts;
         agendaSkippedLines = resp.body.skipped_lines || 0;
+        agendaReminderPolicy = resp.body.reminder_policy || agendaReminderPolicy;
         agendaLoadError = '';
       } else {
         agendaLoadError = (resp.body && resp.body.error) || `agenda unavailable (${resp.status})`;
@@ -112,14 +114,23 @@ function agendaDueChip(item) {
   return `<span class="agenda-chip due${overdue ? ' overdue' : ''}">due ${escapeHtml(label)}</span>`;
 }
 
+function agendaActorLabel(p) {
+  // Gate-attributed actor (A2): kind + session/principal, rendered for
+  // humans. Data only — never markup.
+  if (p.session_id) return `session ${p.session_id.slice(0, 12)}`;
+  if (p.kind === 'dashboard') return 'you';
+  if (p.kind === 'local_process') return 'local ctl';
+  if (p.kind === 'peer') return 'a peer daemon';
+  if (p.kind === 'agent_session') return 'an agent session';
+  return p.principal || '';
+}
+
 function agendaProvenanceLine(item) {
   const p = item.provenance || {};
   const created = p.created_ms
     ? new Date(p.created_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
     : '';
-  const who = p.session_id
-    ? `session ${p.session_id.slice(0, 12)}`
-    : (p.principal || '');
+  const who = agendaActorLabel(p);
   const parts = [];
   if (created) parts.push(`parked ${created}`);
   if (who) parts.push(`by ${who}`);
@@ -131,15 +142,114 @@ function agendaActionButtons(item) {
   if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
   else if (item.status === 'done') actions.push(['reopen', 'Reopen'], ['retire', 'Retire']);
   else actions.push(['reopen', 'Reopen']);
-  return actions
+  const buttons = actions
     .map(([op, label]) =>
       `<button type="button" class="agenda-btn" data-op="${op}" data-id="${escapeHtml(item.id)}">${label}</button>`)
     .join('');
+  // The per-item reminder loudness control (owner policy) — only where a
+  // reminder can still fire.
+  if (item.status !== 'open' || !item.due_ms) return buttons;
+  const level = agendaItemUrgency(item.id);
+  const options = ['default', 'mute', 'info', 'attention', 'urgent']
+    .map((value) => {
+      const label = value === 'default'
+        ? `default (${(agendaReminderPolicy && agendaReminderPolicy.default_urgency) || 'attention'})`
+        : value;
+      return `<option value="${value}"${value === level ? ' selected' : ''}>${label}</option>`;
+    })
+    .join('');
+  return `<select class="agenda-bell" data-id="${escapeHtml(item.id)}" title="Reminder loudness for this item (owner policy)" aria-label="Reminder loudness">${options}</select>${buttons}`;
+}
+
+function agendaItemUrgency(id) {
+  const overrides = (agendaReminderPolicy && agendaReminderPolicy.item_urgency) || {};
+  return overrides[id] || 'default';
+}
+
+async function agendaSetItemUrgency(id, value, control) {
+  const patch = { item_urgency: { [id]: value === 'default' ? null : value } };
+  await agendaSendPolicyPatch(patch, control);
+}
+
+async function agendaSendPolicyPatch(patch, control) {
+  if (control) control.disabled = true;
+  try {
+    const resp = await daemonApi.request('api_agenda_reminder_policy', patch);
+    if (resp.ok && resp.body && resp.body.reminder_policy) {
+      agendaReminderPolicy = resp.body.reminder_policy;
+      agendaRenderAll();
+      return true;
+    }
+    agendaFlashError((resp.body && resp.body.error) || `policy update failed (${resp.status})`);
+    agendaRenderAll(); // restore the control to the effective policy
+    return false;
+  } catch (e) {
+    agendaFlashError(String(e && e.message || e));
+    return false;
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+
+function agendaRenderReminderBar() {
+  const bar = document.getElementById('agenda-reminders-bar');
+  if (!bar) return;
+  const policy = agendaReminderPolicy;
+  if (!policy) {
+    bar.innerHTML = '';
+    return;
+  }
+  const quiet = policy.quiet_hours;
+  const minToHhmm = (min) =>
+    `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
+  const quietLabel = quiet
+    ? `${minToHhmm(quiet.start_min)}–${minToHhmm(quiet.end_min)}`
+    : 'off';
+  bar.innerHTML = `
+    <span class="agenda-rem-label">Reminders</span>
+    <button type="button" class="agenda-btn" id="agenda-rem-toggle">${policy.enabled ? 'on' : 'off'}</button>
+    <span class="agenda-rem-label">quiet hours</span>
+    <button type="button" class="agenda-btn" id="agenda-rem-quiet" title="Deliveries inside the window wait for its end">${escapeHtml(quietLabel)}</button>
+    <span class="agenda-rem-label">default</span>
+    <select id="agenda-rem-default" aria-label="Default reminder urgency">
+      ${['info', 'attention', 'urgent'].map((value) =>
+        `<option value="${value}"${value === policy.default_urgency ? ' selected' : ''}>${value}</option>`).join('')}
+    </select>`;
+  const toggle = document.getElementById('agenda-rem-toggle');
+  if (toggle) toggle.addEventListener('click', () =>
+    agendaSendPolicyPatch({ enabled: !policy.enabled }, toggle));
+  const dflt = document.getElementById('agenda-rem-default');
+  if (dflt) dflt.addEventListener('change', () =>
+    agendaSendPolicyPatch({ default_urgency: dflt.value }, dflt));
+  const quietBtn = document.getElementById('agenda-rem-quiet');
+  if (quietBtn) quietBtn.addEventListener('click', () => {
+    const current = quiet ? `${minToHhmm(quiet.start_min)}-${minToHhmm(quiet.end_min)}` : '';
+    const raw = prompt('Quiet hours (HH:MM-HH:MM local; may cross midnight; empty = off)', current);
+    if (raw === null) return;
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      agendaSendPolicyPatch({ quiet_hours: null }, quietBtn);
+      return;
+    }
+    const m = trimmed.match(/^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    if (!m) {
+      agendaFlashError('quiet hours must look like 22:00-08:00');
+      return;
+    }
+    const start = Number(m[1]) * 60 + Number(m[2]);
+    const end = Number(m[3]) * 60 + Number(m[4]);
+    if (start > 23 * 60 + 59 || end > 23 * 60 + 59) {
+      agendaFlashError('quiet hours must use 00:00–23:59');
+      return;
+    }
+    agendaSendPolicyPatch({ quiet_hours: { start_min: start, end_min: end } }, quietBtn);
+  });
 }
 
 function agendaRenderAll() {
   agendaRenderTab();
   agendaRenderCard();
+  agendaRenderReminderBar();
 }
 
 function agendaRenderTab() {
@@ -203,6 +313,10 @@ function agendaRenderTab() {
     btn.addEventListener('click', () =>
       agendaSendOp({ op: btn.dataset.op, id: btn.dataset.id }, btn));
   });
+  list.querySelectorAll('select.agenda-bell').forEach((sel) => {
+    sel.addEventListener('change', () =>
+      agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
+  });
 }
 
 // ---- Compact card on the activity pane (stacked under the vitals rail).
@@ -259,11 +373,17 @@ function agendaRenderCard() {
     return;
   }
   // Oldest first: long-parked intent stays visible instead of scrolling away.
-  const rows = open.slice(0, 5).map((item) =>
-    `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
+  const rows = open.slice(0, 5).map((item) => {
+    const p = item.provenance || {};
+    // Agent-parked items carry their session provenance right on the card.
+    const who = p.session_id
+      ? `<span class="agenda-card-row-who">· sess ${escapeHtml(p.session_id.slice(0, 8))}</span>`
+      : '';
+    return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
       <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
-      <span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>
-    </div>`);
+      <span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
+    </div>`;
+  });
   const more = open.length > 5
     ? `<div class="agenda-card-more">+${open.length - 5} more…</div>`
     : '';

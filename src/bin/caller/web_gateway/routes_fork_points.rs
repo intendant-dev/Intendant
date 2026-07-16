@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::session_fork::{
-    codex_fork_points, native_fork_points, ForkPointCatalog, ForkPointQuery,
+    claude_fork_points, codex_fork_points, native_fork_points, ForkPointCatalog, ForkPointQuery,
     FORK_POINT_DEFAULT_LIMIT,
 };
 use std::io;
@@ -118,8 +118,8 @@ fn resolve_fork_point_catalog(
     {
         return codex_fork_points(session_id, session_id, &rollout, query).map(Some);
     }
-    if find_claude_session_file(home, session_id).is_some() {
-        return Ok(Some(claude_fork_points_stub(session_id, session_id)));
+    if let Some(transcript) = find_claude_session_file(home, session_id) {
+        return claude_fork_points(session_id, session_id, &transcript, query).map(Some);
     }
     Ok(None)
 }
@@ -144,7 +144,15 @@ fn external_fork_point_catalog(
                 )),
             }
         }
-        "claude-code" => Ok(claude_fork_points_stub(session_id, backend_id)),
+        "claude-code" => match find_claude_session_file(home, backend_id) {
+            Some(transcript) => claude_fork_points(session_id, backend_id, &transcript, query),
+            None => Ok(ForkPointCatalog::unsupported(
+                session_id,
+                "claude-code",
+                Some(backend_id),
+                "transcript not found under the claude session store",
+            )),
+        },
         other => Ok(ForkPointCatalog::unsupported(
             session_id,
             other,
@@ -152,15 +160,6 @@ fn external_fork_point_catalog(
             &format!("fork points are not supported for {other} sessions yet"),
         )),
     }
-}
-
-fn claude_fork_points_stub(session_id: &str, backend_id: &str) -> ForkPointCatalog {
-    ForkPointCatalog::unsupported(
-        session_id,
-        "claude-code",
-        Some(backend_id),
-        "claude-code fork points land with the transcript tree parser (follow-up phase)",
-    )
 }
 
 #[cfg(test)]
@@ -260,14 +259,20 @@ mod tests {
     }
 
     #[test]
-    fn claude_session_reports_follow_up_stub() {
+    fn claude_session_resolves_to_message_catalog() {
+        use crate::session_fork::test_fixtures::message_line;
         let home = tempfile::tempdir().expect("home");
         let codex_root = home.path().join(".codex");
         let project = home.path().join(".claude").join("projects").join("-tmp-x");
         std::fs::create_dir_all(&project).expect("mkdir");
+        let lines = [
+            message_line("u1", None, "user", "round one", false),
+            message_line("a1", Some("u1"), "assistant", "answer", false),
+            message_line("u2", Some("a1"), "user", "round two", false),
+        ];
         std::fs::write(
             project.join("cc11cc11-0000-0000-0000-000000000000.jsonl"),
-            "{\"type\":\"user\",\"sessionId\":\"cc11cc11-0000-0000-0000-000000000000\"}\n",
+            lines.join("\n") + "\n",
         )
         .expect("transcript");
         let (status, body) = response_json(session_fork_points_response_with_roots(
@@ -277,7 +282,14 @@ mod tests {
         ));
         assert_eq!(status, 200);
         assert_eq!(body["source"], "claude-code");
-        assert_eq!(body["supported"], false);
+        assert_eq!(body["supported"], true);
+        let ids: Vec<&str> = body["fork_points"]
+            .as_array()
+            .expect("points")
+            .iter()
+            .filter_map(|point| point["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec!["head", "msg:a1"]);
     }
 
     #[test]

@@ -247,9 +247,11 @@ pub fn spawn_event_listener(
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
+                    | AppEvent::SessionForkResult { .. }
                     | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
+                    | AppEvent::SessionActivity { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
@@ -981,6 +983,10 @@ pub fn spawn_event_listener(
                     | AppEvent::ConversationRollbackRequested { .. }
                     | AppEvent::ConversationRolledBack { .. } => {
                         // Broadcast-only — handled by outbound event converter.
+                    }
+                    AppEvent::SessionFileActivity { .. } => {
+                        // Internal git-vitals activity-locus signal — no
+                        // MCP surface.
                     }
                     AppEvent::DisplayCaptureLost {
                         display_id,

@@ -2994,7 +2994,12 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
         slog(config.session_log, |l| {
-            l.reasoning_content(Some(reasoning), None)
+            l.reasoning_content_for_session(
+                session_id,
+                config.agent_source.as_deref(),
+                Some(reasoning),
+                None,
+            )
         });
     }
 }
@@ -3263,6 +3268,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 source: config.agent_source.clone(),
             });
         }
+        external_agent::AgentEvent::FileActivity { .. } => {
+            // Git-vitals activity-locus signal: an idle Codex subagent's
+            // writes must not retarget any supervising session's git chip
+            // (mirrors the drain's primary-conversation-only gating).
+        }
         external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
             let tool_output_limiter = stats
                 .codex_subagent_tool_output_limiters
@@ -3359,6 +3369,14 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 session_id,
                 main: usage.into_model_snapshot(),
                 presence: None,
+            });
+        }
+        external_agent::AgentEvent::ActivityUpdate { activity } => {
+            // Side/child-thread activity rides the child's session id into
+            // the vitals hub, same keying as its usage snapshots.
+            config.bus.send(AppEvent::SessionActivity {
+                session_id,
+                activity,
             });
         }
         external_agent::AgentEvent::GoalUpdated { goal } => {

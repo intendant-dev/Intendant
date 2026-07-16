@@ -901,6 +901,13 @@ pub enum AgentEvent {
     },
     /// Token usage update reported by the external agent runtime.
     Usage { usage: AgentUsageSnapshot },
+    /// Honest per-session activity snapshot from the adapter's wire-fact
+    /// state machine (`session_activity::ActivityMachine`). Drains forward
+    /// it as `AppEvent::SessionActivity` for the vitals hub; it implies no
+    /// turn and must never open an observe round in the idle drains.
+    ActivityUpdate {
+        activity: crate::types::SessionActivityVitals,
+    },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
     /// Latest Codex `/goal` state for a thread.
@@ -934,6 +941,13 @@ pub enum AgentEvent {
         tool_name: String,
         preview: String,
     },
+    /// Structured paths of files a write-ish tool run touches, verbatim as
+    /// the backend's wire item stated them. Adapters emit this alongside
+    /// the matching `ToolStarted` only where the wire item carries the
+    /// paths structurally (never derived from a rendered preview). The
+    /// drain forwards it as `AppEvent::SessionFileActivity` for the
+    /// git-vitals activity-locus tracker.
+    FileActivity { paths: Vec<String> },
     /// Incremental output from a running tool.
     ToolOutputDelta { item_id: String, text: String },
     /// A tool execution completed.

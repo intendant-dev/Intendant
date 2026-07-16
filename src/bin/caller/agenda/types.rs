@@ -33,22 +33,44 @@ pub enum AgendaStatus {
     Retired,
 }
 
-/// Who performed an op, as far as the daemon can attribute it. In A1 this
-/// is the gateway principal when one is known; A2's session
-/// principal-binding token upgrades `session_id` from best-effort to real
-/// session attribution. Both fields optional by design — attribution must
-/// never block parking an item.
+/// Who performed an op, as the daemon's gates attributed it. This is the
+/// agenda's **own versioned copy** of the resolved actor — mapped from
+/// `access::actor::ActorBinding` at the write path (never serde of the raw
+/// seam type into the durable log; contract in `access/actor.rs`). All
+/// fields optional by design — attribution must never block parking an
+/// item.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaActor {
+    /// The IAM principal exactly as the gate named it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) principal: Option<String>,
+    /// The supervised session the write acted as — gate-bound by token
+    /// possession, never echoed from request fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// Actor class (`agent_session`, `dashboard`, `local_process`, `peer`)
+    /// so the diary can say "by you" vs "by a session" without parsing
+    /// principal ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
 }
 
 impl AgendaActor {
     fn is_empty(&self) -> bool {
-        self.principal.is_none() && self.session_id.is_none()
+        self.principal.is_none() && self.session_id.is_none() && self.kind.is_none()
+    }
+
+    /// Map the shared seam type into the agenda's own record shape.
+    /// `None` for an explicitly unattributed caller with nothing to record.
+    pub(crate) fn from_binding(binding: &crate::access::actor::ActorBinding) -> Option<Self> {
+        let kind = (binding.kind != crate::access::actor::ActorKind::Unattributed)
+            .then(|| binding.kind.as_str().to_string());
+        let actor = Self {
+            principal: binding.principal_id.clone(),
+            session_id: binding.session_id.clone(),
+            kind,
+        };
+        (!actor.is_empty()).then_some(actor)
     }
 }
 
@@ -59,6 +81,9 @@ pub struct AgendaProvenance {
     pub(crate) principal: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<String>,
+    /// Actor class of the parking write (see [`AgendaActor::kind`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
     pub(crate) created_ms: u64,
 }
 
@@ -118,11 +143,12 @@ impl AgendaPatch {
 
 /// `Option<Option<T>>` as JSON merge-patch: field absent → outer `None`
 /// (keep), field `null` → `Some(None)` (clear), value → `Some(Some(v))`.
-mod double_option {
+/// Shared by [`AgendaPatch::due_ms`] and the reminder-policy patch.
+pub(crate) mod double_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub(super) fn serialize<S: Serializer>(
-        v: &Option<Option<u64>>,
+    pub(crate) fn serialize<T: Serialize, S: Serializer>(
+        v: &Option<Option<T>>,
         s: S,
     ) -> Result<S::Ok, S::Error> {
         // Outer `None` is skipped via `skip_serializing_if`; only the inner
@@ -133,10 +159,10 @@ mod double_option {
         }
     }
 
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+    pub(crate) fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
         d: D,
-    ) -> Result<Option<Option<u64>>, D::Error> {
-        Ok(Some(Option::<u64>::deserialize(d)?))
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Ok(Some(Option::<T>::deserialize(d)?))
     }
 }
 
@@ -281,6 +307,7 @@ pub(crate) fn apply_op(
                     provenance: AgendaProvenance {
                         principal: actor.principal,
                         session_id: actor.session_id,
+                        kind: actor.kind,
                         created_ms: at_ms,
                     },
                     status: AgendaStatus::Open,
@@ -510,6 +537,7 @@ mod tests {
             actor: Some(AgendaActor {
                 principal: Some("owner".into()),
                 session_id: None,
+                kind: None,
             }),
             op: AgendaOp::Add {
                 id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
@@ -549,6 +577,35 @@ mod tests {
             r#"{"op":"add","title":"x","kind":"note","effect":"launch"}"#
         )
         .is_err());
+    }
+
+    /// The tenant-side mapping of the shared actor seam: unattributed
+    /// callers record nothing; everyone else records principal/session/kind
+    /// exactly as the gate resolved them.
+    #[test]
+    fn agenda_actor_maps_the_seam_faithfully() {
+        use crate::access::actor::ActorBinding;
+        assert_eq!(
+            AgendaActor::from_binding(&ActorBinding::unattributed()),
+            None
+        );
+
+        let agent = AgendaActor::from_binding(&ActorBinding::agent_session(
+            Some("principal:agent-session:abc".into()),
+            "sess-abc".into(),
+        ))
+        .unwrap();
+        assert_eq!(
+            agent.principal.as_deref(),
+            Some("principal:agent-session:abc")
+        );
+        assert_eq!(agent.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(agent.kind.as_deref(), Some("agent_session"));
+
+        // Trusted-local dashboard: no named principal, kind still recorded.
+        let local = AgendaActor::from_binding(&ActorBinding::dashboard(None)).unwrap();
+        assert_eq!(local.principal, None);
+        assert_eq!(local.kind.as_deref(), Some("dashboard"));
     }
 
     #[test]

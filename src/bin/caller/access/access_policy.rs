@@ -275,6 +275,10 @@ pub enum PeerOperation {
     AgendaRead,
     /// Park, patch, and transition agenda items.
     AgendaWrite,
+    /// Search and read Memory claims (bounded, provenance-labeled).
+    MemoryRead,
+    /// Propose Memory claims (the candidate lane; ephemeral in P1.1).
+    MemoryWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +308,7 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
     Ok(profile.to_ascii_lowercase())
 }
 
-pub const ALL_OPERATIONS: [PeerOperation; 24] = [
+pub const ALL_OPERATIONS: [PeerOperation; 26] = [
     PeerOperation::PresenceRead,
     PeerOperation::StatsRead,
     PeerOperation::DisplayView,
@@ -329,6 +333,8 @@ pub const ALL_OPERATIONS: [PeerOperation; 24] = [
     PeerOperation::FilesystemWrite,
     PeerOperation::AgendaRead,
     PeerOperation::AgendaWrite,
+    PeerOperation::MemoryRead,
+    PeerOperation::MemoryWrite,
 ];
 
 /// True when `granted` allows no operation that `cap` does not. Profiles
@@ -907,6 +913,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::CreateSession { .. }
         | ControlMsg::SpawnSubAgent { .. }
         | ControlMsg::ResumeSession { .. }
+        | ControlMsg::ForkSessionAtAnchor { .. }
         | ControlMsg::EditUserMessage { .. } => PeerOperation::Task,
         ControlMsg::Approve { .. }
         | ControlMsg::Deny { .. }

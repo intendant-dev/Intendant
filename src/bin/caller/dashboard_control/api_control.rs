@@ -1162,7 +1162,11 @@ pub(crate) async fn api_mcp_tool_call_response(
             arguments,
             session_id.as_deref(),
             managed_context,
-            crate::mcp::ToolCallerTrust::from_principal(&runtime.grant.access_principal()),
+            // The tunnel's authenticated grant is the gate here; no token
+            // names a session on this lane, so the actor carries the
+            // dashboard principal only (the `session_id` param above is
+            // context selection, not identity).
+            crate::mcp::ToolCaller::from_gate(&runtime.grant.access_principal(), None),
         )
         .await
     {
@@ -1588,6 +1592,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
             | ControlMsg::ResumeSession { .. }
+            | ControlMsg::ForkSessionAtAnchor { .. }
             | ControlMsg::FollowUp { .. }
             | ControlMsg::CancelFollowUp { .. }
             | ControlMsg::EditUserMessage { .. }
@@ -1661,6 +1666,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
         ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::ForkSessionAtAnchor { .. } => "fork_session_at_anchor",
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
         ControlMsg::SetClaudePermissionMode { .. } => "set_claude_permission_mode",
         ControlMsg::SetClaudeAllowedTools { .. } => "set_claude_allowed_tools",
