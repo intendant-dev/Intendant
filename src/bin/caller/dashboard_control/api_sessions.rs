@@ -9,17 +9,26 @@ pub(crate) fn spawn_control_request(
     method: String,
     params: Option<serde_json::Value>,
     runtime: ControlRuntime,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
 ) {
-    if let Some(previous) = pending_requests.remove(&id) {
-        previous.cancel();
-    }
-    let cancel = CancellationToken::new();
-    pending_requests.insert(id.clone(), cancel.clone());
+    let (cancel, generation) = pending_requests.admit(&id);
     tokio::spawn(async move {
-        let response = control_request_response(id, method, params, runtime, cancel).await;
-        let _ = task_tx.send(response).await;
+        // Cancellation is enforced at this seam rather than threaded into
+        // every handler's internals: superseding/cancelling the request
+        // drops the handler future at its next await point, which bounds
+        // live work for same-id spam (an already-entered spawn_blocking
+        // segment runs out on the blocking pool and drops its output).
+        // A cancelled task sends nothing — its reservation was already
+        // replaced or removed by whoever cancelled it.
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            response = control_request_response(id, method, params, runtime, cancel.clone()) => {
+                response
+            }
+        };
+        let _ = task_tx.send((generation, response)).await;
     });
 }
 
@@ -75,18 +84,14 @@ pub(crate) fn spawn_control_stream(
     id: String,
     method: String,
     params: Option<serde_json::Value>,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
 ) {
-    if let Some(previous) = pending_requests.remove(&id) {
-        previous.cancel();
-    }
-    let cancel = CancellationToken::new();
-    pending_requests.insert(id.clone(), cancel.clone());
+    let (cancel, generation) = pending_requests.admit(&id);
     tokio::spawn(async move {
         match method.as_str() {
             "api_sessions_stream" => {
-                stream_sessions_response(id, params.as_ref(), task_tx, cancel).await;
+                stream_sessions_response(id, params.as_ref(), task_tx, generation, cancel).await;
             }
             _ => {
                 let frame = serde_json::json!({
@@ -96,12 +101,15 @@ pub(crate) fn spawn_control_stream(
                     "error": format!("unknown stream method: {method}"),
                 });
                 let _ = task_tx
-                    .send(ControlTaskResponse {
-                        id,
-                        frame,
-                        byte_stream: None,
-                        done: true,
-                    })
+                    .send((
+                        generation,
+                        ControlTaskResponse {
+                            id,
+                            frame,
+                            byte_stream: None,
+                            done: true,
+                        },
+                    ))
                     .await;
             }
         }
@@ -381,7 +389,8 @@ pub(crate) async fn control_request_frame(
 pub(crate) async fn stream_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    generation: u64,
     cancel: CancellationToken,
 ) {
     let requested_limit = sessions_stream_requested_limit(params);
@@ -391,17 +400,20 @@ pub(crate) async fn stream_sessions_response(
         // The sessions-stream core always answers on the Stream lane; a
         // buffered response reaching this framer is a wiring bug.
         let _ = task_tx
-            .send(ControlTaskResponse {
-                id: id.clone(),
-                frame: serde_json::json!({
-                    "t": "stream_end",
-                    "id": id,
-                    "ok": false,
-                    "error": "session stream returned a buffered response",
-                }),
-                byte_stream: None,
-                done: true,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id: id.clone(),
+                    frame: serde_json::json!({
+                        "t": "stream_end",
+                        "id": id,
+                        "ok": false,
+                        "error": "session stream returned a buffered response",
+                    }),
+                    byte_stream: None,
+                    done: true,
+                },
+            ))
             .await;
         return;
     };
@@ -410,6 +422,7 @@ pub(crate) async fn stream_sessions_response(
         "api_sessions_stream".to_string(),
         stream,
         task_tx,
+        generation,
         cancel,
     )
     .await;
@@ -419,7 +432,8 @@ pub(crate) async fn stream_json_lines_response(
     id: String,
     method: String,
     stream: crate::web_gateway::LineStream,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    generation: u64,
     cancel: CancellationToken,
 ) {
     let crate::web_gateway::LineStream {
@@ -431,16 +445,19 @@ pub(crate) async fn stream_json_lines_response(
     }
 
     if task_tx
-        .send(ControlTaskResponse {
-            id: id.clone(),
-            frame: serde_json::json!({
-                "t": "stream_start",
-                "id": id,
-                "method": method,
-            }),
-            byte_stream: None,
-            done: false,
-        })
+        .send((
+            generation,
+            ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "stream_start",
+                    "id": id,
+                    "method": method,
+                }),
+                byte_stream: None,
+                done: false,
+            },
+        ))
         .await
         .is_err()
     {
@@ -466,12 +483,15 @@ pub(crate) async fn stream_json_lines_response(
                     "error": format!("session stream returned invalid JSON: {e}"),
                 });
                 let _ = task_tx
-                    .send(ControlTaskResponse {
-                        id,
-                        frame,
-                        byte_stream: None,
-                        done: true,
-                    })
+                    .send((
+                        generation,
+                        ControlTaskResponse {
+                            id,
+                            frame,
+                            byte_stream: None,
+                            done: true,
+                        },
+                    ))
                     .await;
                 return;
             }
@@ -486,12 +506,15 @@ pub(crate) async fn stream_json_lines_response(
         });
         seq = seq.saturating_add(1);
         if task_tx
-            .send(ControlTaskResponse {
-                id: id.clone(),
-                frame,
-                byte_stream: None,
-                done: false,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id: id.clone(),
+                    frame,
+                    byte_stream: None,
+                    done: false,
+                },
+            ))
             .await
             .is_err()
         {
@@ -517,12 +540,15 @@ pub(crate) async fn stream_json_lines_response(
     };
     if !cancel.is_cancelled() {
         let _ = task_tx
-            .send(ControlTaskResponse {
-                id,
-                frame,
-                byte_stream: None,
-                done: true,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id,
+                    frame,
+                    byte_stream: None,
+                    done: true,
+                },
+            ))
             .await;
     }
 }
@@ -1687,7 +1713,7 @@ mod tests {
                 line_tx.send(format!("{line}\n")).await.unwrap();
             }
         });
-        let (task_tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let (task_tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
 
         stream_json_lines_response(
             "stream1".to_string(),
@@ -1697,12 +1723,13 @@ mod tests {
                 source: stream_task,
             },
             task_tx,
+            7,
             CancellationToken::new(),
         )
         .await;
 
         let mut frames = Vec::new();
-        while let Some(task) = rx.recv().await {
+        while let Some((_, task)) = rx.recv().await {
             frames.push(task);
             if frames.last().unwrap().done {
                 break;
@@ -2780,17 +2807,18 @@ mod tests {
         // Tunnel lane: the framer over the same sequence — one
         // stream_event per line, events byte-identical to the HTTP
         // lane's parsed lines, under the lifecycle frames.
-        let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
+        let (task_tx, mut task_rx) = mpsc::channel::<SequencedTaskResponse>(64);
         stream_json_lines_response(
             "stream-parity".to_string(),
             "api_sessions_stream".to_string(),
             replay_line_stream(lines.clone()),
             task_tx,
+            7,
             CancellationToken::new(),
         )
         .await;
         let mut frames = Vec::new();
-        while let Some(task) = task_rx.recv().await {
+        while let Some((_, task)) = task_rx.recv().await {
             let done = task.done;
             frames.push(task);
             if done {

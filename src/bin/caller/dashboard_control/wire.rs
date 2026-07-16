@@ -56,8 +56,8 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     }
     let mut tcp_senders: HashMap<SocketAddr, TcpFrameSender> = HashMap::new();
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
-    let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
-    let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
+    let (task_tx, mut task_rx) = mpsc::channel::<SequencedTaskResponse>(64);
+    let mut pending_requests = PendingControlRequests::new();
     let mut outbound_queue = OutboundControlQueue::new();
     let mut inbound_uploads: HashMap<String, InboundUploadState> = HashMap::new();
     let (terminal_events_tx, mut terminal_events_rx) =
@@ -75,6 +75,7 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     let (terminal_output_tx, mut terminal_output_rx) =
         mpsc::channel::<serde_json::Value>(TERMINAL_OUTPUT_LANE_CAP);
     let mut control_wire_congested = false;
+    let mut error_budget = DirectErrorBudget::new("dashboard/control");
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
     // Per-connection ordered display-input lane (F1): `display_input`
@@ -113,6 +114,7 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
             &mut terminal_forwarders,
             &display_input_tx,
             &mut control_wire_congested,
+            &mut error_budget,
         )
         .await
         {
@@ -266,12 +268,16 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
-            Some(task_response) = task_rx.recv() => {
+            Some((generation, task_response)) = task_rx.recv() => {
                 if !runtime.grant.opening_authority_is_current() {
                     shutdown.cancel();
                     break;
                 }
-                if pending_requests.contains_key(&task_response.id) {
+                // Generation-matched forwarding: a superseded task's
+                // response is dropped whole — it must neither reach the
+                // wire under the reused id nor free the replacement's
+                // reservation.
+                if pending_requests.matches(&task_response.id, generation) {
                     let task_id = task_response.id.clone();
                     let done = task_response.done;
                     send_control_task_response(
@@ -280,10 +286,11 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                         &mut outbound_queue,
                         runtime.response_credit_enabled,
                         control_wire_congested,
+                        &mut error_budget,
                         task_response,
                     );
                     if done {
-                        pending_requests.remove(&task_id);
+                        pending_requests.complete(&task_id, generation);
                     }
                 }
                 let _ = rtc.handle_timeout(Instant::now());
@@ -402,13 +409,12 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     // clipboard authority during that window.
     shutdown.cancel();
     remove_dashboard_display_peers(&runtime).await;
-    for (_, token) in pending_requests {
-        token.cancel();
-    }
+    pending_requests.cancel_all();
     for (_, handle) in terminal_forwarders {
         handle.abort();
         let _ = handle.await;
     }
+    error_budget.log_teardown();
     // Egress relays die with their session: no more frames can arrive,
     // so drop the registration and fail any in-flight relayed requests.
     crate::credential_egress::unregister_session(&runtime.session_id);
@@ -506,8 +512,8 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     drop_stats: &mut TransmitDropStats,
     channels: &mut HashMap<String, rtc::data_channel::RTCDataChannelId>,
     runtime: &mut ControlRuntime,
-    task_tx: &mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: &mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
@@ -515,6 +521,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
     display_input_tx: &DisplayInputForwarder,
     control_wire_congested: &mut bool,
+    error_budget: &mut DirectErrorBudget,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1
@@ -597,6 +604,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
                 outbound_queue,
                 runtime.response_credit_enabled,
                 *control_wire_congested,
+                error_budget,
                 response,
             );
         }
@@ -702,6 +710,7 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
     outbound_queue: &mut OutboundControlQueue,
     response_credit_enabled: bool,
     wire_congested: bool,
+    error_budget: &mut DirectErrorBudget,
     response: ControlTaskResponse,
 ) {
     if let Some(byte_stream) = response.byte_stream {
@@ -711,6 +720,7 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
             outbound_queue,
             response_credit_enabled,
             wire_congested,
+            error_budget,
             byte_stream,
         );
     } else if let serde_json::Value::String(text) = response.frame {
@@ -725,6 +735,7 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
             outbound_queue,
             response_credit_enabled,
             wire_congested,
+            error_budget,
             response.id,
             text,
         );
@@ -735,6 +746,7 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
             outbound_queue,
             response_credit_enabled,
             wire_congested,
+            error_budget,
             response.frame,
         );
     }
@@ -751,6 +763,7 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
     outbound_queue: &mut OutboundControlQueue,
     response_credit_enabled: bool,
     wire_congested: bool,
+    error_budget: &mut DirectErrorBudget,
     request_id: String,
     text: String,
 ) {
@@ -759,12 +772,17 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
             if !outbound_queue.enqueue_immediate(request_id.clone(), text) {
                 // Admission control at the queue caps (see
                 // `send_control_frame`).
-                send_control_text(
-                    rtc,
-                    channels,
-                    dashboard_control_error_response(request_id, "outbound response queue is full")
+                if error_budget.allow(wire_congested) {
+                    send_control_text(
+                        rtc,
+                        channels,
+                        dashboard_control_error_response(
+                            request_id,
+                            "outbound response queue is full",
+                        )
                         .to_string(),
-                );
+                    );
+                }
             }
         } else {
             send_control_text(rtc, channels, text);
@@ -804,25 +822,29 @@ fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
         } else {
             // Admission control at the queue caps (see
             // `send_control_frame`).
-            send_control_text(
-                rtc,
-                channels,
-                dashboard_control_error_response(request_id, "outbound response queue is full")
-                    .to_string(),
-            );
+            if error_budget.allow(wire_congested) {
+                send_control_text(
+                    rtc,
+                    channels,
+                    dashboard_control_error_response(request_id, "outbound response queue is full")
+                        .to_string(),
+                );
+            }
         }
     } else if wire_congested {
         // See `send_control_frame`: no credit lane, wire above the high
         // watermark — refuse rather than grow the SCTP queue.
-        send_control_text(
-            rtc,
-            channels,
-            dashboard_control_error_response(
-                request_id,
-                "control channel is congested; retry the request",
-            )
-            .to_string(),
-        );
+        if error_budget.allow(wire_congested) {
+            send_control_text(
+                rtc,
+                channels,
+                dashboard_control_error_response(
+                    request_id,
+                    "control channel is congested; retry the request",
+                )
+                .to_string(),
+            );
+        }
     } else {
         for frame in plan.render_all() {
             send_control_text(rtc, channels, frame);
@@ -837,6 +859,7 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
     outbound_queue: &mut OutboundControlQueue,
     response_credit_enabled: bool,
     wire_congested: bool,
+    error_budget: &mut DirectErrorBudget,
     frame: serde_json::Value,
 ) {
     let request_id = frame
@@ -856,15 +879,17 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
                         // Admission control: the queue caps are exhausted —
                         // answer directly instead of growing the parked
                         // backlog without bound.
-                        send_control_text(
-                            rtc,
-                            channels,
-                            dashboard_control_error_response(
-                                request_id.clone(),
-                                "outbound response queue is full",
-                            )
-                            .to_string(),
-                        );
+                        if error_budget.allow(wire_congested) {
+                            send_control_text(
+                                rtc,
+                                channels,
+                                dashboard_control_error_response(
+                                    request_id.clone(),
+                                    "outbound response queue is full",
+                                )
+                                .to_string(),
+                            );
+                        }
                     }
                 } else {
                     send_control_text(rtc, channels, text);
@@ -880,29 +905,33 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
                     // Admission control: the per-connection queue caps are
                     // exhausted — answer the request instead of pinning
                     // another payload behind a quiet client.
-                    send_control_text(
-                        rtc,
-                        channels,
-                        dashboard_control_error_response(
-                            request_id,
-                            "outbound response queue is full",
-                        )
-                        .to_string(),
-                    );
+                    if error_budget.allow(wire_congested) {
+                        send_control_text(
+                            rtc,
+                            channels,
+                            dashboard_control_error_response(
+                                request_id,
+                                "outbound response queue is full",
+                            )
+                            .to_string(),
+                        );
+                    }
                 }
             } else if wire_congested {
                 // No credit lane to absorb it and the control channel sits
                 // above its high watermark: refuse instead of growing the
                 // unbounded SCTP pending queue at payload size.
-                send_control_text(
-                    rtc,
-                    channels,
-                    dashboard_control_error_response(
-                        request_id,
-                        "control channel is congested; retry the request",
-                    )
-                    .to_string(),
-                );
+                if error_budget.allow(wire_congested) {
+                    send_control_text(
+                        rtc,
+                        channels,
+                        dashboard_control_error_response(
+                            request_id,
+                            "control channel is congested; retry the request",
+                        )
+                        .to_string(),
+                    );
+                }
             } else {
                 for text in plan.render_all() {
                     send_control_text(rtc, channels, text);
@@ -918,6 +947,7 @@ pub(crate) fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
     outbound_queue: &mut OutboundControlQueue,
     response_credit_enabled: bool,
     wire_congested: bool,
+    error_budget: &mut DirectErrorBudget,
     byte_stream: ControlByteStream,
 ) {
     match byte_stream_frame_text_parts(byte_stream, CONTROL_BYTE_STREAM_CHUNK_BYTES) {
@@ -934,28 +964,32 @@ pub(crate) fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
                 } else {
                     // Admission control at the queue caps (see
                     // `send_control_frame`).
+                    if error_budget.allow(wire_congested) {
+                        send_control_text(
+                            rtc,
+                            channels,
+                            dashboard_control_error_response(
+                                request_id,
+                                "outbound response queue is full",
+                            )
+                            .to_string(),
+                        );
+                    }
+                }
+            } else if wire_congested {
+                // See `send_control_frame`: no credit lane, wire above the
+                // high watermark — refuse rather than grow the SCTP queue.
+                if error_budget.allow(wire_congested) {
                     send_control_text(
                         rtc,
                         channels,
                         dashboard_control_error_response(
                             request_id,
-                            "outbound response queue is full",
+                            "control channel is congested; retry the request",
                         )
                         .to_string(),
                     );
                 }
-            } else if wire_congested {
-                // See `send_control_frame`: no credit lane, wire above the
-                // high watermark — refuse rather than grow the SCTP queue.
-                send_control_text(
-                    rtc,
-                    channels,
-                    dashboard_control_error_response(
-                        request_id,
-                        "control channel is congested; retry the request",
-                    )
-                    .to_string(),
-                );
             } else {
                 for text in plan.render_all() {
                     send_control_text(rtc, channels, text);

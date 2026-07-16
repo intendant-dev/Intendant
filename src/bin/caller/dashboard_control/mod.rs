@@ -94,6 +94,66 @@ const CONTROL_OUTBOUND_QUEUE_MAX_FRAMES: usize = 4096;
 pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
+
+/// Token budget for DIRECT error frames — the admission-refusal and
+/// rejection replies that deliberately bypass the queue/backpressure
+/// lanes (they must be deliverable exactly when those lanes are the
+/// problem). While the wire is below its high watermark the budget stays
+/// full (frames drain as fast as they are sent); while congested each
+/// direct error spends one token, and at zero the frame is DROPPED and
+/// counted (logged once per connection, summarized at teardown) — the
+/// protocol contract is best-effort error delivery under abuse, bounded
+/// memory always. Shared by the dashboard tunnel and the peer
+/// file-transfer driver.
+pub(crate) struct DirectErrorBudget {
+    label: &'static str,
+    remaining: u32,
+    dropped: u64,
+}
+
+/// Direct error frames spendable while the wire stays congested.
+pub(crate) const DIRECT_ERROR_BUDGET_FRAMES: u32 = 64;
+
+impl DirectErrorBudget {
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            remaining: DIRECT_ERROR_BUDGET_FRAMES,
+            dropped: 0,
+        }
+    }
+
+    /// Whether one direct error frame may be sent right now.
+    pub(crate) fn allow(&mut self, wire_congested: bool) -> bool {
+        if !wire_congested {
+            // Uncongested wire drains what it is handed; refill.
+            self.remaining = DIRECT_ERROR_BUDGET_FRAMES;
+            return true;
+        }
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            return true;
+        }
+        self.dropped = self.dropped.saturating_add(1);
+        if self.dropped == 1 {
+            eprintln!(
+                "[{}] direct error-frame budget exhausted while congested; dropping further error frames",
+                self.label
+            );
+        }
+        false
+    }
+
+    /// Log the drop tally at connection teardown (silent when zero).
+    pub(crate) fn log_teardown(&self) {
+        if self.dropped > 0 {
+            eprintln!(
+                "[{}] dropped {} direct error frame(s) under congestion this session",
+                self.label, self.dropped
+            );
+        }
+    }
+}
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
@@ -1969,6 +2029,109 @@ pub(crate) struct ControlTaskResponse {
     done: bool,
 }
 
+/// One spawned-lane response paired with the reservation generation that
+/// produced it (see [`PendingControlRequests`]): the driver forwards a
+/// response only while its generation still owns the id's reservation,
+/// so a superseded task can neither reach the wire under a reused id nor
+/// free its replacement's reservation.
+pub(crate) type SequencedTaskResponse = (u64, ControlTaskResponse);
+
+/// The spawned-request reservations for one tunnel connection, keyed by
+/// request id with a per-admission GENERATION (the peer-transfer read
+/// registry's pattern): same-id replacement cancels its predecessor and
+/// mints a new generation, completion frees only its own generation, and
+/// stale-generation responses are dropped. Admission (`at_capacity_for` +
+/// [`MAX_PENDING_CONTROL_REQUESTS`]) reserves at SPAWN time, before any
+/// response bytes exist.
+pub(crate) struct PendingControlRequests {
+    entries: HashMap<String, PendingControlRequest>,
+    next_generation: u64,
+}
+
+struct PendingControlRequest {
+    cancel: CancellationToken,
+    generation: u64,
+}
+
+impl PendingControlRequests {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_generation: 0,
+        }
+    }
+
+    /// Reserve `id`, cancelling and replacing any predecessor (whose
+    /// spawned task dies at its next await point — see the spawn
+    /// wrappers' `select!`). Returns the new reservation's cancel token
+    /// and generation.
+    pub(crate) fn admit(&mut self, id: &str) -> (CancellationToken, u64) {
+        if let Some(previous) = self.entries.remove(id) {
+            previous.cancel.cancel();
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        let cancel = CancellationToken::new();
+        self.entries.insert(
+            id.to_string(),
+            PendingControlRequest {
+                cancel: cancel.clone(),
+                generation,
+            },
+        );
+        (cancel, generation)
+    }
+
+    /// The client's `cancel` frame: cancel and free the reservation.
+    pub(crate) fn cancel_remove(&mut self, id: &str) -> bool {
+        match self.entries.remove(id) {
+            Some(entry) => {
+                entry.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `generation` still owns `id`'s reservation.
+    pub(crate) fn matches(&self, id: &str, generation: u64) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
+    /// Free the reservation on completion — only for its own generation.
+    pub(crate) fn complete(&mut self, id: &str, generation: u64) -> bool {
+        if self.matches(id, generation) {
+            self.entries.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn contains_key(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Spawn-time admission: full only when `id` would be a NEW entry —
+    /// same-id replacement cancels its predecessor and holds the count.
+    pub(crate) fn at_capacity_for(&self, id: &str) -> bool {
+        !self.contains_key(id) && self.len() >= MAX_PENDING_CONTROL_REQUESTS
+    }
+
+    /// Teardown: cancel every reservation.
+    pub(crate) fn cancel_all(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            entry.cancel.cancel();
+        }
+    }
+}
+
 pub(crate) struct ControlByteStream {
     id: String,
     stream_id: String,
@@ -2114,6 +2277,10 @@ pub(crate) struct InboundUploadState {
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
+    /// The pending-request reservation generation minted at
+    /// `upload_start` — the terminal task's response carries it so the
+    /// driver can match it against the live reservation.
+    generation: u64,
 }
 
 impl InboundUploadState {
@@ -3778,6 +3945,42 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Generation-keyed reservations: same-id replacement cancels its
+    /// predecessor and mints a new generation; a superseded generation
+    /// can neither claim ownership nor free the replacement's
+    /// reservation; capacity exempts same-id replacement only.
+    #[test]
+    fn pending_request_generations_protect_replacements() {
+        let mut pending = PendingControlRequests::new();
+        let (first_cancel, first_generation) = pending.admit("r1");
+        let (second_cancel, second_generation) = pending.admit("r1");
+        assert!(
+            first_cancel.is_cancelled(),
+            "replacement cancels the predecessor"
+        );
+        assert!(!second_cancel.is_cancelled());
+        assert_ne!(first_generation, second_generation);
+        assert!(!pending.matches("r1", first_generation));
+        assert!(pending.matches("r1", second_generation));
+        assert!(
+            !pending.complete("r1", first_generation),
+            "a superseded completion must not free the replacement"
+        );
+        assert!(pending.contains_key("r1"));
+        assert!(pending.complete("r1", second_generation));
+        assert!(!pending.contains_key("r1"));
+
+        let mut pending = PendingControlRequests::new();
+        for index in 0..MAX_PENDING_CONTROL_REQUESTS {
+            pending.admit(&format!("r{index}"));
+        }
+        assert!(pending.at_capacity_for("new-id"));
+        assert!(
+            !pending.at_capacity_for("r0"),
+            "same-id replacement stays admissible at capacity"
+        );
+    }
+
     /// The pre-serialized response carrier: byte-verbatim body embedding,
     /// JSON-equivalence with the parse-path envelope, escaped ids, and
     /// the historical error frame for invalid bodies.
@@ -3854,6 +4057,7 @@ mod tests {
             expected_chunks: if bytes.is_empty() { 0 } else { 1 },
             next_seq: if bytes.is_empty() { 0 } else { 1 },
             received_bytes: bytes.len(),
+            generation: 0,
         }
     }
 
@@ -3999,8 +4203,8 @@ mod tests {
     fn test_control_frame_response(
         text: &str,
         runtime: &mut ControlRuntime,
-        task_tx: &mpsc::Sender<ControlTaskResponse>,
-        pending_requests: &mut HashMap<String, CancellationToken>,
+        task_tx: &mpsc::Sender<SequencedTaskResponse>,
+        pending_requests: &mut PendingControlRequests,
         outbound_queue: &mut OutboundControlQueue,
     ) -> Option<serde_json::Value> {
         let mut inbound_uploads = HashMap::new();
@@ -4082,8 +4286,8 @@ mod tests {
 
     #[test]
     fn peer_dashboard_grants_split_access_and_peer_permissions() {
-        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut peer_root = runtime();
         peer_root.grant = DashboardControlGrant::Peer {
@@ -4216,8 +4420,8 @@ mod tests {
     #[tokio::test]
     async fn control_frames_answer_hello_ping_and_config() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let hello = test_control_frame_response(
             r#"{"t":"hello","id":"h1"}"#,
@@ -4533,8 +4737,8 @@ mod tests {
         );
         assert!(project_root.is_none());
         assert!(pending.contains_key("pr1"));
-        let project_root = rx.recv().await.unwrap();
-        assert!(pending.remove(&project_root.id).is_some());
+        let (_, project_root) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&project_root.id));
         assert_eq!(project_root.id, "pr1");
         assert!(project_root.done);
         let project_root = project_root.frame;
@@ -4562,7 +4766,7 @@ mod tests {
         assert_eq!(cancelled["t"], "response");
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
-        assert!(pending.get("q1").is_none());
+        assert!(!pending.contains_key("q1"));
     }
 
     /// The operation a method's declaration carries (route-row tunnel
@@ -5470,7 +5674,7 @@ mod tests {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
         let (task_tx, _task_rx) = mpsc::channel(1);
-        let mut pending = HashMap::new();
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let ack = test_control_frame_response(
@@ -5510,7 +5714,7 @@ mod tests {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         rt.control_frames_tx = Some(control_tx);
         let (task_tx, _task_rx) = mpsc::channel(1);
-        let mut pending = HashMap::new();
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let ack = test_control_frame_response(
@@ -5541,8 +5745,8 @@ mod tests {
     async fn control_frame_routes_session_control_msg_requests() {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let immediate = test_control_frame_response(
             r#"{"t":"request","id":"session-ctrl-frame","method":"api_session_control_msg","params":{"message":{"action":"interrupt","session_id":"session-frame"}}}"#,
@@ -5553,7 +5757,7 @@ mod tests {
         );
         assert!(immediate.is_none(), "session control request should spawn");
 
-        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, task) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -5585,8 +5789,8 @@ mod tests {
     async fn control_frame_routes_dashboard_action_msg_requests() {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let immediate = test_control_frame_response(
             r#"{"t":"request","id":"dash-action-frame","method":"api_dashboard_action_msg","params":{"message":{"action":"close_browser_workspace","workspace_id":"workspace-frame"}}}"#,
@@ -5597,7 +5801,7 @@ mod tests {
         );
         assert!(immediate.is_none(), "dashboard action request should spawn");
 
-        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, task) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -5632,8 +5836,8 @@ mod tests {
     #[tokio::test]
     async fn current_agent_output_without_active_log_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -5646,8 +5850,8 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("out1"));
 
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "out1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -5660,8 +5864,8 @@ mod tests {
     #[tokio::test]
     async fn current_history_without_file_watcher_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         for (idx, (method, params)) in [
@@ -5693,8 +5897,8 @@ mod tests {
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
-            let response = rx.recv().await.unwrap();
-            assert!(pending.remove(&response.id).is_some());
+            let (_, response) = rx.recv().await.unwrap();
+            assert!(pending.cancel_remove(&response.id));
             assert_eq!(response.id, id);
             assert!(response.done);
             assert_eq!(response.frame["t"], "response");
@@ -5708,8 +5912,8 @@ mod tests {
     #[tokio::test]
     async fn current_changes_without_file_watcher_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -5722,8 +5926,8 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("chg1"));
 
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "chg1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -5739,8 +5943,8 @@ mod tests {
         std::fs::write(dir.path().join("note.txt"), b"hello").unwrap();
 
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         for (idx, (method, path)) in [
@@ -5769,8 +5973,8 @@ mod tests {
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
-            let response = rx.recv().await.unwrap();
-            assert!(pending.remove(&response.id).is_some());
+            let (_, response) = rx.recv().await.unwrap();
+            assert!(pending.cancel_remove(&response.id));
             assert_eq!(response.id, id);
             assert!(response.done);
             assert_eq!(response.frame["t"], "response");
@@ -5828,8 +6032,8 @@ mod tests {
             };
             rt
         };
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let request = |id: &str, method: &str, params: serde_json::Value| {
             serde_json::json!({
@@ -5932,8 +6136,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["renamed"], true);
         assert!(!from.exists());
@@ -5971,8 +6175,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 409);
         assert_eq!(response.frame["result"]["code"], "not_empty");
         assert!(sub.exists());
@@ -5989,8 +6193,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["deleted"], true);
         assert!(!sub.exists());
@@ -6004,8 +6208,8 @@ mod tests {
 
         let mut rt = runtime();
         rt.project_root = Some(project);
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -6018,11 +6222,11 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("transfer-jobs-frame"));
 
-        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, response) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "transfer-jobs-frame");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -6063,8 +6267,8 @@ mod tests {
     #[tokio::test]
     async fn control_frames_negotiate_and_apply_response_credit() {
         let mut rt = runtime();
-        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let hello = test_control_frame_response(
