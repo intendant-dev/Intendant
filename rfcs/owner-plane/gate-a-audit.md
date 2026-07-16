@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn; **re-amended 2026-07-16 after the criterion-12 tranche** (the synthesized criterion-12 review, `reviews/2026-07-15-gate-a-criterion12-synthesized-review.md`, found three executable protocol counterexamples — F1 D-99, F2 D-130, F3 D-202 — plus the criterion-8 proof gaps and this document's own drift; the owner directed the bounded repairs 2026-07-15 and they are executed below); **re-amended 2026-07-16 after the ff23f1cd review round** (`reviews/2026-07-16-gate-a-ff23f1cd-review.md` — the fresh independent review at the pinned head returned FAIL with five findings, every one verified and repaired under the owner's delegated adjudication: F1 = the D-205 self-evidence exception completing D-204; F2 = closed key sets in the intrinsic body stage; F3 = three-coordinate registry dispatch; F4 = the storage proof's count-equality, verified pre-seed, and stated sync limit; F5 = this truth sweep)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
-**Spec:** `owner-plane-d0a-spec.md` v0.5.22, SHA-256 `30c91f941da7ba3458ed4886a5fab5a6be991703b7802668be56a4b8d531f5ef` (v0.5.21 = `5ca12fe7…`, v0.5.20 = `ec3a9a6d…`, v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (the D-202 convergence carrier narrowed to shared evidence-arrival structure); v0.5.22 = D-205 under the owner's delegated adjudication of the ff23f1cd review round (the self-evidence exception to same-coordinate fork registration, completing D-204's late-first class on every relative delivery order; plus the §13.1 evidence-lifecycle exception to the universal-convergence sentence)
+**Spec:** `owner-plane-d0a-spec.md` v0.5.23, SHA-256 `22f09e43ee59284e1c0903fd638dc8563b655443904b40e439582395159bb240` (v0.5.22 = `30c91f94…`, v0.5.21 = `5ca12fe7…`, v0.5.20 = `ec3a9a6d…`, v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (the D-202 convergence carrier narrowed to shared evidence-arrival structure); v0.5.22 = D-205 under the owner's delegated adjudication of the ff23f1cd review round (the self-evidence exception to same-coordinate fork registration; KEPT by explicit owner ratification 2026-07-16); v0.5.23 = the owner's closure filing (D-206, the Gate-A closure rule; the freeze-time D4 and D9 prose sentences; the D-151 row correction and its c.enroll registry-row mirror — all owner-ratified 2026-07-16 via the head-session brief)
 **Companion:** `d0a-vector-cases.v1.json`, SHA-256 `8d2f880006502563b528b64f70eb2f0fd3ccdb721b894df93596dc6bfab8d859` (amendments #1–#7; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; #7 = the machine-readable `evidence_class` required on evidence-lifecycle vectors, the ff23f1cd review's F1; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10)
 **Corpus:** 170 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×31, f08×4, f09×13, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated after the ff23f1cd round: +1 extra-field × C2 multi-fault, +1 operation_version negative; the late-first lifecycle vector gains its re-proposal-first third delivery and both lifecycle vectors declare `evidence_class`)
 **Suites at this amendment:** core 141/141 · reducer 37/37 (incl. the metamorphic-convergence corpus test, the arrival-order restoration control, and the D-202 cross-world pin) · the strict harness 170/170 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files (EVERY stream through the durable path with counter EQUALITY against the corpus-derived stream count — `sync_all=14 rename=14` of 14 — each rename replacing a read-back-verified pre-seeded destination, plus the flush failpoint control) · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
@@ -40,12 +40,15 @@
 > shapes, three-coordinate registry dispatch, the storage proof's
 > count-equality + verified pre-seed + honestly stated sync limit,
 > and this truth sweep. Every finding-bearing trace is now a
-> committed regression. The one criterion this repository cannot
-> satisfy from inside remains: a fresh independent reviewer
-> rerunning the gate from a pinned commit — the reviews so far each
-> found real findings, so none closes it. This document never
-> self-stamps; the verdict stays FAIL until a fresh review reports
-> none.
+> committed regression. The closure question is now governed by
+> **D-206** (owner, 2026-07-16): Gate A closes on a fresh
+> independent review at a single pinned commit reporting **zero
+> blockers** (executable or normative, per the §5 criterion-12
+> text); all other findings are residuals — filed in
+> `residuals.md`, repaired in ordinary follow-ups, never
+> gate-reopening. This document never self-stamps; the verdict
+> stays FAIL until that review's PASS report, and the §16 stamp
+> remains the owner's act.
 
 ## 0. Scope and method
 
@@ -533,13 +536,34 @@ ff23f1cd round executed under the owner's delegated adjudication):
     criteria reflect the round, and the PR description is rewritten
     at each amendment. Standing rule: counts in prose are stated
     with their derivation or dated, so the next drift is visible.
-12. *A fresh independent reviewer reruns the gate* — performed
-    TWICE now (the criterion-12 synthesis; the ff23f1cd review),
-    each returning verified findings that this branch then repaired;
-    the criterion therefore remains OUTSTANDING — it closes only
-    when a fresh review at a pinned head reports no executable
-    finding, and this document cannot satisfy it from inside. The
-    verdict stands FAIL until then.
+12. *Gate-A closure (D-206, owner 2026-07-16 — supersedes this
+    criterion's earlier "finds nothing" form).* Gate A closes when a
+    fresh independent review — conducted at a single pinned commit
+    by a reviewer with no prior authorship in this program —
+    re-executes the full battery and reports **zero blockers**,
+    where a blocker is exactly: **(a) executable** — any suite or
+    lane red at the pinned head (core, reducer, strict gate,
+    storage, browser, including the discrimination and negative
+    controls), or a demonstrated divergence between normative text
+    (spec + companion) and committed artifact behavior that changes
+    any admitted, pended, rejected, frozen, or derived outcome;
+    **(b) normative** — a contradiction within or between the spec
+    and companion under which two conforming implementations would
+    disagree on the outcome of a covered behavior. All other
+    findings are **residuals** (editorial drift, stale comments or
+    counts, documentation mismatches, coverage-annotation gaps,
+    style): filed with severity labels, recorded in `residuals.md`,
+    repaired in ordinary follow-up commits — they do not reopen
+    Gate A, do not reset the review, and do not require a further
+    fresh review. A zero-blocker review is a **PASS report**; the
+    §16 stamp remains an owner act (D-151's reservation unchanged).
+    If a review reports blockers, the repair requires **one scoped
+    re-review only** — the repair diff plus a battery re-run at the
+    new pin — never a full-program re-review. Status: two full
+    fresh reviews performed (each returned findings, all repaired);
+    the closure review at the owner-named inspection pin is
+    commissioned by the owner. The verdict below stands FAIL until
+    that review's PASS report.
 
 **The additional D-130 blocker (the review's un-rowed finding)** is
 repaired honest-defer per the owner's direction: `parse_heads`

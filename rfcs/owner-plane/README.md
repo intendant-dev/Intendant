@@ -10,7 +10,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | Path | What |
 |---|---|
 | `agenda-owner-plane-rfc.md` | The umbrella RFC, **v3.1 — FROZEN** (changes belong in gate specs, never here) |
-| `owner-plane-d0a-spec.md` | **D0-A, v0.5.22 — the terminal cut plus the owner's ratification amendments** (D-201..D-205; SHA-256 `30c91f941da7ba3458ed4886a5fab5a6be991703b7802668be56a4b8d531f5ef`; v0.5.19 through v0.5.21 archived byte-exact; D-204 narrows D-202's convergence carrier to shared evidence-arrival structure; D-205 — the ff23f1cd round's delegated adjudication — completes it with the self-evidence exception to fork registration). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
+| `owner-plane-d0a-spec.md` | **D0-A, v0.5.23 — the terminal cut plus the owner's ratification amendments** (D-201..D-206; SHA-256 `22f09e43ee59284e1c0903fd638dc8563b655443904b40e439582395159bb240`; v0.5.19 through v0.5.22 archived byte-exact; D-204 narrows D-202's convergence carrier; D-205 completes it with the self-evidence exception — kept by explicit owner ratification; D-206 is the Gate-A closure rule, filed with the freeze-time D4/D9 prose and the D-151 row correction). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
 | `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91, amendments #1–#7; #7 = the machine-readable `evidence_class` on evidence-lifecycle vectors): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
 | `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.19) — the red baselines |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
@@ -23,6 +23,7 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | `decisions-pending.md` | The **decision record**: D2/D5 RULED 2026-07-14 (D-201 no-class/no-vote; D-202 sticky + re-proposal) and D6 RULED 2026-07-16 (D-204: the criterion-12 D-202 convergence narrowing, folded into spec v0.5.21) — the alternatives and drafts preserved as chosen-from records |
 | `p1-v1-profile.md` | The **P1 v1 profile — RATIFIED as drafted (D-203)**: five implement-before-Gate-A mechanisms; every other unimplemented normative mechanism fail-closed with a named outcome |
 | `execution-lanes-plan.md` | The **execution-lanes plan — BOTH lanes DELIVERED** (per-OS portable storage 2026-07-15; Chromium WebCrypto/IndexedDB 2026-07-15); the Gate-B production concerns stay named and excluded |
+| `residuals.md` | The **residuals ledger (D-206)**: non-blocker review findings land here with severity labels and are repaired in ordinary follow-up commits — they never reopen Gate A |
 
 ## Provenance note
 
