@@ -72,6 +72,26 @@ pub(crate) fn frame_api_json_body_response(
     }
 }
 
+/// `frame_api_json_body_response`, pre-serialized (see
+/// `json_body_response_preserialized`): the JSON arm splices the core's
+/// already-serialized body into a complete envelope string instead of
+/// parse→wrap→re-serialize — for the multi-MB session list/detail/search
+/// family, that re-parse was measurably hot on every poll. Only legal on
+/// the spawned task-response lane, where `send_control_task_response`
+/// recognizes the `Value::String` carrier.
+pub(crate) fn frame_api_json_body_response_preserialized(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { body, .. } => {
+            json_body_response_preserialized(&id, body.into_string(), label)
+        }
+        other => frame_api_json_body_response(id, other, label),
+    }
+}
+
 /// Tunnel adapter for the access family's historical ok/error envelope:
 /// a 2xx JSON body renders as `{t:"response", id, ok:true,
 /// result:<body>}` — the body-only shape, no `_httpStatus` metadata

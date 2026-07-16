@@ -709,6 +709,20 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
             response_credit_enabled,
             byte_stream,
         );
+    } else if let serde_json::Value::String(text) = response.frame {
+        // Pre-serialized response envelope (`json_body_response_
+        // preserialized`): the text goes to the wire verbatim — no
+        // parse, no re-serialize — keyed by the task's own request id
+        // for the credit queue, chunked on the same thresholds an
+        // equivalent object frame would be.
+        send_control_frame_preserialized(
+            rtc,
+            channels,
+            outbound_queue,
+            response_credit_enabled,
+            response.id,
+            text,
+        );
     } else {
         send_control_frame(
             rtc,
@@ -717,6 +731,73 @@ pub(crate) fn send_control_task_response<I: rtc::interceptor::Interceptor>(
             response_credit_enabled,
             response.frame,
         );
+    }
+}
+
+/// The pre-serialized twin of [`send_control_frame`]: same immediate/
+/// queued handling and the same chunk framing (`chunk_id` falls back to
+/// the request id exactly as `control_frame_text_parts` derives it for a
+/// response frame without `chunk_id`/`seq` fields).
+fn send_control_frame_preserialized<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    outbound_queue: &mut OutboundControlQueue,
+    response_credit_enabled: bool,
+    request_id: String,
+    text: String,
+) {
+    if text.len() <= CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES || request_id.is_empty() {
+        if response_credit_enabled && !outbound_queue.is_empty() && !request_id.is_empty() {
+            outbound_queue.enqueue_immediate(request_id, text);
+        } else {
+            send_control_text(rtc, channels, text);
+        }
+        drain_queued_control_frames(rtc, channels, outbound_queue);
+        return;
+    }
+    let total_bytes = text.len();
+    let chunk_count = total_bytes.div_ceil(CONTROL_RESPONSE_CHUNK_BYTES);
+    let start = serde_json::json!({
+        "t": "response_start",
+        "id": request_id,
+        "chunk_id": request_id,
+        "encoding": "base64-json-frame",
+        "total_bytes": total_bytes,
+        "chunks": chunk_count,
+    })
+    .to_string();
+    let end = serde_json::json!({
+        "t": "response_end",
+        "id": request_id,
+        "chunk_id": request_id,
+        "chunks": chunk_count,
+    })
+    .to_string();
+    let plan = ChunkedFramePlan::response(
+        request_id.clone(),
+        request_id.clone(),
+        start,
+        end,
+        text.into_bytes(),
+        CONTROL_RESPONSE_CHUNK_BYTES,
+    );
+    if response_credit_enabled {
+        if outbound_queue.enqueue_chunked(plan) {
+            drain_queued_control_frames(rtc, channels, outbound_queue);
+        } else {
+            // Admission control at the queue byte cap (see
+            // `send_control_frame`).
+            send_control_text(
+                rtc,
+                channels,
+                dashboard_control_error_response(request_id, "outbound response queue is full")
+                    .to_string(),
+            );
+        }
+    } else {
+        for frame in plan.render_all() {
+            send_control_text(rtc, channels, frame);
+        }
     }
 }
 

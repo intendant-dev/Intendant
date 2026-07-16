@@ -3088,6 +3088,49 @@ fn json_body_response(id: String, body: String, label: &str) -> serde_json::Valu
     }
 }
 
+/// Splice a core-serialized JSON body into a complete, PRE-SERIALIZED
+/// `{"t":"response","id":…,"ok":true,"result":<body>}` envelope by string
+/// concatenation — the response lane's twin of the event lane's
+/// `event_lane_frame` splice. The core memoizes its hottest bodies as
+/// strings (routes_sessions' documented multi-MB list cache); parsing
+/// such a body into a full `Value` tree and re-serializing the envelope
+/// made every tunnel poll pay three complete JSON passes.
+///
+/// The caller must have validated `body` as JSON (see
+/// `json_body_response_preserialized`); `id` is JSON-escaped here.
+fn spliced_response_frame_text(id: &str, body: &str) -> String {
+    let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let mut text =
+        String::with_capacity(body.len() + id_json.len() + "{\"t\":\"response\",\"id\":,\"ok\":true,\"result\":}".len());
+    text.push_str("{\"t\":\"response\",\"id\":");
+    text.push_str(&id_json);
+    text.push_str(",\"ok\":true,\"result\":");
+    text.push_str(body);
+    text.push('}');
+    text
+}
+
+/// `json_body_response`, pre-serialized: the returned frame is
+/// `Value::String(<complete envelope text>)` — the task lane's
+/// pre-serialized carrier. Response objects never serialize as top-level
+/// JSON strings, so the variant is unambiguous;
+/// `send_control_task_response` sends the text verbatim (chunking on the
+/// same thresholds, keyed by the task's own request id). Only legal on
+/// the spawned task-response lane. The body is still validated — one
+/// full parse into `IgnoredAny`, no tree allocation — so an invalid body
+/// answers with the historical error frame.
+fn json_body_response_preserialized(id: &str, body: String, label: &str) -> serde_json::Value {
+    if serde_json::from_str::<serde::de::IgnoredAny>(&body).is_err() {
+        return serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned invalid JSON"),
+        });
+    }
+    serde_json::Value::String(spliced_response_frame_text(id, &body))
+}
+
 fn http_body_response(id: String, status: u16, body: String, label: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(mut result) => {
@@ -3196,21 +3239,24 @@ async fn api_sessions_response_from_home(
             "error": "session list returned an unexpected byte response",
         });
     };
-    // Historical result-shape guard: the list must be a JSON array.
-    match serde_json::from_str::<serde_json::Value>(&body.into_string()) {
-        Ok(result) if result.is_array() => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": true,
-            "result": result,
-        }),
-        _ => serde_json::json!({
+    // Historical result-shape guard: the list must be a JSON array —
+    // enforced without materializing the multi-MB Value tree (the SPA
+    // polls this with limit:'all' every 15s per tab, and the core already
+    // serves the body from its serialized-string cache): a full validating
+    // parse into `IgnoredAny` plus the leading-token check, then the body
+    // splices verbatim into a pre-serialized envelope.
+    let body = body.into_string();
+    let is_array = body.trim_start().starts_with('[')
+        && serde_json::from_str::<serde::de::IgnoredAny>(&body).is_ok();
+    if !is_array {
+        return serde_json::json!({
             "t": "response",
             "id": id,
             "ok": false,
             "error": "session list returned invalid JSON",
-        }),
+        });
     }
+    serde_json::Value::String(spliced_response_frame_text(&id, &body))
 }
 
 fn control_session_limit(params: &serde_json::Value) -> Option<usize> {
@@ -3583,6 +3629,43 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pre-serialized response carrier: byte-verbatim body embedding,
+    /// JSON-equivalence with the parse-path envelope, escaped ids, and
+    /// the historical error frame for invalid bodies.
+    #[test]
+    fn preserialized_response_envelope_matches_the_parsed_shape() {
+        let body = r#"{"a":1,"nested":{"b":[1,2,3]}}"#;
+        let frame = json_body_response_preserialized("req-1", body.to_string(), "test");
+        let serde_json::Value::String(text) = &frame else {
+            panic!("expected the pre-serialized carrier, got {frame}");
+        };
+        assert!(
+            text.contains(body),
+            "the body must embed verbatim (proof of no reserialization): {text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["t"], "response");
+        assert_eq!(parsed["id"], "req-1");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["result"]["nested"]["b"][1], 2);
+        // JSON-equivalent to the parse-path envelope.
+        let legacy = json_body_response("req-1".into(), body.to_string(), "test");
+        assert_eq!(parsed, legacy);
+
+        // Invalid bodies keep the historical error frame (an object).
+        let error = json_body_response_preserialized("req-2", "not json".into(), "test");
+        assert_eq!(error["ok"], false);
+        assert!(error["error"].as_str().unwrap().contains("invalid JSON"));
+
+        // Ids embed JSON-escaped.
+        let quoted = json_body_response_preserialized("has\"quote", "{}".to_string(), "test");
+        let serde_json::Value::String(text) = quoted else {
+            panic!("expected the pre-serialized carrier");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["id"], "has\"quote");
+    }
 
     pub(crate) fn test_upload_state(
         method: &str,

@@ -635,7 +635,7 @@ pub(crate) async fn api_session_detail_response_from_home(
     })
     .await;
     match result {
-        Ok(response) => frame_api_json_body_response(id, response, "session detail"),
+        Ok(response) => frame_api_json_body_response_preserialized(id, response, "session detail"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -1301,7 +1301,7 @@ pub(crate) async fn api_sessions_message_search_response(
             .unwrap_or(20),
     };
     let response = crate::web_gateway::sessions_message_search_api_response(search).await;
-    frame_api_json_body_response(id, response, "message search")
+    frame_api_json_body_response_preserialized(id, response, "message search")
 }
 
 pub(crate) async fn api_sessions_search_response(
@@ -1327,7 +1327,7 @@ pub(crate) async fn api_sessions_search_response(
         cancel,
     )
     .await;
-    frame_api_json_body_response(id, response, "session search")
+    frame_api_json_body_response_preserialized(id, response, "session search")
 }
 
 #[cfg(test)]
@@ -1946,8 +1946,21 @@ mod tests {
     }
 
     /// The pre-_httpStatus envelope (difference #1): ok:true with the
-    /// body as the verbatim result — no injected status metadata.
+    /// body as the verbatim result — no injected status metadata. The
+    /// sessions family answers with the PRE-SERIALIZED carrier
+    /// (`Value::String(<envelope text>)`, sent verbatim by
+    /// `send_control_task_response`); materialize it first so the shape
+    /// assertions run against what the browser parses off the wire.
     fn tunnel_plain_body(frame: &serde_json::Value) -> serde_json::Value {
+        let materialized;
+        let frame = match frame {
+            serde_json::Value::String(text) => {
+                materialized = serde_json::from_str::<serde_json::Value>(text)
+                    .expect("pre-serialized envelope is valid JSON");
+                &materialized
+            }
+            other => other,
+        };
         assert_eq!(frame["t"], "response");
         assert_eq!(frame["ok"], true, "{frame}");
         if let Some(result) = frame["result"].as_object() {
