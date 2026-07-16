@@ -1497,19 +1497,31 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
 
     let mut changed = false;
     for dir in dirs {
-        let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+        // Replay only the tail appended since the last hydration of this
+        // log: the fold is a pure last-write-wins state fold (no log-ring
+        // pushes), so folding just the new lines lands on the same state
+        // as a full replay — without re-reading and re-parsing a growing
+        // multi-MB log on every session-scoped `get_status` poll. The
+        // cursor is validated against the live file and never advances
+        // past an unterminated final line, so partially flushed writes are
+        // re-read (and re-applied, idempotently) once complete.
+        let path = dir.join("session.jsonl");
+        let prior = s.session_log_hydration_cursors.get(&path).copied();
+        let Some((tail, base)) = read_session_jsonl_tail(&path, prior) else {
             continue;
         };
-        for line in contents.lines() {
+        let advanced = walk_session_jsonl_tail(&tail, base, |_, line| {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
+                return true;
             };
             let Some(event) = crate::session_log::session_log_entry_to_app_event(&entry, &dir)
             else {
-                continue;
+                return true;
             };
             changed |= apply_observed_event_to_mcp_state(s, &event);
-        }
+            true
+        });
+        s.session_log_hydration_cursors.insert(path, advanced);
     }
 
     s.provider_name = provider_name;
@@ -1564,6 +1576,93 @@ mod tests {
     use crate::mcp::tests::test_state;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn hydration_replays_only_the_appended_log_tail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-hydrate-cursor";
+            let log_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("cursor test task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "edit files",
+                None,
+                Some("Codex"),
+            );
+
+            let state = test_state();
+            let mut s = state.write().await;
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+
+            // Simulate a live-observed phase the log has not caught up to.
+            // Re-hydration must fold nothing (no appended lines) instead of
+            // replaying the whole log and regressing the live phase — that
+            // is the cursor's contract.
+            s.note_session_phase(Some(session_id), None, Phase::WaitingFollowUp, None);
+            assert!(!hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+
+            // Append a session_ended line; the next hydration folds exactly
+            // the appended tail.
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": {
+                            "session_id": session_id,
+                            "reason": "done",
+                        },
+                    })
+                )
+                .unwrap();
+            }
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id).map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
 
     #[test]
     fn managed_watch_context_pressure_satisfied_after_rewind_across_alias_and_compact_cu_growth() {

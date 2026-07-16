@@ -65,6 +65,14 @@ pub struct McpAppState {
     /// re-seed it; see [`CONTROLLER_LOOP_RAW_STATUS_TTL`].
     controller_loop_raw_status_cache:
         std::sync::Mutex<Option<(std::time::Instant, ControllerLoopRawStatus)>>,
+    /// Per-`session.jsonl` replay cursors for
+    /// [`hydrate_requested_session_status_from_logs`]: session-scoped
+    /// `get_status` used to re-read and re-fold the whole log on every call;
+    /// the cursor limits each hydration to the appended tail. Validated
+    /// against the live file on use, so a replaced/truncated log self-heals
+    /// with one full replay.
+    pub(crate) session_log_hydration_cursors:
+        std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -217,6 +225,7 @@ impl McpAppState {
             controller_loop_status_override: None,
             session_logs_home_override: None,
             controller_loop_raw_status_cache: std::sync::Mutex::new(None),
+            session_log_hydration_cursors: std::collections::HashMap::new(),
             launcher: None,
             task_handle: None,
             controller_restart: None,

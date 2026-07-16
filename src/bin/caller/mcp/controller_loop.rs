@@ -1629,16 +1629,13 @@ pub(crate) fn controller_loop_state_is_idle(status: &str) -> bool {
 }
 
 pub(crate) fn codex_app_server_process_tree_active(pid: u32) -> bool {
-    // The root-alive probe is a cheap syscall, while the descendants
-    // snapshot spawns `ps` and parses the whole system process table —
-    // and `_with_root` never reads the descendants when the root is
-    // alive (the common case on this per-wrapper status hot path). Only
-    // pay for the snapshot once the root is known dead.
-    if crate::platform::process_alive(pid) {
-        return true;
-    }
-    codex_app_server_process_tree_active_from_descendants(
-        crate::platform::process_descendants(pid),
+    codex_app_server_process_tree_active_with_root(
+        pid,
+        // Lazy: `_with_root` never advances the descendants iterator when
+        // the root is alive (the common case on this per-wrapper status
+        // hot path), and materializing the descendants spawns `ps` over
+        // the whole system process table — defer the spawn to first use.
+        std::iter::once_with(move || crate::platform::process_descendants(pid)).flatten(),
         crate::platform::process_alive,
         crate::platform::process_cmdline,
     )
