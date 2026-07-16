@@ -18434,6 +18434,76 @@ html.ui-v2 .diff-log-entry .diff-log-body {
 html.ui-v2 .log-entry.superseded { opacity: .48; }
 html.ui-v2 .log-entry.rollback-marker { color: var(--amber); }
 
+/* — reasoning ("Thinking") rows (41b-reasoning-log.js) ─────────────────
+   Calm by default: violet-dotted, dimmed one-line summary under a plain
+   "Thinking" label; the full text renders lazily on tap. Same classes
+   style the Activity feed, session windows, and the Sessions detail
+   view — the builder is shared across all three. */
+html.ui-v2 .log-entry.reasoning-log-entry .log-icon {
+  background: var(--violet);
+  opacity: .55;
+}
+html.ui-v2 .log-entry.reasoning-log-entry.expandable { cursor: pointer; }
+html.ui-v2 .reasoning-log-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  white-space: normal;
+  word-break: normal;
+}
+html.ui-v2 .reasoning-log-summary {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 9px;
+  min-width: 0;
+}
+html.ui-v2 .reasoning-log-label {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: var(--eyebrow-size);
+  font-weight: 700;
+  letter-spacing: var(--eyebrow-track);
+  text-transform: uppercase;
+  color: var(--violet);
+  opacity: .8;
+}
+html.ui-v2 .reasoning-log-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+  color: var(--text-3);
+}
+/* expanded: the label stays as the header, the summary line yields to the
+   full text (otherwise the first sentence reads twice) */
+html.ui-v2 .reasoning-log-entry.expanded .reasoning-log-text { display: none; }
+html.ui-v2 .reasoning-log-body {
+  display: none;
+  min-width: 0;
+  margin: 2px 0 4px;
+  padding: 8px 12px;
+  border-left: 2px solid rgba(var(--violet-rgb), .35);
+  background: rgba(var(--violet-rgb), .05);
+  border-radius: 0 var(--r-inset) var(--r-inset) 0;
+  color: var(--text-2);
+  font-style: italic;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.55;
+}
+html.ui-v2 .reasoning-log-entry.expanded .reasoning-log-body { display: block; }
+html.ui-v2 .reasoning-log-entry .collapse-toggle {
+  color: var(--text-3);
+  font-size: 11px;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+html.ui-v2 .reasoning-log-entry.expanded .collapse-toggle .arrow { display: none; }
+html.ui-v2 .reasoning-log-entry:not(.expanded) .collapse-toggle .arrow-up { display: none; }
+
 /* — approval hero card (design's flagship moment) — */
 html.ui-v2 #approval-panel .approval-card {
   border: 1px solid rgba(var(--amber-rgb), .32);
@@ -28448,7 +28518,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'a1ccdc7343c34ada';
+const INTENDANT_APP_BUILD = 'aad14fa627f234d8';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -47070,6 +47140,10 @@ function wireSessionWindowLogClone(clone, sourceEntry) {
     wireDiffLogEntry(clone);
     return;
   }
+  if (clone.classList.contains('reasoning-log-entry')) {
+    wireReasoningLogClone(clone, sourceEntry);
+    return;
+  }
   if (!clone.classList.contains('collapsible')) return;
   wireCollapsibleLogEntry(clone, clone.querySelector('.log-content'), sourceEntry);
 }
@@ -49954,11 +50028,12 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
       if (!reasoning) return null;
-      content = `Reasoning: ${reasoning}`;
-      level = 'detail';
-    } else {
-      level = 'model';
+      // First-class thinking row (same grammar as the live WASM path and
+      // the transcript-sync lanes: level model + kind reasoning, raw text)
+      // so the dedupe signatures collapse this record with live copies.
+      return { ...base, level: 'model', source: source || 'model', content: reasoning, kind: 'reasoning' };
     }
+    level = 'model';
     return { ...base, level, source: source || 'model', content, kind };
   }
   if (event === 'agent_started') {
@@ -50217,9 +50292,13 @@ function sessionWindowTranscriptContentForNode(node) {
 function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
   if (!node) return [];
   const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
+  // Reasoning rows render a label + elided summary and defer their body,
+  // so the raw text comes from the reasoning store (record-lane parity).
   const content = isCommandOutput
     ? (node.querySelector?.('.command-output-summary')?.textContent || '')
-    : sessionWindowTranscriptContentForNode(node);
+    : node.dataset?.kind === 'reasoning'
+      ? reasoningLogNodeContent(node)
+      : sessionWindowTranscriptContentForNode(node);
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',
@@ -52528,6 +52607,9 @@ function buildSessionWindowLogEntry(c) {
   if (!content && c.kind !== 'rollback_marker') return null;
   if (isSessionWindowCommandOutputRecord(c)) {
     return buildSessionWindowCommandOutputEntry(c);
+  }
+  if (isReasoningLog(c)) {
+    return buildReasoningLogEntryNode(c);
   }
   if (isDiffLog(c)) {
     const diffText = diffLogContent(c);
@@ -56671,6 +56753,10 @@ function renderLogEntry(c) {
     renderDiffLogEntry(c);
     return;
   }
+  if (isReasoningLog(c)) {
+    renderReasoningLogEntry(c);
+    return;
+  }
   finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
@@ -57498,6 +57584,163 @@ function hideBadge(tab) {
   if (badge) { badge.classList.remove('visible'); badge.textContent = ''; }
 }
 
+/* ── static/app/41b-reasoning-log.js ── */
+// ── Reasoning ("Thinking") rows ────────────────────────────────────────
+// First-class Activity rows for the agent's reasoning summaries. One
+// grammar across all three backends (Claude Code thinking blocks, Codex
+// reasoning items, native provider reasoning summaries): the daemon emits
+// them as log rows with level "model" + kind "reasoning" and the RAW
+// reasoning text as content — no prefix, no markup. This fragment owns
+// their rendering everywhere a log row can appear:
+//
+//   - live Activity feed        renderLogEntry → renderReasoningLogEntry
+//   - session windows           buildSessionWindowLogEntry → buildReasoningLogEntryNode
+//   - Sessions detail view      materializeSessionDetailRow → buildReasoningLogEntryNode
+//
+// The row is calm by default: a dimmed one-line summary under a plain
+// "Thinking" label, expanding on tap (whole row is the tap target — no
+// hover-only affordance) to the full reasoning text. The full text is
+// NOT stuffed into the DOM eagerly — it lives in a WeakMap store and the
+// body renders on first expand (same idea as the deferred command-output
+// pattern in 41-session-window-actions.js). If a backend emits no
+// reasoning, no row renders — honest absence, never a placeholder.
+
+function isReasoningLog(c) {
+  return String(c?.kind || '') === 'reasoning';
+}
+
+// One-line summary: the first non-blank line, cut at a sentence boundary
+// when one lands inside the cap, hard-elided otherwise. CSS ellipsis
+// handles narrower viewports; this cap only bounds what enters the DOM.
+const REASONING_SUMMARY_CHAR_LIMIT = 200;
+function reasoningLogSummaryText(text) {
+  const firstLine = String(text || '')
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line.length > 0) || '';
+  if (firstLine.length <= REASONING_SUMMARY_CHAR_LIMIT) return firstLine;
+  const head = firstLine.slice(0, REASONING_SUMMARY_CHAR_LIMIT);
+  const sentenceEnd = head.lastIndexOf('. ');
+  if (sentenceEnd > 40) return head.slice(0, sentenceEnd + 1);
+  return head.replace(/\s+\S*$/, '') + '\u2026';
+}
+
+// Full reasoning text per rendered entry, for the lazy body and for the
+// dedupe signature bridge below. Values: { text, body, rendered }.
+const _reasoningLogStore = new WeakMap();
+
+// Signature bridge: node-lane transcript signatures read the rendered
+// .log-content textContent, but a reasoning row renders a label + elided
+// summary (and defers the body), so the store supplies the raw text the
+// record lane hashes. Consumed by sessionWindowTranscriptSignaturesForNode.
+function reasoningLogNodeContent(node) {
+  const state = node ? _reasoningLogStore.get(node) : null;
+  if (state && state.text) return state.text;
+  return node?.querySelector?.('.reasoning-log-text')?.textContent || '';
+}
+
+function renderReasoningLogBody(entry) {
+  const state = entry ? _reasoningLogStore.get(entry) : null;
+  if (!state || state.rendered || !state.body) return;
+  state.rendered = true;
+  // Plain pre-wrap text on purpose: reasoning is scratch prose, and the
+  // calm read matters more than markdown fidelity. One text node keeps
+  // even very long traces cheap.
+  state.body.textContent = state.text;
+}
+
+// Build the DOM node for a reasoning row. `c` is any log-command/record
+// shape that carries {level, source, kind: 'reasoning', content, ...}.
+function buildReasoningLogEntryNode(c) {
+  const text = String(c?.content || '').trim();
+  if (!text) return null;
+  const summaryText = reasoningLogSummaryText(text);
+  const expandable = text !== summaryText;
+
+  const { entry } = createLogScaffold(c, 'reasoning-log-entry');
+
+  const wrap = document.createElement('span');
+  wrap.className = 'log-content reasoning-log-wrap';
+  const summary = document.createElement('span');
+  summary.className = 'reasoning-log-summary';
+  const label = document.createElement('span');
+  label.className = 'reasoning-log-label';
+  label.textContent = 'Thinking';
+  label.title = "The agent's reasoning before it acted";
+  const summaryTextEl = document.createElement('span');
+  summaryTextEl.className = 'reasoning-log-text';
+  summaryTextEl.textContent = summaryText;
+  summary.appendChild(label);
+  summary.appendChild(summaryTextEl);
+  wrap.appendChild(summary);
+
+  const body = document.createElement('span');
+  body.className = 'reasoning-log-body';
+  wrap.appendChild(body);
+  entry.appendChild(wrap);
+  _reasoningLogStore.set(entry, { text, body, rendered: false });
+
+  appendCopyLogEntryButton(entry, text);
+
+  if (expandable) {
+    entry.classList.add('expandable');
+    const toggle = document.createElement('span');
+    toggle.className = 'collapse-toggle';
+    toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
+    entry.appendChild(toggle);
+    entry.addEventListener('click', (event) => {
+      if (event.target?.closest?.('a, button')) return;
+      const expanded = !entry.classList.contains('expanded');
+      entry.classList.toggle('expanded', expanded);
+      if (expanded) renderReasoningLogBody(entry);
+    });
+  }
+
+  return entry;
+}
+
+// Session-window clones of a live entry are plain cloneNode copies: no
+// listeners and no store entry. Re-arm both from the source entry (or,
+// for a clone whose source is gone, from whatever body text the clone
+// carried over). Dispatched from wireSessionWindowLogClone.
+const _wiredReasoningLogEntries = new WeakSet();
+function wireReasoningLogClone(clone, sourceEntry) {
+  if (!clone || _wiredReasoningLogEntries.has(clone)) return;
+  _wiredReasoningLogEntries.add(clone);
+  const body = clone.querySelector?.('.reasoning-log-body');
+  const sourceState = sourceEntry ? _reasoningLogStore.get(sourceEntry) : null;
+  // Text priority: the source's store (full text), then a body the clone
+  // carried over already rendered (also full), then the elided summary —
+  // the last resort keeps the row usable, never broken.
+  const text = sourceState?.text || body?.textContent || reasoningLogNodeContent(clone);
+  if (body && text) {
+    _reasoningLogStore.set(clone, {
+      text,
+      body,
+      // A clone taken after the source expanded carries the rendered body
+      // markup with it; don't re-render over it.
+      rendered: !!body.textContent,
+    });
+  }
+  if (!clone.classList.contains('expandable')) return;
+  clone.addEventListener('click', (event) => {
+    if (event.target?.closest?.('a, button')) return;
+    const expanded = !clone.classList.contains('expanded');
+    clone.classList.toggle('expanded', expanded);
+    if (expanded) renderReasoningLogBody(clone);
+  });
+}
+
+// Live-feed path (dispatched from renderLogEntry): append to the main
+// stream and mirror into the owning session window, exactly like the
+// other special row types.
+function renderReasoningLogEntry(c) {
+  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  inferSessionPhaseFromLog(c);
+  const entry = buildReasoningLogEntryNode(c);
+  if (!entry) return;
+  appendLogEntryElement(entry, sessionWindowRecordFromLogCommand(c));
+}
 /* ── static/app/42-usage-terminal.js ── */
 // ── Usage Tab Rendering ──
 // ── Token Ticker ──
@@ -101682,6 +101925,14 @@ function buildSessionDetailRows(entries) {
       if (!notification) continue;
       e = { ...e, ...notification };
     }
+    // Reasoning-only model_response events (replayed `reasoning` rows from
+    // session.jsonl) normalize into the first-class thinking-row grammar;
+    // without this the empty-content skip below dropped them entirely.
+    if (e && e.event === 'model_response' && !String(e.content || e.summary || '').trim()) {
+      const reasoning = String(e.reasoning_summary || e.reasoningSummary || '').trim();
+      if (!reasoning) continue;
+      e = { ...e, level: 'model', kind: 'reasoning', content: reasoning, source: e.source || 'model' };
+    }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
@@ -101899,6 +102150,13 @@ function materializeSessionDetailRow(view, row, index) {
     if (!outputEntry) return null;
     outputEntry.dataset.detailRowIndex = String(index);
     return outputEntry;
+  }
+  if (isReasoningLog(e)) {
+    const reasoningEntry = buildReasoningLogEntryNode(e);
+    if (reasoningEntry) {
+      reasoningEntry.dataset.detailRowIndex = String(index);
+      return reasoningEntry;
+    }
   }
 
   const entry = document.createElement('div');

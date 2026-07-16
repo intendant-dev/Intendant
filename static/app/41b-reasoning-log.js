@@ -112,6 +112,38 @@ function buildReasoningLogEntryNode(c) {
   return entry;
 }
 
+// Session-window clones of a live entry are plain cloneNode copies: no
+// listeners and no store entry. Re-arm both from the source entry (or,
+// for a clone whose source is gone, from whatever body text the clone
+// carried over). Dispatched from wireSessionWindowLogClone.
+const _wiredReasoningLogEntries = new WeakSet();
+function wireReasoningLogClone(clone, sourceEntry) {
+  if (!clone || _wiredReasoningLogEntries.has(clone)) return;
+  _wiredReasoningLogEntries.add(clone);
+  const body = clone.querySelector?.('.reasoning-log-body');
+  const sourceState = sourceEntry ? _reasoningLogStore.get(sourceEntry) : null;
+  // Text priority: the source's store (full text), then a body the clone
+  // carried over already rendered (also full), then the elided summary —
+  // the last resort keeps the row usable, never broken.
+  const text = sourceState?.text || body?.textContent || reasoningLogNodeContent(clone);
+  if (body && text) {
+    _reasoningLogStore.set(clone, {
+      text,
+      body,
+      // A clone taken after the source expanded carries the rendered body
+      // markup with it; don't re-render over it.
+      rendered: !!body.textContent,
+    });
+  }
+  if (!clone.classList.contains('expandable')) return;
+  clone.addEventListener('click', (event) => {
+    if (event.target?.closest?.('a, button')) return;
+    const expanded = !clone.classList.contains('expanded');
+    clone.classList.toggle('expanded', expanded);
+    if (expanded) renderReasoningLogBody(clone);
+  });
+}
+
 // Live-feed path (dispatched from renderLogEntry): append to the main
 // stream and mirror into the owning session window, exactly like the
 // other special row types.

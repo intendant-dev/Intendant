@@ -624,10 +624,9 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
             // + kind reasoning, raw text via the same extractor the reader
             // uses) so window hydration dedupes against streamed rows.
             if payload.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-                if let Some(text) =
-                    crate::external_agent::codex::extract_reasoning_text(payload)
-                        .map(|text| text.trim().to_string())
-                        .filter(|text| !text.is_empty())
+                if let Some(text) = crate::external_agent::codex::extract_reasoning_text(payload)
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
                 {
                     let mut entry = serde_json::json!({
                         "ts": ts,

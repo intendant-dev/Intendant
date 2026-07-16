@@ -4977,9 +4977,12 @@ mod tests {
         let lines2: Vec<_> = cmds2
             .iter()
             .filter_map(|c| match c {
-                UiCommand::AddLogEntry { content, kind, level, .. } => {
-                    Some((content.clone(), kind.clone(), level.clone()))
-                }
+                UiCommand::AddLogEntry {
+                    content,
+                    kind,
+                    level,
+                    ..
+                } => Some((content.clone(), kind.clone(), level.clone())),
                 _ => None,
             })
             .collect();
