@@ -788,7 +788,7 @@ const VITALS_SYMBOLS = {
   worktree: {
     label: 'Worktree',
     priority: 20,
-    unavailable: 'Not in a worktree — this agent works directly in the project folder.',
+    unavailable: 'Working directly in the project folder (its main checkout) — not in an isolated worktree copy.',
     chip: () => '⧉',
     explain: (v) => {
       const lines = [
@@ -1362,6 +1362,16 @@ function openVitalsGlossary(sessionId, anchor) {
   const familyPresent = (key) => (VITALS_GIT_KEYS.has(key) ? hasGit
     : key === 'cache-hit' || key === 'cache-ttl' ? hasCache
     : false);
+  // Absent-family wording states who actually owns the reading: git is
+  // probed by the daemon from the session's folder (agent-independent);
+  // cache and limits come from the agent's provider responses.
+  const familyAbsentText = (key) => (VITALS_GIT_KEYS.has(key)
+    ? "No git reading for this session — its folder may not be a git project."
+    : key === 'cache-hit' || key === 'cache-ttl'
+      ? "Nothing measured yet — appears after the agent's first reply."
+      : key === 'limit'
+        ? 'No usage limits reported by this provider yet.'
+        : 'Not reported for this session yet.');
   const addRow = (model, def, label, key) => {
     const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
     row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
@@ -1369,7 +1379,7 @@ function openVitalsGlossary(sessionId, anchor) {
     body.appendChild(vxEl('div', 'vx-label', label || def.label));
     const absentText = familyPresent(key) && def.quiet
       ? def.quiet
-      : (def.unavailable || 'Not reported by this agent yet.');
+      : (def.unavailable || familyAbsentText(key));
     body.appendChild(vxEl('div', 'vx-desc',
       model ? (model.explainLines[0] || '') : absentText));
     row.appendChild(body);
@@ -1430,20 +1440,22 @@ function vitalsOpenChangesTab() {
 // keyed by the backend-native id from birth missed every emission sent
 // before the SessionIdentity linkage landed — and the change-only hub
 // sends nothing again until something changes. Called from
-// applySessionIdentity the moment the linkage is recorded.
+// applySessionIdentity the moment the linkage is recorded. Sections that
+// accumulated under different ids pre-linkage (git under the wrapper,
+// usage under the native id) union here rather than first-found-wins.
 function refanSessionVitalsForIdentityGroup(sessionId) {
   const ids = sessionGoalUpdateIds(sessionId);
-  let vitals = null;
+  let union = null;
   for (const id of ids) {
     const cached = sessionMetadataById.get(id)?.vitals;
-    if (cached) { vitals = cached; break; }
+    if (cached) union = mergeSessionVitals(cached, union);
   }
-  if (!vitals) return;
+  if (!union) return;
   for (const id of ids) {
     const meta = sessionMetadataById.get(id) || {};
-    if (!meta.vitals) sessionMetadataById.set(id, { ...meta, vitals });
+    sessionMetadataById.set(id, { ...meta, vitals: union });
     if (sessionWindows.has(id)) {
-      renderSessionWindowVitals(sessionWindows.get(id), sessionMetadataById.get(id).vitals);
+      renderSessionWindowVitals(sessionWindows.get(id), union);
     }
   }
   refreshSessionVitalsTicker();
@@ -1638,16 +1650,35 @@ function normalizeSessionVitals(raw) {
   return { git, cache, limits };
 }
 
+// Merge an arriving vitals snapshot over what a session already has. A
+// missing section means "this emission's producer doesn't own it", not
+// "the section went away": the daemon folds identity groups server-side
+// now, but replayed logs and older daemons still emit git and cache
+// under different ids of one session — wholesale overwrite made them
+// blank each other (last writer won; the git family read "not reported"
+// on every supervised session, 2026-07-15).
+function mergeSessionVitals(incoming, existing) {
+  if (!incoming) return existing || null;
+  if (!existing) return incoming;
+  return {
+    git: incoming.git || existing.git || null,
+    cache: incoming.cache || existing.cache || null,
+    limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
+  };
+}
+
 function applySessionVitals(raw = {}) {
   const data = raw?.data && typeof raw.data === 'object' ? raw.data : raw;
   const sid = String(data?.session_id || data?.sessionId || '').trim();
   if (!sid) return;
   const vitals = normalizeSessionVitals(data);
+  if (!vitals) return;
   for (const id of sessionGoalUpdateIds(sid)) {
-    const meta = { ...(sessionMetadataById.get(id) || {}), vitals };
-    sessionMetadataById.set(id, meta);
+    const meta = sessionMetadataById.get(id) || {};
+    const merged = mergeSessionVitals(vitals, meta.vitals);
+    sessionMetadataById.set(id, { ...meta, vitals: merged });
     if (sessionWindows.has(id)) {
-      renderSessionWindowVitals(sessionWindows.get(id), vitals);
+      renderSessionWindowVitals(sessionWindows.get(id), merged);
     }
   }
   refreshSessionVitalsTicker();
