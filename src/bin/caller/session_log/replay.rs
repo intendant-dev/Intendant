@@ -399,7 +399,7 @@ pub fn session_log_entry_to_app_event(
             // Backward compat: older sessions stored the raw JSON blob in
             // `message`; newer sessions store a pre-formatted preview.
             let commands_preview = if message.starts_with('{') {
-                crate::format_commands_preview(message)
+                crate::tool_batch::BatchFacts::from_json(message).commands_preview
             } else {
                 message.to_string()
             };

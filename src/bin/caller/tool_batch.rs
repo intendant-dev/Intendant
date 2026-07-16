@@ -1,5 +1,116 @@
 use crate::{mcp_client, provider, tools};
 
+/// Facts about a runtime command batch, derived in ONE parse of the final
+/// (post `finalize_command_batch`) AgentInput JSON.
+///
+/// The agent loop used to answer each of these questions with its own helper
+/// (`has_ask_human`, `has_ask_human_command`, `batch_is_all_ask_human`,
+/// `extract_ask_human_question`, `has_capture_screen_command`,
+/// `has_exec_command`, `format_commands_preview`), every one re-parsing the
+/// complete batch — including full editFile payloads that can run to
+/// megabytes — into a fresh `serde_json::Value` tree, up to ~8 times per
+/// runtime spawn on the hottest controller path.
+#[derive(Debug, Clone, Default)]
+pub struct BatchFacts {
+    /// Any command is `askHuman` (selects the runtime's no-timeout path).
+    pub has_ask_human: bool,
+    /// The batch consists ENTIRELY of `askHuman` commands — the shape models
+    /// actually emit for a blocking question. The question-rail interception
+    /// only fires for this shape; a mixed batch would need the controller to
+    /// reorder execution around the runtime. `false` for an empty batch.
+    pub all_ask_human: bool,
+    /// Question text of the first `askHuman` command that carries one.
+    pub ask_human_question: Option<String>,
+    /// Any command is `captureScreen` (Xvfb auto-launch trigger).
+    pub has_capture_screen: bool,
+    /// Any command is `execAsAgent`/`execPty` (Xvfb auto-launch trigger).
+    pub has_exec: bool,
+    /// Human-readable one-line preview for the Activity tab; falls back to
+    /// the raw JSON when the batch is unparseable or previews to nothing
+    /// (the UI handles collapsing).
+    pub commands_preview: String,
+}
+
+impl BatchFacts {
+    pub fn from_json(json_str: &str) -> Self {
+        let parsed: serde_json::Value = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(_) => return Self::opaque(json_str),
+        };
+        let Some(commands) = parsed.get("commands").and_then(|v| v.as_array()) else {
+            return Self::opaque(json_str);
+        };
+        let mut facts = BatchFacts {
+            all_ask_human: !commands.is_empty(),
+            ..Self::default()
+        };
+        let mut preview_parts: Vec<String> = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            let function = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+            match function {
+                "askHuman" => {
+                    facts.has_ask_human = true;
+                    if facts.ask_human_question.is_none() {
+                        facts.ask_human_question = cmd
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                }
+                "captureScreen" => facts.has_capture_screen = true,
+                "execAsAgent" | "execPty" => facts.has_exec = true,
+                _ => {}
+            }
+            if function != "askHuman" {
+                facts.all_ask_human = false;
+            }
+            if let Some(part) = command_preview_part(function, cmd) {
+                preview_parts.push(part);
+            }
+        }
+        facts.commands_preview = if preview_parts.is_empty() {
+            json_str.to_string()
+        } else {
+            preview_parts.join(" | ")
+        };
+        facts
+    }
+
+    /// Facts for an unparseable (or command-less) batch: nothing detected,
+    /// raw JSON as the preview — matching what each replaced helper answered
+    /// for that input.
+    fn opaque(json_str: &str) -> Self {
+        BatchFacts {
+            commands_preview: json_str.to_string(),
+            ..Self::default()
+        }
+    }
+}
+
+/// One command's contribution to the Activity-tab preview line. `None` drops
+/// the command from the preview (e.g. an exec with no command string).
+fn command_preview_part(function: &str, cmd: &serde_json::Value) -> Option<String> {
+    match function {
+        "execAsAgent" => cmd
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|c| format!("exec: {}", c)),
+        "inspectPath" => cmd
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("inspect: {}", p)),
+        "editFile" | "writeFile" => cmd
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|p| format!("{}: {}", function, p)),
+        "spawn_live_audio" => Some(format!(
+            "spawn_live_audio ({})",
+            cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?")
+        )),
+        _ => Some(function.to_string()),
+    }
+}
+
 /// Context directives extracted from manage_context / signal_done tool calls.
 pub struct ToolBatchResult {
     /// JSON string of AgentInput to send to the runtime (None if no runtime commands).
@@ -291,6 +402,88 @@ pub fn map_results_to_tool_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_facts_detects_ask_human_shapes() {
+        let solo = BatchFacts::from_json(
+            r#"{"commands":[{"function":"askHuman","nonce":1,"question":"Which DB?"}]}"#,
+        );
+        assert!(solo.has_ask_human);
+        assert!(solo.all_ask_human);
+        assert_eq!(solo.ask_human_question.as_deref(), Some("Which DB?"));
+
+        let mixed = BatchFacts::from_json(
+            r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"askHuman","nonce":2,"question":"ok?"}]}"#,
+        );
+        assert!(mixed.has_ask_human);
+        assert!(!mixed.all_ask_human, "mixed batch is not all-askHuman");
+        assert_eq!(mixed.ask_human_question.as_deref(), Some("ok?"));
+
+        // The question comes from the first askHuman that HAS one (the old
+        // find_map semantics), not blindly from the first askHuman.
+        let questionless_first = BatchFacts::from_json(
+            r#"{"commands":[{"function":"askHuman","nonce":1},{"function":"askHuman","nonce":2,"question":"second"}]}"#,
+        );
+        assert_eq!(
+            questionless_first.ask_human_question.as_deref(),
+            Some("second")
+        );
+
+        // "askHuman" appearing inside a command STRING is not a detection.
+        let embedded = BatchFacts::from_json(
+            r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo \"askHuman\""}]}"#,
+        );
+        assert!(!embedded.has_ask_human);
+        assert!(!embedded.all_ask_human);
+
+        let empty = BatchFacts::from_json(r#"{"commands":[]}"#);
+        assert!(!empty.all_ask_human, "empty batch is not all-askHuman");
+    }
+
+    #[test]
+    fn batch_facts_detects_capture_and_exec() {
+        let capture = BatchFacts::from_json(
+            r#"{"commands":[{"function":"inspectPath","nonce":1,"path":"/x"},{"function":"captureScreen","nonce":2}]}"#,
+        );
+        assert!(capture.has_capture_screen);
+        assert!(!capture.has_exec);
+
+        let pty = BatchFacts::from_json(
+            r#"{"commands":[{"function":"execPty","nonce":1,"command":"top"}]}"#,
+        );
+        assert!(pty.has_exec);
+        assert!(!pty.has_capture_screen);
+
+        let invalid = BatchFacts::from_json("not json");
+        assert!(!invalid.has_ask_human);
+        assert!(!invalid.has_capture_screen);
+        assert!(!invalid.has_exec);
+    }
+
+    #[test]
+    fn batch_facts_preview_matches_legacy_format() {
+        let facts = BatchFacts::from_json(
+            r#"{"commands":[
+                {"function":"execAsAgent","nonce":1,"command":"cargo test"},
+                {"function":"inspectPath","nonce":2,"path":"src/main.rs"},
+                {"function":"editFile","nonce":3,"file_path":"src/lib.rs","operation":"write"},
+                {"function":"captureScreen","nonce":4}
+            ]}"#,
+        );
+        assert_eq!(
+            facts.commands_preview,
+            "exec: cargo test | inspect: src/main.rs | editFile: src/lib.rs | captureScreen"
+        );
+
+        // Unparseable input falls back to the raw string (UI collapses it).
+        assert_eq!(BatchFacts::from_json("not json").commands_preview, "not json");
+        // A batch whose every command previews to nothing falls back too.
+        let empty_parts = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
+        assert_eq!(
+            BatchFacts::from_json(empty_parts).commands_preview,
+            empty_parts
+        );
+    }
 
     #[test]
     fn assemble_batch_collects_sub_agent_calls() {
