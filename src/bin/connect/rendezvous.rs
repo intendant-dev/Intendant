@@ -630,7 +630,11 @@ pub(crate) async fn daemon_register(
     if !known_daemon {
         // Refreshes arrive once a minute and must not spend the creation
         // budget. New identities are separately bounded per observed source;
-        // the production proxy overwrites forwarded-address headers.
+        // the production proxy overwrites forwarded-address headers. This
+        // check runs deliberately BEFORE signature verification: the budget
+        // exists to bound signature-verification CPU, so it must gate the
+        // expensive check rather than run behind it (its bucket allocation
+        // is confined to this scope's own capacity partition).
         check_rate_limit(
             &state,
             &headers,
@@ -2193,7 +2197,7 @@ mod tests {
             .lock()
             .await
             .contains_key("legacy-session"));
-        assert!(state.rate_limits.lock().await.buckets.is_empty());
+        assert!(state.rate_limits.lock().await.scopes.is_empty());
     }
 
     #[test]

@@ -2484,7 +2484,7 @@ mod tests {
             .lock()
             .await
             .contains_key("legacy-session"));
-        assert!(state.rate_limits.lock().await.buckets.is_empty());
+        assert!(state.rate_limits.lock().await.scopes.is_empty());
         server.abort();
     }
 

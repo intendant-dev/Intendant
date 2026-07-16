@@ -504,16 +504,17 @@ pub(crate) fn header_string(headers: &HeaderMap, name: &'static str) -> Option<S
         .map(str::to_string)
 }
 
-pub(crate) fn client_rate_key(headers: &HeaderMap, scope: &str) -> String {
-    format!("{scope}:{}", forwarded_peer_token(headers))
-}
-
 /// Canonicalized, bounded source token for rate keys. The first forwarded
 /// hop is parsed as an IP address (accepting an `ip:port` form some proxies
-/// emit) and re-rendered canonically, so the key cap is also a byte cap
-/// (≤45 chars) and textual IPv6 variants of one address share a bucket. A
-/// present-but-unparseable value collapses to one bounded "invalid" bucket
-/// (previously it became an attacker-mintable arbitrary-length key); the
+/// emit) and re-rendered canonically, so the key space is also byte-capped
+/// (≤45 chars). IPv6 sources aggregate by /64 prefix — one household/VM
+/// gets one bucket, and rotating addresses inside a /64 (free for any v6
+/// holder) stops minting fresh buckets; IPv4-mapped IPv6 folds to its IPv4
+/// form so `::ffff:203.0.113.9` and `203.0.113.9` share one budget. A
+/// present-but-unparseable value (zone-qualified link-local like
+/// `fe80::1%eth0` included — a link-local peer behind a proxy is not a
+/// meaningful source identity) collapses to one bounded "invalid" bucket
+/// instead of becoming an attacker-mintable arbitrary-length key; the
 /// absent-header fallback stays "unknown", unchanged.
 fn forwarded_peer_token(headers: &HeaderMap) -> String {
     let raw = header_string(headers, "x-forwarded-for")
@@ -524,12 +525,35 @@ fn forwarded_peer_token(headers: &HeaderMap) -> String {
         return "unknown".to_string();
     };
     if let Ok(ip) = value.parse::<std::net::IpAddr>() {
-        return ip.to_string();
+        return canonical_peer_ip(ip);
     }
     if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
-        return addr.ip().to_string();
+        return canonical_peer_ip(addr.ip());
     }
     "invalid".to_string()
+}
+
+fn canonical_peer_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let segments = v6.segments();
+            let prefix = std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                segments[3],
+                0,
+                0,
+                0,
+                0,
+            );
+            format!("{prefix}/64")
+        }
+    }
 }
 
 /// The caller's public IP as this service observed it (first
@@ -548,15 +572,25 @@ pub(crate) fn client_observed_ip(headers: &HeaderMap) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
-/// Hard bound on distinct rate-limit keys held in memory. Keys derive from
-/// client-controlled forwarded-address headers, so an attacker (or plain
-/// IPv6 churn) can mint fresh keys freely; the table must not grow with
-/// them. At roughly 100 bytes per entry this is a few MB.
-pub(crate) const RATE_LIMIT_MAX_KEYS: usize = 50_000;
+/// Per-scope key capacity, derived from the scope's window. Short windows
+/// (minutes) serve high-cardinality populations — every polling daemon,
+/// public log readers — and their buckets churn out within minutes, so the
+/// cap is generous. Long windows (≥10 min: the attest / subscribe budgets,
+/// the hourly new-daemon-identity budget) pin a slot for the whole window
+/// and serve small legitimate populations, so the cap is small. Worst-case
+/// total memory = scopes × cap × ~100B — a few MB with today's ~20 scopes.
+fn scope_capacity(window_ms: u64) -> usize {
+    if window_ms >= 10 * 60_000 {
+        2_000
+    } else {
+        10_000
+    }
+}
 
 /// At-capacity prune scans are amortized to at most one per this interval:
-/// after a saturated prune the table is all-live, so an immediate re-scan
-/// could only reclaim buckets whose windows elapsed in between.
+/// after a saturated prune the scope is all-live, so an immediate re-scan
+/// could only reclaim buckets whose windows elapsed in between (bounded
+/// false-429 staleness of ≤1s while a scope sits at its cap).
 const RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS: u64 = 1_000;
 
 fn rate_bucket_expired(bucket: &RateLimitBucket, now: u64) -> bool {
@@ -568,35 +602,39 @@ fn rate_bucket_expired(bucket: &RateLimitBucket, now: u64) -> bool {
 /// removal never changes a limit decision. Expiry is strictly per-bucket:
 /// judging a short-window bucket by a longer global bound would rank it
 /// "live" long after its own window died, letting churned short-window keys
-/// crowd out genuinely live long-window buckets.
-pub(crate) fn prune_rate_limits(buckets: &mut HashMap<String, RateLimitBucket>, now: u64) {
+/// crowd out genuinely live long-window buckets. Scopes emptied by the
+/// prune are dropped entirely.
+pub(crate) fn prune_rate_limits(table: &mut RateLimitTable, now: u64) {
+    for scope in table.scopes.values_mut() {
+        prune_scope_buckets(&mut scope.buckets, now);
+    }
+    table.scopes.retain(|_, scope| !scope.buckets.is_empty());
+}
+
+fn prune_scope_buckets(buckets: &mut HashMap<String, RateLimitBucket>, now: u64) {
     buckets.retain(|_, bucket| !rate_bucket_expired(bucket, now));
 }
 
-/// Capacity gate for inserting a new key. Reclaims genuinely expired
-/// buckets first (full scan amortized to once per
-/// `RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS` while saturated); if the
-/// table is still full of LIVE buckets, it fails closed on the new key —
-/// a live bucket is never evicted, because evicting one resets an active
-/// counter (an attacker flooding cheap short-window keys could otherwise
-/// reset a security-sensitive budget like the hourly new-daemon-identity
-/// cap). Existing keys always pass.
-fn reserve_rate_limit_slot(
-    table: &mut RateLimitTable,
-    key: &str,
-    now: u64,
-    max_keys: usize,
-) -> bool {
-    if table.buckets.len() < max_keys || table.buckets.contains_key(key) {
+/// Capacity gate for inserting a new key into ONE scope's partition.
+/// Reclaims genuinely expired buckets first (full scan amortized to once
+/// per `RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS` while saturated); if
+/// the scope is still full of LIVE buckets, it fails closed on the new key
+/// — a live bucket is never evicted, because evicting one resets an active
+/// counter (an attacker flooding cheap keys could otherwise reset a
+/// security-sensitive budget like the hourly new-daemon-identity cap).
+/// Existing keys always pass, and other scopes are untouched by
+/// construction: saturation here can never 429 a different scope.
+fn reserve_scope_slot(scope: &mut ScopeRateLimits, key: &str, now: u64, max_keys: usize) -> bool {
+    if scope.buckets.len() < max_keys || scope.buckets.contains_key(key) {
         return true;
     }
-    if now.saturating_sub(table.last_saturated_prune_unix_ms)
+    if now.saturating_sub(scope.last_saturated_prune_unix_ms)
         >= RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS
     {
-        table.last_saturated_prune_unix_ms = now;
-        prune_rate_limits(&mut table.buckets, now);
+        scope.last_saturated_prune_unix_ms = now;
+        prune_scope_buckets(&mut scope.buckets, now);
     }
-    table.buckets.len() < max_keys
+    scope.buckets.len() < max_keys
 }
 
 pub(crate) async fn check_rate_limit(
@@ -607,13 +645,20 @@ pub(crate) async fn check_rate_limit(
     window_ms: u64,
 ) -> ApiResult<()> {
     let now = now_unix_ms();
-    let key = client_rate_key(headers, scope);
+    let peer = forwarded_peer_token(headers);
     let mut table = state.rate_limits.lock().await;
-    if !reserve_rate_limit_slot(&mut table, &key, now, RATE_LIMIT_MAX_KEYS) {
-        // Table saturated with live windows: fail closed on the unseen key.
-        return Err(ApiError::too_many_requests("rate limit exceeded"));
+    let scope_limits = table.scopes.entry(scope.to_string()).or_default();
+    if !reserve_scope_slot(scope_limits, &peer, now, scope_capacity(window_ms)) {
+        // This scope's partition is saturated with live windows: fail
+        // closed on the unseen key. Retry-After can only bound the wait
+        // honestly by this scope's own window (a slot frees whenever any
+        // bucket in the partition expires, which is not cheaply knowable).
+        return Err(ApiError::too_many_requests_after(
+            "rate limit exceeded",
+            window_ms.div_ceil(1000).max(1),
+        ));
     }
-    let bucket = table.buckets.entry(key).or_insert(RateLimitBucket {
+    let bucket = scope_limits.buckets.entry(peer).or_insert(RateLimitBucket {
         window_start_unix_ms: now,
         count: 0,
         window_ms,
@@ -627,7 +672,14 @@ pub(crate) async fn check_rate_limit(
     }
     bucket.count = bucket.count.saturating_add(1);
     if bucket.count > limit {
-        return Err(ApiError::too_many_requests("rate limit exceeded"));
+        let remaining_ms = bucket
+            .window_start_unix_ms
+            .saturating_add(bucket.window_ms)
+            .saturating_sub(now);
+        return Err(ApiError::too_many_requests_after(
+            "rate limit exceeded",
+            remaining_ms.div_ceil(1000).max(1),
+        ));
     }
     Ok(())
 }
@@ -1073,70 +1125,84 @@ mod tests {
         }
     }
 
-    fn table_with(entries: Vec<(&str, RateLimitBucket)>) -> RateLimitTable {
-        let mut table = RateLimitTable::default();
+    fn scope_with(entries: Vec<(&str, RateLimitBucket)>) -> ScopeRateLimits {
+        let mut scope = ScopeRateLimits::default();
         for (key, bucket) in entries {
-            table.buckets.insert(key.to_string(), bucket);
+            scope.buckets.insert(key.to_string(), bucket);
         }
-        table
+        scope
     }
 
     #[test]
     fn rate_limit_prune_judges_each_bucket_by_its_own_window() {
         let now = HOUR_MS * 3;
-        let mut buckets = HashMap::new();
-        // 2 minutes old: dead for a 60s scope, alive for the hourly scope.
-        buckets.insert("short:1.1.1.1".to_string(), bucket(now - 120_000, 60_000));
-        buckets.insert("hourly:2.2.2.2".to_string(), bucket(now - 120_000, HOUR_MS));
-        // Exactly at its own bound is still live (strict `>` expiry).
-        buckets.insert("edge:3.3.3.3".to_string(), bucket(now - 60_000, 60_000));
-        prune_rate_limits(&mut buckets, now);
+        let mut table = RateLimitTable::default();
+        table.scopes.insert(
+            "mixed".to_string(),
+            scope_with(vec![
+                // 2 minutes old: dead for a 60s window, alive for an hourly one.
+                ("1.1.1.1", bucket(now - 120_000, 60_000)),
+                ("2.2.2.2", bucket(now - 120_000, HOUR_MS)),
+                // Exactly at its own bound is still live (strict `>` expiry).
+                ("3.3.3.3", bucket(now - 60_000, 60_000)),
+            ]),
+        );
+        table.scopes.insert(
+            "all-dead".to_string(),
+            scope_with(vec![("4.4.4.4", bucket(now - 120_000, 60_000))]),
+        );
+        prune_rate_limits(&mut table, now);
+        let mixed = &table.scopes["mixed"].buckets;
         assert!(
-            !buckets.contains_key("short:1.1.1.1"),
+            !mixed.contains_key("1.1.1.1"),
             "expired by its own window despite being young globally"
         );
-        assert!(buckets.contains_key("hourly:2.2.2.2"));
-        assert!(buckets.contains_key("edge:3.3.3.3"));
+        assert!(mixed.contains_key("2.2.2.2"));
+        assert!(mixed.contains_key("3.3.3.3"));
+        assert!(
+            !table.scopes.contains_key("all-dead"),
+            "scopes emptied by the prune are dropped"
+        );
     }
 
     #[test]
     fn rate_limit_capacity_reclaims_expired_before_touching_live_buckets() {
         let now = HOUR_MS * 3;
-        // At cap 3: one live hourly bucket + two short-window buckets that
-        // are dead by their own windows (the churn-attack shape).
-        let mut table = table_with(vec![
-            ("hourly:victim", bucket(now - 300_000, HOUR_MS)),
-            ("short:churn-1", bucket(now - 300_000, 60_000)),
-            ("short:churn-2", bucket(now - 300_000, 60_000)),
+        // At cap 3: one live hourly bucket + two buckets dead by their own
+        // windows (the churn-attack shape).
+        let mut scope = scope_with(vec![
+            ("victim", bucket(now - 300_000, HOUR_MS)),
+            ("churn-1", bucket(now - 300_000, 60_000)),
+            ("churn-2", bucket(now - 300_000, 60_000)),
         ]);
         assert!(
-            reserve_rate_limit_slot(&mut table, "hourly:newcomer", now, 3),
+            reserve_scope_slot(&mut scope, "newcomer", now, 3),
             "expired churn is reclaimed"
         );
         assert!(
-            table.buckets.contains_key("hourly:victim"),
+            scope.buckets.contains_key("victim"),
             "the active hourly bucket survives cap pressure from short-window churn"
         );
-        assert!(!table.buckets.contains_key("short:churn-1"));
-        assert!(!table.buckets.contains_key("short:churn-2"));
+        assert!(!scope.buckets.contains_key("churn-1"));
+        assert!(!scope.buckets.contains_key("churn-2"));
     }
 
     #[test]
     fn rate_limit_capacity_fails_closed_instead_of_evicting_live_buckets() {
         let now = HOUR_MS * 3;
-        let mut table = table_with(vec![
-            ("hourly:a", bucket(now - 1_000, HOUR_MS)),
-            ("hourly:b", bucket(now - 2_000, HOUR_MS)),
+        let mut scope = scope_with(vec![
+            ("a", bucket(now - 1_000, HOUR_MS)),
+            ("b", bucket(now - 2_000, HOUR_MS)),
         ]);
         assert!(
-            !reserve_rate_limit_slot(&mut table, "hourly:new", now, 2),
-            "a table full of live buckets rejects the new key"
+            !reserve_scope_slot(&mut scope, "new", now, 2),
+            "a scope full of live buckets rejects the new key"
         );
-        assert_eq!(table.buckets.len(), 2, "no live bucket was evicted");
-        assert!(table.buckets.contains_key("hourly:a"));
-        assert!(table.buckets.contains_key("hourly:b"));
+        assert_eq!(scope.buckets.len(), 2, "no live bucket was evicted");
+        assert!(scope.buckets.contains_key("a"));
+        assert!(scope.buckets.contains_key("b"));
         assert!(
-            reserve_rate_limit_slot(&mut table, "hourly:a", now, 2),
+            reserve_scope_slot(&mut scope, "a", now, 2),
             "existing keys always pass"
         );
     }
@@ -1144,23 +1210,96 @@ mod tests {
     #[test]
     fn rate_limit_saturated_prune_scans_are_amortized() {
         let now = HOUR_MS * 3;
-        let mut table = table_with(vec![
-            ("hourly:live", bucket(now - 1_000, HOUR_MS)),
-            ("short:soon-dead", bucket(now - 30_000, 60_000)),
+        let mut scope = scope_with(vec![
+            ("live", bucket(now - 1_000, HOUR_MS)),
+            ("soon-dead", bucket(now - 30_000, 60_000)),
         ]);
         // First saturated insert prunes (nothing expired yet) and fails.
-        assert!(!reserve_rate_limit_slot(&mut table, "k:new", now, 2));
+        assert!(!reserve_scope_slot(&mut scope, "new", now, 2));
         // The short bucket expires 30s later, but within the amortization
         // interval the scan is skipped — the insert still fails closed.
         // (Bounded staleness: at most one interval, trading scan cost.)
         let later = now + 31_000;
-        table.last_saturated_prune_unix_ms = later - 500;
-        assert!(!reserve_rate_limit_slot(&mut table, "k:new", later, 2));
-        assert!(table.buckets.contains_key("short:soon-dead"));
+        scope.last_saturated_prune_unix_ms = later - 500;
+        assert!(!reserve_scope_slot(&mut scope, "new", later, 2));
+        assert!(scope.buckets.contains_key("soon-dead"));
         // Past the interval the prune runs and the slot frees up.
-        table.last_saturated_prune_unix_ms = 0;
-        assert!(reserve_rate_limit_slot(&mut table, "k:new", later, 2));
-        assert!(!table.buckets.contains_key("short:soon-dead"));
+        scope.last_saturated_prune_unix_ms = 0;
+        assert!(reserve_scope_slot(&mut scope, "new", later, 2));
+        assert!(!scope.buckets.contains_key("soon-dead"));
+    }
+
+    /// The R2 blocker: saturating one scope's partition must never
+    /// fail-close another scope. Driven end-to-end through
+    /// `check_rate_limit` with rotating source addresses.
+    #[tokio::test]
+    async fn rate_limit_scope_saturation_cannot_starve_other_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let window_ms = HOUR_MS; // long window → the small (2k) scope cap
+        let cap = scope_capacity(window_ms);
+        // Saturate scope A with live buckets from rotating /64s.
+        for index in 0..cap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-forwarded-for",
+                format!("2001:db8:{:x}:{:x}::7", index >> 16, index & 0xffff)
+                    .parse()
+                    .unwrap(),
+            );
+            check_rate_limit(&state, &headers, "scope-a", 1000, window_ms)
+                .await
+                .expect("filling scope A stays under its own cap");
+        }
+        let mut fresh = HeaderMap::new();
+        fresh.insert("x-forwarded-for", "203.0.113.200".parse().unwrap());
+        let closed = check_rate_limit(&state, &fresh, "scope-a", 1000, window_ms)
+            .await
+            .expect_err("scope A is saturated: unseen key fails closed");
+        assert_eq!(closed.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            closed.retry_after_seconds.is_some(),
+            "capacity 429 carries Retry-After"
+        );
+        // The SAME new source is admitted in a different scope.
+        check_rate_limit(&state, &fresh, "scope-b", 1000, window_ms)
+            .await
+            .expect("scope B is isolated from scope A's saturation");
+        // Sources already known to scope A keep passing there too.
+        let mut known = HeaderMap::new();
+        known.insert("x-forwarded-for", "2001:db8:0:0::7".parse().unwrap());
+        check_rate_limit(&state, &known, "scope-a", 1000, window_ms)
+            .await
+            .expect("existing keys in the saturated scope still pass");
+    }
+
+    /// Over-limit 429s tell clients how long the actual window has left.
+    #[tokio::test]
+    async fn rate_limit_429_carries_retry_after() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.9".parse().unwrap());
+        check_rate_limit(&state, &headers, "tight", 1, 60_000)
+            .await
+            .unwrap();
+        let over = check_rate_limit(&state, &headers, "tight", 1, 60_000)
+            .await
+            .expect_err("second request exceeds limit 1");
+        let seconds = over.retry_after_seconds.expect("Retry-After set");
+        assert!(
+            (1..=60).contains(&seconds),
+            "remaining window in seconds, got {seconds}"
+        );
+        let response = over.into_response();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some(seconds.to_string().as_str()),
+            "header emitted on the wire"
+        );
     }
 
     #[test]
@@ -1170,27 +1309,34 @@ mod tests {
             if let Some(value) = value {
                 headers.insert("x-forwarded-for", value.parse().unwrap());
             }
-            client_rate_key(&headers, "scope")
+            forwarded_peer_token(&headers)
         }
-        assert_eq!(key_for(None), "scope:unknown");
-        assert_eq!(key_for(Some("203.0.113.9")), "scope:203.0.113.9");
-        // Textual IPv6 variants of one address share a bucket.
+        assert_eq!(key_for(None), "unknown");
+        assert_eq!(key_for(Some("203.0.113.9")), "203.0.113.9");
+        // IPv6 aggregates by /64: rotating inside the prefix cannot mint
+        // fresh buckets; distinct /64s stay distinct.
+        assert_eq!(key_for(Some("2001:db8::1")), "2001:db8::/64");
         assert_eq!(
-            key_for(Some("2001:0db8:0000:0000:0000:0000:0000:0001")),
-            "scope:2001:db8::1"
+            key_for(Some("2001:0db8:0000:0000:dead:beef:0000:0001")),
+            "2001:db8::/64"
         );
-        assert_eq!(key_for(Some("2001:db8::1")), "scope:2001:db8::1");
+        assert_ne!(
+            key_for(Some("2001:db8:0:1::1")),
+            key_for(Some("2001:db8::1"))
+        );
+        // IPv4-mapped IPv6 folds to the IPv4 form: one client, one budget.
+        assert_eq!(key_for(Some("::ffff:203.0.113.9")), "203.0.113.9");
         // ip:port proxy forms resolve to the address.
-        assert_eq!(key_for(Some("203.0.113.9:5678")), "scope:203.0.113.9");
+        assert_eq!(key_for(Some("203.0.113.9:5678")), "203.0.113.9");
+        // Zone-qualified link-local (fe80::1%eth0) does not parse as a
+        // source identity — documented as collapsing to the invalid bucket.
+        assert_eq!(key_for(Some("fe80::1%eth0")), "invalid");
         // Garbage collapses to one bounded bucket instead of minting an
         // attacker-controlled arbitrary-length key.
         let garbage = "x".repeat(4096);
-        assert_eq!(key_for(Some(garbage.as_str())), "scope:invalid");
-        assert_eq!(key_for(Some("not an ip, at all")), "scope:invalid");
+        assert_eq!(key_for(Some(garbage.as_str())), "invalid");
+        assert_eq!(key_for(Some("not an ip, at all")), "invalid");
         // Only the first hop counts, as before.
-        assert_eq!(
-            key_for(Some("203.0.113.9, 198.51.100.7")),
-            "scope:203.0.113.9"
-        );
+        assert_eq!(key_for(Some("203.0.113.9, 198.51.100.7")), "203.0.113.9");
     }
 }

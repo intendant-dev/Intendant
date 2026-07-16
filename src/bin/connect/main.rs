@@ -180,50 +180,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.listen, config.public_origin, config.rp_id
     );
     eprintln!("[connect] state file {}", config.data_file.display());
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    // Deploy-time restarts land here: without a final flush, every restart
-    // would discard the pending debounce window (a daemon that went offline
-    // during it would permanently lose its last presence hours).
+    // Graceful shutdown with a BOUNDED drain: `with_graceful_shutdown` alone
+    // waits for every in-flight request (only the daemon long-poll caps
+    // itself at 30s — one slow POST would hold the drain until the
+    // supervisor SIGKILLs, killing the final flush below). After the signal
+    // plus the grace window, the serve future is dropped, aborting whatever
+    // is still in flight.
+    let (shutdown_seen_tx, shutdown_seen_rx) = oneshot::channel::<()>();
+    let serve = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            let _ = shutdown_seen_tx.send(());
+        }),
+    );
+    tokio::pin!(serve);
+    let serve_result = tokio::select! {
+        result = &mut serve => result,
+        _ = async {
+            // Only starts counting once the shutdown signal actually fired.
+            let _ = shutdown_seen_rx.await;
+            tokio::time::sleep(SHUTDOWN_DRAIN_GRACE).await;
+        } => {
+            eprintln!(
+                "[connect] graceful drain exceeded {}s; aborting in-flight requests",
+                SHUTDOWN_DRAIN_GRACE.as_secs()
+            );
+            Ok(())
+        }
+    };
+    // The final flush runs on EVERY exit path — clean drain, bounded-drain
+    // abort, or a serve error — before the error (if any) propagates.
+    // Without it, every restart would discard the pending debounce window
+    // (a daemon that went offline during it would permanently lose its last
+    // presence hours).
     final_store_flush(&state).await;
+    serve_result?;
     Ok(())
 }
 
+/// How long in-flight requests may drain after the shutdown signal before
+/// they are aborted. Below typical supervisor stop timeouts, so the final
+/// store flush always gets to run; overrunning requests (the 30s-max daemon
+/// long-poll included) are dropped — daemons and browsers retry.
+const SHUTDOWN_DRAIN_GRACE: Duration = Duration::from_secs(25);
+
 /// Resolves on SIGTERM (what systemd/deploy tooling sends) or ctrl-c. A
-/// failed signal-handler registration degrades to the other signal rather
-/// than aborting startup.
+/// failed handler registration degrades to the OTHER signal staying live:
+/// each arm parks on `pending()` inside its own future on error, so the
+/// select keeps polling the healthy receiver instead of abandoning it.
 async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = sigterm.recv() => {}
-                    result = tokio::signal::ctrl_c() => {
-                        if let Err(err) = result {
-                            eprintln!("[connect] ctrl-c handler failed: {err}");
-                            std::future::pending::<()>().await;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                eprintln!("[connect] SIGTERM handler registration failed: {err}");
-                if let Err(err) = tokio::signal::ctrl_c().await {
-                    eprintln!("[connect] ctrl-c handler failed: {err}");
-                    std::future::pending::<()>().await;
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
+    let ctrl_c = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             eprintln!("[connect] ctrl-c handler failed: {err}");
             std::future::pending::<()>().await;
         }
+    };
+    #[cfg(unix)]
+    {
+        let sigterm = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    sigterm.recv().await;
+                }
+                Err(err) => {
+                    eprintln!("[connect] SIGTERM handler registration failed: {err}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = sigterm => {}
+            _ = ctrl_c => {}
+        }
     }
+    #[cfg(not(unix))]
+    ctrl_c.await;
 }
 
 /// Synchronously flush any pending debounced marks; called once after the
@@ -1056,13 +1087,24 @@ struct RateLimitBucket {
     window_ms: u64,
 }
 
-/// The rate-limit table plus the bookkeeping that amortizes full-scan
-/// pruning when the table sits at capacity.
+/// Rate-limit state, PARTITIONED per scope: each scope owns its own
+/// capacity-bounded bucket map, so saturating one scope (e.g. flooding the
+/// hourly new-daemon-identity budget from rotating addresses) can never
+/// fail-close a different scope (logins, fleet sync, log reads). Fail-closed
+/// capacity is therefore a per-scope blast radius by construction.
 #[derive(Default)]
 struct RateLimitTable {
+    scopes: HashMap<String, ScopeRateLimits>,
+}
+
+/// One scope's buckets plus the bookkeeping that amortizes full-scan
+/// pruning while the scope sits at capacity.
+#[derive(Default)]
+struct ScopeRateLimits {
+    /// Keyed by the canonical bounded peer token (accounts.rs).
     buckets: HashMap<String, RateLimitBucket>,
     /// When the last at-capacity prune ran; saturated inserts within the
-    /// interval skip the O(table) scan and fail closed directly.
+    /// interval skip the O(scope) scan and fail closed directly.
     last_saturated_prune_unix_ms: u64,
 }
 
@@ -1130,6 +1172,10 @@ enum ClaimStatus {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Emitted as a `Retry-After` header (seconds). Set by rate-limit
+    /// rejections so well-behaved clients back off for the actual window
+    /// instead of guessing.
+    retry_after_seconds: Option<u64>,
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -1139,6 +1185,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -1166,6 +1213,13 @@ impl ApiError {
         Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
 
+    fn too_many_requests_after(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            retry_after_seconds: Some(retry_after_seconds),
+            ..Self::new(StatusCode::TOO_MANY_REQUESTS, message)
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
@@ -1173,14 +1227,20 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(json!({
                 "ok": false,
                 "error": self.message,
             })),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = self.retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -1257,11 +1317,12 @@ fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
 }
 
 /// Debounced-persistence signal. Hot paths whose mutations tolerate a
-/// bounded loss window (presence refreshes: `last_seen`, presence hours, the
-/// registration-proof watermark) `mark` instead of persisting;
-/// `store_flush_monitor` coalesces the marks into one full-store write per
-/// debounce window. Critical mutations keep their synchronous
-/// `persist_locked` path unchanged.
+/// bounded loss window — presence-display fields only (`last_seen`,
+/// `updated`, presence hours; the registration-proof watermark is NOT one
+/// of them: it persists synchronously, see `DaemonRegistrationOutcome`) —
+/// `mark` instead of persisting; `store_flush_monitor` coalesces the marks
+/// into one full-store write per debounce window. Critical mutations keep
+/// their synchronous `persist_locked` path unchanged.
 #[derive(Default)]
 struct StoreDirty {
     dirty: std::sync::atomic::AtomicBool,
@@ -1397,7 +1458,7 @@ async fn sweep_in_memory_state(state: &AppState) {
     state.active_sessions.lock().await.retain(|_, session| {
         now.saturating_sub(session.created_unix_ms) <= ACTIVE_DASHBOARD_SESSION_TTL_MS
     });
-    prune_rate_limits(&mut state.rate_limits.lock().await.buckets, now);
+    prune_rate_limits(&mut *state.rate_limits.lock().await, now);
 }
 
 /// Apply a durable store mutation transactionally: serialize/write the cloned
@@ -1835,16 +1896,17 @@ mod tests {
         }
         {
             let mut limits = state.rate_limits.lock().await;
-            limits.buckets.insert(
-                "hourly:1.2.3.4".to_string(),
+            let scope = limits.scopes.entry("scope".to_string()).or_default();
+            scope.buckets.insert(
+                "1.2.3.4".to_string(),
                 RateLimitBucket {
                     window_start_unix_ms: now - 120_000,
                     count: 3,
                     window_ms: 60 * 60_000,
                 },
             );
-            limits.buckets.insert(
-                "short:5.6.7.8".to_string(),
+            scope.buckets.insert(
+                "5.6.7.8".to_string(),
                 RateLimitBucket {
                     window_start_unix_ms: now - 120_000,
                     count: 900,
@@ -1860,13 +1922,14 @@ mod tests {
         assert!(claims.contains_key("fresh"));
         assert!(!claims.contains_key("ancient"));
         let limits = state.rate_limits.lock().await;
+        let scope = &limits.scopes["scope"].buckets;
         assert!(
-            limits.buckets.contains_key("hourly:1.2.3.4"),
+            scope.contains_key("1.2.3.4"),
             "a bucket inside its own window stays"
         );
         assert!(
-            !limits.buckets.contains_key("short:5.6.7.8"),
-            "a bucket past its own window is expired even when younger than other scopes' windows"
+            !scope.contains_key("5.6.7.8"),
+            "a bucket past its own window is expired even when younger than other windows"
         );
     }
 }
