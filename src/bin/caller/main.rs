@@ -67,6 +67,7 @@ mod recording;
 mod sandbox;
 mod schema_validator;
 mod service_mode;
+mod session_activity;
 mod session_config;
 mod session_fork;
 mod session_identity;

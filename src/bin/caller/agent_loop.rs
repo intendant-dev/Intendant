@@ -845,6 +845,19 @@ pub(crate) async fn run_agent_loop(
     // We keep the watcher alive across multiple steers — unlike the interrupt
     // branch which exits after cancelling.
     let local_session_id = session_log_id(&session_log);
+    // Honest activity signal (vitals `activity` section): wire-fact state
+    // machine fed at the loop's own seams — dispatch, stream deltas, tool
+    // execution. Native providers surface no live reasoning deltas today
+    // (Anthropic is not asked for thinking; OpenAI reasoning summaries
+    // arrive only with the completed response), so the native machine
+    // never claims "reasoning" — liveness and phase only. The guard
+    // settles the claim on every exit path.
+    let activity = local_session_id
+        .clone()
+        .map(|sid| crate::session_activity::ActivityPublisher::new(bus.clone(), sid));
+    let _activity_guard = activity
+        .clone()
+        .map(crate::session_activity::ActivityTurnGuard);
     // Live action-visualization lane for the dashboard: one ephemeral
     // cu_action event per executed CU action (never session-logged).
     let cu_observer = computer_use::CuActionObserver::new(bus.clone(), local_session_id.clone());
@@ -1033,6 +1046,12 @@ pub(crate) async fn run_agent_loop(
             budget_pct,
             remaining,
         });
+        if let Some(activity) = &activity {
+            // First-hand dispatch fact: the provider call is about to go
+            // out — the honest "awaiting model" claim (and its stall
+            // clock) starts here, confirmed or degraded by stream bytes.
+            activity.observe(crate::session_activity::ActivityObservation::TurnDispatched);
+        }
 
         // The OpenAI computer tool rejects multiple non-CU images, so
         // CU-enabled providers that need it get all but the most recent
@@ -1102,12 +1121,20 @@ pub(crate) async fn run_agent_loop(
             for attempt in 0..=STREAM_RETRIES {
                 let stream_bus = bus.clone();
                 let stream_session_id = local_session_id.clone();
+                let stream_activity = activity.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
                     if let crate::provider::StreamEvent::Delta(ref text) = event {
                         stream_bus.send(AppEvent::ModelResponseDelta {
                             session_id: stream_session_id.clone(),
                             text: text.clone(),
                         });
+                        if let Some(activity) = &stream_activity {
+                            // Live response bytes — the machine's own
+                            // quantization bounds the publish rate.
+                            activity.observe(
+                                crate::session_activity::ActivityObservation::ResponseDelta,
+                            );
+                        }
                     }
                 };
                 let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
@@ -1326,6 +1353,14 @@ pub(crate) async fn run_agent_loop(
             reasoning: response.reasoning_summary.clone(),
             source: None,
         });
+        if has_tool_calls || has_cu_calls {
+            // The response carried calls and the loop executes them now;
+            // tool silence is normal, so this state never reads stalled.
+            // The next iteration's dispatch flips it back to awaiting-api.
+            if let Some(activity) = &activity {
+                activity.observe(crate::session_activity::ActivityObservation::ToolsRunning);
+            }
+        }
 
         // ====== TOOL CALL PATH vs TEXT EXTRACTION PATH ======
         if has_tool_calls {

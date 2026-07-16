@@ -1452,6 +1452,17 @@ pub(crate) async fn run_with_presence(
                             presence: None,
                         });
                     }
+                    // Ambient bookkeeping like Usage/Log: forward to the
+                    // vitals hub and NEVER fall through to the observe
+                    // drain — an idle activity snapshot (turn settle,
+                    // rate-limit change) implies no turn and must not open
+                    // a spontaneous round.
+                    external_agent::AgentEvent::ActivityUpdate { activity } => {
+                        bus.send(AppEvent::SessionActivity {
+                            session_id: session_log_id(&session_log),
+                            activity,
+                        });
+                    }
                     external_agent::AgentEvent::BackendError {
                         message,
                         code,

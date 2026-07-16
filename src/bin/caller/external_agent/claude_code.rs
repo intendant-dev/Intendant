@@ -10,6 +10,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::CallerError;
+use crate::session_activity::ActivityObservation as ActivityObs;
 
 use super::{
     normalize_plan_status, AgentConfig, AgentEvent, AgentImageAttachment, AgentThread,
@@ -216,6 +217,10 @@ struct CcShared {
     /// The effective mode the CLI last echoed in `system:init`. `None`
     /// until the first init.
     effective_permission_mode: StdMutex<Option<String>>,
+    /// Wire-fact activity state machine (vitals `activity` section).
+    /// Shared because its observations span both sides of the pipe: the
+    /// writer half marks turn dispatch, the reader half everything else.
+    activity: StdMutex<crate::session_activity::ActivityMachine>,
 }
 
 impl CcShared {
@@ -229,7 +234,31 @@ impl CcShared {
             turn_active: AtomicBool::new(false),
             requested_permission_mode: StdMutex::new("default".to_string()),
             effective_permission_mode: StdMutex::new(None),
+            activity: StdMutex::new(crate::session_activity::ActivityMachine::default()),
         }
+    }
+
+    /// Feed the activity machine one wire observation; returns the vitals
+    /// snapshot to publish when it changed (see `session_activity.rs`).
+    fn observe_activity(
+        &self,
+        obs: crate::session_activity::ActivityObservation,
+    ) -> Option<crate::types::SessionActivityVitals> {
+        let mut machine = match self.activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        machine.observe(obs, crate::session_activity::epoch_seconds())
+    }
+
+    /// Adopt a first-hand effort value (launch config, or the CLI's own
+    /// echo when a future protocol states one).
+    fn set_activity_effort(&self, effort: Option<String>) {
+        let mut machine = match self.activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        machine.set_effort(effort);
     }
 
     fn lock_goal(&self) -> std::sync::MutexGuard<'_, GoalEngine> {
@@ -908,6 +937,14 @@ impl CcReader {
         }
     }
 
+    /// Route one wire observation through the shared activity machine and
+    /// queue the resulting vitals snapshot (if any) for the drain.
+    fn observe_activity(&self, obs: ActivityObs, out: &mut CcLineOutcome) {
+        if let Some(activity) = self.shared.observe_activity(obs) {
+            out.events.push(AgentEvent::ActivityUpdate { activity });
+        }
+    }
+
     fn process_line(&mut self, line: &str) -> CcLineOutcome {
         let mut out = CcLineOutcome::default();
         let msg = match serde_json::from_str::<serde_json::Value>(line) {
@@ -1201,6 +1238,16 @@ impl CcReader {
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             self.model = model.to_string();
         }
+        // First-hand effort: adopt the CLI's own echo if an init ever
+        // states one (2.1.2xx doesn't; the launch `--effort` value seeds
+        // the machine at spawn — effort is never inferred from output).
+        if let Some(effort) = msg
+            .get("effort")
+            .or_else(|| msg.get("reasoningEffort"))
+            .and_then(|v| v.as_str())
+        {
+            self.shared.set_activity_effort(Some(effort.to_string()));
+        }
         if !self.init_logged {
             self.init_logged = true;
             let permission_mode = msg
@@ -1448,6 +1495,12 @@ impl CcReader {
                                 .map(str::to_string),
                         };
                         self.register_task_child(&tool_id, child_scope, spawn, out);
+                        if child_scope.is_none() {
+                            // The main thread is executing its Agent tool
+                            // (sync spawns block on the child; async ones
+                            // flip state again on the next API stream).
+                            self.observe_activity(ActivityObs::ToolsRunning, out);
+                        }
                         continue;
                     }
                     if tool_name == "TodoWrite" && !tool_id.is_empty() {
@@ -1528,6 +1581,13 @@ impl CcReader {
                         tool_name,
                         preview: tool_input_preview(&input),
                     });
+                    if child_scope.is_none() {
+                        // Main-thread tool execution begins here (the API
+                        // message with the tool_use closed). Child-scoped
+                        // tools run concurrently and say nothing about the
+                        // main thread's phase.
+                        self.observe_activity(ActivityObs::ToolsRunning, out);
+                    }
                 }
                 "tool_result" => self.tool_result_events(block, out, false),
                 _ => {}
@@ -1672,7 +1732,13 @@ impl CcReader {
             });
         }
 
-        self.open_tools.remove(&tool_id);
+        let owner = self.open_tools.remove(&tool_id);
+        if matches!(owner, Some(None)) && !self.open_tools.values().any(|o| o.is_none()) {
+            // The main thread's last open tool settled — the CLI has to
+            // call the API again to continue, so the honest phase is
+            // awaiting the model (the next stream bytes flip it onward).
+            self.observe_activity(ActivityObs::SegmentSettled, out);
+        }
         let status = match failure_message {
             Some(message) => ToolCompletionStatus::Failed { message },
             None => ToolCompletionStatus::Success,
@@ -1698,17 +1764,51 @@ impl CcReader {
             return;
         };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "content_block_start" => {
+                // First-hand phase evidence: a thinking block opening is the
+                // only honest ground for a "Thinking" claim, and we launch
+                // with --include-partial-messages so live thinking deltas
+                // follow as its heartbeat. Every other block type (text,
+                // tool_use args) is the model responding.
+                match event
+                    .pointer("/content_block/type")
+                    .and_then(|t| t.as_str())
+                {
+                    Some("thinking") | Some("redacted_thinking") => self.observe_activity(
+                        ActivityObs::ReasoningStarted {
+                            delta_heartbeat: true,
+                        },
+                        out,
+                    ),
+                    _ => self.observe_activity(ActivityObs::ResponseDelta, out),
+                }
+            }
             "content_block_delta" => {
                 if let Some(delta) = event.get("delta") {
-                    if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
-                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                            out.events.push(AgentEvent::MessageDelta {
-                                text: text.to_string(),
-                            });
+                    match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                        "text_delta" => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                out.events.push(AgentEvent::MessageDelta {
+                                    text: text.to_string(),
+                                });
+                            }
+                            self.observe_activity(ActivityObs::ResponseDelta, out);
                         }
+                        // thinking_delta CONTENT stays skipped (reasoning is
+                        // emitted once per completed block from the assistant
+                        // message) — but each delta is the live heartbeat that
+                        // keeps the "Thinking" activity claim honest.
+                        // signature_delta closes a thinking block and counts
+                        // as the same reasoning-stream evidence.
+                        "thinking_delta" | "signature_delta" => {
+                            self.observe_activity(ActivityObs::ReasoningDelta, out);
+                        }
+                        // Streamed tool-call arguments: response bytes.
+                        "input_json_delta" => {
+                            self.observe_activity(ActivityObs::ResponseDelta, out);
+                        }
+                        _ => self.observe_activity(ActivityObs::StreamByte, out),
                     }
-                    // thinking_delta is skipped: reasoning is emitted once
-                    // per completed block from the assistant message.
                 }
             }
             "message_start" => {
@@ -1724,6 +1824,7 @@ impl CcReader {
                 if let Some(usage) = message.and_then(|m| m.get("usage")) {
                     self.note_cache_ttl_flavor(usage);
                 }
+                self.observe_activity(ActivityObs::StreamByte, out);
             }
             "message_delta" => {
                 // Final usage for one API call within the turn — the live
@@ -1740,6 +1841,7 @@ impl CcReader {
                         out.events.push(AgentEvent::Usage { usage: snapshot });
                     }
                 }
+                self.observe_activity(ActivityObs::StreamByte, out);
             }
             _ => {}
         }
@@ -1748,6 +1850,10 @@ impl CcReader {
     fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let was_interrupt = self.shared.interrupt_pending.swap(false, Ordering::SeqCst);
         self.shared.turn_active.store(false, Ordering::SeqCst);
+        // Every result path — success, error, interrupt — ends the turn's
+        // activity claim. (The absorbed out-of-band /compact result is a
+        // no-op here: no turn was dispatched, the machine is already idle.)
+        self.observe_activity(ActivityObs::TurnSettled, out);
 
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
@@ -2017,6 +2123,20 @@ impl CcReader {
         if !status.is_empty() {
             window.status = Some(status.to_string());
         }
+        // Activity: a non-allowed status while a turn runs is the honest
+        // "rate-limited" claim (with the reset countdown when carried);
+        // an explicit allowed status retires it. `allowed_warning` still
+        // allows requests — the limits gauge carries the warning.
+        let resets_at_epoch = window.resets_at_epoch;
+        match status {
+            "" => {}
+            "allowed" | "allowed_warning" => {
+                self.observe_activity(ActivityObs::RateLimitCleared, out);
+            }
+            _ => {
+                self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
+            }
+        }
         if status.is_empty() || status == "allowed" {
             return;
         }
@@ -2064,6 +2184,10 @@ async fn reader_task(
                 }
                 let mut cleanup = CcLineOutcome::default();
                 reader_state.close_open_task_children(&mut cleanup);
+                // A process that dies mid-turn never sends its result —
+                // settle the activity claim so the chip can't show a
+                // phantom "thinking" for a dead backend.
+                reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }
@@ -2456,6 +2580,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         } else {
             self.resume_session.clone()
         }));
+        // Seed the activity machine's configured effort with the value we
+        // pass at launch (`--effort`); a backend echo may upgrade it, and
+        // it is never inferred from output volume or timing.
+        self.shared.set_activity_effort(self.effort.clone());
 
         // Build command args
         let mut args = vec![
@@ -2702,6 +2830,14 @@ impl ExternalAgent for ClaudeCodeAgent {
             message
         };
         self.shared.turn_active.store(true, Ordering::SeqCst);
+        // Turn dispatch is a first-hand wire fact from our side of the
+        // pipe: the honest "awaiting model" claim starts here (and the
+        // stall clock with it) until stream bytes confirm or degrade it.
+        if let Some(activity) = self.shared.observe_activity(ActivityObs::TurnDispatched) {
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(AgentEvent::ActivityUpdate { activity });
+            }
+        }
         // send_message is non-blocking. The reader task emits events
         // (MessageDelta, ToolStarted, …) as they arrive and TurnCompleted
         // when a "result" message appears. No deadlock risk because the
@@ -2880,6 +3016,155 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             true,
         )
+    }
+
+    fn activity_states(out: &CcLineOutcome) -> Vec<crate::types::SessionActivityState> {
+        out.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ActivityUpdate { activity } => Some(activity.state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_activity(out: &CcLineOutcome) -> Option<crate::types::SessionActivityVitals> {
+        out.events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                AgentEvent::ActivityUpdate { activity } => Some(activity.clone()),
+                _ => None,
+            })
+    }
+
+    /// The wire → activity mapping: thinking blocks (and their live
+    /// deltas) are the ONLY ground for a reasoning claim; text/args
+    /// deltas respond; tool_use runs tools; tool results settle back to
+    /// awaiting-api; the result settles the turn.
+    #[test]
+    fn activity_follows_claude_stream_wire_facts() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        // Arm the turn the way the writer half does at dispatch.
+        let dispatched = reader
+            .shared
+            .observe_activity(ActivityObs::TurnDispatched)
+            .expect("dispatch publishes");
+        assert_eq!(dispatched.state, S::AwaitingApi);
+        assert!(
+            dispatched.stalled_after_seconds.is_some(),
+            "an awaited response is a byte-stream promise"
+        );
+
+        // A thinking block opens → reasoning, heartbeat-armed.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Reasoning]);
+        assert_eq!(
+            last_activity(&out).unwrap().stalled_after_seconds,
+            Some(crate::session_activity::STALL_AFTER_SECS)
+        );
+
+        // thinking_delta content stays skipped, but it is the heartbeat —
+        // no MessageDelta, no state change (sub-quantum liveness).
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}},"session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "thinking content never renders");
+
+        // Text deltas → responding.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Responding]);
+
+        // A tool_use on the completed assistant envelope → tools running.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 90"}}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::ToolRunning]);
+        assert_eq!(
+            last_activity(&out).unwrap().stalled_after_seconds,
+            None,
+            "quiet long-running tools are normal, never 'stalled'"
+        );
+
+        // Its result settles the segment → awaiting the next API call.
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+
+        // The turn result settles everything.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Idle]);
+    }
+
+    /// A bare thinking_delta arriving while awaiting the API (start
+    /// missed, e.g. resume mid-block) still flips honestly to reasoning.
+    #[test]
+    fn activity_thinking_delta_alone_claims_reasoning() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"…"}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Reasoning]);
+    }
+
+    /// Child-scoped envelopes (in-band sub-agents) say nothing about the
+    /// main thread's activity.
+    #[test]
+    fn activity_ignores_child_scoped_tool_blocks() {
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        // A child-scoped tool_use (lazy-materialized spawn) must publish
+        // no main-thread activity claim.
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-1","message":{"content":[{"type":"tool_use","id":"ct1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            activity_states(&out).is_empty(),
+            "child tool blocks must not claim main-thread tool-running"
+        );
+    }
+
+    /// Rate-limit statuses map to the honest pause claim and clear back
+    /// to awaiting-api (the turn is still running, stream not flowing).
+    #[test]
+    fn activity_rate_limit_claims_and_clears() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783929600},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::RateLimited]);
+        assert_eq!(
+            last_activity(&out).unwrap().resets_at_epoch,
+            Some(1783929600)
+        );
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+    }
+
+    /// The launch `--effort` value rides every published snapshot as the
+    /// configured (never inferred) effort.
+    #[test]
+    fn activity_carries_configured_effort() {
+        let shared = CcShared::new(None);
+        shared.set_activity_effort(Some("max".into()));
+        let snapshot = shared
+            .observe_activity(ActivityObs::TurnDispatched)
+            .expect("dispatch publishes");
+        assert_eq!(snapshot.effort.as_deref(), Some("max"));
     }
 
     #[test]

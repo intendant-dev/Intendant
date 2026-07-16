@@ -2428,6 +2428,16 @@ function isSessionWindowSteerActive(sessionId) {
   // just starts the turn; a wrong steer stalls in the 2s fallback and is
   // logged with steer semantics — the confusing case users hit.)
   if (win.optimisticActiveExpired && normalizeSessionPhase(win.phase) === 'thinking') {
+    // Wire-fact override: a live activity section is first-hand evidence
+    // from the backend's own stream that the turn is really running (or
+    // really rate-limited) — the uncertainty the demotion guards against
+    // doesn't exist, so steer semantics stay.
+    const activity = typeof sessionWireActivity === 'function'
+      ? sessionWireActivity(sid)
+      : null;
+    if (activity && String(activity.state || 'idle') !== 'idle') {
+      return isSteerPhase(win.phase);
+    }
     return false;
   }
   return isSteerPhase(win.phase);

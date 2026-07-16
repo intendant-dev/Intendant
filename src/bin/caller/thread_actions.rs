@@ -3361,6 +3361,14 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 presence: None,
             });
         }
+        external_agent::AgentEvent::ActivityUpdate { activity } => {
+            // Side/child-thread activity rides the child's session id into
+            // the vitals hub, same keying as its usage snapshots.
+            config.bus.send(AppEvent::SessionActivity {
+                session_id,
+                activity,
+            });
+        }
         external_agent::AgentEvent::GoalUpdated { goal } => {
             emit_external_session_goal(config, Some(child_thread_id), Some(goal));
         }
