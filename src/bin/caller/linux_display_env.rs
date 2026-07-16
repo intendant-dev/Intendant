@@ -30,8 +30,13 @@ pub struct GuiEnvAdoption {
 }
 
 /// How often the probe may re-fork `systemctl --user show-environment`
-/// while no display variable has appeared yet (daemon started before
-/// graphical login). Bounds how stale a fresh login's env can look.
+/// while the env is not settled — i.e. until a successful probe has seen
+/// the complete managed set. This cadence-gates EVERY unsettled call: a
+/// daemon started before graphical login upgrades within one interval of
+/// the user logging in, and a host whose env can never complete (a pure
+/// X11 desktop has no `WAYLAND_DISPLAY` to adopt, however healthy its
+/// display) keeps probing at this rate forever — one fork per interval is
+/// the accepted cost of staying able to adopt late-appearing session vars.
 #[cfg(target_os = "linux")]
 const PROBE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
