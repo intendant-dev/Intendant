@@ -26,7 +26,7 @@
 use crate::cbor::{self, Value};
 use crate::domains::{h_tag, Tag};
 use crate::shapes::control::{AdminKey, Cgrant, Crecovsucc};
-use crate::shapes::envelope::{ActorKind, Signedop};
+use crate::shapes::envelope::{seal_op, ActorKind, OpSigner, Signedop};
 use crate::shapes::identity::Authproof;
 use crate::shapes::memory::Merasereq;
 use crate::shapes::{
@@ -446,6 +446,110 @@ pub fn f7_post_freeze_cddl_invalid_kept() -> Vector {
     );
     push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
     v
+}
+
+/// D4 (d), the ff23f1cd review's F2 trace: a validly signed,
+/// hash-valid post-freeze `c.grant` whose body carries a VALID grant
+/// PLUS one unknown top-level field (`{grant: …, bogus: 1}`) keeps
+/// its BODY outcome — the registry body is closed CDDL (O3: unknown
+/// fields reject exactly as in headers), enforced in the intrinsic
+/// stage before replay and placement, so the frozen plane never
+/// converts an extra-field body into fork evidence.
+pub fn f7_post_freeze_extra_field_kept() -> Vector {
+    let name = "f7-post-freeze-extra";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4g = rig.simple_grant("grant4", &d1, vec![Verb::Assert]);
+    let body = {
+        let Value::Map(mut entries) = (Cgrant { grant: g4g }).to_value() else {
+            unreachable!("cgrant body is a map")
+        };
+        entries.push((Value::Text("bogus".into()), Value::Uint(1)));
+        Value::Map(entries)
+    };
+    let g4 = rig.seal_ctrl_candidate(
+        "g4extra",
+        Cgrant::OP_TYPE,
+        Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: c2.op_hash(),
+        },
+        body,
+    );
+    let c1 = rig.genesis_op.clone();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-extra-field-kept",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("g4", &g4)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "body-invariant", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// The ff23f1cd review's F3 trace: the registry is keyed by
+/// (tenant, operation_type, operation_version) — a validly signed,
+/// hash-valid `c.grant` re-sealed with `operation_version = 2`
+/// rejects `(unknown-version, reject-permanent)` at the registry-row
+/// consult, before the arm's CDDL, replay, or placement. Distinct
+/// from `f07-header-unknown-version-rejects`, which mutates the
+/// header's own `v` (the PROTOCOL version, rejected at parse).
+pub fn f7_operation_version_unknown() -> Vector {
+    let name = "f7-op-version";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let c2 = rig.enroll_new(&dev2, vec![], "wrap.dev2.eph");
+    let grant_x = rig.simple_grant("grant-x", &dev2, vec![Verb::Propose]);
+    let body = (Cgrant { grant: grant_x }).to_value();
+    let x = {
+        let template = rig.seal_ctrl_candidate(
+            "xv2",
+            Cgrant::OP_TYPE,
+            Authproof::Admin {
+                epoch: 1,
+                ctrl_frontier: c2.op_hash(),
+            },
+            body.clone(),
+        );
+        let mut header = template.header;
+        header.operation_version = 2;
+        let resealed = seal_op(header, body, &OpSigner::Ed25519(&rig.root_sk));
+        assert!(resealed.verify(&rig.root_pk), "re-sealed op must verify");
+        resealed
+    };
+    let c1 = rig.genesis_op.clone();
+    ctrl_vector(
+        "operation-version-unknown-rejects",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("x", &x)],
+        json!([
+            { "item": "c1" },
+            { "item": "c2" },
+            { "item": "x", "outcome": "unknown-version", "disposition": "reject-permanent" },
+        ]),
+        None,
+    )
 }
 
 /// The §5.4 manifest-admission face (D-203 ratified the P1 profile;
@@ -903,6 +1007,8 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_post_freeze_valid_op_frozen(),
         f7_post_freeze_sig_invalid_kept(),
         f7_post_freeze_cddl_invalid_kept(),
+        f7_post_freeze_extra_field_kept(),
+        f7_operation_version_unknown(),
         f7_kek_rotate_manifest_admits(),
         f7_kek_rotate_manifest_target_outside(),
         f7_revoke_refs_valid_exclusion(),

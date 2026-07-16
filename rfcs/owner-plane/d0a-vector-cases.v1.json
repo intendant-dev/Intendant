@@ -228,6 +228,13 @@
             "$ref": "#/$defs/hexcbor"
           },
           "$comment": "non-delivered context bytes (installed descriptors, policies) — never folded, only resolved"
+        },
+        "evidence_class": {
+          "enum": [
+            "late-first",
+            "timely-first"
+          ],
+          "$comment": "amendment #7 (the ff23f1cd review's F1): the evidence-lifecycle lane's machine-readable arrival-structure declaration — which qualified evidence (late or timely) is held at the ORIGINAL operation's first evaluation in every listed delivery. Required on evidence-lifecycle vectors (the case-kind contract pins it); meaningless elsewhere. Within one declared class the listed deliveries must derive identical final verdicts on every relative delivery order of original and re-proposal (D-204 + D-205); convergence across classes is not promised (the D-204 residual)."
         }
       }
     },
@@ -2718,7 +2725,12 @@
           "then": {
             "properties": {
               "inputs": {
-                "$ref": "#/$defs/fold_inputs"
+                "$ref": "#/$defs/fold_inputs",
+                "required": [
+                  "items",
+                  "deliveries",
+                  "evidence_class"
+                ]
               },
               "expected": {
                 "properties": {

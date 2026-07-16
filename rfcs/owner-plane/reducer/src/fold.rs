@@ -597,6 +597,96 @@ fn keys_are_map(n: &Node, want: &[&str]) -> bool {
     })
 }
 
+/// App A.1 `cert` — required / optional key sets, verbatim.
+const CERT_REQ: &[&str] = &[
+    "v",
+    "plane_id",
+    "device_id",
+    "sig_alg",
+    "sig_pk",
+    "kem_alg",
+    "kem_pk",
+    "class",
+    "evidence_hash",
+    "issued_admin_epoch",
+    "revocation_id",
+];
+const CERT_OPT: &[&str] = &["evidence_media_type", "expiry_deadline_ms", "renews"];
+
+/// App A.1 `grant` — required / optional key sets, verbatim.
+const GRANT_REQ: &[&str] = &[
+    "v",
+    "plane_id",
+    "grant_id",
+    "subject_device",
+    "tenants",
+    "zone",
+    "spaces",
+    "ops",
+    "class_ceiling",
+    "online_lease",
+    "issued_admin_epoch",
+    "capability_epoch",
+];
+const GRANT_OPT: &[&str] = &[
+    "lineage",
+    "kinds",
+    "can_declassify",
+    "can_raise",
+    "raise_quota",
+    "flows",
+    "budget",
+    "max_age_ms",
+    "expiry_deadline_ms",
+];
+
+/// App A.3 `kekwrap` — the exact key set.
+const KEKWRAP_KEYS: &[&str] = &[
+    "v",
+    "plane_id",
+    "zone_id",
+    "epoch",
+    "recipient_device",
+    "recipient_kem_key",
+    "kem",
+    "enc",
+    "ct",
+];
+
+/// App A.3 `zonepolicy` — required / optional key sets, verbatim.
+const ZONEPOLICY_REQ: &[&str] = &[
+    "v",
+    "zone_id",
+    "strictness",
+    "deadline_fallback",
+    "require_cert_deadlines",
+];
+const ZONEPOLICY_OPT: &[&str] = &["grant_epoch_slack", "time_witnesses", "connect_service_key"];
+
+/// App A.3 `spacedef` — the exact key set.
+const SPACEDEF_KEYS: &[&str] = &[
+    "space_id",
+    "zone_id",
+    "name_hash",
+    "space_class",
+    "class_minimum",
+    "status_policy",
+];
+
+/// The closed-CDDL key discipline (O3, the ff23f1cd review's F2):
+/// every required key present, every present key required-or-
+/// optional — unknown fields in a registry body reject exactly as
+/// in headers.
+fn keys_within(n: &Node, required: &[&str], optional: &[&str]) -> bool {
+    let Some(keys) = n.map_keys() else {
+        return false;
+    };
+    required.iter().all(|r| keys.contains(r))
+        && keys
+            .iter()
+            .all(|k| required.contains(k) || optional.contains(k))
+}
+
 impl State {
     /// O5 replay consult (§11.1) — read-only; consumption happens at
     /// the ACCEPTING transition only (D-112). Byte-identical
@@ -2893,6 +2983,26 @@ impl State {
                 if self.fork_selected.get(&coord) == Some(&op.op_hash()) {
                     return Err(Unimplemented("D-130 selected-variant revival".into()));
                 }
+                // The self-evidence exception (D-205, completing
+                // D-204): a variant whose OWN held evidence already
+                // classifies it lease-stale takes that sticky
+                // terminal classification and registers NO fork
+                // evidence — D-112's no-precedence rule extended to
+                // fork registration: the condemned original never
+                // freezes the writer's re-proposed convergence
+                // carrier, so the late-first class converges on
+                // EVERY relative delivery order of original and
+                // re-proposal (the ff23f1cd review's F1 trace). An
+                // evidence-less or timely-evidenced variant stays
+                // fork evidence (the timely-first both-freeze world
+                // is unchanged).
+                if grant.online_lease {
+                    if let Some(v @ Verdict::Rejected("lease-stale", _)) =
+                        self.lease_self_verdict(op, &held_cert, &grant)
+                    {
+                        return ok(Err(v));
+                    }
+                }
                 return ok(Err(Verdict::Rejected("fork", "freeze-writer")));
             }
             std::cmp::Ordering::Greater => {
@@ -2963,37 +3073,66 @@ impl State {
                 // (D-202 stickiness is consulted at the TOP of
                 // classify — the memoized terminal verdict answers
                 // before any pipeline stage.)
-                let max_age = grant.max_age_ms.unwrap_or(0);
-                let windows = self.qualified_lease_windows(op, &held_cert, &grant, max_age);
-                if windows.is_empty() {
-                    return ok(Err(Verdict::Pending("lease-missing", "pending-dependency")));
-                }
-                // T5: skew = 300000 ms, fixed.
-                const SKEW_MS: u64 = 300_000;
-                let in_window = windows
-                    .iter()
-                    .any(|&(i, e)| accepts.iter().any(|&s| s >= i && s <= e + SKEW_MS));
-                if !in_window {
-                    if accepts.is_empty() {
-                        // No observation held at all: still awaiting
-                        // evidence (pending, §9.1's pairing).
-                        return ok(Err(Verdict::Pending("lease-missing", "pending-dependency")));
-                    }
-                    // A held qualified observation OUTSIDE every
-                    // valid window is staleness on the held
-                    // evidence. The owner's D5 ruling (2026-07-14,
-                    // alternative (ii)): the rejection is STICKY —
-                    // terminal where issued; convergence rides the
-                    // writer's re-proposed op, which is exactly the
-                    // quarantine-reproposal disposition.
-                    return ok(Err(Verdict::Rejected(
-                        "lease-stale",
-                        "quarantine-reproposal",
-                    )));
+                if let Some(v) = self.lease_self_verdict(op, &held_cert, &grant) {
+                    return ok(Err(v));
                 }
             }
         }
+        // The body stage opens with the registry-row consult, keyed
+        // by ALL THREE coordinates — (tenant, operation_type,
+        // operation_version), the ff23f1cd review's F3: an
+        // unsupported semantic version rejects before any
+        // arm-specific body reading (every v1 registry row is
+        // operation_version 1).
+        if op.header.operation_version != 1 {
+            return ok(Err(Verdict::Rejected(
+                "unknown-version",
+                "reject-permanent",
+            )));
+        }
         ok(Ok(grant))
+    }
+
+    /// The T5 lease classification of `op` on currently HELD
+    /// evidence — the one evaluator both consumers share (derive,
+    /// don't mirror): the time stage proper, and the D-205
+    /// self-evidence consult at an occupied coordinate. `None` =
+    /// in-window (or the grant is not lease-bound); `lease-missing`
+    /// pends where no window or no observation is held; a held
+    /// qualified observation OUTSIDE every valid window is staleness
+    /// on the held evidence — the owner's D5 ruling (D-202,
+    /// alternative (ii)): STICKY, terminal where issued, convergence
+    /// riding the writer's re-proposed op (exactly the
+    /// quarantine-reproposal disposition).
+    fn lease_self_verdict(
+        &self,
+        op: &SignedOp,
+        held_cert: &HeldCert,
+        grant: &HeldGrant,
+    ) -> Option<Verdict> {
+        if !grant.online_lease {
+            return None;
+        }
+        let accepts = self.qualified_accepts(op, held_cert);
+        let max_age = grant.max_age_ms.unwrap_or(0);
+        let windows = self.qualified_lease_windows(op, held_cert, grant, max_age);
+        if windows.is_empty() {
+            return Some(Verdict::Pending("lease-missing", "pending-dependency"));
+        }
+        // T5: skew = 300000 ms, fixed.
+        const SKEW_MS: u64 = 300_000;
+        let in_window = windows
+            .iter()
+            .any(|&(i, e)| accepts.iter().any(|&s| s >= i && s <= e + SKEW_MS));
+        if !in_window {
+            if accepts.is_empty() {
+                // No observation held at all: still awaiting
+                // evidence (pending, §9.1's pairing).
+                return Some(Verdict::Pending("lease-missing", "pending-dependency"));
+            }
+            return Some(Verdict::Rejected("lease-stale", "quarantine-reproposal"));
+        }
+        None
     }
 
     /// The T2 anchor: the policy in force at `(zone, epoch)` —
@@ -3295,26 +3434,30 @@ impl State {
 
     /// The body stage's arm-indexed CDDL/shape residue (§10.2
     /// `admit_ctrl`: body = hash → registry row → CDDL; D-99): the
-    /// required members, coarse types, static caps, and byte-internal
-    /// equalities of each DISPATCHED arm's registered body shape —
-    /// every check the transition rejects `body-invariant` without
-    /// reading state — evaluated BEFORE the replay consult and the
-    /// placement gate (the criterion-12 F1 repair: a validly signed,
-    /// hash-valid `c.grant` over `{bogus: 1}` classifies
-    /// `(body-invariant, reject-permanent)`; it never derives
-    /// `request-fork` or `ctrl-fork`). Taking NO `&self` makes
-    /// byte-onlyness structural. What stays behind, deliberately:
-    /// state-dependent invariants (the §10.2 state stage), wrap
-    /// fields the transition only reaches after a state read (the
-    /// enroll path's epoch gate), and every branch whose transition
-    /// is an honest `Unimplemented` marker — where the transition
-    /// aborts before a shape check, this stage returns `Ok` at the
-    /// same point rather than inventing law for an unimplemented
-    /// mechanism. `c.genesis` stays fully self-contained in its
-    /// transition (arm/signature/body are one composition and C2/C5
-    /// skip it), and `c.recovery_succession`'s base-binding and
-    /// arm-agreement equalities stay in its §7.4 lane (prec-stage
-    /// facts, not body shape).
+    /// CLOSED KEY SETS (O3 — unknown fields in a registry body
+    /// reject exactly as in headers; nested closed maps included,
+    /// the ff23f1cd review's F2), the required members, coarse
+    /// types, static caps, and byte-internal equalities of each
+    /// DISPATCHED arm's registered body shape — every check the
+    /// transition rejects `body-invariant` without reading state —
+    /// evaluated BEFORE the replay consult and the placement gate
+    /// (the criterion-12 F1 repair: a validly signed, hash-valid
+    /// `c.grant` over `{bogus: 1}` — or over a valid grant PLUS a
+    /// bogus sibling — classifies `(body-invariant,
+    /// reject-permanent)`; it never derives `request-fork` or
+    /// `ctrl-fork`). Taking NO `&self` makes byte-onlyness
+    /// structural. What stays behind, deliberately: state-dependent
+    /// invariants (the §10.2 state stage), wrap fields the
+    /// transition only reaches after a state read (the enroll
+    /// path's epoch gate), and every branch whose MECHANISM is an
+    /// honest `Unimplemented` marker — its known CDDL key set is
+    /// still enforced (the shape is ratified law even where the
+    /// machine is deferred), but this stage returns `Ok` at the
+    /// transition's abort point rather than inventing deeper law.
+    /// `c.recovery_succession`'s base-binding and arm-agreement
+    /// equalities stay in its §7.4 lane (prec-stage facts, not body
+    /// shape). The module-level key-set tables mirror App A
+    /// verbatim.
     fn ctrl_intrinsic_shape(op: &SignedOp) -> Result<(), Verdict> {
         let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
         let body = &op.body;
@@ -3323,9 +3466,24 @@ impl State {
                 let Some(cert) = body.get("cert") else {
                     return Err(bad());
                 };
+                if !keys_within(cert, CERT_REQ, CERT_OPT) {
+                    return Err(bad());
+                }
                 if cert.get("renews").is_some() {
-                    // Renewal union arm: honest Unimplemented.
+                    // Renewal union arm: the mechanism is an honest
+                    // Unimplemented, but its CDDL key set is ratified
+                    // law — unknown fields reject here.
+                    if !keys_within(
+                        body,
+                        &["cert", "feed_closure", "history_cutoffs"],
+                        &["wraps"],
+                    ) {
+                        return Err(bad());
+                    }
                     return Ok(());
+                }
+                if !keys_within(body, &["cert", "grants", "lineage", "wraps"], &[]) {
+                    return Err(bad());
                 }
                 let Some(device_id) = b16_field(cert, "device_id") else {
                     return Err(bad());
@@ -3340,6 +3498,9 @@ impl State {
                 let Some(lineage) = body.get("lineage") else {
                     return Err(bad());
                 };
+                if !keys_are_map(lineage, &["lineage", "device_id", "max_generations"]) {
+                    return Err(bad());
+                }
                 let Some(lineage_id) = b16_field(lineage, "lineage") else {
                     return Err(bad());
                 };
@@ -3356,10 +3517,13 @@ impl State {
                 }
                 if let Some(wraps) = body.get("wraps").and_then(|w| w.as_array()) {
                     for wn in wraps {
-                        // Only the pre-epoch-gate member is bytes;
-                        // the remaining wrap fields sit behind the
+                        // The wrap's key set is bytes; its epoch and
+                        // recipient equalities sit behind the
                         // transition's state read + Unimplemented
                         // epoch gate.
+                        if !keys_within(wn, KEKWRAP_KEYS, &[]) {
+                            return Err(bad());
+                        }
                         if b16_field(wn, "zone_id").is_none() {
                             return Err(bad());
                         }
@@ -3368,6 +3532,9 @@ impl State {
                 Ok(())
             }
             "c.grant" => {
+                if !keys_within(body, &["grant"], &[]) {
+                    return Err(bad());
+                }
                 let Some(gn) = body.get("grant") else {
                     return Err(bad());
                 };
@@ -3378,6 +3545,9 @@ impl State {
                 Ok(())
             }
             "c.revoke_grant" => {
+                if !keys_within(body, &["grant_id"], &["cutoff"]) {
+                    return Err(bad());
+                }
                 if b16_field(body, "grant_id").is_none() {
                     return Err(bad());
                 }
@@ -3390,6 +3560,13 @@ impl State {
                 }
             }
             "c.revoke_device" => {
+                if !keys_within(
+                    body,
+                    &["mode", "revocation_id", "cutoffs", "rotation_refs"],
+                    &["receipt_cutoffs"],
+                ) {
+                    return Err(bad());
+                }
                 let compromise = match body.get("mode").and_then(|m| m.as_text()) {
                     Some("exclude") => false,
                     Some("compromise") => true,
@@ -3423,8 +3600,12 @@ impl State {
                 Ok(())
             }
             "c.cutoff" => {
+                if !keys_within(body, &["cutoffs"], &["closes", "requester"]) {
+                    return Err(bad());
+                }
                 if body.get("requester").is_some() {
-                    // Requester attestation: honest Unimplemented.
+                    // Requester attestation: honest Unimplemented
+                    // (the top-level key set above is still law).
                     return Ok(());
                 }
                 let Some(ratify) = body.get("cutoffs").and_then(|c| c.as_array()) else {
@@ -3444,6 +3625,9 @@ impl State {
                 Ok(())
             }
             "c.cap_epoch_bump" => {
+                if !keys_within(body, &["zone_id", "new_epoch"], &["cutoffs"]) {
+                    return Err(bad());
+                }
                 let Some(zone) = b16_field(body, "zone_id") else {
                     return Err(bad());
                 };
@@ -3453,9 +3637,15 @@ impl State {
                 Self::zone_cutoffs_shape(body, zone)
             }
             "c.zone_policy" => {
+                if !keys_within(body, &["policy"], &["cutoffs"]) {
+                    return Err(bad());
+                }
                 let Some(policy) = body.get("policy") else {
                     return Err(bad());
                 };
+                if !keys_within(policy, ZONEPOLICY_REQ, ZONEPOLICY_OPT) {
+                    return Err(bad());
+                }
                 if policy.get("v").and_then(|n| n.as_uint()) != Some(1) {
                     return Err(bad());
                 }
@@ -3488,6 +3678,13 @@ impl State {
                 Self::zone_cutoffs_shape(body, zone)
             }
             "c.kek_rotate" => {
+                if !keys_within(
+                    body,
+                    &["zone_id", "new_epoch", "wraps", "erase_manifest"],
+                    &[],
+                ) {
+                    return Err(bad());
+                }
                 let zone = b16_field(body, "zone_id");
                 if zone.is_none() {
                     return Err(bad());
@@ -3531,7 +3728,8 @@ impl State {
                     // The wrap's static fields against the op's OWN
                     // zone/new_epoch (byte-internal; the plane and
                     // recipient-certificate checks are state).
-                    if wn.get("v").and_then(|n| n.as_uint()) != Some(1)
+                    if !keys_within(wn, KEKWRAP_KEYS, &[])
+                        || wn.get("v").and_then(|n| n.as_uint()) != Some(1)
                         || wn.get("kem").and_then(|n| n.as_text()) != Some("hpke-p256-v1")
                         || wn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none()
                         || b16_field(wn, "zone_id") != zone
@@ -3551,6 +3749,13 @@ impl State {
                 Ok(())
             }
             "c.zone_create" => {
+                if !keys_within(
+                    body,
+                    &["zone_id", "initial_epoch", "wraps", "zone_policy"],
+                    &[],
+                ) {
+                    return Err(bad());
+                }
                 let Some(zone_id) = b16_field(body, "zone_id") else {
                     return Err(bad());
                 };
@@ -3560,7 +3765,9 @@ impl State {
                 let Some(policy) = body.get("zone_policy") else {
                     return Err(bad());
                 };
-                if b16_field(policy, "zone_id") != Some(zone_id) {
+                if !keys_within(policy, ZONEPOLICY_REQ, ZONEPOLICY_OPT)
+                    || b16_field(policy, "zone_id") != Some(zone_id)
+                {
                     return Err(bad());
                 }
                 let wraps = match body.get("wraps").and_then(|w| w.as_array()) {
@@ -3568,7 +3775,8 @@ impl State {
                     _ => return Err(bad()),
                 };
                 for wn in wraps {
-                    if wn.get("v").and_then(|n| n.as_uint()) != Some(1)
+                    if !keys_within(wn, KEKWRAP_KEYS, &[])
+                        || wn.get("v").and_then(|n| n.as_uint()) != Some(1)
                         || wn.get("kem").and_then(|n| n.as_text()) != Some("hpke-p256-v1")
                         || wn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none()
                         || b16_field(wn, "zone_id") != Some(zone_id)
@@ -3581,22 +3789,45 @@ impl State {
                 Ok(())
             }
             "c.space_create" => {
+                // cspacecreate = spacedef, the whole body.
+                if !keys_within(body, SPACEDEF_KEYS, &[]) {
+                    return Err(bad());
+                }
                 if b16_field(body, "space_id").is_none() || b16_field(body, "zone_id").is_none() {
                     return Err(bad());
                 }
                 Ok(())
             }
             "c.drill" => {
+                if !keys_within(body, &["nonce"], &[]) {
+                    return Err(bad());
+                }
                 if body.get("nonce").and_then(|n| n.bytes_n::<16>()).is_none() {
                     return Err(bad());
                 }
                 Ok(())
             }
             "c.recovery_succession" => {
+                if !keys_within(
+                    body,
+                    &[
+                        "base",
+                        "epoch",
+                        "repoch",
+                        "new_admin",
+                        "new_recovery_commitment",
+                        "tenant_cutoffs",
+                        "adopted_rotations",
+                    ],
+                    &["adopted_renewals", "retired_keys"],
+                ) {
+                    return Err(bad());
+                }
                 let Some(base) = body.get("base") else {
                     return Err(bad());
                 };
-                if base.get("seq").and_then(|n| n.as_uint()).is_none()
+                if !keys_are_map(base, &["seq", "op"])
+                    || base.get("seq").and_then(|n| n.as_uint()).is_none()
                     || base.get("op").and_then(|n| n.bytes_n::<32>()).is_none()
                 {
                     return Err(bad());
@@ -3609,6 +3840,9 @@ impl State {
                 let Some(new_admin) = body.get("new_admin") else {
                     return Err(bad());
                 };
+                if !keys_are_map(new_admin, &["alg", "pk"]) {
+                    return Err(bad());
+                }
                 if new_admin.get("alg").and_then(|a| a.as_text()) != Some("ed25519") {
                     // Non-ed25519 successor: honest Unimplemented.
                     return Ok(());
@@ -3645,24 +3879,77 @@ impl State {
                 }
                 Ok(())
             }
-            // `c.genesis` (self-contained transition) and the
-            // registry rows whose mechanisms are honest
+            "c.genesis" => {
+                // The transition is self-contained (arm/signature/
+                // body one composition; C2/C5 skip it), but the
+                // closed key sets are byte law like every arm's
+                // (O3 — the ff23f1cd review's F2 class).
+                if !keys_within(
+                    body,
+                    &[
+                        "descriptor",
+                        "cert",
+                        "lineage",
+                        "zone",
+                        "home_space",
+                        "audit_space",
+                        "zone_policy",
+                        "grant",
+                        "audit_grant",
+                    ],
+                    &[],
+                ) {
+                    return Err(bad());
+                }
+                if let Some(zone) = body.get("zone") {
+                    if !keys_are_map(zone, &["zone_id", "initial_epoch", "wraps"]) {
+                        return Err(bad());
+                    }
+                }
+                for g in ["grant", "audit_grant"] {
+                    if let Some(gn) = body.get(g) {
+                        Self::grant_intrinsic_shape(gn, None)?;
+                    }
+                }
+                if let Some(cert) = body.get("cert") {
+                    if !keys_within(cert, CERT_REQ, CERT_OPT) {
+                        return Err(bad());
+                    }
+                }
+                if let Some(policy) = body.get("zone_policy") {
+                    if !keys_within(policy, ZONEPOLICY_REQ, ZONEPOLICY_OPT) {
+                        return Err(bad());
+                    }
+                }
+                for s in ["home_space", "audit_space"] {
+                    if let Some(sd) = body.get(s) {
+                        if !keys_within(sd, SPACEDEF_KEYS, &[]) {
+                            return Err(bad());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            // The registry rows whose mechanisms are honest
             // `Unimplemented` markers carry no intrinsic law here.
             _ => Ok(()),
         }
     }
 
     /// The grant object's byte-only gates (`grant_static_checks`
-    /// minus its state reads): `plane_id` present, the verb rules,
-    /// and — for op-authoring grants — the finite zone plus the
-    /// lineage/subject members. `enrolling` supplies the enroll/
-    /// genesis shapes' byte-internal ownership equality; ownership
-    /// against the lineage registry is state.
+    /// minus its state reads): the closed key set (App A.1), the
+    /// verb rules, and — for op-authoring grants — the finite zone
+    /// plus the lineage/subject members. `enrolling` supplies the
+    /// enroll/genesis shapes' byte-internal ownership equality;
+    /// ownership against the lineage registry is state.
     fn grant_intrinsic_shape(
         gn: &Node,
         enrolling: Option<([u8; 16], [u8; 16])>,
     ) -> Result<(), Verdict> {
         let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        if !keys_within(gn, GRANT_REQ, GRANT_OPT) {
+            return Err(bad());
+        }
         if gn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none() {
             return Err(bad());
         }
@@ -3688,12 +3975,16 @@ impl State {
         Ok(())
     }
 
-    /// A frontierclose's byte-only shape (App A.3): `zone_id` and
-    /// `lineage` present, `heads` an array of `{lineage, gen, seq,
-    /// op}` heads each naming the close's OWN lineage. Resolution
-    /// against held chains (unheld pends, D-130 selection) is state.
+    /// A frontierclose's byte-only shape (App A.3): the closed key
+    /// set, `zone_id` and `lineage` present, `heads` an array of
+    /// exact `{lineage, gen, seq, op}` heads each naming the close's
+    /// OWN lineage. Resolution against held chains (unheld pends,
+    /// D-130 selection) is state.
     fn frontierclose_shape(cn: &Node) -> Result<(), Verdict> {
         let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        if !keys_are_map(cn, &["zone_id", "lineage", "heads"]) {
+            return Err(bad());
+        }
         let (Some(cl), Some(_cz)) = (b16_field(cn, "lineage"), b16_field(cn, "zone_id")) else {
             return Err(bad());
         };
@@ -3701,6 +3992,9 @@ impl State {
             return Err(bad());
         };
         for hn in heads {
+            if !keys_are_map(hn, &["lineage", "gen", "seq", "op"]) {
+                return Err(bad());
+            }
             let (Some(hl), Some(_gen), Some(_seq), Some(_hop)) = (
                 b16_field(hn, "lineage"),
                 hn.get("gen").and_then(|n| n.as_uint()),
@@ -5415,6 +5709,16 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
         }
         if !REGISTRY_OP_TYPES.contains(&op.header.operation_type) {
             return Ok(Verdict::Rejected("op-unknown", "reject-permanent"));
+        }
+        // The registry row is keyed by ALL THREE coordinates —
+        // (tenant, operation_type, operation_version), the ff23f1cd
+        // review's F3: an unsupported semantic version rejects
+        // `unknown-version` at the row consult, before the arm's
+        // CDDL, the replay consult, and placement (every v1 registry
+        // row is operation_version 1; the header's OWN `v` is the
+        // protocol version, rejected at parse).
+        if op.header.operation_version != 1 {
+            return Ok(Verdict::Rejected("unknown-version", "reject-permanent"));
         }
         // ...and the arm's intrinsic CDDL shape completes the body
         // stage (hash → registry row → CDDL, §10.2/D-99) before ANY

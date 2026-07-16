@@ -547,9 +547,15 @@ pub fn f9_lease_lifecycle_sticky_reproposal() -> Vector {
     item_map.insert("timely_i2".into(), json!(hex_of(&timely_i2.encode())));
     item_map.insert("i2".into(), json!(hex_of(&i2.encode())));
     inputs.insert("items".into(), Json::Object(item_map));
-    // Both listed orders share the declared arrival structure: the
-    // late receipt precedes i's first evaluation; both timely
-    // receipts and the re-proposal follow it.
+    // All listed orders share the declared late-first class: the
+    // late receipt is held (and the timely one is not) at i's first
+    // evaluation. The THIRD order delivers the re-proposal BEFORE
+    // the original (the ff23f1cd review's F1 regression): i2 admits
+    // first, and arriving i self-classifies sticky `lease-stale` at
+    // the occupied coordinate instead of freezing its own carrier
+    // (D-205) — the class converges on every relative delivery
+    // order of original and re-proposal.
+    inputs.insert("evidence_class".into(), json!("late-first"));
     inputs.insert(
         "deliveries".into(),
         json!([
@@ -574,6 +580,17 @@ pub fn f9_lease_lifecycle_sticky_reproposal() -> Vector {
                 "timely_i2",
                 "timely_i",
                 "i2"
+            ],
+            [
+                "c1",
+                "c2",
+                "c3",
+                "c4",
+                "late",
+                "timely_i2",
+                "i2",
+                "i",
+                "timely_i"
             ]
         ]),
     );
@@ -671,11 +688,12 @@ pub fn f9_lease_lifecycle_timely_first_forks() -> Vector {
     item_map.insert("timely_i2".into(), json!(hex_of(&timely_i2.encode())));
     item_map.insert("i2".into(), json!(hex_of(&i2.encode())));
     inputs.insert("items".into(), Json::Object(item_map));
-    // Both listed orders share the declared arrival structure: a
+    // Both listed orders share the declared timely-first class: a
     // timely receipt is held at i's first evaluation (delivery 0
     // additionally holds the late one — held timely evidence beats
     // held late evidence; delivery 1 holds the timely one alone and
     // the late receipt arrives after the verdict).
+    inputs.insert("evidence_class".into(), json!("timely-first"));
     inputs.insert(
         "deliveries".into(),
         json!([

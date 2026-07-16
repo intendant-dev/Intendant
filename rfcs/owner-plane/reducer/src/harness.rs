@@ -1186,7 +1186,7 @@ mod tests {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
         assert_eq!(
             reports.len(),
-            168,
+            170,
             "the corpus through the criterion-12 tranche"
         );
         for r in &reports {

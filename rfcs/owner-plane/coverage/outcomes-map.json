@@ -17,6 +17,7 @@
       "audit-duplicate-chunk-index",
       "audit-overlapping-result-sets",
       "c2-post-freeze-cddl-invalid-kept",
+      "c2-post-freeze-extra-field-kept",
       "consumed-request-id-cddl-invalid",
       "issuance-to-revoked-device-rejects",
       "kek-rotate-manifest-target-outside-rejects",
@@ -44,6 +45,7 @@
     ],
     "ctrl-fork": [
       "c2-post-freeze-cddl-invalid-kept",
+      "c2-post-freeze-extra-field-kept",
       "c2-post-freeze-sig-invalid-kept",
       "c2-post-freeze-valid-op-frozen",
       "walkthrough-c2-freeze-both"
@@ -200,7 +202,8 @@
       "shape3-token-out-of-scope"
     ],
     "unknown-version": [
-      "header-unknown-version-rejects"
+      "header-unknown-version-rejects",
+      "operation-version-unknown-rejects"
     ],
     "wrapper-mismatch": [
       "wrapper-address-mismatch"

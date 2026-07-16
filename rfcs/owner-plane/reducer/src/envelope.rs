@@ -451,7 +451,7 @@ mod tests {
         // +2: the criterion-12 D-99 multi-fault pair (CDDL-invalid
         // × C2, CDDL-invalid × consumed-request-ID); +1: the D-202
         // timely-first world sibling.
-        assert_eq!(geneses, 81);
+        assert_eq!(geneses, 83);
     }
 
     /// Tampering any byte of the header breaks the signature; the
