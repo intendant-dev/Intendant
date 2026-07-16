@@ -1265,17 +1265,24 @@ pub(crate) async fn api_memory_claim_response(
 }
 
 /// Tunnel twin of `POST /api/memory/propose` — the proposal rides
-/// `params` (the same JSON shape as the HTTP body).
+/// `params` (the same JSON shape as the HTTP body); attribution comes
+/// from the authenticated dashboard-control grant.
 pub(crate) async fn api_memory_propose_response(
     id: String,
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
     let body_text = params_body_text(params);
+    let actor =
+        crate::access::actor::ActorBinding::from_principal(&runtime.grant.access_principal(), None);
     frame_api_response(
         id,
-        crate::web_gateway::memory_propose_api_response(&body_text, runtime.mcp_server.as_ref())
-            .await,
+        crate::web_gateway::memory_propose_api_response(
+            &body_text,
+            runtime.mcp_server.as_ref(),
+            &actor,
+        )
+        .await,
         "memory propose",
     )
 }

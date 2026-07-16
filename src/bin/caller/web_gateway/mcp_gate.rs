@@ -1058,6 +1058,118 @@ mod tests {
         );
     }
 
+    fn memory_claim_from_outcome(outcome: McpHttpOutcome) -> serde_json::Value {
+        let McpHttpOutcome::Response(resp) = outcome else {
+            panic!("expected a response outcome");
+        };
+        let result = resp.result.expect("tool result");
+        assert_ne!(
+            result.get("isError").and_then(serde_json::Value::as_bool),
+            Some(true),
+            "tool errored: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().expect("text content");
+        serde_json::from_str::<serde_json::Value>(text).expect("claim json")["claim"].clone()
+    }
+
+    /// Memory P1's exit-criterion attribution test (package §5.4 /
+    /// umbrella §15.2: attribution unforgeable under the §8 threat
+    /// model — **recorded actor == token-bound principal**), full lane
+    /// in process: the gate classifies the token, dispatch carries the
+    /// resolved `ActorBinding`, and the claim's own provenance fields
+    /// record exactly the principal the token bound. A dashboard-lane
+    /// write with a session id riding the QUERY attributes no session
+    /// anywhere — neither provenance nor claim context. (The
+    /// wire-level token↔session binding is pinned by
+    /// `gate_session_never_trusts_unbound_query_ids`.)
+    #[tokio::test]
+    async fn memory_writes_record_the_token_bound_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bus = crate::event::EventBus::new();
+        let mut state = crate::mcp::McpAppState::new(
+            "test".into(),
+            "test".into(),
+            crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            tmp.path().join("logs"),
+        );
+        state.memory = Some(std::sync::Arc::new(
+            crate::memory::MemoryHandle::bootstrap().expect("ephemeral plane bootstraps"),
+        ));
+        let server = crate::mcp::IntendantServer::new(
+            std::sync::Arc::new(tokio::sync::RwLock::new(state)),
+            bus,
+        );
+        let call = |statement: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "memory_propose",
+                    "arguments": { "kind": "observation", "statement": statement },
+                },
+            })
+            .to_string()
+        };
+
+        // Supervised session: agent-session principal + gate-bound sid.
+        let session_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+                "sess-e2e", "http", true,
+            ),
+            iam_state: None,
+        };
+        let outcome = handle_mcp_http_request(
+            &call("proposed by the session"),
+            &server,
+            Some("sess-e2e"),
+            None,
+            None,
+            &session_access,
+            Some("sess-e2e".to_string()),
+        )
+        .await;
+        let claim = memory_claim_from_outcome(outcome);
+        assert_eq!(
+            claim["proposed_by"]["principal"],
+            serde_json::json!(session_access.principal.id),
+            "recorded actor must equal the token-bound principal, verbatim"
+        );
+        assert_eq!(claim["proposed_by"]["actor"], "agent_session");
+        assert_eq!(claim["proposed_by"]["session"], "sess-e2e");
+        assert_eq!(claim["proposed_by"]["v"], 1);
+        // Unstated session context defaulted from the gate binding.
+        assert_eq!(claim["session"], "sess-e2e");
+
+        // Dashboard lane: no gate-bound session, so the query-string
+        // sid must attribute nothing — provenance carries the
+        // dashboard principal only, and the claim context stays empty.
+        let dashboard_access = HttpAccessContext {
+            principal: crate::access::iam::AccessPrincipal::root_dashboard_session("test", "https"),
+            iam_state: None,
+        };
+        let outcome = handle_mcp_http_request(
+            &call("proposed by the owner"),
+            &server,
+            Some("sess-e2e"),
+            None,
+            None,
+            &dashboard_access,
+            None,
+        )
+        .await;
+        let claim = memory_claim_from_outcome(outcome);
+        assert_eq!(claim["proposed_by"]["actor"], "dashboard");
+        assert_eq!(claim["proposed_by"].get("session"), None);
+        assert_eq!(
+            claim["proposed_by"]["principal"],
+            serde_json::json!(dashboard_access.principal.id)
+        );
+        assert_eq!(
+            claim.get("session"),
+            Some(&serde_json::Value::Null),
+            "a query-echoed sid must not leak into the claim context"
+        );
+    }
+
     #[test]
     fn mcp_http_access_context_binds_token_origin_and_loopback_paths() {
         use std::net::{Ipv4Addr, SocketAddr};

@@ -33,8 +33,17 @@ impl MemoryHandle {
         &self.plane_id_hex
     }
 
-    pub(crate) fn propose(&self, args: ProposeArgs) -> Result<ClaimView, MemoryError> {
-        self.lock().propose(args)
+    /// Author a claim. `actor` is the gate-resolved binding from the
+    /// authenticated edge that dispatched this write (the seam
+    /// contract in `access/actor.rs`) — the service maps it into the
+    /// claim's own provenance fields and the op envelope's actor, and
+    /// makes the ring authorization decision from it.
+    pub(crate) fn propose(
+        &self,
+        args: ProposeArgs,
+        actor: &crate::access::actor::ActorBinding,
+    ) -> Result<ClaimView, MemoryError> {
+        self.lock().propose(args, actor)
     }
 
     pub(crate) fn search(&self, args: &SearchArgs) -> Vec<ClaimView> {
