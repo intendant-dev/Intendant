@@ -9,17 +9,33 @@ pub(crate) fn spawn_control_request(
     method: String,
     params: Option<serde_json::Value>,
     runtime: ControlRuntime,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
 ) {
-    if let Some(previous) = pending_requests.remove(&id) {
-        previous.cancel();
-    }
-    let cancel = CancellationToken::new();
-    pending_requests.insert(id.clone(), cancel.clone());
+    let (cancel, generation, slot) = pending_requests.admit(&id);
     tokio::spawn(async move {
-        let response = control_request_response(id, method, params, runtime, cancel).await;
-        let _ = task_tx.send(response).await;
+        // RAII: the slot frees when THIS task exits, so the 64-slot
+        // admission bound covers ALL live work. The handler runs to
+        // completion even when superseded — dropping the future
+        // mid-flight would detach an in-flight spawn_blocking segment
+        // and let its work (and queue position on the blocking pool)
+        // escape the bound; a cancelled predecessor therefore keeps its
+        // slot while it drains, and rapid same-id cycling saturates the
+        // bound and gets refused instead of occupying the pool.
+        // Handlers that poll the token still stop early.
+        let _slot = slot;
+        let response = control_request_response(id, method, params, runtime, cancel.clone()).await;
+        if cancel.is_cancelled() {
+            // Superseded: stale output must not reach the wire.
+            return;
+        }
+        // The channel wait is cancellable too — a completed-but-stale
+        // response must not sit queued holding a full payload.
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {}
+            _ = task_tx.send((generation, response)) => {}
+        }
     });
 }
 
@@ -75,34 +91,51 @@ pub(crate) fn spawn_control_stream(
     id: String,
     method: String,
     params: Option<serde_json::Value>,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
 ) {
-    if let Some(previous) = pending_requests.remove(&id) {
-        previous.cancel();
-    }
-    let cancel = CancellationToken::new();
-    pending_requests.insert(id.clone(), cancel.clone());
+    let (cancel, generation, slot) = pending_requests.admit(&id);
     tokio::spawn(async move {
+        // Same RAII contract as the request lane, with one refinement: a
+        // mid-stream framer exit must NOT free the slot while the line
+        // producer's detached hydration keeps running (its final send
+        // results are ignored, so a dropped receiver does not stop it) —
+        // the framer hands the slot + receiver to a drain task that frees
+        // the slot only when the producer's sender drops (see
+        // `hold_slot_until_producer_exits`).
         match method.as_str() {
             "api_sessions_stream" => {
-                stream_sessions_response(id, params.as_ref(), task_tx, cancel).await;
+                stream_sessions_response(
+                    id,
+                    params.as_ref(),
+                    task_tx,
+                    generation,
+                    cancel,
+                    Some(slot),
+                )
+                .await;
             }
             _ => {
+                let _slot = slot;
                 let frame = serde_json::json!({
                     "t": "stream_end",
                     "id": id,
                     "ok": false,
                     "error": format!("unknown stream method: {method}"),
                 });
-                let _ = task_tx
-                    .send(ControlTaskResponse {
-                        id,
-                        frame,
-                        byte_stream: None,
-                        done: true,
-                    })
-                    .await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    _ = task_tx.send((
+                        generation,
+                        ControlTaskResponse {
+                            id,
+                            frame,
+                            byte_stream: None,
+                            done: true,
+                        },
+                    )) => {}
+                }
             }
         }
     });
@@ -381,8 +414,10 @@ pub(crate) async fn control_request_frame(
 pub(crate) async fn stream_sessions_response(
     id: String,
     params: Option<&serde_json::Value>,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    generation: u64,
     cancel: CancellationToken,
+    slot: Option<LiveWorkSlot>,
 ) {
     let requested_limit = sessions_stream_requested_limit(params);
     let crate::web_gateway::ApiResponse::Stream { stream, .. } =
@@ -391,17 +426,20 @@ pub(crate) async fn stream_sessions_response(
         // The sessions-stream core always answers on the Stream lane; a
         // buffered response reaching this framer is a wiring bug.
         let _ = task_tx
-            .send(ControlTaskResponse {
-                id: id.clone(),
-                frame: serde_json::json!({
-                    "t": "stream_end",
-                    "id": id,
-                    "ok": false,
-                    "error": "session stream returned a buffered response",
-                }),
-                byte_stream: None,
-                done: true,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id: id.clone(),
+                    frame: serde_json::json!({
+                        "t": "stream_end",
+                        "id": id,
+                        "ok": false,
+                        "error": "session stream returned a buffered response",
+                    }),
+                    byte_stream: None,
+                    done: true,
+                },
+            ))
             .await;
         return;
     };
@@ -410,47 +448,74 @@ pub(crate) async fn stream_sessions_response(
         "api_sessions_stream".to_string(),
         stream,
         task_tx,
+        generation,
         cancel,
+        slot,
     )
     .await;
 }
 
+/// Free `slot` only when the line PRODUCER actually exits: discard
+/// remaining lines until `recv()` returns `None` — the producer dropping
+/// its sender is the producer function returning. Mid-stream framer exits
+/// (cancellation, send failure, invalid JSON) hand their receiver here so
+/// admission capacity is never released while hydration keeps running;
+/// slot lifetime equals producer lifetime by construction, with zero
+/// producer-side changes.
+fn hold_slot_until_producer_exits(slot: Option<LiveWorkSlot>, mut line_rx: mpsc::Receiver<String>) {
+    tokio::spawn(async move {
+        let _slot = slot;
+        while line_rx.recv().await.is_some() {}
+    });
+}
+
+#[allow(clippy::too_many_arguments)] // established internal signature: the params are distinct dependencies, not a bundle
 pub(crate) async fn stream_json_lines_response(
     id: String,
     method: String,
     stream: crate::web_gateway::LineStream,
-    task_tx: mpsc::Sender<ControlTaskResponse>,
+    task_tx: mpsc::Sender<SequencedTaskResponse>,
+    generation: u64,
     cancel: CancellationToken,
+    slot: Option<LiveWorkSlot>,
 ) {
     let crate::web_gateway::LineStream {
         lines: mut line_rx,
         source: stream_task,
     } = stream;
     if cancel.is_cancelled() {
-        return;
+        return hold_slot_until_producer_exits(slot, line_rx);
     }
 
     if task_tx
-        .send(ControlTaskResponse {
-            id: id.clone(),
-            frame: serde_json::json!({
-                "t": "stream_start",
-                "id": id,
-                "method": method,
-            }),
-            byte_stream: None,
-            done: false,
-        })
+        .send((
+            generation,
+            ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "stream_start",
+                    "id": id,
+                    "method": method,
+                }),
+                byte_stream: None,
+                done: false,
+            },
+        ))
         .await
         .is_err()
     {
-        return;
+        return hold_slot_until_producer_exits(slot, line_rx);
     }
 
     let mut seq: u64 = 0;
-    while let Some(line) = line_rx.recv().await {
+    loop {
+        let Some(line) = line_rx.recv().await else {
+            // recv() == None: the producer exited — the loop ends and the
+            // slot may now die with this framer.
+            break;
+        };
         if cancel.is_cancelled() {
-            return;
+            return hold_slot_until_producer_exits(slot, line_rx);
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -466,14 +531,17 @@ pub(crate) async fn stream_json_lines_response(
                     "error": format!("session stream returned invalid JSON: {e}"),
                 });
                 let _ = task_tx
-                    .send(ControlTaskResponse {
-                        id,
-                        frame,
-                        byte_stream: None,
-                        done: true,
-                    })
+                    .send((
+                        generation,
+                        ControlTaskResponse {
+                            id,
+                            frame,
+                            byte_stream: None,
+                            done: true,
+                        },
+                    ))
                     .await;
-                return;
+                return hold_slot_until_producer_exits(slot, line_rx);
             }
         };
         let chunk_id = format!("{id}:{seq}");
@@ -486,16 +554,19 @@ pub(crate) async fn stream_json_lines_response(
         });
         seq = seq.saturating_add(1);
         if task_tx
-            .send(ControlTaskResponse {
-                id: id.clone(),
-                frame,
-                byte_stream: None,
-                done: false,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id: id.clone(),
+                    frame,
+                    byte_stream: None,
+                    done: false,
+                },
+            ))
             .await
             .is_err()
         {
-            return;
+            return hold_slot_until_producer_exits(slot, line_rx);
         }
     }
 
@@ -517,12 +588,15 @@ pub(crate) async fn stream_json_lines_response(
     };
     if !cancel.is_cancelled() {
         let _ = task_tx
-            .send(ControlTaskResponse {
-                id,
-                frame,
-                byte_stream: None,
-                done: true,
-            })
+            .send((
+                generation,
+                ControlTaskResponse {
+                    id,
+                    frame,
+                    byte_stream: None,
+                    done: true,
+                },
+            ))
             .await;
     }
 }
@@ -635,7 +709,7 @@ pub(crate) async fn api_session_detail_response_from_home(
     })
     .await;
     match result {
-        Ok(response) => frame_api_json_body_response(id, response, "session detail"),
+        Ok(response) => frame_api_json_body_response_preserialized(id, response, "session detail"),
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -921,7 +995,22 @@ pub(crate) async fn api_session_current_upload_task_response(
     // The tunnel edge of the Streaming lane (S8): frame params parsed
     // here in their wire form, the spool handed to the same neutral
     // commit the HTTP staged-upload POST feeds its socket spool.
-    let (params, body) = upload.into_spooled_body();
+    let (params, body) = match upload.into_spooled_body() {
+        Ok(spooled) => spooled,
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("spool upload: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
     let name = optional_string_param(&params, &["name", "filename", "file_name"])
         .unwrap_or_else(|| "upload.bin".to_string());
     let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
@@ -1301,7 +1390,7 @@ pub(crate) async fn api_sessions_message_search_response(
             .unwrap_or(20),
     };
     let response = crate::web_gateway::sessions_message_search_api_response(search).await;
-    frame_api_json_body_response(id, response, "message search")
+    frame_api_json_body_response_preserialized(id, response, "message search")
 }
 
 pub(crate) async fn api_sessions_search_response(
@@ -1327,13 +1416,104 @@ pub(crate) async fn api_sessions_search_response(
         cancel,
     )
     .await;
-    frame_api_json_body_response(id, response, "session search")
+    frame_api_json_body_response_preserialized(id, response, "session search")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::runtime;
+
+    /// A cancelled stream must NOT free its live-work slot while the line
+    /// producer keeps running: the framer hands the slot + receiver to
+    /// the drain task, which frees the slot only when the producer's
+    /// sender drops (the producer function returning).
+    #[tokio::test]
+    async fn cancelled_stream_slot_frees_only_when_producer_exits() {
+        let mut pending = PendingControlRequests::new();
+        let (_cancel_token, generation, slot) = pending.admit("s1");
+        assert_eq!(pending.live_work(), 1);
+
+        let (line_tx, line_rx) = mpsc::channel::<String>(4);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        // A producer that keeps running well past the framer's exit.
+        let source = tokio::spawn(async move {
+            let _ = line_tx.send("{\"type\":\"ping\"}\n".to_string()).await;
+            let _ = release_rx.await;
+            // line_tx drops here — the producer's actual exit.
+        });
+        let (task_tx, _task_rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        stream_json_lines_response(
+            "s1".to_string(),
+            "api_sessions_stream".to_string(),
+            crate::web_gateway::LineStream {
+                lines: line_rx,
+                source,
+            },
+            task_tx,
+            generation,
+            cancel,
+            Some(slot),
+        )
+        .await;
+
+        // The framer returned (cancelled), the producer still runs: the
+        // slot must still be held.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(
+            pending.live_work(),
+            1,
+            "cancellation must not free the slot while the producer runs"
+        );
+
+        // Let the producer exit; the drain task frees the slot at None.
+        release_tx.send(()).expect("producer waiting");
+        let mut freed = false;
+        for _ in 0..400 {
+            if pending.live_work() == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(freed, "slot must free when the producer's sender drops");
+    }
+
+    /// The spawned request lane's RAII contract: a spawned task holds its
+    /// live-work slot for its whole life (admission counts it) and the
+    /// slot frees only when the task actually exits — after its response
+    /// is delivered, not at replacement time.
+    #[tokio::test]
+    async fn spawned_request_slot_frees_on_task_exit() {
+        let mut pending = PendingControlRequests::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        spawn_control_request(
+            "slot-1".to_string(),
+            "definitely_not_a_method".to_string(),
+            None,
+            runtime(),
+            tx,
+            &mut pending,
+        );
+        assert_eq!(pending.live_work(), 1, "the spawned task holds its slot");
+        let (generation, response) = rx.recv().await.expect("task answers");
+        assert!(pending.matches("slot-1", generation));
+        assert_eq!(response.id, "slot-1");
+        // The slot frees when the task exits (just after the send).
+        let mut freed = false;
+        for _ in 0..400 {
+            if pending.live_work() == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(freed, "the slot must free on task exit");
+        assert!(pending.complete("slot-1", generation));
+    }
 
     #[tokio::test]
     async fn session_report_rpc_returns_zip_for_active_log() {
@@ -1672,7 +1852,7 @@ mod tests {
                 line_tx.send(format!("{line}\n")).await.unwrap();
             }
         });
-        let (task_tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let (task_tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
 
         stream_json_lines_response(
             "stream1".to_string(),
@@ -1682,12 +1862,14 @@ mod tests {
                 source: stream_task,
             },
             task_tx,
+            7,
             CancellationToken::new(),
+            None,
         )
         .await;
 
         let mut frames = Vec::new();
-        while let Some(task) = rx.recv().await {
+        while let Some((_, task)) = rx.recv().await {
             frames.push(task);
             if frames.last().unwrap().done {
                 break;
@@ -1946,8 +2128,21 @@ mod tests {
     }
 
     /// The pre-_httpStatus envelope (difference #1): ok:true with the
-    /// body as the verbatim result — no injected status metadata.
+    /// body as the verbatim result — no injected status metadata. The
+    /// sessions family answers with the PRE-SERIALIZED carrier
+    /// (`Value::String(<envelope text>)`, sent verbatim by
+    /// `send_control_task_response`); materialize it first so the shape
+    /// assertions run against what the browser parses off the wire.
     fn tunnel_plain_body(frame: &serde_json::Value) -> serde_json::Value {
+        let materialized;
+        let frame = match frame {
+            serde_json::Value::String(text) => {
+                materialized = serde_json::from_str::<serde_json::Value>(text)
+                    .expect("pre-serialized envelope is valid JSON");
+                &materialized
+            }
+            other => other,
+        };
         assert_eq!(frame["t"], "response");
         assert_eq!(frame["ok"], true, "{frame}");
         if let Some(result) = frame["result"].as_object() {
@@ -2489,17 +2684,11 @@ mod tests {
         // Tunnel commit: the upload lane's spooled frames end in the
         // same shared neutral fn the HTTP POST runs (difference #3 —
         // only the carriage differs).
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(&payload).unwrap();
-        let upload = InboundUploadState {
-            method: "api_session_current_upload".to_string(),
-            params: serde_json::json!({ "name": "parity.txt", "mime": "text/plain" }),
-            tmp,
-            total_bytes: payload.len(),
-            expected_chunks: 1,
-            next_seq: 1,
-            received_bytes: payload.len(),
-        };
+        let upload = crate::dashboard_control::tests::test_upload_state(
+            "api_session_current_upload",
+            serde_json::json!({ "name": "parity.txt", "mime": "text/plain" }),
+            &payload,
+        );
         let commit = api_session_current_upload_task_response(
             "parity-upload-commit".to_string(),
             upload,
@@ -2758,17 +2947,19 @@ mod tests {
         // Tunnel lane: the framer over the same sequence — one
         // stream_event per line, events byte-identical to the HTTP
         // lane's parsed lines, under the lifecycle frames.
-        let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
+        let (task_tx, mut task_rx) = mpsc::channel::<SequencedTaskResponse>(64);
         stream_json_lines_response(
             "stream-parity".to_string(),
             "api_sessions_stream".to_string(),
             replay_line_stream(lines.clone()),
             task_tx,
+            7,
             CancellationToken::new(),
+            None,
         )
         .await;
         let mut frames = Vec::new();
-        while let Some(task) = task_rx.recv().await {
+        while let Some((_, task)) = task_rx.recv().await {
             let done = task.done;
             frames.push(task);
             if done {

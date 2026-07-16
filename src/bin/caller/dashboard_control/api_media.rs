@@ -61,25 +61,11 @@ pub(crate) fn media_task_response(
 pub(crate) fn read_inbound_upload_bytes(
     upload: &mut InboundUploadState,
 ) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::with_capacity(upload.received_bytes);
-    upload
-        .tmp
-        .as_file_mut()
-        .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| format!("seek upload tempfile: {e}"))?;
-    upload
-        .tmp
-        .as_file_mut()
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("read upload tempfile: {e}"))?;
-    if bytes.len() != upload.received_bytes {
-        return Err(format!(
-            "upload byte count changed while committing: expected {}, got {}",
-            upload.received_bytes,
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
+    // Memory spools (every payload ≤1 MiB — presence webcam frames
+    // included) move out with zero I/O; disk spools settle and read back
+    // exactly as the tempfile path always did.
+    let received_bytes = upload.received_bytes;
+    upload.spool.take_bytes(received_bytes)
 }
 
 pub(crate) async fn dashboard_media_session_handles(

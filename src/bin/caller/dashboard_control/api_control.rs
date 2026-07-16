@@ -120,7 +120,7 @@ pub(crate) async fn api_state_snapshot_response(
             "t": "state_snapshot",
             "state": state,
             "connection_id": runtime.session_id.clone(),
-            "config": runtime.config.clone(),
+            "config": &*runtime.config,
             "session_id": bootstrap_session_id,
         },
     })
@@ -3586,10 +3586,10 @@ mod tests {
     #[tokio::test]
     async fn api_voice_session_preserves_endpoint_error_metadata() {
         let mut rt = runtime();
-        rt.config = serde_json::json!({
+        rt.config = Arc::new(serde_json::json!({
             "provider": "unsupported-voice-provider",
             "model": "unused",
-        });
+        }));
         let response = api_voice_session_response("voice1".to_string(), &rt).await;
         assert_eq!(response["t"], "response");
         assert_eq!(response["id"], "voice1");

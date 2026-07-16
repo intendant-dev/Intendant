@@ -48,6 +48,14 @@ use tokio::task::JoinHandle;
 /// limit.
 pub const LOG_CHANNEL_CAPACITY: usize = 2048;
 
+/// Rotate the log once it grows past this size; the previous file is
+/// kept as `<name>.1` (one generation), so the durable record is
+/// bounded at roughly twice this figure instead of growing for the
+/// daemon's lifetime. A long-lived daemon federated with busy peers
+/// otherwise accretes an unbounded `peers.jsonl` (this box has had a
+/// disk-pressure incident).
+pub const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Spawn the peer log writer task and return the input channel
 /// plus a join handle.
 ///
@@ -62,11 +70,33 @@ pub const LOG_CHANNEL_CAPACITY: usize = 2048;
 /// actors) causes the writer task to drain the channel and exit.
 pub fn spawn_peer_log_writer(log_path: PathBuf) -> (mpsc::Sender<TaggedPeerEvent>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel::<TaggedPeerEvent>(LOG_CHANNEL_CAPACITY);
-    let handle = tokio::spawn(run_writer(log_path, rx));
+    let handle = tokio::spawn(run_writer(log_path, rx, LOG_ROTATE_BYTES));
     (tx, handle)
 }
 
-async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>) {
+/// Open the log for append and report its current size (the rotation
+/// accumulator's starting point across daemon restarts).
+async fn open_log(log_path: &PathBuf) -> Option<(BufWriter<tokio::fs::File>, u64)> {
+    let file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "peer log writer: failed to open {}: {e}",
+                log_path.display()
+            );
+            return None;
+        }
+    };
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    Some((BufWriter::new(file), len))
+}
+
+async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>, rotate_bytes: u64) {
     // Ensure the parent directory exists before the append open.
     // Failing to create it is the same failure class as failing to
     // open the file, so we report and exit.
@@ -80,22 +110,9 @@ async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>) 
         }
     }
 
-    let file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "peer log writer: failed to open {}: {e}",
-                log_path.display()
-            );
-            return;
-        }
+    let Some((mut writer, mut written)) = open_log(&log_path).await else {
+        return;
     };
-    let mut writer = BufWriter::new(file);
 
     while let Some(event) = rx.recv().await {
         let line = match serde_json::to_string(&event) {
@@ -123,11 +140,45 @@ async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>) 
             eprintln!("peer log writer: flush failed, shutting down");
             return;
         }
+        written = written.saturating_add(line.len() as u64 + 1);
+
+        // Size-based rotation: shift the full file to `<name>.1`
+        // (replacing the previous generation) and start fresh. On any
+        // rotation error, keep appending to the current file — losing
+        // rotation is recoverable, losing events is not.
+        if written >= rotate_bytes {
+            drop(writer);
+            let rotated = rotated_path(&log_path);
+            // Windows rename refuses to replace an existing file;
+            // removing first keeps the behavior uniform.
+            let _ = tokio::fs::remove_file(&rotated).await;
+            if let Err(e) = tokio::fs::rename(&log_path, &rotated).await {
+                eprintln!(
+                    "peer log writer: rotate {} -> {} failed: {e}",
+                    log_path.display(),
+                    rotated.display()
+                );
+            }
+            match open_log(&log_path).await {
+                Some((reopened, len)) => {
+                    writer = reopened;
+                    written = len;
+                }
+                None => return,
+            }
+        }
     }
 
     // Channel closed: all peer actors + the registry have dropped
     // their senders. Final flush on shutdown.
     let _ = writer.flush().await;
+}
+
+/// `peers.jsonl` -> `peers.jsonl.1`.
+fn rotated_path(log_path: &std::path::Path) -> PathBuf {
+    let mut name = log_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".1");
+    log_path.with_file_name(name)
 }
 
 #[cfg(test)]
@@ -296,5 +347,54 @@ mod tests {
     #[test]
     fn channel_capacity_is_nonzero() {
         assert!(LOG_CHANNEL_CAPACITY > 0);
+    }
+
+    /// Crossing the size cap shifts the log to `<name>.1` and starts
+    /// fresh: the live file stays bounded, the previous generation is
+    /// retained, no event is lost across the boundary, and every
+    /// surviving line is intact JSONL.
+    #[tokio::test]
+    async fn rotates_log_at_size_cap() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("peers.jsonl");
+        let (tx, rx) = mpsc::channel::<TaggedPeerEvent>(LOG_CHANNEL_CAPACITY);
+        let rotate_bytes: u64 = 1024;
+        let handle = tokio::spawn(run_writer(log_path.clone(), rx, rotate_bytes));
+        for seq in 1..=40 {
+            tx.send(make_event(seq, PeerStatus::Idle)).await.unwrap();
+        }
+        drop(tx);
+        timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let rotated = rotated_path(&log_path);
+        assert!(rotated.exists(), "size cap must produce {rotated:?}");
+
+        // Only the newest two generations survive by design; the newest
+        // event must be present and every surviving line must parse.
+        let mut max_seq = 0;
+        for path in [&rotated, &log_path] {
+            let Ok(contents) = tokio::fs::read_to_string(path).await else {
+                continue;
+            };
+            for line in contents.lines() {
+                let parsed: TaggedPeerEvent = serde_json::from_str(line).unwrap();
+                max_seq = max_seq.max(parsed.seq);
+            }
+        }
+        assert_eq!(max_seq, 40, "the newest event survives rotation");
+
+        // The live file restarted below the cap (bounded by one line of
+        // overshoot at most).
+        let live_len = tokio::fs::metadata(&log_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            live_len <= rotate_bytes + 256,
+            "live log stays bounded, got {live_len} bytes"
+        );
     }
 }

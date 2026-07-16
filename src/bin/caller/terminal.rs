@@ -973,12 +973,15 @@ impl PtySession {
         mut reader: Box<dyn Read + Send>,
         mut child: Box<dyn portable_pty::Child + Send + Sync>,
     ) {
-        let mut buf = [0u8; 4096];
+        // 64 KiB reads: bulk shell output at 4 KiB paid 16× the syscalls,
+        // and the per-read Vec was pure overhead — `fan_out` copies into
+        // each listener's queue itself.
+        let mut buf = vec![0u8; 64 * 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = buf[..n].to_vec();
+                    let chunk = &buf[..n];
                     // Answer ConPTY's startup cursor-position query so the shell
                     // doesn't block waiting for it (Windows only; no-op on Unix
                     // where the slice is never present).
@@ -996,7 +999,7 @@ impl PtySession {
                     // output-hub lock, atomic against `attach`'s
                     // snapshot+register (see [`OutputHub`]).
                     let mut hub = session.output.lock().unwrap_or_else(|e| e.into_inner());
-                    hub.fan_out(&chunk);
+                    hub.fan_out(chunk);
                 }
                 Err(_) => break,
             }

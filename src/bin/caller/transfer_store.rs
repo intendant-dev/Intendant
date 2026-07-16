@@ -856,9 +856,35 @@ pub fn append_upload_tempfile(
         .as_file_mut()
         .seek(std::io::SeekFrom::Start(0))
         .map_err(|e| TransferStoreError::new(500, format!("seek upload chunk: {e}")))?;
-    let copied = std::io::copy(chunk.as_file_mut(), &mut output)
-        .map_err(|e| TransferStoreError::new(500, format!("append upload chunk: {e}")))?;
+    // On any incomplete append (I/O error or a chunk that didn't match its
+    // declared length), roll the partial back to the acknowledged offset
+    // BEFORE returning. Leaving the extra bytes in place wedged the job:
+    // the partial disagreed with `completed_bytes`, so every later append
+    // 409'd as a "foreign writer" until the active-job entry idled out
+    // (15 minutes). Truncating restores the exact resume-offset contract
+    // on the very next chunk. A failed truncate leaves the historical
+    // wedge (crash reconciliation still recovers it on re-admission).
+    let rollback = |output: &fs::File| {
+        if let Err(e) = output.set_len(job.completed_bytes) {
+            eprintln!(
+                "[transfer-store] failed to roll back upload partial {} to {} bytes: {e}",
+                temp_path.display(),
+                job.completed_bytes
+            );
+        }
+    };
+    let copied = match std::io::copy(chunk.as_file_mut(), &mut output) {
+        Ok(copied) => copied,
+        Err(e) => {
+            rollback(&output);
+            return Err(TransferStoreError::new(
+                500,
+                format!("append upload chunk: {e}"),
+            ));
+        }
+    };
     if copied != chunk_len {
+        rollback(&output);
         return Err(TransferStoreError::new(
             400,
             "upload chunk length did not match declared size",
@@ -1513,6 +1539,51 @@ mod tests {
         assert_eq!(disk_job(&project, &id).completed_bytes, 1);
         let resumed =
             append_upload_tempfile(&scope(&project), &id, 1, write_chunk(b"bcdef"), 5).unwrap();
+        assert_eq!(resumed.completed_bytes, 6);
+        assert_eq!(resumed.status, TransferStatus::Ready);
+    }
+
+    /// A chunk whose real length disagrees with its declared length rolls
+    /// the partial back to the acknowledged offset immediately: the very
+    /// next correctly-sized append succeeds instead of 409ing as a
+    /// "foreign writer" until the active-job entry idles out (15 minutes).
+    #[test]
+    fn chunk_length_mismatch_rolls_back_and_next_append_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let dest_dir = tmp.path().join("dest");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("out.bin");
+
+        let job = create_upload_job(
+            &scope(&project),
+            dest.to_str().unwrap(),
+            "out.bin",
+            "application/octet-stream",
+            Some(6),
+            None,
+            TransferConflictPolicy::Fail,
+        )
+        .unwrap();
+        let id = job.id.clone();
+        let temp_path = job.temp_path.clone().unwrap();
+
+        append_upload_tempfile(&scope(&project), &id, 0, write_chunk(b"abc"), 3).unwrap();
+
+        // Declared 3 bytes, delivered 5: rejected AND rolled back.
+        let err =
+            append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"defgh"), 3).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert_eq!(
+            fs::metadata(&temp_path).unwrap().len(),
+            3,
+            "the partial must be truncated back to the acknowledged offset"
+        );
+
+        // The retry at the same offset works right away.
+        let resumed =
+            append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"def"), 3).unwrap();
         assert_eq!(resumed.completed_bytes, 6);
         assert_eq!(resumed.status, TransferStatus::Ready);
     }

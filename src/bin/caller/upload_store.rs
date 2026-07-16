@@ -373,11 +373,100 @@ pub fn list_uploads(session_dir: &Path, scope: &StoreScope) -> Vec<UploadDescrip
 }
 
 /// Look up a single upload by id. `None` if no descriptor matches.
+///
+/// Blob and sidecar filenames embed the id (`{id[..8]}__{name}` plus the
+/// `.json` sidecar — see [`commit_upload`]), so the lookup scans directory
+/// entries for that prefix and parses only the matching sidecars, instead
+/// of reading and parsing every sidecar in the whole store per call (the
+/// full-scan cost grew with store age, and callers pay per attachment —
+/// a note with four images paid four full scans). The historical full
+/// scan remains as a fallback so any blob predating the prefix layout is
+/// still found.
 pub fn find_upload(id: &str, session_dir: &Path, scope: &StoreScope) -> Option<UploadDescriptor> {
+    if let Some(found) = find_upload_by_prefix(id, session_dir, scope) {
+        return Some(found);
+    }
     list_uploads(session_dir, scope)
         .into_iter()
         .find(|u| u.id == id)
         .or_else(|| find_task_upload_in_sibling_sessions(id, session_dir))
+}
+
+/// The `{id[..8]}__` filename prefix both the blob and its sidecar carry.
+/// `None` for ids whose 8-byte cut is not a char boundary (never our own
+/// UUIDs; caller-supplied ids fall back to the full scan).
+fn upload_filename_prefix(id: &str) -> Option<String> {
+    let prefix = id.get(..id.len().min(8))?;
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(format!("{prefix}__"))
+}
+
+/// Resolve an upload by filename prefix across the same directories
+/// [`list_uploads`] and the sibling-session sweep walk, parsing only
+/// sidecars whose name matches (`{prefix}__…json`) and whose descriptor
+/// confirms the full id.
+fn find_upload_by_prefix(
+    id: &str,
+    session_dir: &Path,
+    scope: &StoreScope,
+) -> Option<UploadDescriptor> {
+    let prefix = upload_filename_prefix(id)?;
+    let mut dirs = vec![legacy_task_uploads_dir(session_dir)];
+    if let Some(project_root) = scope.project_root() {
+        dirs.push(legacy_workspace_uploads_dir(project_root));
+    }
+    let root = uploads_root(scope);
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    for dir in dirs {
+        if let Some(found) = find_upload_by_prefix_in_dir(&dir, &prefix, id) {
+            return Some(found);
+        }
+    }
+    // The sibling task-session sweep, prefix-matched.
+    let sessions_root = session_dir.parent()?;
+    for entry in fs::read_dir(sessions_root).ok()?.flatten() {
+        let sibling_dir = entry.path();
+        if sibling_dir == session_dir || !sibling_dir.is_dir() {
+            continue;
+        }
+        if let Some(found) =
+            find_upload_by_prefix_in_dir(&legacy_task_uploads_dir(&sibling_dir), &prefix, id)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_upload_by_prefix_in_dir(dir: &Path, prefix: &str, id: &str) -> Option<UploadDescriptor> {
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(descriptor) = serde_json::from_str::<UploadDescriptor>(&content) else {
+            continue;
+        };
+        if descriptor.id == id {
+            return Some(descriptor);
+        }
+    }
+    None
 }
 
 fn find_task_upload_in_sibling_sessions(id: &str, session_dir: &Path) -> Option<UploadDescriptor> {
@@ -444,6 +533,65 @@ mod tests {
 
     fn project_scope(project_root: &Path) -> StoreScope {
         StoreScope::Project(project_root.to_path_buf())
+    }
+
+    /// The prefix fast path finds a committed upload, and a hand-written
+    /// sidecar whose filename predates the `{id[..8]}__` layout is still
+    /// resolved through the full-scan fallback.
+    #[test]
+    fn find_upload_resolves_by_prefix_and_falls_back_for_legacy_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_dir = tmp.path().join("session");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+        let scope = project_scope(&project_root);
+
+        let committed = commit_upload(
+            mk_tempfile(b"new"),
+            "a.txt",
+            "text/plain",
+            3,
+            UploadDestination::Task,
+            &session_dir,
+            "sess",
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            find_upload(&committed.id, &session_dir, &scope).map(|d| d.id),
+            Some(committed.id.clone()),
+            "prefix-named sidecar resolves"
+        );
+        // The fast path alone must already resolve it.
+        assert_eq!(
+            find_upload_by_prefix(&committed.id, &session_dir, &scope).map(|d| d.id),
+            Some(committed.id.clone())
+        );
+
+        // Legacy-named sidecar (no id prefix in the filename).
+        let legacy = UploadDescriptor {
+            id: "legacy-upload-id".to_string(),
+            name: "old.txt".to_string(),
+            original_name: Some("old.txt".to_string()),
+            mime: "text/plain".to_string(),
+            size: 3,
+            path: session_uploads_dir(&scope, "sess").join("old.txt"),
+            destination: UploadDestination::Task,
+            session_id: "sess".to_string(),
+            created_at: 1,
+        };
+        let sidecar = session_uploads_dir(&scope, "sess").join("oldstyle.json");
+        std::fs::write(&sidecar, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            find_upload("legacy-upload-id", &session_dir, &scope).map(|d| d.id),
+            Some("legacy-upload-id".to_string()),
+            "legacy-named sidecars still resolve via the fallback scan"
+        );
+        assert!(
+            find_upload_by_prefix("legacy-upload-id", &session_dir, &scope).is_none(),
+            "the fast path alone must not claim legacy-named sidecars"
+        );
     }
 
     #[test]

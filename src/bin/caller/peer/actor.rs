@@ -24,7 +24,8 @@
 
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
-    PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo, TaggedPeerEvent, TaskId,
+    MessageContent, MessageId, MessageRole, PeerDisplayInfo, PeerEvent, PeerStatus, SessionInfo,
+    TaggedPeerEvent, TaskId,
 };
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
@@ -42,6 +43,23 @@ use tokio::sync::{broadcast, mpsc, watch};
 /// exists so a chatty or hostile peer can't grow the map without limit.
 pub(crate) const MAX_TRACKED_TASK_RECEIPTS: usize = 64;
 
+/// In-flight streaming messages whose partial text is folded for the
+/// disconnect salvage record (see `PeerActor::pending_partials`). At the
+/// cap the OLDEST fold is silently evicted — salvage records exist for
+/// disconnect/abort only, so a healthy connection streaming a 9th
+/// concurrent message must never mint one (the evicted message merely
+/// loses crash-salvage coverage; its final is unaffected).
+pub(crate) const MAX_PENDING_PARTIAL_MESSAGES: usize = 8;
+
+/// Per-fold byte cap on LENGTH: the fold keeps the TAIL of the
+/// accumulated text (the most recent output is the valuable part of an
+/// interrupted reply), trimming down to half the cap so trims amortize.
+/// Buffer capacity is bounded at ~2× this figure (String doubling from
+/// at most cap, with an advisory shrink as the safety valve), so the
+/// whole fold structure holds ~[`MAX_PENDING_PARTIAL_MESSAGES`] × 512 KiB
+/// of heap per peer worst case.
+pub(crate) const MAX_PENDING_PARTIAL_TEXT_BYTES: usize = 256 * 1024;
+
 // ---------------------------------------------------------------------------
 // Backoff
 // ---------------------------------------------------------------------------
@@ -56,13 +74,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 struct Backoff {
     current: Duration,
     attempt: u32,
+    /// Per-actor jitter phase. Deriving jitter from the attempt counter
+    /// alone put every peer actor on an identical schedule — after a
+    /// network blip the whole fleet reconnected in lockstep (thundering
+    /// herd). Seeding by peer identity keeps jitter deterministic per
+    /// actor (tests stay reproducible) while decorrelating actors.
+    seed: u32,
 }
 
 impl Backoff {
-    fn new() -> Self {
+    fn new(seed: u32) -> Self {
         Self {
             current: INITIAL_BACKOFF,
             attempt: 0,
+            seed,
         }
     }
 
@@ -72,18 +97,39 @@ impl Backoff {
     }
 
     /// Return the next delay and advance internal state. Jitter is
-    /// deterministic (derived from the attempt counter) so tests are
-    /// reproducible; a real rng can be swapped in later without
-    /// changing the shape.
+    /// deterministic (derived from the attempt counter and the actor's
+    /// seed) so tests are reproducible; a real rng can be swapped in
+    /// later without changing the shape.
     fn next_delay(&mut self) -> Duration {
         let base_ms = self.current.as_millis() as i64;
-        // ±20% jitter, stepping through 40 positions based on attempt.
-        let jitter_bps = (self.attempt as i64 * 137) % 40 - 20;
+        // ±20% jitter, stepping through 40 positions based on attempt,
+        // phase-shifted per actor.
+        let jitter_bps = ((self.attempt as i64 * 137) + self.seed as i64) % 40 - 20;
         let jittered_ms = (base_ms * (100 + jitter_bps) / 100).max(0) as u64;
         self.current = (self.current * 2).min(MAX_BACKOFF);
         self.attempt = self.attempt.saturating_add(1);
         Duration::from_millis(jittered_ms)
     }
+}
+
+/// One in-flight streaming message's accumulated partial text (see
+/// `PeerActor::pending_partials`).
+pub(crate) struct PendingPartialMessage {
+    role: MessageRole,
+    /// Whether the first chunk was a `Reasoning` part — the salvage
+    /// record keeps the kind the stream started with.
+    reasoning: bool,
+    text: String,
+}
+
+/// Stable per-actor jitter seed from the peer id (FNV-1a over the bytes).
+fn backoff_seed(peer_id: &PeerId) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in peer_id.0.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +178,18 @@ pub(crate) struct PeerActor {
     pub receipts: HashMap<String, TaskId>,
     /// Insertion order for `receipts` eviction.
     pub receipt_order: VecDeque<String>,
+    /// Accumulated text of in-flight streaming messages (partials are
+    /// elided from the durable log; the fold preserves an interrupted
+    /// reply). A final for the same id clears its fold; on disconnect
+    /// every remaining fold lands in the log as ONE coalesced record
+    /// still marked `partial: true` — in the durable log that marker
+    /// appears ONLY on these interruption salvage records. Bounded by
+    /// [`MAX_PENDING_PARTIAL_MESSAGES`] (oldest evicted, never salvaged)
+    /// and [`MAX_PENDING_PARTIAL_TEXT_BYTES`] per fold (tail kept).
+    pub pending_partials: HashMap<MessageId, PendingPartialMessage>,
+    /// Insertion order for `pending_partials` eviction and deterministic
+    /// flush order (the `receipt_order` pattern).
+    pub pending_partial_order: VecDeque<MessageId>,
     pub seq: u64,
     /// Operator's via-URL override, preserved across card refreshes.
     ///
@@ -175,7 +233,7 @@ impl PeerActor {
 
 impl PeerActor {
     pub async fn run(mut self) {
-        let mut backoff = Backoff::new();
+        let mut backoff = Backoff::new(backoff_seed(&self.peer_id));
 
         loop {
             // ---- Attempt connect ----
@@ -421,6 +479,22 @@ impl PeerActor {
                 }
                 let _ = self.receipts_tx.send(Arc::new(self.receipts.clone()));
             }
+            PeerEvent::Message {
+                id,
+                role,
+                content,
+                partial,
+            } => {
+                if *partial {
+                    self.fold_pending_partial(id, *role, content);
+                } else {
+                    // The final carries the complete text; the fold is
+                    // no longer needed for salvage.
+                    if self.pending_partials.remove(id).is_some() {
+                        self.pending_partial_order.retain(|held| held != id);
+                    }
+                }
+            }
             PeerEvent::Disconnected { .. } => {
                 if !self.sessions.is_empty() {
                     self.sessions.clear();
@@ -430,10 +504,124 @@ impl PeerActor {
                     self.displays.clear();
                     self.publish_displays();
                 }
+                // Interrupted replies: land each accumulated fold as one
+                // coalesced durable record before the Disconnected event
+                // itself is logged.
+                self.flush_pending_partials_to_log().await;
             }
             _ => {}
         }
         self.emit_event(event).await;
+    }
+
+    /// Fold one streaming chunk into the per-message salvage accumulator.
+    /// Non-text chunks (images, parts, unknown) don't fold — they don't
+    /// stream as deltas.
+    ///
+    /// Bounds: at [`MAX_PENDING_PARTIAL_MESSAGES`] concurrent folds the
+    /// OLDEST is evicted WITHOUT a salvage record (salvage is for
+    /// disconnect/abort only — a healthy 9th stream must not mint one;
+    /// the evicted message loses crash-salvage coverage, its final is
+    /// unaffected). Each fold keeps at most
+    /// [`MAX_PENDING_PARTIAL_TEXT_BYTES`] — the TAIL, because the most
+    /// recent text is the valuable part of an interrupted reply.
+    fn fold_pending_partial(
+        &mut self,
+        id: &MessageId,
+        role: MessageRole,
+        content: &MessageContent,
+    ) {
+        let (delta, reasoning) = match content {
+            MessageContent::Text { text } => (text.as_str(), false),
+            MessageContent::Reasoning { text } => (text.as_str(), true),
+            _ => return,
+        };
+        if !self.pending_partials.contains_key(id) {
+            while self.pending_partials.len() >= MAX_PENDING_PARTIAL_MESSAGES {
+                match self.pending_partial_order.pop_front() {
+                    Some(oldest) => {
+                        self.pending_partials.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            self.pending_partial_order.push_back(id.clone());
+        }
+        let entry =
+            self.pending_partials
+                .entry(id.clone())
+                .or_insert_with(|| PendingPartialMessage {
+                    role,
+                    reasoning,
+                    text: String::new(),
+                });
+        // Trim BEFORE appending so the length never overshoots the cap,
+        // and trim down to HALF the cap so the front-shift amortizes to
+        // one move per ~128 KiB of streamed text instead of one per
+        // delta at the boundary.
+        if entry.text.len().saturating_add(delta.len()) > MAX_PENDING_PARTIAL_TEXT_BYTES {
+            if delta.len() >= MAX_PENDING_PARTIAL_TEXT_BYTES {
+                // The delta alone exceeds the cap: keep only its tail.
+                entry.text.clear();
+                let tail_start = delta.len() - MAX_PENDING_PARTIAL_TEXT_BYTES;
+                let cut = (tail_start..=delta.len())
+                    .find(|index| delta.is_char_boundary(*index))
+                    .unwrap_or(delta.len());
+                entry.text.push_str(&delta[cut..]);
+            } else {
+                let keep = (MAX_PENDING_PARTIAL_TEXT_BYTES / 2).saturating_sub(delta.len());
+                let excess = entry.text.len().saturating_sub(keep);
+                let cut = (excess..=entry.text.len())
+                    .find(|index| entry.text.is_char_boundary(*index))
+                    .unwrap_or(entry.text.len());
+                entry.text.drain(..cut);
+                entry.text.push_str(delta);
+            }
+        } else {
+            entry.text.push_str(delta);
+        }
+        // The length invariant (≤ cap) bounds the buffer's growth at
+        // ~2× cap (String doubling from at most cap). `shrink_to` is
+        // advisory, so it stays a rare safety valve rather than a
+        // per-delta call — the earlier per-delta drain+shrink thrashed
+        // ~256 KiB of moves on every chunk at the boundary.
+        if entry.text.capacity() > 2 * MAX_PENDING_PARTIAL_TEXT_BYTES {
+            entry.text.shrink_to(MAX_PENDING_PARTIAL_TEXT_BYTES);
+        }
+    }
+
+    /// Write every accumulated fold to the DURABLE log as one coalesced
+    /// `partial: true` record (the live broadcast already carried the
+    /// deltas). Preserves the pre-elision durability property — an
+    /// interrupted reply's text survives — at one record instead of N.
+    async fn flush_pending_partials_to_log(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending_partials);
+        let order = std::mem::take(&mut self.pending_partial_order);
+        let ordered = order
+            .into_iter()
+            .filter_map(|id| pending.remove(&id).map(|fold| (id, fold)));
+        for (id, fold) in ordered {
+            if fold.text.is_empty() {
+                continue;
+            }
+            let content = if fold.reasoning {
+                MessageContent::Reasoning { text: fold.text }
+            } else {
+                MessageContent::Text { text: fold.text }
+            };
+            self.seq = self.seq.saturating_add(1);
+            let tagged = TaggedPeerEvent {
+                peer: self.peer_id.clone(),
+                payload: PeerEvent::Message {
+                    id,
+                    role: fold.role,
+                    content,
+                    partial: true,
+                },
+                seq: self.seq,
+            };
+            let _ = self.log_sink.send(tagged).await;
+        }
     }
 
     /// Publish the current sessions fold, newest first (matching how
@@ -458,16 +646,29 @@ impl PeerActor {
 
     /// Durable-first fan-out: await on the log sink (must not drop),
     /// then broadcast (lossy, slow subscribers skip).
+    ///
+    /// Streaming `Message { partial: true }` deltas stay off the durable
+    /// log: the final message carries the complete text, so logging every
+    /// delta stored the streamed output twice and made `peers.jsonl` grow
+    /// at model-streaming rate (≤25 Hz per busy peer session) instead of
+    /// the "few hundred events per minute" its writer was sized for. Live
+    /// consumers still get every partial via the broadcast. Elided
+    /// partials still advance `seq`, so a gap in the log's sequence marks
+    /// exactly where deltas were skipped. An INTERRUPTED reply is not
+    /// lost: `pending_partials` folds the deltas and lands one coalesced
+    /// `partial: true` record at disconnect.
     async fn emit_event(&mut self, event: PeerEvent) {
         self.seq = self.seq.saturating_add(1);
-        let tagged = TaggedPeerEvent {
-            peer: self.peer_id.clone(),
-            payload: event.clone(),
-            seq: self.seq,
-        };
-        // Durable sink: await. If closed, the log writer is gone
-        // (process shutdown) and we drop silently.
-        let _ = self.log_sink.send(tagged).await;
+        if !matches!(&event, PeerEvent::Message { partial: true, .. }) {
+            let tagged = TaggedPeerEvent {
+                peer: self.peer_id.clone(),
+                payload: event.clone(),
+                seq: self.seq,
+            };
+            // Durable sink: await. If closed, the log writer is gone
+            // (process shutdown) and we drop silently.
+            let _ = self.log_sink.send(tagged).await;
+        }
         // Broadcast: non-blocking. Err means no subscribers — that's
         // fine, we still wrote to the durable sink.
         let _ = self.events_out_tx.send(event);
@@ -485,7 +686,7 @@ mod tests {
 
     #[test]
     fn backoff_resets() {
-        let mut b = Backoff::new();
+        let mut b = Backoff::new(0);
         let _ = b.next_delay();
         let _ = b.next_delay();
         let _ = b.next_delay();
@@ -498,7 +699,7 @@ mod tests {
 
     #[test]
     fn backoff_caps_at_max() {
-        let mut b = Backoff::new();
+        let mut b = Backoff::new(7);
         // Burn a generous number of attempts to ensure we saturate.
         for _ in 0..20 {
             let _ = b.next_delay();
@@ -512,14 +713,337 @@ mod tests {
 
     #[test]
     fn backoff_initial_delay_is_jittered_but_bounded() {
-        let mut b = Backoff::new();
-        let d = b.next_delay();
-        // First delay should be within ±20% of INITIAL_BACKOFF.
-        let min = INITIAL_BACKOFF * 80 / 100;
-        let max = INITIAL_BACKOFF * 120 / 100;
+        for seed in [0, 1, 19, u32::MAX] {
+            let mut b = Backoff::new(seed);
+            let d = b.next_delay();
+            // First delay should be within ±20% of INITIAL_BACKOFF.
+            let min = INITIAL_BACKOFF * 80 / 100;
+            let max = INITIAL_BACKOFF * 120 / 100;
+            assert!(
+                d >= min && d <= max,
+                "seed {seed}: got {d:?}, expected between {min:?} and {max:?}"
+            );
+        }
+    }
+
+    struct StubTransport(crate::peer::card::TransportSpec);
+
+    #[async_trait::async_trait]
+    impl PeerTransport for StubTransport {
+        fn spec(&self) -> &crate::peer::card::TransportSpec {
+            &self.0
+        }
+        fn features(&self) -> crate::peer::traits::TransportFeatures {
+            crate::peer::traits::TransportFeatures::default()
+        }
+        async fn connect(&mut self) -> Result<AgentCard, PeerError> {
+            Err(PeerError::NotConnected)
+        }
+        async fn disconnect(&mut self) -> Result<(), PeerError> {
+            Ok(())
+        }
+        fn is_connected(&self) -> bool {
+            false
+        }
+        async fn send(
+            &mut self,
+            _op: crate::peer::traits::PeerOp,
+        ) -> Result<crate::peer::traits::PeerOpAck, PeerError> {
+            Err(PeerError::NotConnected)
+        }
+    }
+
+    /// Actor with a stub transport and an observable durable-log channel;
+    /// all other channels are held open by the returned guards.
+    #[allow(clippy::type_complexity)]
+    fn test_actor(
+        log_tx: mpsc::Sender<TaggedPeerEvent>,
+    ) -> (
+        PeerActor,
+        (
+            mpsc::Sender<PeerCommand>,
+            mpsc::Sender<PeerEvent>,
+            broadcast::Receiver<PeerEvent>,
+        ),
+    ) {
+        let peer_id = PeerId::new(crate::peer::id::PeerKind::Intendant, "fold-test");
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let (events_in_tx, events_in_rx) = mpsc::channel(4);
+        let (events_out_tx, events_out_rx) = broadcast::channel(16);
+        let (connection_tx, _connection_rx) = watch::channel(ConnectionState::Initializing);
+        let (status_tx, _status_rx) = watch::channel(PeerStatus::Idle);
+        let card = AgentCard {
+            id: peer_id.clone(),
+            label: "fold-test".to_string(),
+            version: "test".into(),
+            git_sha: None,
+            transports: Vec::new(),
+            capabilities: Vec::new(),
+            auth: crate::peer::card::AuthRequirements::none(),
+        };
+        let (card_tx, _card_rx) = watch::channel(Arc::new(card));
+        let (sessions_tx, _sessions_rx) = watch::channel(Arc::new(Vec::new()));
+        let (displays_tx, _displays_rx) = watch::channel(Arc::new(Vec::new()));
+        let (receipts_tx, _receipts_rx) = watch::channel(Arc::new(HashMap::new()));
+        let actor = PeerActor {
+            peer_id,
+            transport: Box::new(StubTransport(
+                crate::peer::card::TransportSpec::IntendantWs {
+                    url: "ws://127.0.0.1:1/ws".into(),
+                },
+            )),
+            commands_rx,
+            events_in_rx,
+            events_out_tx,
+            log_sink: log_tx,
+            connection_tx,
+            status_tx,
+            card_tx,
+            sessions_tx,
+            sessions: BTreeMap::new(),
+            displays_tx,
+            displays: BTreeMap::new(),
+            receipts_tx,
+            receipts: HashMap::new(),
+            receipt_order: VecDeque::new(),
+            pending_partials: HashMap::new(),
+            pending_partial_order: VecDeque::new(),
+            seq: 0,
+            via_urls: Vec::new(),
+            label_override: None,
+        };
+        (actor, (commands_tx, events_in_tx, events_out_rx))
+    }
+
+    fn partial_text(id: &str, delta: &str) -> PeerEvent {
+        PeerEvent::Message {
+            id: MessageId(id.to_string()),
+            role: MessageRole::Assistant,
+            content: MessageContent::Text {
+                text: delta.to_string(),
+            },
+            partial: true,
+        }
+    }
+
+    /// An interrupted streaming reply lands as ONE coalesced durable
+    /// record (still `partial: true` — in the log that marker exists only
+    /// on interruption salvage) ahead of the Disconnected record, while
+    /// the deltas themselves stay off the durable log.
+    #[tokio::test]
+    async fn interrupted_streaming_reply_lands_one_coalesced_log_record() {
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        for delta in ["Hel", "lo ", "world"] {
+            actor.handle_event(partial_text("m-1", delta)).await;
+        }
         assert!(
-            d >= min && d <= max,
-            "got {d:?}, expected between {min:?} and {max:?}"
+            log_rx.try_recv().is_err(),
+            "streaming deltas must stay off the durable log"
+        );
+
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+        let salvage = log_rx.try_recv().expect("coalesced salvage record");
+        match salvage.payload {
+            PeerEvent::Message {
+                content: MessageContent::Text { text },
+                partial: true,
+                ..
+            } => assert_eq!(text, "Hello world"),
+            other => panic!("expected the coalesced partial, got {other:?}"),
+        }
+        let disconnected = log_rx.try_recv().expect("disconnected record");
+        assert!(matches!(
+            disconnected.payload,
+            PeerEvent::Disconnected { .. }
+        ));
+        assert!(log_rx.try_recv().is_err());
+    }
+
+    /// Cap pressure on a HEALTHY connection evicts the oldest fold
+    /// silently: no salvage record is minted outside disconnect, an
+    /// evicted message that later finalizes logs only its final, and the
+    /// survivors salvage in order at disconnect.
+    #[tokio::test]
+    async fn fold_cap_evicts_oldest_without_false_salvage() {
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        for index in 0..=MAX_PENDING_PARTIAL_MESSAGES {
+            actor
+                .handle_event(partial_text(
+                    &format!("m-{index}"),
+                    &format!("text-{index}"),
+                ))
+                .await;
+        }
+        assert!(
+            log_rx.try_recv().is_err(),
+            "cap pressure must not mint salvage records on a healthy connection"
+        );
+        assert!(
+            !actor
+                .pending_partials
+                .contains_key(&MessageId("m-0".into())),
+            "the oldest fold is evicted"
+        );
+        assert_eq!(actor.pending_partials.len(), MAX_PENDING_PARTIAL_MESSAGES);
+
+        // The evicted message finalizing later logs ONLY its final.
+        actor
+            .handle_event(PeerEvent::Message {
+                id: MessageId("m-0".to_string()),
+                role: MessageRole::Assistant,
+                content: MessageContent::Text {
+                    text: "text-0 complete".to_string(),
+                },
+                partial: false,
+            })
+            .await;
+        let final_record = log_rx.try_recv().expect("final record");
+        assert!(matches!(
+            final_record.payload,
+            PeerEvent::Message { partial: false, .. }
+        ));
+
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+        let mut salvaged = Vec::new();
+        while let Ok(record) = log_rx.try_recv() {
+            match record.payload {
+                PeerEvent::Message {
+                    id, partial: true, ..
+                } => salvaged.push(id.0),
+                PeerEvent::Disconnected { .. } => break,
+                other => panic!("unexpected record: {other:?}"),
+            }
+        }
+        let expected: Vec<String> = (1..=MAX_PENDING_PARTIAL_MESSAGES)
+            .map(|index| format!("m-{index}"))
+            .collect();
+        assert_eq!(salvaged, expected, "survivors salvage in fold order");
+    }
+
+    /// The per-fold byte cap keeps the TAIL of the accumulated text, the
+    /// length never overshoots the cap (trim runs BEFORE append), and
+    /// buffer capacity stays within the documented ~2x cap across a long
+    /// stream of small deltas (the advisory-shrink slack).
+    #[tokio::test]
+    async fn fold_byte_cap_keeps_the_tail_and_bounds_capacity() {
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        // A long stream of small deltas pushes well past the cap many
+        // times over; check the invariants as the stream runs.
+        let delta = "x".repeat(4 * 1024);
+        for _ in 0..192 {
+            actor.handle_event(partial_text("m-big", &delta)).await;
+            let fold = &actor.pending_partials[&MessageId("m-big".into())];
+            assert!(
+                fold.text.len() <= MAX_PENDING_PARTIAL_TEXT_BYTES,
+                "length must never overshoot the cap"
+            );
+            assert!(
+                fold.text.capacity() <= 2 * MAX_PENDING_PARTIAL_TEXT_BYTES,
+                "capacity must stay within the documented 2x-cap slack, got {}",
+                fold.text.capacity()
+            );
+        }
+        actor
+            .handle_event(partial_text("m-big", "THE-TAIL-MARKER"))
+            .await;
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+        let salvage = log_rx.try_recv().expect("salvage record");
+        match salvage.payload {
+            PeerEvent::Message {
+                content: MessageContent::Text { text },
+                partial: true,
+                ..
+            } => {
+                assert!(text.len() <= MAX_PENDING_PARTIAL_TEXT_BYTES);
+                assert!(
+                    text.ends_with("THE-TAIL-MARKER"),
+                    "the most recent text survives the cap"
+                );
+            }
+            other => panic!("expected the coalesced partial, got {other:?}"),
+        }
+
+        // An oversized single delta keeps only its own tail, still capped.
+        let (log_tx, _log_rx2) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        let huge = format!(
+            "{}HUGE-TAIL",
+            "y".repeat(MAX_PENDING_PARTIAL_TEXT_BYTES + 4096)
+        );
+        actor.handle_event(partial_text("m-huge", &huge)).await;
+        let fold = &actor.pending_partials[&MessageId("m-huge".into())];
+        assert!(fold.text.len() <= MAX_PENDING_PARTIAL_TEXT_BYTES);
+        assert!(fold.text.ends_with("HUGE-TAIL"));
+    }
+
+    /// A final message clears its fold: nothing is salvaged at disconnect
+    /// for a reply whose complete text was already logged.
+    #[tokio::test]
+    async fn finalized_reply_leaves_no_salvage_record() {
+        let (log_tx, mut log_rx) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        actor.handle_event(partial_text("m-2", "chunk")).await;
+        actor
+            .handle_event(PeerEvent::Message {
+                id: MessageId("m-2".to_string()),
+                role: MessageRole::Assistant,
+                content: MessageContent::Text {
+                    text: "chunk plus the rest".to_string(),
+                },
+                partial: false,
+            })
+            .await;
+        actor
+            .handle_event(PeerEvent::Disconnected {
+                reason: "test".into(),
+            })
+            .await;
+
+        let final_record = log_rx.try_recv().expect("final message record");
+        assert!(matches!(
+            final_record.payload,
+            PeerEvent::Message { partial: false, .. }
+        ));
+        let disconnected = log_rx.try_recv().expect("disconnected record");
+        assert!(matches!(
+            disconnected.payload,
+            PeerEvent::Disconnected { .. }
+        ));
+        assert!(
+            log_rx.try_recv().is_err(),
+            "no salvage for a finalized reply"
+        );
+    }
+
+    /// Distinct peers must not share a reconnect phase (the thundering
+    /// herd this seed exists to break): different ids yield different
+    /// first-attempt delays for at least some pair.
+    #[test]
+    fn backoff_seed_decorrelates_actors() {
+        let delays: std::collections::HashSet<Duration> = (0..8)
+            .map(|i| {
+                let id = PeerId::new(crate::peer::id::PeerKind::Intendant, &format!("peer-{i}"));
+                Backoff::new(backoff_seed(&id)).next_delay()
+            })
+            .collect();
+        assert!(
+            delays.len() > 1,
+            "eight distinct peer ids produced one shared delay schedule"
         );
     }
 }
