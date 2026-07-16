@@ -1805,29 +1805,37 @@ pub(crate) fn fleet_access_origin_allowed(
 
 /// Whether `origin` is a loopback-host page origin: an `http`/`https`
 /// page served from `localhost`, `127.0.0.0/8`, or `[::1]` on any port.
-/// Only canonical `scheme://host[:port]` serializations qualify — the
-/// same bar the direct-loopback authority parser sets for Host values:
-/// userinfo, a path, a query, or a fragment disqualifies the value even
-/// when its host is loopback (browsers never serialize `Origin` with
-/// any of those). `null`, custom schemes, and anything unparseable are
-/// refused (fail closed). A page can only carry a loopback origin if
-/// something on the browser's own machine served it — remote DNS names
-/// never produce one.
+/// The trimmed value must BE its own canonical ASCII origin
+/// serialization (`scheme://host[:port]`, lowercased, default port
+/// elided) — exactly the form browsers emit in `Origin`. Every
+/// normalization-equivalent spelling is refused (fail closed):
+/// userinfo (even the empty `@`), paths (dot-segments included),
+/// queries, fragments, uppercase spellings, explicit default ports,
+/// non-canonical IP forms, `null`, custom schemes, and anything
+/// unparseable. A page can only carry a loopback origin if something
+/// on the browser's own machine served it — remote DNS names never
+/// produce one.
 pub(crate) fn origin_is_loopback_host(origin: &str) -> bool {
-    let Ok(url) = url::Url::parse(origin.trim()) else {
+    let origin = origin.trim();
+    let Ok(url) = url::Url::parse(origin) else {
         return false;
     };
+    // The scheme allowlist stays ahead of the round-trip: other special
+    // schemes (ws, ftp) would otherwise round-trip their own canonical
+    // origins.
     if !matches!(url.scheme(), "http" | "https") {
         return false;
     }
-    // An http(s) URL with no path component parses to "/"; anything
-    // else means the value carried more than an origin.
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
+    // Round-trip canonicalization. URL parsing normalizes before any
+    // component can be inspected (lowercasing, dot-segment resolution,
+    // host decoding, default-port elision), so component checks on the
+    // PARSED value would launder non-canonical raw forms like
+    // `http://@localhost:3000` or `http://localhost:3000/.`. Requiring
+    // the raw value to equal its own serialized origin refuses every
+    // such spelling — and subsumes the userinfo/path/query/fragment
+    // checks this replaces (any of those makes the serialization
+    // differ).
+    if origin != url.origin().ascii_serialization() {
         return false;
     }
     match url.host() {
@@ -3311,12 +3319,15 @@ mod tests {
 
     #[test]
     fn loopback_origin_predicate_is_strict() {
-        // Loopback page origins, any port and either scheme.
+        // Loopback page origins in their canonical serialization — the
+        // exact forms browsers emit — any port, either scheme, with and
+        // without an explicit (non-default) port.
         assert!(origin_is_loopback_host("http://127.0.0.1:9321"));
-        assert!(origin_is_loopback_host("http://127.5.0.1:80"));
+        assert!(origin_is_loopback_host("http://127.5.0.1:8080"));
         assert!(origin_is_loopback_host("https://localhost:8766"));
-        assert!(origin_is_loopback_host("http://LOCALHOST"));
+        assert!(origin_is_loopback_host("http://localhost"));
         assert!(origin_is_loopback_host("http://[::1]:8765"));
+        assert!(origin_is_loopback_host("https://[::1]:8443"));
         // Everything else fails closed: foreign hosts, localhost
         // subdomains, non-page schemes, null, and garbage.
         assert!(!origin_is_loopback_host("https://evil.example"));
@@ -3327,20 +3338,28 @@ mod tests {
         assert!(!origin_is_loopback_host("null"));
         assert!(!origin_is_loopback_host(""));
         assert!(!origin_is_loopback_host("http://192.0.2.1:8080"));
-        // Non-canonical serializations fail closed too — a real Origin
-        // is exactly scheme://host[:port]; userinfo, a path, a query,
-        // or a fragment means the value is not a browser origin (the
-        // same bar the direct-loopback authority parser sets).
+        // Values carrying more than an origin fail closed — userinfo,
+        // paths, queries, fragments.
         assert!(!origin_is_loopback_host("http://user@localhost:3000"));
         assert!(!origin_is_loopback_host("http://user:pw@127.0.0.1:3000"));
         assert!(!origin_is_loopback_host("http://localhost:3000/path"));
         assert!(!origin_is_loopback_host("http://127.0.0.1:3000?q=1"));
         assert!(!origin_is_loopback_host("http://[::1]:3000#frag"));
         assert!(!origin_is_loopback_host("http://user@localhost/path?x=1#y"));
-        // The bare-slash form is indistinguishable from the canonical
-        // origin after parsing (http URLs normalize the empty path to
-        // "/") and stays admitted.
-        assert!(origin_is_loopback_host("http://localhost:3000/"));
+        // Normalization-equivalent spellings fail closed too: URL
+        // parsing would launder these into canonical forms, so the
+        // predicate requires the raw value to BE the canonical
+        // serialization. Browsers serialize Origin lowercased,
+        // slash-free, and with default ports elided — refusing these
+        // matches browser reality exactly.
+        assert!(!origin_is_loopback_host("http://@localhost:3000"));
+        assert!(!origin_is_loopback_host("http://localhost:3000/"));
+        assert!(!origin_is_loopback_host("http://localhost:3000/."));
+        assert!(!origin_is_loopback_host("http://localhost:3000/%2e"));
+        assert!(!origin_is_loopback_host("http://127.1:3000"));
+        assert!(!origin_is_loopback_host("http://LOCALHOST"));
+        assert!(!origin_is_loopback_host("http://localhost:80"));
+        assert!(!origin_is_loopback_host("http://127.5.0.1:80"));
     }
 
     #[test]
