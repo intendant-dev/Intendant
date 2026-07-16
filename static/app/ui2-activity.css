@@ -716,6 +716,34 @@ html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
 /* live groups are collapsible now too (v1 only ever hid finalized
    bodies): a collapsed streaming group keeps receiving text off-screen */
 html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
+/* the streaming tail: last few output lines under a collapsed live group —
+   proof of life while it streams. Gone once expanded (the body takes over)
+   or finalized (the summary row is the record). JS keeps it to ~3 trimmed
+   lines; the max-height is a belt against odd content. */
+html.ui-v2 .command-output-group .command-output-tail {
+  display: block;
+  margin-top: 4px;
+  padding-left: 13px;
+  border-left: 2px solid color-mix(in srgb, var(--iris) 32%, transparent);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+  white-space: pre;
+  overflow: hidden;
+  max-height: 4.5em;
+}
+html.ui-v2 .command-output-group .command-output-tail:empty { display: none; }
+html.ui-v2 .command-output-group.expanded .command-output-tail,
+html.ui-v2 .command-output-group.finalized .command-output-tail { display: none; }
+/* verbose-opened truncated rows show their local preview plus this hint */
+html.ui-v2 .command-output-group .command-output-truncation-note {
+  display: block;
+  padding: 4px 12px 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
 html.ui-v2 .command-output-group .command-output-pre {
   margin: 0;
   padding: 8px 12px;
