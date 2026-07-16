@@ -1326,6 +1326,90 @@ impl FileIdentity {
     }
 }
 
+/// A file's platform change signal plus its [`FileIdentity`], for
+/// fingerprint caches that must catch mtime-preserving rewrites (size and
+/// mtime alone are spoofable via `touch -r` / `SetFileTime`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileChangeStamp {
+    /// Platform change signal:
+    ///
+    /// - **Unix**: inode ctime in nanoseconds since the epoch — bumped by
+    ///   every content or metadata write and not settable by
+    ///   mtime-preserving tools.
+    /// - **Windows**: `FILE_BASIC_INFO.ChangeTime` (100ns intervals since
+    ///   1601) — NTFS bumps it on every write, and unlike the three
+    ///   timestamps `SetFileTime` covers, it cannot be set through that API.
+    pub change_signal: i128,
+    /// Real file identity (volume + file index / inode), so a
+    /// replace-by-rename never aliases the file it replaced.
+    pub identity: FileIdentity,
+}
+
+/// Best-available change stamp for the file at `path`.
+///
+/// Unix reads both fields from `metadata` (no extra I/O). Windows needs an
+/// open handle (`GetFileInformationByHandleEx`), so the query can fail —
+/// locked file, permissions, or a filesystem without ChangeTime — and on
+/// platforms that are neither Unix nor Windows there is no signal at all.
+/// `None` means **no signal**: fingerprint caches must treat it as
+/// untrusted (re-read), never as "unchanged".
+pub fn file_change_stamp(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> Option<FileChangeStamp> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Some(FileChangeStamp {
+            change_signal: (metadata.ctime() as i128) * 1_000_000_000
+                + metadata.ctime_nsec() as i128,
+            identity: FileIdentity {
+                volume: metadata.dev(),
+                file_index: metadata.ino(),
+            },
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        };
+
+        let _ = metadata;
+        let file = std::fs::File::open(path).ok()?;
+        // SAFETY: FILE_BASIC_INFO is a plain Win32 POD struct (five i64/u32
+        // fields), for which the all-zero bit pattern is a valid value.
+        let mut info: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: `file` keeps its handle open and valid for the duration of
+        // the call; `info` is a live writable out-pointer of exactly
+        // `dwbuffersize` bytes, the size the API contract fills for the
+        // `FileBasicInfo` information class.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut info as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let identity = FileIdentity::from_file(&file).ok()?;
+        Some(FileChangeStamp {
+            change_signal: i128::from(info.ChangeTime),
+            identity,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, metadata);
+        None
+    }
+}
+
 // The state-path seam (home_dir, intendant_home, intendant_home_in) lives
 // in intendant-core::state_paths so content modules there can use it too;
 // re-exported here where every existing platform:: caller expects it.
@@ -1779,6 +1863,36 @@ mod tests {
         assert_ne!(
             FileIdentity::from_path(&a).unwrap(),
             FileIdentity::from_path(&b).unwrap()
+        );
+    }
+
+    /// The change stamp exists on Unix and Windows, moves on every content
+    /// write (even when the write leaves size and mtime untouched), and
+    /// keeps the file's identity stable across in-place rewrites.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn file_change_stamp_moves_on_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stamped.txt");
+        std::fs::write(&path, b"one!").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let first = file_change_stamp(&path, &meta).expect("stamp available");
+
+        // Cross the platform's change-time tick (Windows ~15.6ms; Unix
+        // filesystems are ns-to-1s — CI runs ns-resolution ext4/APFS/NTFS,
+        // and the sleep keeps even coarse ticks distinct in spirit).
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        std::fs::write(&path, b"two!").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let second = file_change_stamp(&path, &meta).expect("stamp available");
+
+        assert_ne!(
+            first.change_signal, second.change_signal,
+            "a content rewrite must move the change signal"
+        );
+        assert_eq!(
+            first.identity, second.identity,
+            "an in-place rewrite must keep the file identity"
         );
     }
 

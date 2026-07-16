@@ -109,6 +109,36 @@ pub struct HistoryRound {
     /// `None` on index round stubs and on legacy data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_epoch: Option<String>,
+    /// Marker that this round's maps live inline in THIS record — set on an
+    /// index row when its manifest write failed and the maps were retained.
+    /// Load-bearing for empty trees: an empty inline map serializes to
+    /// nothing, so without the marker a retained empty-tree round would
+    /// reload as an ordinary slim stub and its restore-to-empty state would
+    /// be unreachable. `false` everywhere else (stubs, manifests, legacy).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub maps_inline: bool,
+}
+
+/// Whether an index row is currently the authoritative carrier of its own
+/// maps (retained after a failed migration, or a legacy row not yet
+/// migrated) — as opposed to a slim stub whose maps live in a manifest.
+fn round_has_inline_maps(round: &HistoryRound) -> bool {
+    round.maps_inline || !round.files_at_end.is_empty() || !round.all_files_at_end.is_empty()
+}
+
+/// Content binding between a per-round manifest and its index row: every
+/// scalar the index records must agree. Identity (`id`) alone is never
+/// enough — a pre-format-2 binary restarts ids at 0, so a manifest it
+/// overwrote carries one of our ids with a different round's content.
+fn manifest_binds_to_round(manifest: &HistoryRound, stub: &HistoryRound) -> bool {
+    manifest.id == stub.id
+        && manifest.parent_id == stub.parent_id
+        && manifest.summary == stub.summary
+        && manifest.timestamp_unix == stub.timestamp_unix
+        && manifest.files_changed == stub.files_changed
+        && manifest.turn_count == stub.turn_count
+        && manifest.native_message_count == stub.native_message_count
+        && manifest.maps_from_round == stub.maps_from_round
 }
 
 /// A branch of rounds that was replaced by a rollback-then-new-action. Kept
@@ -184,35 +214,47 @@ pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
 /// Metadata identity used to decide whether a file may have changed without
 /// re-reading it. Size and mtime alone are spoofable (mtime-preserving
 /// writers, coarse timestamp granules), so the fingerprint also carries the
-/// platform's best change signal and file identity:
+/// platform's change signal and file identity from
+/// [`crate::platform::file_change_stamp`]:
 ///
 /// - Unix: inode ctime (bumped by every content write; not settable by
 ///   `touch -r`/`rsync -t` style tools) plus `(dev, ino)`.
-/// - Windows: the file's creation time (stable std exposes no ChangeTime) —
-///   catches replace-by-rename writers; in-place mtime-backdated rewrites
-///   are left to the racy-distrust window below.
-/// - Elsewhere: `None`s — the mtime requirement still applies.
+/// - Windows: NTFS `ChangeTime` via `GetFileInformationByHandleEx` (bumped
+///   by every write; not settable through `SetFileTime`) plus the volume +
+///   file-index identity.
+/// - Elsewhere: no signal exists — see [`FileFingerprint::matches`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileFingerprint {
     size: u64,
     /// Modification time in nanos since the epoch; `None` when unreadable.
     mtime_nanos: Option<u128>,
-    /// Platform change signal (see type docs); `None` where unavailable.
+    /// Platform change signal (see type docs); `None` when the platform
+    /// query failed (Windows handle open/query) or offers no signal.
     change_signal: Option<i128>,
-    /// `(dev, inode)` on Unix; `None` where unavailable.
+    /// Real file identity `(volume/dev, index/inode)`; `None` alongside a
+    /// `None` change signal.
     file_id: Option<(u64, u64)>,
 }
 
 impl FileFingerprint {
     /// True when `other` plausibly describes the same file state. Requires a
     /// *known, equal* mtime on both sides — a fingerprint with an unreadable
-    /// timestamp never matches anything, so unreadable stats always fall
-    /// toward re-reading.
+    /// timestamp never matches anything — and, on platforms that have a
+    /// change signal (Unix, Windows), a *present, equal* signal: a failed
+    /// signal query never matches, so degraded stats always fall toward
+    /// re-reading.
     fn matches(&self, other: &FileFingerprint) -> bool {
+        let change_signal_ok = match (self.change_signal, other.change_signal) {
+            (Some(a), Some(b)) => a == b,
+            // Where a signal is expected, its absence is a failed query,
+            // never proof of anything.
+            (None, None) => !cfg!(any(unix, windows)),
+            _ => false,
+        };
         self.size == other.size
             && self.mtime_nanos.is_some()
             && self.mtime_nanos == other.mtime_nanos
-            && self.change_signal == other.change_signal
+            && change_signal_ok
             && self.file_id == other.file_id
     }
 }
@@ -232,36 +274,6 @@ fn now_nanos() -> u128 {
         // Clock before epoch: record 0 so every entry looks racy and gets
         // re-read — the safe direction.
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn metadata_change_signal(meta: &std::fs::Metadata) -> Option<i128> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.ctime() as i128) * 1_000_000_000 + meta.ctime_nsec() as i128)
-}
-
-#[cfg(windows)]
-fn metadata_change_signal(meta: &std::fs::Metadata) -> Option<i128> {
-    use std::os::windows::fs::MetadataExt;
-    // 100ns intervals since 1601-01-01; creation time is the best change
-    // signal stable std exposes on Windows (see FileFingerprint docs).
-    Some(meta.creation_time() as i128)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_change_signal(_meta: &std::fs::Metadata) -> Option<i128> {
-    None
-}
-
-#[cfg(unix)]
-fn metadata_file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    Some((meta.dev(), meta.ino()))
-}
-
-#[cfg(not(unix))]
-fn metadata_file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
-    None
 }
 
 /// `(restorable, display_mirror)` maps from a snapshot object scan: relative
@@ -421,17 +433,25 @@ fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
     Ok(out)
 }
 
-fn metadata_fingerprint(meta: &std::fs::Metadata) -> FileFingerprint {
+/// Fingerprint the file at `path`. Unix derives everything from `meta`;
+/// Windows additionally opens a handle for the ChangeTime + identity query
+/// (a failed query yields `None` fields, which [`FileFingerprint::matches`]
+/// treats as never-matching). Call with a stat taken *before* any content
+/// read the fingerprint will describe.
+fn file_fingerprint(path: &Path, meta: &std::fs::Metadata) -> FileFingerprint {
     let mtime_nanos = meta
         .modified()
         .ok()
         .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos());
+    let stamp = crate::platform::file_change_stamp(path, meta);
     FileFingerprint {
         size: meta.len(),
         mtime_nanos,
-        change_signal: metadata_change_signal(meta),
-        file_id: metadata_file_id(meta),
+        change_signal: stamp.as_ref().map(|s| s.change_signal),
+        file_id: stamp
+            .as_ref()
+            .map(|s| (s.identity.volume, s.identity.file_index)),
     }
 }
 
@@ -628,55 +648,125 @@ fn round_manifest_path(snapshot_dir: &Path, round_id: u64) -> PathBuf {
         .join("manifest.json")
 }
 
-/// Result of loading `history.json`: the (slim) history plus whether the
-/// index changed in ways that must be persisted immediately (minted epoch,
-/// migrated maps, format upgrade) — before any new manifest is stamped with
-/// state the on-disk index doesn't know yet.
+/// Result of loading `history.json`: the (slim) history, whether the index
+/// changed in ways that must be persisted immediately (adopted epoch,
+/// migrated maps) — before any new manifest is stamped with state the
+/// on-disk index doesn't know yet — and whether the store must be treated
+/// as read-only because an existing `history.json` was damaged and could
+/// not be set aside (it must never be overwritten).
 struct LoadedHistory {
     history: History,
     needs_persist: bool,
+    force_read_only: bool,
+}
+
+impl LoadedHistory {
+    fn read_only_with(history: History) -> Self {
+        Self {
+            history,
+            needs_persist: false,
+            force_read_only: true,
+        }
+    }
 }
 
 /// Load `history.json`, minting the store epoch when absent and migrating
 /// any round that still carries inline maps (legacy pre-format-2 files, or
 /// rounds retained after an earlier failed migration) into stamped
 /// per-round manifests. Rounds whose manifest write fails KEEP their inline
-/// maps — the index remains the authoritative carrier for them until a
-/// later load succeeds.
-fn load_history_from_disk(snapshot_dir: &Path) -> LoadedHistory {
+/// maps — marked via `maps_inline` so even empty trees survive — and the
+/// index remains the authoritative carrier for them until a later load
+/// succeeds.
+///
+/// A present-but-unparseable `history.json` is never overwritten: it is
+/// renamed aside (`history.json.damaged-<ts>`) and a fresh timeline starts;
+/// if even the rename fails, the watcher runs read-only.
+///
+/// With `read_only` (another process owns the store lock), the file is
+/// parsed as-is: no mint, no migration, no renames, no persist.
+fn load_history_from_disk(snapshot_dir: &Path, read_only: bool) -> LoadedHistory {
     let history_path = snapshot_dir.join("history.json");
-    let (mut history, format) = match std::fs::read(&history_path) {
+    // Ok(Some(..)) = parsed; Ok(None) = absent (fresh store); Err(()) =
+    // present but unreadable/unparseable — the damaged case.
+    let parsed: Result<Option<(History, u64)>, ()> = match std::fs::read(&history_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Err(_) => Err(()),
             Ok(value) => {
                 let format = value.get("format").and_then(|v| v.as_u64()).unwrap_or(0);
                 match serde_json::from_value::<History>(value) {
-                    Ok(history) => (history, format),
-                    Err(_) => (History::default(), HISTORY_INDEX_FORMAT),
+                    Ok(history) => Ok(Some((history, format))),
+                    Err(_) => Err(()),
                 }
             }
-            Err(_) => (History::default(), HISTORY_INDEX_FORMAT),
         },
-        Err(_) => (History::default(), HISTORY_INDEX_FORMAT),
     };
 
-    let mut needs_persist = format < HISTORY_INDEX_FORMAT;
-    let minted_epoch = history.store_epoch.is_none();
-    if minted_epoch {
-        history.store_epoch = Some(mint_store_epoch(snapshot_dir));
-        needs_persist = true;
-        if format >= HISTORY_INDEX_FORMAT {
-            // An epoch-less format-2 index (written by the brief pre-epoch
-            // revision): its manifests are presumptively ours — re-stamp the
-            // parseable, id-matching ones with the new epoch so they stay
-            // resolvable.
-            restamp_manifests_for_new_epoch(&history, snapshot_dir);
+    let (mut history, format) = match parsed {
+        Ok(Some((history, format))) => (history, format),
+        Ok(None) => (History::default(), HISTORY_INDEX_FORMAT),
+        Err(()) => {
+            if read_only {
+                return LoadedHistory::read_only_with(History::default());
+            }
+            let damaged_path = snapshot_dir.join(format!("history.json.damaged-{}", now_unix()));
+            match std::fs::rename(&history_path, &damaged_path) {
+                Ok(()) => {
+                    eprintln!(
+                        "[file_watcher] history.json was unreadable; preserved it at {} and \
+                         starting a fresh timeline",
+                        damaged_path.display()
+                    );
+                    (History::default(), HISTORY_INDEX_FORMAT)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[file_watcher] history.json is unreadable and could not be set aside \
+                         ({}); rewind runs read-only so it is never overwritten",
+                        err
+                    );
+                    return LoadedHistory::read_only_with(History::default());
+                }
+            }
+        }
+    };
+
+    if read_only {
+        return LoadedHistory {
+            history,
+            needs_persist: false,
+            force_read_only: false,
+        };
+    }
+
+    let mut needs_persist = false;
+    if history.store_epoch.is_none() {
+        let epoch = mint_store_epoch(snapshot_dir);
+        let restamped_ok = format < HISTORY_INDEX_FORMAT
+            || restamp_manifests_for_new_epoch(&history, snapshot_dir, &epoch);
+        if restamped_ok {
+            history.store_epoch = Some(epoch);
+            needs_persist = true;
+        } else {
+            // A content-binding manifest could not be restamped (e.g. a
+            // transiently unwritable dir). Adopting the epoch now would make
+            // that correct manifest permanently unresolvable once the index
+            // persists — so stay epoch-less this load (the resolver falls
+            // back to content binding under a `None` epoch) and retry the
+            // mint on the next load.
+            eprintln!(
+                "[file_watcher] could not stamp every round manifest with the new store epoch; \
+                 deferring epoch adoption to the next load"
+            );
         }
     }
 
     // Legacy files carry every round's state inline — even an empty map is
     // an explicit "empty tree" record that must become a manifest (distinct
     // from a missing manifest, which rollback refuses). Format-2 rounds with
-    // empty maps are ordinary slim stubs.
+    // empty maps are ordinary slim stubs unless their `maps_inline` marker
+    // says otherwise.
     let treat_empty_as_inline = format < HISTORY_INDEX_FORMAT;
     migrate_inline_round_maps(
         &mut history,
@@ -688,6 +778,7 @@ fn load_history_from_disk(snapshot_dir: &Path) -> LoadedHistory {
     LoadedHistory {
         history,
         needs_persist,
+        force_read_only: false,
     }
 }
 
@@ -705,8 +796,10 @@ fn mint_store_epoch(snapshot_dir: &Path) -> String {
 
 /// Move every round's inline maps into a stamped per-round manifest. On a
 /// successful write the inline maps are dropped from the index; on failure
-/// (or a serialization error) they are KEPT so the data stays authoritative
-/// in the index and migration retries on the next load.
+/// (or a serialization error) they are KEPT and the row is marked
+/// `maps_inline`, so the data — including an empty tree, which serializes
+/// no maps of its own — stays authoritative in the index and migration
+/// retries on the next load.
 fn migrate_inline_round_maps(
     history: &mut History,
     snapshot_dir: &Path,
@@ -714,9 +807,8 @@ fn migrate_inline_round_maps(
     needs_persist: &mut bool,
 ) {
     let epoch = history.store_epoch.clone();
-    let mut migrate_round = |round: &mut HistoryRound| {
-        let has_inline = !round.files_at_end.is_empty() || !round.all_files_at_end.is_empty();
-        if !has_inline && !treat_empty_as_inline {
+    let migrate_round = |round: &mut HistoryRound, needs_persist: &mut bool| {
+        if !round_has_inline_maps(round) && !treat_empty_as_inline {
             return;
         }
         // Always rewrite from the inline maps — they are the authoritative
@@ -725,6 +817,7 @@ fn migrate_inline_round_maps(
         let manifest = HistoryRound {
             store_epoch: epoch.clone(),
             maps_from_round: None,
+            maps_inline: false,
             ..round.clone()
         };
         let manifest_path = round_manifest_path(snapshot_dir, round.id);
@@ -735,43 +828,100 @@ fn migrate_inline_round_maps(
             round.files_at_end = HashMap::new();
             round.all_files_at_end = HashMap::new();
             round.maps_from_round = None;
+            round.maps_inline = false;
+            *needs_persist = true;
+        } else if !round.maps_inline {
+            round.maps_inline = true;
             *needs_persist = true;
         }
     };
     for round in &mut history.rounds {
-        migrate_round(round);
+        migrate_round(round, needs_persist);
     }
     for branch in &mut history.abandoned_branches {
         for round in &mut branch.rounds {
-            migrate_round(round);
+            migrate_round(round, needs_persist);
         }
     }
 }
 
 /// Re-stamp existing manifests with a freshly minted epoch (epoch-less
-/// format-2 index only — see `load_history_from_disk`). Only parseable
-/// manifests whose recorded id matches their path are touched; anything
-/// else is left to fail closed at resolve time.
-fn restamp_manifests_for_new_epoch(history: &History, snapshot_dir: &Path) {
+/// format-2 index only — see `load_history_from_disk`). A manifest is only
+/// stamped when its content BINDS to its index row
+/// ([`manifest_binds_to_round`]) — identity alone never blesses a manifest,
+/// so one poisoned by a pre-format-2 binary (same id, different round)
+/// stays unstamped and fails closed at resolve time. Returns `false` when
+/// any binding manifest could not be written — the caller must then defer
+/// epoch adoption (see FIX in `load_history_from_disk`).
+fn restamp_manifests_for_new_epoch(history: &History, snapshot_dir: &Path, epoch: &str) -> bool {
+    let mut all_ok = true;
     let rounds = history
         .rounds
         .iter()
         .chain(history.abandoned_branches.iter().flat_map(|b| &b.rounds));
     for round in rounds {
+        if round_has_inline_maps(round) {
+            // Retained in the index; no manifest of ours to stamp.
+            continue;
+        }
         let manifest_path = round_manifest_path(snapshot_dir, round.id);
         let Ok(bytes) = std::fs::read(&manifest_path) else {
+            // Missing: unresolvable with or without an epoch — not a stamp
+            // failure.
             continue;
         };
         let Ok(mut manifest) = serde_json::from_slice::<HistoryRound>(&bytes) else {
             continue;
         };
-        if manifest.id != round.id {
+        if !manifest_binds_to_round(&manifest, round) {
+            eprintln!(
+                "[file_watcher] round {} manifest does not match the index (a foreign or \
+                 damaged write?) — leaving it unstamped; restores of that round will refuse",
+                round.id
+            );
             continue;
         }
-        manifest.store_epoch = history.store_epoch.clone();
-        if let Ok(stamped) = serde_json::to_vec_pretty(&manifest) {
-            let _ = atomic_write(&manifest_path, &stamped);
+        if manifest.store_epoch.as_deref() == Some(epoch) {
+            continue;
         }
+        manifest.store_epoch = Some(epoch.to_string());
+        let written = serde_json::to_vec_pretty(&manifest)
+            .ok()
+            .is_some_and(|stamped| atomic_write(&manifest_path, &stamped).is_ok());
+        if !written {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+/// Advisory exclusive lock on the snapshot store, held for the watcher's
+/// lifetime (released when the returned `File` drops). Locks a dedicated
+/// `store.lock` file — never `history.json` itself, whose reads Windows'
+/// LockFileEx would otherwise block. `(lock, read_only)`: any failure to
+/// acquire — held by another process, or a filesystem that cannot lock —
+/// yields read-only, the safe direction (no writes can interleave).
+fn acquire_store_lock(snapshot_dir: &Path) -> (Option<std::fs::File>, bool) {
+    let path = snapshot_dir.join("store.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "[file_watcher] could not open store lock {}: {} — rewind runs read-only",
+                path.display(),
+                err
+            );
+            return (None, true);
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => (Some(file), false),
+        Err(_) => (None, true),
     }
 }
 
@@ -795,18 +945,29 @@ fn hex_decode_hash(hex: &str) -> Option<[u8; 32]> {
 /// files were deleted (or stopped being text) before this resume. Keeps the
 /// on-disk baseline key universe identical to the manifest's, so the
 /// full-scan and watcher-index changes paths agree.
-fn reconcile_baseline_dir(baseline_dir: &Path, manifest: &BaselineManifest) {
+///
+/// Returns `false` on any failure (unreadable subdir, undeletable stale
+/// file): the key universes may then diverge, and the caller must disable
+/// the watcher-index fast path rather than serve divergent views.
+fn reconcile_baseline_dir(baseline_dir: &Path, manifest: &BaselineManifest) -> bool {
+    let mut ok = true;
     let mut stack = vec![baseline_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                ok = false;
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
-                Err(_) => continue,
+                Err(_) => {
+                    ok = false;
+                    continue;
+                }
             };
             if ft.is_dir() {
                 stack.push(path);
@@ -822,11 +983,47 @@ fn reconcile_baseline_dir(baseline_dir: &Path, manifest: &BaselineManifest) {
             let keep = manifest
                 .get(&rel_path_key(rel))
                 .is_some_and(|meta| meta.supported_text);
-            if !keep {
-                let _ = std::fs::remove_file(&path);
+            if !keep && std::fs::remove_file(&path).is_err() {
+                ok = false;
             }
         }
     }
+    ok
+}
+
+/// Clear wrong-typed leftovers from a previous run before writing a
+/// baseline file at `baseline_path`: a stale FILE occupying a path that now
+/// needs to be a directory (project `foo` became `foo/bar`), or a stale
+/// DIRECTORY occupying a path that now needs to be a file (`foo/bar`
+/// became file `foo`). Best-effort — a leftover this cannot clear makes
+/// the subsequent baseline write fail loudly.
+fn clear_stale_baseline_slot(baseline_dir: &Path, baseline_path: &Path) {
+    let mut blocking_files: Vec<&Path> = Vec::new();
+    let mut cursor = baseline_path.parent();
+    while let Some(dir) = cursor {
+        if dir == baseline_dir {
+            break;
+        }
+        blocking_files.push(dir);
+        cursor = dir.parent();
+    }
+    for ancestor in blocking_files {
+        if ancestor.is_file() {
+            let _ = std::fs::remove_file(ancestor);
+        }
+    }
+    if baseline_path.is_dir() {
+        let _ = std::fs::remove_dir_all(baseline_path);
+    }
+}
+
+/// The on-disk baseline manifest, for read-only instances that must adopt
+/// the store owner's baseline state instead of writing their own.
+fn read_baseline_manifest_file(snapshot_dir: &Path) -> BaselineManifest {
+    std::fs::read(snapshot_dir.join(BASELINE_MANIFEST_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// Recursively sum file bytes under `path`.
@@ -952,21 +1149,33 @@ struct ScanCacheEntry {
     /// and restorable); false for inspected-but-unsupported files that only
     /// feed the display mirror.
     restorable: bool,
-    /// When this entry was recorded (walk start for scan-recorded entries),
-    /// for the racy-distrust check.
+    /// Wall-clock time this entry was recorded (walk start for
+    /// scan-recorded entries), compared against the file's mtime — same
+    /// clock domain as filesystem timestamps.
     recorded_at_nanos: u128,
+    /// Monotonic recording instant: the primary racy-distrust gate, immune
+    /// to wall-clock steps (in-memory only, never serialized).
+    recorded_at_instant: std::time::Instant,
 }
 
 impl ScanCacheEntry {
     /// True when this entry can be trusted for a file currently stat'ing as
-    /// `current`: full fingerprint match plus the racy-distrust window (the
-    /// entry's mtime must be comfortably older than when the entry was
-    /// recorded, or a same-granule rewrite could hide behind it).
-    fn trustworthy_for(&self, current: &FileFingerprint) -> bool {
+    /// `current`: full fingerprint match plus the racy-distrust window,
+    /// gated both ways —
+    ///
+    /// 1. monotonically: at least `window` of real time must have passed
+    ///    since the entry was hashed (a backward wall-clock step cannot
+    ///    fake this), and
+    /// 2. on the wall clock: the entry's mtime must be comfortably older
+    ///    than its recording time (a same-granule rewrite lands near the
+    ///    recording moment and fails this).
+    fn trustworthy_for(&self, current: &FileFingerprint, window_nanos: u128) -> bool {
         self.fingerprint.matches(current)
-            && self.fingerprint.mtime_nanos.is_some_and(|mtime| {
-                mtime.saturating_add(FINGERPRINT_RACY_WINDOW_NANOS) < self.recorded_at_nanos
-            })
+            && self.recorded_at_instant.elapsed().as_nanos() >= window_nanos
+            && self
+                .fingerprint
+                .mtime_nanos
+                .is_some_and(|mtime| mtime.saturating_add(window_nanos) < self.recorded_at_nanos)
     }
 }
 
@@ -1016,6 +1225,23 @@ pub struct FileWatcher {
     /// full scan serves (correct, just slower). A rescan-flagged notify
     /// event triggers a full re-sync instead of degrading.
     live_index_degraded: bool,
+    /// Sticky sibling of `live_index_degraded`: set when this watcher can
+    /// never trust its live index for the rest of the process (read-only
+    /// mode, a failed baseline reconciliation). Never cleared.
+    live_index_disabled: bool,
+    /// True when another process holds this store's lock (or the store was
+    /// damaged in a way we could not set aside): this watcher serves reads
+    /// (/history, the legacy changes scan) but refuses every mutation —
+    /// round recording, rollback/redo/prune, index persists.
+    read_only: bool,
+    /// Advisory store lock (a dedicated `store.lock` file — never
+    /// `history.json` itself; Windows LockFileEx blocks reads of the locked
+    /// file). Held for the watcher's lifetime; released on drop.
+    _store_lock: Option<std::fs::File>,
+    /// Racy-distrust window (see [`ScanCacheEntry::trustworthy_for`]).
+    /// `FINGERPRINT_RACY_WINDOW_NANOS` in production; tests shrink it to
+    /// exercise fingerprint mechanics without multi-second sleeps.
+    racy_window_nanos: u128,
     /// Test-only observability: how many files the last
     /// `scan_and_store_objects` walk actually read (cache misses).
     #[cfg(test)]
@@ -1048,127 +1274,169 @@ impl FileWatcher {
         std::fs::create_dir_all(snapshot_dir.join("rounds"))
             .map_err(|e| CallerError::Config(format!("create rounds dir: {}", e)))?;
 
+        // Cross-process exclusion, acquired before any store write: a second
+        // watcher on the same store (another daemon resuming this session)
+        // must never interleave baseline/manifest/index writes with ours.
+        let (store_lock, lock_read_only) = acquire_store_lock(&snapshot_dir);
+        if lock_read_only {
+            eprintln!(
+                "[file_watcher] snapshot store {} is locked by another intendant process — \
+                 rewind runs read-only in this instance",
+                snapshot_dir.display()
+            );
+        }
+
         let mut baseline_manifest = BaselineManifest::new();
         let mut hashes = HashMap::new();
         let mut large_file_fingerprints = HashMap::new();
+        let mut reconcile_failed = false;
         let mut files_seen: usize = 0;
         let mut bytes_seen: u64 = 0;
 
-        let mut stack = vec![project_root.clone()];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let ft = match entry.file_type() {
-                    Ok(ft) => ft,
+        if lock_read_only {
+            // Write nothing: adopt the owning process's on-disk baseline
+            // state so reads (the legacy changes scan, FileChanged line
+            // counts) stay consistent with the store we serve.
+            baseline_manifest = read_baseline_manifest_file(&snapshot_dir);
+            for (key, meta) in &baseline_manifest {
+                if let Some(hash) = hex_decode_hash(&meta.hash) {
+                    hashes.insert(PathBuf::from(key), hash);
+                }
+            }
+        } else {
+            let mut stack = vec![project_root.clone()];
+            while let Some(dir) = stack.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(e) => e,
                     Err(_) => continue,
                 };
-                if ft.is_dir() {
-                    // Check if this directory should be ignored.
-                    if let Ok(rel) = path.strip_prefix(&project_root) {
-                        if !should_ignore(rel) {
-                            stack.push(path);
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    if ft.is_dir() {
+                        // Check if this directory should be ignored.
+                        if let Ok(rel) = path.strip_prefix(&project_root) {
+                            if !should_ignore(rel) {
+                                stack.push(path);
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
-                if !ft.is_file() {
-                    continue;
-                }
-                let rel = match path.strip_prefix(&project_root) {
-                    Ok(r) => r.to_path_buf(),
-                    Err(_) => continue,
-                };
-                if should_ignore(&rel) {
-                    continue;
-                }
-                let rel_key = rel_path_key(&rel);
-                files_seen += 1;
-                if tree_budget_exceeded(files_seen, bytes_seen) {
-                    return Err(CallerError::Config(format!(
-                        "initial snapshot budget exceeded under {} ({files_seen} files / \
+                    if !ft.is_file() {
+                        continue;
+                    }
+                    let rel = match path.strip_prefix(&project_root) {
+                        Ok(r) => r.to_path_buf(),
+                        Err(_) => continue,
+                    };
+                    if should_ignore(&rel) {
+                        continue;
+                    }
+                    let rel_key = rel_path_key(&rel);
+                    files_seen += 1;
+                    if tree_budget_exceeded(files_seen, bytes_seen) {
+                        return Err(CallerError::Config(format!(
+                            "initial snapshot budget exceeded under {} ({files_seen} files / \
                          {bytes_seen} bytes so far; caps {SNAPSHOT_MAX_TREE_FILES} files / \
                          {SNAPSHOT_MAX_TREE_BYTES} bytes) — rewind snapshots stay off for \
                          this run rather than shadow-copying a tree that large",
-                        project_root.display()
-                    )));
-                }
-                match inspect_file(&path) {
-                    Ok(InspectedFile::Text(snapshot)) => {
-                        bytes_seen = bytes_seen.saturating_add(snapshot.size);
-                        let baseline_path = baseline_dir.join(&rel);
-                        if let Some(parent) = baseline_path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                CallerError::Config(format!(
-                                    "create baseline parent {}: {}",
-                                    parent.display(),
-                                    e
-                                ))
-                            })?;
-                        }
-                        std::fs::write(&baseline_path, snapshot.text.as_bytes()).map_err(|e| {
-                            CallerError::Config(format!(
-                                "write baseline {}: {}",
-                                baseline_path.display(),
-                                e
-                            ))
-                        })?;
-                        hashes.insert(rel, snapshot.hash);
-                        baseline_manifest.insert(
-                            rel_key,
-                            BaselineFileMeta {
-                                supported_text: true,
-                                hash: snapshot.hash_hex,
-                                size: snapshot.size,
-                                reason: None,
-                            },
-                        );
+                            project_root.display()
+                        )));
                     }
-                    Ok(InspectedFile::Unsupported(snapshot)) => {
-                        bytes_seen = bytes_seen.saturating_add(snapshot.size);
-                        if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
-                            if let Ok(meta) = std::fs::metadata(&path) {
-                                large_file_fingerprints
-                                    .insert(rel.clone(), metadata_fingerprint(&meta));
+                    match inspect_file(&path) {
+                        Ok(InspectedFile::Text(snapshot)) => {
+                            bytes_seen = bytes_seen.saturating_add(snapshot.size);
+                            let baseline_path = baseline_dir.join(&rel);
+                            // A previous run may have baselined a FILE where this
+                            // run needs a directory (or vice versa): clear the
+                            // wrong-typed leftover before writing.
+                            clear_stale_baseline_slot(&baseline_dir, &baseline_path);
+                            if let Some(parent) = baseline_path.parent() {
+                                std::fs::create_dir_all(parent).map_err(|e| {
+                                    CallerError::Config(format!(
+                                        "create baseline parent {}: {}",
+                                        parent.display(),
+                                        e
+                                    ))
+                                })?;
                             }
+                            std::fs::write(&baseline_path, snapshot.text.as_bytes()).map_err(
+                                |e| {
+                                    CallerError::Config(format!(
+                                        "write baseline {}: {}",
+                                        baseline_path.display(),
+                                        e
+                                    ))
+                                },
+                            )?;
+                            hashes.insert(rel, snapshot.hash);
+                            baseline_manifest.insert(
+                                rel_key,
+                                BaselineFileMeta {
+                                    supported_text: true,
+                                    hash: snapshot.hash_hex,
+                                    size: snapshot.size,
+                                    reason: None,
+                                },
+                            );
                         }
-                        hashes.insert(rel, snapshot.hash);
-                        baseline_manifest.insert(
-                            rel_key,
-                            BaselineFileMeta {
-                                supported_text: false,
-                                hash: snapshot.hash_hex,
-                                size: snapshot.size,
-                                reason: Some(snapshot.reason),
-                            },
-                        );
+                        Ok(InspectedFile::Unsupported(snapshot)) => {
+                            bytes_seen = bytes_seen.saturating_add(snapshot.size);
+                            if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
+                                if let Ok(meta) = std::fs::metadata(&path) {
+                                    large_file_fingerprints
+                                        .insert(rel.clone(), file_fingerprint(&path, &meta));
+                                }
+                            }
+                            hashes.insert(rel, snapshot.hash);
+                            baseline_manifest.insert(
+                                rel_key,
+                                BaselineFileMeta {
+                                    supported_text: false,
+                                    hash: snapshot.hash_hex,
+                                    size: snapshot.size,
+                                    reason: Some(snapshot.reason),
+                                },
+                            );
+                        }
+                        Err(_) => continue,
                     }
-                    Err(_) => continue,
                 }
             }
+
+            let manifest_path = snapshot_dir.join(BASELINE_MANIFEST_FILE);
+            let manifest_bytes = serde_json::to_vec_pretty(&baseline_manifest)
+                .map_err(|e| CallerError::Config(format!("baseline manifest serialize: {}", e)))?;
+            atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
+
+            // Drop baseline/ files left over from a previous run whose sources
+            // no longer exist: stale copies otherwise make the full-scan changes
+            // path report phantom "deleted" files this session never had. Any
+            // reconciliation failure permanently disables the changes fast path
+            // (the full scan would diverge from the watcher index otherwise).
+            reconcile_failed = !reconcile_baseline_dir(&baseline_dir, &baseline_manifest);
+            if reconcile_failed {
+                eprintln!(
+                    "[file_watcher] baseline reconciliation under {} failed — the changes fast \
+                 path is disabled for this run",
+                    baseline_dir.display()
+                );
+            }
         }
-
-        let manifest_path = snapshot_dir.join(BASELINE_MANIFEST_FILE);
-        let manifest_bytes = serde_json::to_vec_pretty(&baseline_manifest)
-            .map_err(|e| CallerError::Config(format!("baseline manifest serialize: {}", e)))?;
-        atomic_write(&manifest_path, &manifest_bytes).map_err(CallerError::Io)?;
-
-        // Drop baseline/ files left over from a previous run whose sources
-        // no longer exist: stale copies otherwise make the full-scan changes
-        // path report phantom "deleted" files this session never had.
-        reconcile_baseline_dir(&baseline_dir, &baseline_manifest);
 
         // Load history.json if it exists (session resume / restart). Legacy
         // full-fat files (per-round maps inline) are migrated to per-round
         // manifests + a slim index; the store epoch is minted on first
-        // format-2 load.
+        // format-2 load. Read-only instances parse without mutating.
         let LoadedHistory {
             history,
             needs_persist,
-        } = load_history_from_disk(&snapshot_dir);
+            force_read_only,
+        } = load_history_from_disk(&snapshot_dir, lock_read_only);
+        let read_only = lock_read_only || force_read_only;
 
         // One boot-time walk seeds the size estimate the soft-cap check
         // maintains incrementally afterwards (it used to re-walk per round).
@@ -1186,6 +1454,10 @@ impl FileWatcher {
             large_file_fingerprints,
             round_scan_cache: HashMap::new(),
             live_index_degraded: true,
+            live_index_disabled: read_only || reconcile_failed,
+            read_only,
+            _store_lock: store_lock,
+            racy_window_nanos: FINGERPRINT_RACY_WINDOW_NANOS,
             #[cfg(test)]
             files_read_in_last_scan: 0,
             head_maps: None,
@@ -1193,8 +1465,8 @@ impl FileWatcher {
             last_history_index_bytes,
             history,
         };
-        if needs_persist {
-            // Make the minted epoch / migrated maps durable before any new
+        if needs_persist && !watcher.read_only {
+            // Make the adopted epoch / migrated maps durable before any new
             // manifest is stamped against them.
             watcher.persist_history()?;
         }
@@ -1209,6 +1481,20 @@ impl FileWatcher {
         &self.history
     }
 
+    /// Refuse store mutations in read-only mode (another process owns the
+    /// store lock, or a damaged `history.json` could not be set aside).
+    fn ensure_writable(&self) -> Result<(), CallerError> {
+        if self.read_only {
+            return Err(CallerError::Config(
+                "snapshot store is read-only in this instance (held by another intendant \
+                 process, or a damaged history.json) — round recording and rollback are \
+                 disabled here"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Snapshot the state the changes endpoint needs to compute the
     /// changed-key set without walking the project tree. Cheap relative to
     /// a tree read (two O(files) map clones), taken under the watcher lock.
@@ -1218,7 +1504,7 @@ impl FileWatcher {
     /// fall back to their full-scan path instead of serving from a hash
     /// mirror that may be missing events.
     pub(crate) fn changes_index_snapshot(&self) -> Option<ChangesIndexSnapshot> {
-        if self.live_index_degraded {
+        if self.live_index_degraded || self.live_index_disabled {
             return None;
         }
         Some(ChangesIndexSnapshot {
@@ -1233,10 +1519,18 @@ impl FileWatcher {
 
     /// Test hook: pretend the notify watcher is confirmed healthy, so unit
     /// tests can exercise the watcher-index fast path without spawning the
-    /// real filesystem-event loop.
+    /// real filesystem-event loop. Deliberately leaves the sticky
+    /// `live_index_disabled` flag alone — tests assert its precedence.
     #[cfg(test)]
     pub(crate) fn mark_live_index_healthy_for_tests(&mut self) {
         self.live_index_degraded = false;
+    }
+
+    /// Test hook: shrink the racy-distrust window so fingerprint mechanics
+    /// can be pinned without multi-second sleeps.
+    #[cfg(test)]
+    pub(crate) fn set_racy_window_for_tests(&mut self, nanos: u128) {
+        self.racy_window_nanos = nanos;
     }
 
     /// Wrap `self` in an async-mutex-backed shared handle and spawn the
@@ -1356,7 +1650,7 @@ impl FileWatcher {
                     Ok(meta) => meta,
                     Err(_) => return,
                 };
-                let fingerprint = metadata_fingerprint(&meta);
+                let fingerprint = file_fingerprint(abs_path, &meta);
                 if meta.len() > SNAPSHOT_MAX_FILE_BYTES
                     && self
                         .large_file_fingerprints
@@ -1380,6 +1674,7 @@ impl FileWatcher {
                                 hash_hex: snapshot.hash_hex.clone(),
                                 restorable: true,
                                 recorded_at_nanos: now_nanos(),
+                                recorded_at_instant: std::time::Instant::now(),
                             },
                         );
                         if self.hashes.get(&rel) == Some(&snapshot.hash) {
@@ -1418,6 +1713,7 @@ impl FileWatcher {
                                     hash_hex: snapshot.hash_hex.clone(),
                                     restorable: false,
                                     recorded_at_nanos: now_nanos(),
+                                    recorded_at_instant: std::time::Instant::now(),
                                 },
                             );
                         }
@@ -1474,6 +1770,7 @@ impl FileWatcher {
         turn_count: Option<u32>,
         native_message_count: Option<u32>,
     ) -> Result<(), CallerError> {
+        self.ensure_writable()?;
         // Walk the project and compute file hashes + write any new objects.
         // Fingerprint-cached: unchanged files are stat'd, not re-read.
         let (files_at_end, all_files_at_end) = self.scan_and_store_objects()?;
@@ -1530,6 +1827,7 @@ impl FileWatcher {
             native_message_count,
             maps_from_round: maps_source_id,
             store_epoch: None,
+            maps_inline: false,
         };
 
         // Write the per-round manifest — the durable home of the maps,
@@ -1585,6 +1883,7 @@ impl FileWatcher {
     /// happens if a NEW round is created after the rollback (see
     /// [`on_round_complete`]).
     pub fn rollback(&mut self, target_round_id: u64) -> Result<RollbackResult, CallerError> {
+        self.ensure_writable()?;
         let target_idx = self
             .history
             .rounds
@@ -1637,6 +1936,7 @@ impl FileWatcher {
     /// restoring file state accordingly. Errors if already at the latest
     /// round.
     pub fn redo(&mut self) -> Result<RedoResult, CallerError> {
+        self.ensure_writable()?;
         let head_id = self
             .history
             .current_head_id
@@ -1683,6 +1983,7 @@ impl FileWatcher {
     /// Delete all abandoned branches and garbage-collect any orphaned blobs
     /// under `objects/`.
     pub fn prune_abandoned(&mut self) -> Result<PruneResult, CallerError> {
+        self.ensure_writable()?;
         let branches_removed = self.history.abandoned_branches.len() as u32;
         self.history.abandoned_branches.clear();
 
@@ -1728,6 +2029,7 @@ impl FileWatcher {
         // racy-distrust check compares a file's mtime against it, and the
         // start is the most conservative bound (recording happens later).
         let walk_started_nanos = now_nanos();
+        let walk_started_instant = std::time::Instant::now();
         #[cfg(test)]
         {
             self.files_read_in_last_scan = 0;
@@ -1772,9 +2074,9 @@ impl FileWatcher {
                 }
                 // Stat-before-read: this fingerprint describes content no
                 // newer than what a subsequent read returns.
-                let fingerprint = metadata_fingerprint(&meta);
+                let fingerprint = file_fingerprint(&path, &meta);
                 if let Some(cached) = self.round_scan_cache.get(&rel) {
-                    if cached.trustworthy_for(&fingerprint) {
+                    if cached.trustworthy_for(&fingerprint, self.racy_window_nanos) {
                         let key = rel_path_key(&rel);
                         if cached.restorable {
                             if objects_dir.join(&cached.hash_hex).exists() {
@@ -1819,6 +2121,7 @@ impl FileWatcher {
                                 hash_hex: snapshot.hash_hex.clone(),
                                 restorable: true,
                                 recorded_at_nanos: walk_started_nanos,
+                                recorded_at_instant: walk_started_instant,
                             },
                         );
                         out.insert(rel_path_key(&rel), snapshot.hash_hex);
@@ -1833,6 +2136,7 @@ impl FileWatcher {
                                 hash_hex: snapshot.hash_hex,
                                 restorable: false,
                                 recorded_at_nanos: walk_started_nanos,
+                                recorded_at_instant: walk_started_instant,
                             },
                         );
                     }
@@ -1872,8 +2176,10 @@ impl FileWatcher {
             }
         }
         let stub = self.history.rounds.iter().find(|r| r.id == round_id)?;
-        // Inline maps retained after a failed migration are authoritative.
-        if !stub.files_at_end.is_empty() || !stub.all_files_at_end.is_empty() {
+        // Inline maps retained after a failed migration are authoritative —
+        // including the explicit `maps_inline` marker, which is how an
+        // empty-tree retention survives (empty maps serialize to nothing).
+        if round_has_inline_maps(stub) {
             return Some(ResolvedRoundMaps {
                 source_round_id: stub.id,
                 files_at_end: stub.files_at_end.clone(),
@@ -1881,8 +2187,8 @@ impl FileWatcher {
             });
         }
         // Prefer the in-memory stub's backreference (skips one manifest
-        // read); fall back to whatever the manifest chain says so maps stay
-        // resolvable even if the index was rebuilt from scratch.
+        // read); the chain below re-verifies every hop against its own
+        // index row anyway.
         let mut source_id = stub.maps_from_round.unwrap_or(round_id);
         // Backreferences are written depth-1; the visited set and bound are
         // defense against corrupt or foreign manifests.
@@ -1894,30 +2200,37 @@ impl FileWatcher {
                 // empty tree.
                 return None;
             }
+            // Every hop must have an index row of its own (backreference
+            // targets are always linear-path ancestors).
+            let hop_stub = self.history.rounds.iter().find(|r| r.id == source_id)?;
             // A referenced round whose own migration is still pending keeps
             // its maps inline in the index — serve those (its manifest does
             // not exist yet).
-            if let Some(inline) = self
-                .history
-                .rounds
-                .iter()
-                .find(|r| r.id == source_id)
-                .filter(|r| !r.files_at_end.is_empty() || !r.all_files_at_end.is_empty())
-            {
+            if round_has_inline_maps(hop_stub) {
                 return Some(ResolvedRoundMaps {
-                    source_round_id: inline.id,
-                    files_at_end: inline.files_at_end.clone(),
-                    all_files_at_end: inline.all_files_at_end.clone(),
+                    source_round_id: hop_stub.id,
+                    files_at_end: hop_stub.files_at_end.clone(),
+                    all_files_at_end: hop_stub.all_files_at_end.clone(),
                 });
             }
             let manifest_path = round_manifest_path(&self.snapshot_dir, source_id);
             let bytes = std::fs::read(&manifest_path).ok()?;
             let manifest = serde_json::from_slice::<HistoryRound>(&bytes).ok()?;
-            if manifest.id != source_id {
+            // Content binding: the manifest must be the round the index
+            // recorded, not merely a file at the right path (a pre-format-2
+            // binary restarts ids at 0 and can overwrite manifests with
+            // same-id rounds of a different timeline).
+            if !manifest_binds_to_round(&manifest, hop_stub) {
                 return None;
             }
-            if manifest.store_epoch.as_deref() != self.history.store_epoch.as_deref() {
-                return None;
+            // Epoch binding: with an adopted epoch, the stamp must match
+            // exactly. An epoch-less index (a pre-epoch store whose stamping
+            // hasn't completed yet) accepts any stamp — content binding
+            // above is the guard for that window.
+            if let Some(epoch) = self.history.store_epoch.as_deref() {
+                if manifest.store_epoch.as_deref() != Some(epoch) {
+                    return None;
+                }
             }
             match manifest.maps_from_round {
                 Some(next) => source_id = next,
@@ -1984,9 +2297,9 @@ impl FileWatcher {
                 if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
                     continue;
                 }
-                let fingerprint = metadata_fingerprint(&meta);
+                let fingerprint = file_fingerprint(&path, &meta);
                 if let Some(cached) = self.round_scan_cache.get(&rel) {
-                    if cached.trustworthy_for(&fingerprint) {
+                    if cached.trustworthy_for(&fingerprint, self.racy_window_nanos) {
                         if cached.restorable {
                             current.insert(rel_path_key(&rel), cached.hash);
                         }
@@ -2004,6 +2317,7 @@ impl FileWatcher {
                                 hash_hex: snapshot.hash_hex,
                                 restorable: false,
                                 recorded_at_nanos: now_nanos(),
+                                recorded_at_instant: std::time::Instant::now(),
                             },
                         );
                         continue;
@@ -2018,6 +2332,7 @@ impl FileWatcher {
                         hash_hex: snapshot.hash_hex,
                         restorable: true,
                         recorded_at_nanos: now_nanos(),
+                        recorded_at_instant: std::time::Instant::now(),
                     },
                 );
                 current.insert(rel_path_key(&rel), snapshot.hash);
@@ -2045,11 +2360,12 @@ impl FileWatcher {
                 watcher.round_scan_cache.insert(
                     PathBuf::from(rel),
                     ScanCacheEntry {
-                        fingerprint: metadata_fingerprint(&meta),
+                        fingerprint: file_fingerprint(&abs, &meta),
                         hash,
                         hash_hex: target_hex.to_string(),
                         restorable: true,
                         recorded_at_nanos: now_nanos(),
+                        recorded_at_instant: std::time::Instant::now(),
                     },
                 );
             }
@@ -2130,7 +2446,7 @@ impl FileWatcher {
                     continue;
                 };
                 if meta.len() > SNAPSHOT_MAX_FILE_BYTES {
-                    let fingerprint = metadata_fingerprint(&meta);
+                    let fingerprint = file_fingerprint(&path, &meta);
                     // Keep the last-known hash when the file is untouched
                     // (its fingerprint matches) so the change index doesn't
                     // treat it as deleted after a restore; a genuinely
@@ -2152,9 +2468,9 @@ impl FileWatcher {
                     large_file_fingerprints.insert(rel, fingerprint);
                     continue;
                 }
-                let fingerprint = metadata_fingerprint(&meta);
+                let fingerprint = file_fingerprint(&path, &meta);
                 if let Some(cached) = self.round_scan_cache.get(&rel) {
-                    if cached.trustworthy_for(&fingerprint) {
+                    if cached.trustworthy_for(&fingerprint, self.racy_window_nanos) {
                         new_hashes.insert(rel.clone(), cached.hash);
                         next_cache.insert(rel, cached.clone());
                         continue;
@@ -2176,6 +2492,7 @@ impl FileWatcher {
                             hash_hex,
                             restorable,
                             recorded_at_nanos: now_nanos(),
+                            recorded_at_instant: std::time::Instant::now(),
                         },
                     );
                 }
@@ -2196,6 +2513,7 @@ impl FileWatcher {
     /// without `files_at_end` and fall back to an empty history — no
     /// rollback offered, never a restore from an empty map.
     fn persist_history(&mut self) -> Result<(), CallerError> {
+        self.ensure_writable()?;
         let path = self.snapshot_dir.join("history.json");
         let mut value = serde_json::to_value(&self.history)
             .map_err(|e| CallerError::Config(format!("history serialize: {}", e)))?;
@@ -2325,30 +2643,54 @@ async fn run_watcher_loop(
 
     let _watcher = watcher;
 
-    shared.lock().await.live_index_degraded = false;
+    // Close the scan-to-watch gap: the construction scan ran before the
+    // watch registration above, so a change landing between them has no
+    // event. Re-sync the hash mirrors from disk (a fingerprint walk), drain
+    // whatever raced in meanwhile, and only then mark the index healthy.
+    {
+        let mut w = shared.lock().await;
+        w.refresh_hashes_from_tree();
+    }
+    while let Ok(res) = rx.try_recv() {
+        apply_notify_result(&shared, res).await;
+    }
+    {
+        let mut w = shared.lock().await;
+        if !w.live_index_disabled {
+            w.live_index_degraded = false;
+        }
+    }
 
     while let Some(res) = rx.recv().await {
-        match res {
-            Ok(notify_event) => {
-                let mut w = shared.lock().await;
-                if notify_event.need_rescan() {
-                    // The backend dropped events; re-sync the hash mirrors
-                    // from disk before processing anything further.
-                    w.refresh_hashes_from_tree();
-                }
-                for path in &notify_event.paths {
-                    w.process_change(path, &notify_event.kind);
-                }
-            }
-            Err(err) => {
-                eprintln!("[file_watcher] notify error, live index degraded: {}", err);
-                shared.lock().await.live_index_degraded = true;
-            }
-        }
+        apply_notify_result(&shared, res).await;
     }
 
     shared.lock().await.live_index_degraded = true;
     Ok(())
+}
+
+/// Apply one notify callback result to the shared watcher: rescan-flagged
+/// events re-sync the hash mirrors first (the backend dropped events);
+/// errors degrade the live index for the rest of the process.
+async fn apply_notify_result(
+    shared: &SharedFileWatcher,
+    res: Result<notify::Event, notify::Error>,
+) {
+    match res {
+        Ok(notify_event) => {
+            let mut w = shared.lock().await;
+            if notify_event.need_rescan() {
+                w.refresh_hashes_from_tree();
+            }
+            for path in &notify_event.paths {
+                w.process_change(path, &notify_event.kind);
+            }
+        }
+        Err(err) => {
+            eprintln!("[file_watcher] notify error, live index degraded: {}", err);
+            shared.lock().await.live_index_degraded = true;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2917,6 +3259,7 @@ mod tests {
                 native_message_count: None,
                 maps_from_round: None,
                 store_epoch: None,
+                maps_inline: false,
             };
             w.history.abandoned_branches.push(AbandonedBranch {
                 branched_from_id: r1,
@@ -3001,6 +3344,9 @@ mod tests {
         drop(handle);
 
         let mut w = make_watcher(root, tmp_snap.path());
+        // Disable the racy window: this test pins that the CHANGE SIGNAL
+        // alone catches the rewrite (the window is exercised separately).
+        w.set_racy_window_for_tests(0);
         w.on_round_complete("R1".into(), None, None).unwrap();
         let r1 = w.history.current_head_id.unwrap();
         assert_eq!(
@@ -3046,6 +3392,9 @@ mod tests {
         }
 
         let mut w = make_watcher(root, tmp_snap.path());
+        // Pin pure fingerprint mechanics: the racy-distrust window (tested
+        // separately) would force re-reads between back-to-back rounds.
+        w.set_racy_window_for_tests(0);
         w.on_round_complete("R1".into(), None, None).unwrap();
         assert_eq!(w.files_read_in_last_scan, 3, "first scan reads everything");
 
@@ -3308,6 +3657,7 @@ mod tests {
             b"v2",
             "a refused rollback must not touch the tree"
         );
+        drop(resumed);
 
         // An unstamped manifest (what an old binary writes) is refused too.
         manifest.store_epoch = None;
@@ -3452,5 +3802,443 @@ mod tests {
         let other = TempDir::new().unwrap();
         assert!(live_watcher_for(other.path(), tmp_snap.path()).is_none());
         assert!(live_watcher_for(tmp_proj.path(), other.path()).is_none());
+    }
+
+    /// Windows: a same-length rewrite whose mtime is backdated OUTSIDE the
+    /// racy window is still detected via the NTFS ChangeTime component of
+    /// the fingerprint (SetFileTime cannot set ChangeTime).
+    #[cfg(windows)]
+    #[test]
+    fn mtime_backdated_rewrite_is_detected_via_change_signal() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"round-1!").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle.set_modified(past).unwrap();
+        drop(handle);
+
+        let mut w = make_watcher(root, tmp_snap.path());
+        // Pin the change signal itself; the racy window is tested separately.
+        w.set_racy_window_for_tests(0);
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        assert_eq!(
+            w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"],
+            hex_encode(&sha256_hash(b"round-1!"))
+        );
+
+        // Cross the NTFS timestamp tick (~15.6ms) so the rewrite cannot
+        // share the original write's ChangeTime.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(&file, b"round-2!").unwrap();
+        let handle = std::fs::File::options().write(true).open(&file).unwrap();
+        handle.set_modified(past).unwrap();
+        drop(handle);
+
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+        assert_eq!(
+            w.resolved_round_maps(r2).unwrap().files_at_end["a.txt"],
+            hex_encode(&sha256_hash(b"round-2!")),
+            "an mtime-backdated rewrite must be caught by the ChangeTime fingerprint"
+        );
+    }
+
+    /// FIX 1: an epoch-less (pre-epoch draft) format-2 store never blesses a
+    /// manifest on identity alone — a poisoned manifest (right id, wrong
+    /// content, e.g. written by a pre-format-2 binary) is left unstamped and
+    /// restore refuses, while a content-binding sibling is stamped and keeps
+    /// working.
+    #[test]
+    fn restamp_refuses_poisoned_manifest() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        let r2 = w.history.current_head_id.unwrap();
+        drop(w);
+
+        // Rebuild the epoch-less pre-fix layout: strip the epoch from the
+        // index and from both manifests.
+        let index_path = tmp_snap.path().join("history.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        index.as_object_mut().unwrap().remove("store_epoch");
+        atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+        for id in [r1, r2] {
+            let path = round_manifest_path(tmp_snap.path(), id);
+            let mut manifest: HistoryRound =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest.store_epoch = None;
+            atomic_write(&path, &serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        }
+        // Poison r1's manifest the way an old binary would: same id,
+        // different round content entirely.
+        let poison_path = round_manifest_path(tmp_snap.path(), r1);
+        let mut poison: HistoryRound =
+            serde_json::from_slice(&std::fs::read(&poison_path).unwrap()).unwrap();
+        poison.summary = "Round 1".to_string();
+        poison.timestamp_unix = 12345;
+        poison.files_changed = vec!["other.txt".to_string()];
+        poison.files_at_end = HashMap::from([(
+            "other.txt".to_string(),
+            hex_encode(&sha256_hash(b"foreign content")),
+        )]);
+        atomic_write(&poison_path, &serde_json::to_vec_pretty(&poison).unwrap()).unwrap();
+
+        let mut resumed = make_watcher(root, tmp_snap.path());
+        assert!(
+            resumed.history.store_epoch.is_some(),
+            "the epoch mint must complete (poison refusal is not a write failure)"
+        );
+        let stamped: HistoryRound = serde_json::from_slice(
+            &std::fs::read(round_manifest_path(tmp_snap.path(), r2)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stamped.store_epoch, resumed.history.store_epoch,
+            "the binding sibling manifest must be adopted"
+        );
+        let unstamped: HistoryRound =
+            serde_json::from_slice(&std::fs::read(&poison_path).unwrap()).unwrap();
+        assert_eq!(
+            unstamped.store_epoch, None,
+            "a poisoned manifest must never be blessed on identity alone"
+        );
+        assert!(resumed.resolved_round_maps(r1).is_none());
+        assert!(resumed.rollback(r1).is_err());
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"v2",
+            "a refused restore must not touch the tree"
+        );
+        assert!(
+            resumed.resolved_round_maps(r2).is_some(),
+            "the healthy round must keep resolving"
+        );
+    }
+
+    /// FIX 3: a second watcher on the same store cannot interleave writes —
+    /// it constructs read-only: reads serve, every mutation refuses, and the
+    /// lock releases with the owner.
+    #[test]
+    fn second_watcher_is_read_only_until_lock_released() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut owner = make_watcher(root, tmp_snap.path());
+        owner.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = owner.history.current_head_id.unwrap();
+
+        let mut second = make_watcher(root, tmp_snap.path());
+        assert!(second.read_only, "a locked store must yield read-only");
+        assert_eq!(
+            second.history.rounds.len(),
+            1,
+            "read-only instances still serve the on-disk history"
+        );
+        let err = second
+            .on_round_complete("R2".into(), None, None)
+            .expect_err("round recording must refuse in read-only mode");
+        assert!(err.to_string().contains("read-only"), "clear error: {err}");
+        assert!(second.rollback(r1).is_err());
+        assert!(second.redo().is_err());
+        assert!(second.prune_abandoned().is_err());
+        second.mark_live_index_healthy_for_tests();
+        assert!(
+            second.changes_index_snapshot().is_none(),
+            "read-only instances must not serve the changes fast path"
+        );
+        drop(second);
+        drop(owner);
+
+        let mut reclaimed = make_watcher(root, tmp_snap.path());
+        assert!(!reclaimed.read_only);
+        reclaimed
+            .on_round_complete("R2".into(), None, None)
+            .unwrap();
+    }
+
+    /// FIX 4: a change landing between the construction scan and the notify
+    /// watch registration has no event — the pre-healthy re-sync must pick
+    /// it up before the fast path serves.
+    #[tokio::test]
+    async fn scan_to_watch_gap_is_resynced_before_healthy() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), b"scanned-1").unwrap();
+        let w = make_watcher(&root, tmp_snap.path());
+
+        // Mutate in the gap: the watcher scanned, notify is not running yet.
+        std::fs::write(root.join("a.txt"), b"gap-write").unwrap();
+
+        let (shared, _watcher_handle, _round_handle) = w.start_shared();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let index = loop {
+            if let Some(index) = shared.lock().await.changes_index_snapshot() {
+                break index;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher never became healthy"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            index.current_hashes.get("a.txt"),
+            Some(&hex_encode(&sha256_hash(b"gap-write"))),
+            "the gap write must be visible the moment the index is healthy"
+        );
+    }
+
+    /// FIX 5: a retained EMPTY-tree round (failed migration of a legacy
+    /// round with no files) keeps its authority across reloads via the
+    /// explicit `maps_inline` marker — restore-to-empty still works.
+    #[cfg(unix)]
+    #[test]
+    fn retained_empty_tree_round_survives_reload() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        // R1 records a genuinely empty tree.
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1 empty".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+
+        let mut legacy = w.history.clone();
+        legacy.store_epoch = None;
+        for round in &mut legacy.rounds {
+            let maps = w.resolved_round_maps(round.id).unwrap();
+            round.files_at_end = maps.files_at_end;
+            round.all_files_at_end = maps.all_files_at_end;
+            round.maps_from_round = None;
+            round.maps_inline = false;
+        }
+        assert!(legacy.rounds[0].files_at_end.is_empty(), "empty-tree round");
+        drop(w);
+        let rounds_dir = tmp_snap.path().join("rounds");
+        std::fs::remove_dir_all(&rounds_dir).unwrap();
+        std::fs::create_dir_all(&rounds_dir).unwrap();
+        atomic_write(
+            &tmp_snap.path().join("history.json"),
+            &serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let blocked = make_watcher(root, tmp_snap.path());
+        assert!(
+            blocked.history.rounds[0].maps_inline,
+            "a retained empty-tree round must carry the explicit inline marker"
+        );
+        let persisted = std::fs::read_to_string(tmp_snap.path().join("history.json")).unwrap();
+        assert!(
+            persisted.contains("maps_inline"),
+            "the marker must be durable: {persisted}"
+        );
+        drop(blocked);
+
+        // Reload (manifest dir still unwritable): the marker alone must keep
+        // the round restorable — rolling back to the empty tree deletes the
+        // file created since.
+        let mut reloaded = make_watcher(root, tmp_snap.path());
+        std::fs::write(root.join("late.txt"), b"created later").unwrap();
+        reloaded.rollback(r1).unwrap();
+        assert!(
+            !root.join("late.txt").exists(),
+            "restore-to-empty must still be exact after reload"
+        );
+
+        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// FIX 6: when a binding manifest cannot be restamped (transiently
+    /// unwritable dir), the epoch mint is deferred — never persisted over a
+    /// store whose manifests it would orphan — and the store keeps working
+    /// epoch-less until a later load succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn failed_restamp_defers_epoch_adoption() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        drop(w);
+
+        // Strip the epoch everywhere (pre-epoch store) and make the
+        // manifest home unwritable so the restamp cannot land.
+        let index_path = tmp_snap.path().join("history.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        index.as_object_mut().unwrap().remove("store_epoch");
+        atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
+        for id in [r1, r1 + 1] {
+            let path = round_manifest_path(tmp_snap.path(), id);
+            let mut manifest: HistoryRound =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            manifest.store_epoch = None;
+            atomic_write(&path, &serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        }
+        let rounds_dir = tmp_snap.path().join("rounds");
+        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Manifest subdirs must stay readable but unwritable too.
+        for id in [r1, r1 + 1] {
+            let dir = rounds_dir.join(format!("round_{id}"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let mut deferred = make_watcher(root, tmp_snap.path());
+        assert_eq!(
+            deferred.history.store_epoch, None,
+            "epoch adoption must be deferred when a binding manifest cannot be stamped"
+        );
+        let on_disk = std::fs::read_to_string(&index_path).unwrap();
+        assert!(
+            !on_disk.contains("store_epoch"),
+            "no epoch may persist over unstamped manifests: {on_disk}"
+        );
+        // The store still works epoch-less: content binding guards resolves.
+        assert!(deferred.resolved_round_maps(r1).is_some());
+        deferred.rollback(r1).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+        drop(deferred);
+
+        // Writable again: the next load completes the mint.
+        for id in [r1, r1 + 1] {
+            let dir = rounds_dir.join(format!("round_{id}"));
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let adopted = make_watcher(root, tmp_snap.path());
+        assert!(adopted.history.store_epoch.is_some());
+        let stamped: HistoryRound = serde_json::from_slice(
+            &std::fs::read(round_manifest_path(tmp_snap.path(), r1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stamped.store_epoch, adopted.history.store_epoch);
+        assert!(adopted.resolved_round_maps(r1).is_some());
+    }
+
+    /// FIX 7: a present-but-unparseable history.json is never overwritten —
+    /// it is preserved aside and a fresh timeline starts.
+    #[test]
+    fn damaged_history_json_is_preserved_not_overwritten() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        drop(w);
+
+        let garbage = b"{not json at all";
+        atomic_write(&tmp_snap.path().join("history.json"), garbage).unwrap();
+
+        let resumed = make_watcher(root, tmp_snap.path());
+        assert!(resumed.history.rounds.is_empty(), "fresh timeline");
+        let damaged: Vec<_> = std::fs::read_dir(tmp_snap.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history.json.damaged-")
+            })
+            .collect();
+        assert_eq!(damaged.len(), 1, "damaged index preserved aside");
+        assert_eq!(
+            std::fs::read(damaged[0].path()).unwrap(),
+            garbage,
+            "the damaged bytes must survive untouched"
+        );
+    }
+
+    /// FIX 9a: any baseline-reconciliation failure permanently disables the
+    /// changes fast path (the full scan would diverge from the index
+    /// otherwise) — even after the notify loop reports healthy.
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_failure_disables_fast_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/stale.rs"), b"leftover").unwrap();
+        let first = make_watcher(root, tmp_snap.path());
+        drop(first);
+
+        // The source disappears between runs; the stale baseline copy is
+        // made undeletable.
+        std::fs::remove_file(root.join("sub/stale.rs")).unwrap();
+        let locked_dir = tmp_snap.path().join("baseline").join("sub");
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut second = make_watcher(root, tmp_snap.path());
+        second.mark_live_index_healthy_for_tests();
+        assert!(
+            second.changes_index_snapshot().is_none(),
+            "a failed reconciliation must disable the fast path for good"
+        );
+
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// FIX 9b: path-type changes between runs are reconciled — a stale
+    /// baseline FILE where this run needs a directory, and a stale baseline
+    /// DIRECTORY where this run needs a file.
+    #[test]
+    fn baseline_path_type_changes_are_reconciled() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+
+        // Run 1: `thing` is a file.
+        std::fs::write(root.join("thing"), b"i am a file").unwrap();
+        let first = make_watcher(root, tmp_snap.path());
+        drop(first);
+
+        // Run 2: `thing` became a directory.
+        std::fs::remove_file(root.join("thing")).unwrap();
+        std::fs::create_dir_all(root.join("thing")).unwrap();
+        std::fs::write(root.join("thing/inner.rs"), b"nested now").unwrap();
+        let second = make_watcher(root, tmp_snap.path());
+        assert!(second.baseline_manifest.contains_key("thing/inner.rs"));
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/thing/inner.rs")).unwrap(),
+            b"nested now"
+        );
+        drop(second);
+
+        // Run 3: `thing` is a file again.
+        std::fs::remove_dir_all(root.join("thing")).unwrap();
+        std::fs::write(root.join("thing"), b"file again").unwrap();
+        let third = make_watcher(root, tmp_snap.path());
+        assert!(third.baseline_manifest.contains_key("thing"));
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/thing")).unwrap(),
+            b"file again"
+        );
     }
 }
