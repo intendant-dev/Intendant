@@ -8,8 +8,9 @@
 use super::*;
 
 /// Transport-neutral core of `GET /api/agenda` (tunnel twin
-/// `api_agenda_list`): every item oldest-first plus status counts and the
-/// count of preserved-but-unfolded log lines.
+/// `api_agenda_list`): every item oldest-first plus status counts, the
+/// count of preserved-but-unfolded log lines, and the reminder policy
+/// (read-only here — mutations ride the Settings-gated policy route).
 pub(crate) async fn agenda_list_api_response(
     mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
 ) -> ApiResponse {
@@ -23,8 +24,49 @@ pub(crate) async fn agenda_list_api_response(
             "items": items,
             "counts": counts,
             "skipped_lines": skipped_lines,
+            "reminder_policy": agenda.reminder_policy(),
         })),
     )
+}
+
+/// Transport-neutral core of `POST /api/agenda/reminders/policy` (tunnel
+/// twin `api_agenda_reminder_policy`): body is a merge-patch
+/// ([`crate::agenda::ReminderPolicyPatch`] — absent keeps, `null` clears);
+/// returns the effective policy. Owner policy, Settings-gated.
+pub(crate) async fn agenda_reminder_policy_api_response(
+    body_text: &str,
+    mcp_server: Option<&Arc<crate::mcp::IntendantServer>>,
+) -> ApiResponse {
+    let Some(agenda) = agenda_handle(mcp_server).await else {
+        return ApiResponse::json_error(503, "agenda unavailable on this daemon");
+    };
+    let patch: crate::agenda::ReminderPolicyPatch = match serde_json::from_str(body_text) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return ApiResponse::json_error(400, format!("invalid reminder policy patch: {err}"));
+        }
+    };
+    if patch.is_empty() {
+        return ApiResponse::json_error(400, "policy patch changes nothing");
+    }
+    match agenda.update_reminder_policy(patch) {
+        Ok(policy) => ApiResponse::json(
+            200,
+            JsonBody::Value(serde_json::json!({ "reminder_policy": policy })),
+        ),
+        Err(err) => ApiResponse::json_error(500, format!("saving reminder policy: {err}")),
+    }
+}
+
+pub(crate) async fn handle_agenda_reminder_policy(
+    stream: DemuxStream,
+    body_text: String,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) {
+    let response = agenda_reminder_policy_api_response(&body_text, mcp_server.as_ref()).await;
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 /// Transport-neutral core of `POST /api/agenda/op` (tunnel twin

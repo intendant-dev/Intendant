@@ -8,22 +8,69 @@
 //! need synchronous results (the minted id, a 400/404), which the
 //! request/response surfaces already provide.
 
+use super::reminders::{ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore};
 use super::store::{AgendaError, AgendaStore};
 use super::types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem};
 use crate::event::{AppEvent, EventBus};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub(crate) struct AgendaHandle {
     store: Mutex<AgendaStore>,
     bus: EventBus,
+    /// The agenda dir (op log, reminder policy, occurrence journal).
+    dir: PathBuf,
+    /// Owner-controlled reminder delivery policy (see `reminders.rs`).
+    reminder_policy: Mutex<ReminderPolicyStore>,
+    /// Wakes the reminder scheduler after any change that can move the
+    /// plan: an applied op (due patched, item completed) or a policy edit.
+    reminder_nudge: tokio::sync::Notify,
 }
 
 impl AgendaHandle {
-    pub(crate) fn new(store: AgendaStore, bus: EventBus) -> Self {
+    pub(crate) fn new(store: AgendaStore, bus: EventBus, dir: &Path) -> Self {
         Self {
             store: Mutex::new(store),
             bus,
+            dir: dir.to_path_buf(),
+            reminder_policy: Mutex::new(ReminderPolicyStore::open(dir)),
+            reminder_nudge: tokio::sync::Notify::new(),
         }
+    }
+
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub(crate) fn bus(&self) -> &EventBus {
+        &self.bus
+    }
+
+    pub(crate) fn reminder_policy(&self) -> ReminderPolicy {
+        match self.reminder_policy.lock() {
+            Ok(guard) => guard.policy().clone(),
+            Err(poisoned) => poisoned.into_inner().policy().clone(),
+        }
+    }
+
+    pub(crate) fn update_reminder_policy(
+        &self,
+        patch: ReminderPolicyPatch,
+    ) -> std::io::Result<ReminderPolicy> {
+        let policy = {
+            let mut guard = match self.reminder_policy.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.update(patch)?.clone()
+        };
+        self.reminder_nudge.notify_waiters();
+        Ok(policy)
+    }
+
+    /// Await the next plan-moving change (op applied or policy edited).
+    pub(crate) async fn reminder_nudged(&self) {
+        self.reminder_nudge.notified().await;
     }
 
     /// Validate and apply one command, then broadcast `agenda_changed` so
@@ -44,6 +91,7 @@ impl AgendaHandle {
             item: item.clone(),
             counts,
         });
+        self.reminder_nudge.notify_waiters();
         Ok(item)
     }
 
@@ -84,7 +132,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus);
+        let handle = AgendaHandle::new(AgendaStore::open(dir.path()).unwrap(), bus, dir.path());
 
         let item = handle
             .apply(
