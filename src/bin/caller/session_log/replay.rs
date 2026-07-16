@@ -81,6 +81,43 @@ pub(crate) fn read_model_response_content(
     fs::read_to_string(path).unwrap_or_else(|_| message.to_string())
 }
 
+/// Monotonic generation per logs ROOT (the parent of session log dirs),
+/// bumped by [`crate::session_log::SessionLog`] on every `agent_output`
+/// append anywhere under that root. The gateway's negative agent-output
+/// memo records the generation it observed at sweep time and treats any
+/// mismatch as stale — so an id that a sweep missed becomes findable the
+/// moment ANY session under the root appends output, instead of after a
+/// fixed TTL. Keys are the paths as constructed by the standard home flow
+/// (`SessionLog::resolve_path_in_home` under `<home>/.intendant/logs`);
+/// an exotic symlinked root would only make the memo distrust itself
+/// more, never trust a stale verdict longer.
+static AGENT_OUTPUT_GENERATIONS: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::Mutex::new(None);
+
+/// Current append generation for a logs root (0 until the first append).
+pub fn agent_output_generation(logs_root: &Path) -> u64 {
+    AGENT_OUTPUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|map| map.get(logs_root).copied())
+        .unwrap_or(0)
+}
+
+/// Bump the generation for the logs root containing `log_dir`. Called at
+/// the `agent_output` write choke point.
+pub(crate) fn note_agent_output_appended(log_dir: &Path) {
+    let Some(root) = log_dir.parent() else {
+        return;
+    };
+    let mut map = AGENT_OUTPUT_GENERATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(std::collections::HashMap::new);
+    *map.entry(root.to_path_buf()).or_insert(0) += 1;
+}
+
 pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOutputChunk> {
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     if wanted.is_empty() {

@@ -1748,6 +1748,9 @@ impl SessionLog {
         output_id: Option<&str>,
         item_id: Option<&str>,
     ) {
+        // Invalidates the gateway's negative agent-output memo for this
+        // logs root (see `replay::agent_output_generation`).
+        super::replay::note_agent_output_appended(self.dir());
         let stdout_span = if !stdout.is_empty() {
             self.append_turn_file_span("stdout.txt", stdout)
         } else {

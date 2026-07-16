@@ -21,27 +21,71 @@ pub(crate) static SESSIONS_SEARCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::M
 const AGENT_OUTPUT_SWEEP_MAX_DIRS: usize = 64;
 
 /// How long a store-sweep miss is remembered per (logs root, output id).
-/// Output rows are append-once historical records: an id the sweep could
-/// not find does not appear later in swept dirs (a *live* session's rows
-/// land in the primary dir, which is never memoized). The TTL exists so the
-/// memo self-heals anyway, e.g. across a session-dir move.
+/// A memoized miss is ALSO discarded the moment any session under the root
+/// appends agent output (the append generation below), so the TTL is a
+/// backstop for writes the generation cannot see (e.g. a session dir moved
+/// into the root), not the primary invalidation.
 const AGENT_OUTPUT_NEGATIVE_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const AGENT_OUTPUT_NEGATIVE_MEMO_CAP: usize = 1024;
 
+/// Requests carry at most this many output ids (after dedup); beyond it the
+/// request is refused with a 400. The dashboard fetches a handful per
+/// output group, and `agent_output_json_body_accepts_large_id_lists` pins a
+/// deliberate 2026-05 decision that several-hundred-id lists stay accepted
+/// — so the cap sits above that contract, aligned with the negative-memo
+/// cap. It is a hard ceiling against degenerate requests; the memo-flood
+/// vector specifically is closed at insertion regardless of id count.
+const AGENT_OUTPUT_MAX_IDS_PER_REQUEST: usize = 1024;
+
+/// A remembered sweep miss: valid until `expires_at`, and only while the
+/// logs root's agent-output append generation still equals `generation`.
+struct AgentOutputNegativeEntry {
+    expires_at: std::time::Instant,
+    generation: u64,
+}
+
 static AGENT_OUTPUT_NEGATIVE_MEMO: std::sync::Mutex<
-    Option<HashMap<(PathBuf, String), std::time::Instant>>,
+    Option<HashMap<(PathBuf, String), AgentOutputNegativeEntry>>,
 > = std::sync::Mutex::new(None);
 
-fn agent_output_negative_memo_fresh(logs_dir: &Path, id: &str) -> bool {
+/// Serializes tests that assert on the process-global negative memo (the
+/// cap test deliberately fills it; unserialized, that starves concurrent
+/// tests' inserts). Same idiom as `SESSIONS_SEARCH_TEST_LOCK`.
+#[cfg(test)]
+pub(crate) static AGENT_OUTPUT_MEMO_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only: drop every memo entry so capacity-sensitive assertions start
+/// from a known state.
+#[cfg(test)]
+fn agent_output_negative_memo_reset() {
+    *AGENT_OUTPUT_NEGATIVE_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// `generation` is the root's current append generation
+/// (`session_log::agent_output_generation`): an entry recorded under an
+/// older generation is stale — output was appended somewhere under the
+/// root since the sweep that missed — and must not veto a re-sweep.
+fn agent_output_negative_memo_fresh(logs_dir: &Path, id: &str, generation: u64) -> bool {
     let memo = AGENT_OUTPUT_NEGATIVE_MEMO
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     memo.as_ref()
         .and_then(|memo| memo.get(&(logs_dir.to_path_buf(), id.to_string())))
-        .is_some_and(|expiry| *expiry > std::time::Instant::now())
+        .is_some_and(|entry| {
+            entry.generation == generation && entry.expires_at > std::time::Instant::now()
+        })
 }
 
-fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String]) {
+/// Record sweep misses under the generation observed BEFORE the sweep ran:
+/// an append racing the sweep bumps the generation and the entry is born
+/// stale, which fails toward re-sweeping. The cap is enforced at insertion
+/// — expired entries are pruned when full, then remaining inserts are
+/// SKIPPED (skipping only costs a future re-sweep); the map is never
+/// cleared wholesale, so a flood of scripted ids cannot evict everyone
+/// else's entries.
+fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String], generation: u64) {
     if ids.is_empty() {
         return;
     }
@@ -51,17 +95,19 @@ fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String]) {
     let memo = memo.get_or_insert_with(HashMap::new);
     let now = std::time::Instant::now();
     if memo.len() + ids.len() > AGENT_OUTPUT_NEGATIVE_MEMO_CAP {
-        memo.retain(|_, expiry| *expiry > now);
-        // Still over cap after pruning expired entries: drop the memo rather
-        // than let a scripted id flood grow it; the cost is re-sweeping.
-        if memo.len() + ids.len() > AGENT_OUTPUT_NEGATIVE_MEMO_CAP {
-            memo.clear();
-        }
+        memo.retain(|_, entry| entry.expires_at > now);
     }
     for id in ids {
+        let key = (logs_dir.to_path_buf(), id.clone());
+        if memo.len() >= AGENT_OUTPUT_NEGATIVE_MEMO_CAP && !memo.contains_key(&key) {
+            continue;
+        }
         memo.insert(
-            (logs_dir.to_path_buf(), id.clone()),
-            now + AGENT_OUTPUT_NEGATIVE_MEMO_TTL,
+            key,
+            AgentOutputNegativeEntry {
+                expires_at: now + AGENT_OUTPUT_NEGATIVE_MEMO_TTL,
+                generation,
+            },
         );
     }
 }
@@ -81,11 +127,15 @@ pub(crate) fn agent_output_chunks_with_fallback(
         if let Some(logs_dir) = fallback_logs_dir {
             // Ids a recent sweep of this store already failed to resolve are
             // not re-swept — dashboard retries otherwise re-read the store
-            // per poll for as long as a stale id stays on screen.
+            // per poll for as long as a stale id stays on screen. Read the
+            // append generation ONCE, before sweeping: misses are memoized
+            // under it, so an append racing this sweep leaves the memo
+            // already stale.
+            let generation = crate::session_log::agent_output_generation(logs_dir);
             let sweep_ids: Vec<String> = ids
                 .iter()
                 .filter(|id| !found.contains_key(id.as_str()))
-                .filter(|id| !agent_output_negative_memo_fresh(logs_dir, id))
+                .filter(|id| !agent_output_negative_memo_fresh(logs_dir, id, generation))
                 .cloned()
                 .collect();
             if !sweep_ids.is_empty() {
@@ -101,7 +151,15 @@ pub(crate) fn agent_output_chunks_with_fallback(
                         }
                     }
                 }
-                dirs.sort_by_key(|b| std::cmp::Reverse(session_log_mtime(b)));
+                // Deterministic order: newest session.jsonl first, path as
+                // the tie-breaker so equal-mtime dirs cannot flap in and out
+                // of the bounded window between sweeps. Ids living only in
+                // the 65th+ most-recent dirs are out of sweep scope by
+                // design (the audit's bound; a per-id → session index is
+                // the recorded follow-up if archaeology ever matters).
+                dirs.sort_by_cached_key(|dir| {
+                    (std::cmp::Reverse(session_log_mtime(dir)), dir.clone())
+                });
                 dirs.truncate(AGENT_OUTPUT_SWEEP_MAX_DIRS);
 
                 for dir in dirs {
@@ -121,7 +179,7 @@ pub(crate) fn agent_output_chunks_with_fallback(
                     .into_iter()
                     .filter(|id| !found.contains_key(id.as_str()))
                     .collect();
-                agent_output_negative_memo_insert(logs_dir, &still_missing);
+                agent_output_negative_memo_insert(logs_dir, &still_missing, generation);
             }
         }
     }
@@ -191,15 +249,27 @@ pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>,
     let Some(ids) = parsed.get("ids").and_then(|ids| ids.as_array()) else {
         return Err("missing output ids".to_string());
     };
+    // Dedupe (first occurrence wins, order preserved) — repeated ids would
+    // otherwise multiply lookup and memo work for free — then cap: one
+    // request must not be able to monopolize the lookup path or flood the
+    // negative memo.
+    let mut seen: HashSet<&str> = HashSet::new();
     let ids: Vec<String> = ids
         .iter()
         .filter_map(|id| id.as_str())
         .map(str::trim)
         .filter(|id| is_valid_agent_output_id(id))
+        .filter(|id| seen.insert(id))
         .map(ToString::to_string)
         .collect();
     if ids.is_empty() {
         return Err("missing output ids".to_string());
+    }
+    if ids.len() > AGENT_OUTPUT_MAX_IDS_PER_REQUEST {
+        return Err(format!(
+            "too many output ids in one request: {} (max {AGENT_OUTPUT_MAX_IDS_PER_REQUEST}); split the fetch",
+            ids.len()
+        ));
     }
     Ok(ids)
 }
@@ -3082,11 +3152,21 @@ pub(crate) async fn handle_session_agent_output_from_home(
         .unwrap_or("");
     let path = rest.split('?').next().unwrap_or(rest);
     let rest_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let session_id = rest_parts.first().copied().unwrap_or("");
+    let session_id = rest_parts.first().copied().unwrap_or("").to_string();
     let is_agent_output_route = rest_parts.get(1).copied() == Some("agent-output");
     let source = query_param(request_line, "source").unwrap_or_else(|| "intendant".to_string());
     let response = if is_agent_output_route {
-        session_agent_output_api_response(home, &body_text, session_id, &source)
+        // Same blocking-pool treatment as the /current twin: the lookup
+        // reads and filters full session logs (native path) or external
+        // transcripts, which stalled a gateway worker when run inline.
+        let home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            session_agent_output_api_response(&home, &body_text, &session_id, &source)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            session_wildcard_json_error(500, &format!("agent output task failed: {e}"))
+        })
     } else {
         session_wildcard_json_error(404, "unknown session output route")
     };
@@ -6131,6 +6211,30 @@ mod tests {
         assert_eq!(parsed[699], "ao-19e4f985a17-2bb");
     }
 
+    /// Repeated ids collapse to their first occurrence, and a list past the
+    /// hard per-request ceiling is refused outright.
+    #[test]
+    fn agent_output_json_body_dedupes_and_caps_ids() {
+        let body = serde_json::json!({ "ids": ["ao-1", "ao-2", "ao-1", "ao-2", "ao-3"] });
+        let parsed = agent_output_ids_from_json_body(&body.to_string()).unwrap();
+        assert_eq!(parsed, vec!["ao-1", "ao-2", "ao-3"]);
+
+        let oversized: Vec<String> = (0..(AGENT_OUTPUT_MAX_IDS_PER_REQUEST + 1))
+            .map(|n| format!("ao-cap-{n}"))
+            .collect();
+        let body = serde_json::json!({ "ids": oversized }).to_string();
+        let err = agent_output_ids_from_json_body(&body).unwrap_err();
+        assert!(err.contains("too many output ids"), "error: {err}");
+
+        // Duplicates are removed BEFORE the cap is applied: a list that
+        // dedupes under the ceiling stays accepted.
+        let dup_heavy: Vec<String> = (0..(AGENT_OUTPUT_MAX_IDS_PER_REQUEST + 200))
+            .map(|n| format!("ao-dup-{}", n % 8))
+            .collect();
+        let body = serde_json::json!({ "ids": dup_heavy }).to_string();
+        assert_eq!(agent_output_ids_from_json_body(&body).unwrap().len(), 8);
+    }
+
     // ── Golden HTTP transcripts: the sessions read-core wire contract ──
     //
     // Byte-exact pins of the session list / search / detail /
@@ -6435,31 +6539,87 @@ mod tests {
         );
     }
 
-    /// A store-sweep miss is remembered per (logs root, id) and expires;
-    /// distinct roots never share a verdict. (The memo only ever guards the
-    /// fallback sweep — the primary dir is re-read on every fetch.)
+    /// A store-sweep miss is remembered per (logs root, id), expires, and
+    /// is discarded when the root's append generation moves; distinct roots
+    /// never share a verdict. (The memo only ever guards the fallback
+    /// sweep — the primary dir is re-read on every fetch.)
     #[test]
-    fn agent_output_negative_memo_is_root_scoped_and_expiring() {
+    fn agent_output_negative_memo_is_root_and_generation_scoped() {
+        let _guard = AGENT_OUTPUT_MEMO_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
         let ids = vec!["memo-probe-1".to_string()];
-        assert!(!agent_output_negative_memo_fresh(root_a.path(), &ids[0]));
-        agent_output_negative_memo_insert(root_a.path(), &ids);
-        assert!(agent_output_negative_memo_fresh(root_a.path(), &ids[0]));
+        assert!(!agent_output_negative_memo_fresh(root_a.path(), &ids[0], 7));
+        agent_output_negative_memo_insert(root_a.path(), &ids, 7);
+        assert!(agent_output_negative_memo_fresh(root_a.path(), &ids[0], 7));
         assert!(
-            !agent_output_negative_memo_fresh(root_b.path(), &ids[0]),
+            !agent_output_negative_memo_fresh(root_a.path(), &ids[0], 8),
+            "an append-bumped generation must invalidate the memoized miss"
+        );
+        assert!(
+            !agent_output_negative_memo_fresh(root_b.path(), &ids[0], 7),
             "a miss under one logs root must not veto sweeps under another"
         );
         assert!(!agent_output_negative_memo_fresh(
             root_a.path(),
-            "memo-probe-other"
+            "memo-probe-other",
+            7
         ));
     }
 
-    /// The bounded sweep still resolves ids from sibling dirs and reports
-    /// what it could not find; a memoized miss suppresses only re-sweeps.
+    /// The insertion-enforced cap never clears other entries: an oversized
+    /// batch of fresh ids is simply not memoized once the map is full (the
+    /// cost is a re-sweep), while pre-existing entries survive.
     #[test]
-    fn agent_output_fallback_resolves_sibling_and_memoizes_miss() {
+    fn agent_output_negative_memo_cap_skips_instead_of_clearing() {
+        let _guard = AGENT_OUTPUT_MEMO_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Deliberately fills the global memo: start from and return to a
+        // clean slate so capacity is never leaked into other tests.
+        agent_output_negative_memo_reset();
+        let keeper_root = tempfile::tempdir().unwrap();
+        let flood_root = tempfile::tempdir().unwrap();
+        let keeper = vec!["memo-cap-keeper".to_string()];
+        agent_output_negative_memo_insert(keeper_root.path(), &keeper, 1);
+        assert!(agent_output_negative_memo_fresh(
+            keeper_root.path(),
+            &keeper[0],
+            1
+        ));
+
+        // Flood far past the cap in one insert call (the old clear-then-
+        // insert-all shape would have evicted the keeper).
+        let flood: Vec<String> = (0..(AGENT_OUTPUT_NEGATIVE_MEMO_CAP + 64))
+            .map(|i| format!("memo-cap-flood-{i}"))
+            .collect();
+        agent_output_negative_memo_insert(flood_root.path(), &flood, 1);
+        assert!(
+            agent_output_negative_memo_fresh(keeper_root.path(), &keeper[0], 1),
+            "a flood of new ids must not evict existing entries"
+        );
+        assert!(
+            !agent_output_negative_memo_fresh(
+                flood_root.path(),
+                &flood[AGENT_OUTPUT_NEGATIVE_MEMO_CAP + 32],
+                1
+            ),
+            "ids beyond the cap are skipped, not memoized"
+        );
+        agent_output_negative_memo_reset();
+    }
+
+    /// The bounded sweep still resolves ids from sibling dirs and reports
+    /// what it could not find; a memoized miss suppresses only re-sweeps,
+    /// and an agent-output append under the root makes it stale — the id
+    /// becomes findable immediately, not after the TTL.
+    #[test]
+    fn agent_output_fallback_memoizes_miss_until_root_appends() {
+        let _guard = AGENT_OUTPUT_MEMO_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
         let logs_root = home.path().join("logs");
         let primary = logs_root.join("primary");
@@ -6474,20 +6634,41 @@ mod tests {
         let ids = vec![
             "fb-primary".to_string(),
             "fb-sibling".to_string(),
-            "fb-nowhere".to_string(),
+            "fb-late".to_string(),
         ];
         let chunks = agent_output_chunks_with_fallback(&primary, &ids, Some(&logs_root));
         let found: Vec<&str> = chunks.iter().map(|c| c.output_id.as_str()).collect();
         assert_eq!(found, vec!["fb-primary", "fb-sibling"]);
+        let generation = crate::session_log::agent_output_generation(&logs_root);
         assert!(
-            agent_output_negative_memo_fresh(&logs_root, "fb-nowhere"),
+            agent_output_negative_memo_fresh(&logs_root, "fb-late", generation),
             "the unresolved id must be memoized against immediate re-sweeps"
         );
-        assert!(!agent_output_negative_memo_fresh(&logs_root, "fb-sibling"));
+        assert!(!agent_output_negative_memo_fresh(
+            &logs_root,
+            "fb-sibling",
+            generation
+        ));
 
         // Second query: identical answer (memo affects IO, not results).
         let chunks = agent_output_chunks_with_fallback(&primary, &ids, Some(&logs_root));
         assert_eq!(chunks.len(), 2);
+
+        // The formerly-missing id gets WRITTEN to a sibling session: the
+        // append bumps the root generation, the memo goes stale, and the
+        // very next fetch resolves it — the cross-session blind window the
+        // generation exists to close.
+        let late_dir = logs_root.join("late");
+        let mut log = crate::session_log::SessionLog::open(late_dir).unwrap();
+        log.agent_output_with_id("late out", "", None, Some("fb-late"));
+        drop(log);
+        let chunks = agent_output_chunks_with_fallback(&primary, &ids, Some(&logs_root));
+        let found: Vec<&str> = chunks.iter().map(|c| c.output_id.as_str()).collect();
+        assert_eq!(
+            found,
+            vec!["fb-primary", "fb-sibling", "fb-late"],
+            "an appended output must be findable immediately after the append"
+        );
     }
 
     #[tokio::test]

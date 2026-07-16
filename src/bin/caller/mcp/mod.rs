@@ -1209,7 +1209,14 @@ impl IntendantServer {
                 )
             })
             .await
-            .unwrap_or((None, None))
+            .unwrap_or_else(|e| {
+                // A JoinError here is a panic (or forced shutdown) inside
+                // the merge — answer without ledgers, but never silently:
+                // a status payload missing its ledgers looks identical to
+                // "no fission activity" to the caller.
+                eprintln!("[mcp] get_status ledger merge task failed: {e}");
+                (None, None)
+            })
         };
         if let Some(ledger) = ledgers.0 {
             if let Some(obj) = value.as_object_mut() {
