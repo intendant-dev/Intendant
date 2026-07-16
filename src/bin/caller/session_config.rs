@@ -983,7 +983,12 @@ fn find_wrapper_config_for_external_session(
     // Newest first: a resumed session is almost always among the most recent
     // stores, and the per-directory identity check below can end up reading
     // session logs — in readdir order a hit near the end pays that cost
-    // across the whole store.
+    // across the whole store. The sort key is the wrapper CONFIG file's
+    // mtime, not the directory's: unrelated bookkeeping rewrites bump a
+    // store dir's mtime, while the config file only changes when the launch
+    // config itself is (re)written. Directories without a config sort last
+    // (epoch) but stay in the scan — the loop below skips them exactly as
+    // before, preserving the exhaustive-until-exact-match semantics.
     let mut dirs: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
         .flatten()
         .filter_map(|entry| {
@@ -991,8 +996,7 @@ fn find_wrapper_config_for_external_session(
             if !dir.is_dir() {
                 return None;
             }
-            let modified = entry
-                .metadata()
+            let modified = std::fs::metadata(dir.join(SESSION_AGENT_CONFIG_FILE))
                 .and_then(|meta| meta.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             Some((modified, dir))
