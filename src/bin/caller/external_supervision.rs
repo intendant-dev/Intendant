@@ -1042,10 +1042,20 @@ pub(crate) struct LimitParkState {
 
 /// The session-log/activity row announcing a park. One place so the two
 /// lanes (persistent daemon lane and the supervised external-mode lane)
-/// cannot drift.
-pub(crate) fn limit_park_log_line(resets_at_epoch: Option<u64>, now_epoch: u64) -> String {
+/// cannot drift. `has_pending` says whether a rejected message will be
+/// re-sent when the park elapses.
+pub(crate) fn limit_park_log_line(
+    resets_at_epoch: Option<u64>,
+    now_epoch: u64,
+    has_pending: bool,
+) -> String {
+    let tail = if has_pending {
+        "will auto-resume and re-send the pending message (messages arriving meanwhile queue)"
+    } else {
+        "messages arriving meanwhile queue until the limit resets"
+    };
     format!(
-        "Rate-limited — parked; {}; will auto-resume and re-send the pending message (messages arriving meanwhile queue)",
+        "Rate-limited — parked; {}; {tail}",
         external_agent::limit_reset_phrase(resets_at_epoch, now_epoch)
     )
 }

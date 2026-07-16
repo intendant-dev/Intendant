@@ -262,6 +262,16 @@ pub(crate) async fn run_external_agent_mode(
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
     let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
+    // Rate-limit park (park-until-reset): armed when a turn ends
+    // limit-rejected. While parked, the idle wait holds new input in
+    // `parked_follow_ups` instead of burning it against the rejected
+    // backend; the park timer re-sends the pending message at the reset.
+    // The streak counts consecutive limit-rejections (backoff input when
+    // the wire carries no reset time) and clears on any completed turn.
+    let mut limit_park: Option<LimitParkState> = None;
+    let mut limit_park_streak: u32 = 0;
+    let mut parked_follow_ups: std::collections::VecDeque<FollowUpMessage> =
+        std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
     let mut managed_context_density_block_handoffs_without_relief = 0u8;
     let mut managed_context_surgical_recoveries = 0u8;
@@ -323,11 +333,37 @@ pub(crate) async fn run_external_agent_mode(
         let followup = match next_turn.take() {
             Some(turn) => turn,
             None => loop {
-                if has_queued_steers_for_session(
-                    &context_injection,
-                    live_session_id.as_deref(),
-                    drain_config.alias_session_id.as_deref(),
-                ) {
+                if limit_park.is_none() {
+                    // Flush messages queued during a rate-limit park,
+                    // oldest first, honoring cancels recorded while they
+                    // waited. (Steer-id dedup happened when each message
+                    // entered the queue — the queue is not a second
+                    // delivery path.)
+                    let mut flushed = None;
+                    while let Some(queued) = parked_follow_ups.pop_front() {
+                        if follow_up_message_was_cancelled(&mut cancelled_follow_ups, &queued) {
+                            slog(&session_log, |l| {
+                                l.info("Skipped cancelled queued follow-up")
+                            });
+                            continue;
+                        }
+                        flushed = Some(queued);
+                        break;
+                    }
+                    if let Some(queued) = flushed {
+                        break queued;
+                    }
+                }
+                // While parked, a queued steer must not trigger an empty
+                // flush turn into the rejected backend — it merges into
+                // the pending re-send at resume instead.
+                if limit_park.is_none()
+                    && has_queued_steers_for_session(
+                        &context_injection,
+                        live_session_id.as_deref(),
+                        drain_config.alias_session_id.as_deref(),
+                    )
+                {
                     break FollowUpMessage::text(String::new());
                 }
                 tokio::select! {
@@ -364,6 +400,50 @@ pub(crate) async fn run_external_agent_mode(
                                 stats.terminal_outcome =
                                     Some("follow-up channel closed".to_string());
                                 break 'outer;
+                            }
+                        }
+                    }
+                    // Rate-limit park timer: at the reset (plus jitter),
+                    // re-send the message the limit rejected. Messages
+                    // queued meanwhile flush right after via the
+                    // parked-flush preamble above.
+                    _ = tokio::time::sleep_until(
+                        limit_park
+                            .as_ref()
+                            .map(|park| park.resume_at)
+                            .unwrap_or_else(tokio::time::Instant::now)
+                    ), if limit_park.is_some() => {
+                        let park = limit_park.take().expect("branch guarded by is_some");
+                        match park.pending {
+                            Some(pending)
+                                if !follow_up_message_was_cancelled(
+                                    &mut cancelled_follow_ups,
+                                    &pending,
+                                ) =>
+                            {
+                                let line =
+                                    "Rate-limit park elapsed — re-sending the parked message";
+                                slog(&session_log, |l| l.info(line));
+                                bus.send(AppEvent::LogEntry {
+                                    session_id: live_session_id.clone(),
+                                    level: "info".to_string(),
+                                    source: "Intendant".to_string(),
+                                    content: line.to_string(),
+                                    turn: None,
+                                });
+                                break pending;
+                            }
+                            Some(_) => {
+                                slog(&session_log, |l| {
+                                    l.info(
+                                        "Rate-limit park elapsed — the parked message was cancelled; awaiting input",
+                                    )
+                                });
+                            }
+                            None => {
+                                slog(&session_log, |l| {
+                                    l.info("Rate-limit park elapsed — awaiting input")
+                                });
                             }
                         }
                     }
@@ -612,6 +692,32 @@ pub(crate) async fn run_external_agent_mode(
                                                     round,
                                                     turns_in_round,
                                                     native_message_count: None,
+                                                });
+                                            }
+                                            DrainOutcome::LimitRejected {
+                                                resets_at_epoch, ..
+                                            } => {
+                                                // A backend-started round
+                                                // ended limit-rejected:
+                                                // nothing to re-send and no
+                                                // round to count — log and
+                                                // return to idle. (A later
+                                                // user message that gets
+                                                // rejected parks properly
+                                                // with itself as pending.)
+                                                round = round.saturating_sub(1);
+                                                let park_line = limit_park_log_line(
+                                                    resets_at_epoch,
+                                                    crate::session_activity::epoch_seconds(),
+                                                    false,
+                                                );
+                                                slog(&session_log, |l| l.warn(&park_line));
+                                                bus.send(AppEvent::LogEntry {
+                                                    session_id: live_session_id.clone(),
+                                                    level: "warn".to_string(),
+                                                    source: "Intendant".to_string(),
+                                                    content: park_line,
+                                                    turn: None,
                                                 });
                                             }
                                             DrainOutcome::ContextRewindRequested {
@@ -1065,7 +1171,27 @@ pub(crate) async fn run_external_agent_mode(
                             {
                                 // Ignore idle interrupts; this shared receiver
                                 // consumed the event, so the next task will not
-                                // inherit a stale Stop request.
+                                // inherit a stale Stop request. A live
+                                // rate-limit park is the exception: the
+                                // interrupt cancels the timer and drops the
+                                // pending re-send (messages queued during the
+                                // park stay queued and flush normally).
+                                if let Some(park) = limit_park.take() {
+                                    limit_park_streak = 0;
+                                    let line = if park.pending.is_some() {
+                                        "Rate-limit park cancelled by interrupt — dropped the pending re-send"
+                                    } else {
+                                        "Rate-limit park cancelled by interrupt"
+                                    };
+                                    slog(&session_log, |l| l.info(line));
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "info".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: line.to_string(),
+                                        turn: None,
+                                    });
+                                }
                             }
                             Ok(_) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1083,6 +1209,30 @@ pub(crate) async fn run_external_agent_mode(
             slog(&session_log, |l| {
                 l.info("Skipped cancelled queued follow-up")
             });
+            continue;
+        }
+        if limit_park.is_some() {
+            // Rate-limit park: never burn input against the rejected
+            // backend (a delivered message would be consumed with zero
+            // work). Queue it and return to the idle wait; the flush
+            // preamble delivers it after the pending re-send.
+            slog(&session_log, |l| l.info(LIMIT_PARK_QUEUED_MESSAGE_LOG));
+            bus.send(AppEvent::LogEntry {
+                session_id: live_session_id.clone(),
+                level: "info".to_string(),
+                source: "Intendant".to_string(),
+                content: LIMIT_PARK_QUEUED_MESSAGE_LOG.to_string(),
+                turn: None,
+            });
+            emit_follow_up_status(
+                &bus,
+                live_session_id.as_deref(),
+                &followup.follow_up_id,
+                Some(&followup.text),
+                "queued",
+                Some("rate-limited; delivers when the limit resets"),
+            );
+            parked_follow_ups.push_back(followup);
             continue;
         }
         let active_followup_for_rewind_replay = followup.clone();
@@ -1812,6 +1962,25 @@ pub(crate) async fn run_external_agent_mode(
                                 native_message_count: None,
                             });
                         }
+                        DrainOutcome::LimitRejected { resets_at_epoch, .. } => {
+                            // The in-flight turn ended rejected at the
+                            // provider limit; no round to record. The turn
+                            // is over, so the user's edit rollback below
+                            // proceeds like any completed turn.
+                            let park_line = limit_park_log_line(
+                                resets_at_epoch,
+                                crate::session_activity::epoch_seconds(),
+                                false,
+                            );
+                            slog(&session_log, |l| l.warn(&park_line));
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content: park_line,
+                                turn: None,
+                            });
+                        }
                         DrainOutcome::ContextRewindRequested {
                             request,
                             message,
@@ -2102,6 +2271,8 @@ pub(crate) async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
+                // A completed turn proves the provider is serving again.
+                limit_park_streak = 0;
                 if codex_managed_context_enabled {
                     match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
@@ -2441,6 +2612,58 @@ pub(crate) async fn run_external_agent_mode(
                     round,
                     turns_in_round,
                     native_message_count: None,
+                });
+            }
+            DrainOutcome::LimitRejected {
+                resets_at_epoch,
+                message: _,
+                turns_in_round: _,
+            } => {
+                // The round did no work: hand its number back so the
+                // retried round reuses it, count no round (no DoneSignal /
+                // RoundComplete — those were the burn), and park instead
+                // of re-firing. The incident class burned follow-up
+                // rounds at decaying intervals until the budget silently
+                // exhausted, with the reset time on the wire the whole
+                // time.
+                round = round.saturating_sub(1);
+                limit_park_streak = limit_park_streak.saturating_add(1);
+                let now_epoch = crate::session_activity::epoch_seconds();
+                let delay = limit_park_delay(
+                    resets_at_epoch,
+                    now_epoch,
+                    limit_park_streak,
+                    limit_park_jitter_secs(),
+                );
+                let park_line = limit_park_log_line(resets_at_epoch, now_epoch, true);
+                slog(&session_log, |l| l.warn(&park_line));
+                bus.send(AppEvent::LogEntry {
+                    session_id: live_session_id.clone(),
+                    level: "warn".to_string(),
+                    source: "Intendant".to_string(),
+                    content: park_line,
+                    turn: None,
+                });
+                emit_external_turn_status(
+                    &bus,
+                    &autonomy,
+                    live_session_id.as_deref(),
+                    round.saturating_add(1),
+                    "waiting-rate-limit",
+                    format!(
+                        "{} rate-limited; parked until the limit resets",
+                        agent.name()
+                    ),
+                )
+                .await;
+                // Re-send exactly what the limit rejected: the merged
+                // text (queued steers were already consumed into it) with
+                // the original attachments.
+                let mut pending = active_followup_for_rewind_replay.clone();
+                pending.text = merged.clone();
+                limit_park = Some(LimitParkState {
+                    resume_at: tokio::time::Instant::now() + delay,
+                    pending: Some(pending),
                 });
             }
             DrainOutcome::ContextRewindRequested {
