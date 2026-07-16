@@ -1268,7 +1268,9 @@ pub(crate) async fn run_agent_loop(
         // Log reasoning content if available
         if response.reasoning_summary.is_some() || response.reasoning_content.is_some() {
             slog(&session_log, |l| {
-                l.reasoning_content(
+                l.reasoning_content_for_session(
+                    local_session_id.as_deref(),
+                    None,
                     response.reasoning_summary.as_deref(),
                     response.reasoning_content.as_deref(),
                 )

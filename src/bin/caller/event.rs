@@ -3568,7 +3568,12 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 );
             }
             if let Some(ref r) = reasoning {
-                log.reasoning_content(Some(r.as_str()), None);
+                log.reasoning_content_for_session(
+                    session_id.as_deref(),
+                    source.as_deref(),
+                    Some(r.as_str()),
+                    None,
+                );
             }
         }
 

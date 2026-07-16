@@ -66,6 +66,7 @@ ui2-activity.js
 
 40-session-launch.js
 41-session-window-actions.js
+41b-reasoning-log.js
 42-usage-terminal.js
 42b-access-model.js
 43-access-panes.js
