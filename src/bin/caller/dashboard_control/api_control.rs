@@ -1103,7 +1103,11 @@ pub(crate) async fn api_mcp_tool_call_response(
             arguments,
             session_id.as_deref(),
             managed_context,
-            crate::mcp::ToolCallerTrust::from_principal(&runtime.grant.access_principal()),
+            // The tunnel's authenticated grant is the gate here; no token
+            // names a session on this lane, so the actor carries the
+            // dashboard principal only (the `session_id` param above is
+            // context selection, not identity).
+            crate::mcp::ToolCaller::from_gate(&runtime.grant.access_principal(), None),
         )
         .await
     {
