@@ -112,10 +112,7 @@ impl SessionSupervisor {
         // its ordering guarantee).
         let worktree_meta = match worktree.as_ref() {
             Some(request) => {
-                let permit = worktree::git_ops_semaphore()
-                    .clone()
-                    .acquire_owned()
-                    .await;
+                let permit = worktree::git_ops_semaphore().clone().acquire_owned().await;
                 let blocking_root = project_root.clone();
                 let blocking_request = request.clone();
                 let blocking_name = session_name.clone();
