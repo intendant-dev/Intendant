@@ -2297,7 +2297,12 @@ function materializeSessionDetailRow(view, row, index) {
 
   const e = row.record;
   if (isSessionWindowCommandOutputRecord(e)) {
-    const outputEntry = buildSessionWindowCommandOutputEntry(e);
+    // The detail pane's own verbosity select is the knob here (retroactive:
+    // changing it re-renders through renderCurrent); the Activity dropdown
+    // governs the live/session-window lanes.
+    const outputEntry = buildSessionWindowCommandOutputEntry(e, {
+      defaultExpanded: detailVerbosity === 'verbose' || detailVerbosity === 'debug',
+    });
     if (!outputEntry) return null;
     outputEntry.dataset.detailRowIndex = String(index);
     return outputEntry;

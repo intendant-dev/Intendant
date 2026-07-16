@@ -910,9 +910,18 @@ async function loadReplayCommandOutputIntoBody(c, body, copyRef = null) {
   }
 }
 
-function buildSessionWindowCommandOutputEntry(c) {
+function buildSessionWindowCommandOutputEntry(c, options = {}) {
   const content = String(c?.content || '');
-  const { entry } = createLogScaffold(c, 'command-output-group finalized');
+  // Verbosity is the power knob: Verbose/Debug builds output rows open
+  // (session detail passes its own detail-verbosity level; session
+  // windows follow the Activity dropdown). Only rows with LOCAL text can
+  // honor it — an open row whose full output still needs an RPC would
+  // render an empty or placeholder body.
+  const defaultExpanded = (options.defaultExpanded ?? commandOutputDefaultExpanded()) && !!content;
+  const { entry } = createLogScaffold(
+    c,
+    'command-output-group finalized' + (defaultExpanded ? ' expanded' : '')
+  );
   const wrap = document.createElement('span');
   wrap.className = 'log-content command-output-wrap';
   const summary = document.createElement('span');
@@ -933,10 +942,21 @@ function buildSessionWindowCommandOutputEntry(c) {
   });
   if (content && !canFetchFull) {
     setDeferredCommandOutputText(entry, body, content, stats);
+    if (defaultExpanded) renderDeferredCommandOutputText(entry);
   } else if (canFetchFull) {
-    body.textContent = content
-      ? 'Preview loaded; expand to fetch full output.'
-      : 'Expand to fetch full output.';
+    if (defaultExpanded) {
+      // Open by default: show the local preview now; the lazy store stays
+      // wired, so collapsing and re-expanding fetches the full output.
+      appendCommandOutputText(body, content);
+      const note = document.createElement('span');
+      note.className = 'command-output-truncation-note';
+      note.textContent = 'Preview shown — collapse and expand to fetch the full output.';
+      body.appendChild(note);
+    } else {
+      body.textContent = content
+        ? 'Preview loaded; expand to fetch full output.'
+        : 'Expand to fetch full output.';
+    }
     _lazyCommandOutputStore.set(entry, { c, body, loaded: false, loading: false });
   }
   const toggle = document.createElement('span');
@@ -2089,6 +2109,13 @@ function applySessionRelationshipMetadata(rel) {
   if (rel.kind === 'subagent' && !childHadRelationship && sessionWindows.has(rel.childId)) {
     setSessionWindowHeaderCollapsed(rel.childId, true);
   }
+  // Relationship identity can land AFTER the window and its terminal
+  // phase (catalog hydration, replayed relationship events) — the window
+  // only just became known to be a sub-agent, so re-derive its
+  // auto-minimize now.
+  if (rel.kind === 'subagent') {
+    maybeAutoMinimizeSubagentWindow(rel.childId);
+  }
   updateSessionWindowActionMenuVisibility(rel.childId);
   updateSessionWindowRelationshipStyle(rel.childId);
 }
@@ -2159,6 +2186,12 @@ function sessionRelationshipSubagentIsActive(childId) {
 }
 
 function updateSessionRelationshipBadges(sessionId) {
+  // The "Minimize done" pill counts across the same active boundary this
+  // badge renders with — refresh it (rAF-deduped) wherever the badge
+  // refreshes, which is exactly the set of phase/relationship crossings
+  // that can change the count. Before the early-outs: the count is a
+  // global derivation, not a property of this window.
+  ui2QueueMinimizeDoneRefresh();
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win || !win.relationStrip) return;
@@ -2344,6 +2377,10 @@ function scheduleSessionRelationshipRender() {
   sessionRelationshipRenderHandle = requestAnimationFrame(() => {
     sessionRelationshipRenderHandle = 0;
     renderSessionRelationships();
+    // Grid membership / minimize / maximize changes all schedule this
+    // pass — piggyback the "Minimize done" pill recount (cheap sweep of
+    // sessionWindows) so it stays fresh without per-call-site wiring.
+    ui2RefreshMinimizeDoneControl();
   });
 }
 

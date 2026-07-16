@@ -148,7 +148,7 @@ function wireReasoningLogClone(clone, sourceEntry) {
 // stream and mirror into the owning session window, exactly like the
 // other special row types.
 function renderReasoningLogEntry(c) {
-  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  finalizeSessionCommandOutputGroups(c);
   inferSessionPhaseFromLog(c);
   const entry = buildReasoningLogEntryNode(c);
   if (!entry) return;

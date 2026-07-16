@@ -1500,6 +1500,11 @@ function openSessionWorktreeMergeCard(sessionId) {
       return;
     }
     if (win.minimized && typeof setSessionWindowMinimized === 'function') {
+      // Explicit open of the finish card: record the restore so the
+      // done-subagent auto-minimize rule doesn't re-collapse the window
+      // (and its card) on the next phase/metadata application.
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
       setSessionWindowMinimized(sid, false);
     }
     try { worktreeFinishCardDismissed.delete(sid); } catch (_) {}

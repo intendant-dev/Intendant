@@ -65,7 +65,14 @@ function applyDashboardVerbosity(level, options = {}) {
   if (!['normal', 'verbose', 'debug'].includes(next)) return '';
   const select = document.getElementById('verbosity-select');
   if (select) select.value = next;
-  if (app) processCommands(app.set_verbosity(next));
+  if (app) {
+    processCommands(app.set_verbosity(next));
+    // set_verbosity re-emitted the whole log buffer synchronously; every
+    // rebuilt output group is history and closes now (at Verbose/Debug the
+    // rebuilt groups stay open — that's the default finalize preserves). A
+    // command still streaming reopens a fresh group on its next chunk.
+    finalizeActiveCommandOutputGroup();
+  }
   localStorage.setItem(VERBOSITY_KEY, next);
   if (options.dispatch !== false) {
     dispatchControlMsg({ action: 'set_verbosity', level: next });

@@ -674,6 +674,33 @@ html.ui-v2 #question-panel .question-free-text:focus {
   border-color: rgba(var(--iris-rgb), .45);
   box-shadow: 0 0 0 3px rgba(var(--iris-rgb), .22);
 }
+/* pinned index chips ride the same sky grammar as the header chips;
+   answered flips to the success hue (tick glyph comes from the base rule) */
+html.ui-v2 #question-panel .question-index-chip {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--sky);
+  background: rgba(var(--sky-rgb), .1);
+  border: 1px solid rgba(var(--sky-rgb), .24);
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 #question-panel .question-index-chip:hover {
+  background: rgba(var(--sky-rgb), .16);
+  border-color: rgba(var(--sky-rgb), .38);
+}
+html.ui-v2 #question-panel .question-index-chip.answered {
+  color: var(--green);
+  background: rgba(var(--green-rgb), .1);
+  border-color: rgba(var(--green-rgb), .32);
+}
+html.ui-v2 #question-panel .question-progress {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 650;
+}
 
 /* Inline command code rides the design mono, not the UA's generic
    monospace (chrome-audit cross-surface sweep). */
@@ -759,6 +786,34 @@ html.ui-v2 .command-output-group .command-output-body:empty { display: none; }
 /* live groups are collapsible now too (v1 only ever hid finalized
    bodies): a collapsed streaming group keeps receiving text off-screen */
 html.ui-v2 .command-output-group:not(.expanded) .command-output-body { display: none; }
+/* the streaming tail: last few output lines under a collapsed live group —
+   proof of life while it streams. Gone once expanded (the body takes over)
+   or finalized (the summary row is the record). JS keeps it to ~3 trimmed
+   lines; the max-height is a belt against odd content. */
+html.ui-v2 .command-output-group .command-output-tail {
+  display: block;
+  margin-top: 4px;
+  padding-left: 13px;
+  border-left: 2px solid color-mix(in srgb, var(--iris) 32%, transparent);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+  white-space: pre;
+  overflow: hidden;
+  max-height: 4.5em;
+}
+html.ui-v2 .command-output-group .command-output-tail:empty { display: none; }
+html.ui-v2 .command-output-group.expanded .command-output-tail,
+html.ui-v2 .command-output-group.finalized .command-output-tail { display: none; }
+/* verbose-opened truncated rows show their local preview plus this hint */
+html.ui-v2 .command-output-group .command-output-truncation-note {
+  display: block;
+  padding: 4px 12px 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
 html.ui-v2 .command-output-group .command-output-pre {
   margin: 0;
   padding: 8px 12px;
