@@ -901,6 +901,13 @@ pub enum AgentEvent {
     },
     /// Token usage update reported by the external agent runtime.
     Usage { usage: AgentUsageSnapshot },
+    /// Honest per-session activity snapshot from the adapter's wire-fact
+    /// state machine (`session_activity::ActivityMachine`). Drains forward
+    /// it as `AppEvent::SessionActivity` for the vitals hub; it implies no
+    /// turn and must never open an observe round in the idle drains.
+    ActivityUpdate {
+        activity: crate::types::SessionActivityVitals,
+    },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
     /// Latest Codex `/goal` state for a thread.
