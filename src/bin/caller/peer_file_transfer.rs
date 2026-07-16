@@ -45,7 +45,32 @@ const MAX_PENDING_TRANSFER_RESERVATIONS: usize = 128;
 const MAX_PENDING_TRANSFER_RESERVATIONS_PER_OWNER: usize = 8;
 const PENDING_TRANSFER_RESERVATION_TTL: Duration = Duration::from_secs(60);
 const LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a positive [`PeerFileTransferAuthorization::is_current`] verdict
+/// may be reused by the hot paths (driver loop, per-datachannel message,
+/// per-chunk stream checks) before the identity store is consulted again.
+/// Each fresh consult costs a fingerprint normalize, a `fs::metadata` stat,
+/// and a process-global cache lock — at chunk rate that was thousands of
+/// syscalls per second per transfer. The driver's authority tick always
+/// re-verifies fresh, so the revocation bound stays
+/// `LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL` for the driver and
+/// `LIVE_TRANSFER_AUTHORITY_MEMO_TTL` for in-flight read streams; a test
+/// pins their sum under the 500 ms revocation budget.
+const LIVE_TRANSFER_AUTHORITY_MEMO_TTL: Duration = Duration::from_millis(100);
 const TCP_OUT_QUEUE: usize = 256;
+/// Pause pulling new transfer commands (file chunks included) once the SCTP
+/// stream buffers this much; resume when it drains to the low watermark.
+/// Without this gate the reader pumps the unbounded SCTP pending queue at
+/// disk speed — a 512 MB read to a slow WAN peer parked hundreds of MB of
+/// RSS. 4 MiB comfortably covers a 100 Mbit/s × 300 ms RTT pipe.
+const TRANSFER_BUFFERED_HIGH_WATERMARK_BYTES: usize = 4 * 1024 * 1024;
+/// Low watermark paired with [`TRANSFER_BUFFERED_HIGH_WATERMARK_BYTES`].
+const TRANSFER_BUFFERED_LOW_WATERMARK_BYTES: usize = 1024 * 1024;
+/// In-flight read streams per transfer session. Each distinct read spawns a
+/// task and holds an open file descriptor; without a cap an authorized peer
+/// could hold hundreds of parallel streams, multiplying the send-queue
+/// memory the watermarks above bound per stream admission. The dashboard
+/// client reads ranges sequentially, so a small cap is generous.
+const MAX_CONCURRENT_READS_PER_SESSION: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct PeerFileTransferAuthorization {
@@ -89,6 +114,73 @@ impl PeerFileTransferAuthorization {
             self.profile.clone(),
             "peer-file-transfer",
         )
+    }
+}
+
+/// A transfer session's authorization plus a shared positive-verdict memo.
+///
+/// [`PeerFileTransferAuthorization::is_current`] stats the identity store
+/// and takes a process-global cache lock on every call; the transfer paths
+/// call it per driver wakeup, per datachannel message, and twice per 16 KiB
+/// chunk — thousands of times per second during a bulk read, all contending
+/// the same mutex across every live transfer. This wrapper memoizes only
+/// **positive** verdicts for [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`]; clones
+/// (the driver plus each spawned read stream) share the memo cell.
+///
+/// Trust invariants (do not weaken):
+/// - Negative verdicts are never memoized — a failed check re-verifies
+///   fresh on every subsequent call.
+/// - The request-authorization path ([`authorize_path`],
+///   [`open_authorized_read_file`]) and the driver's authority tick call
+///   [`Self::is_current_fresh`], so authorization decisions and the
+///   periodic revocation probe never ride the memo.
+/// - `revocation bound = tick interval` for the driver (fresh at tick) and
+///   `≤ memo TTL` extra staleness for in-flight chunk streams; a test pins
+///   `tick + TTL ≤ 500 ms`.
+#[derive(Clone)]
+struct LiveTransferAuthority {
+    authorization: PeerFileTransferAuthorization,
+    /// Instant of the last fresh **positive** verification, shared across
+    /// clones. `None` until first verified.
+    verified_at: Arc<std::sync::Mutex<Option<Instant>>>,
+}
+
+impl LiveTransferAuthority {
+    fn new(authorization: PeerFileTransferAuthorization) -> Self {
+        Self {
+            authorization,
+            verified_at: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Memoized liveness: reuse a positive verdict younger than
+    /// [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`], else verify fresh.
+    fn is_current(&self) -> bool {
+        {
+            let verified_at = self
+                .verified_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = *verified_at {
+                if at.elapsed() < LIVE_TRANSFER_AUTHORITY_MEMO_TTL {
+                    return true;
+                }
+            }
+        }
+        self.is_current_fresh()
+    }
+
+    /// Uncached liveness against the identity store; primes the memo on a
+    /// positive verdict only.
+    fn is_current_fresh(&self) -> bool {
+        let ok = self.authorization.is_current();
+        if ok {
+            *self
+                .verified_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+        ok
     }
 }
 
@@ -408,7 +500,7 @@ struct PeerFileTransferPeer {
     command_tx: mpsc::Sender<TransferCommand>,
     shutdown: CancellationToken,
     owner_fingerprint: String,
-    opening_authorization: PeerFileTransferAuthorization,
+    opening_authorization: LiveTransferAuthority,
 }
 
 impl PeerFileTransferPeer {
@@ -513,6 +605,9 @@ impl PeerFileTransferPeer {
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
         let owner_fingerprint = authorization.fingerprint.clone();
+        // One memo shared by the signaling handle, the driver, and every
+        // read stream the driver spawns.
+        let authorization = LiveTransferAuthority::new(authorization);
         let opening_authorization = authorization.clone();
         tokio::spawn(transfer_driver(
             session_id,
@@ -571,7 +666,7 @@ struct InboundPacket {
 enum TransferCommand {
     AddIceCandidate(String),
     SendText(String),
-    SendBinary(Vec<u8>),
+    SendBinary(BytesMut),
     ReadFinished(String),
 }
 
@@ -596,7 +691,7 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
     session_id: String,
     mut rtc: RTCPeerConnection<I>,
     sockets: Vec<Arc<UdpSocket>>,
-    authorization: PeerFileTransferAuthorization,
+    authorization: LiveTransferAuthority,
     bus: crate::event::EventBus,
     command_tx: mpsc::Sender<TransferCommand>,
     mut command_rx: mpsc::Receiver<TransferCommand>,
@@ -607,7 +702,7 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
 ) {
     let mut sockets_by_addr: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundPacket>(64);
-    let mut tcp_senders: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut tcp_senders: HashMap<SocketAddr, mpsc::Sender<BytesMut>> = HashMap::new();
     let mut forwarder_handles = Vec::new();
     for sock in sockets {
         let local = match sock.local_addr() {
@@ -647,6 +742,12 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
 
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
     let mut active_reads: HashMap<String, CancellationToken> = HashMap::new();
+    // True while the transfer channel's SCTP send buffer sits above the
+    // high watermark: the command lane stops admitting work (chunks, text,
+    // trickled candidates alike — FIFO order must hold anyway), the bounded
+    // command channel fills, and the disk readers' `send().await` parks.
+    // Cleared by the OnBufferedAmountLow event in `drain_transfer_outputs`.
+    let mut send_paused = false;
     let mut authority_tick = tokio::time::interval(LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL);
     authority_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -660,6 +761,7 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
             &sockets_by_addr,
             &mut tcp_senders,
             &mut channels,
+            &mut send_paused,
         )
         .await
         {
@@ -676,7 +778,8 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = authority_tick.tick() => {
-                if !authorization.is_current() {
+                // The periodic revocation probe never rides the memo.
+                if !authorization.is_current_fresh() {
                     shutdown.cancel();
                     break;
                 }
@@ -719,7 +822,7 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                 );
                 let (read_half, write_half) = stream.into_split();
 
-                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Vec<u8>>(TCP_OUT_QUEUE);
+                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<BytesMut>(TCP_OUT_QUEUE);
                 tcp_senders.insert(remote_addr, tcp_out_tx);
                 let writer_shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -791,7 +894,9 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
                     break;
                 }
             }
-            Some(cmd) = command_rx.recv() => {
+            // Gated on the SCTP send-buffer watermark: while paused, queued
+            // commands wait in the bounded channel and the readers park.
+            Some(cmd) = command_rx.recv(), if !send_paused => {
                 if !authorization.is_current() {
                     shutdown.cancel();
                     break;
@@ -869,8 +974,9 @@ async fn transfer_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'stati
 async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
-    tcp_senders: &mut HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>,
+    tcp_senders: &mut HashMap<SocketAddr, mpsc::Sender<BytesMut>>,
     channels: &mut HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    send_paused: &mut bool,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1
@@ -882,7 +988,11 @@ async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
         // keeps any future stamping regression from presenting as a
         // silent DTLS timeout again.
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
-            match sender.try_send(t.message.to_vec()) {
+            // Move the transmit into the writer lane without copying
+            // (~1.2 KB per packet — ~450k allocations per 512 MB read
+            // before this). A full lane drops the packet exactly as the
+            // to_vec path did; SCTP retransmission recovers it.
+            match sender.try_send(t.message) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -920,10 +1030,44 @@ async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
                     .data_channel(cid)
                     .map(|channel| channel.label().to_string())
                     .unwrap_or_else(|| format!("channel-{cid}"));
+                if label == TRANSFER_CHANNEL_LABEL {
+                    // Arm the SCTP buffered-amount watermarks (same
+                    // event-driven pattern as the display pipeline's
+                    // tile-delta backpressure): the High event pauses the
+                    // driver's command lane, Low resumes it.
+                    if let Some(mut channel) = rtc.data_channel(cid) {
+                        channel.set_buffered_amount_high_threshold(watermark_to_u32(
+                            TRANSFER_BUFFERED_HIGH_WATERMARK_BYTES,
+                        ));
+                        channel.set_buffered_amount_low_threshold(watermark_to_u32(
+                            TRANSFER_BUFFERED_LOW_WATERMARK_BYTES,
+                        ));
+                    }
+                    *send_paused = false;
+                }
                 channels.insert(label, cid);
             }
             RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(cid)) => {
+                if channels.get(TRANSFER_CHANNEL_LABEL).copied() == Some(cid) {
+                    // Never leave the command lane parked behind a channel
+                    // that can no longer drain.
+                    *send_paused = false;
+                }
                 channels.retain(|_, id| *id != cid);
+            }
+            RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(
+                cid,
+            )) => {
+                if channels.get(TRANSFER_CHANNEL_LABEL).copied() == Some(cid) {
+                    *send_paused = true;
+                }
+            }
+            RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(
+                cid,
+            )) => {
+                if channels.get(TRANSFER_CHANNEL_LABEL).copied() == Some(cid) {
+                    *send_paused = false;
+                }
             }
             RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
                 if matches!(
@@ -946,7 +1090,7 @@ async fn drain_transfer_outputs<I: rtc::interceptor::Interceptor>(
 fn handle_transfer_request(
     session_id: &str,
     text: &str,
-    authorization: &PeerFileTransferAuthorization,
+    authorization: &LiveTransferAuthority,
     bus: &crate::event::EventBus,
     command_tx: mpsc::Sender<TransferCommand>,
     active_reads: &mut HashMap<String, CancellationToken>,
@@ -971,6 +1115,19 @@ fn handle_transfer_request(
         } => {
             if let Some(old) = active_reads.remove(&id) {
                 old.cancel();
+            }
+            if active_reads.len() >= MAX_CONCURRENT_READS_PER_SESSION {
+                let _ = command_tx.try_send(TransferCommand::SendText(
+                    serde_json::json!({
+                        "t": "error",
+                        "id": id,
+                        "error": format!(
+                            "too many concurrent reads on this transfer session (max {MAX_CONCURRENT_READS_PER_SESSION})"
+                        ),
+                    })
+                    .to_string(),
+                ));
+                return;
             }
             let cancel = CancellationToken::new();
             active_reads.insert(id.clone(), cancel.clone());
@@ -1007,7 +1164,7 @@ async fn stream_read_request(
     raw_path: String,
     offset: u64,
     length: Option<u64>,
-    authorization: PeerFileTransferAuthorization,
+    authorization: LiveTransferAuthority,
     command_tx: mpsc::Sender<TransferCommand>,
     cancel: CancellationToken,
     bus: crate::event::EventBus,
@@ -1093,7 +1250,12 @@ async fn stream_read_request(
                 source: "peer-file-transfer".into(),
                 content: format!(
                     "completed read session={} peer={} fingerprint={} path={} offset={} length={:?}",
-                    session_id, authorization.label, authorization.fingerprint, raw_path, offset, length
+                    session_id,
+                    authorization.authorization.label,
+                    authorization.authorization.fingerprint,
+                    raw_path,
+                    offset,
+                    length
                 ),
                 turn: None,
             });
@@ -1112,20 +1274,21 @@ async fn stream_read_request(
 }
 
 fn authorize_path(
-    authorization: &PeerFileTransferAuthorization,
+    authorization: &LiveTransferAuthority,
     raw_path: &str,
 ) -> Result<PathBuf, String> {
-    if !authorization.is_current() {
+    // Authorization decisions never ride the memo: verify fresh.
+    if !authorization.is_current_fresh() {
         return Err("peer file-transfer identity changed or is no longer active".to_string());
     }
     crate::access::iam::evaluate_principal_operation(
-        &authorization.access_principal(),
+        &authorization.authorization.access_principal(),
         PeerOperation::FilesystemRead,
     )
     .ensure_allowed()?;
     let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
     filesystem_access_canonical_subject(
-        &authorization.filesystem,
+        &authorization.authorization.filesystem,
         FilesystemAccessKind::Read,
         &path,
     )
@@ -1136,7 +1299,7 @@ fn authorize_path(
 /// caller-controlled path, narrowing symlink/path replacement races to the
 /// platform's path-open operation itself.
 fn open_authorized_read_file(
-    authorization: &PeerFileTransferAuthorization,
+    authorization: &LiveTransferAuthority,
     raw_path: &str,
 ) -> Result<(PathBuf, std::fs::File), String> {
     let canonical = authorize_path(authorization, raw_path)?;
@@ -1168,7 +1331,7 @@ fn open_authorized_read_file(
             canonical.display()
         ));
     }
-    if !authorization.is_current() {
+    if !authorization.is_current_fresh() {
         return Err("peer file-transfer identity changed while opening the file".to_string());
     }
     Ok((canonical, file))
@@ -1179,15 +1342,21 @@ async fn stream_file_range(
     path: &Path,
     offset: u64,
     length: u64,
-    authorization: &PeerFileTransferAuthorization,
+    authorization: &LiveTransferAuthority,
     command_tx: &mpsc::Sender<TransferCommand>,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
+    use bytes::BufMut as _;
+
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek {}: {e}", path.display()))?;
     let mut file = tokio::fs::File::from_std(file);
     let mut remaining = length;
-    let mut buf = vec![0u8; CHUNK_BYTES];
+    // One BytesMut reused across chunks: `read_buf` fills fresh capacity
+    // and `split_to` hands the filled prefix to the driver without a copy
+    // (the old path copied each chunk into a new Vec, and the driver
+    // copied it again into a BytesMut for the datachannel).
+    let mut buf = BytesMut::with_capacity(CHUNK_BYTES);
     while remaining > 0 {
         if cancel.is_cancelled() {
             return Err("transfer cancelled".to_string());
@@ -1195,9 +1364,10 @@ async fn stream_file_range(
         if !authorization.is_current() {
             return Err("peer file-transfer identity changed during read".to_string());
         }
-        let want = (remaining as usize).min(buf.len());
+        let want = (remaining as usize).min(CHUNK_BYTES);
+        buf.reserve(want);
         let n = file
-            .read(&mut buf[..want])
+            .read_buf(&mut (&mut buf).limit(want))
             .await
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         if n == 0 {
@@ -1208,7 +1378,7 @@ async fn stream_file_range(
         }
         remaining = remaining.saturating_sub(n as u64);
         command_tx
-            .send(TransferCommand::SendBinary(buf[..n].to_vec()))
+            .send(TransferCommand::SendBinary(buf.split_to(n)))
             .await
             .map_err(|_| "transfer driver gone".to_string())?;
     }
@@ -1233,16 +1403,22 @@ fn send_transfer_text<I: rtc::interceptor::Interceptor>(
 fn send_transfer_binary<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
-    bytes: Vec<u8>,
+    bytes: BytesMut,
 ) {
     let Some(cid) = channels.get(TRANSFER_CHANNEL_LABEL).copied() else {
         return;
     };
     if let Some(mut channel) = rtc.data_channel(cid) {
-        if let Err(e) = channel.send(BytesMut::from(&bytes[..])) {
+        if let Err(e) = channel.send(bytes) {
             eprintln!("[peer-file-transfer] data channel binary write failed: {e:?}");
         }
     }
+}
+
+/// Clamp a byte watermark into the `u32` the rtc data-channel threshold
+/// setters take.
+fn watermark_to_u32(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
 fn to_rtc_ice_servers(servers: &[crate::display::IceServer]) -> Vec<RTCIceServer> {
@@ -1292,17 +1468,40 @@ fn tcp_host_candidate_init(addr: SocketAddr) -> RTCIceCandidateInit {
 mod tests {
     use super::*;
 
+    fn approved_authorization(
+        tmp: &tempfile::TempDir,
+        fingerprint: &str,
+    ) -> PeerFileTransferAuthorization {
+        let record = crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            fingerprint,
+            "peer-b",
+            "file-reader",
+            None,
+            None,
+        )
+        .unwrap();
+        PeerFileTransferAuthorization {
+            fingerprint: record.fingerprint.clone(),
+            label: record.label.clone(),
+            profile: record.profile.clone(),
+            filesystem: record.filesystem.clone(),
+            identity_record: Some(record),
+            iam_cert_dir: Some(tmp.path().to_path_buf()),
+        }
+    }
+
     #[test]
     fn transfer_session_owner_match_is_exact() {
         let (command_tx, _command_rx) = mpsc::channel(1);
-        let opening_authorization = PeerFileTransferAuthorization {
+        let opening_authorization = LiveTransferAuthority::new(PeerFileTransferAuthorization {
             fingerprint: "peer-a".to_string(),
             label: "Peer A".to_string(),
             profile: "file-reader".to_string(),
             filesystem: Default::default(),
             identity_record: None,
             iam_cert_dir: None,
-        };
+        });
         let peer = PeerFileTransferPeer {
             command_tx,
             shutdown: CancellationToken::new(),
@@ -1316,28 +1515,50 @@ mod tests {
     #[test]
     fn live_peer_identity_change_invalidates_file_transfer_authority() {
         assert!(LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL <= Duration::from_millis(500));
+        // The end-to-end revocation budget: a fresh driver tick plus the
+        // worst-case memo staleness of an in-flight read stream.
+        assert!(
+            LIVE_TRANSFER_AUTHORITY_RECHECK_INTERVAL + LIVE_TRANSFER_AUTHORITY_MEMO_TTL
+                <= Duration::from_millis(500)
+        );
         let tmp = tempfile::TempDir::new().unwrap();
         let fingerprint = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let record = crate::peer::access_policy::write_approved_identity(
-            tmp.path(),
-            fingerprint,
-            "peer-b",
-            "file-reader",
-            None,
-            None,
-        )
-        .unwrap();
-        let authorization = PeerFileTransferAuthorization {
-            fingerprint: record.fingerprint.clone(),
-            label: record.label.clone(),
-            profile: record.profile.clone(),
-            filesystem: record.filesystem.clone(),
-            identity_record: Some(record),
-            iam_cert_dir: Some(tmp.path().to_path_buf()),
-        };
+        let authorization = approved_authorization(&tmp, fingerprint);
         assert!(authorization.is_current());
         crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
         assert!(!authorization.is_current());
+    }
+
+    /// Trust pin for the memoized wrapper: `is_current_fresh` (the driver
+    /// tick and the request-authorization path) consults the identity
+    /// store on every call — a primed memo never masks a revocation from
+    /// the fresh path.
+    #[test]
+    fn transfer_authority_fresh_check_ignores_memo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let authority = LiveTransferAuthority::new(approved_authorization(&tmp, fingerprint));
+        assert!(authority.is_current());
+        assert!(authority.verified_at.lock().unwrap().is_some());
+        crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
+        assert!(!authority.is_current_fresh());
+    }
+
+    /// Trust pin for the memoized wrapper: a positive verdict is reusable
+    /// for at most [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`] — after the TTL a
+    /// revocation is observed by the memoized path too, and the failed
+    /// check must not re-prime the memo.
+    #[test]
+    fn transfer_authority_memo_detects_revocation_after_ttl() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fingerprint = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let authority = LiveTransferAuthority::new(approved_authorization(&tmp, fingerprint));
+        assert!(authority.is_current());
+        crate::peer::access_policy::revoke_identity(tmp.path(), fingerprint).unwrap();
+        std::thread::sleep(LIVE_TRANSFER_AUTHORITY_MEMO_TTL + Duration::from_millis(50));
+        assert!(!authority.is_current());
+        // Negative verdicts are never memoized.
+        assert!(!authority.is_current());
     }
 
     #[test]
@@ -1434,7 +1655,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("a.txt");
         std::fs::write(&file, b"ok").unwrap();
-        let auth = PeerFileTransferAuthorization {
+        let auth = LiveTransferAuthority::new(PeerFileTransferAuthorization {
             fingerprint: "fp".into(),
             label: "peer".into(),
             profile: "operator".into(),
@@ -1444,7 +1665,7 @@ mod tests {
             },
             identity_record: None,
             iam_cert_dir: None,
-        };
+        });
         let err = authorize_path(&auth, file.to_str().unwrap()).unwrap_err();
         assert!(err.contains("does not allow filesystem.read"));
     }
@@ -1454,7 +1675,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let file = tmp.path().join("a.txt");
         std::fs::write(&file, b"ok").unwrap();
-        let auth = PeerFileTransferAuthorization {
+        let auth = LiveTransferAuthority::new(PeerFileTransferAuthorization {
             fingerprint: "fp".into(),
             label: "peer".into(),
             profile: "file-reader".into(),
@@ -1464,7 +1685,7 @@ mod tests {
             },
             identity_record: None,
             iam_cert_dir: None,
-        };
+        });
         assert_eq!(
             authorize_path(&auth, file.to_str().unwrap()).unwrap(),
             std::fs::canonicalize(file).unwrap()
@@ -1480,7 +1701,7 @@ mod tests {
         let file = tmp.path().join("a.txt");
         let moved = tmp.path().join("opened.txt");
         std::fs::write(&file, b"authorized object").unwrap();
-        let auth = PeerFileTransferAuthorization {
+        let auth = LiveTransferAuthority::new(PeerFileTransferAuthorization {
             fingerprint: "fp".into(),
             label: "peer".into(),
             profile: "file-reader".into(),
@@ -1490,7 +1711,7 @@ mod tests {
             },
             identity_record: None,
             iam_cert_dir: None,
-        };
+        });
 
         let (_canonical, mut opened) =
             open_authorized_read_file(&auth, file.to_str().unwrap()).unwrap();
