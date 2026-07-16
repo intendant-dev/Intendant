@@ -44,14 +44,8 @@ pub(crate) fn install_sh_body(public_origin: &str) -> String {
     )
 }
 
-pub(crate) async fn install_sh(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        install_sh_body(&state.config.public_origin),
-    )
+pub(crate) async fn install_sh(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.static_pages.install_sh.respond(&headers)
 }
 
 /// The Windows counterpart, for PowerShell:
@@ -70,14 +64,11 @@ pub(crate) fn install_ps1_body(public_origin: &str) -> String {
     )
 }
 
-pub(crate) async fn install_ps1(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    (
-        [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        install_ps1_body(&state.config.public_origin),
-    )
+pub(crate) async fn install_ps1(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    state.static_pages.install_ps1.respond(&headers)
 }
 
 /// The canonical Intendant mark, embedded so every page this binary serves
@@ -161,12 +152,17 @@ pub(crate) async fn landing_asset(AxumPath(name): AxumPath<String>) -> Response 
 }
 
 pub(crate) async fn readyz(State(state): State<Arc<AppState>>) -> Response {
-    let state_parent_ok = state
-        .config
-        .data_file
-        .parent()
-        .map(|parent| parent.exists() || std::fs::create_dir_all(parent).is_ok())
-        .unwrap_or(false);
+    // Filesystem probe (and first-run dir creation) off the async workers:
+    // a slow disk must degrade this probe, not the whole runtime.
+    let parent = state.config.data_file.parent().map(Path::to_path_buf);
+    let state_parent_ok = match parent {
+        None => false,
+        Some(parent) => tokio::task::spawn_blocking(move || {
+            parent.exists() || std::fs::create_dir_all(&parent).is_ok()
+        })
+        .await
+        .unwrap_or(false),
+    };
     let ok = state_parent_ok;
     let status = if ok {
         StatusCode::OK
@@ -193,18 +189,99 @@ fn deny_html_framing(headers: &mut HeaderMap) {
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
 }
 
-fn html_response(body: String) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    deny_html_framing(&mut headers);
-    (headers, body).into_response()
+/// One startup-rendered page: shared bytes plus a strong ETag, served with
+/// `Cache-Control: no-cache` so browsers revalidate cheaply (304) instead of
+/// re-downloading tens of KB per visit.
+pub(crate) struct StaticPage {
+    body: axum::body::Bytes,
+    etag: HeaderValue,
+    content_type: HeaderValue,
+    deny_framing: bool,
 }
 
-pub(crate) async fn landing_ui(State(state): State<Arc<AppState>>) -> Response {
-    html_response(landing_ui_html(&state.config.public_origin))
+impl StaticPage {
+    fn html(body: String) -> Self {
+        Self::new(
+            body,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+            true,
+        )
+    }
+
+    fn script(body: String) -> Self {
+        Self::new(
+            body,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+            false,
+        )
+    }
+
+    fn new(body: String, content_type: HeaderValue, deny_framing: bool) -> Self {
+        let etag = HeaderValue::from_str(&format!("\"{}\"", &sha256_hex(body.as_bytes())[..32]))
+            .expect("hex etag is a valid header value");
+        StaticPage {
+            body: axum::body::Bytes::from(body),
+            etag,
+            content_type,
+            deny_framing,
+        }
+    }
+
+    fn respond(&self, request_headers: &HeaderMap) -> Response {
+        let revalidated = request_headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(',').any(|candidate| {
+                    candidate.trim().trim_start_matches("W/")
+                        == self.etag.to_str().unwrap_or_default()
+                })
+            });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, self.content_type.clone());
+        headers.insert(header::ETAG, self.etag.clone());
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        if self.deny_framing {
+            deny_html_framing(&mut headers);
+        }
+        if revalidated {
+            (StatusCode::NOT_MODIFIED, headers).into_response()
+        } else {
+            (headers, self.body.clone()).into_response()
+        }
+    }
+}
+
+/// Every page this binary serves is a pure function of the public origin
+/// (pinned by the artifact-transparency determinism tests), so they are
+/// rendered exactly once at startup instead of formatting a multi-KB
+/// template per hit. The same builders feed the transparency manifest, so
+/// served bytes and logged hashes cannot diverge.
+pub(crate) struct StaticPages {
+    landing: StaticPage,
+    connect: StaticPage,
+    access: StaticPage,
+    trust: StaticPage,
+    install_sh: StaticPage,
+    install_ps1: StaticPage,
+}
+
+impl StaticPages {
+    pub(crate) fn render(config: &ServiceConfig) -> Self {
+        let origin = config.public_origin.as_str();
+        StaticPages {
+            landing: StaticPage::html(landing_ui_html(origin)),
+            connect: StaticPage::html(connect_page_html(origin)),
+            access: StaticPage::html(access_page_html(origin)),
+            trust: StaticPage::html(trust_ui_html(origin)),
+            install_sh: StaticPage::script(install_sh_body(origin)),
+            install_ps1: StaticPage::script(install_ps1_body(origin)),
+        }
+    }
+}
+
+pub(crate) async fn landing_ui(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.static_pages.landing.respond(&headers)
 }
 
 /// The `/connect` page body — shared by the route handler and the
@@ -222,16 +299,16 @@ pub(crate) fn access_page_html(origin: &str) -> String {
     )
 }
 
-pub(crate) async fn connect_ui(State(state): State<Arc<AppState>>) -> Response {
-    html_response(connect_page_html(&state.config.public_origin))
+pub(crate) async fn connect_ui(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.static_pages.connect.respond(&headers)
 }
 
-pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>) -> Response {
-    html_response(trust_ui_html(&state.config.public_origin))
+pub(crate) async fn trust_ui(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.static_pages.trust.respond(&headers)
 }
 
-pub(crate) async fn access_ui(State(state): State<Arc<AppState>>) -> Response {
-    html_response(access_page_html(&state.config.public_origin))
+pub(crate) async fn access_ui(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    state.static_pages.access.respond(&headers)
 }
 
 /// The default Connect build is a directory, not a daemon-control client.
@@ -2208,7 +2285,7 @@ mod tests {
             trust_ui_html("https://connect.example"),
             access_page_html("https://connect.example"),
         ] {
-            let response = html_response(body);
+            let response = StaticPage::html(body).respond(&HeaderMap::new());
             assert_eq!(
                 response
                     .headers()
@@ -2218,6 +2295,54 @@ mod tests {
             );
             assert_framing_denied(&response);
         }
+    }
+
+    #[test]
+    fn static_pages_serve_etags_and_revalidate_to_304() {
+        let page = StaticPage::html("<!doctype html><title>x</title>".to_string());
+        let full = page.respond(&HeaderMap::new());
+        assert_eq!(full.status(), StatusCode::OK);
+        let etag = full.headers().get(header::ETAG).cloned().expect("etag set");
+        assert_eq!(
+            full.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+        assert_framing_denied(&full);
+
+        let mut revalidate = HeaderMap::new();
+        revalidate.insert(header::IF_NONE_MATCH, etag.clone());
+        let not_modified = page.respond(&revalidate);
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            not_modified.headers().get(header::ETAG),
+            Some(&etag),
+            "304 re-states the validator"
+        );
+
+        // A weak-prefixed or list-form validator still matches; a stale one
+        // gets the full body again.
+        let mut weak = HeaderMap::new();
+        weak.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("W/{}, \"other\"", etag.to_str().unwrap())).unwrap(),
+        );
+        assert_eq!(page.respond(&weak).status(), StatusCode::NOT_MODIFIED);
+        let mut stale = HeaderMap::new();
+        stale.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"stale\""));
+        assert_eq!(page.respond(&stale).status(), StatusCode::OK);
+
+        // Installers keep their plain-text identity and skip CSP framing.
+        let script = StaticPage::script("#!/bin/sh\n".to_string()).respond(&HeaderMap::new());
+        assert_eq!(
+            script
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        assert!(script.headers().get("x-frame-options").is_none());
     }
 
     #[tokio::test]

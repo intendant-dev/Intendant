@@ -123,11 +123,33 @@ pub(crate) async fn api_fleet_targets_sync(
         }
     }
     let mut store = state.store.lock().await;
-    let owned_daemon_ids = owned_daemon_ids(&store, user.id);
+    if merge_fleet_targets(&mut store, user.id, incoming) {
+        persist_locked(&state, &store)?;
+    }
+    let targets = fleet_targets_for_user(&state.config, &store, user.id);
+    Ok(Json(json!({
+        "ok": true,
+        "schema_version": 1,
+        "targets": targets,
+    })))
+}
+
+/// Merge one user's incoming (already normalized) targets over their stored
+/// partition. Returns whether the stored partition actually changed:
+/// `normalize_fleet_target_input` stamps `updated_unix_ms = now` on every
+/// input, so a content-identical re-sync (the dashboard pushes its whole
+/// list on a debounced dirty flag) would otherwise rewrite and re-persist
+/// the entire store on every push.
+pub(crate) fn merge_fleet_targets(
+    store: &mut Store,
+    user_id: Uuid,
+    incoming: Vec<FleetTargetRecord>,
+) -> bool {
+    let owned_daemon_ids = owned_daemon_ids(store, user_id);
     let mut by_host: HashMap<String, FleetTargetRecord> = store
         .fleet_targets
         .iter()
-        .filter(|target| target.user_id == user.id)
+        .filter(|target| target.user_id == user_id)
         .map(|target| {
             let mut target = target.clone();
             canonicalize_fleet_target_for_owned_daemon(&mut target, &owned_daemon_ids);
@@ -136,9 +158,8 @@ pub(crate) async fn api_fleet_targets_sync(
         .collect();
     for mut target in incoming {
         canonicalize_fleet_target_for_owned_daemon(&mut target, &owned_daemon_ids);
-        let previous = by_host.get(&target.host_id).cloned();
-        let first_seen_unix_ms = previous
-            .as_ref()
+        let first_seen_unix_ms = by_host
+            .get(&target.host_id)
             .map(|record| record.first_seen_unix_ms)
             .filter(|value| *value > 0)
             .unwrap_or(target.first_seen_unix_ms);
@@ -161,17 +182,48 @@ pub(crate) async fn api_fleet_targets_sync(
             .then_with(|| a.label.cmp(&b.label))
     });
     user_targets.truncate(FLEET_TARGET_LIMIT);
+    let unchanged = {
+        // Count rows (not deduped map entries): a legacy partition holding
+        // duplicate host rows must read as changed so the rewrite dedupes it.
+        let existing_rows = store
+            .fleet_targets
+            .iter()
+            .filter(|target| target.user_id == user_id)
+            .count();
+        let existing: HashMap<&str, &FleetTargetRecord> = store
+            .fleet_targets
+            .iter()
+            .filter(|target| target.user_id == user_id)
+            .map(|target| (target.host_id.as_str(), target))
+            .collect();
+        existing_rows == user_targets.len()
+            && user_targets.iter().all(|next| {
+                existing
+                    .get(next.host_id.as_str())
+                    .is_some_and(|previous| fleet_targets_equal_ignoring_updated(previous, next))
+            })
+    };
+    if unchanged {
+        return false;
+    }
     store
         .fleet_targets
-        .retain(|target| target.user_id != user.id);
+        .retain(|target| target.user_id != user_id);
     store.fleet_targets.extend(user_targets);
-    persist_locked(&state, &store)?;
-    let targets = fleet_targets_for_user(&state.config, &store, user.id);
-    Ok(Json(json!({
-        "ok": true,
-        "schema_version": 1,
-        "targets": targets,
-    })))
+    true
+}
+
+/// `updated_unix_ms` is stamped with the sync time on every normalized
+/// input, so no-op detection patches it out; the derived `PartialEq` keeps
+/// every OTHER field — including ones added later — in the comparison
+/// automatically.
+fn fleet_targets_equal_ignoring_updated(
+    previous: &FleetTargetRecord,
+    next: &FleetTargetRecord,
+) -> bool {
+    let mut next = next.clone();
+    next.updated_unix_ms = previous.updated_unix_ms;
+    *previous == next
 }
 
 pub(crate) async fn api_fleet_target_forget(
@@ -766,6 +818,131 @@ pub(crate) async fn api_vault_publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fleet_merge_skips_identical_resyncs_and_lands_real_changes() {
+        let user_id = Uuid::new_v4();
+        let mut store = Store::default();
+        let input = |now: u64| {
+            normalize_fleet_target_input(
+                user_id,
+                FleetTargetInput {
+                    id: "daemon-1".to_string(),
+                    host_id: "daemon-1".to_string(),
+                    label: "Anchor box".to_string(),
+                    first_seen_unix_ms: 1_700_000_000_000,
+                    last_seen_unix_ms: 1_700_000_000_000,
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("record normalizes")
+        };
+
+        assert!(
+            merge_fleet_targets(&mut store, user_id, vec![input(1_800_000_000_000)]),
+            "first sync stores the record"
+        );
+        let stored_updated = store.fleet_targets[0].updated_unix_ms;
+
+        // Identical content re-synced later: normalize stamps a fresh
+        // updated_unix_ms, but nothing else differs — no store rewrite.
+        assert!(
+            !merge_fleet_targets(&mut store, user_id, vec![input(1_800_000_060_000)]),
+            "content-identical resync is a no-op"
+        );
+        assert_eq!(
+            store.fleet_targets[0].updated_unix_ms, stored_updated,
+            "stored record untouched by the no-op"
+        );
+
+        // A real change lands (and refreshes the stamp).
+        let mut renamed = input(1_800_000_120_000);
+        renamed.label = "Renamed box".to_string();
+        assert!(merge_fleet_targets(&mut store, user_id, vec![renamed]));
+        assert_eq!(store.fleet_targets[0].label, "Renamed box");
+
+        // A new host is a change even when existing rows are identical.
+        let mut second = input(1_800_000_180_000);
+        second.host_id = "daemon-2".to_string();
+        second.id = "daemon-2".to_string();
+        assert!(merge_fleet_targets(&mut store, user_id, vec![second]));
+        assert_eq!(store.fleet_targets.len(), 2);
+
+        // Another user's identical push never reads as this user's no-op.
+        let other_user = Uuid::new_v4();
+        assert!(merge_fleet_targets(
+            &mut store,
+            other_user,
+            vec![normalize_fleet_target_input(
+                other_user,
+                FleetTargetInput {
+                    id: "daemon-1".to_string(),
+                    host_id: "daemon-1".to_string(),
+                    ..Default::default()
+                },
+                1_800_000_240_000,
+            )
+            .unwrap()],
+        ));
+        assert_eq!(store.fleet_targets.len(), 3);
+    }
+
+    #[test]
+    fn fleet_merge_no_op_detection_survives_owned_daemon_canonicalization() {
+        let user_id = Uuid::new_v4();
+        let mut store = Store::default();
+        store.daemons.push(DaemonRecord {
+            daemon_id: "owned-daemon".to_string(),
+            label: None,
+            daemon_public_key: "key".to_string(),
+            owner_user_id: Some(user_id),
+            claim_code_hash: None,
+            claim_code_created_unix_ms: None,
+            last_registration_proof_unix_ms: None,
+            route_link_revision: 0,
+            last_unclaim_proof_unix_ms: None,
+            registered_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            updated_unix_ms: 1,
+            presence_hours: Vec::new(),
+        });
+        let input = |now: u64| {
+            normalize_fleet_target_input(
+                user_id,
+                FleetTargetInput {
+                    id: "browser-alias".to_string(),
+                    host_id: "browser-alias".to_string(),
+                    connect_daemon_id: "owned-daemon".to_string(),
+                    record_key: "PubKeyB64u".to_string(),
+                    record_sig: "SigB64u".to_string(),
+                    record_signed_at_unix_ms: 1_700_000_000_000,
+                    first_seen_unix_ms: 1_700_000_000_000,
+                    last_seen_unix_ms: 1_700_000_000_000,
+                    ..Default::default()
+                },
+                now,
+            )
+            .expect("record normalizes")
+        };
+        assert!(merge_fleet_targets(
+            &mut store,
+            user_id,
+            vec![input(1_800_000_000_000)]
+        ));
+        assert_eq!(
+            store.fleet_targets[0].host_id, "owned-daemon",
+            "stored under the canonical daemon id"
+        );
+        assert!(
+            store.fleet_targets[0].record_sig.is_empty(),
+            "rewritten host drops the now-unverifiable signature"
+        );
+        assert!(
+            !merge_fleet_targets(&mut store, user_id, vec![input(1_800_000_060_000)]),
+            "the same alias re-synced canonicalizes to the stored record"
+        );
+    }
 
     #[test]
     fn fleet_sync_round_trips_record_signatures() {

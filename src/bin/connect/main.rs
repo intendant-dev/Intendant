@@ -147,11 +147,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon_sessions: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(HashMap::new()),
         active_sessions: Mutex::new(HashMap::new()),
+        store_dirty: StoreDirty::default(),
+        log_caches: std::sync::Mutex::new(LogCaches::default()),
+        static_pages: StaticPages::render(&config),
         dns_zone,
     });
 
     tokio::spawn(presence_alert_monitor(state.clone()));
     tokio::spawn(handle_reclaim_monitor(state.clone()));
+    tokio::spawn(store_flush_monitor(state.clone()));
+    tokio::spawn(in_memory_state_sweeper(state.clone()));
     if let (Some(zone), Some(listen)) = (state.dns_zone.clone(), state.config.dns_listen) {
         // Fail startup on an unbindable DNS listener (privileges, port
         // in use); afterwards the server runs until process exit.
@@ -525,6 +530,17 @@ struct AppState {
     daemon_sessions: Mutex<HashMap<String, DaemonSessionCredential>>,
     rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
     active_sessions: Mutex<HashMap<String, ActiveDashboardSession>>,
+    /// Dirty flag + wakeup for the debounced store flusher: hot paths that
+    /// only refresh presence-grade fields mark instead of persisting.
+    store_dirty: StoreDirty,
+    /// Derived read caches over the append-only transparency log
+    /// (transparency.rs). std Mutex: held only for short synchronous
+    /// extends, never across an await.
+    log_caches: std::sync::Mutex<LogCaches>,
+    /// Startup-rendered static pages (ui.rs): pure functions of the public
+    /// origin, served as shared bytes with ETag revalidation instead of
+    /// re-rendered per hit.
+    static_pages: StaticPages,
     vapid: ring::signature::EcdsaKeyPair,
     log_key: ring::signature::EcdsaKeyPair,
     push_http: reqwest::Client,
@@ -558,6 +574,7 @@ fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> 
         .strict_base64(true);
     let vapid = load_or_create_vapid_keypair(&mut store).unwrap();
     let log_key = load_or_create_log_keypair(&mut store).unwrap();
+    let static_pages = StaticPages::render(&config);
     Arc::new(AppState {
         config,
         webauthn,
@@ -572,6 +589,9 @@ fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> 
         daemon_sessions: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(HashMap::new()),
         active_sessions: Mutex::new(HashMap::new()),
+        store_dirty: StoreDirty::default(),
+        log_caches: std::sync::Mutex::new(LogCaches::default()),
+        static_pages,
         vapid,
         log_key,
         push_http: reqwest::Client::new(),
@@ -876,7 +896,7 @@ fn record_presence_hour(hours: &mut Vec<u64>, now_unix_ms: u64) -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 struct FleetTargetRecord {
     user_id: Uuid,
     id: String,
@@ -1102,8 +1122,20 @@ fn load_store(path: &Path) -> Result<Store, String> {
     }
 }
 
+/// Serialize the store for disk. Compact JSON: the file is machine-read
+/// (serde ignores whitespace in both directions, so state files written by
+/// older pretty-printing builds load unchanged and older builds read compact
+/// files), and pretty printing roughly doubled the bytes of a file that is
+/// rewritten in full on every persist.
+fn serialize_store(store: &Store) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(store).map_err(|e| format!("serialize state: {e}"))
+}
+
 fn save_store(path: &Path, store: &Store) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(store).map_err(|e| format!("serialize state: {e}"))?;
+    write_store_bytes(path, &serialize_store(store)?)
+}
+
+fn write_store_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1115,18 +1147,179 @@ fn save_store(path: &Path, store: &Store) -> Result<(), String> {
         .suffix(".tmp")
         .tempfile_in(parent)
         .map_err(|e| format!("create Connect state tempfile in {}: {e}", parent.display()))?;
-    tmp.write_all(&bytes)
+    tmp.write_all(bytes)
         .map_err(|e| format!("write Connect state tempfile {}: {e}", tmp.path().display()))?;
     tmp.as_file_mut()
         .sync_all()
         .map_err(|e| format!("sync Connect state tempfile {}: {e}", tmp.path().display()))?;
     tmp.persist(path)
         .map_err(|e| format!("replace Connect state {}: {}", path.display(), e.error))?;
+    fsync_parent_dir(parent)
+}
+
+/// fsync the directory entry so the rename that just published the new state
+/// file is itself durable — without it, a crash right after the rename can
+/// roll the whole replacement back on some filesystems. Directories are not
+/// open-and-fsync-able on Windows; there the pre-rename file sync plus the
+/// atomic ReplaceFile stand alone.
+fn fsync_parent_dir(parent: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| format!("sync Connect state dir {}: {e}", parent.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
     Ok(())
 }
 
+/// Persist the current store synchronously, before the caller's response.
+/// Callers hold the store lock, so the bytes are a consistent snapshot and
+/// the write covers anything the debounced flusher had pending — hence the
+/// dirty flag is cleared on success (marks only ever happen under the same
+/// lock, so none can slip between the write and the clear).
 fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
-    save_store(&state.config.data_file, store).map_err(ApiError::internal)
+    save_store(&state.config.data_file, store).map_err(ApiError::internal)?;
+    state.store_dirty.clear();
+    Ok(())
+}
+
+/// Debounced-persistence signal. Hot paths whose mutations tolerate a
+/// bounded loss window (presence refreshes: `last_seen`, presence hours, the
+/// registration-proof watermark) `mark` instead of persisting;
+/// `store_flush_monitor` coalesces the marks into one full-store write per
+/// debounce window. Critical mutations keep their synchronous
+/// `persist_locked` path unchanged.
+#[derive(Default)]
+struct StoreDirty {
+    dirty: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl StoreDirty {
+    fn mark(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_one();
+    }
+
+    fn clear(&self) {
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn take(&self) -> bool {
+        self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Mark the store dirty for the debounced flusher. MUST be called while
+/// holding the store lock: the mark records a mutation just made under that
+/// lock, and the lock is also what orders marks against `persist_locked`'s
+/// clear-on-success.
+fn mark_store_dirty(state: &AppState) {
+    state.store_dirty.mark();
+}
+
+/// Upper bound on how much presence-grade mutation a crash can lose, and the
+/// whole-service write cadence under steady daemon polling: one coalesced
+/// write per window instead of several fsynced full-store rewrites per
+/// daemon-minute.
+const STORE_FLUSH_DEBOUNCE: Duration = Duration::from_secs(60);
+
+async fn store_flush_monitor(state: Arc<AppState>) {
+    store_flush_monitor_with(state, STORE_FLUSH_DEBOUNCE).await;
+}
+
+/// Debounce-loop body, with the window injectable so tests need not wait the
+/// production 60s. The write happens with the store lock HELD (like every
+/// synchronous persist): a single writer ordering means the file can never
+/// regress to an older snapshot written late. `spawn_blocking` keeps the
+/// blocking file I/O off the async workers; store waiters queue exactly as
+/// they do for a synchronous persist today, once per window instead of per
+/// request.
+async fn store_flush_monitor_with(state: Arc<AppState>, debounce: Duration) {
+    loop {
+        state.store_dirty.notify.notified().await;
+        tokio::time::sleep(debounce).await;
+        let store = state.store.lock().await;
+        if !state.store_dirty.take() {
+            // A synchronous persist already covered the mark.
+            continue;
+        }
+        let bytes = match serialize_store(&store) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("[connect] debounced store flush serialize failed: {err}");
+                continue;
+            }
+        };
+        let path = state.config.data_file.clone();
+        match tokio::task::spawn_blocking(move || write_store_bytes(&path, &bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                eprintln!("[connect] debounced store flush failed (will retry): {err}");
+                // The mutations are still memory-only: re-mark so the next
+                // window retries even without new activity.
+                state.store_dirty.mark();
+            }
+            Err(err) => eprintln!("[connect] debounced store flush task failed: {err}"),
+        }
+        drop(store);
+    }
+}
+
+/// How long a resolved (approved / rejected / timed-out) claim stays
+/// queryable by the polling browser before the sweeper drops it. Claims
+/// resolve or time out within `CLAIM_TIMEOUT_MS` and the claiming page polls
+/// every second or two, so this is generous observation headroom.
+const PENDING_CLAIM_RETENTION_MS: u64 = 15 * 60 * 1000;
+const IN_MEMORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Periodic expiry sweep across the in-memory tables, none of which
+/// otherwise remove entries except opportunistically (an expired session was
+/// only dropped when its exact token was re-presented; abandoned WebAuthn
+/// flows, resolved claims, and expired rate windows never were). Every rule
+/// removes only entries already dead to their consumers, so the sweep never
+/// changes what any live request observes.
+async fn in_memory_state_sweeper(state: Arc<AppState>) {
+    loop {
+        tokio::time::sleep(IN_MEMORY_SWEEP_INTERVAL).await;
+        sweep_in_memory_state(&state).await;
+    }
+}
+
+async fn sweep_in_memory_state(state: &AppState) {
+    let now = now_unix_ms();
+    state
+        .sessions
+        .lock()
+        .await
+        .retain(|_, session| session.expires_unix_ms > now);
+    state
+        .pending_registrations
+        .lock()
+        .await
+        .retain(|_, pending| pending.expires_unix_ms > now);
+    state
+        .pending_authentications
+        .lock()
+        .await
+        .retain(|_, pending| pending.expires_unix_ms > now);
+    state
+        .pending_claims
+        .lock()
+        .await
+        .retain(|_, claim| now.saturating_sub(claim.created_unix_ms) <= PENDING_CLAIM_RETENTION_MS);
+    state
+        .daemon_sessions
+        .lock()
+        .await
+        .retain(|_, session| session.expires_unix_ms > now);
+    state.active_sessions.lock().await.retain(|_, session| {
+        now.saturating_sub(session.created_unix_ms) <= ACTIVE_DASHBOARD_SESSION_TTL_MS
+    });
+    prune_rate_limits(&mut *state.rate_limits.lock().await, now);
 }
 
 /// Apply a durable store mutation transactionally: serialize/write the cloned
@@ -1360,5 +1553,204 @@ mod tests {
         }
         assert_eq!(hours.len(), PRESENCE_HOURS_KEPT);
         assert_eq!(*hours.last().unwrap(), 209);
+    }
+
+    fn store_with_marker() -> Store {
+        let mut store = Store::default();
+        store.users.push(UserRecord {
+            id: Uuid::new_v4(),
+            account_name: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            passkeys: Vec::new(),
+            created_unix_ms: 1,
+            updated_unix_ms: 2,
+            last_login_unix_ms: 3,
+            attestations: Vec::new(),
+        });
+        append_log_entry(&mut store, "account_created", json!({ "handle": "alice" }));
+        store
+    }
+
+    /// The deployed instance's state file was written pretty-printed; the
+    /// compact writer and the pretty reader must both round-trip it, so a
+    /// binary from either side of the transition loads the other's file.
+    #[test]
+    fn store_format_is_forward_and_backward_compatible_across_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_marker();
+
+        // Legacy pretty file (what the deployed build wrote) loads cleanly.
+        let legacy = dir.path().join("legacy.json");
+        std::fs::write(&legacy, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+        let loaded_legacy = load_store(&legacy).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded_legacy).unwrap(),
+            serde_json::to_value(&store).unwrap()
+        );
+
+        // The compact writer round-trips, and its bytes stay valid JSON an
+        // older (pretty-writing) serde build parses identically.
+        let compact = dir.path().join("state.json");
+        save_store(&compact, &store).unwrap();
+        let loaded_compact = load_store(&compact).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded_compact).unwrap(),
+            serde_json::to_value(&store).unwrap()
+        );
+    }
+
+    #[test]
+    fn store_dirty_marks_take_once_and_clear() {
+        let dirty = StoreDirty::default();
+        assert!(!dirty.take(), "starts clean");
+        dirty.mark();
+        assert!(dirty.take(), "mark is observable");
+        assert!(!dirty.take(), "take consumes the mark");
+        dirty.mark();
+        dirty.clear();
+        assert!(!dirty.take(), "a synchronous persist clears pending marks");
+    }
+
+    #[tokio::test]
+    async fn persist_locked_clears_the_debounce_mark() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), store_with_marker());
+        let store = state.store.lock().await;
+        mark_store_dirty(&state);
+        persist_locked(&state, &store).unwrap();
+        assert!(
+            !state.store_dirty.take(),
+            "successful sync persist covers pending marks"
+        );
+        let on_disk = load_store(&state.config.data_file).unwrap();
+        assert_eq!(on_disk.users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_flush_monitor_writes_marked_state_once_debounced() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), store_with_marker());
+        tokio::spawn(store_flush_monitor_with(
+            state.clone(),
+            Duration::from_millis(10),
+        ));
+        {
+            let mut store = state.store.lock().await;
+            store.daemons.push(DaemonRecord {
+                daemon_id: "daemon-flush".to_string(),
+                label: None,
+                daemon_public_key: "key".to_string(),
+                owner_user_id: None,
+                claim_code_hash: None,
+                claim_code_created_unix_ms: None,
+                last_registration_proof_unix_ms: None,
+                route_link_revision: 0,
+                last_unclaim_proof_unix_ms: None,
+                registered_unix_ms: 1,
+                last_seen_unix_ms: 1,
+                updated_unix_ms: 1,
+                presence_hours: Vec::new(),
+            });
+            mark_store_dirty(&state);
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(on_disk) = load_store(&state.config.data_file) {
+                if on_disk
+                    .daemons
+                    .iter()
+                    .any(|d| d.daemon_id == "daemon-flush")
+                {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "debounced flush never reached disk"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !state.store_dirty.take(),
+            "flusher consumed the mark it wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweeper_drops_only_entries_dead_to_their_consumers() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+        let now = now_unix_ms();
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(
+                "live".to_string(),
+                SessionRecord {
+                    user_id: Uuid::new_v4(),
+                    csrf_token: "c".to_string(),
+                    expires_unix_ms: now + 60_000,
+                },
+            );
+            sessions.insert(
+                "expired".to_string(),
+                SessionRecord {
+                    user_id: Uuid::new_v4(),
+                    csrf_token: "c".to_string(),
+                    expires_unix_ms: now - 1,
+                },
+            );
+        }
+        {
+            let mut claims = state.pending_claims.lock().await;
+            let claim = PendingClaim {
+                user_id: Uuid::new_v4(),
+                account_name: "alice".to_string(),
+                daemon_id: "daemon-1".to_string(),
+                daemon_public_key: "key".to_string(),
+                challenge: "ch".to_string(),
+                created_unix_ms: now,
+                claim_code_hash: "h".to_string(),
+                claim_code_created_unix_ms: now,
+                status: ClaimStatus::Pending,
+            };
+            claims.insert("fresh".to_string(), claim.clone());
+            claims.insert(
+                "ancient".to_string(),
+                PendingClaim {
+                    created_unix_ms: now - PENDING_CLAIM_RETENTION_MS - 1,
+                    ..claim
+                },
+            );
+        }
+        {
+            let mut limits = state.rate_limits.lock().await;
+            limits.insert(
+                "scope:1.2.3.4".to_string(),
+                RateLimitBucket {
+                    window_start_unix_ms: now,
+                    count: 3,
+                },
+            );
+            limits.insert(
+                "scope:5.6.7.8".to_string(),
+                RateLimitBucket {
+                    window_start_unix_ms: now - RATE_LIMIT_WINDOW_MAX_MS - 1,
+                    count: 900,
+                },
+            );
+        }
+        sweep_in_memory_state(&state).await;
+        let sessions = state.sessions.lock().await;
+        assert!(sessions.contains_key("live"));
+        assert!(!sessions.contains_key("expired"));
+        let claims = state.pending_claims.lock().await;
+        assert!(claims.contains_key("fresh"));
+        assert!(!claims.contains_key("ancient"));
+        let limits = state.rate_limits.lock().await;
+        assert!(limits.contains_key("scope:1.2.3.4"));
+        assert!(
+            !limits.contains_key("scope:5.6.7.8"),
+            "buckets past every window are expired for every scope"
+        );
     }
 }

@@ -529,6 +529,52 @@ pub(crate) fn client_observed_ip(headers: &HeaderMap) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
+/// The largest window any `check_rate_limit` call site uses (the hourly
+/// new-daemon-identity budget). A bucket idle past this is expired for every
+/// scope — the next request would reset it anyway — so pruning such buckets
+/// never changes a limit decision. Asserted at use so a wider window cannot
+/// silently outlive the sweep.
+pub(crate) const RATE_LIMIT_WINDOW_MAX_MS: u64 = 60 * 60_000;
+
+/// Hard bound on distinct rate-limit keys held in memory. Keys derive from
+/// client-controlled forwarded-address headers, so an attacker (or plain
+/// IPv6 churn) can mint fresh keys freely; the table must not grow with
+/// them. At roughly 100 bytes per entry this is a few MB.
+pub(crate) const RATE_LIMIT_MAX_KEYS: usize = 50_000;
+
+/// Drop buckets whose window has expired under every scope's window size.
+pub(crate) fn prune_rate_limits(buckets: &mut HashMap<String, RateLimitBucket>, now: u64) {
+    buckets.retain(|_, bucket| {
+        now.saturating_sub(bucket.window_start_unix_ms) <= RATE_LIMIT_WINDOW_MAX_MS
+    });
+}
+
+/// Bound the table before inserting a new key: prune expired windows first;
+/// if the table is still saturated with live windows, evict the stalest
+/// bucket (the one closest to expiring anyway) rather than growing without
+/// bound or refusing brand-new legitimate clients. An attacker gains nothing
+/// they lack: minting fresh keys was always free via forwarded headers.
+fn reserve_rate_limit_slot(
+    buckets: &mut HashMap<String, RateLimitBucket>,
+    key: &str,
+    now: u64,
+    max_keys: usize,
+) {
+    if buckets.len() < max_keys || buckets.contains_key(key) {
+        return;
+    }
+    prune_rate_limits(buckets, now);
+    if buckets.len() >= max_keys {
+        let stalest = buckets
+            .iter()
+            .min_by_key(|(_, bucket)| bucket.window_start_unix_ms)
+            .map(|(key, _)| key.clone());
+        if let Some(stalest) = stalest {
+            buckets.remove(&stalest);
+        }
+    }
+}
+
 pub(crate) async fn check_rate_limit(
     state: &AppState,
     headers: &HeaderMap,
@@ -536,9 +582,14 @@ pub(crate) async fn check_rate_limit(
     limit: u32,
     window_ms: u64,
 ) -> ApiResult<()> {
+    debug_assert!(
+        window_ms <= RATE_LIMIT_WINDOW_MAX_MS,
+        "rate window {window_ms}ms exceeds the sweep bound — widen RATE_LIMIT_WINDOW_MAX_MS"
+    );
     let now = now_unix_ms();
     let key = client_rate_key(headers, scope);
     let mut buckets = state.rate_limits.lock().await;
+    reserve_rate_limit_slot(&mut buckets, &key, now, RATE_LIMIT_MAX_KEYS);
     let bucket = buckets.entry(key).or_insert(RateLimitBucket {
         window_start_unix_ms: now,
         count: 0,
@@ -979,4 +1030,76 @@ pub(crate) async fn auth_login_finish(
         session_cookie(&state.config, &token, SESSION_TTL_MS / 1000),
     );
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket(window_start_unix_ms: u64) -> RateLimitBucket {
+        RateLimitBucket {
+            window_start_unix_ms,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn rate_limit_prune_removes_only_universally_expired_windows() {
+        let now = RATE_LIMIT_WINDOW_MAX_MS * 3;
+        let mut buckets = HashMap::new();
+        buckets.insert("scope:fresh".to_string(), bucket(now));
+        buckets.insert(
+            "scope:edge".to_string(),
+            bucket(now - RATE_LIMIT_WINDOW_MAX_MS),
+        );
+        buckets.insert(
+            "scope:expired".to_string(),
+            bucket(now - RATE_LIMIT_WINDOW_MAX_MS - 1),
+        );
+        prune_rate_limits(&mut buckets, now);
+        assert!(buckets.contains_key("scope:fresh"));
+        assert!(
+            buckets.contains_key("scope:edge"),
+            "a bucket exactly at the bound may still gate the hourly scope"
+        );
+        assert!(!buckets.contains_key("scope:expired"));
+    }
+
+    #[test]
+    fn rate_limit_table_is_bounded_and_evicts_the_stalest_live_window() {
+        let now = RATE_LIMIT_WINDOW_MAX_MS * 3;
+        let mut buckets = HashMap::new();
+        // Saturate with live windows, one strictly stalest.
+        buckets.insert("scope:stalest".to_string(), bucket(now - 50_000));
+        for index in 0..3 {
+            buckets.insert(format!("scope:live-{index}"), bucket(now - 1_000));
+        }
+        reserve_rate_limit_slot(&mut buckets, "scope:new", now, 4);
+        assert_eq!(buckets.len(), 3, "one slot was reclaimed for the new key");
+        assert!(
+            !buckets.contains_key("scope:stalest"),
+            "the bucket closest to expiring is the one evicted"
+        );
+
+        // An existing key never evicts anything.
+        let before = buckets.len();
+        reserve_rate_limit_slot(&mut buckets, "scope:live-0", now, 3);
+        assert_eq!(buckets.len(), before);
+
+        // Expired windows are reclaimed before any live eviction.
+        buckets.insert(
+            "scope:expired".to_string(),
+            bucket(now - RATE_LIMIT_WINDOW_MAX_MS - 1),
+        );
+        let live_before: Vec<String> = buckets
+            .keys()
+            .filter(|key| *key != "scope:expired")
+            .cloned()
+            .collect();
+        reserve_rate_limit_slot(&mut buckets, "scope:new-2", now, 4);
+        assert!(!buckets.contains_key("scope:expired"));
+        for key in live_before {
+            assert!(buckets.contains_key(&key), "{key} must survive");
+        }
+    }
 }
