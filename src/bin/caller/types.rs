@@ -1066,6 +1066,11 @@ pub enum OutboundEvent {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
     },
+    /// The agenda ledger changed; frontends refresh their agenda views.
+    AgendaChanged {
+        item: crate::agenda::AgendaItem,
+        counts: crate::agenda::AgendaCounts,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

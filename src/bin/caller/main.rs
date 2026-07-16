@@ -1,4 +1,5 @@
 mod access;
+mod agenda;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;

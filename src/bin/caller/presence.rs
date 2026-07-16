@@ -1112,6 +1112,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::UserMessageLog { .. }
         | AppEvent::FollowUpStatus { .. }
         | AppEvent::ExternalFollowUpRequested { .. }
+        | AppEvent::AgendaChanged { .. }
         | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::AutonomyChanged { .. }
         | AppEvent::CodexConfigChanged { .. }
