@@ -74,8 +74,21 @@ pub(crate) enum ActivityObservation {
     /// The provider reported the limit window allowed again.
     RateLimitCleared,
     /// The turn ended (result, turn/completed, interrupt settled, process
-    /// gone) — back to idle.
+    /// gone) — back to idle, or to parked-on-tasks while armed background
+    /// tasks remain.
     TurnSettled,
+    /// The backend's armed background-task set changed (a task launched,
+    /// completed, or was killed — first-hand task events only). Carries
+    /// the full current set of short descriptions; an empty set drains a
+    /// parked claim back to idle. Allowed between turns: a task finishing
+    /// while parked is exactly the between-turn fact this tracks.
+    BackgroundTasksChanged { tasks: Vec<String> },
+    /// A background task's completion notification arrived while no turn
+    /// was running and the backend wakes itself with a new round (probed
+    /// live: the notification is followed immediately by a self-initiated
+    /// API round). Re-opens the turn as awaiting-api. Ignored while a
+    /// turn is already active — a mid-turn completion wakes nothing.
+    WokenByTask,
 }
 
 /// Per-session activity state machine. Pure and clock-injected: every
@@ -90,6 +103,10 @@ pub(crate) struct ActivityMachine {
     effort: Option<String>,
     resets_at_epoch: Option<u64>,
     turn_active: bool,
+    /// Short descriptions of the backend-announced background tasks
+    /// currently running (the armed set, insertion-ordered). Carried in
+    /// every snapshot; grounds the `ParkedOnTasks` claim at turn end.
+    background_tasks: Vec<String>,
     /// The snapshot consumers last saw; `observe` returns the next one
     /// only when it materially differs.
     published: Option<SessionActivityVitals>,
@@ -122,10 +139,19 @@ impl ActivityMachine {
         obs: ActivityObservation,
         now_epoch: u64,
     ) -> Option<SessionActivityVitals> {
-        // Between turns only a dispatch means anything: ambient wire
-        // traffic (idle rate-limit refreshes, bookkeeping notifications)
-        // must not resurrect an activity claim.
-        if !self.turn_active && !matches!(obs, ActivityObservation::TurnDispatched) {
+        // Between turns only a dispatch, a wake, or a background-task
+        // change means anything: ambient wire traffic (idle rate-limit
+        // refreshes, bookkeeping notifications) must not resurrect an
+        // activity claim. The two task observations are precisely the
+        // between-turn facts the parked state exists for.
+        if !self.turn_active
+            && !matches!(
+                obs,
+                ActivityObservation::TurnDispatched
+                    | ActivityObservation::BackgroundTasksChanged { .. }
+                    | ActivityObservation::WokenByTask
+            )
+        {
             return self.maybe_publish();
         }
         match obs {
@@ -172,10 +198,50 @@ impl ActivityMachine {
             }
             ActivityObservation::TurnSettled => {
                 self.turn_active = false;
-                self.enter(SessionActivityState::Idle, false, now_epoch);
+                self.enter(self.settled_state(), false, now_epoch);
+            }
+            ActivityObservation::BackgroundTasksChanged { tasks } => {
+                self.background_tasks = tasks;
+                if !self.turn_active
+                    && matches!(
+                        self.state,
+                        SessionActivityState::Idle | SessionActivityState::ParkedOnTasks
+                    )
+                {
+                    // Between turns the set decides the claim: drain →
+                    // idle, armed → parked. Mid-turn it is carried data
+                    // only — the active state stands.
+                    self.enter(self.settled_state(), false, now_epoch);
+                }
+            }
+            ActivityObservation::WokenByTask => {
+                if !self.turn_active {
+                    // The backend opens a self-initiated round; the honest
+                    // phase is awaiting the API until its bytes arrive.
+                    self.turn_active = true;
+                    self.enter(SessionActivityState::AwaitingApi, true, now_epoch);
+                    self.mark_byte(now_epoch);
+                }
             }
         }
         self.maybe_publish()
+    }
+
+    /// The honest between-turn state: parked while armed background tasks
+    /// remain, idle otherwise.
+    fn settled_state(&self) -> SessionActivityState {
+        if self.background_tasks.is_empty() {
+            SessionActivityState::Idle
+        } else {
+            SessionActivityState::ParkedOnTasks
+        }
+    }
+
+    /// Whether a turn is currently open (dispatch/wake seen, no settle
+    /// yet) — the reader's wake discriminator: a task notification with no
+    /// open turn is a wake, mid-turn it is plain bookkeeping.
+    pub(crate) fn turn_active(&self) -> bool {
+        self.turn_active
     }
 
     fn enter(&mut self, state: SessionActivityState, delta_heartbeat: bool, now_epoch: u64) {
@@ -210,6 +276,7 @@ impl ActivityMachine {
             stalled_after_seconds: stall_armed.then_some(STALL_AFTER_SECS),
             effort: self.effort.clone(),
             resets_at_epoch: self.resets_at_epoch,
+            background_tasks: self.background_tasks.clone(),
         }
     }
 
@@ -525,6 +592,90 @@ mod tests {
     }
 
     #[test]
+    fn turn_settled_with_armed_tasks_parks_then_drains_to_idle() {
+        let mut m = ActivityMachine::new(None);
+        m.observe(Obs::TurnDispatched, 100);
+        m.observe(Obs::ToolsRunning, 101);
+        // The backend announced a background task mid-turn: carried data,
+        // no state change while the turn runs.
+        assert!(m
+            .observe(
+                Obs::BackgroundTasksChanged {
+                    tasks: vec!["sleep 8 && echo done".into()]
+                },
+                102,
+            )
+            .is_some());
+        assert_eq!(m.snapshot().state, SessionActivityState::ToolRunning);
+
+        // Turn end with the set armed: parked, not idle — and parked
+        // promises no byte stream, so it never degrades to stalled.
+        let s = m.observe(Obs::TurnSettled, 150).expect("parked publishes");
+        assert_eq!(s.state, SessionActivityState::ParkedOnTasks);
+        assert_eq!(s.since_epoch, 150);
+        assert_eq!(s.background_tasks, vec!["sleep 8 && echo done"]);
+        assert_eq!(s.stalled_after_seconds, None, "quiet is normal here");
+        assert_eq!(
+            m.effective_state(150 + 100 * u64::from(STALL_AFTER_SECS)),
+            SessionActivityState::ParkedOnTasks
+        );
+
+        // Ambient bytes still say nothing between turns.
+        assert!(m.observe(Obs::ResponseDelta, 160).is_none());
+        assert_eq!(m.snapshot().state, SessionActivityState::ParkedOnTasks);
+
+        // The set draining between turns retires the claim to idle.
+        let s = m
+            .observe(Obs::BackgroundTasksChanged { tasks: Vec::new() }, 200)
+            .expect("drain publishes");
+        assert_eq!(s.state, SessionActivityState::Idle);
+        assert!(s.background_tasks.is_empty());
+    }
+
+    #[test]
+    fn woken_by_task_reopens_the_turn_and_resettles_parked_while_armed() {
+        let mut m = ActivityMachine::new(None);
+        m.observe(Obs::TurnDispatched, 100);
+        m.observe(
+            Obs::BackgroundTasksChanged {
+                tasks: vec!["battery run".into(), "deploy".into()],
+            },
+            101,
+        );
+        let s = m.observe(Obs::TurnSettled, 110).expect("parked publishes");
+        assert_eq!(s.state, SessionActivityState::ParkedOnTasks);
+        assert_eq!(s.background_tasks.len(), 2);
+
+        // First task finishes → the backend wakes itself: awaiting-api
+        // (with its stall promise), turn open again, one task left.
+        assert!(!m.turn_active());
+        let s = m.observe(Obs::WokenByTask, 200).expect("wake publishes");
+        assert_eq!(s.state, SessionActivityState::AwaitingApi);
+        assert_eq!(s.stalled_after_seconds, Some(STALL_AFTER_SECS));
+        assert!(m.turn_active());
+        m.observe(
+            Obs::BackgroundTasksChanged {
+                tasks: vec!["deploy".into()],
+            },
+            200,
+        );
+        m.observe(Obs::ResponseDelta, 203);
+        assert_eq!(m.snapshot().state, SessionActivityState::Responding);
+
+        // The wake round ends with one task still armed: parked again.
+        let s = m.observe(Obs::TurnSettled, 250).expect("parked publishes");
+        assert_eq!(s.state, SessionActivityState::ParkedOnTasks);
+        assert_eq!(s.background_tasks, vec!["deploy"]);
+
+        // A wake while a turn is already open is a no-op (mid-turn
+        // completions wake nothing).
+        m.observe(Obs::TurnDispatched, 300);
+        m.observe(Obs::ResponseDelta, 301);
+        assert!(m.observe(Obs::WokenByTask, 302).is_none());
+        assert_eq!(m.snapshot().state, SessionActivityState::Responding);
+    }
+
+    #[test]
     fn heartbeat_publishing_is_quantized() {
         let mut m = ActivityMachine::new(None);
         m.observe(Obs::TurnDispatched, 100);
@@ -580,16 +731,22 @@ mod tests {
             stalled_after_seconds: Some(20),
             effort: Some("high".into()),
             resets_at_epoch: None,
+            background_tasks: vec!["cargo test".into()],
         };
         let json = serde_json::to_string(&activity).expect("serializes");
         assert!(json.contains("\"state\":\"tool-running\""), "{json}");
         assert!(json.contains("\"sinceEpoch\":1"), "{json}");
         assert!(json.contains("\"lastStreamByteEpoch\":2"), "{json}");
         assert!(json.contains("\"stalledAfterSeconds\":20"), "{json}");
+        assert!(json.contains("\"backgroundTasks\":[\"cargo test\"]"), "{json}");
+        // An empty task list stays off the wire entirely.
+        let quiet = serde_json::to_string(&SessionActivityVitals::default()).expect("serializes");
+        assert!(!quiet.contains("backgroundTasks"), "{quiet}");
         for state in [
             SessionActivityState::Reasoning,
             SessionActivityState::Responding,
             SessionActivityState::AwaitingApi,
+            SessionActivityState::ParkedOnTasks,
             SessionActivityState::RateLimited,
             SessionActivityState::Stalled,
             SessionActivityState::Idle,
@@ -600,6 +757,7 @@ mod tests {
                     "\"reasoning\"",
                     "\"responding\"",
                     "\"awaiting-api\"",
+                    "\"parked-on-tasks\"",
                     "\"rate-limited\"",
                     "\"stalled\"",
                     "\"idle\""
