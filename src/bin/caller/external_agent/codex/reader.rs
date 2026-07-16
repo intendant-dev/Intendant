@@ -739,7 +739,11 @@ pub(crate) fn non_empty_string_at(value: &serde_json::Value, paths: &[&str]) -> 
     })
 }
 
-pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
+/// Structured file paths of a Codex `fileChange` item, verbatim as the wire
+/// item stated them (single-path fields, `paths`/`files` arrays, or the
+/// `changes` map's keys — same precedence the preview always used). Feeds
+/// both the human preview and `AgentEvent::FileActivity`.
+pub(crate) fn codex_file_change_paths(params: &serde_json::Value) -> Vec<String> {
     if let Some(path) = non_empty_string_at(
         params,
         &[
@@ -752,7 +756,7 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
             "/file_path",
         ],
     ) {
-        return Some(path);
+        return vec![path];
     }
 
     let item = params.get("item").unwrap_or(params);
@@ -773,7 +777,7 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
                 }
             }
             if !paths.is_empty() {
-                return Some(paths.join(", "));
+                return paths;
             }
         }
     }
@@ -782,11 +786,20 @@ pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<St
         let mut paths: Vec<String> = changes.keys().cloned().collect();
         paths.sort();
         if !paths.is_empty() {
-            return Some(paths.join(", "));
+            return paths;
         }
     }
 
-    None
+    Vec::new()
+}
+
+pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
+    let paths = codex_file_change_paths(params);
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths.join(", "))
+    }
 }
 
 pub(crate) fn codex_web_search_preview(params: &serde_json::Value) -> String {
@@ -2240,7 +2253,8 @@ pub(crate) fn translate_notification_with_scope(
                     // path metadata is attached. Avoid showing a blank
                     // "file_change:" activity row; the filesystem watcher
                     // will still report the actual changed files.
-                    if let Some(preview) = codex_file_change_preview(params) {
+                    let paths = codex_file_change_paths(params);
+                    if !paths.is_empty() {
                         send_scoped_agent_event(
                             event_tx,
                             thread_id,
@@ -2248,8 +2262,16 @@ pub(crate) fn translate_notification_with_scope(
                             AgentEvent::ToolStarted {
                                 item_id,
                                 tool_name: "file_change".to_string(),
-                                preview,
+                                preview: paths.join(", "),
                             },
+                        );
+                        // Same paths, structured — the drain forwards them
+                        // to the git-vitals activity-locus tracker.
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::FileActivity { paths },
                         );
                     }
                 }
@@ -3431,6 +3453,58 @@ mod tests {
                 assert!(preview.contains("src/main.rs"));
             }
             other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_started_file_change_emits_structured_file_activity() {
+        // The preview's ToolStarted is followed by a structured
+        // FileActivity carrying the same paths — the git-vitals
+        // activity-locus signal (never parsed back out of the preview).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "item": {
+                "type": "fileChange",
+                "changes": {
+                    "/abs/checkout/src/main.rs": {},
+                    "/abs/checkout/src/lib.rs": {}
+                }
+            }
+        });
+        translate_notification("item/started", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolStarted { tool_name, .. } => assert_eq!(tool_name, "file_change"),
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::FileActivity { paths } => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        "/abs/checkout/src/lib.rs".to_string(),
+                        "/abs/checkout/src/main.rs".to_string(),
+                    ],
+                    "changes-map keys arrive sorted and verbatim"
+                );
+            }
+            other => panic!("expected FileActivity, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "exactly two events per fileChange");
+
+        // Single-path items carry that path structurally too.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "itemId": "item-3",
+            "item": {"type": "fileChange", "path": "/tmp/test.txt"}
+        });
+        translate_notification("item/started", &params, &tx);
+        let _tool_started = rx.try_recv().unwrap();
+        match rx.try_recv().unwrap() {
+            AgentEvent::FileActivity { paths } => {
+                assert_eq!(paths, vec!["/tmp/test.txt".to_string()]);
+            }
+            other => panic!("expected FileActivity, got {:?}", other),
         }
     }
 

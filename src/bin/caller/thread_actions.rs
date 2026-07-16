@@ -3263,6 +3263,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 source: config.agent_source.clone(),
             });
         }
+        external_agent::AgentEvent::FileActivity { .. } => {
+            // Git-vitals activity-locus signal: an idle Codex subagent's
+            // writes must not retarget any supervising session's git chip
+            // (mirrors the drain's primary-conversation-only gating).
+        }
         external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
             let tool_output_limiter = stats
                 .codex_subagent_tool_output_limiters
