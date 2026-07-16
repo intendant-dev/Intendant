@@ -22,9 +22,11 @@
 //!   catalog reports `supported: false` until the tree parser lands).
 
 mod claude_tree;
+mod codex_stage;
 mod fork_points;
 mod native;
 pub(crate) use claude_tree::*;
+pub(crate) use codex_stage::*;
 pub(crate) use fork_points::*;
 pub(crate) use native::*;
 

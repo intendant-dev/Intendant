@@ -21,6 +21,9 @@ on:
       - "Cargo.lock"
       - "crates/**/Cargo.toml"
       - ".cargo/audit.toml"
+      # Edits to this workflow validate themselves pre-merge (advisory
+      # check, not required — a paths filter here can't wedge queue entry).
+      - ".github/workflows/audit.yml"
   schedule:
     # Mondays at 08:00 UTC.
     - cron: "0 8 * * 1"
@@ -44,6 +47,12 @@ jobs:
         # nothing in these jobs pushes.
         with:
           persist-credentials: false
+      # Prebuilt cargo-audit binary (seconds) so audit-check below finds it on
+      # PATH — its fallback is a cargo-install from source (~3 min per run).
+      # rustsec/audit-check stays for the annotations / issue-filing behavior.
+      - uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2.83.1
+        with:
+          tool: cargo-audit
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

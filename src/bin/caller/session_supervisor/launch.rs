@@ -644,6 +644,10 @@ impl SessionSupervisor {
                     .map(str::to_string);
             }
         }
+        // Anchor-fork parameters ride internal overrides only (absent from
+        // `as_wire_fields`); applied after the wire-vetted block so the
+        // supervisor-minted kind (`anchor-fork`) can override it.
+        overrides.apply_fork_lineage(session_agent_config.as_mut());
         let project_root = if external_backend.is_some() {
             match resolve_external_resume_project_root(
                 project_root,
