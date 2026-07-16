@@ -12,23 +12,30 @@ pub(crate) fn spawn_control_request(
     task_tx: mpsc::Sender<SequencedTaskResponse>,
     pending_requests: &mut PendingControlRequests,
 ) {
-    let (cancel, generation) = pending_requests.admit(&id);
+    let (cancel, generation, slot) = pending_requests.admit(&id);
     tokio::spawn(async move {
-        // Cancellation is enforced at this seam rather than threaded into
-        // every handler's internals: superseding/cancelling the request
-        // drops the handler future at its next await point, which bounds
-        // live work for same-id spam (an already-entered spawn_blocking
-        // segment runs out on the blocking pool and drops its output).
-        // A cancelled task sends nothing — its reservation was already
-        // replaced or removed by whoever cancelled it.
-        let response = tokio::select! {
+        // RAII: the slot frees when THIS task exits, so the 64-slot
+        // admission bound covers ALL live work. The handler runs to
+        // completion even when superseded — dropping the future
+        // mid-flight would detach an in-flight spawn_blocking segment
+        // and let its work (and queue position on the blocking pool)
+        // escape the bound; a cancelled predecessor therefore keeps its
+        // slot while it drains, and rapid same-id cycling saturates the
+        // bound and gets refused instead of occupying the pool.
+        // Handlers that poll the token still stop early.
+        let _slot = slot;
+        let response = control_request_response(id, method, params, runtime, cancel.clone()).await;
+        if cancel.is_cancelled() {
+            // Superseded: stale output must not reach the wire.
+            return;
+        }
+        // The channel wait is cancellable too — a completed-but-stale
+        // response must not sit queued holding a full payload.
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
-            response = control_request_response(id, method, params, runtime, cancel.clone()) => {
-                response
-            }
-        };
-        let _ = task_tx.send((generation, response)).await;
+            _ = cancel.cancelled() => {}
+            _ = task_tx.send((generation, response)) => {}
+        }
     });
 }
 
@@ -87,8 +94,14 @@ pub(crate) fn spawn_control_stream(
     task_tx: mpsc::Sender<SequencedTaskResponse>,
     pending_requests: &mut PendingControlRequests,
 ) {
-    let (cancel, generation) = pending_requests.admit(&id);
+    let (cancel, generation, slot) = pending_requests.admit(&id);
     tokio::spawn(async move {
+        // Same RAII contract as the request lane: the slot spans the
+        // framer AND the awaited source task, so the stream's detached
+        // blocking work stays inside the admission bound (the framer
+        // polls the token per line; an early exit drops the line
+        // receiver, which stops the producer at its next send).
+        let _slot = slot;
         match method.as_str() {
             "api_sessions_stream" => {
                 stream_sessions_response(id, params.as_ref(), task_tx, generation, cancel).await;
@@ -100,8 +113,10 @@ pub(crate) fn spawn_control_stream(
                     "ok": false,
                     "error": format!("unknown stream method: {method}"),
                 });
-                let _ = task_tx
-                    .send((
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    _ = task_tx.send((
                         generation,
                         ControlTaskResponse {
                             id,
@@ -109,8 +124,8 @@ pub(crate) fn spawn_control_stream(
                             byte_stream: None,
                             done: true,
                         },
-                    ))
-                    .await;
+                    )) => {}
+                }
             }
         }
     });
@@ -1375,6 +1390,39 @@ pub(crate) async fn api_sessions_search_response(
 mod tests {
     use super::*;
     use crate::dashboard_control::tests::runtime;
+
+    /// The spawned request lane's RAII contract: a spawned task holds its
+    /// live-work slot for its whole life (admission counts it) and the
+    /// slot frees only when the task actually exits — after its response
+    /// is delivered, not at replacement time.
+    #[tokio::test]
+    async fn spawned_request_slot_frees_on_task_exit() {
+        let mut pending = PendingControlRequests::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        spawn_control_request(
+            "slot-1".to_string(),
+            "definitely_not_a_method".to_string(),
+            None,
+            runtime(),
+            tx,
+            &mut pending,
+        );
+        assert_eq!(pending.live_work(), 1, "the spawned task holds its slot");
+        let (generation, response) = rx.recv().await.expect("task answers");
+        assert!(pending.matches("slot-1", generation));
+        assert_eq!(response.id, "slot-1");
+        // The slot frees when the task exits (just after the send).
+        let mut freed = false;
+        for _ in 0..400 {
+            if pending.live_work() == 0 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(freed, "the slot must free on task exit");
+        assert!(pending.complete("slot-1", generation));
+    }
 
     #[tokio::test]
     async fn session_report_rpc_returns_zip_for_active_log() {

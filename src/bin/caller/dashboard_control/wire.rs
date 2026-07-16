@@ -867,6 +867,13 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Classified BEFORE the frame is consumed: every ERROR-class frame is
+    // budgeted at this one choke point no matter which path built it —
+    // auth denials, unknown methods, upload errors, admission refusals —
+    // because with credit disabled (or an empty queue) immediate frames
+    // go straight to the reliable SCTP queue, which spam must not grow
+    // without bound. Success frames are never budgeted.
+    let error_class = is_error_class_frame(&frame);
     match control_frame_text_parts(
         frame,
         CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
@@ -891,7 +898,7 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
                             );
                         }
                     }
-                } else {
+                } else if !error_class || error_budget.allow(wire_congested) {
                     send_control_text(rtc, channels, text);
                 }
             }

@@ -913,7 +913,7 @@ pub(crate) fn control_frame_response(
                     &runtime.grant,
                 )),
                 "api_sessions_stream" => {
-                    if pending_requests_at_capacity(pending_requests, &id) {
+                    if pending_requests_at_capacity(pending_requests) {
                         return Some(dashboard_control_error_response(
                             id,
                             "too many in-flight requests on this connection",
@@ -947,7 +947,7 @@ pub(crate) fn control_frame_response(
                     // could build N full payloads the queue would then
                     // refuse. Same-id replacement stays allowed (it
                     // cancels its predecessor).
-                    if pending_requests_at_capacity(pending_requests, &id) {
+                    if pending_requests_at_capacity(pending_requests) {
                         return Some(dashboard_control_error_response(
                             id,
                             "too many in-flight requests on this connection",
@@ -991,11 +991,12 @@ pub(crate) fn control_frame_response(
     }
 }
 
-/// Spawn-time admission for the request lane (`MAX_PENDING_CONTROL_REQUESTS`):
-/// full only when the id would be a NEW entry — replacing an in-flight
-/// request with the same id cancels its predecessor and holds the count.
-fn pending_requests_at_capacity(pending_requests: &PendingControlRequests, id: &str) -> bool {
-    pending_requests.at_capacity_for(id)
+/// Spawn-time admission for the spawned-work lanes
+/// (`MAX_PENDING_CONTROL_REQUESTS`, live-work slots). No same-id
+/// exemption: a replacement cannot make its predecessor's in-flight work
+/// disappear, so it must fit under the same bound.
+fn pending_requests_at_capacity(pending_requests: &PendingControlRequests) -> bool {
+    pending_requests.at_capacity()
 }
 
 pub(crate) fn control_upload_error_response(
@@ -1079,7 +1080,19 @@ pub(crate) fn control_upload_start_frame(
     }
     // Connection-level admission (same-id restart replaces its own slot):
     // a burst of upload_starts must not reserve unbounded spool space.
-    let concurrent_elsewhere = inbound_uploads.keys().filter(|key| *key != &id).count();
+    // The live-work bound covers uploads too — the slot minted below is
+    // held from the first frame through commit completion.
+    if pending_requests_at_capacity(pending_requests) {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            "too many in-flight requests on this connection",
+        ));
+    }
+    // Committing uploads left `inbound_uploads` but their work and spool
+    // live until the commit finishes — they count against the cap.
+    let concurrent_elsewhere = inbound_uploads.keys().filter(|key| *key != &id).count()
+        + pending_requests.committing_uploads();
     if concurrent_elsewhere >= MAX_INBOUND_UPLOADS_PER_CONNECTION {
         return Some(control_upload_error_response(
             id,
@@ -1111,8 +1124,10 @@ pub(crate) fn control_upload_start_frame(
     };
     inbound_uploads.remove(&id);
     // Reserve through the same generation-bearing admission the request
-    // lane uses: the terminal task's response must match this generation.
-    let (_cancel, generation) = pending_requests.admit(&id);
+    // lane uses: the terminal task's response must match this generation,
+    // and the RAII slot rides the receiving state into the commit task —
+    // one continuous live-work slot from first frame to commit end.
+    let (_cancel, generation, slot) = pending_requests.admit(&id);
     inbound_uploads.insert(
         id,
         InboundUploadState {
@@ -1127,6 +1142,7 @@ pub(crate) fn control_upload_start_frame(
             next_seq: 0,
             received_bytes: 0,
             generation,
+            slot: Some(slot),
         },
     );
     None
@@ -1241,8 +1257,17 @@ pub(crate) fn control_upload_end_frame(
     // arbitrary await point is worse than finishing it); the generation
     // gate on the response is what keeps a superseded commit from
     // reaching the wire or freeing its replacement's reservation.
+    // Run-to-completion is fine — UNBOUNDED run-to-completion is not:
+    // the commit occupies its live-work slot (taken out of the state so
+    // it survives the handlers consuming `upload`) plus a committing-
+    // upload slot that the upload 8-cap counts, both until the commit
+    // actually finishes.
     let generation = upload.generation;
+    let commit_slot = pending_requests.upload_commit_slot();
     tokio::spawn(async move {
+        let mut upload = upload;
+        let _slot = upload.slot.take();
+        let _commit_slot = commit_slot;
         let response = match upload.method.as_str() {
             "api_session_current_upload" => {
                 api_session_current_upload_task_response(id.clone(), upload, runtime).await

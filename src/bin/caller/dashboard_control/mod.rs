@@ -95,6 +95,23 @@ pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 
+/// ERROR-class classification for the immediate-frame budget seam: the
+/// plain error envelope (`ok: false` — auth denials, unknown methods,
+/// admission refusals) and the injected-status error shape
+/// (`result._httpOk: false` — the upload lane's 4xx/5xx envelopes).
+/// These are the frames a client can mint cheaply by spamming invalid
+/// requests; success frames are never budgeted.
+pub(crate) fn is_error_class_frame(frame: &serde_json::Value) -> bool {
+    if frame.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return true;
+    }
+    frame
+        .get("result")
+        .and_then(|result| result.get("_httpOk"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
 /// Token budget for DIRECT error frames — the admission-refusal and
 /// rejection replies that deliberately bypass the queue/backpressure
 /// lanes (they must be deliverable exactly when those lanes are the
@@ -142,6 +159,11 @@ impl DirectErrorBudget {
             );
         }
         false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Log the drop tally at connection teardown (silent when zero).
@@ -2040,11 +2062,23 @@ pub(crate) type SequencedTaskResponse = (u64, ControlTaskResponse);
 /// request id with a per-admission GENERATION (the peer-transfer read
 /// registry's pattern): same-id replacement cancels its predecessor and
 /// mints a new generation, completion frees only its own generation, and
-/// stale-generation responses are dropped. Admission (`at_capacity_for` +
-/// [`MAX_PENDING_CONTROL_REQUESTS`]) reserves at SPAWN time, before any
-/// response bytes exist.
+/// stale-generation responses are dropped.
+///
+/// Admission is bounded by LIVE WORK, not addressable entries: every
+/// admit hands out an RAII [`LiveWorkSlot`] that the spawned task owns
+/// until its work ACTUALLY ends (the handler future runs to completion —
+/// awaited `spawn_blocking` segments included). A cancelled predecessor
+/// therefore keeps holding its slot while it drains, so rapid same-id
+/// cycling saturates [`MAX_PENDING_CONTROL_REQUESTS`] and gets refused
+/// instead of stacking untracked work onto the blocking pool.
 pub(crate) struct PendingControlRequests {
     entries: HashMap<String, PendingControlRequest>,
+    /// Live-work ledger: strong count − 1 = slots currently held.
+    live_work: Arc<()>,
+    /// Committing-upload ledger: strong count − 1 = commits in flight
+    /// (they left `inbound_uploads` but their work — and spool — lives
+    /// until the commit finishes; the upload 8-cap counts them).
+    committing_uploads: Arc<()>,
     next_generation: u64,
 }
 
@@ -2053,19 +2087,28 @@ struct PendingControlRequest {
     generation: u64,
 }
 
+/// RAII live-work slot: dropping it is the ONLY thing that frees
+/// admission capacity, so a slot must be owned by the spawned task (or
+/// the upload state that becomes one) and live until the work ends.
+pub(crate) struct LiveWorkSlot(#[allow(dead_code)] Arc<()>);
+
+/// RAII committing-upload slot (see `committing_uploads`).
+pub(crate) struct UploadCommitSlot(#[allow(dead_code)] Arc<()>);
+
 impl PendingControlRequests {
     pub(crate) fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            live_work: Arc::new(()),
+            committing_uploads: Arc::new(()),
             next_generation: 0,
         }
     }
 
-    /// Reserve `id`, cancelling and replacing any predecessor (whose
-    /// spawned task dies at its next await point — see the spawn
-    /// wrappers' `select!`). Returns the new reservation's cancel token
-    /// and generation.
-    pub(crate) fn admit(&mut self, id: &str) -> (CancellationToken, u64) {
+    /// Reserve a live-work slot for `id`, cancelling and replacing any
+    /// predecessor ENTRY. The predecessor's SLOT stays with its task —
+    /// capacity frees when that work exits, never at replacement.
+    pub(crate) fn admit(&mut self, id: &str) -> (CancellationToken, u64, LiveWorkSlot) {
         if let Some(previous) = self.entries.remove(id) {
             previous.cancel.cancel();
         }
@@ -2079,7 +2122,26 @@ impl PendingControlRequests {
                 generation,
             },
         );
-        (cancel, generation)
+        (
+            cancel,
+            generation,
+            LiveWorkSlot(Arc::clone(&self.live_work)),
+        )
+    }
+
+    /// Slots currently held by live work (draining predecessors included).
+    pub(crate) fn live_work(&self) -> usize {
+        Arc::strong_count(&self.live_work).saturating_sub(1)
+    }
+
+    /// One committing upload's cap presence (held until the commit ends).
+    pub(crate) fn upload_commit_slot(&self) -> UploadCommitSlot {
+        UploadCommitSlot(Arc::clone(&self.committing_uploads))
+    }
+
+    /// Commits currently in flight.
+    pub(crate) fn committing_uploads(&self) -> usize {
+        Arc::strong_count(&self.committing_uploads).saturating_sub(1)
     }
 
     /// The client's `cancel` frame: cancel and free the reservation.
@@ -2110,18 +2172,23 @@ impl PendingControlRequests {
         }
     }
 
+    /// Test-only observers (production reads go through `matches` /
+    /// `live_work` / `at_capacity`).
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, id: &str) -> bool {
         self.entries.contains_key(id)
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Spawn-time admission: full only when `id` would be a NEW entry —
-    /// same-id replacement cancels its predecessor and holds the count.
-    pub(crate) fn at_capacity_for(&self, id: &str) -> bool {
-        !self.contains_key(id) && self.len() >= MAX_PENDING_CONTROL_REQUESTS
+    /// Spawn-time admission against LIVE WORK. Deliberately no same-id
+    /// exemption: a replacement cannot make its predecessor's in-flight
+    /// work disappear, so it must fit under the same bound.
+    pub(crate) fn at_capacity(&self) -> bool {
+        self.live_work() >= MAX_PENDING_CONTROL_REQUESTS
     }
 
     /// Teardown: cancel every reservation.
@@ -2173,9 +2240,12 @@ const MAX_INBOUND_UPLOADS_PER_CONNECTION: usize = 8;
 /// admission control at upload_start, so a burst of starts cannot
 /// reserve unbounded spool space regardless of the per-upload cap.
 const MAX_INBOUND_UPLOAD_TOTAL_BYTES: usize = 256 * 1024 * 1024;
-/// Concurrent spawned request tasks per tunnel connection. Each spawned
-/// handler may construct a response as large as the fs-read cap before
-/// queue admission runs, so the reservation has to happen at spawn time.
+/// LIVE spawned-work slots per tunnel connection (request tasks, stream
+/// framers, upload states and their commit tasks). Each spawned handler
+/// may construct a response as large as the fs-read cap before queue
+/// admission runs, so the reservation happens at spawn time and — via
+/// the RAII [`LiveWorkSlot`] — frees only when the work actually ends,
+/// covering cancelled-but-draining predecessors too.
 const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
 
 impl UploadSpool {
@@ -2281,6 +2351,11 @@ pub(crate) struct InboundUploadState {
     /// `upload_start` — the terminal task's response carries it so the
     /// driver can match it against the live reservation.
     generation: u64,
+    /// The live-work slot minted at `upload_start`, carried through the
+    /// receiving state and taken by the commit task at `upload_end` —
+    /// one continuous slot from first frame to commit completion.
+    /// `None` only in hermetic fixtures.
+    slot: Option<LiveWorkSlot>,
 }
 
 impl InboundUploadState {
@@ -3945,15 +4020,60 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The direct-error budget: while congested, exactly
+    /// [`DIRECT_ERROR_BUDGET_FRAMES`] error frames pass, further ones drop
+    /// and are counted; an uncongested beat (the wire drained) refills.
+    #[test]
+    fn direct_error_budget_bounds_congested_error_frames() {
+        let mut budget = DirectErrorBudget::new("test");
+        for index in 0..DIRECT_ERROR_BUDGET_FRAMES {
+            assert!(budget.allow(true), "frame {index} rides the budget");
+        }
+        assert!(!budget.allow(true), "budget exhausted while congested");
+        assert!(!budget.allow(true));
+        assert_eq!(budget.dropped(), 2, "drops are counted per connection");
+        // A drained wire refills the budget.
+        assert!(budget.allow(false));
+        assert!(budget.allow(true));
+        assert_eq!(budget.dropped(), 2);
+    }
+
+    /// The immediate-frame seam's ERROR classification: the plain error
+    /// envelope and the injected-status error shape are budgeted; success
+    /// shapes never are.
+    #[test]
+    fn error_class_frames_are_classified() {
+        assert!(is_error_class_frame(&dashboard_control_error_response(
+            "r1".into(),
+            "denied"
+        )));
+        assert!(is_error_class_frame(&serde_json::json!({
+            "t": "response",
+            "id": "u1",
+            "ok": true,
+            "result": { "_httpStatus": 429, "_httpOk": false, "error": "too many" },
+        })));
+        assert!(!is_error_class_frame(&serde_json::json!({
+            "t": "response",
+            "id": "ok1",
+            "ok": true,
+            "result": { "_httpStatus": 200, "_httpOk": true },
+        })));
+        assert!(!is_error_class_frame(&serde_json::json!({
+            "t": "hello_ack",
+            "id": "h1",
+        })));
+    }
+
     /// Generation-keyed reservations: same-id replacement cancels its
     /// predecessor and mints a new generation; a superseded generation
     /// can neither claim ownership nor free the replacement's
-    /// reservation; capacity exempts same-id replacement only.
+    /// reservation.
     #[test]
     fn pending_request_generations_protect_replacements() {
         let mut pending = PendingControlRequests::new();
-        let (first_cancel, first_generation) = pending.admit("r1");
-        let (second_cancel, second_generation) = pending.admit("r1");
+        let (first_cancel, first_generation, _first_slot) = pending.admit("r1");
+        let (second_cancel, second_generation, _second_slot) = pending.admit("r1");
         assert!(
             first_cancel.is_cancelled(),
             "replacement cancels the predecessor"
@@ -3969,16 +4089,46 @@ mod tests {
         assert!(pending.contains_key("r1"));
         assert!(pending.complete("r1", second_generation));
         assert!(!pending.contains_key("r1"));
+    }
 
+    /// The admission bound counts LIVE WORK, not addressable entries:
+    /// rapid same-id cycling accumulates one slot per still-draining
+    /// predecessor (held via RAII until that task actually exits), so a
+    /// spammer saturates the bound and gets refused instead of stacking
+    /// untracked work onto the blocking pool — and capacity frees only
+    /// when a predecessor's own slot drops.
+    #[test]
+    fn live_work_slots_bound_same_id_cycling() {
         let mut pending = PendingControlRequests::new();
-        for index in 0..MAX_PENDING_CONTROL_REQUESTS {
-            pending.admit(&format!("r{index}"));
+        let mut draining = Vec::new();
+        for _ in 0..MAX_PENDING_CONTROL_REQUESTS {
+            let (_cancel, _generation, slot) = pending.admit("spam");
+            draining.push(slot);
         }
-        assert!(pending.at_capacity_for("new-id"));
-        assert!(
-            !pending.at_capacity_for("r0"),
-            "same-id replacement stays admissible at capacity"
+        assert_eq!(pending.len(), 1, "one addressable entry");
+        assert_eq!(
+            pending.live_work(),
+            MAX_PENDING_CONTROL_REQUESTS,
+            "every draining predecessor still holds its slot"
         );
+        assert!(
+            pending.at_capacity(),
+            "cycling one id saturates the live-work bound"
+        );
+        // Only a predecessor's own exit frees capacity.
+        draining.pop();
+        assert!(!pending.at_capacity());
+        // Entry removal (cancel frame) does not free the drained work.
+        assert!(pending.cancel_remove("spam"));
+        assert_eq!(pending.live_work(), MAX_PENDING_CONTROL_REQUESTS - 1);
+        drop(draining);
+        assert_eq!(pending.live_work(), 0);
+
+        // The committing-upload ledger is RAII the same way.
+        let commit_slot = pending.upload_commit_slot();
+        assert_eq!(pending.committing_uploads(), 1);
+        drop(commit_slot);
+        assert_eq!(pending.committing_uploads(), 0);
     }
 
     /// The pre-serialized response carrier: byte-verbatim body embedding,
@@ -4058,6 +4208,7 @@ mod tests {
             next_seq: if bytes.is_empty() { 0 } else { 1 },
             received_bytes: bytes.len(),
             generation: 0,
+            slot: None,
         }
     }
 
