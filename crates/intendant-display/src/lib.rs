@@ -1975,6 +1975,12 @@ impl DisplaySession {
             let mut frame_counter = 0u64;
             let reg_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                // The frame the cached JPEG was encoded from, so an
+                // unchanged `latest_frame` (event-driven backends emit
+                // nothing while the desktop is idle) re-registers the
+                // cached bytes instead of re-encoding the identical
+                // image every second.
+                let mut last_jpeg: Option<(Arc<Frame>, Vec<u8>)> = None;
                 loop {
                     tokio::select! {
                         _ = shutdown_reg.cancelled() => break,
@@ -1990,57 +1996,41 @@ impl DisplaySession {
                             let Some(frame) = frame else { continue };
                             let w = frame.width;
                             let h = frame.height;
-                            // Encode BGRA/RGBA → JPEG on blocking pool
-                            let jpeg = tokio::task::spawn_blocking(move || {
-                                // Strip row padding if stride > width * 4
-                                let row_bytes = w as usize * 4;
-                                let stride = frame.stride as usize;
-                                let rgba_data = match frame.format {
-                                    FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-                                    FrameFormat::Rgba => {
-                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                                        for row in 0..h as usize {
-                                            let start = row * stride;
-                                            tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-                                        }
-                                        tight
-                                    }
-                                    FrameFormat::Bgra => {
-                                        let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                                        for row in 0..h as usize {
-                                            let start = row * stride;
-                                            for col in 0..w as usize {
-                                                let px = start + col * 4;
-                                                tight.push(frame.data[px + 2]); // R
-                                                tight.push(frame.data[px + 1]); // G
-                                                tight.push(frame.data[px]);      // B
-                                                tight.push(frame.data[px + 3]); // A
-                                            }
-                                        }
-                                        tight
-                                    }
-                                };
-                                let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
-                                let mut buf = std::io::Cursor::new(Vec::new());
-                                img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
-                                Some(buf.into_inner())
-                            }).await.ok().flatten();
-                            if let Some(jpeg_bytes) = jpeg {
-                                frame_counter += 1;
-                                let stream = format!("display_{}", display_id);
-                                let frame_id = format!("{}-f{}", stream, frame_counter);
-                                let meta = presence_core::FrameMeta {
-                                    frame_id,
-                                    stream,
-                                    timestamp: chrono::Utc::now().to_rfc3339(),
-                                    sent_to_live: false,
-                                    live_resolution: None,
-                                    hq_resolution: Some(format!("{}x{}", w, h)),
-                                    note: None,
-                                };
-                                let mut reg = registry.write().await;
-                                let _ = reg.register(meta, &jpeg_bytes);
+                            let cache_hit = last_jpeg
+                                .as_ref()
+                                .is_some_and(|(cached, _)| Arc::ptr_eq(cached, &frame));
+                            if !cache_hit {
+                                // Encode BGRA/RGBA → JPEG on blocking pool
+                                let encode_frame = Arc::clone(&frame);
+                                let jpeg = tokio::task::spawn_blocking(move || {
+                                    let rgba_data = frame_to_tight_rgba(&encode_frame);
+                                    let img = image::RgbaImage::from_raw(w, h, rgba_data)?;
+                                    let mut buf = std::io::Cursor::new(Vec::new());
+                                    img.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+                                    Some(buf.into_inner())
+                                }).await.ok().flatten();
+                                // On encode failure, register nothing this
+                                // tick (matching the old behavior) rather
+                                // than re-publishing a stale cache entry
+                                // as if it were this frame.
+                                let Some(jpeg) = jpeg else { continue };
+                                last_jpeg = Some((frame, jpeg));
                             }
+                            let Some((_, jpeg_bytes)) = last_jpeg.as_ref() else { continue };
+                            frame_counter += 1;
+                            let stream = format!("display_{}", display_id);
+                            let frame_id = format!("{}-f{}", stream, frame_counter);
+                            let meta = presence_core::FrameMeta {
+                                frame_id,
+                                stream,
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                sent_to_live: false,
+                                live_resolution: None,
+                                hq_resolution: Some(format!("{}x{}", w, h)),
+                                note: None,
+                            };
+                            let mut reg = registry.write().await;
+                            let _ = reg.register(meta, jpeg_bytes);
                         }
                     }
                 }
@@ -2360,8 +2350,16 @@ impl DisplaySession {
     }
 
     /// Encode the latest frame as a PNG screenshot.
+    ///
+    /// The PNG encode of a multi-MB frame is 50-200ms of pure CPU, so
+    /// it runs on the blocking pool — inline it would stall unrelated
+    /// tasks on the async runtime for every CU action / dashboard /
+    /// MCP screenshot.
     pub async fn screenshot(&self) -> Result<Vec<u8>, CallerError> {
-        encode_frame_png(&*self.current_frame().await?)
+        let frame = self.current_frame().await?;
+        tokio::task::spawn_blocking(move || encode_frame_png(&frame))
+            .await
+            .map_err(|e| CallerError::Display(format!("screenshot encode task failed: {e}")))?
     }
 
     /// The freshest raw frame captured at or after `min_timestamp`, waiting up
@@ -2421,13 +2419,63 @@ impl DisplaySession {
 
     /// Encode a PNG screenshot from a frame captured at or after
     /// `min_timestamp`, waiting up to `timeout` for one to arrive (the
-    /// [`Self::fresh_frame`] contract).
+    /// [`Self::fresh_frame`] contract). Encode runs on the blocking
+    /// pool — see [`Self::screenshot`].
     pub async fn screenshot_fresh(
         &self,
         min_timestamp: Instant,
         timeout: Duration,
     ) -> Result<Vec<u8>, CallerError> {
-        encode_frame_png(&*self.fresh_frame(min_timestamp, timeout).await?)
+        let frame = self.fresh_frame(min_timestamp, timeout).await?;
+        tokio::task::spawn_blocking(move || encode_frame_png(&frame))
+            .await
+            .map_err(|e| CallerError::Display(format!("screenshot encode task failed: {e}")))?
+    }
+}
+
+/// Convert a raw captured frame to tightly-packed RGBA bytes: stride
+/// padding stripped, BGRA swizzled to RGBA.
+///
+/// The one shared pixel converter for every screenshot/JPEG path (PNG
+/// screenshots, the FrameRegistry sampler). Row-wise with indexed
+/// writes into a pre-sized buffer — the previous per-site loops pushed
+/// four bounds-checked bytes per pixel (~15M pushes per 1440p frame),
+/// which defeated autovectorization and cost tens of milliseconds per
+/// conversion on the CU screenshot path.
+fn frame_to_tight_rgba(frame: &Frame) -> Vec<u8> {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let row_bytes = w * 4;
+    let stride = (frame.stride as usize).max(row_bytes);
+
+    match frame.format {
+        FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+        FrameFormat::Rgba => {
+            let mut tight = Vec::with_capacity(row_bytes * h);
+            for row in 0..h {
+                let start = row * stride;
+                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
+            }
+            tight
+        }
+        FrameFormat::Bgra => {
+            let mut tight = vec![0u8; row_bytes * h];
+            for (dst_row, src_row) in tight
+                .chunks_exact_mut(row_bytes)
+                .zip(frame.data.chunks(stride))
+            {
+                let src_row = &src_row[..row_bytes];
+                for (dst, px) in dst_row
+                    .chunks_exact_mut(4)
+                    .zip(src_row.chunks_exact(4))
+                {
+                    dst[0] = px[2];
+                    dst[1] = px[1];
+                    dst[2] = px[0];
+                    dst[3] = px[3];
+                }
+            }
+            tight
+        }
     }
 }
 
@@ -2437,41 +2485,7 @@ impl DisplaySession {
 /// consumers can transform the raw pixels (resize, crop, annotate) and encode
 /// PNG exactly once, instead of decoding a PNG this crate just encoded.
 pub fn frame_to_rgba_image(frame: &Frame) -> Result<image::RgbaImage, CallerError> {
-    let (w, h) = (frame.width, frame.height);
-
-    // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
-    // If stride > width * 4 the rows have alignment padding that must be stripped.
-    let row_bytes = w as usize * 4;
-    let stride = frame.stride as usize;
-
-    let rgba_data = match frame.format {
-        FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-        FrameFormat::Rgba => {
-            let mut tight = Vec::with_capacity(row_bytes * h as usize);
-            for row in 0..h as usize {
-                let start = row * stride;
-                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-            }
-            tight
-        }
-        FrameFormat::Bgra => {
-            let mut tight = Vec::with_capacity(row_bytes * h as usize);
-            for row in 0..h as usize {
-                let start = row * stride;
-                for col in 0..w as usize {
-                    let px = start + col * 4;
-                    // Swap B <-> R while copying
-                    tight.push(frame.data[px + 2]); // R
-                    tight.push(frame.data[px + 1]); // G
-                    tight.push(frame.data[px]); // B
-                    tight.push(frame.data[px + 3]); // A
-                }
-            }
-            tight
-        }
-    };
-
-    image::RgbaImage::from_raw(w, h, rgba_data)
+    image::RgbaImage::from_raw(frame.width, frame.height, frame_to_tight_rgba(frame))
         .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))
 }
 
