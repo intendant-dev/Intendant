@@ -129,6 +129,69 @@ impl IntendantServer {
         Self::new(state, bus)
     }
 
+    /// The daemon's agenda ledger handle, when this server shape carries
+    /// one (set by the gateway/daemon wiring; `None` on bare stdio
+    /// servers, where agenda surfaces answer "unavailable").
+    pub(crate) async fn agenda_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::agenda::AgendaHandle>> {
+        self.state.read().await.agenda.clone()
+    }
+
+    async fn agenda_list_inner(
+        &self,
+        params: AgendaListParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        let status = params
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                serde_json::from_value::<crate::agenda::AgendaStatus>(serde_json::Value::String(
+                    s.to_ascii_lowercase(),
+                ))
+                .map_err(|_| format!("unknown status '{s}' (open, done, or retired)"))
+            })
+            .transpose()?;
+        let (mut items, counts, skipped_lines) = agenda.snapshot();
+        if let Some(status) = status {
+            items.retain(|item| item.status == status);
+        }
+        Ok(serde_json::json!({
+            "items": items,
+            "counts": counts,
+            "skipped_lines": skipped_lines,
+        }))
+    }
+
+    async fn agenda_op_inner(
+        &self,
+        cmd: crate::agenda::AgendaCommand,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        // MCP-lane attribution (A1 best-effort): supervised sessions call
+        // through their injected INTENDANT_MCP_URL, which binds a session
+        // id here. Principal binding arrives with the shared token (A2).
+        let actor = crate::agenda::AgendaActor {
+            principal: None,
+            session_id: session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+        };
+        match agenda.apply(cmd, Some(actor)) {
+            Ok(item) => Ok(serde_json::json!({ "item": item })),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     async fn start_task_internal(
         &self,
         task: String,
@@ -376,6 +439,23 @@ impl IntendantServer {
                 Ok(match self.notify_user_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("notify_user failed: {message}")),
+                })
+            }
+            "agenda_list" => {
+                let Parameters(params) = parse_params::<AgendaListParams>(args)?;
+                Ok(match self.agenda_list_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_list failed: {message}")),
+                })
+            }
+            "agenda_op" => {
+                // The tool args ARE the one agenda command vocabulary —
+                // the same shape the HTTP body and tunnel params carry.
+                let cmd: crate::agenda::AgendaCommand =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(match self.agenda_op_inner(cmd, session_id).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_op failed: {message}")),
                 })
             }
             "set_autonomy" => {

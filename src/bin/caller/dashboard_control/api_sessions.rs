@@ -248,6 +248,8 @@ pub(crate) async fn control_request_frame(
         "api_session_context_snapshot" => {
             api_session_context_snapshot_response(id, params.as_ref()).await
         }
+        "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
+        "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
         "api_session_current_uploads" => api_session_current_uploads_response(id, &runtime).await,
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
@@ -1175,6 +1177,33 @@ pub(crate) async fn api_session_agent_output_response_from_home(
             "session agent output",
         ),
     }
+}
+
+/// Tunnel twin of `GET /api/agenda` — reuses the transport-neutral core.
+pub(crate) async fn api_agenda_list_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_list_api_response(runtime.mcp_server.as_ref()).await,
+        "agenda list",
+    )
+}
+
+/// Tunnel twin of `POST /api/agenda/op` — the command rides `params`.
+pub(crate) async fn api_agenda_op_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_op_api_response(&body_text, runtime.mcp_server.as_ref(), None)
+            .await,
+        "agenda op",
+    )
 }
 
 pub(crate) async fn api_session_current_history_response(

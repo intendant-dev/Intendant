@@ -256,7 +256,8 @@ pub fn spawn_event_listener(
                     | AppEvent::SharedView { .. }
                     | AppEvent::DisplayRequestRaised { .. }
                     | AppEvent::DisplayRequestResolved { .. }
-                    | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
+                    | AppEvent::BrowserWorkspaceChanged { .. }
+                    | AppEvent::AgendaChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..
                     } => {

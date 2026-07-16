@@ -43,6 +43,9 @@ portable-pty = "0.9"
 dotenvy = "0.15"
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
+# Agenda item IDs: ULIDs are time-ordered, so lexicographic id order is
+# creation order — the agenda ledger's natural sort. Pure Rust.
+ulid = "1"
 url = "2"
 axum = "0.8"
 # Embedded authoritative DNS for the delegated fleet subzone

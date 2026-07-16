@@ -43,6 +43,13 @@ pub struct SetAutonomyParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgendaListParams {
+    /// Filter by status: "open", "done", or "retired". Omit for every item.
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetVerbosityParams {
     /// The verbosity level: "quiet", "normal", "verbose", or "debug".
     pub level: String,
