@@ -1,9 +1,28 @@
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Extra tool definitions registered at runtime (e.g. from MCP servers).
-static EXTRA_TOOLS: Mutex<Vec<ToolDefinition>> = Mutex::new(Vec::new());
+/// Extra tool definitions registered at runtime (e.g. from MCP servers),
+/// stamped with a generation that bumps on every mutation. The generation is
+/// the cache key for the composed [`all_tools`] list (and any future
+/// serialized-schema caches): a changed extra-tools set must invalidate
+/// derived tool schemas, never serve a stale set.
+struct ExtraToolsRegistry {
+    tools: Vec<ToolDefinition>,
+    generation: u64,
+}
+
+static EXTRA_TOOLS: Mutex<ExtraToolsRegistry> = Mutex::new(ExtraToolsRegistry {
+    tools: Vec::new(),
+    generation: 0,
+});
+
+/// Composed built-ins + extras list, keyed by the extras generation.
+/// `all_tools()` runs per model request on the agent hot loop; without this
+/// every call re-evaluated ~18 `json!` schema trees (thousands of small
+/// allocations) just to hand the provider an identical list.
+static ALL_TOOLS_CACHE: Mutex<Option<(u64, Arc<Vec<ToolDefinition>>)>> = Mutex::new(None);
+
 const BUILT_IN_TOOL_COUNT: usize = 18;
 
 /// Provider-agnostic tool definition.
@@ -61,7 +80,48 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
 }
 
 /// Returns all built-in tool definitions plus any runtime-registered extras.
+///
+/// Cached: the built-in set is static per process and the extras only change
+/// through [`register_extra_tools`]/[`clear_extra_tools`], so the composed
+/// list is memoized keyed on the extras generation and each call clones the
+/// cached vector instead of rebuilding every schema.
 pub fn all_tools() -> Vec<ToolDefinition> {
+    let (generation, extras) = {
+        let Ok(registry) = EXTRA_TOOLS.lock() else {
+            // Poisoned registry: fall back to just the built-ins (matches the
+            // pre-cache behavior of ignoring a poisoned extras lock).
+            return built_in_tools().to_vec();
+        };
+        (registry.generation, registry.tools.clone())
+    };
+    {
+        let cache = ALL_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_generation, tools)) = cache.as_ref() {
+            if *cached_generation == generation {
+                return tools.as_ref().clone();
+            }
+        }
+    }
+    let built_ins = built_in_tools();
+    let mut tools = Vec::with_capacity(built_ins.len() + extras.len());
+    tools.extend(built_ins.iter().cloned());
+    tools.extend(extras);
+    let shared = Arc::new(tools);
+    // A racing register may have bumped the generation since we read it; the
+    // entry is stored under the generation it was BUILT from, so a stale
+    // build can never be served for the new generation.
+    *ALL_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((generation, Arc::clone(&shared)));
+    shared.as_ref().clone()
+}
+
+/// The static built-in tool definitions, constructed once per process.
+fn built_in_tools() -> &'static [ToolDefinition] {
+    static BUILT_INS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    BUILT_INS.get_or_init(build_built_in_tools)
+}
+
+fn build_built_in_tools() -> Vec<ToolDefinition> {
     let mut tools = Vec::with_capacity(BUILT_IN_TOOL_COUNT);
 
     // 1. exec_command → execAsAgent
@@ -610,11 +670,6 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
-    // Append any extra tools registered at runtime (MCP servers, etc.)
-    if let Ok(extra) = EXTRA_TOOLS.lock() {
-        tools.extend(extra.iter().cloned());
-    }
-
     tools
 }
 
@@ -622,7 +677,8 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 /// These will be included in subsequent calls to `all_tools()`.
 pub fn register_extra_tools(new_tools: Vec<ToolDefinition>) {
     if let Ok(mut extra) = EXTRA_TOOLS.lock() {
-        extra.extend(new_tools);
+        extra.tools.extend(new_tools);
+        extra.generation += 1;
     }
 }
 
@@ -651,7 +707,8 @@ pub fn escalate_to_agent_tool() -> ToolDefinition {
 #[allow(dead_code)]
 pub fn clear_extra_tools() {
     if let Ok(mut extra) = EXTRA_TOOLS.lock() {
-        extra.clear();
+        extra.tools.clear();
+        extra.generation += 1;
     }
 }
 
@@ -690,6 +747,26 @@ mod tests {
                 "missing built-in tool {name}"
             );
         }
+    }
+
+    /// The composed-list cache must be invalidated by registry mutations:
+    /// register → the extra appears; clear → it is gone. (The registered
+    /// definition satisfies every global-tool invariant — snake_case name,
+    /// description, object schema — so tests iterating `all_tools()`
+    /// concurrently cannot be tripped by the registration window.)
+    #[test]
+    fn all_tools_cache_invalidates_on_extra_tool_mutations() {
+        let name = "extra_tool_cache_probe";
+        // Warm the cache first so the register exercises invalidation.
+        assert!(all_tools().iter().all(|tool| tool.name != name));
+        register_extra_tools(vec![ToolDefinition {
+            name: name.to_string(),
+            description: "cache invalidation probe".to_string(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }]);
+        assert!(all_tools().iter().any(|tool| tool.name == name));
+        clear_extra_tools();
+        assert!(all_tools().iter().all(|tool| tool.name != name));
     }
 
     #[test]
