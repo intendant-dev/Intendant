@@ -462,6 +462,7 @@ impl PeerRegistry {
             bearer_token: bearer_token.clone(),
             pinned_fingerprints: pinned_fingerprints.clone(),
             client_identity: client_identity.clone(),
+            tls: Default::default(),
         };
 
         let handle = spawn_peer(
@@ -714,6 +715,7 @@ fn build_transport(
                 bearer_token,
                 pinned_fingerprints,
                 client_identity,
+                tls: Default::default(),
             },
         )),
         other => {

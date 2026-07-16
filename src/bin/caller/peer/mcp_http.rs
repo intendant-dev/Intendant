@@ -20,7 +20,7 @@
 use super::card::{AgentCard, McpTransportKind, TransportSpec};
 use super::handle::PeerHandle;
 use super::transport::intendant::{PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE};
-use super::transport::{tls_client, ws_url_to_http_base};
+use super::transport::ws_url_to_http_base;
 use std::time::Duration;
 
 /// Ceiling for one peer tool round-trip. Generous because
@@ -95,12 +95,14 @@ pub async fn call_peer_mcp_tool(
         )
     })?;
     let creds = handle.transport_credentials();
-    let client = tls_client::reqwest_client(
-        PEER_MCP_TIMEOUT,
-        &creds.pinned_fingerprints,
-        creds.client_identity.as_ref(),
-    )
-    .map_err(|e| format!("build peer http client: {e}"))?;
+    // Shared with the transport's card fetch: one pooled client per
+    // credentials bundle, so a CU loop's dozens of tool calls reuse the
+    // TCP+TLS connection instead of a fresh handshake (and root-store
+    // load) per call.
+    let client = creds
+        .tls
+        .http_client(&creds.pinned_fingerprints, creds.client_identity.as_ref())
+        .map_err(|e| format!("build peer http client: {e}"))?;
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -112,6 +114,7 @@ pub async fn call_peer_mcp_tool(
     // downgrade to the anonymous path.
     let mut request = client
         .post(&endpoint)
+        .timeout(PEER_MCP_TIMEOUT)
         .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE)
         .json(&body);
     if let Some(token) = &creds.bearer_token {

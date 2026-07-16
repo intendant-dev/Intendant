@@ -113,6 +113,140 @@ fn load_client_identity(
     })
 }
 
+/// Stat fingerprint (length + mtime) of one PEM file — the freshness probe
+/// for [`TlsClientCache`], so a re-issued `client.crt`/`client.key` is
+/// picked up on the next use for two stats instead of re-reading and
+/// re-parsing the PEMs (and, on the no-pin path, the whole native root
+/// store) per connect attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// Lazily built, shared client-side TLS material for one credentials
+/// bundle (see `TransportCredentials.tls`).
+///
+/// Before this cache, every transport `connect()` built the rustls
+/// `ClientConfig` twice (agent-card fetch + WebSocket open) — re-reading
+/// the client PEMs and, without pinning, loading and parsing the entire
+/// native OS root store — and every peer MCP tool call built a fresh
+/// `reqwest::Client` on top (a full TCP+TLS handshake per call, zero
+/// keep-alive). Clones share the cell, so the card fetch, the WS connect,
+/// and `/mcp` side-channel calls reuse one config and one pooled HTTP
+/// client.
+///
+/// Freshness: the entry revalidates the identity PEMs by stat fingerprint
+/// on every use and the pin list by equality, so certificate rotation
+/// rebuilds on the next call; entries whose PEMs cannot be stat'ed are
+/// never considered fresh (today's rebuild-every-time behavior).
+#[derive(Clone, Debug, Default)]
+pub struct TlsClientCache(Arc<std::sync::Mutex<Option<TlsCacheEntry>>>);
+
+#[derive(Debug)]
+struct TlsCacheEntry {
+    pins: Vec<Fingerprint>,
+    /// Identity paths plus the (cert, key) stamps captured at build time.
+    identity: Option<(ClientIdentityPaths, Option<FileStamp>, Option<FileStamp>)>,
+    /// `None` = neither pinning nor client auth: WS callers use their
+    /// library's default TLS connector, exactly as before.
+    config: Option<Arc<rustls::ClientConfig>>,
+    /// Pooled HTTP client over `config` (or the library default). No
+    /// client-level timeout — callers set per-request timeouts.
+    http_client: reqwest::Client,
+}
+
+impl TlsCacheEntry {
+    fn is_fresh(&self, pins: &[Fingerprint], identity: Option<&ClientIdentityPaths>) -> bool {
+        if self.pins != pins {
+            return false;
+        }
+        match (&self.identity, identity) {
+            (None, None) => true,
+            (Some((paths, cert_stamp, key_stamp)), Some(current)) => {
+                paths == current
+                    && cert_stamp
+                        .as_ref()
+                        .is_some_and(|stamp| file_stamp(&paths.cert_path).as_ref() == Some(stamp))
+                    && key_stamp
+                        .as_ref()
+                        .is_some_and(|stamp| file_stamp(&paths.key_path).as_ref() == Some(stamp))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl TlsClientCache {
+    /// The rustls config for WebSocket connects: `None` when neither
+    /// pinning nor client auth is configured (use the library default).
+    pub fn client_config(
+        &self,
+        pinned_fingerprints: &[Fingerprint],
+        client_identity: Option<&ClientIdentityPaths>,
+    ) -> Result<Option<Arc<rustls::ClientConfig>>, PeerError> {
+        Ok(self.entry(pinned_fingerprints, client_identity)?.0)
+    }
+
+    /// The pooled HTTP client on the same trust policy. Callers set
+    /// per-request timeouts (`RequestBuilder::timeout`).
+    pub fn http_client(
+        &self,
+        pinned_fingerprints: &[Fingerprint],
+        client_identity: Option<&ClientIdentityPaths>,
+    ) -> Result<reqwest::Client, PeerError> {
+        Ok(self.entry(pinned_fingerprints, client_identity)?.1)
+    }
+
+    fn entry(
+        &self,
+        pins: &[Fingerprint],
+        identity: Option<&ClientIdentityPaths>,
+    ) -> Result<(Option<Arc<rustls::ClientConfig>>, reqwest::Client), PeerError> {
+        {
+            let cached = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cached.as_ref() {
+                if entry.is_fresh(pins, identity) {
+                    return Ok((entry.config.clone(), entry.http_client.clone()));
+                }
+            }
+        }
+        // Build outside the lock; a racing rebuild is harmless (last
+        // writer wins, both entries are valid for the same inputs).
+        let identity_stamps = identity.map(|paths| {
+            (
+                paths.clone(),
+                file_stamp(&paths.cert_path),
+                file_stamp(&paths.key_path),
+            )
+        });
+        let config = rustls_client_config(pins, identity)?.map(Arc::new);
+        let mut builder = reqwest::Client::builder();
+        if let Some(config) = &config {
+            builder = builder.use_preconfigured_tls(rustls::ClientConfig::clone(config));
+        }
+        let http_client = builder
+            .build()
+            .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
+        let entry = TlsCacheEntry {
+            pins: pins.to_vec(),
+            identity: identity_stamps,
+            config: config.clone(),
+            http_client: http_client.clone(),
+        };
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+        Ok((config, http_client))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +283,72 @@ mod tests {
         let config = rustls_client_config(&[[0u8; 32]], Some(&identity));
         assert!(config.is_ok(), "config should build: {:?}", config.err());
         assert!(config.unwrap().is_some());
+    }
+
+    /// The cache reuses one built config across calls (pointer-equal Arc)
+    /// and rebuilds when the identity PEMs change on disk (certificate
+    /// rotation) or the pin set differs.
+    #[test]
+    fn tls_cache_reuses_config_until_identity_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(dir.path(), &names, "peer-client-cache-test", false)
+            .unwrap();
+        let identity = ClientIdentityPaths {
+            cert_path: dir.path().join("client.crt"),
+            key_path: dir.path().join("client.key"),
+        };
+        let pins = [[0u8; 32]];
+
+        let cache = TlsClientCache::default();
+        let first = cache
+            .client_config(&pins, Some(&identity))
+            .unwrap()
+            .expect("pinned + identity builds a config");
+        let second = cache
+            .client_config(&pins, Some(&identity))
+            .unwrap()
+            .expect("cached config");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged identity must reuse the built config"
+        );
+
+        // A different pin set never reuses the entry.
+        let other_pins = [[1u8; 32]];
+        let repinned = cache
+            .client_config(&other_pins, Some(&identity))
+            .unwrap()
+            .expect("rebuilt config");
+        assert!(!Arc::ptr_eq(&first, &repinned));
+
+        // Rotate the cert on disk (appending keeps the PEM parseable but
+        // changes the stat fingerprint): the next call rebuilds.
+        let mut cert_pem = std::fs::read(&identity.cert_path).unwrap();
+        cert_pem.push(b'\n');
+        std::fs::write(&identity.cert_path, &cert_pem).unwrap();
+        let rotated = cache
+            .client_config(&pins, Some(&identity))
+            .unwrap()
+            .expect("rebuilt config after rotation");
+        assert!(
+            !Arc::ptr_eq(&first, &rotated),
+            "a rotated identity must rebuild the config"
+        );
+    }
+
+    /// The unpinned, identity-less shape stays `None` (library default
+    /// TLS) through the cache, and the pooled HTTP client still builds.
+    #[test]
+    fn tls_cache_default_policy_yields_no_config_and_a_client() {
+        let cache = TlsClientCache::default();
+        assert!(cache.client_config(&[], None).unwrap().is_none());
+        let _client = cache.http_client(&[], None).unwrap();
+        assert!(cache.client_config(&[], None).unwrap().is_none());
     }
 }
