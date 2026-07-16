@@ -715,6 +715,42 @@ pub(crate) async fn create_external_agent(
                 .is_some_and(|parent| parent.trim() == resume)
         });
 
+    // Anchor-fork staging (codex): one-shot spawn parameters the fork
+    // orchestrator persisted into the wrapper's launch config. Lifted only
+    // while the wrapper still resumes the parent id (the same window as
+    // `fork_resume`), so a later plain resume of the child can never
+    // re-fork; the announce-time overlay persist strips them durably.
+    let (codex_fork_rollout_path, codex_fork_cut) = if fork_resume {
+        session_log
+            .lock()
+            .ok()
+            .map(|log| log.dir().to_path_buf())
+            .and_then(|dir| crate::session_config::read_log_dir_config(&dir))
+            .map(|cfg| {
+                let cut = if let Some(item_id) = cfg
+                    .codex_fork_rollback_item_id
+                    .filter(|item| !item.trim().is_empty())
+                {
+                    Some(crate::session_fork::CodexForkCut::ItemAnchor {
+                        item_id,
+                        position: cfg
+                            .codex_fork_rollback_position
+                            .unwrap_or_else(|| "after".to_string()),
+                    })
+                } else {
+                    cfg.codex_fork_rollback_turns
+                        .map(crate::session_fork::CodexForkCut::Turns)
+                };
+                (
+                    cfg.codex_fork_rollout_path.map(std::path::PathBuf::from),
+                    cut,
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
@@ -780,6 +816,8 @@ pub(crate) async fn create_external_agent(
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
+                fork_from_rollout_path: codex_fork_rollout_path.clone(),
+                fork_cut: codex_fork_cut.clone(),
                 codex_home,
                 protocol_watch,
             };
@@ -823,6 +861,8 @@ pub(crate) async fn create_external_agent(
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
+                fork_from_rollout_path: None,
+                fork_cut: None,
                 codex_home: None,
                 protocol_watch,
             };
