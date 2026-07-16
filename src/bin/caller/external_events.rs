@@ -2356,7 +2356,6 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 return DrainOutcome::LimitRejected {
                     resets_at_epoch,
                     message,
-                    turns_in_round,
                 };
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {

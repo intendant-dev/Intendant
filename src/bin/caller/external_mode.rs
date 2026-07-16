@@ -2617,7 +2617,6 @@ pub(crate) async fn run_external_agent_mode(
             DrainOutcome::LimitRejected {
                 resets_at_epoch,
                 message: _,
-                turns_in_round: _,
             } => {
                 // The round did no work: hand its number back so the
                 // retried round reuses it, count no round (no DoneSignal /

@@ -979,7 +979,6 @@ pub(crate) enum DrainOutcome {
     LimitRejected {
         resets_at_epoch: Option<u64>,
         message: Option<String>,
-        turns_in_round: usize,
     },
 }
 
