@@ -27,10 +27,12 @@ pub(crate) async fn reader_task(
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut terminal_turns_observed = CodexTerminalObserved::default();
-    let mut notification_state = CodexNotificationState::default();
-    // Configured effort, first-hand: the value Intendant itself passes at
-    // spawn (`-c model_reasoning_effort=…`) — never inferred from output.
-    notification_state.activity = crate::session_activity::ActivityMachine::new(reasoning_effort);
+    let mut notification_state = CodexNotificationState {
+        // Configured effort, first-hand: the value Intendant itself passes
+        // at spawn (`-c model_reasoning_effort=…`) — never inferred.
+        activity: crate::session_activity::ActivityMachine::new(reasoning_effort),
+        ..Default::default()
+    };
 
     loop {
         let line = match lines.next_line().await {
