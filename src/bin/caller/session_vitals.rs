@@ -712,7 +712,7 @@ pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVital
         restored.push((mtime, session_id, PathBuf::from(root)));
     }
     // Newest first; the cap keeps probe work and emission fan-out bounded.
-    restored.sort_by(|a, b| b.0.cmp(&a.0));
+    restored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     restored
         .into_iter()
         .take(RESTORED_TARGET_CAP)
