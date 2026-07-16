@@ -7,9 +7,9 @@ use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RolloutUserTurn {
-    index: u32,
-    line: usize,
-    text: String,
+    pub(crate) index: u32,
+    pub(crate) line: usize,
+    pub(crate) text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
