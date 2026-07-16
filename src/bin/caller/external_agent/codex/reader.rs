@@ -793,15 +793,6 @@ pub(crate) fn codex_file_change_paths(params: &serde_json::Value) -> Vec<String>
     Vec::new()
 }
 
-pub(crate) fn codex_file_change_preview(params: &serde_json::Value) -> Option<String> {
-    let paths = codex_file_change_paths(params);
-    if paths.is_empty() {
-        None
-    } else {
-        Some(paths.join(", "))
-    }
-}
-
 pub(crate) fn codex_web_search_preview(params: &serde_json::Value) -> String {
     if let Some(query) = non_empty_string_at(
         params,
