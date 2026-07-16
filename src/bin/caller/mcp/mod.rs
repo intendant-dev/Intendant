@@ -129,6 +129,69 @@ impl IntendantServer {
         Self::new(state, bus)
     }
 
+    /// The daemon's agenda ledger handle, when this server shape carries
+    /// one (set by the gateway/daemon wiring; `None` on bare stdio
+    /// servers, where agenda surfaces answer "unavailable").
+    pub(crate) async fn agenda_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::agenda::AgendaHandle>> {
+        self.state.read().await.agenda.clone()
+    }
+
+    async fn agenda_list_inner(
+        &self,
+        params: AgendaListParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        let status = params
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                serde_json::from_value::<crate::agenda::AgendaStatus>(serde_json::Value::String(
+                    s.to_ascii_lowercase(),
+                ))
+                .map_err(|_| format!("unknown status '{s}' (open, done, or retired)"))
+            })
+            .transpose()?;
+        let (mut items, counts, skipped_lines) = agenda.snapshot();
+        if let Some(status) = status {
+            items.retain(|item| item.status == status);
+        }
+        Ok(serde_json::json!({
+            "items": items,
+            "counts": counts,
+            "skipped_lines": skipped_lines,
+        }))
+    }
+
+    async fn agenda_op_inner(
+        &self,
+        cmd: crate::agenda::AgendaCommand,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let Some(agenda) = self.agenda_handle().await else {
+            return Err("agenda unavailable on this daemon".to_string());
+        };
+        // MCP-lane attribution (A1 best-effort): supervised sessions call
+        // through their injected INTENDANT_MCP_URL, which binds a session
+        // id here. Principal binding arrives with the shared token (A2).
+        let actor = crate::agenda::AgendaActor {
+            principal: None,
+            session_id: session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+        };
+        match agenda.apply(cmd, Some(actor)) {
+            Ok(item) => Ok(serde_json::json!({ "item": item })),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     async fn start_task_internal(
         &self,
         task: String,
@@ -376,6 +439,23 @@ impl IntendantServer {
                 Ok(match self.notify_user_inner(params).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("notify_user failed: {message}")),
+                })
+            }
+            "agenda_list" => {
+                let Parameters(params) = parse_params::<AgendaListParams>(args)?;
+                Ok(match self.agenda_list_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_list failed: {message}")),
+                })
+            }
+            "agenda_op" => {
+                // The tool args ARE the one agenda command vocabulary —
+                // the same shape the HTTP body and tunnel params carry.
+                let cmd: crate::agenda::AgendaCommand =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(match self.agenda_op_inner(cmd, session_id).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("agenda_op failed: {message}")),
                 })
             }
             "set_autonomy" => {
@@ -1189,8 +1269,36 @@ impl IntendantServer {
         // Supervised parents log under `~/.intendant/logs/<id>/`, which is not
         // necessarily this server's primary log dir, so merge the ledger reads
         // across every candidate dir the requested session is known by.
-        let ledger_dirs = status_ledger_candidate_dirs(&self.home, &log_dir, &session_id);
-        if let Some(ledger) = merged_lineage_ledger_for_session(&ledger_dirs, &session_id) {
+        //
+        // On the blocking pool: candidate resolution can scan the session
+        // store on an id miss, and the fission ledger document is a full
+        // read + parse of a file observed at ~1 MB — get_status is the
+        // model's habitual poll, and this ran inline on the async handler.
+        // (The lineage read behind it is incrementally cached; the fission
+        // document read is not yet.)
+        let ledgers = {
+            let home = self.home.clone();
+            let ledger_log_dir = log_dir.clone();
+            let ledger_session_id = session_id.clone();
+            tokio::task::spawn_blocking(move || {
+                let ledger_dirs =
+                    status_ledger_candidate_dirs(&home, &ledger_log_dir, &ledger_session_id);
+                (
+                    merged_lineage_ledger_for_session(&ledger_dirs, &ledger_session_id),
+                    merged_fission_ledger_document_for_session(&ledger_dirs, &ledger_session_id),
+                )
+            })
+            .await
+            .unwrap_or_else(|e| {
+                // A JoinError here is a panic (or forced shutdown) inside
+                // the merge — answer without ledgers, but never silently:
+                // a status payload missing its ledgers looks identical to
+                // "no fission activity" to the caller.
+                eprintln!("[mcp] get_status ledger merge task failed: {e}");
+                (None, None)
+            })
+        };
+        if let Some(ledger) = ledgers.0 {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "lineage_ledger".to_string(),
@@ -1202,9 +1310,7 @@ impl IntendantServer {
         // markers and branch charters are visible in the status payload; the
         // wire shape stays back-compatible because `ext` serializes only when
         // non-empty.
-        if let Some(document) =
-            merged_fission_ledger_document_for_session(&ledger_dirs, &session_id)
-        {
+        if let Some(document) = ledgers.1 {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "fission_ledger".to_string(),

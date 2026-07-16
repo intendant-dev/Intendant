@@ -785,6 +785,33 @@
     </div>
 
     <!-- Stats Tab -->
+    <div id="tab-agenda" class="tab-pane">
+      <div class="agenda-wrap">
+        <div class="agenda-head">
+          <h2 class="agenda-title">Agenda</h2>
+          <div class="agenda-counts" id="agenda-tab-counts"></div>
+        </div>
+        <div class="agenda-compose">
+          <select id="agenda-add-kind" aria-label="Kind">
+            <option value="task">Task</option>
+            <option value="note">Note</option>
+          </select>
+          <input id="agenda-add-title" type="text" maxlength="500"
+                 placeholder="Park a task or note…" aria-label="New agenda item title" />
+          <button type="button" id="agenda-add-btn">Add</button>
+        </div>
+        <div class="agenda-filters" id="agenda-filters" role="tablist" aria-label="Agenda filter">
+          <button type="button" class="agenda-filter active" data-filter="open">Open</button>
+          <button type="button" class="agenda-filter" data-filter="done">Done</button>
+          <button type="button" class="agenda-filter" data-filter="retired">Retired</button>
+          <button type="button" class="agenda-filter" data-filter="all">All</button>
+        </div>
+        <div class="agenda-note" id="agenda-tab-skipped" style="display:none"></div>
+        <div class="agenda-list" id="agenda-tab-list">
+          <div class="ui-empty" id="agenda-tab-empty">Nothing parked yet — add a task above, or run <code>intendant ctl agenda add</code>.</div>
+        </div>
+      </div>
+    </div>
     <div id="tab-stats" class="tab-pane">
       <div class="stats-host-bar" id="stats-host-bar">
         <label class="stats-host-label" for="stats-host-select">Host</label>

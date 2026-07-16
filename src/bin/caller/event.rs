@@ -1011,6 +1011,14 @@ pub enum AppEvent {
         method: String,
     },
 
+    /// The agenda ledger changed (item added, patched, or transitioned).
+    /// Carries the item as it now stands plus fresh counts so frontends
+    /// update live without refetching.
+    AgendaChanged {
+        item: crate::agenda::AgendaItem,
+        counts: crate::agenda::AgendaCounts,
+    },
+
     /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
     /// listener consumes it (stuck-phase detection), and only MCP mode
     /// spawns the timer.
@@ -2959,6 +2967,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             turns_removed: *turns_removed,
             backend: backend.clone(),
             method: method.clone(),
+        }),
+        AppEvent::AgendaChanged { item, counts } => Some(OutboundEvent::AgendaChanged {
+            item: item.clone(),
+            counts: *counts,
         }),
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,

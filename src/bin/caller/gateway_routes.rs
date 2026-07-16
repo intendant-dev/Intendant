@@ -287,6 +287,10 @@ pub(crate) enum RouteHandlerId {
     /// Live dashboard connections (tab presence): the tabs registry
     /// snapshot with voice/input-authority ownership joined in.
     DashboardTabs,
+    /// Agenda ledger snapshot (items + counts).
+    AgendaList,
+    /// Apply one agenda command (add/patch/complete/reopen/retire).
+    AgendaOp,
     /// The whole /api/peers registry + pairing sub-router, moved
     /// verbatim (its internal shapes stay as they were; leaf-shape
     /// declarations are a deliberate follow-up, not part of the
@@ -762,6 +766,24 @@ pub(crate) static ROUTES: &[Route] = &[
         "Roll the current session back to a round (optionally reverting files)",
     )
     .with_tunnel(tunnel_method("api_session_current_rollback")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/agenda"),
+        PeerOperation::AgendaRead,
+        BodyPolicy::None,
+        RouteHandlerId::AgendaList,
+        "Agenda ledger snapshot: items (oldest first) plus status counts",
+    )
+    .with_tunnel(tunnel_method("api_agenda_list")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/agenda/op"),
+        PeerOperation::AgendaWrite,
+        BodyPolicy::Default,
+        RouteHandlerId::AgendaOp,
+        "Apply one agenda command (add, patch, complete, reopen, or retire)",
+    )
+    .with_tunnel(tunnel_method("api_agenda_op")),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/session/current/redo"),

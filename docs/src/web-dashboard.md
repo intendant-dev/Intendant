@@ -1605,6 +1605,8 @@ shell only.
 | GET | `/api/session/current/changes[/…]` | SessionManage | own origin | none | List the session's changed files, or the unified diff for one file (subpath) |
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
+| GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts |
+| POST | `/api/agenda/op` | AgendaWrite | own origin | bounded | Apply one agenda command (add, patch, complete, reopen, or retire) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |

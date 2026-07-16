@@ -2393,6 +2393,8 @@ fn permission_label(id: &str) -> &'static str {
         "runtime.control" => "Runtime control",
         "filesystem.read" => "Filesystem read",
         "filesystem.write" => "Filesystem write",
+        "agenda.read" => "Agenda read",
+        "agenda.write" => "Agenda write",
         _ => "Permission",
     }
 }
@@ -2434,6 +2436,8 @@ fn permission_summary(id: &str) -> &'static str {
         "runtime.control" => "Use runtime-control surfaces such as TUI, media, and recording controls.",
         "filesystem.read" => "Stat, list, and read files through dashboard APIs.",
         "filesystem.write" => "Create directories or write uploaded file content.",
+        "agenda.read" => "Read the daemon's agenda ledger (parked items and counts).",
+        "agenda.write" => "Park, edit, complete, reopen, and retire agenda items.",
         _ => "Operation permission.",
     }
 }
@@ -2959,6 +2963,8 @@ pub fn operation_permission_id(op: crate::access::access_policy::PeerOperation) 
         PeerOperation::RuntimeControl => "runtime.control",
         PeerOperation::FilesystemRead => "filesystem.read",
         PeerOperation::FilesystemWrite => "filesystem.write",
+        PeerOperation::AgendaRead => "agenda.read",
+        PeerOperation::AgendaWrite => "agenda.write",
     }
 }
 
@@ -3165,6 +3171,9 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "access.inspect".to_string(),
                 "peer.inspect".to_string(),
                 "session.inspect".to_string(),
+                // Observing the daemon includes seeing what's parked on
+                // its agenda — read only.
+                "agenda.read".to_string(),
             ],
             source: "builtin".to_string(),
         },
@@ -3275,6 +3284,8 @@ fn builtin_role_templates() -> Vec<IamRole> {
                 "credentials.manage".to_string(),
                 "filesystem.read".to_string(),
                 "filesystem.write".to_string(),
+                "agenda.read".to_string(),
+                "agenda.write".to_string(),
             ],
             source: "builtin".to_string(),
         },
@@ -3305,6 +3316,8 @@ fn root_permission_ids() -> Vec<String> {
         "runtime.control",
         "filesystem.read",
         "filesystem.write",
+        "agenda.read",
+        "agenda.write",
     ]
     .iter()
     .map(|permission| (*permission).to_string())

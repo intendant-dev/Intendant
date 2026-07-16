@@ -553,7 +553,11 @@ async function main() {
         serverMsgStep(d, 'shared_view', () => handleSharedViewEvent(d));
         return;
       }
-      if (d.event === 'session_note') {
+      if (d.event === 'agenda_changed') {
+      serverMsgStep(d, 'agenda_changed', () => agendaObserveServerMessage(d));
+      return;
+    }
+    if (d.event === 'session_note') {
         // Display-only transcript note: rendered end to end in JS (the
         // WASM presence layer does not know this event).
         serverMsgStep(d, 'session_note', () => handleSessionNoteEvent(d));

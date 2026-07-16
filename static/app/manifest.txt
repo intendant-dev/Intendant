@@ -24,6 +24,7 @@ ui2-station.css
 ui2-vault.css
 ui2-sessions.css
 ui2-activity.css
+ui2-agenda.css
 ui2-grid.css
 ui2-live.css
 ui2-usage.css
@@ -79,6 +80,12 @@ ui2-activity.js
 45b-cu-overlays.js
 46-recording-replay.js
 47-annotation-clips.js
+# Agenda must evaluate BEFORE the router (48): a #agenda deep link makes the
+# router's eval-time boot call agendaOnTabShown(), which reads this fragment's
+# module-level lets — they must be initialized by then (deep-link TDZ rule).
+# Its own top level declares only lets/functions; daemonApi (32), routeTo (48),
+# escapeHtml (52) are reached from inside functions at runtime.
+ui2-agenda.js
 48-router-settings.js
 48b-context-viz.js
 49-daemons-multihost.js

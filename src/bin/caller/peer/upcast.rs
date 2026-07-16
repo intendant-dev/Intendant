@@ -596,7 +596,10 @@ impl AppEventUpcaster {
             | AppEvent::Redone { .. }
             | AppEvent::HistoryPruned { .. }
             | AppEvent::ConversationRollbackRequested { .. }
-            | AppEvent::ConversationRolledBack { .. } => vec![],
+            | AppEvent::ConversationRolledBack { .. }
+            // The agenda is home-scoped daemon state; the peer rail does
+            // not carry another daemon's ledger (ratified v1 scope).
+            | AppEvent::AgendaChanged { .. } => vec![],
 
             AppEvent::UserMessageEditStatus {
                 user_turn_index,
@@ -1941,6 +1944,7 @@ impl WireEventUpcaster {
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::ContextSnapshot { .. }
+            | OutboundEvent::AgendaChanged { .. }
             | OutboundEvent::FileChanged { .. }
             | OutboundEvent::UploadReady { .. }
             | OutboundEvent::UploadDeleted { .. }

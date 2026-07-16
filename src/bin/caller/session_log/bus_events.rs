@@ -1798,7 +1798,7 @@ impl SessionLog {
             data["stderr_offset"] = serde_json::Value::from(span.offset);
             data["stderr_bytes"] = serde_json::Value::from(span.len);
         }
-        self.emit(LogEvent {
+        let emitted = self.emit_checked(LogEvent {
             ts: Self::ts(),
             ts_ms: Self::ts_ms(),
             turn: Some(self.current_turn),
@@ -1817,6 +1817,29 @@ impl SessionLog {
             file: stdout_span.map(|span| span.relative),
             file2: stderr_span.map(|span| span.relative),
         });
+        match emitted {
+            // Invalidate the gateway's negative agent-output memo for this
+            // logs root — strictly AFTER the row above flushed, and ONLY
+            // when it flushed. The generation must publish exactly when the
+            // row becomes readable: bumping before the (potentially
+            // multi-MB) sidecar writes let a concurrent fetch read the new
+            // generation, miss the not-yet-emitted row, and memoize that
+            // miss under a generation this write would never move again;
+            // bumping after a FAILED flush is the same trap on the failure
+            // path — the row isn't readable, a fetch memoizes under the
+            // published generation, and if a later event's successful flush
+            // drains the retained buffered bytes the row appears with no
+            // further bump. On Ok, a fetch that raced and missed the row
+            // memoized under the OLD generation, which this bump
+            // immediately invalidates; on Err, no bump — the generation
+            // never vouches for an unreadable row, and if retained bytes
+            // later surface via an unrelated flush, the next successful
+            // output append's bump or the memo's TTL backstop covers them.
+            Ok(()) => super::replay::note_agent_output_appended(self.dir()),
+            Err(e) => {
+                eprintln!("session_log: failed to write log event: {}", e);
+            }
+        }
     }
 
     /// Log reasoning content from the model (full reasoning, not just summary).

@@ -16,6 +16,7 @@ const UI2_NAV_GROUPS = [
   { label: 'Work', items: [
     { tab: 'activity', label: 'Activity', icon: 'activity' },
     { tab: 'sessions', label: 'Sessions', icon: 'sessions' },
+    { tab: 'agenda', label: 'Agenda', icon: 'agenda' },
   ] },
   { label: 'Watch', items: [
     { tab: 'displays', label: 'Live display', icon: 'live' },

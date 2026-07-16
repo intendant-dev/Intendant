@@ -1,4 +1,5 @@
 mod access;
+mod agenda;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;
@@ -142,7 +143,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
+use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses, BatchFacts};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
 
@@ -950,7 +951,13 @@ fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> 
     )
 }
 
-fn inject_project_context(json_str: &str, project: &Project) -> String {
+/// Finalize a command batch before dispatch: inject project context
+/// (`memory_file` on memory commands) and normalize command aliases
+/// (`writeFile` → `editFile`) in ONE parse + serialize. These were two
+/// separate helpers (`inject_project_context`, `normalize_command_batch`)
+/// chained on every batch, each paying its own full parse and re-serialize
+/// of a payload that can embed megabytes of editFile content.
+pub(crate) fn finalize_command_batch(json_str: &str, project: &Project) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
@@ -960,111 +967,24 @@ fn inject_project_context(json_str: &str, project: &Project) -> String {
         let memory_file = project.memory_path().to_string_lossy().to_string();
 
         for cmd in commands.iter_mut() {
-            if let Some("storeMemory" | "recallMemory") =
-                cmd.get("function").and_then(|f| f.as_str())
-            {
-                if cmd.get("memory_file").is_none() {
-                    cmd["memory_file"] = serde_json::Value::String(memory_file.clone());
+            match cmd.get("function").and_then(|f| f.as_str()) {
+                Some("storeMemory" | "recallMemory") => {
+                    if cmd.get("memory_file").is_none() {
+                        cmd["memory_file"] = serde_json::Value::String(memory_file.clone());
+                    }
                 }
+                Some("writeFile") => {
+                    cmd["function"] = serde_json::Value::String("editFile".to_string());
+                    if cmd.get("operation").is_none() {
+                        cmd["operation"] = serde_json::Value::String("write".to_string());
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
-}
-
-fn has_ask_human_command(json_str: &str) -> bool {
-    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .map(|commands| {
-            commands
-                .iter()
-                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
-        })
-        .unwrap_or(false)
-}
-
-/// True when the batch consists ENTIRELY of askHuman commands — the shape
-/// models actually emit for a blocking question. The question-rail
-/// interception only fires for this shape; a mixed batch would need the
-/// controller to reorder execution around the runtime.
-fn batch_is_all_ask_human(json_str: &str) -> bool {
-    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .map(|commands| {
-            !commands.is_empty()
-                && commands
-                    .iter()
-                    .all(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
-        })
-        .unwrap_or(false)
-}
-
-/// Extract the question text from an askHuman command in a batch JSON string.
-fn extract_ask_human_question(json_str: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str).ok()?;
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .and_then(|commands| {
-            commands.iter().find_map(|cmd| {
-                if cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman") {
-                    cmd.get("question")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-        })
-}
-
-fn has_capture_screen_command(json_str: &str) -> bool {
-    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .map(|commands| {
-            commands
-                .iter()
-                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("captureScreen"))
-        })
-        .unwrap_or(false)
-}
-
-fn has_exec_command(json_str: &str) -> bool {
-    let parsed: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .map(|commands| {
-            commands.iter().any(|cmd| {
-                matches!(
-                    cmd.get("function").and_then(|v| v.as_str()),
-                    Some("execAsAgent" | "execPty")
-                )
-            })
-        })
-        .unwrap_or(false)
 }
 
 /// Try to encode a captureScreen result as base64 image data.
@@ -1093,49 +1013,15 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 /// 4. Launch Xvfb, store guard, set DISPLAY
 /// 5. On failure → log warning, let commands fail naturally
 ///
-/// Format raw agent JSON into a human-readable preview for the Activity tab.
-pub(crate) fn format_commands_preview(json_str: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-        if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
-            let parts: Vec<String> = cmds
-                .iter()
-                .filter_map(|cmd| {
-                    let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
-                    match func {
-                        "execAsAgent" => cmd
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .map(|c| format!("exec: {}", c)),
-                        "inspectPath" => cmd
-                            .get("path")
-                            .and_then(|v| v.as_str())
-                            .map(|p| format!("inspect: {}", p)),
-                        "editFile" | "writeFile" => cmd
-                            .get("file_path")
-                            .and_then(|v| v.as_str())
-                            .map(|p| format!("{}: {}", func, p)),
-                        "spawn_live_audio" => Some(format!(
-                            "spawn_live_audio ({})",
-                            cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?")
-                        )),
-                        _ => Some(func.to_string()),
-                    }
-                })
-                .collect();
-            if !parts.is_empty() {
-                return parts.join(" | ");
-            }
-        }
-    }
-    json_str.to_string()
-}
-
 /// We launch on execAsAgent (not just captureScreen) because GUI applications
 /// started in early turns must share the same display that captureScreen will
 /// later capture. Launching only on captureScreen is too late — the app would
 /// already be running on a different (or no) display.
+///
+/// `facts` carries the batch's trigger booleans, derived once per batch —
+/// this function used to re-parse the full batch JSON (twice) to answer them.
 async fn maybe_auto_launch_xvfb(
-    json_str: &str,
+    facts: &BatchFacts,
     xvfb_guard: &mut Option<vision::XvfbGuard>,
     provider_name: &str,
     session_log: &SharedSessionLog,
@@ -1143,7 +1029,7 @@ async fn maybe_auto_launch_xvfb(
     if xvfb_guard.is_some() {
         return;
     }
-    if !has_capture_screen_command(json_str) && !has_exec_command(json_str) {
+    if !facts.has_capture_screen && !facts.has_exec {
         return;
     }
     // Memoized accessible-display verdict: this function runs on every
@@ -1193,7 +1079,7 @@ async fn maybe_auto_launch_xvfb(
         return;
     }
     let config = vision::display_config_for_provider(provider_name);
-    let trigger = if has_capture_screen_command(json_str) {
+    let trigger = if facts.has_capture_screen {
         "captureScreen"
     } else {
         "execAsAgent (display needed)"
@@ -1441,28 +1327,6 @@ fn format_command_preview(json_str: &str) -> String {
     }
     // Fallback: full raw JSON (UI handles collapsing)
     json_str.to_string()
-}
-
-fn normalize_command_batch(json_str: &str) -> String {
-    let mut value: serde_json::Value = match serde_json::from_str(json_str) {
-        Ok(v) => v,
-        Err(_) => return json_str.to_string(),
-    };
-
-    let Some(commands) = value.get_mut("commands").and_then(|c| c.as_array_mut()) else {
-        return json_str.to_string();
-    };
-
-    for cmd in commands {
-        if cmd.get("function").and_then(|f| f.as_str()) == Some("writeFile") {
-            cmd["function"] = serde_json::Value::String("editFile".to_string());
-            if cmd.get("operation").is_none() {
-                cmd["operation"] = serde_json::Value::String("write".to_string());
-            }
-        }
-    }
-
-    serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
 #[cfg(test)]
@@ -1781,14 +1645,14 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn inject_project_context_adds_memory_file() {
+    fn finalize_command_batch_adds_memory_file() {
         let root = std::path::PathBuf::from("/tmp/proj");
         let project = Project {
             root: root.clone(),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"test","memory_summary":"hello"}]}"#;
-        let result = inject_project_context(input, &project);
+        let result = finalize_command_batch(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         // Build the expected path the same platform-aware way production does
         // (via `PathBuf::join`) instead of hardcoding '/'-joined POSIX text,
@@ -1805,13 +1669,13 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn inject_project_context_preserves_existing() {
+    fn finalize_command_batch_preserves_existing_memory_file() {
         let project = Project {
             root: std::path::PathBuf::from("/tmp/proj"),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_file":"/custom/path.json"}]}"#;
-        let result = inject_project_context(input, &project);
+        let result = finalize_command_batch(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
             parsed["commands"][0]["memory_file"].as_str().unwrap(),
@@ -1820,16 +1684,36 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn inject_project_context_ignores_unrelated() {
+    fn finalize_command_batch_ignores_unrelated() {
         let project = Project {
             root: std::path::PathBuf::from("/tmp/proj"),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
-        let result = inject_project_context(input, &project);
+        let result = finalize_command_batch(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["commands"][0].get("memory_file").is_none());
         assert!(parsed["commands"][0].get("project_dir").is_none());
+    }
+
+    /// The `writeFile` → `editFile` alias normalization (formerly its own
+    /// `normalize_command_batch` pass) rides the same single parse.
+    #[test]
+    fn finalize_command_batch_normalizes_write_file_alias() {
+        let project = Project {
+            root: std::path::PathBuf::from("/tmp/proj"),
+            config: project::ProjectConfig::default(),
+        };
+        let input = r#"{"commands":[{"function":"writeFile","nonce":1,"file_path":"a.txt","content":"hi"},{"function":"writeFile","nonce":2,"file_path":"b.txt","operation":"append","content":"x"}]}"#;
+        let result = finalize_command_batch(input, &project);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["commands"][0]["function"], "editFile");
+        assert_eq!(parsed["commands"][0]["operation"], "write");
+        assert_eq!(parsed["commands"][1]["function"], "editFile");
+        // An explicit operation is preserved, not clobbered.
+        assert_eq!(parsed["commands"][1]["operation"], "append");
+        // Unparseable input passes through untouched.
+        assert_eq!(finalize_command_batch("not json", &project), "not json");
     }
 
     #[test]
@@ -2405,60 +2289,6 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn has_ask_human_command_true() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
-        assert!(has_ask_human_command(json));
-    }
-
-    #[test]
-    fn has_ask_human_command_false() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
-        assert!(!has_ask_human_command(json));
-    }
-
-    #[test]
-    fn has_ask_human_command_invalid_json() {
-        assert!(!has_ask_human_command("not json"));
-    }
-
-    #[test]
-    fn batch_is_all_ask_human_pure_batch() {
-        let json = r#"{"commands":[{"function":"askHuman","question":"a?","nonce":1},{"function":"askHuman","question":"b?","nonce":2}]}"#;
-        assert!(batch_is_all_ask_human(json));
-    }
-
-    #[test]
-    fn batch_is_all_ask_human_rejects_mixed_empty_and_invalid() {
-        let mixed = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"askHuman","nonce":2}]}"#;
-        assert!(!batch_is_all_ask_human(mixed));
-        assert!(!batch_is_all_ask_human(r#"{"commands":[]}"#));
-        assert!(!batch_is_all_ask_human("not json"));
-    }
-
-    #[test]
-    fn has_capture_screen_command_true() {
-        let json = r#"{"commands":[{"function":"captureScreen","nonce":1}]}"#;
-        assert!(has_capture_screen_command(json));
-    }
-
-    #[test]
-    fn has_capture_screen_command_false() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
-        assert!(!has_capture_screen_command(json));
-    }
-
-    #[test]
-    fn has_capture_screen_command_mixed_batch() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1},{"function":"captureScreen","nonce":2}]}"#;
-        assert!(has_capture_screen_command(json));
-    }
-
-    #[test]
-    fn has_capture_screen_command_invalid_json() {
-        assert!(!has_capture_screen_command("not json"));
-    }
-
-    #[test]
     fn encode_screenshot_valid() {
         let dir = tempfile::tempdir().unwrap();
         let img_path = dir.path().join("test.png");
@@ -2496,29 +2326,6 @@ Also: {"source": "bare"}"#;
     fn encode_screenshot_missing_path_field() {
         let json = r#"{"success":true}"#;
         assert!(encode_screenshot(json).is_none());
-    }
-
-    #[test]
-    fn has_exec_command_true() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
-        assert!(has_exec_command(json));
-    }
-
-    #[test]
-    fn has_exec_command_pty() {
-        let json = r#"{"commands":[{"function":"execPty","nonce":1,"command":"ls"}]}"#;
-        assert!(has_exec_command(json));
-    }
-
-    #[test]
-    fn has_exec_command_false_for_non_exec() {
-        let json = r#"{"commands":[{"function":"captureScreen","nonce":1}]}"#;
-        assert!(!has_exec_command(json));
-    }
-
-    #[test]
-    fn has_exec_command_invalid_json() {
-        assert!(!has_exec_command("not json"));
     }
 
     // --- assemble_batch_from_tool_calls tests ---

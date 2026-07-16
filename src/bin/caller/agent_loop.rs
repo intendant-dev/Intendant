@@ -1699,10 +1699,14 @@ pub(crate) async fn run_agent_loop(
             empty_command_streak = 0;
 
             // Inject project context and normalize
-            let json_str = normalize_command_batch(&inject_project_context(json_str, project));
+            let json_str = finalize_command_batch(json_str, project);
+            // One parse of the final batch answers every per-batch question
+            // below (ask-human rail, Xvfb triggers, Activity preview, runtime
+            // timeout selection) — these used to be separate full re-parses.
+            let batch_facts = BatchFacts::from_json(&json_str);
 
             // Headless askHuman check — skip unless JSON mode (which handles it via stdin)
-            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
+            if headless && json_approval.is_none() && batch_facts.has_ask_human {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -1720,7 +1724,7 @@ pub(crate) async fn run_agent_loop(
             }
             // In JSON mode, emit the question so the outbound broadcaster prints it
             if json_approval.is_some() {
-                if let Some(question) = extract_ask_human_question(&json_str) {
+                if let Some(question) = batch_facts.ask_human_question.clone() {
                     bus.send(AppEvent::HumanQuestionDetected { question });
                 }
             }
@@ -1733,9 +1737,11 @@ pub(crate) async fn run_agent_loop(
             // Scope: batches that are entirely askHuman (the shape models
             // emit — a blocking question stands alone); a mixed batch keeps
             // the legacy path and logs why.
-            if !headless && json_approval.is_none() && has_ask_human_command(&json_str) {
-                if batch_is_all_ask_human(&json_str) {
-                    let question = extract_ask_human_question(&json_str)
+            if !headless && json_approval.is_none() && batch_facts.has_ask_human {
+                if batch_facts.all_ask_human {
+                    let question = batch_facts
+                        .ask_human_question
+                        .clone()
                         .unwrap_or_else(|| "The agent asked for your input.".to_string());
                     slog(&session_log, |l| l.human_question(&question));
                     let question_id = turn as u64;
@@ -2050,8 +2056,8 @@ pub(crate) async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, xvfb_guard, provider.name(), &session_log).await;
-            let preview = format_commands_preview(&json_str);
+            maybe_auto_launch_xvfb(&batch_facts, xvfb_guard, provider.name(), &session_log).await;
+            let preview = batch_facts.commands_preview.clone();
             bus.send(AppEvent::AgentStarted {
                 session_id: local_session_id.clone(),
                 turn,
@@ -2063,9 +2069,14 @@ pub(crate) async fn run_agent_loop(
             // Read the grant fresh from the autonomy guard at every runtime
             // spawn so a mid-session grant/revoke reaches the next child.
             let user_display_granted = autonomy.read().await.user_display_granted;
-            let output =
-                agent_runner::run_agent(&json_str, log_dir, &project.root, user_display_granted)
-                    .await?;
+            let output = agent_runner::run_agent(
+                &json_str,
+                log_dir,
+                &project.root,
+                user_display_granted,
+                batch_facts.has_ask_human,
+            )
+            .await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output
@@ -2254,10 +2265,13 @@ pub(crate) async fn run_agent_loop(
             empty_command_streak = 0;
 
             // Inject project context (memory_file) into commands and normalize aliases.
-            let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
+            let json_str = finalize_command_batch(&json_str, project);
+            // One parse of the final batch answers every per-batch question
+            // below (see the JSON-batch twin above).
+            let batch_facts = BatchFacts::from_json(&json_str);
 
             // In headless mode there is no askHuman input panel — skip unless JSON mode.
-            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
+            if headless && json_approval.is_none() && batch_facts.has_ask_human {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -2271,7 +2285,7 @@ Proceed with explicit assumptions and continue without additional questions."
             }
             // In JSON mode, emit the question so the outbound broadcaster prints it
             if json_approval.is_some() {
-                if let Some(question) = extract_ask_human_question(&json_str) {
+                if let Some(question) = batch_facts.ask_human_question.clone() {
                     bus.send(AppEvent::HumanQuestionDetected { question });
                 }
             }
@@ -2279,8 +2293,10 @@ Proceed with explicit assumptions and continue without additional questions."
             // JSON-batch twin above). The text loop mirrors its headless
             // precedent: the batch is consumed by the question — the model
             // re-issues any other commands after reading the answer.
-            if !headless && json_approval.is_none() && has_ask_human_command(&json_str) {
-                let question = extract_ask_human_question(&json_str)
+            if !headless && json_approval.is_none() && batch_facts.has_ask_human {
+                let question = batch_facts
+                    .ask_human_question
+                    .clone()
                     .unwrap_or_else(|| "The agent asked for your input.".to_string());
                 slog(&session_log, |l| l.human_question(&question));
                 let question_id = turn as u64;
@@ -2576,9 +2592,9 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, xvfb_guard, provider.name(), &session_log).await;
+            maybe_auto_launch_xvfb(&batch_facts, xvfb_guard, provider.name(), &session_log).await;
 
-            let preview = format_commands_preview(&json_str);
+            let preview = batch_facts.commands_preview.clone();
             bus.send(AppEvent::AgentStarted {
                 session_id: local_session_id.clone(),
                 turn,
@@ -2590,9 +2606,14 @@ Proceed with explicit assumptions and continue without additional questions."
             // Read the grant fresh from the autonomy guard at every runtime
             // spawn so a mid-session grant/revoke reaches the next child.
             let user_display_granted = autonomy.read().await.user_display_granted;
-            let output =
-                agent_runner::run_agent(&json_str, log_dir, &project.root, user_display_granted)
-                    .await?;
+            let output = agent_runner::run_agent(
+                &json_str,
+                log_dir,
+                &project.root,
+                user_display_granted,
+                batch_facts.has_ask_human,
+            )
+            .await?;
             let output_id = event::next_agent_output_id();
 
             // Log agent output

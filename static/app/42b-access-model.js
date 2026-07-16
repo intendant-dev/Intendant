@@ -1459,7 +1459,7 @@ function accessIamEnforcementReason(iam) {
 }
 
 function accessFallbackIamRoles() {
-  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'settings.manage', 'credentials.manage', 'runtime.control', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write'];
   return [{
     id: 'role:root',
     label: 'Root',
@@ -1493,7 +1493,7 @@ function accessFallbackIamRoles() {
     label: 'Observer',
     status: 'enforced',
     summary: 'Read-only dashboard visibility without files, terminal, task control, or settings.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'access.inspect', 'peer.inspect', 'session.inspect'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'access.inspect', 'peer.inspect', 'session.inspect', 'agenda.read'],
     source: 'builtin',
   }, {
     id: 'role:session-reader',
@@ -1535,7 +1535,7 @@ function accessFallbackIamRoles() {
     label: 'Operator',
     status: 'enforced',
     summary: 'Operate sessions, display, shell, files, peers, and approvals without access/settings administration.',
-    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write'],
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.use', 'session.inspect', 'session.manage', 'terminal.view', 'terminal.write', 'shell.spawn', 'credentials.manage', 'filesystem.read', 'filesystem.write', 'agenda.read', 'agenda.write'],
     source: 'builtin',
   }];
 }
@@ -1601,6 +1601,8 @@ function accessFallbackPermissions() {
     'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as media and recording controls.'],
     'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
     'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
+    'agenda.read': ['Agenda read', 'agenda', 'Read the daemon\'s agenda ledger (parked items and counts).'],
+    'agenda.write': ['Agenda write', 'agenda', 'Park, edit, complete, reopen, and retire agenda items.'],
   };
   return Object.entries(summaries).map(([id, [label, domain, summary]]) => ({
     id,

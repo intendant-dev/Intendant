@@ -126,6 +126,10 @@ pub struct McpAppState {
     /// reducer-level guard against stale portal-pending events arriving after
     /// a ready event or successful screenshot.
     display_capture_ready: HashSet<u32>,
+    /// The daemon's agenda ledger (single-writer handle). `None` outside
+    /// the gateway/daemon shapes or when the store failed to open — agenda
+    /// surfaces then answer "unavailable" instead of failing the daemon.
+    pub agenda: Option<std::sync::Arc<crate::agenda::AgendaHandle>>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -305,6 +309,7 @@ impl McpAppState {
             frame_registry: None,
             session_registry: None,
             peer_registry: None,
+            agenda: None,
             user_display_activation_pending: std::collections::HashMap::new(),
             display_capture_ready: HashSet::new(),
             screenshot_dir: None,

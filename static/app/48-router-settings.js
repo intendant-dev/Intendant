@@ -59,7 +59,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'vault', 'debug', 'settings', 'agenda'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug', 'autonomy', 'providers', 'presence', 'advanced', 'appearance'];
@@ -284,6 +284,9 @@ function switchTab(tabId) {
   syncSessionWindowMetadataRefresh();
   if (tabId === 'sessions' && !sessionsLoaded) {
     loadSessions();
+  }
+  if (tabId === 'agenda') {
+    agendaOnTabShown();
   }
   if (tabId === 'stats') {
     // The explicit refresh below supersedes any render deferred while

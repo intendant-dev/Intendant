@@ -98,20 +98,11 @@ pub struct AgentOutput {
     pub stderr: String,
 }
 
-fn has_ask_human(json_input: &str) -> bool {
-    let parsed: serde_json::Value = match serde_json::from_str(json_input) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    parsed
-        .get("commands")
-        .and_then(|v| v.as_array())
-        .map(|commands| {
-            commands
-                .iter()
-                .any(|cmd| cmd.get("function").and_then(|v| v.as_str()) == Some("askHuman"))
-        })
-        .unwrap_or(false)
+/// Convert captured child output to a `String` without copying: the buffer
+/// is moved when it is valid UTF-8 (the overwhelmingly common case) and only
+/// the invalid-UTF-8 path pays a lossy re-allocation.
+fn output_buf_into_string(buf: Vec<u8>) -> String {
+    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// True when `line` is a complete runtime protocol line: JSON with a
@@ -141,20 +132,24 @@ fn output_with_exit_status(
     stderr_buf: Vec<u8>,
     status: ExitStatus,
 ) -> Result<AgentOutput, CallerError> {
-    let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
-    let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+    // Failure triage borrows the buffers; the success path then MOVES them
+    // into the returned strings (this used to memcpy the full — up to 64 MB —
+    // output through `from_utf8_lossy(..).to_string()` on every batch).
+    if !status.success() && !has_parseable_runtime_output(&stdout_buf) {
+        let stderr = output_buf_into_string(stderr_buf);
+        let stderr_tail = stderr.trim();
+        let detail = if stderr_tail.is_empty() {
+            String::new()
+        } else {
+            format!("; stderr: {stderr_tail}")
+        };
+        return Err(CallerError::Agent(format!(
+            "sandboxed runtime exited with {status} before producing parseable output{detail}"
+        )));
+    }
+    let stdout = output_buf_into_string(stdout_buf);
+    let mut stderr = output_buf_into_string(stderr_buf);
     if !status.success() {
-        if !has_parseable_runtime_output(&stdout_buf) {
-            let stderr_tail = stderr.trim();
-            let detail = if stderr_tail.is_empty() {
-                String::new()
-            } else {
-                format!("; stderr: {stderr_tail}")
-            };
-            return Err(CallerError::Agent(format!(
-                "sandboxed runtime exited with {status} before producing parseable output{detail}"
-            )));
-        }
         if !stderr.ends_with('\n') && !stderr.is_empty() {
             stderr.push('\n');
         }
@@ -170,11 +165,17 @@ fn output_with_exit_status(
 /// `user_display_granted` is the autonomy guard's grant state, read by the
 /// caller at spawn time — the runtime child observes it as
 /// `INTENDANT_USER_DISPLAY_GRANTED` on its environment.
+///
+/// `has_ask_human` selects the no-timeout path for batches containing
+/// `askHuman` (which polls indefinitely for the user). The caller derives it
+/// once per batch (`tool_batch::BatchFacts`) — this function used to re-parse
+/// the entire batch JSON, including full editFile payloads, to answer it.
 pub async fn run_agent(
     json_input: &str,
     log_dir: &std::path::Path,
     workdir: &std::path::Path,
     user_display_granted: bool,
+    has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
     // Linux enforces this via Landlock inside the runtime; macOS wraps the
     // runtime in sandbox-exec; Windows re-execs inside the runtime under a
@@ -195,6 +196,7 @@ pub async fn run_agent(
                 Some(workdir),
                 Some(&sandbox),
                 user_display_granted,
+                has_ask_human,
             )
             .await;
         }
@@ -205,6 +207,7 @@ pub async fn run_agent(
         Some(workdir),
         None,
         user_display_granted,
+        has_ask_human,
     )
     .await
 }
@@ -216,6 +219,7 @@ pub async fn run_agent_sandboxed(
     log_dir: &std::path::Path,
     sandbox: &crate::sandbox::SandboxConfig,
     user_display_granted: bool,
+    has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
     run_agent_inner(
         json_input,
@@ -223,6 +227,7 @@ pub async fn run_agent_sandboxed(
         None,
         Some(sandbox),
         user_display_granted,
+        has_ask_human,
     )
     .await
 }
@@ -233,6 +238,7 @@ async fn run_agent_inner(
     workdir: Option<&std::path::Path>,
     sandbox: Option<&crate::sandbox::SandboxConfig>,
     user_display_granted: bool,
+    has_ask_human: bool,
 ) -> Result<AgentOutput, CallerError> {
     let agent_path = std::env::current_exe()
         .ok()
@@ -326,8 +332,7 @@ async fn run_agent_inner(
     }
 
     // Hard timeout: 120s default, no timeout for askHuman (polls indefinitely)
-    let has_human = has_ask_human(json_input);
-    let hard_timeout_secs: u64 = if has_human { u64::MAX / 2 } else { 120 };
+    let hard_timeout_secs: u64 = if has_ask_human { u64::MAX / 2 } else { 120 };
     let hard_timeout = Duration::from_secs(hard_timeout_secs);
 
     // Read stdout and stderr (bounded), then wait for exit, all under a
@@ -376,8 +381,8 @@ async fn run_agent_inner(
             // work the model would just redo; commands with no result line
             // surface as missing downstream.
             if let Some(salvaged) = salvage_partial_stdout(stdout_buf) {
-                let stdout = String::from_utf8_lossy(&salvaged).to_string();
-                let mut stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+                let stdout = output_buf_into_string(salvaged);
+                let mut stderr = output_buf_into_string(stderr_buf);
                 if !stderr.ends_with('\n') && !stderr.is_empty() {
                     stderr.push('\n');
                 }
@@ -429,29 +434,17 @@ fn salvage_partial_stdout(mut stdout_buf: Vec<u8>) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Valid UTF-8 moves through without a copy; invalid UTF-8 falls back
+    /// to lossy replacement (the pre-move behavior for both cases).
     #[test]
-    fn has_ask_human_detects_function() {
-        let json = r#"{"commands":[{"function":"askHuman","nonce":1,"question":"Which DB?"}]}"#;
-        assert!(has_ask_human(json));
-    }
-
-    #[test]
-    fn has_ask_human_false_for_other() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
-        assert!(!has_ask_human(json));
-    }
-
-    #[test]
-    fn has_ask_human_mixed_commands() {
-        let json = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"},{"function":"askHuman","nonce":2,"question":"ok?"}]}"#;
-        assert!(has_ask_human(json));
-    }
-
-    #[test]
-    fn has_ask_human_false_for_text_only() {
-        let json =
-            r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"echo \"askHuman\""}]}"#;
-        assert!(!has_ask_human(json));
+    fn output_buf_into_string_moves_utf8_and_lossy_falls_back() {
+        assert_eq!(
+            output_buf_into_string(b"plain output".to_vec()),
+            "plain output"
+        );
+        let mut broken = b"tail: ".to_vec();
+        broken.push(0xFF);
+        assert_eq!(output_buf_into_string(broken), "tail: \u{FFFD}");
     }
 
     #[test]
