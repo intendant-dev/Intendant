@@ -3255,6 +3255,7 @@ function questionOptionClicked(qIndex, optIndex) {
     buttons.forEach((b) => b.classList.remove('selected'));
     btn.classList.add('selected');
   }
+  updateQuestionProgress();
 }
 
 function collectQuestionAnswers() {
@@ -3275,6 +3276,45 @@ function collectQuestionAnswers() {
     answers[q.question] = answer;
   }
   return { answers };
+}
+
+// Scroll a question block to the top of the panel's internal scroll region.
+// Deliberately NOT scrollIntoView: that also adjusts overflow:hidden
+// ancestors (.tab-content), which would drag the whole pane around.
+function scrollQuestionIntoView(qIndex) {
+  const scroller = document.querySelector('#question-content .question-scroll');
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  if (!scroller || !block) return;
+  const top = block.getBoundingClientRect().top
+    - scroller.getBoundingClientRect().top
+    + scroller.scrollTop;
+  scroller.scrollTo({ top: Math.max(0, top - 4), behavior: 'smooth' });
+}
+
+// Answered = a selected option or non-empty free text (same rule as
+// collectQuestionAnswers). Drives the index chips' tick state and the
+// "N of M answered" counter; both exist only for multi-question panels,
+// so single-question panels no-op here.
+function updateQuestionProgress() {
+  if (!pendingQuestion) return;
+  const content = document.getElementById('question-content');
+  const progress = document.getElementById('question-progress');
+  if (!progress && !content.querySelector('.question-index-chip')) return;
+  const total = pendingQuestion.questions.length;
+  let answered = 0;
+  for (let i = 0; i < total; i++) {
+    const block = content.querySelector(`.question-block[data-q="${i}"]`);
+    const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
+    const done = !!(block && (typed || block.querySelector('.question-option.selected')));
+    if (done) answered++;
+    const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
+    if (chip) {
+      chip.classList.toggle('answered', done);
+      const header = pendingQuestion.questions[i]?.header || `Q${i + 1}`;
+      chip.setAttribute('aria-label', done ? `${header} (answered)` : header);
+    }
+  }
+  if (progress) progress.textContent = `${answered} of ${total} answered`;
 }
 
 function showUserQuestion(id, questions, sessionId) {
@@ -3298,10 +3338,38 @@ function showUserQuestion(id, questions, sessionId) {
 
   const content = document.getElementById('question-content');
   content.innerHTML = '';
+  const multi = list.length > 1;
   const title = document.createElement('div');
   title.className = 'approval-title';
-  title.textContent = 'The agent has a question';
+  title.textContent = multi
+    ? `The agent has ${list.length} questions`
+    : 'The agent has a question';
   content.appendChild(title);
+
+  // Pinned index (2+ questions): one chip per header, kept above the
+  // scroll region; tapping a chip jumps to its question, and
+  // updateQuestionProgress ticks chips as answers land.
+  if (multi) {
+    const index = document.createElement('div');
+    index.className = 'question-index';
+    list.forEach((q, qIndex) => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'question-index-chip';
+      chip.dataset.q = String(qIndex);
+      chip.textContent = q.header || `Q${qIndex + 1}`;
+      chip.title = q.question;
+      chip.addEventListener('click', () => scrollQuestionIntoView(qIndex));
+      index.appendChild(chip);
+    });
+    content.appendChild(index);
+  }
+
+  // The question list is the only scrolling region: the panel caps at the
+  // pane height (CSS max-height) and title/index/actions stay pinned, so
+  // Submit remains reachable however many questions arrived.
+  const scroll = document.createElement('div');
+  scroll.className = 'question-scroll';
 
   list.forEach((q, qIndex) => {
     const block = document.createElement('div');
@@ -3350,9 +3418,11 @@ function showUserQuestion(id, questions, sessionId) {
     free.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
     });
+    free.addEventListener('input', () => updateQuestionProgress());
     block.appendChild(free);
-    content.appendChild(block);
+    scroll.appendChild(block);
   });
+  content.appendChild(scroll);
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
@@ -3366,7 +3436,14 @@ function showUserQuestion(id, questions, sessionId) {
   skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
   skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
   actions.appendChild(skip);
+  if (multi) {
+    const progress = document.createElement('span');
+    progress.className = 'question-progress';
+    progress.id = 'question-progress';
+    actions.appendChild(progress);
+  }
   content.appendChild(actions);
+  updateQuestionProgress();
 
   // Station surfaces the question through the existing human-question rail.
   const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';

@@ -232,8 +232,10 @@
           </div>
 
           <!-- Structured User Question Panel (external agents' ask-the-user tool).
-               Body is rendered by showUserQuestion(): one block per question with
-               option buttons, a free-text input, and Submit/Skip actions. -->
+               Body is rendered by showUserQuestion(): a pinned header-chip index
+               (2+ questions), a scrollable list of question blocks (option
+               buttons + a free-text input each), and pinned Submit/Skip actions
+               with an "N of M answered" counter. -->
           <div class="bottom-panel" id="question-panel">
             <div class="panel-body">
               <div class="approval-card">
