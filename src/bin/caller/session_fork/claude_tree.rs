@@ -19,16 +19,8 @@ pub(crate) struct ClaudeTreeNode {
     /// `user` / `assistant` / `system:<subtype>` / the raw `type` field.
     pub(crate) kind: String,
     pub(crate) preview: String,
-    pub(crate) ts: Option<String>,
     pub(crate) line_no: usize,
     pub(crate) is_sidechain: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ClaudeCompactBoundary {
-    pub(crate) uuid: String,
-    pub(crate) logical_parent_uuid: Option<String>,
-    pub(crate) line_no: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,7 +31,9 @@ pub(crate) struct ClaudeTranscriptTree {
     /// The uuid resume would walk back from: the last non-sidechain
     /// message-bearing line in file order.
     pub(crate) active_leaf: Option<String>,
-    pub(crate) newest_compact_boundary: Option<ClaudeCompactBoundary>,
+    /// 1-based line of the newest `compact_boundary` system line, the
+    /// chronological pre/post-compaction divide.
+    pub(crate) newest_compact_boundary_line: Option<usize>,
 }
 
 impl ClaudeTranscriptTree {
@@ -90,11 +84,11 @@ impl ClaudeTranscriptTree {
     /// supported — the chain-slice never includes the boundary — this is
     /// informational for the UI.
     pub(crate) fn anchor_is_pre_compaction(&self, uuid: &str) -> bool {
-        let Some(boundary) = &self.newest_compact_boundary else {
+        let Some(boundary_line) = self.newest_compact_boundary_line else {
             return false;
         };
         self.node(uuid)
-            .is_some_and(|node| node.line_no < boundary.line_no)
+            .is_some_and(|node| node.line_no < boundary_line)
     }
 }
 
@@ -164,10 +158,6 @@ pub(crate) fn parse_claude_transcript_tree(path: &Path) -> io::Result<ClaudeTran
             parent_uuid: parent_uuid.clone(),
             kind: kind.clone(),
             preview: node_preview(&value),
-            ts: value
-                .get("timestamp")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
             line_no: line_index + 1,
             is_sidechain,
         };
@@ -178,14 +168,7 @@ pub(crate) fn parse_claude_transcript_tree(path: &Path) -> io::Result<ClaudeTran
             tree.children.entry(parent).or_default().push(index);
         }
         if kind == "system:compact_boundary" {
-            tree.newest_compact_boundary = Some(ClaudeCompactBoundary {
-                uuid: uuid.clone(),
-                logical_parent_uuid: value
-                    .get("logicalParentUuid")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string),
-                line_no: line_index + 1,
-            });
+            tree.newest_compact_boundary_line = Some(line_index + 1);
         }
         if !is_sidechain && (kind == "user" || kind == "assistant") {
             tree.active_leaf = Some(uuid);

@@ -370,7 +370,7 @@ pub(crate) fn claude_fork_points(
         ));
     }
 
-    keyed.sort_by(|a, b| b.0.cmp(&a.0));
+    keyed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let points: Vec<ForkPoint> = keyed.into_iter().map(|(_, point)| point).collect();
 
     let mut catalog = ForkPointCatalog {
