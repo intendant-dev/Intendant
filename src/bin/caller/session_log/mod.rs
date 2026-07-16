@@ -3,7 +3,7 @@ use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use uuid::Uuid;
@@ -358,15 +358,30 @@ pub(super) fn context_snapshot_stream_key(source: &str, session_id: Option<&str>
 /// Rebuild the latest-sidecar-per-stream rotation state from the rows an
 /// earlier process persisted. Without this, every restart/`--continue`
 /// strands the previous process's latest sidecar forever — retention
-/// would grow O(session reopenings). One pass over session.jsonl with a
-/// substring prefilter (only `context_snapshot` rows are parsed), run
-/// once per session open.
+/// would grow O(session reopenings). Streams session.jsonl line by line
+/// (a resident session's log can be tens of MB — never buffered whole)
+/// with a substring prefilter so only `context_snapshot` rows are parsed;
+/// a damaged line or torn/invalid-UTF-8 tail is skipped per line (lossy)
+/// without aborting the rows already folded. Run once per session open,
+/// and only when rotation is active.
 fn seed_context_snapshot_rotation(dir: &Path) -> std::collections::HashMap<String, String> {
     let mut latest = std::collections::HashMap::new();
-    let Ok(contents) = fs::read_to_string(dir.join("session.jsonl")) else {
+    let Ok(file) = File::open(dir.join("session.jsonl")) else {
         return latest;
     };
-    for line in contents.lines() {
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // Keep whatever was folded so far; a damaged region ends the
+            // seed, not the session open.
+            Err(_) => break,
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
         if !line.contains("\"context_snapshot\"") {
             continue;
         }
@@ -478,6 +493,7 @@ impl SessionLog {
                 .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
 
+        let keep_all_context_snapshots = bus_events::context_snapshot_keep_all();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -500,8 +516,14 @@ impl SessionLog {
             },
             voice_utterance_buf: String::new(),
             last_approval_resolved: None,
-            last_context_snapshots: seed_context_snapshot_rotation(&log_dir),
-            keep_all_context_snapshots: bus_events::context_snapshot_keep_all(),
+            // Seeding only matters when rotation is active — under
+            // keep-all nothing is ever deleted, so skip the log pass.
+            last_context_snapshots: if keep_all_context_snapshots {
+                std::collections::HashMap::new()
+            } else {
+                seed_context_snapshot_rotation(&log_dir)
+            },
+            keep_all_context_snapshots,
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -799,16 +821,32 @@ impl SessionLog {
     }
 
     fn emit(&mut self, event: LogEvent) {
-        // Serialize straight into the writer — the intermediate String per
-        // event bought nothing on this universal append path. The flush per
-        // record stays: it is the durability contract for tail readers.
-        if let Err(e) = serde_json::to_writer(&mut self.writer, &event)
-            .map_err(std::io::Error::other)
-            .and_then(|()| self.writer.write_all(b"\n"))
-        {
+        if let Err(e) = self.emit_checked(event) {
             eprintln!("session_log: failed to write log event: {}", e);
         }
-        let _ = self.writer.flush();
+    }
+
+    /// Fallible emit: serialize straight into the writer (the intermediate
+    /// String per event bought nothing on this universal append path) and
+    /// flush — the flush per record is the durability contract for tail
+    /// readers. Callers whose follow-up is only safe once the row is
+    /// durably queued (context-snapshot rotation deletes its predecessor)
+    /// branch on the result; everything else uses the fire-and-forget
+    /// [`Self::emit`].
+    fn emit_checked(&mut self, event: LogEvent) -> std::io::Result<()> {
+        serde_json::to_writer(&mut self.writer, &event).map_err(std::io::Error::other)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    /// Test seam: swap the session.jsonl writer for a read-only handle so
+    /// the next emit fails at flush — exercises contracts that must hold
+    /// when a row cannot be made durable (disk full, revoked handle).
+    #[cfg(test)]
+    pub(crate) fn sabotage_writer_for_tests(&mut self) {
+        if let Ok(file) = File::open(self.dir.join("session.jsonl")) {
+            self.writer = BufWriter::new(file);
+        }
     }
 
     fn emit_transcript(&mut self, entry: TranscriptEntry) {

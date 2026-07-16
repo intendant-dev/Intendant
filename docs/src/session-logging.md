@@ -208,7 +208,12 @@ S=~/.intendant/logs/<uuid>
 # Event overview
 jq -r '.event' "$S/session.jsonl"
 
-# What the model received on turn 5
+# What the model received — the LATEST context snapshot (sidecars rotate
+# to latest-only; see above)
+jq . "$S/$(jq -r 'select(.event=="context_snapshot") | .file' "$S/session.jsonl" | tail -1)"
+
+# Per-turn messages dump — debug-only (INTENDANT_LOG_MESSAGES_JSON=1, or
+# automatic for providers without a request snapshot)
 jq . "$S/turns/turn_005_messages.json"
 
 # Model reasoning on turn 3

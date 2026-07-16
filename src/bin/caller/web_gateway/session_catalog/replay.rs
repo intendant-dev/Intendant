@@ -373,8 +373,14 @@ pub(crate) fn inject_replay_entry_metadata(
             // Availability derives from disk truth: sidecars rotate to
             // latest-only, so a historical row's file is usually gone —
             // advertising exact replay for it would send the viewer to a
-            // fetch that cannot succeed.
-            let available = context_snapshot_raw_file_size(entry_json, log_dir).is_some();
+            // fetch that cannot succeed. An earlier stage that already
+            // established availability (the without-raw builder's stat,
+            // the exact lane's actual read) stamps the key on the value;
+            // reuse it so each snapshot row costs at most one stat.
+            let available = obj
+                .get("exact_replay_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| context_snapshot_raw_file_size(entry_json, log_dir).is_some());
             obj.insert(
                 "snapshot_file".to_string(),
                 serde_json::Value::String(file.to_string()),
@@ -723,11 +729,14 @@ pub(crate) fn context_snapshot_replay_entry_without_raw(
         .map(|v| v as usize);
     // Advertise the sidecar only while it exists on disk (latest-only
     // rotation deletes historical ones) — `context_snapshot_omitted_raw`
-    // derives `exact_replay_available` from its presence.
+    // derives `exact_replay_available` from its presence. The result is
+    // also stamped on the returned value so the metadata injector reuses
+    // it instead of statting the same file a second time per row.
     let snapshot_file = entry_json
         .get("file")
         .and_then(|v| v.as_str())
         .filter(|_| context_snapshot_raw_file_size(entry_json, log_dir).is_some());
+    let available = snapshot_file.is_some();
     let raw = context_snapshot_omitted_raw(
         request_id.as_deref(),
         request_index,
@@ -735,7 +744,7 @@ pub(crate) fn context_snapshot_replay_entry_without_raw(
         item_count,
         snapshot_file,
     );
-    serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
+    let mut value = serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
         session_id,
         source,
         label,
@@ -750,7 +759,10 @@ pub(crate) fn context_snapshot_replay_entry_without_raw(
         item_count,
         raw,
     })
-    .ok()
+    .ok()?;
+    // Stamp the stat result for the metadata injector (stat-once-per-row).
+    value["exact_replay_available"] = serde_json::Value::Bool(available);
+    Some(value)
 }
 
 pub(crate) fn context_snapshot_omitted_raw(

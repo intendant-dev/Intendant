@@ -96,6 +96,11 @@ impl TestRig {
             .env_remove("PRESENCE_MODEL")
             .env_remove("CU_PROVIDER")
             .env_remove("CU_MODEL")
+            // Session-log retention toggles: an ambient debug gate would
+            // satisfy the snapshot-less-provider fallback assertion without
+            // exercising the fallback, and keep-all would mask rotation.
+            .env_remove("INTENDANT_LOG_MESSAGES_JSON")
+            .env_remove("INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL")
             // A host shell exporting the Connect rendezvous URL would make
             // the daemon-lane tests dial out; the suite is no-network.
             .env_remove("INTENDANT_CONNECT_RENDEZVOUS_URL")

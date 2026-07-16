@@ -1356,31 +1356,29 @@ impl SessionLog {
         // opts back into archive-everything (resolved once at open; see
         // `keep_all_context_snapshots`).
         //
-        // The predecessor is deleted only AFTER the new row is emitted
-        // (emit flushes per record): a crash between the new-file write
-        // and the row emit must strand an orphan file, never leave a
-        // persisted row pointing at a deleted sidecar.
-        let mut rotated_out: Option<String> = None;
+        // The predecessor is deleted only AFTER the new row is CONFIRMED
+        // durable (checked emit below): a crash or write failure between
+        // the new-file write and the row landing must strand an orphan
+        // file, never leave the last durable row pointing at a deleted
+        // sidecar.
+        let mut rotation: Option<(String, Option<String>)> = None;
         if let Some(ref new_file) = file {
             if !self.keep_all_context_snapshots {
                 let stream_key = super::context_snapshot_stream_key(
                     source,
                     session_id.map(str::trim).filter(|s| !s.is_empty()),
                 );
-                if let Some(previous) = self
+                let previous = self
                     .last_context_snapshots
-                    .insert(stream_key, new_file.clone())
-                {
-                    if previous != *new_file {
-                        rotated_out = Some(previous);
-                    }
-                }
+                    .insert(stream_key.clone(), new_file.clone());
+                rotation = Some((stream_key, previous));
             }
         }
+        let new_file_for_rotation = file.clone();
         let item_suffix = item_count
             .map(|n| format!(" ({} items)", n))
             .unwrap_or_default();
-        self.emit(LogEvent {
+        let row = LogEvent {
             ts: Self::ts(),
             ts_ms: Self::ts_ms(),
             turn: effective_turn,
@@ -1407,9 +1405,33 @@ impl SessionLog {
             }),
             file,
             file2: None,
-        });
-        if let Some(previous) = rotated_out {
-            let _ = fs::remove_file(self.dir.join(&previous));
+        };
+        match self.emit_checked(row) {
+            Ok(()) => {
+                if let Some((_, Some(previous))) = rotation {
+                    if new_file_for_rotation.as_deref() != Some(previous.as_str()) {
+                        let _ = fs::remove_file(self.dir.join(&previous));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("session_log: failed to write log event: {}", e);
+                // The row never durably landed, so the last durable row
+                // still references the PREVIOUS sidecar — it must survive.
+                // Restore the rotation map to the durable state so the
+                // next successful snapshot rotates it out; the just-written
+                // new file is the accepted orphan.
+                if let Some((stream_key, previous)) = rotation {
+                    match previous {
+                        Some(previous) => {
+                            self.last_context_snapshots.insert(stream_key, previous);
+                        }
+                        None => {
+                            self.last_context_snapshots.remove(&stream_key);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2033,6 +2055,63 @@ mod tests {
             "sidecar is compact single-line JSON"
         );
         assert!(log_dir.join(&files[2]).exists(), "other source kept");
+    }
+
+    #[test]
+    fn rotation_keeps_the_predecessor_when_the_row_fails_to_persist() {
+        // Disk-full contract: if the new context_snapshot row cannot be
+        // made durable, the last durable row still references the OLD
+        // sidecar — it must not be deleted. The just-written new file is
+        // the accepted orphan.
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.set_context_snapshot_keep_all(false);
+        log.turn_start(1, 0.0, 0);
+        log.context_snapshot(
+            "native",
+            "req 1",
+            Some(1),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            &serde_json::json!({"messages": ["durable turn"]}),
+        );
+        let files = snapshot_files(&log_dir);
+        assert_eq!(files.len(), 1);
+        let durable_sidecar = files[0].clone();
+
+        log.sabotage_writer_for_tests();
+        log.context_snapshot(
+            "native",
+            "req 2",
+            Some(1),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            &serde_json::json!({"messages": ["never lands"]}),
+        );
+
+        // The durable row set is unchanged, and its sidecar survives.
+        let files = snapshot_files(&log_dir);
+        assert_eq!(files, vec![durable_sidecar.clone()]);
+        assert!(
+            log_dir.join(&durable_sidecar).exists(),
+            "predecessor must survive a failed row emit"
+        );
+        // Both sidecar files exist: the durable one + the accepted orphan.
+        let sidecars = fs::read_dir(log_dir.join("turns"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("context"))
+            .count();
+        assert_eq!(sidecars, 2, "orphaned new file is the accepted side");
     }
 
     #[test]

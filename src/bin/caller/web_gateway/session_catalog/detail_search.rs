@@ -305,21 +305,34 @@ pub(crate) fn exact_context_snapshot_from_log_entry(
     log_dir: &Path,
     contents: &str,
 ) -> Option<serde_json::Value> {
-    // Disk truth first: sidecars rotate to latest-only, and the event
-    // converter degrades a missing file to an empty `{}` raw — without
-    // this gate a rotated-away row would serve 200-with-{} instead of
-    // taking the caller's honest 404 arm.
-    if context_snapshot_raw_file_size(entry, log_dir).is_none() {
+    // ONE fallible read is the whole availability decision: sidecars
+    // rotate to latest-only, and a stat followed by a separate converter
+    // read could still race a rotation into the converter's `{}` degrade.
+    // Reading the bytes here means NotFound ⇒ the caller's honest 404
+    // arm, and a served response always carries the payload we actually
+    // read — this path never degrades to `{}`.
+    let file = entry.get("file").and_then(|v| v.as_str())?;
+    let relative = Path::new(file);
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
         return None;
     }
-    let app_event = crate::session_log::session_log_entry_to_app_event(entry, log_dir)?;
-    let outbound = crate::event::app_event_to_outbound(&app_event)?;
-    let mut value = serde_json::to_value(&outbound).ok()?;
+    let raw_bytes = std::fs::read(log_dir.join(relative)).ok()?;
+    let raw_loaded: serde_json::Value = serde_json::from_slice(&raw_bytes).ok()?;
+
     let external_replay_session_id = external_backend_session_id_from_replay(contents);
     let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
     let replay_session_id = external_replay_session_id
         .clone()
         .or_else(|| wrapper_replay_session_id.clone());
+    // Build the outbound shape from the row's metadata, then substitute
+    // the raw we hold — no second read, no converter involvement.
+    let mut value =
+        context_snapshot_replay_entry_without_raw(entry, log_dir, replay_session_id.as_deref())?;
+    value["raw"] = raw_loaded;
+    value["exact_replay_available"] = serde_json::Value::Bool(true);
     inject_replay_entry_metadata(
         &mut value,
         entry,
