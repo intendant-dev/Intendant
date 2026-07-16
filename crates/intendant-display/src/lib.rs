@@ -1499,8 +1499,7 @@ async fn send_tile_snapshot_to_peer(
     counters: Arc<DisplayMetricsCounters>,
 ) {
     if let Some(frames) =
-        encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters)
-            .await
+        encode_tile_snapshot_frames(frame, epoch, snapshot_id, visual_marker_value, &counters).await
     {
         send_tile_snapshot_frames_to_peer(&peer, &frames).await;
     }
@@ -2465,10 +2464,7 @@ fn frame_to_tight_rgba(frame: &Frame) -> Vec<u8> {
                 .zip(frame.data.chunks(stride))
             {
                 let src_row = &src_row[..row_bytes];
-                for (dst, px) in dst_row
-                    .chunks_exact_mut(4)
-                    .zip(src_row.chunks_exact(4))
-                {
+                for (dst, px) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
                     dst[0] = px[2];
                     dst[1] = px[1];
                     dst[2] = px[0];

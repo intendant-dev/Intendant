@@ -711,11 +711,7 @@ pub fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, stride: u32, out:
 /// Load one BGRA pixel as `(b, g, r)` i32 components.
 #[inline]
 fn bgra_px(bgra: &[u8], idx: usize) -> (i32, i32, i32) {
-    (
-        bgra[idx] as i32,
-        bgra[idx + 1] as i32,
-        bgra[idx + 2] as i32,
-    )
+    (bgra[idx] as i32, bgra[idx + 1] as i32, bgra[idx + 2] as i32)
 }
 
 #[inline]
@@ -847,7 +843,14 @@ pub fn downscale_i420_into(
 /// rounds the same direction as `f32::round` on the only possible
 /// fractions .0/.25/.5/.75) several times faster and without per-pixel
 /// float math. Everything else takes the generic bilinear path.
-fn downscale_plane(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize, dst_h: usize) {
+fn downscale_plane(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) {
     if src_w == dst_w * 2 && src_h == dst_h * 2 && dst_w > 0 && dst_h > 0 {
         downscale_plane_box2x(src, src_w, dst, dst_w, dst_h);
     } else {
