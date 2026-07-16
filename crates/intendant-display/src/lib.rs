@@ -1188,10 +1188,11 @@ pub struct DisplaySession {
 
 /// Convert one BGRA frame to I420 for the pool-feed bridge.
 ///
-/// Phase 0 visual-freshness stamps are applied later, at pool send/encoder
-/// time, so heartbeat re-sends of a static desktop still carry a fresh marker
-/// timestamp and downscaled layers get a marker in their final output
-/// resolution.
+/// Phase 0 visual-freshness stamps are applied later, at pool *push* time
+/// (into a per-push copy of the cached buffer), so heartbeat re-sends of a
+/// static desktop still carry a fresh marker timestamp; encoder threads
+/// re-stamp only after per-layer downscale so shrunken markers are redrawn
+/// at final output resolution.
 ///
 /// `reuse` is a retired I420 buffer to convert into (pass an empty
 /// `Vec` when none is available) — the bridge recycles buffers whose
@@ -3649,8 +3650,35 @@ impl DisplaySession {
                             } else {
                                 None
                             };
+                        // Marker stamping happens here, once per push,
+                        // into a per-push copy: the cached buffer stays
+                        // unstamped (it is Arc-shared with in-flight
+                        // encoders and future re-pushes), and stamping
+                        // at push time keeps the heartbeat property —
+                        // every re-push of a static desktop carries a
+                        // fresh marker value. One copy per *push*
+                        // replaces the old one copy per *source-dim
+                        // encoder per frame* (workers now only re-stamp
+                        // after downscale, where they already own a
+                        // buffer). Marker off (the default): no copy.
+                        let push_buf = match visual_marker_value {
+                            Some(value) => {
+                                let mut stamped = i420.as_ref().clone();
+                                let y_len = enc_w as usize * enc_h as usize;
+                                if let Some(y) = stamped.get_mut(0..y_len) {
+                                    visual_marker::stamp_y_plane(
+                                        y,
+                                        enc_w as usize,
+                                        enc_h as usize,
+                                        value,
+                                    );
+                                }
+                                Arc::new(stamped)
+                            }
+                            None => Arc::clone(i420),
+                        };
                         pool.push_i420_frame_with_visual_marker(
-                            Arc::clone(i420),
+                            push_buf,
                             arrived,
                             visual_marker_value,
                         );
