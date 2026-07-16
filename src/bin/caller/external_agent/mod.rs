@@ -1288,6 +1288,15 @@ pub trait ExternalAgent: Send + Sync {
         self.send_message(thread, message).await
     }
 
+    /// Whether this backend delivers image attachments natively through its
+    /// wire protocol. The supervisor consults this before sending a message
+    /// that carries images, so undeliverable images produce a visible
+    /// session-log warning instead of vanishing (the
+    /// `send_message_with_images` default forwards text only).
+    fn supports_image_input(&self) -> bool {
+        false
+    }
+
     /// Return the latest exact model request payload captured at the provider
     /// boundary. Backends without such a payload return `None`; callers should
     /// not synthesize transcript-shaped replacements.
@@ -1955,6 +1964,14 @@ mod tests {
         async fn shutdown(&mut self) -> Result<(), CallerError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn default_backend_reports_no_image_input_support() {
+        assert!(
+            !DefaultOnlyBackend.supports_image_input(),
+            "backends must opt in to image delivery explicitly"
+        );
     }
 
     #[tokio::test]

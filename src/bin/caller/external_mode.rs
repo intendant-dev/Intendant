@@ -7,6 +7,30 @@
 // is the deferred cosmetic pass (see the god-file split design).
 use crate::*;
 
+/// Surface a visible warning when an outbound message carries image
+/// attachments the backend cannot deliver natively (the
+/// `send_message_with_images` default forwards text only). Non-image files
+/// always travel via the staged-path prelude, so images are the only
+/// attachment kind that can silently vanish on an unsupporting backend.
+fn warn_undeliverable_images(
+    session_log: &SharedSessionLog,
+    agent_name: &str,
+    supports_images: bool,
+    attachments: &[external_agent::AgentAttachment],
+) {
+    if supports_images {
+        return;
+    }
+    let dropped = attachments.iter().filter(|a| a.is_image()).count();
+    if dropped > 0 {
+        slog(session_log, |l| {
+            l.warn(&format!(
+                "{agent_name} backend does not deliver image attachments; {dropped} image(s) will not reach the agent (text and staged file paths still sent)"
+            ));
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_external_agent_mode(
     backend: external_agent::AgentBackend,
@@ -1156,6 +1180,12 @@ pub(crate) async fn run_external_agent_mode(
             let send_result = if attachments.is_empty() {
                 agent.send_message(&side_thread, &merged).await
             } else {
+                warn_undeliverable_images(
+                    &session_log,
+                    agent.name(),
+                    agent.supports_image_input(),
+                    &attachments.items,
+                );
                 agent
                     .send_message_with_attachments(&side_thread, &merged, &attachments.items)
                     .await
@@ -1273,6 +1303,12 @@ pub(crate) async fn run_external_agent_mode(
             let send_result = if attachments.is_empty() {
                 agent.send_message(&subagent_thread, &merged).await
             } else {
+                warn_undeliverable_images(
+                    &session_log,
+                    agent.name(),
+                    agent.supports_image_input(),
+                    &attachments.items,
+                );
                 agent
                     .send_message_with_attachments(&subagent_thread, &merged, &attachments.items)
                     .await
@@ -1960,6 +1996,12 @@ pub(crate) async fn run_external_agent_mode(
         let send_result = if attachments.is_empty() {
             agent.send_message(&thread, &merged).await
         } else {
+            warn_undeliverable_images(
+                &session_log,
+                agent.name(),
+                agent.supports_image_input(),
+                &attachments.items,
+            );
             agent
                 .send_message_with_attachments(&thread, &merged, &attachments.items)
                 .await
