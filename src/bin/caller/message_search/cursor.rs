@@ -17,6 +17,13 @@ use std::path::{Path, PathBuf};
 /// same head-hash to distinguish appends from rewrites.
 pub(crate) const PREFIX_HASH_BYTES: usize = 4096;
 
+/// How much older than the check time a stored mtime must be before
+/// timestamp equality is trusted without re-hashing (racy-mtime
+/// distrust). Covers every supported filesystem's stamp granularity —
+/// Linux jiffies (~1-4 ms) through FAT/exFAT (2 s) — with the whole
+/// window as margin.
+const RACY_MTIME_QUIESCENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SourceCursor {
     pub path: PathBuf,
@@ -24,13 +31,16 @@ pub(crate) struct SourceCursor {
     pub identity: Option<FileIdentity>,
     pub len: u64,
     pub mtime_ms: i64,
-    /// Full-precision mtime for the cheap-facts short-circuit: two writes
-    /// inside one millisecond are indistinguishable at `mtime_ms`
-    /// precision, and a same-length rewrite hiding there must not skip
-    /// the hash windows. `0` on cursors persisted before the field —
-    /// those never short-circuit (they hash every sweep, the historical
-    /// behavior). Residual: filesystems with coarse stamps (FAT/exFAT:
-    /// 2 s) keep a same-granule blind spot; nil on APFS/ext4/NTFS.
+    /// Full-precision mtime for the cheap-facts short-circuit. Precision
+    /// alone cannot carry it — filesystem stamps come from coarse kernel
+    /// clocks (Linux jiffies: ~1-4 ms; FAT/exFAT: 2 s granules), so two
+    /// writes inside one granule are indistinguishable at ANY stored
+    /// precision. The short-circuit therefore also requires the stored
+    /// mtime to be QUIESCENT — at least [`RACY_MTIME_QUIESCENCE`] older
+    /// than the check time (git's racy-index discipline); fresh mtimes
+    /// always fall through to the hash windows. `0` on cursors persisted
+    /// before the field — those never short-circuit (they hash every
+    /// sweep, the historical behavior).
     #[serde(default)]
     pub mtime_ns: u64,
     /// Offset just past the last COMPLETE line consumed — a partial
@@ -170,6 +180,12 @@ impl SourceCursor {
 
     /// Compare the file on disk against this cursor.
     pub(crate) fn check(&self) -> CursorCheck {
+        self.check_at(std::time::SystemTime::now())
+    }
+
+    /// [`Self::check`] with an injectable clock, so tests pin the racy
+    /// mtime-distrust window without sleeping.
+    pub(crate) fn check_at(&self, now: std::time::SystemTime) -> CursorCheck {
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             return CursorCheck::Gone;
         };
@@ -203,16 +219,26 @@ impl SourceCursor {
             return CursorCheck::Rewritten;
         }
         // Cheap-facts short-circuit: a reliable identity match with
-        // unchanged len + FULL-PRECISION mtime is the steady state of
+        // unchanged len + full-precision mtime is the steady state of
         // nearly every in-retention file on every 30s sweep — skip the
         // open + 4 KiB read + SHA-256 that used to run merely to confirm
-        // it. Millisecond precision is NOT enough here (two writes inside
-        // one ms hid a same-length rewrite from an earlier draft), so
-        // legacy cursors without `mtime_ns` never short-circuit.
+        // it. Racy-mtime distrust (git's index discipline): timestamp
+        // equality is only trusted on a QUIESCENT file — the stored mtime
+        // must be comfortably older than the check time. Filesystem
+        // stamps come from coarse kernel clocks (a Linux jiffy is ~1-4 ms;
+        // FAT/exFAT granules are 2 s), so a rewrite landing in the same
+        // granule as the captured write is timestamp-invisible; a fresh
+        // mtime therefore falls through to the hash windows, and only
+        // files untouched for the full window skip them. Legacy cursors
+        // without `mtime_ns` never short-circuit.
+        let stored_mtime_quiescent = now
+            .duration_since(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(self.mtime_ns))
+            .is_ok_and(|age| age >= RACY_MTIME_QUIESCENCE);
         let hash_needed = !(identity_reliably_same
             && metadata.len() == self.len
             && self.mtime_ns != 0
-            && !mtime_moved);
+            && !mtime_moved
+            && stored_mtime_quiescent);
         if hash_needed {
             match prefix_hash16(&self.path) {
                 Some(hash) => {
@@ -343,14 +369,73 @@ mod tests {
         assert_eq!(cursor.check(), CursorCheck::Rewritten);
     }
 
+    /// Sets an explicit whole-second mtime (exactly representable on
+    /// every supported filesystem, so the captured stamp round-trips).
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    fn whole_seconds_now() -> std::time::SystemTime {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// Deterministic detection via the moved-mtime rule: explicit DISTINCT
+    /// stamps, no reliance on platform clock granularity.
     #[test]
     fn same_length_prefix_rewrite_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log.jsonl");
+        let t0 = whole_seconds_now() - std::time::Duration::from_secs(10);
         std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, t0);
         let cursor = SourceCursor::capture(&path, 10).unwrap();
         std::fs::write(&path, "zzzz\nbbbb\n").unwrap(); // same len, new head
+        set_mtime(&path, t0 + std::time::Duration::from_secs(1));
         assert_eq!(cursor.check(), CursorCheck::Rewritten);
+    }
+
+    /// A rewrite landing in the SAME timestamp granule as the captured
+    /// write (identical mtime, identical length — what a coarse kernel
+    /// clock produces for rapid writes) must still be caught: the racy
+    /// window distrusts fresh mtimes and falls through to the hash
+    /// windows. No sleeps — the check time is injected.
+    #[test]
+    fn same_granule_rewrite_is_caught_inside_the_racy_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+        let stamp = whole_seconds_now();
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        let cursor = SourceCursor::capture(&path, 10).unwrap();
+        assert_eq!(cursor.mtime_ns % 1_000_000_000, 0, "whole-second stamp");
+
+        // Same-granule rewrite: same length, same mtime, new head bytes.
+        std::fs::write(&path, "zzzz\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        assert_eq!(
+            cursor.check_at(stamp + std::time::Duration::from_millis(100)),
+            CursorCheck::Rewritten,
+            "a fresh mtime must fall through to the hash windows"
+        );
+
+        // Quiescent fast path still exists: with the ORIGINAL bytes back
+        // and the same stamp, an old-mtime check trusts the facts.
+        std::fs::write(&path, "aaaa\nbbbb\n").unwrap();
+        set_mtime(&path, stamp);
+        assert_eq!(
+            cursor.check_at(stamp + std::time::Duration::from_secs(3)),
+            CursorCheck::Unchanged,
+            "a quiescent matching file skips the hashes and reads Unchanged"
+        );
     }
 
     #[test]
