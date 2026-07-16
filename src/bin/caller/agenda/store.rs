@@ -411,6 +411,7 @@ mod tests {
         Some(AgendaActor {
             principal: Some("owner".into()),
             session_id: None,
+            kind: None,
         })
     }
 

@@ -50,6 +50,26 @@ pub struct AgendaListParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemorySearchParams {
+    /// Substring query over statements, labels, and kind. Omit to list.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Max results (default 10, hard ceiling 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Include `candidate` claims (excluded by default; results are
+    /// always status-labeled).
+    #[serde(default)]
+    pub include_candidates: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryReadParams {
+    /// Claim id prefix (≥ 8 hex chars of the claim's operation hash).
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetVerbosityParams {
     /// The verbosity level: "quiet", "normal", "verbose", or "debug".
     pub level: String,

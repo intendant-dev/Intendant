@@ -66,6 +66,12 @@ impl MemoryService {
         })
     }
 
+    /// The plane id (hex) — logged at wiring so an operator can tell
+    /// one ephemeral plane incarnation from the next across restarts.
+    pub(crate) fn plane_id_hex(&self) -> String {
+        hex32(&self.plane.plane_id)
+    }
+
     /// Author a claim (`propose` — the candidate lane; `assert` is a
     /// separate verb this build does not expose). The claim enters as
     /// a `candidate` and only judgments move its derived status.

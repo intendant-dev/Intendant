@@ -1607,6 +1607,9 @@ shell only.
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts |
 | POST | `/api/agenda/op` | AgendaWrite | own origin | bounded | Apply one agenda command (add, patch, complete, reopen, or retire) |
+| GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
+| GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
+| POST | `/api/memory/propose` | MemoryWrite | own origin | bounded | Propose one Memory claim (candidate lane; ephemeral plane in P1.1) |
 | POST | `/api/session/current/redo` | SessionManage | own origin | bounded | Redo the last rolled-back round |
 | POST | `/api/session/current/prune` | SessionManage | own origin | bounded | Prune rollback state for the current session |
 | POST | `/api/session/current/agent-output` | SessionManage | own origin | bounded | Fetch the current session's persisted agent output by id (POST-shaped read) |
