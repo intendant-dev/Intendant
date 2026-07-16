@@ -560,6 +560,9 @@ impl PeerActor {
                 .find(|index| entry.text.is_char_boundary(*index))
                 .unwrap_or(entry.text.len());
             entry.text.drain(..cut);
+            // `drain` shrinks the length but RETAINS the capacity — the
+            // byte bound is on the heap, so release it too.
+            entry.text.shrink_to(MAX_PENDING_PARTIAL_TEXT_BYTES);
         }
     }
 
