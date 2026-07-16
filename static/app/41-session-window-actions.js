@@ -2478,6 +2478,10 @@ function renderLogEntry(c) {
     renderDiffLogEntry(c);
     return;
   }
+  if (isReasoningLog(c)) {
+    renderReasoningLogEntry(c);
+    return;
+  }
   finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);

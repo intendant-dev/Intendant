@@ -2994,7 +2994,12 @@ pub(crate) fn persist_external_model_response_for_session_if_needed(
     }
     if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
         slog(config.session_log, |l| {
-            l.reasoning_content(Some(reasoning), None)
+            l.reasoning_content_for_session(
+                session_id,
+                config.agent_source.as_deref(),
+                Some(reasoning),
+                None,
+            )
         });
     }
 }

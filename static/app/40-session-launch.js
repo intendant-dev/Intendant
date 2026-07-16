@@ -989,6 +989,9 @@ function buildSessionWindowLogEntry(c) {
   if (isSessionWindowCommandOutputRecord(c)) {
     return buildSessionWindowCommandOutputEntry(c);
   }
+  if (isReasoningLog(c)) {
+    return buildReasoningLogEntryNode(c);
+  }
   if (isDiffLog(c)) {
     const diffText = diffLogContent(c);
     const parsed = parseUnifiedDiff(diffText);
