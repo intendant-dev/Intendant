@@ -34,9 +34,11 @@ dashboard, attributed to your session.
 ```
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
-  quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339 —
-  display-only in v1 (reminders are a later slice; a due date fires
-  nothing yet).
+  quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.
+  **A due date delivers a reminder** to the owner at that instant (their
+  notification rail; how loudly is owner policy — quiet hours and per-item
+  levels, not yours to set). Completing or retiring an item cancels its
+  pending reminder; patching `--due` reschedules it.
 - Your write is attributed to your session automatically (the daemon
   resolves the session-scoped token your environment already carries) —
   never claim someone else's identity in the text.

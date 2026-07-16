@@ -989,9 +989,11 @@ mod tests {
             crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
             tmp.path().join("logs"),
         );
+        let agenda_dir = tmp.path().join("agenda");
         state.agenda = Some(std::sync::Arc::new(crate::agenda::AgendaHandle::new(
-            crate::agenda::AgendaStore::open(&tmp.path().join("agenda")).unwrap(),
+            crate::agenda::AgendaStore::open(&agenda_dir).unwrap(),
             bus.clone(),
+            &agenda_dir,
         )));
         let server = crate::mcp::IntendantServer::new(
             std::sync::Arc::new(tokio::sync::RwLock::new(state)),

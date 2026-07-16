@@ -250,6 +250,9 @@ pub(crate) async fn control_request_frame(
         }
         "api_agenda_list" => api_agenda_list_response(id, &runtime).await,
         "api_agenda_op" => api_agenda_op_response(id, params.as_ref(), &runtime).await,
+        "api_agenda_reminder_policy" => {
+            api_agenda_reminder_policy_response(id, params.as_ref(), &runtime).await
+        }
         "api_memory_search" => api_memory_search_response(id, params.as_ref(), &runtime).await,
         "api_memory_claim" => api_memory_claim_response(id, params.as_ref(), &runtime).await,
         "api_memory_propose" => api_memory_propose_response(id, params.as_ref(), &runtime).await,
@@ -1284,6 +1287,25 @@ pub(crate) async fn api_memory_propose_response(
         )
         .await,
         "memory propose",
+    )
+}
+
+/// Tunnel twin of `POST /api/agenda/reminders/policy` — the merge-patch
+/// rides `params`.
+pub(crate) async fn api_agenda_reminder_policy_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::agenda_reminder_policy_api_response(
+            &body_text,
+            runtime.mcp_server.as_ref(),
+        )
+        .await,
+        "agenda reminder policy",
     )
 }
 
