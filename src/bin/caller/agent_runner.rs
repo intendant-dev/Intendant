@@ -114,19 +114,26 @@ fn has_ask_human(json_input: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `line` is a complete runtime protocol line: JSON with a
+/// `type` of `status`/`result` and a numeric `nonce` — the shape
+/// `map_results_to_tool_responses` folds into per-command results.
+fn is_runtime_protocol_line(line: &str) -> bool {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return false;
+    };
+    matches!(
+        parsed.get("type").and_then(|value| value.as_str()),
+        Some("status" | "result")
+    ) && parsed
+        .get("nonce")
+        .and_then(|value| value.as_u64())
+        .is_some()
+}
+
 fn has_parseable_runtime_output(stdout: &[u8]) -> bool {
-    String::from_utf8_lossy(stdout).lines().any(|line| {
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            return false;
-        };
-        matches!(
-            parsed.get("type").and_then(|value| value.as_str()),
-            Some("status" | "result")
-        ) && parsed
-            .get("nonce")
-            .and_then(|value| value.as_u64())
-            .is_some()
-    })
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .any(is_runtime_protocol_line)
 }
 
 fn output_with_exit_status(
@@ -389,21 +396,28 @@ async fn run_agent_inner(
     }
 }
 
-/// Prepare a timed-out batch's stdout for salvage: drop the partial
-/// trailing line first — the kill can land mid-write, and the result mapper
-/// folds any unparseable line into ordinary output text, so an untruncated
-/// buffer would broadcast a malformed JSON fragment into every tool
-/// response. Complete result lines always end in a newline (the runtime
-/// writes line-buffered JSONL), so cutting at the last newline never drops
-/// a finished command's result. Returns None when nothing parseable
-/// remains (the batch keeps its timeout error).
+/// Prepare a timed-out batch's stdout for salvage. The kill can land
+/// mid-write, and the result mapper folds any unparseable line into
+/// ordinary output text, so a torn trailing fragment must not survive —
+/// but the trailing bytes are not always torn: the runtime's stdout is a
+/// line-buffered writer whose ~1 KiB buffer flushes a large result JSON to
+/// the pipe *before* the separate newline write, so a kill in that window
+/// leaves a COMPLETE result for a command that already ran (possibly with
+/// side effects) — dropping it would make the model redo the command.
+/// Keep the post-newline tail iff it parses as a complete protocol line;
+/// drop it otherwise. Returns None when nothing parseable remains (the
+/// batch keeps its timeout error).
 fn salvage_partial_stdout(mut stdout_buf: Vec<u8>) -> Option<Vec<u8>> {
     let cut = stdout_buf
         .iter()
         .rposition(|&b| b == b'\n')
         .map(|i| i + 1)
         .unwrap_or(0);
-    stdout_buf.truncate(cut);
+    let tail_is_complete_line = std::str::from_utf8(&stdout_buf[cut..])
+        .is_ok_and(|tail| !tail.is_empty() && is_runtime_protocol_line(tail));
+    if !tail_is_complete_line {
+        stdout_buf.truncate(cut);
+    }
     if has_parseable_runtime_output(&stdout_buf) {
         Some(stdout_buf)
     } else {
@@ -567,36 +581,53 @@ mod tests {
         );
     }
 
-    /// Timeout salvage must drop a partial trailing line (a mid-write kill
-    /// otherwise leaks a malformed JSON fragment into the tool responses as
-    /// ordinary text) while keeping every complete result line, and must
-    /// decline when nothing parseable remains.
+    /// Timeout salvage must drop a torn trailing fragment (a mid-write kill
+    /// otherwise leaks malformed JSON into the tool responses as ordinary
+    /// text) while keeping BOTH every newline-terminated result and a
+    /// complete trailing result whose newline never made it out — the
+    /// line-buffered writer flushes a large payload to the pipe before the
+    /// separate newline write, and that command already ran (possibly with
+    /// side effects), so dropping it would make the model redo it.
     #[test]
-    fn salvage_truncates_partial_trailing_line() {
-        let complete = br#"{"type":"result","nonce":1,"data":"first ok"}"#;
-        let mut buf = complete.to_vec();
+    fn salvage_keeps_complete_results_drops_torn_fragments() {
+        let first = br#"{"type":"result","nonce":1,"data":"first ok"}"#;
+        let second_complete = br#"{"type":"result","nonce":2,"data":"second ok"}"#;
+
+        // Torn second result: fragment dropped, first kept.
+        let mut buf = first.to_vec();
         buf.push(b'\n');
         buf.extend_from_slice(br#"{"type":"result","nonce":2,"da"#); // killed mid-write
-
-        let salvaged = salvage_partial_stdout(buf).expect("first result must be salvaged");
-        let text = String::from_utf8(salvaged).unwrap();
-        assert_eq!(text.as_bytes().last(), Some(&b'\n'));
+        let text = String::from_utf8(salvage_partial_stdout(buf).unwrap()).unwrap();
         assert!(text.contains("first ok"));
+        assert!(text.ends_with('\n'));
         assert!(
             !text.contains(r#""nonce":2"#),
-            "no fragment of the killed second result may remain: {text}"
+            "no fragment of the torn second result may remain: {text}"
         );
 
-        // Only a partial line: nothing to salvage.
-        assert!(salvage_partial_stdout(br#"{"type":"result","non"#.to_vec()).is_none());
+        // Complete second result missing only its newline: kept.
+        let mut buf = first.to_vec();
+        buf.push(b'\n');
+        buf.extend_from_slice(second_complete);
+        let text = String::from_utf8(salvage_partial_stdout(buf).unwrap()).unwrap();
+        assert!(text.contains("first ok"));
+        assert!(
+            text.contains("second ok"),
+            "a complete newline-less trailing result must survive: {text}"
+        );
 
-        // A complete-looking line without its trailing newline is
-        // indistinguishable from a truncated longer line — conservatively
-        // dropped.
-        assert!(salvage_partial_stdout(complete.to_vec()).is_none());
+        // A lone complete result with no newline at all: also kept.
+        let text = String::from_utf8(salvage_partial_stdout(first.to_vec()).unwrap()).unwrap();
+        assert!(text.contains("first ok"));
+
+        // Only a torn line: nothing to salvage.
+        assert!(salvage_partial_stdout(br#"{"type":"result","non"#.to_vec()).is_none());
 
         // Unparseable noise lines alone don't qualify for salvage.
         assert!(salvage_partial_stdout(b"panic: something\n".to_vec()).is_none());
+
+        // Noise plus a torn tail: still nothing parseable.
+        assert!(salvage_partial_stdout(b"noise\n{\"type\":\"res".to_vec()).is_none());
     }
 
     /// The spawn boundary is the only place the user-display grant becomes
