@@ -109,7 +109,24 @@ const NARRATION_DEBOUNCE: std::time::Duration =
 /// window before anything was trimmed. 10% caps the steady-state narration
 /// prompt at ~105k tokens on the default window and scales down with
 /// smaller configured windows.
+///
+/// Deliberate design limit (decided, not an oversight): compaction replaces
+/// the middle of the transcript with a static marker — no LLM summarization
+/// happens (`Conversation` is a data type and must not call a model), so
+/// presence context older than the kept tail is dropped un-summarized.
+/// That is acceptable here because presence is *narration, not memory*:
+/// the worker session's own context remains authoritative, and presence
+/// tools re-query live state. If standing user instructions to presence
+/// need to survive indefinitely, a real summarization pass before
+/// compaction is the follow-up, not a bigger window.
 const PRESENCE_COMPACT_THRESHOLD: f64 = 0.10;
+
+/// How many leading messages a presence compaction pins verbatim. The
+/// presence conversation starts with only its system message — unlike the
+/// worker (which pins 3: system + its working-directory/ack context pair),
+/// pinning more here would freeze the first user/assistant exchange
+/// forever as if it were context.
+const PRESENCE_COMPACT_KEEP_PREFIX: usize = 1;
 
 /// How many trailing messages survive a presence compaction verbatim.
 /// The worker default (4) is tuned for tool-loop transcripts whose state is
@@ -326,8 +343,11 @@ impl PresenceLayer {
             self.cumulative_cached += response.usage.cached_tokens;
             self.cumulative_cache_creation += response.usage.cache_creation_tokens;
             self.conversation.set_usage(response.usage.clone());
-            self.conversation
-                .auto_compact_at(PRESENCE_COMPACT_THRESHOLD, PRESENCE_COMPACT_KEEP_SUFFIX);
+            self.conversation.auto_compact_at(
+                PRESENCE_COMPACT_THRESHOLD,
+                PRESENCE_COMPACT_KEEP_PREFIX,
+                PRESENCE_COMPACT_KEEP_SUFFIX,
+            );
 
             if response.tool_calls.is_empty() {
                 if !response.content.is_empty() {
