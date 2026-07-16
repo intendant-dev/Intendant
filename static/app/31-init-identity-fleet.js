@@ -603,7 +603,12 @@ const SESSION_TEXT_SIGNATURE_CHAR_LIMIT = 8192;
 const SESSION_RENDERED_SIGNATURE_CHAR_LIMIT = 4096;
 const STATION_ACTIVITY_TEXT_CHAR_LIMIT = 1200;
 const STATION_ANCHOR_DETAIL_CHAR_LIMIT = 2000;
-const COMMAND_OUTPUT_EAGER_RENDER_CHAR_LIMIT = 24000;
+// 0 = collapsed replay/hydration output rows NEVER carry their text in the
+// DOM — expand renders it from _deferredCommandOutputStore. No consumer
+// reads a hidden .command-output-body (copy uses logEntryCopyTextByEntry
+// refs; transcript signatures exclude output records; Station reads the
+// pushed event objects), so hidden full text was pure node weight.
+const COMMAND_OUTPUT_EAGER_RENDER_CHAR_LIMIT = 0;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';

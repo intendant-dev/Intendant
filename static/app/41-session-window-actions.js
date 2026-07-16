@@ -1609,6 +1609,7 @@ function registerCommandOutputCloneView(group, clone) {
     entry: clone,
     summary: clone.querySelector('.command-output-summary'),
     body: clone.querySelector('.command-output-body'),
+    tail: clone.querySelector('.command-output-tail'),
     loaded: false,
     loading: false,
   };
@@ -1617,12 +1618,40 @@ function registerCommandOutputCloneView(group, clone) {
   if (!Array.isArray(group.clones)) group.clones = [];
   group.clones.push(view);
   view.summary.innerHTML = group.summary.innerHTML;
+  if (view.tail) view.tail.textContent = group.tail?.textContent || '';
   clone.classList.toggle('finalized', group.finalized);
   clone.classList.toggle('expanded', group.entry.classList.contains('expanded'));
   if (group.finalized) {
-    view.body.innerHTML = '';
+    // Re-fetchable output starts empty (lazy-loaded on expand); output with
+    // no persisted ids keeps whatever the clone carried — it is the only copy.
+    if (group.outputIds.length) {
+      view.body.innerHTML = '';
+    } else {
+      view.loaded = view.body.childElementCount > 0;
+    }
   }
   return view;
+}
+
+// Session scope for a log command — the same `targetSid || sid || 'global'`
+// prefix commandOutputGroupKey embeds (keep the two in lockstep). Groups
+// store it so finalize can sweep "every active group of THIS session"
+// without string-parsing keys.
+function commandOutputSessionScope(c) {
+  const sid = String(c?.session_id || '').trim();
+  const targetSid = sid ? sessionWindowTargetForLogSession(sid) : '';
+  return targetSid || sid || 'global';
+}
+
+// The Activity-tab verbosity dropdown doubles as the output-visibility
+// power knob: at Verbose/Debug, command-output groups default to
+// expanded; Normal keeps them collapsed to their summary row. Read live
+// (not cached) so finalize honors the level at the moment it runs.
+function commandOutputDefaultExpanded() {
+  const level = document.getElementById('verbosity-select')?.value
+    || localStorage.getItem(VERBOSITY_KEY)
+    || 'normal';
+  return level === 'verbose' || level === 'debug';
 }
 
 function commandOutputGroupKey(c) {
@@ -1676,6 +1705,43 @@ function appendCommandOutputText(body, text) {
   code.innerHTML = highlightCommandOutput(text);
   pre.appendChild(code);
   body.appendChild(pre);
+}
+
+// ── Live streaming tail ──
+// While a group streams (created, not yet finalized) and sits collapsed,
+// a small dim region under the summary shows the LAST few output lines —
+// proof the command is alive without the full body. CSS hides it once the
+// group is expanded or finalized; finalize also empties it.
+const COMMAND_OUTPUT_TAIL_LINES = 3;
+const COMMAND_OUTPUT_TAIL_LINE_CHARS = 240;
+const COMMAND_OUTPUT_TAIL_BUFFER_CHARS = 4096;
+
+function updateCommandOutputTail(group, text) {
+  if (!group?.tail) return;
+  const merged = (group.tailText || '') + String(text || '');
+  group.tailText = merged.length > COMMAND_OUTPUT_TAIL_BUFFER_CHARS
+    ? merged.slice(-COMMAND_OUTPUT_TAIL_BUFFER_CHARS)
+    : merged;
+  const lines = group.tailText.replace(/\r/g, '').split('\n').filter(line => line.trim() !== '');
+  const rendered = lines
+    .slice(-COMMAND_OUTPUT_TAIL_LINES)
+    .map(line => line.length > COMMAND_OUTPUT_TAIL_LINE_CHARS
+      ? '…' + line.slice(-COMMAND_OUTPUT_TAIL_LINE_CHARS)
+      : line)
+    .join('\n');
+  group.tail.textContent = rendered;
+  for (const view of commandOutputCloneViews(group)) {
+    if (view.tail) view.tail.textContent = rendered;
+  }
+}
+
+function clearCommandOutputTail(group) {
+  if (!group) return;
+  group.tailText = '';
+  if (group.tail) group.tail.textContent = '';
+  for (const view of commandOutputCloneViews(group)) {
+    if (view.tail) view.tail.textContent = '';
+  }
 }
 
 async function appendCommandOutputTextProgressive(body, text, chunkChars = 65536) {
@@ -1810,11 +1876,23 @@ function appendCommandOutputChunk(group, c) {
   updateCommandOutputSummary(group);
   if (!group.finalized && text && !processingLogReplay) {
     appendCommandOutputText(group.body, text);
+    updateCommandOutputTail(group, text);
     for (const view of commandOutputCloneViews(group)) {
       if (view.entry.classList.contains('expanded')) {
         appendCommandOutputText(view.body, text);
       }
     }
+  }
+  if (!processingLogReplay && !group.itemScoped) {
+    // Uncorrelated (no item_id) output rides the native batch contract:
+    // one wire event carries the COMPLETE stdout+stderr of a finished
+    // command batch, delivered as one synchronous UiCommand burst. A
+    // microtask after that burst is therefore the command's own
+    // completion — finalize deterministically instead of waiting for
+    // whatever entry happens to arrive next. Item-scoped (external)
+    // groups stream across many wire events and finalize on their
+    // session's next non-output entry / round completion instead.
+    scheduleCommandOutputBatchFinalize(group);
   }
   for (const [win, shouldFollow] of sessionScrollStates.entries()) {
     applySessionWindowOutputScroll(win, shouldFollow);
@@ -1826,15 +1904,24 @@ function renderCommandOutputEntry(c) {
   let activeCommandOutputGroup = activeCommandOutputGroups.get(groupKey);
   if (!activeCommandOutputGroup || activeCommandOutputGroup.finalized) {
     const groupId = 'cmdout-' + (++commandOutputGroupSeq);
-    const { entry } = createLogScaffold(c, 'command-output-group expanded');
+    // Deterministic default: born COLLAPSED (like the replay lane) unless
+    // the verbosity knob says outputs default open. The streaming tail
+    // below keeps a collapsed live group visibly alive.
+    const { entry } = createLogScaffold(
+      c,
+      'command-output-group' + (commandOutputDefaultExpanded() ? ' expanded' : '')
+    );
     entry.dataset.outputGroupId = groupId;
     const wrap = document.createElement('span');
     wrap.className = 'log-content command-output-wrap';
     const summary = document.createElement('span');
     summary.className = 'command-output-summary';
+    const tail = document.createElement('span');
+    tail.className = 'command-output-tail';
     const body = document.createElement('span');
     body.className = 'command-output-body';
     wrap.appendChild(summary);
+    wrap.appendChild(tail);
     wrap.appendChild(body);
     const toggle = document.createElement('span');
     toggle.className = 'collapse-toggle';
@@ -1851,8 +1938,15 @@ function renderCommandOutputEntry(c) {
     const group = {
       id: groupId,
       key: groupKey,
+      sessionScope: commandOutputSessionScope(c),
+      // item-correlated groups stream across wire events (external
+      // backends); uncorrelated ones complete within one event (native
+      // batch contract) — see appendCommandOutputChunk.
+      itemScoped: !!itemId,
       entry,
       summary,
+      tail,
+      tailText: '',
       body,
       outputIds: [],
       outputIdSet: new Set(),
@@ -1861,6 +1955,7 @@ function renderCommandOutputEntry(c) {
       bytes: 0,
       warns: 0,
       finalized: false,
+      finalizeQueued: false,
       loaded: false,
       loading: false,
       clones: [],
@@ -1881,36 +1976,68 @@ function renderCommandOutputEntry(c) {
   if (!concurrentLogDetachedFragment && autoScroll && stream) scheduleMainLogScrollToBottom();
 }
 
+// Uncorrelated (native-batch) groups finalize one microtask after the
+// synchronous UiCommand burst that streamed them — the wire event that
+// carried the chunks IS the command's completion (stdout+stderr arrive
+// together once the batch finished). Armed per chunk, idempotent.
+function scheduleCommandOutputBatchFinalize(group) {
+  if (!group || group.finalized || group.finalizeQueued) return;
+  group.finalizeQueued = true;
+  queueMicrotask(() => {
+    group.finalizeQueued = false;
+    finalizeCommandOutputGroup(group);
+  });
+}
+
 function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
   group.entry.classList.add('finalized');
+  // The streaming tail retires with the stream — the collapsed summary
+  // row carries the group from here.
+  clearCommandOutputTail(group);
   // A group the USER opened stays open with its streamed body — yanking
   // the output shut mid-read because the command happened to finish was
-  // the "collapsible doesn't work" experience. Auto-expanded (streaming)
-  // groups still fold to their summary line.
-  if (group.userExpanded && group.entry.classList.contains('expanded')) {
+  // the "collapsible doesn't work" experience. At Verbose/Debug the
+  // default itself is open, so auto-expanded groups keep their body too.
+  // Only groups whose body actually holds the stream stay open — replay
+  // recreations stream no DOM text, and an open-but-empty body lies.
+  const defaultExpanded = commandOutputDefaultExpanded();
+  // Output with no persisted ids cannot be re-fetched on expand — keep
+  // the streamed body (hidden while collapsed) instead of destroying the
+  // only copy.
+  const preserveBody = group.outputIds.length === 0;
+  const keepOpen = group.entry.classList.contains('expanded')
+    && (group.userExpanded || defaultExpanded)
+    && group.body.childElementCount > 0;
+  if (keepOpen) {
     group.loaded = true;
     group.loading = false;
   } else {
     group.entry.classList.remove('expanded');
-    group.body.innerHTML = '';
-    group.loaded = false;
+    if (!preserveBody) group.body.innerHTML = '';
+    group.loaded = preserveBody && group.body.childElementCount > 0;
     group.loading = false;
   }
   for (const view of commandOutputCloneViews(group)) {
     view.entry.classList.add('finalized');
-    if (view.entry.classList.contains('expanded') && group.userExpanded) {
+    if (view.entry.classList.contains('expanded')
+        && (group.userExpanded || defaultExpanded)
+        && view.body.childElementCount > 0) {
       view.loaded = true;
       view.loading = false;
       continue;
     }
     view.entry.classList.remove('expanded');
-    view.body.innerHTML = '';
-    view.loaded = false;
+    if (!preserveBody) view.body.innerHTML = '';
+    view.loaded = preserveBody && view.body.childElementCount > 0;
     view.loading = false;
   }
-  if (group.key) activeCommandOutputGroups.delete(group.key);
+  // Identity-guarded: a deferred (microtask) finalize must never evict a
+  // NEWER group that re-registered under the same key.
+  if (group.key && activeCommandOutputGroups.get(group.key) === group) {
+    activeCommandOutputGroups.delete(group.key);
+  }
 }
 
 function finalizeActiveCommandOutputGroup(groupKey = null) {
@@ -1924,8 +2051,28 @@ function finalizeActiveCommandOutputGroup(groupKey = null) {
   activeCommandOutputGroups.clear();
 }
 
+// Deterministic cross-command close: any non-output entry rendering for a
+// session means its in-flight command output is done (backends announce
+// the next tool / model text only after the previous command's output was
+// delivered). Exact-key finalize almost never fired for item-correlated
+// groups — the next entry carries a different (or no) item id, so groups
+// stayed open forever purely by timing.
+function finalizeSessionCommandOutputGroups(c) {
+  const scope = commandOutputSessionScope(c);
+  for (const group of Array.from(activeCommandOutputGroups.values())) {
+    if (group.sessionScope === scope) finalizeCommandOutputGroup(group);
+  }
+}
+
 async function loadCommandOutputIntoBody(group, body) {
   if (!group.outputIds.length) {
+    // Nothing persisted to re-fetch: finalize preserved the streamed body
+    // on the main entry in that case — serve expands from it.
+    if (body !== group.body && group.body?.childElementCount) {
+      body.innerHTML = group.body.innerHTML;
+      return;
+    }
+    if (body.childElementCount) return;
     body.textContent = 'Output is not available for lazy loading.';
     return;
   }
@@ -2001,7 +2148,7 @@ async function toggleCommandOutputGroup(group) {
 }
 
 function renderDiffLogEntry(c) {
-  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  finalizeSessionCommandOutputGroups(c);
   const diffText = diffLogContent(c);
   const parsed = parseUnifiedDiff(diffText);
   const { entry } = createLogScaffold(c, 'diff-log-entry');
@@ -2478,7 +2625,7 @@ function renderLogEntry(c) {
     renderDiffLogEntry(c);
     return;
   }
-  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  finalizeSessionCommandOutputGroups(c);
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 
