@@ -2323,6 +2323,42 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 }
                 continue;
             }
+            external_agent::AgentEvent::TurnLimitRejected {
+                resets_at_epoch,
+                message,
+            } => {
+                if event_is_side || event_is_codex_subagent {
+                    // A limit-rejected child turn ends like any child turn
+                    // end; the park machinery is a primary-thread concern.
+                    if event_is_side
+                        && !claim_active_side_turn_completion(
+                            &mut active_side_turns,
+                            config.session_id.as_deref(),
+                        )
+                    {
+                        continue;
+                    }
+                    let conversation_kind = if event_is_side { "side" } else { "subagent" };
+                    emit_child_turn_complete(config, conversation_kind, message);
+                    continue;
+                }
+                if interrupt_pending {
+                    config.bus.send(AppEvent::Interrupted {
+                        session_id: config.session_id.clone(),
+                        reason: interrupt_reason.clone(),
+                    });
+                    return DrainOutcome::Interrupted {
+                        reason: interrupt_reason.clone(),
+                    };
+                }
+                // Terminal immediately — a rejected turn ran nothing, so
+                // no trailing events justify the post-turn grace window.
+                return DrainOutcome::LimitRejected {
+                    resets_at_epoch,
+                    message,
+                    turns_in_round,
+                };
+            }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
                 if interrupt_pending {
                     config.bus.send(AppEvent::Interrupted {

@@ -969,7 +969,90 @@ pub(crate) enum DrainOutcome {
         turns_in_round: usize,
         turn_stop_status: ManagedContextRewindTurnStopStatus,
     },
+    /// The turn ended rejected at a provider usage limit
+    /// ([`external_agent::AgentEvent::TurnLimitRejected`]). The backend
+    /// process stays usable, but the round did no work: the caller must
+    /// consume no round budget and must NOT immediately re-fire —
+    /// instead it parks the pending follow-up until `resets_at_epoch`
+    /// (plus jitter; exponential backoff when absent) and queues user
+    /// input arriving meanwhile.
+    LimitRejected {
+        resets_at_epoch: Option<u64>,
+        message: Option<String>,
+        turns_in_round: usize,
+    },
 }
+
+// ---------------------------------------------------------------------------
+// Rate-limit park policy (park-until-reset for limit-rejected turns)
+// ---------------------------------------------------------------------------
+
+/// Jitter added on top of the provider's reset time so a fleet of parked
+/// sessions doesn't stampede the API the second a window opens.
+pub(crate) const LIMIT_PARK_JITTER_MIN_SECS: u64 = 30;
+pub(crate) const LIMIT_PARK_JITTER_MAX_SECS: u64 = 90;
+/// Backoff bounds when the rejection carried no reset time.
+const LIMIT_PARK_BACKOFF_MIN_SECS: u64 = 5 * 60;
+const LIMIT_PARK_BACKOFF_MAX_SECS: u64 = 30 * 60;
+/// Cap on a single park cycle. A `seven_day` window can honestly reset
+/// days out; instead of one multi-day timer, the park re-checks at this
+/// cadence (one cheap rejected request per cycle re-parks with a fresh
+/// reset time).
+const LIMIT_PARK_MAX_SECS: u64 = 6 * 3600;
+
+/// Random park jitter in the fleet-safe band. Tests inject their own
+/// value into [`limit_park_delay`] instead of calling this.
+pub(crate) fn limit_park_jitter_secs() -> u64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS)
+}
+
+/// How long a limit-rejected follow-up parks before it is re-sent. Pure —
+/// clock and jitter injected. With a wire reset time: until the reset
+/// plus jitter, capped at [`LIMIT_PARK_MAX_SECS`]. Without one:
+/// exponential backoff by consecutive-park `streak` (1-based), 5 → 30
+/// minutes, so an untimed limit is retried patiently instead of hammered.
+pub(crate) fn limit_park_delay(
+    resets_at_epoch: Option<u64>,
+    now_epoch: u64,
+    streak: u32,
+    jitter_secs: u64,
+) -> Duration {
+    let secs = match resets_at_epoch {
+        Some(resets_at) => resets_at
+            .saturating_sub(now_epoch)
+            .min(LIMIT_PARK_MAX_SECS)
+            .saturating_add(jitter_secs),
+        None => {
+            let shift = streak.saturating_sub(1).min(3);
+            (LIMIT_PARK_BACKOFF_MIN_SECS << shift).min(LIMIT_PARK_BACKOFF_MAX_SECS)
+        }
+    };
+    Duration::from_secs(secs)
+}
+
+/// One armed rate-limit park in an external-session lane: the lane sleeps
+/// until `resume_at`, then re-sends `pending` (if still uncancelled).
+/// User messages arriving while parked queue behind it instead of burning
+/// against the rejected backend.
+pub(crate) struct LimitParkState {
+    pub(crate) resume_at: tokio::time::Instant,
+    pub(crate) pending: Option<FollowUpMessage>,
+}
+
+/// The session-log/activity row announcing a park. One place so the two
+/// lanes (persistent daemon lane and the supervised external-mode lane)
+/// cannot drift.
+pub(crate) fn limit_park_log_line(resets_at_epoch: Option<u64>, now_epoch: u64) -> String {
+    format!(
+        "Rate-limited — parked; {}; will auto-resume and re-send the pending message (messages arriving meanwhile queue)",
+        external_agent::limit_reset_phrase(resets_at_epoch, now_epoch)
+    )
+}
+
+/// The queued-while-parked row for a user follow-up held during a park.
+pub(crate) const LIMIT_PARK_QUEUED_MESSAGE_LOG: &str =
+    "Message queued — delivers when the limit resets";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalBackendRecovery {
@@ -1470,5 +1553,40 @@ new file mode 100644
 
         assert!(overrides.is_none(), "fresh startups must stay untouched");
         assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+    }
+
+    #[test]
+    fn limit_park_delay_targets_reset_plus_jitter() {
+        // Reset 2h out, 60s jitter: park exactly until reset + jitter.
+        let delay = limit_park_delay(Some(10_000 + 7_200), 10_000, 1, 60);
+        assert_eq!(delay, Duration::from_secs(7_260));
+        // A reset already in the past parks for just the jitter.
+        let delay = limit_park_delay(Some(9_000), 10_000, 1, 45);
+        assert_eq!(delay, Duration::from_secs(45));
+        // A seven_day-style reset far out is capped to one re-check cycle.
+        let delay = limit_park_delay(Some(10_000 + 3 * 24 * 3600), 10_000, 1, 30);
+        assert_eq!(delay, Duration::from_secs(LIMIT_PARK_MAX_SECS + 30));
+    }
+
+    #[test]
+    fn limit_park_delay_backs_off_exponentially_without_reset_time() {
+        // 5 → 10 → 20 → 30 (capped) minutes; streak is 1-based and a
+        // runaway streak must not overflow the shift.
+        let d = |streak| limit_park_delay(None, 10_000, streak, 60).as_secs();
+        assert_eq!(d(1), 5 * 60);
+        assert_eq!(d(2), 10 * 60);
+        assert_eq!(d(3), 20 * 60);
+        assert_eq!(d(4), 30 * 60);
+        assert_eq!(d(50), 30 * 60);
+        // Streak 0 (defensive) behaves like the first park.
+        assert_eq!(d(0), 5 * 60);
+    }
+
+    #[test]
+    fn limit_park_jitter_stays_in_band() {
+        for _ in 0..32 {
+            let jitter = limit_park_jitter_secs();
+            assert!((LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS).contains(&jitter));
+        }
     }
 }
