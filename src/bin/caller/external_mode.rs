@@ -339,16 +339,12 @@ pub(crate) async fn run_external_agent_mode(
                     // waited. (Steer-id dedup happened when each message
                     // entered the queue — the queue is not a second
                     // delivery path.)
-                    let mut flushed = None;
-                    while let Some(queued) = parked_follow_ups.pop_front() {
-                        if follow_up_message_was_cancelled(&mut cancelled_follow_ups, &queued) {
-                            slog(&session_log, |l| {
-                                l.info("Skipped cancelled queued follow-up")
-                            });
-                            continue;
-                        }
-                        flushed = Some(queued);
-                        break;
+                    let (flushed, skipped) =
+                        next_parked_follow_up(&mut parked_follow_ups, &mut cancelled_follow_ups);
+                    if skipped > 0 {
+                        slog(&session_log, |l| {
+                            l.info(&format!("Skipped {skipped} cancelled queued follow-up(s)"))
+                        });
                     }
                     if let Some(queued) = flushed {
                         break queued;
@@ -1962,7 +1958,9 @@ pub(crate) async fn run_external_agent_mode(
                                 native_message_count: None,
                             });
                         }
-                        DrainOutcome::LimitRejected { resets_at_epoch, .. } => {
+                        DrainOutcome::LimitRejected {
+                            resets_at_epoch, ..
+                        } => {
                             // The in-flight turn ended rejected at the
                             // provider limit; no round to record. The turn
                             // is over, so the user's edit rollback below

@@ -1758,7 +1758,9 @@ pub(crate) async fn run_with_presence(
                                 DrainOutcome::Interrupted { .. } => {
                                     cumulative_stats.rounds = round;
                                 }
-                                DrainOutcome::LimitRejected { resets_at_epoch, .. } => {
+                                DrainOutcome::LimitRejected {
+                                    resets_at_epoch, ..
+                                } => {
                                     // A backend-started round ended
                                     // limit-rejected: nothing to re-send
                                     // and no round to count — log and
@@ -2319,16 +2321,14 @@ pub(crate) async fn run_with_presence(
                 }
                 continue;
             }
-            let mut next_persistent_turn = None;
-            while let Some(parked) = persistent_parked_follow_ups.pop_front() {
-                if follow_up_message_was_cancelled(&mut persistent_cancelled_follow_ups, &parked) {
-                    slog(&session_log, |l| {
-                        l.info("Skipped cancelled queued follow-up")
-                    });
-                    continue;
-                }
-                next_persistent_turn = Some(parked);
-                break;
+            let (mut next_persistent_turn, skipped) = next_parked_follow_up(
+                &mut persistent_parked_follow_ups,
+                &mut persistent_cancelled_follow_ups,
+            );
+            if skipped > 0 {
+                slog(&session_log, |l| {
+                    l.info(&format!("Skipped {skipped} cancelled queued follow-up(s)"))
+                });
             }
             if next_persistent_turn.is_some() {
                 // A real task racing the parked flush keeps FIFO order.

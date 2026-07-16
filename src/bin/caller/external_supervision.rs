@@ -1063,6 +1063,27 @@ pub(crate) fn limit_park_log_line(
 pub(crate) const LIMIT_PARK_QUEUED_MESSAGE_LOG: &str =
     "Message queued — delivers when the limit resets";
 
+/// Pop the next still-deliverable message off a rate-limit park queue,
+/// dropping entries cancelled while they waited. FIFO — the pending
+/// re-send sits at the front, user messages queued during the park
+/// behind it. Returns the message plus how many cancelled entries were
+/// skipped (for the caller's log row). Shared by both lanes so the
+/// resume-flush semantics cannot drift.
+pub(crate) fn next_parked_follow_up(
+    parked: &mut std::collections::VecDeque<FollowUpMessage>,
+    cancelled_follow_ups: &mut HashSet<String>,
+) -> (Option<FollowUpMessage>, usize) {
+    let mut skipped = 0usize;
+    while let Some(queued) = parked.pop_front() {
+        if follow_up_message_was_cancelled(cancelled_follow_ups, &queued) {
+            skipped += 1;
+            continue;
+        }
+        return (Some(queued), skipped);
+    }
+    (None, skipped)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalBackendRecovery {
     pub(crate) message: String,
@@ -1597,5 +1618,38 @@ new file mode 100644
             let jitter = limit_park_jitter_secs();
             assert!((LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS).contains(&jitter));
         }
+    }
+
+    #[test]
+    fn parked_follow_ups_flush_fifo_and_honor_cancels() {
+        let mut parked: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        let mut first = FollowUpMessage::text("re-send".to_string());
+        first.follow_up_id = Some("fu-1".to_string());
+        let mut cancelled_mid_park = FollowUpMessage::text("cancelled".to_string());
+        cancelled_mid_park.follow_up_id = Some("fu-2".to_string());
+        let mut last = FollowUpMessage::text("queued during park".to_string());
+        last.follow_up_id = Some("fu-3".to_string());
+        parked.push_back(first);
+        parked.push_back(cancelled_mid_park);
+        parked.push_back(last);
+
+        // A cancel recorded while the message waited in the park queue.
+        let mut cancelled: HashSet<String> = HashSet::new();
+        cancelled.insert("fu-2".to_string());
+
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert_eq!(popped.unwrap().text, "re-send");
+        assert_eq!(skipped, 0);
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert_eq!(
+            popped.unwrap().text,
+            "queued during park",
+            "cancelled entries are dropped, later ones still deliver in order"
+        );
+        assert_eq!(skipped, 1);
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert!(popped.is_none());
+        assert_eq!(skipped, 0);
     }
 }

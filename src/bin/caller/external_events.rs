@@ -2688,6 +2688,89 @@ mod tests {
         );
     }
 
+    /// A TurnLimitRejected from the adapter maps to the terminal
+    /// LimitRejected outcome — immediately (no post-turn grace) and
+    /// without any backend-error side effects.
+    #[tokio::test]
+    async fn drain_maps_limit_rejection_to_limit_outcome() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("native-thread".to_string()),
+            alias_session_id: None,
+            backend_thread_id: Some("native-thread".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Claude Code".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::TurnLimitRejected {
+                resets_at_epoch: Some(1_783_990_800),
+                message: Some("You've hit your session limit".to_string()),
+            })
+            .unwrap();
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+        match outcome {
+            DrainOutcome::LimitRejected {
+                resets_at_epoch,
+                message,
+            } => {
+                assert_eq!(resets_at_epoch, Some(1_783_990_800));
+                assert!(message.as_deref().is_some_and(|m| m.contains("limit")));
+            }
+            _ => panic!("expected LimitRejected, got a different outcome"),
+        }
+    }
+
     /// Post-upgrade, frontends target the backend-native id; the drain's
     /// launch snapshot only knows the wrapper id. Targeted control events
     /// must be rewritten to the primary — and left alone for foreign
