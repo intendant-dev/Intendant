@@ -192,6 +192,72 @@ impl IntendantServer {
         }
     }
 
+    /// The daemon's Memory service handle, if this server carries one
+    /// (set by the gateway/daemon wiring; `None` on bare stdio servers,
+    /// where memory surfaces answer "unavailable").
+    pub(crate) async fn memory_handle(
+        &self,
+    ) -> Option<std::sync::Arc<crate::memory::MemoryHandle>> {
+        self.state.read().await.memory.clone()
+    }
+
+    async fn memory_search_inner(
+        &self,
+        params: MemorySearchParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(memory) = self.memory_handle().await else {
+            return Err("memory service unavailable on this daemon".to_string());
+        };
+        let args = crate::memory::SearchArgs {
+            query: params.query.unwrap_or_default(),
+            limit: params.limit.unwrap_or(10),
+            include_candidates: params.include_candidates.unwrap_or(false),
+        };
+        Ok(serde_json::json!({
+            "results": memory.search(&args),
+            "durability": "ephemeral",
+        }))
+    }
+
+    async fn memory_read_inner(
+        &self,
+        params: MemoryReadParams,
+    ) -> Result<serde_json::Value, String> {
+        let Some(memory) = self.memory_handle().await else {
+            return Err("memory service unavailable on this daemon".to_string());
+        };
+        match memory.read(&params.id) {
+            Ok(claim) => Ok(serde_json::json!({ "claim": claim })),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    async fn memory_propose_inner(
+        &self,
+        mut args: crate::memory::ProposeArgs,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let Some(memory) = self.memory_handle().await else {
+            return Err("memory service unavailable on this daemon".to_string());
+        };
+        // MCP-lane attribution (best-effort, pre-A2): supervised
+        // sessions call through their injected INTENDANT_MCP_URL,
+        // which binds a session id here — it rides the claim's
+        // provenance unless the caller stated one explicitly. The
+        // principal-bound ActorBinding seam (A2) upgrades this
+        // honestly rather than stamping a fabricated label.
+        if args.session.is_none() {
+            args.session = session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string);
+        }
+        match memory.propose(args) {
+            Ok(claim) => Ok(serde_json::json!({ "claim": claim })),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
     async fn start_task_internal(
         &self,
         task: String,
@@ -456,6 +522,30 @@ impl IntendantServer {
                 Ok(match self.agenda_op_inner(cmd, session_id).await {
                     Ok(value) => text_tool_result(value.to_string()),
                     Err(message) => text_tool_error(format!("agenda_op failed: {message}")),
+                })
+            }
+            "memory_search" => {
+                let Parameters(params) = parse_params::<MemorySearchParams>(args)?;
+                Ok(match self.memory_search_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("memory_search failed: {message}")),
+                })
+            }
+            "memory_read" => {
+                let Parameters(params) = parse_params::<MemoryReadParams>(args)?;
+                Ok(match self.memory_read_inner(params).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("memory_read failed: {message}")),
+                })
+            }
+            "memory_propose" => {
+                // The tool args ARE the propose vocabulary — the same
+                // shape the HTTP body and tunnel params carry.
+                let args: crate::memory::ProposeArgs =
+                    serde_json::from_value(args).map_err(|e| e.to_string())?;
+                Ok(match self.memory_propose_inner(args, session_id).await {
+                    Ok(value) => text_tool_result(value.to_string()),
+                    Err(message) => text_tool_error(format!("memory_propose failed: {message}")),
                 })
             }
             "set_autonomy" => {
