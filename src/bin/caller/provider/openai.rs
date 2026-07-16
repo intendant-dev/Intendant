@@ -148,12 +148,6 @@ pub(crate) struct OpenAIResponsesResponse {
     usage: Option<ResponsesUsage>,
 }
 
-/// Minimal wrapper to capture raw output items as JSON values.
-#[derive(Deserialize)]
-pub(crate) struct OpenAIResponsesRawOutput {
-    output: Option<Vec<serde_json::Value>>,
-}
-
 #[derive(Deserialize)]
 pub(crate) struct ResponsesOutputItem {
     #[serde(rename = "type")]
@@ -353,7 +347,9 @@ impl ChatProvider for OpenAIProvider {
         // Note: OpenAI Responses API uses automatic prompt caching for prompts
         // longer than 1024 tokens. No explicit API changes are needed — caching
         // is applied server-side and reported via usage.prompt_tokens_details.
-        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
+        // Serialize once, straight to bytes — `to_value` + `.json()` walked
+        // the full request (images included) twice per call.
+        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
         let client = &self.client;
         let api_key = &self.api_key;
         let response = send_with_retry(
@@ -362,7 +358,8 @@ impl ChatProvider for OpenAIProvider {
                 client
                     .post("https://api.openai.com/v1/responses")
                     .header("Authorization", format!("Bearer {}", api_key))
-                    .json(&request_json)
+                    .header("content-type", "application/json")
+                    .body(request_body.clone())
             },
             MAX_RETRIES,
         )
@@ -378,12 +375,13 @@ impl ChatProvider for OpenAIProvider {
             )));
         }
 
-        let body = response.text().await?;
-        let resp: OpenAIResponsesResponse = serde_json::from_str(&body)?;
+        // Parse the body once; the typed view and the raw echo-back items
+        // both project from the same DOM (this used to re-tokenize the
+        // full body a second time).
+        let body: serde_json::Value = serde_json::from_str(&response.text().await?)?;
         // Capture raw output items for verbatim echo-back (reasoning + function_call items)
-        let raw_output = serde_json::from_str::<OpenAIResponsesRawOutput>(&body)
-            .ok()
-            .and_then(|r| r.output);
+        let raw_output = body.get("output").and_then(|o| o.as_array()).cloned();
+        let resp: OpenAIResponsesResponse = serde_json::from_value(body)?;
 
         // Extract function_call and computer_call items from the output array
         let mut tool_calls = Vec::new();
@@ -576,17 +574,26 @@ impl ChatProvider for OpenAIProvider {
             tools,
             stream: true,
         };
-        let request_json = serde_json::to_value(&request).map_err(CallerError::Json)?;
+        let request_body = serde_json::to_vec(&request).map_err(CallerError::Json)?;
         let client = &self.client;
         let api_key = &self.api_key;
 
-        let response = client
-            .post("https://api.openai.com/v1/responses")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .timeout(STREAM_TIMEOUT)
-            .json(&request_json)
-            .send()
-            .await?;
+        // Same retry policy as non-streaming: the status is known before any
+        // body bytes stream, so a 429/5xx at request-open retries with
+        // backoff instead of killing the session turn.
+        let response = send_with_retry(
+            client,
+            || {
+                client
+                    .post("https://api.openai.com/v1/responses")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("content-type", "application/json")
+                    .timeout(STREAM_TIMEOUT)
+                    .body(request_body.clone())
+            },
+            MAX_RETRIES,
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
