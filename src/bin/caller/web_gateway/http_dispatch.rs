@@ -193,6 +193,13 @@ pub(crate) async fn serve_http_request(
             table_posture,
             Some(crate::gateway_routes::CorsPosture::FleetAllowlist)
         ) || (table_posture.is_none() && is_fleet_cors_access_path(opt_path));
+        // The session-data rows: same strict echo shape as the fleet
+        // branch, over the fleet-or-loopback allow set (never the
+        // legacy wildcard fallback below).
+        let fleet_or_loopback_scoped = matches!(
+            table_posture,
+            Some(crate::gateway_routes::CorsPosture::FleetOrLoopback)
+        );
         let response = if own_origin_scoped {
             // Own-origin APIs (and /mcp) are same-origin (or
             // app-scheme) only; a cross-origin preflight gets
@@ -217,16 +224,27 @@ pub(crate) async fn serve_http_request(
                     .header("Vary", "Origin")
                     .header("Connection", "close"),
             }
-        } else if fleet_scoped {
+        } else if fleet_scoped || fleet_or_loopback_scoped {
             let methods = table_methods.as_deref().unwrap_or("GET, POST, OPTIONS");
             let allowed = extract_origin_header(header_text).filter(|origin| {
-                fleet_access_origin_allowed(
-                    origin,
-                    is_tls,
-                    header_text,
-                    peer_registry.as_ref(),
-                    &cert_dir,
-                )
+                if fleet_or_loopback_scoped {
+                    session_data_origin_allowed(
+                        origin,
+                        peer_addr,
+                        is_tls,
+                        header_text,
+                        peer_registry.as_ref(),
+                        &cert_dir,
+                    )
+                } else {
+                    fleet_access_origin_allowed(
+                        origin,
+                        is_tls,
+                        header_text,
+                        peer_registry.as_ref(),
+                        &cert_dir,
+                    )
+                }
             });
             match allowed {
                 Some(origin) => HttpResponse::new("204 No Content")
@@ -308,29 +326,31 @@ pub(crate) async fn serve_http_request(
         .as_deref()
         .filter(|_| !authority_free_request)
     {
-        let own = is_own_or_app_origin(origin, is_tls, header_text);
-        let fleet_allowed = !own
-            && (is_fleet_cors_access_path(req_path) || req_path == "/config")
-            && fleet_access_origin_allowed(
-                origin,
-                is_tls,
-                header_text,
-                peer_registry.as_ref(),
-                &cert_dir,
-            );
-        if fleet_allowed {
-            fleet_cors_origin = Some(origin.to_string());
-        } else if !own {
-            use tokio::io::AsyncWriteExt;
-            let body = serde_json::json!({
-                "error": "cross-origin caller is not allowed on this API",
-                "origin": origin,
-            })
-            .to_string();
-            let response = json_response("403 Forbidden", body);
-            let _ = stream.write_all(response.as_bytes()).await;
-            finalize_http_stream(&mut stream).await;
-            return;
+        match cross_origin_request_decision(
+            origin,
+            req_path,
+            peer_addr,
+            is_tls,
+            header_text,
+            peer_registry.as_ref(),
+            &cert_dir,
+        ) {
+            CrossOriginDecision::OwnOrigin => {}
+            CrossOriginDecision::EchoOrigin(allowed) => {
+                fleet_cors_origin = Some(allowed);
+            }
+            CrossOriginDecision::Refuse => {
+                use tokio::io::AsyncWriteExt;
+                let body = serde_json::json!({
+                    "error": "cross-origin caller is not allowed on this API",
+                    "origin": origin,
+                })
+                .to_string();
+                let response = json_response("403 Forbidden", body);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
         }
     } else if !authority_free_request
         && matches!(
@@ -549,9 +569,10 @@ pub(crate) async fn serve_http_request(
                         let base = HttpResponse::json(status_reason(status), body);
                         let response = match crate::gateway_routes::preflight_posture(req_path) {
                             Some(crate::gateway_routes::CorsPosture::Public) => base.public_cors(),
-                            Some(crate::gateway_routes::CorsPosture::FleetAllowlist) => {
-                                base.fleet_cors(fleet_cors_origin.as_deref())
-                            }
+                            Some(
+                                crate::gateway_routes::CorsPosture::FleetAllowlist
+                                | crate::gateway_routes::CorsPosture::FleetOrLoopback,
+                            ) => base.fleet_cors(fleet_cors_origin.as_deref()),
                             _ => base,
                         };
                         let _ = stream.write_all(&response.into_bytes()).await;
@@ -1926,16 +1947,21 @@ pub(crate) fn api_response_http_bytes(
 }
 
 /// The row-declared CORS posture, applied to a rendered response — one
-/// place for both the buffered renderer and the Stream-lane head.
+/// place for both the buffered renderer and the Stream-lane head. The
+/// posture column is authoritative: an own-origin row strips any
+/// `Access-Control-Allow-Origin` a legacy response shape still bakes
+/// in, so cross-origin readability can only ever come from the row's
+/// declaration, never from a handler's header vec.
 fn apply_cors_posture(
     http: HttpResponse,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) -> HttpResponse {
     match cors {
-        crate::gateway_routes::CorsPosture::OwnOrigin => http,
+        crate::gateway_routes::CorsPosture::OwnOrigin => http.own_origin_cors(),
         crate::gateway_routes::CorsPosture::Public => http.public_cors(),
-        crate::gateway_routes::CorsPosture::FleetAllowlist => http.fleet_cors(fleet_origin),
+        crate::gateway_routes::CorsPosture::FleetAllowlist
+        | crate::gateway_routes::CorsPosture::FleetOrLoopback => http.fleet_cors(fleet_origin),
     }
 }
 
@@ -2103,6 +2129,58 @@ mod tests {
     }
 
     #[test]
+    fn api_render_fleet_or_loopback_posture_echoes_and_omits_like_fleet() {
+        // The session-data posture shares the fleet renderer: echo a
+        // dispatch-validated origin exactly (never a wildcard) …
+        let rendered = api_response_http_bytes(
+            ApiResponse::json(200, JsonBody::PreSerialized("[]".to_string())),
+            CorsPosture::FleetOrLoopback,
+            Some("http://127.0.0.1:9321"),
+        );
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(
+            text.contains("Access-Control-Allow-Origin: http://127.0.0.1:9321\r\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Access-Control-Allow-Origin: *"), "{text}");
+        assert!(text.contains("Vary: Origin\r\n"), "{text}");
+
+        // … and omit the header entirely when dispatch validated none.
+        let rendered = api_response_http_bytes(
+            ApiResponse::json(200, JsonBody::PreSerialized("[]".to_string())),
+            CorsPosture::FleetOrLoopback,
+            None,
+        );
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
+        assert!(text.contains("Vary: Origin\r\n"), "{text}");
+    }
+
+    #[test]
+    fn api_render_own_origin_posture_strips_any_baked_acao() {
+        // The posture column is authoritative: a legacy response shape
+        // that still bakes a wildcard (or any) ACAO into its header vec
+        // must not leak it through an own-origin row.
+        let rendered = api_response_http_bytes(
+            ApiResponse::Json {
+                status: 200,
+                body: JsonBody::PreSerialized(r#"{"ok":true}"#.to_string()),
+                headers: vec![
+                    ("Cache-Control", "no-cache".to_string()),
+                    ("Access-Control-Allow-Origin", "*".to_string()),
+                    ("Connection", "close".to_string()),
+                ],
+            },
+            CorsPosture::OwnOrigin,
+            None,
+        );
+        let text = String::from_utf8(rendered).unwrap();
+        assert!(!text.contains("Access-Control-Allow-Origin"), "{text}");
+        assert!(text.contains("Cache-Control: no-cache\r\n"), "{text}");
+        assert!(text.contains("Connection: close\r\n"), "{text}");
+    }
+
+    #[test]
     fn ephemeral_session_token_response_is_never_stored() {
         for result in [
             Ok(r#"{"client_secret":{"value":"live-token"}}"#.to_string()),
@@ -2123,16 +2201,18 @@ mod tests {
     // Captured from the hand-rolled `handle_sessions_stream` header
     // block before the Stream-lane conversion: no Content-Length, no
     // Transfer-Encoding — the response is EOF-delimited
-    // (`Connection: close`), with the wildcard-CORS tail the sessions
-    // family bakes into its responses (the row's posture is OwnOrigin;
-    // the header is response decoration, exactly like `/api/sessions`).
+    // (`Connection: close`). The head's historical baked wildcard ACAO
+    // is retired: the row's fleet-or-loopback posture appends
+    // `Vary: Origin` and echoes only a dispatch-validated origin,
+    // exactly like `/api/sessions`.
 
-    /// The historical head, byte for byte.
+    /// The posture-rendered head with no validated cross-origin caller,
+    /// byte for byte.
     pub(super) const SESSIONS_STREAM_HEAD_GOLDEN: &str = "HTTP/1.1 200 OK\r\n\
          Content-Type: application/x-ndjson\r\n\
          Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
+         Vary: Origin\r\n\
          \r\n";
 
     #[tokio::test]

@@ -1803,6 +1803,107 @@ pub(crate) fn fleet_access_origin_allowed(
     false
 }
 
+/// Whether `origin` is a loopback-host page origin: an `http`/`https`
+/// page served from `localhost`, `127.0.0.0/8`, or `[::1]` on any port.
+/// Only real page-origin schemes qualify; `null`, custom schemes, and
+/// anything unparseable are refused (fail closed). A page can only carry
+/// such an origin if something on the browser's own machine served it —
+/// remote DNS names never produce a loopback `Origin` value.
+pub(crate) fn origin_is_loopback_host(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => {
+            host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        }
+        Some(url::Host::Ipv4(ip)) => client_ip_is_loopback(ip.into()),
+        Some(url::Host::Ipv6(ip)) => client_ip_is_loopback(ip.into()),
+        None => false,
+    }
+}
+
+/// Decide whether a cross-origin caller may read the session-data lanes
+/// ([`crate::gateway_routes::CorsPosture::FleetOrLoopback`]): the fleet
+/// origin allowlist (the cross-daemon Stats lane), plus same-machine
+/// loopback pages — a sibling daemon's dashboard on another loopback
+/// port fetching this daemon for the Stats tab. The loopback half
+/// requires the connection itself to arrive over loopback with no
+/// reverse-proxy provenance, so a remote browser (whose loopback pages
+/// belong to a *different* machine) never qualifies. Like the fleet
+/// gate, this only decides which pages may read; authentication stays
+/// with mTLS/IAM.
+pub(crate) fn session_data_origin_allowed(
+    origin: &str,
+    peer_addr: std::net::SocketAddr,
+    is_tls: bool,
+    header_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+    cert_dir: &std::path::Path,
+) -> bool {
+    let same_machine_loopback = client_ip_is_loopback(peer_addr.ip())
+        && !has_reverse_proxy_provenance(header_text)
+        && origin_is_loopback_host(origin);
+    same_machine_loopback
+        || fleet_access_origin_allowed(origin, is_tls, header_text, peer_registry, cert_dir)
+}
+
+/// The pre-dispatch verdict on a request that carries an `Origin`
+/// header (the browser-origin gate in `serve_http_request`): foreign
+/// origins are refused unless the path's declared CORS posture admits
+/// them, and an admitted foreign origin is echoed back exactly (with
+/// `Vary: Origin`) by the response renderer. Extracted so the gate's
+/// admission logic is unit-testable; behavior is the gate's historical
+/// ladder plus the [`session_data_origin_allowed`] lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CrossOriginDecision {
+    /// The daemon's own origin or the packaged-app scheme: proceed, no
+    /// echo needed.
+    OwnOrigin,
+    /// A foreign origin this path's posture admits: echo it exactly.
+    EchoOrigin(String),
+    /// A foreign origin with no business on this path: refuse before
+    /// any transport authority is consulted.
+    Refuse,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cross_origin_request_decision(
+    origin: &str,
+    req_path: &str,
+    peer_addr: std::net::SocketAddr,
+    is_tls: bool,
+    header_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+    cert_dir: &std::path::Path,
+) -> CrossOriginDecision {
+    if is_own_or_app_origin(origin, is_tls, header_text) {
+        return CrossOriginDecision::OwnOrigin;
+    }
+    if (is_fleet_cors_access_path(req_path) || req_path == "/config")
+        && fleet_access_origin_allowed(origin, is_tls, header_text, peer_registry, cert_dir)
+    {
+        return CrossOriginDecision::EchoOrigin(origin.to_string());
+    }
+    if matches!(
+        crate::gateway_routes::preflight_posture(req_path),
+        Some(crate::gateway_routes::CorsPosture::FleetOrLoopback)
+    ) && session_data_origin_allowed(
+        origin,
+        peer_addr,
+        is_tls,
+        header_text,
+        peer_registry,
+        cert_dir,
+    ) {
+        return CrossOriginDecision::EchoOrigin(origin.to_string());
+    }
+    CrossOriginDecision::Refuse
+}
+
 /// One approved peer identity's contribution to the fleet-CORS origin
 /// allowlist: its card URL's normalized origin, plus the expiry the
 /// per-request check still evaluates against "now".
@@ -3175,6 +3276,167 @@ mod tests {
             .expect("identity record on disk (pins the mirrored dir name)");
         std::fs::remove_file(record.path()).unwrap();
         assert!(!allowed(cert_dir.path()));
+    }
+
+    #[test]
+    fn loopback_origin_predicate_is_strict() {
+        // Loopback page origins, any port and either scheme.
+        assert!(origin_is_loopback_host("http://127.0.0.1:9321"));
+        assert!(origin_is_loopback_host("http://127.5.0.1:80"));
+        assert!(origin_is_loopback_host("https://localhost:8766"));
+        assert!(origin_is_loopback_host("http://LOCALHOST"));
+        assert!(origin_is_loopback_host("http://[::1]:8765"));
+        // Everything else fails closed: foreign hosts, localhost
+        // subdomains, non-page schemes, null, and garbage.
+        assert!(!origin_is_loopback_host("https://evil.example"));
+        assert!(!origin_is_loopback_host("http://foo.localhost:3000"));
+        assert!(!origin_is_loopback_host("http://127.0.0.1.evil.example"));
+        assert!(!origin_is_loopback_host("intendant://bundle"));
+        assert!(!origin_is_loopback_host("file:///tmp/page.html"));
+        assert!(!origin_is_loopback_host("null"));
+        assert!(!origin_is_loopback_host(""));
+        assert!(!origin_is_loopback_host("http://192.0.2.1:8080"));
+    }
+
+    #[test]
+    fn session_data_origin_gate_admits_fleet_and_same_machine_loopback() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let headers = "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n";
+        let loopback_conn: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mapped_loopback_conn: std::net::SocketAddr =
+            "[::ffff:127.0.0.1]:54321".parse().unwrap();
+        let remote_conn: std::net::SocketAddr = "192.0.2.9:44444".parse().unwrap();
+
+        // A sibling daemon's dashboard on another loopback port, fetching
+        // over a loopback connection: allowed (the multi-instance Stats
+        // topology), including the dual-stack mapped-address form.
+        for conn in [loopback_conn, mapped_loopback_conn] {
+            assert!(session_data_origin_allowed(
+                "http://127.0.0.1:9321",
+                conn,
+                false,
+                headers,
+                None,
+                cert_dir.path(),
+            ));
+        }
+        assert!(session_data_origin_allowed(
+            "https://localhost:8766",
+            loopback_conn,
+            false,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+
+        // The same loopback origin presented over a REMOTE connection
+        // belongs to a different machine's loopback: refused.
+        assert!(!session_data_origin_allowed(
+            "http://127.0.0.1:9321",
+            remote_conn,
+            false,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+
+        // Reverse-proxy provenance breaks the same-machine inference:
+        // refused even on a loopback connection.
+        let proxied =
+            "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nX-Forwarded-For: 192.0.2.9\r\n";
+        assert!(!session_data_origin_allowed(
+            "http://127.0.0.1:9321",
+            loopback_conn,
+            false,
+            proxied,
+            None,
+            cert_dir.path(),
+        ));
+
+        // Arbitrary web origins stay refused on an empty allowlist …
+        assert!(!session_data_origin_allowed(
+            "https://evil.example",
+            loopback_conn,
+            false,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+
+        // … while an approved fleet identity origin is admitted through
+        // the fleet half, connection locality notwithstanding.
+        let fp = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            fp,
+            "peer-e",
+            "peer-operator",
+            Some("https://peer-box.local:9900/.well-known/agent-card.json"),
+            Some("req-e"),
+        )
+        .unwrap();
+        assert!(session_data_origin_allowed(
+            "https://peer-box.local:9900",
+            remote_conn,
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+    }
+
+    #[test]
+    fn cross_origin_request_decision_covers_the_gate_ladder() {
+        let cert_dir = tempfile::tempdir().unwrap();
+        let headers = "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n";
+        let loopback_conn: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let decide = |origin: &str, path: &str| {
+            cross_origin_request_decision(
+                origin,
+                path,
+                loopback_conn,
+                false,
+                headers,
+                None,
+                cert_dir.path(),
+            )
+        };
+
+        // The request's own origin (Origin == scheme://Host).
+        assert_eq!(
+            decide("http://127.0.0.1:8765", "/api/sessions"),
+            CrossOriginDecision::OwnOrigin
+        );
+        // Sibling loopback dashboards are echoed on the session-data
+        // rows only; the own-origin default refuses them everywhere
+        // else, exactly as before.
+        assert_eq!(
+            decide("http://127.0.0.1:9321", "/api/sessions"),
+            CrossOriginDecision::EchoOrigin("http://127.0.0.1:9321".to_string())
+        );
+        assert_eq!(
+            decide("http://127.0.0.1:9321", "/api/sessions/stream"),
+            CrossOriginDecision::EchoOrigin("http://127.0.0.1:9321".to_string())
+        );
+        for own_origin_path in [
+            "/api/sessions/search",
+            "/api/settings",
+            "/api/fs/read",
+            "/api/session/current/changes",
+        ] {
+            assert_eq!(
+                decide("http://127.0.0.1:9321", own_origin_path),
+                CrossOriginDecision::Refuse,
+                "{own_origin_path}"
+            );
+        }
+        // Arbitrary web origins are refused everywhere, including the
+        // session-data rows.
+        assert_eq!(
+            decide("https://evil.example", "/api/sessions"),
+            CrossOriginDecision::Refuse
+        );
+        assert_eq!(decide("null", "/api/sessions"), CrossOriginDecision::Refuse);
     }
 
     #[test]

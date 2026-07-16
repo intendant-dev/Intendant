@@ -212,7 +212,7 @@ pub(crate) fn current_upload_delete_response_body(
 /// body into the [`SpooledBody`] handle; tunnel twin
 /// `api_session_current_upload`'s upload_end leg): the shared
 /// (status, body) commit core — session-dir resolution, store commit,
-/// `UploadReady` broadcast — under the wildcard-CORS tail.
+/// `UploadReady` broadcast — under the session json tail.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn current_upload_commit_api_response(
     state_root: &std::path::Path,
@@ -236,24 +236,24 @@ pub(crate) fn current_upload_commit_api_response(
         body,
         bus,
     );
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 /// Transport-neutral core of the staged-uploads list (`GET
 /// /api/session/current/uploads`; tunnel twin
 /// `api_session_current_uploads`): the store listing under the
-/// wildcard-CORS tail. The session dir arrives lane-resolved.
+/// session json tail. The session dir arrives lane-resolved.
 pub(crate) fn current_uploads_list_api_response(
     session_dir: &std::path::Path,
     scope: &crate::global_store::StoreScope,
 ) -> ApiResponse {
     let uploads = crate::upload_store::list_uploads(session_dir, scope);
     let body = serde_json::to_string(&uploads).unwrap_or_else(|_| "[]".to_string());
-    session_wildcard_json_response(200, body)
+    session_json_response(200, body)
 }
 
 /// Content-core error of the staged-upload raw read. Each lane frames it
-/// in its historical shape — HTTP as wildcard `{"error":…}` bodies, the
+/// in its historical shape — HTTP as bare `{"error":…}` bodies, the
 /// tunnel as `{"ok":false,"error":…}` objects under the injected-status
 /// envelope (with `total_size` riding the 416 as a body sidecar) — so
 /// the framing difference stays deliberate and enumerated instead of
@@ -383,7 +383,6 @@ pub(crate) fn current_upload_raw_api_response(
             ),
             ("X-Content-Type-Options", "nosniff".to_string()),
             ("Cache-Control", "no-cache".to_string()),
-            ("Access-Control-Allow-Origin", "*".to_string()),
             ("Connection", "close".to_string()),
         ],
         bytes: BytesPayload::InMemory(bytes),
@@ -2158,7 +2157,6 @@ pub(crate) fn upload_error_response(status: &str, message: &str) -> String {
     let body = serde_json::json!({"error": message}).to_string();
     HttpResponse::with_content(status, "application/json", body)
         .header("Cache-Control", "no-cache")
-        .header("Access-Control-Allow-Origin", "*")
         .header("Connection", "close")
         .into_string()
 }
@@ -2359,7 +2357,6 @@ pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
                 ),
             ));
             headers.push(("Cache-Control", "no-cache".to_string()));
-            headers.push(("Access-Control-Allow-Origin", "*".to_string()));
             headers.push((
                 "Access-Control-Expose-Headers",
                 "X-Content-Sha256".to_string(),
@@ -2383,7 +2380,6 @@ pub(crate) fn fs_read_api_response(request: &ApiRequest) -> ApiResponse {
                         ("Content-Range", format!("bytes */{total_size}")),
                         ("Accept-Ranges", "bytes".to_string()),
                         ("Cache-Control", "no-cache".to_string()),
-                        ("Access-Control-Allow-Origin", "*".to_string()),
                         ("Connection", "close".to_string()),
                     ],
                 }
@@ -2786,7 +2782,7 @@ pub(crate) async fn handle_current_uploads_post_in_state_root(
         match stream_body_to_tempfile(header_text, &discard, &mut stream, UPLOAD_MAX_BYTES).await {
             Err(e) => {
                 let status = if e.contains("too large") { 413 } else { 400 };
-                session_wildcard_json_error(status, &e)
+                session_json_error(status, &e)
             }
             Ok(body) => current_upload_commit_api_response(
                 state_root,
@@ -2824,7 +2820,7 @@ pub(crate) async fn handle_current_uploads_get(
     let session_dir = match session_dir {
         Ok(dir) => dir,
         Err(error) => {
-            let response = session_wildcard_json_error(500, error);
+            let response = session_json_error(500, error);
             return write_api_response(stream, response, cors, fleet_origin).await;
         }
     };
@@ -2840,10 +2836,10 @@ pub(crate) async fn handle_current_uploads_get(
         // GET raw bytes for one upload (the HTTP form: one full read).
         match current_upload_raw_api_response(id, None, &session_dir, &scope) {
             Ok(response) => response,
-            Err(err) => session_wildcard_json_error(err.status(), &err.message()),
+            Err(err) => session_json_error(err.status(), &err.message()),
         }
     } else {
-        session_wildcard_json_error(404, "unknown upload route")
+        session_json_error(404, "unknown upload route")
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
@@ -3699,7 +3695,7 @@ mod tests {
         })
         .await;
         let mut expected = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nX-Content-Sha256: {}\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n",
             GOLDEN_READ_CONTENT.len(),
             fs_sha256_hex(GOLDEN_READ_CONTENT),
         )
@@ -3724,7 +3720,7 @@ mod tests {
         })
         .await;
         // A partial read carries Content-Range instead of the sha header.
-        let mut expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n"
+        let mut expected = "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 7-16/26\r\nContent-Disposition: attachment; filename=\"golden.txt\"\r\nCache-Control: no-cache\r\nAccess-Control-Expose-Headers: X-Content-Sha256\r\nConnection: close\r\n\r\n"
             .to_string()
             .into_bytes();
         expected.extend_from_slice(&GOLDEN_READ_CONTENT[7..17]);
@@ -3748,7 +3744,7 @@ mod tests {
         .await;
         let body = r#"{"error":"range is not satisfiable"}"#;
         let expected = format!(
-            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nContent-Range: bytes */26\r\nAccept-Ranges: bytes\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         assert_eq!(transcript(&response), expected);
@@ -4241,7 +4237,7 @@ mod tests {
     }
 
     fn upload_golden_tail() -> &'static str {
-        "Cache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        "Cache-Control: no-cache\r\nConnection: close\r\n\r\n"
     }
 
     /// POST success over a project-rooted store: framing pinned exactly

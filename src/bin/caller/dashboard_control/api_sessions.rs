@@ -2944,15 +2944,21 @@ mod tests {
         assert_eq!(events[5].to_string(), r#"{"type":"done"}"#);
 
         // HTTP lane: the real writer over an in-memory stream — the
-        // pinned head, then the captured lines byte for byte.
+        // pinned head (rendered under the row's declared posture, with
+        // no validated cross-origin caller), then the captured lines
+        // byte for byte.
         let response = crate::web_gateway::sessions_stream_api_response_from(replay_line_stream(
             lines.clone(),
         ));
+        let row_cors = crate::gateway_routes::match_route("GET", "/api/sessions/stream")
+            .expect("sessions stream route declared")
+            .0
+            .cors;
         let (mut client, server) = tokio::io::duplex(1 << 20);
         crate::web_gateway::write_api_response(
             crate::web_gateway::DemuxStream::new(Box::pin(server)),
             response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
+            row_cors,
             None,
         )
         .await;
@@ -2968,8 +2974,8 @@ mod tests {
             "HTTP/1.1 200 OK\r\n\
              Content-Type: application/x-ndjson\r\n\
              Cache-Control: no-cache\r\n\
-             Access-Control-Allow-Origin: *\r\n\
              Connection: close\r\n\
+             Vary: Origin\r\n\
              \r\n"
         );
         assert_eq!(&text[head_end..], lines.concat());

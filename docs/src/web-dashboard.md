@@ -1582,7 +1582,13 @@ listener classifies fleet SNI first and rejects all non-public HTTP/MCP,
 signaling, and WebSocket traffic before route CORS, browser mTLS, or IAM is
 resolved. The fleet certificate endpoint itself can therefore be requested
 only from a trusted direct surface; the resulting name is discovery/public
-shell only.
+shell only. `fleet or loopback` (the session-list rows the multi-daemon Stats
+tab reads) is the same allowlist echo plus loopback-host page origins on
+connections that themselves arrive over loopback — a sibling daemon's
+dashboard on another port of the same machine; these rows historically
+answered with a wildcard `Access-Control-Allow-Origin`, which is retired —
+an admitted origin is echoed exactly (with `Vary: Origin`) and every other
+response omits the header.
 
 <!-- gateway-route-table:begin (generated; do not edit by hand) -->
 | Method | Path | Authorization | CORS | Body | Description |
@@ -1641,10 +1647,10 @@ shell only.
 | POST | `/api/worktrees/merge` | SessionManage | own origin | bounded | Merge a session's linked worktree branch into its base checkout, then remove the checkout |
 | POST | `/api/worktrees/scan` | SessionManage | own origin | none | Rescan the worktree inventory (refreshes the cache) |
 | GET | `/api/worktrees` | SessionInspect | own origin | none | Cached worktree inventory |
-| GET | `/api/sessions/stream` | SessionInspect | own origin | none | NDJSON stream of the session list |
+| GET | `/api/sessions/stream` | SessionInspect | fleet or loopback | none | NDJSON stream of the session list |
 | GET | `/api/sessions/search` | SessionInspect | own origin | none | Search sessions (q, source, mode, project filters) |
 | GET | `/api/sessions/message-search` | SessionInspect | own origin | none | Message-lane search over the shard index (q, source, superseded, subagents, cursor) |
-| GET | `/api/sessions` | SessionInspect | own origin | none | List sessions (id filter, limit, usage view; response CORS * for the fleet Stats tab) |
+| GET | `/api/sessions` | SessionInspect | fleet or loopback | none | List sessions (id filter, limit, usage view; fleet/loopback CORS echo for the multi-daemon Stats tab) |
 | GET | `/api/project-root` | Settings | own origin | none | Project root path this daemon serves |
 | POST | `/api/settings` | Settings | own origin | bounded | Update runtime settings |
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
