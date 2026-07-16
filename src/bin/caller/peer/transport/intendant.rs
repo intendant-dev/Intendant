@@ -184,6 +184,13 @@ pub struct TransportCredentials {
     /// can satisfy the same mTLS gate as browsers without a dashboard-only
     /// bearer token.
     pub client_identity: Option<ClientIdentityPaths>,
+    /// Lazily built TLS material (rustls config + pooled HTTP client) for
+    /// the fields above, shared across clones — the card fetch, the WS
+    /// connect, and `/mcp` side-channel calls reuse it instead of
+    /// re-reading PEMs and the native root store per attempt. Freshness is
+    /// stat-checked, so certificate rotation still applies on the next
+    /// use. See [`super::tls_client::TlsClientCache`].
+    pub tls: super::tls_client::TlsClientCache,
 }
 
 impl IntendantWsTransport {
@@ -227,6 +234,7 @@ impl IntendantWsTransport {
                 bearer_token,
                 pinned_fingerprints: Vec::new(),
                 client_identity: None,
+                tls: Default::default(),
             },
         )
     }
@@ -275,14 +283,14 @@ impl IntendantWsTransport {
         let http_base = super::ws_url_to_http_base(&ws_url);
         let card_url = format!("{http_base}/.well-known/agent-card.json");
 
-        let client = super::tls_client::reqwest_client(
-            CARD_FETCH_TIMEOUT,
+        let client = self.creds.tls.http_client(
             &self.creds.pinned_fingerprints,
             self.creds.client_identity.as_ref(),
         )?;
 
         let mut request = client
             .get(&card_url)
+            .timeout(CARD_FETCH_TIMEOUT)
             .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE);
         if let Some(token) = &self.creds.bearer_token {
             request = request.bearer_auth(token);
@@ -353,11 +361,14 @@ impl IntendantWsTransport {
                 .expect("static header value"),
         );
 
-        let connector: Option<Connector> = super::tls_client::rustls_client_config(
-            &self.creds.pinned_fingerprints,
-            self.creds.client_identity.as_ref(),
-        )?
-        .map(|config| Connector::Rustls(std::sync::Arc::new(config)));
+        let connector: Option<Connector> = self
+            .creds
+            .tls
+            .client_config(
+                &self.creds.pinned_fingerprints,
+                self.creds.client_identity.as_ref(),
+            )?
+            .map(Connector::Rustls);
 
         let (ws_stream, _response) =
             tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
@@ -433,15 +444,21 @@ async fn drain_ws(
                 // upcaster so folded session snapshots can stamp
                 // `is_primary` (renderers merge that session into the peer
                 // node instead of drawing it twice).
+                //
+                // The `contains` checks are cheap prefilters only; a frame
+                // is swallowed as a bootstrap frame ONLY when its parsed
+                // top-level `t` actually matches. (An earlier unconditional
+                // `continue` here silently dropped any OutboundEvent whose
+                // nested payload happened to contain these literals.)
                 if text.contains("\"t\":\"state_snapshot\"") {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
                         if value["t"] == "state_snapshot" {
                             if let Some(sid) = value["session_id"].as_str() {
                                 upcaster.set_primary_session_id(sid);
                             }
+                            continue;
                         }
                     }
-                    continue;
                 }
                 // The bootstrap `log_replay` frame carries the peer's recent
                 // outbound history. Fold its session-state effects through
@@ -467,9 +484,9 @@ async fn drain_ws(
                                     }
                                 }
                             }
+                            continue;
                         }
                     }
-                    continue;
                 }
                 // Forward-compat via OutboundEvent::Unknown: unknown
                 // event variants deserialize silently and the upcaster

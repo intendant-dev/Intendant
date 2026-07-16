@@ -440,7 +440,24 @@ pub(crate) async fn api_transfer_upload_chunk_task_response(
         };
     }
     let scope = transfer_store_scope(&runtime);
-    let (params, body) = upload.into_spooled_body();
+    let (params, body) = match upload.into_spooled_body() {
+        Ok(spooled) => spooled,
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: frame_api_response(
+                    id,
+                    crate::web_gateway::transfer_error_api_response(
+                        500,
+                        format!("spool upload chunk: {e}"),
+                    ),
+                    "transfer upload chunk",
+                ),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
     let frame = frame_api_response(
         id.clone(),
         crate::web_gateway::transfer_upload_chunk_api_response(scope, &params, body).await,
@@ -634,8 +651,18 @@ pub(crate) async fn api_fs_write_upload_task_response(
     // Drain the upload spool off the async runtime — the content
     // carriage is transport-owned (the tunnel's upload lane vs HTTP's
     // JSON content fields); the apply leg is the shared neutral seam.
+    // Memory spools (≤1 MiB — the typical dashboard file save) move out
+    // with zero disk I/O; disk spools read back as before.
     let read_result = tokio::task::spawn_blocking(move || {
-        std::fs::read(upload.tmp.path()).map(|bytes| (upload.params, bytes))
+        let InboundUploadState {
+            params,
+            mut spool,
+            received_bytes,
+            ..
+        } = upload;
+        spool
+            .take_bytes(received_bytes)
+            .map(|bytes| (params, bytes))
     })
     .await;
     let frame = match read_result {

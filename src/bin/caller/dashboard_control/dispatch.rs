@@ -72,6 +72,26 @@ pub(crate) fn frame_api_json_body_response(
     }
 }
 
+/// `frame_api_json_body_response`, pre-serialized (see
+/// `json_body_response_preserialized`): the JSON arm splices the core's
+/// already-serialized body into a complete envelope string instead of
+/// parse→wrap→re-serialize — for the multi-MB session list/detail/search
+/// family, that re-parse was measurably hot on every poll. Only legal on
+/// the spawned task-response lane, where `send_control_task_response`
+/// recognizes the `Value::String` carrier.
+pub(crate) fn frame_api_json_body_response_preserialized(
+    id: String,
+    response: crate::web_gateway::ApiResponse,
+    label: &str,
+) -> serde_json::Value {
+    match response {
+        crate::web_gateway::ApiResponse::Json { body, .. } => {
+            json_body_response_preserialized(&id, body.into_string(), label)
+        }
+        other => frame_api_json_body_response(id, other, label),
+    }
+}
+
 /// Tunnel adapter for the access family's historical ok/error envelope:
 /// a 2xx JSON body renders as `{t:"response", id, ok:true,
 /// result:<body>}` — the body-only shape, no `_httpStatus` metadata
@@ -191,11 +211,12 @@ pub(crate) fn frame_api_task_response(
 pub(crate) fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,
-    task_tx: &mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: &mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
     display_input_tx: &DisplayInputForwarder,
 ) -> Option<serde_json::Value> {
@@ -246,7 +267,7 @@ pub(crate) fn control_frame_response(
             None
         }
         "terminal_open" => {
-            control_terminal_open_frame(parsed, runtime, terminal_events_tx, terminal_forwarders)
+            control_terminal_open_frame(parsed, runtime, terminal_output_tx, terminal_forwarders)
         }
         "terminal_input" => control_terminal_input_frame(parsed, runtime),
         "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
@@ -270,6 +291,21 @@ pub(crate) fn control_frame_response(
             inbound_uploads,
         ),
         "request" => {
+            // Root rejection of empty/absent ids, BEFORE any spawn: a
+            // request without an id cannot receive a correlated response,
+            // so it has no legitimate use on this lane (the dashboard
+            // client always mints `dc-<ts>-<seq>` ids) — while an
+            // empty-id response would bypass the outbound queue (it is
+            // unaddressable) and response chunking, direct-sending
+            // successful payloads even on a congested wire. The rejection
+            // itself is an ok:false frame, budgeted at the error-class
+            // seam like every other cheap-to-mint refusal.
+            if id.is_empty() {
+                return Some(dashboard_control_error_response(
+                    id,
+                    "request frames require a non-empty id",
+                ));
+            }
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = parsed.get("params").cloned();
             if let Err(error) = authorize_dashboard_control_method(runtime, method, params.as_ref())
@@ -878,13 +914,13 @@ pub(crate) fn control_frame_response(
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": runtime.config,
+                    "result": &*runtime.config,
                 })),
                 "api_agent_card" => Some(serde_json::json!({
                     "t": "response",
                     "id": id,
                     "ok": true,
-                    "result": runtime.agent_card,
+                    "result": &*runtime.agent_card,
                 })),
                 "api_cached_bootstrap_events" => Some(cached_bootstrap_events_response_frame(
                     id,
@@ -892,6 +928,12 @@ pub(crate) fn control_frame_response(
                     &runtime.grant,
                 )),
                 "api_sessions_stream" => {
+                    if pending_requests_at_capacity(pending_requests) {
+                        return Some(dashboard_control_error_response(
+                            id,
+                            "too many in-flight requests on this connection",
+                        ));
+                    }
                     spawn_control_stream(
                         id,
                         method.to_string(),
@@ -914,6 +956,18 @@ pub(crate) fn control_frame_response(
                 // with the same `unknown method` shape this match used to
                 // return inline.
                 _ => {
+                    // Reservation at spawn time: each spawned handler may
+                    // construct a response as large as the fs-read cap
+                    // before queue admission runs, so unbounded spawns
+                    // could build N full payloads the queue would then
+                    // refuse. Same-id replacement stays allowed (it
+                    // cancels its predecessor).
+                    if pending_requests_at_capacity(pending_requests) {
+                        return Some(dashboard_control_error_response(
+                            id,
+                            "too many in-flight requests on this connection",
+                        ));
+                    }
                     spawn_control_request(
                         id,
                         method.to_string(),
@@ -927,13 +981,7 @@ pub(crate) fn control_frame_response(
             }
         }
         "cancel" => {
-            let pending_existed = pending_requests
-                .remove(&id)
-                .map(|token| {
-                    token.cancel();
-                    true
-                })
-                .unwrap_or(false);
+            let pending_existed = pending_requests.cancel_remove(&id);
             let queued_existed = outbound_queue.cancel(&id);
             let upload_existed = inbound_uploads.remove(&id).is_some();
             let existed = pending_existed || queued_existed || upload_existed;
@@ -958,6 +1006,14 @@ pub(crate) fn control_frame_response(
     }
 }
 
+/// Spawn-time admission for the spawned-work lanes
+/// (`MAX_PENDING_CONTROL_REQUESTS`, live-work slots). No same-id
+/// exemption: a replacement cannot make its predecessor's in-flight work
+/// disappear, so it must fit under the same bound.
+fn pending_requests_at_capacity(pending_requests: &PendingControlRequests) -> bool {
+    pending_requests.at_capacity()
+}
+
 pub(crate) fn control_upload_error_response(
     id: String,
     status: u16,
@@ -979,7 +1035,7 @@ pub(crate) fn control_upload_start_frame(
     id: String,
     frame: serde_json::Value,
     runtime: &ControlRuntime,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    pending_requests: &mut PendingControlRequests,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Option<serde_json::Value> {
     if id.is_empty() {
@@ -1037,8 +1093,43 @@ pub(crate) fn control_upload_start_frame(
             "empty upload declared chunks",
         ));
     }
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(tmp) => tmp,
+    // Connection-level admission (same-id restart replaces its own slot):
+    // a burst of upload_starts must not reserve unbounded spool space.
+    // The live-work bound covers uploads too — the slot minted below is
+    // held from the first frame through commit completion.
+    if pending_requests_at_capacity(pending_requests) {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            "too many in-flight requests on this connection",
+        ));
+    }
+    // Committing uploads left `inbound_uploads` but their work and spool
+    // live until the commit finishes — they count against the cap.
+    let concurrent_elsewhere = inbound_uploads.keys().filter(|key| *key != &id).count()
+        + pending_requests.committing_uploads();
+    if concurrent_elsewhere >= MAX_INBOUND_UPLOADS_PER_CONNECTION {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            format!("too many concurrent uploads (max {MAX_INBOUND_UPLOADS_PER_CONNECTION})"),
+        ));
+    }
+    let declared_elsewhere: usize = inbound_uploads
+        .iter()
+        .filter(|(key, _)| *key != &id)
+        .map(|(_, upload)| upload.total_bytes)
+        .sum::<usize>()
+        .saturating_add(pending_requests.committing_upload_bytes());
+    if declared_elsewhere.saturating_add(total_bytes) > MAX_INBOUND_UPLOAD_TOTAL_BYTES {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            "concurrent uploads exceed the connection's declared-bytes budget",
+        ));
+    }
+    let spool = match UploadSpool::for_declared_size(total_bytes) {
+        Ok(spool) => spool,
         Err(e) => {
             return Some(control_upload_error_response(
                 id,
@@ -1047,11 +1138,12 @@ pub(crate) fn control_upload_start_frame(
             ));
         }
     };
-    if let Some(previous) = pending_requests.remove(&id) {
-        previous.cancel();
-    }
     inbound_uploads.remove(&id);
-    pending_requests.insert(id.clone(), CancellationToken::new());
+    // Reserve through the same generation-bearing admission the request
+    // lane uses: the terminal task's response must match this generation,
+    // and the RAII slot rides the receiving state into the commit task —
+    // one continuous live-work slot from first frame to commit end.
+    let (_cancel, generation, slot) = pending_requests.admit(&id);
     inbound_uploads.insert(
         id,
         InboundUploadState {
@@ -1060,11 +1152,13 @@ pub(crate) fn control_upload_start_frame(
                 .get("params")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({})),
-            tmp,
+            spool,
             total_bytes,
             expected_chunks,
             next_seq: 0,
             received_bytes: 0,
+            generation,
+            slot: Some(slot),
         },
     );
     None
@@ -1073,11 +1167,11 @@ pub(crate) fn control_upload_start_frame(
 pub(crate) fn control_upload_chunk_frame(
     id: String,
     frame: serde_json::Value,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    pending_requests: &mut PendingControlRequests,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Option<serde_json::Value> {
     let Some(upload) = inbound_uploads.get_mut(&id) else {
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(id, 400, "unknown upload id"));
     };
     let seq = frame
@@ -1087,7 +1181,7 @@ pub(crate) fn control_upload_chunk_frame(
         .unwrap_or(usize::MAX);
     if seq != upload.next_seq {
         inbound_uploads.remove(&id);
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(
             id,
             400,
@@ -1098,7 +1192,7 @@ pub(crate) fn control_upload_chunk_frame(
         Some(data) => data,
         None => {
             inbound_uploads.remove(&id);
-            pending_requests.remove(&id);
+            pending_requests.cancel_remove(&id);
             return Some(control_upload_error_response(
                 id,
                 400,
@@ -1110,7 +1204,7 @@ pub(crate) fn control_upload_chunk_frame(
         Ok(bytes) => bytes,
         Err(_) => {
             inbound_uploads.remove(&id);
-            pending_requests.remove(&id);
+            pending_requests.cancel_remove(&id);
             return Some(control_upload_error_response(
                 id,
                 400,
@@ -1121,16 +1215,16 @@ pub(crate) fn control_upload_chunk_frame(
     upload.received_bytes = upload.received_bytes.saturating_add(bytes.len());
     if upload.received_bytes > upload.total_bytes {
         inbound_uploads.remove(&id);
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(
             id,
             400,
             "upload exceeded declared size",
         ));
     }
-    if let Err(e) = upload.tmp.as_file_mut().write_all(&bytes) {
+    if let Err(e) = upload.spool.append(&bytes) {
         inbound_uploads.remove(&id);
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(
             id,
             500,
@@ -1145,12 +1239,12 @@ pub(crate) fn control_upload_end_frame(
     id: String,
     frame: serde_json::Value,
     runtime: &ControlRuntime,
-    task_tx: &mpsc::Sender<ControlTaskResponse>,
-    pending_requests: &mut HashMap<String, CancellationToken>,
+    task_tx: &mpsc::Sender<SequencedTaskResponse>,
+    pending_requests: &mut PendingControlRequests,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Option<serde_json::Value> {
     let Some(mut upload) = inbound_uploads.remove(&id) else {
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(id, 400, "unknown upload id"));
     };
     let final_chunks = frame
@@ -1162,11 +1256,11 @@ pub(crate) fn control_upload_end_frame(
         || upload.next_seq != upload.expected_chunks
         || upload.received_bytes != upload.total_bytes
     {
-        pending_requests.remove(&id);
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(id, 400, "incomplete upload"));
     }
-    if let Err(e) = upload.tmp.as_file_mut().flush() {
-        pending_requests.remove(&id);
+    if let Err(e) = upload.spool.finish() {
+        pending_requests.cancel_remove(&id);
         return Some(control_upload_error_response(
             id,
             500,
@@ -1175,7 +1269,21 @@ pub(crate) fn control_upload_end_frame(
     }
     let runtime = runtime.clone();
     let task_tx = task_tx.clone();
+    // Commit tasks run to completion (abandoning a store commit at an
+    // arbitrary await point is worse than finishing it); the generation
+    // gate on the response is what keeps a superseded commit from
+    // reaching the wire or freeing its replacement's reservation.
+    // Run-to-completion is fine — UNBOUNDED run-to-completion is not:
+    // the commit occupies its live-work slot (taken out of the state so
+    // it survives the handlers consuming `upload`) plus a committing-
+    // upload slot that the upload 8-cap counts, both until the commit
+    // actually finishes.
+    let generation = upload.generation;
+    let commit_slot = pending_requests.upload_commit_slot(upload.received_bytes);
     tokio::spawn(async move {
+        let mut upload = upload;
+        let _slot = upload.slot.take();
+        let _commit_slot = commit_slot;
         let response = match upload.method.as_str() {
             "api_session_current_upload" => {
                 api_session_current_upload_task_response(id.clone(), upload, runtime).await
@@ -1207,7 +1315,7 @@ pub(crate) fn control_upload_end_frame(
                 done: true,
             },
         };
-        let _ = task_tx.send(response).await;
+        let _ = task_tx.send((generation, response)).await;
     });
     None
 }
@@ -1240,7 +1348,7 @@ pub(crate) fn terminal_frame_dimension(frame: &serde_json::Value, key: &str, def
 pub(crate) fn control_terminal_open_frame(
     frame: serde_json::Value,
     runtime: &ControlRuntime,
-    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Option<serde_json::Value> {
     let (host_id, terminal_id) = terminal_frame_key(&frame);
@@ -1251,7 +1359,12 @@ pub(crate) fn control_terminal_open_frame(
         handle.abort();
     }
     let registry = runtime.terminal_registry.clone();
-    let terminal_events_tx = terminal_events_tx.clone();
+    // Everything this task emits — the open ack/error and the output
+    // stream — rides the BOUNDED terminal lane, so the ack keeps FIFO
+    // order ahead of the first output frame, and when the wire congests
+    // the `send().await` parks this task while terminal.rs's per-listener
+    // drop-oldest bound holds the memory line (see `control_driver`).
+    let terminal_output_tx = terminal_output_tx.clone();
     // Attach needs only the terminal.view floor already enforced by the
     // frame table; creating a shell needs shell.spawn, decided at frame
     // time so expiry mid-connection is honored. A grant-level fs scope
@@ -1280,13 +1393,16 @@ pub(crate) fn control_terminal_open_frame(
         {
             Ok((session, _created)) => {
                 let mut rx = session.attach();
-                let _ = terminal_events_tx.send(serde_json::json!({
+                let ack = serde_json::json!({
                     "t": "terminal_opened",
                     "host_id": host_id.clone(),
                     "terminal_id": terminal_id.clone(),
                     "shared": session.shared(),
                     "can_share": session.managed_by(&actor),
-                }));
+                });
+                if terminal_output_tx.send(ack).await.is_err() {
+                    return;
+                }
                 while let Some(event) = rx.recv().await {
                     let frame = match event {
                         crate::terminal::TerminalEvent::Output(bytes) => {
@@ -1307,18 +1423,20 @@ pub(crate) fn control_terminal_open_frame(
                             })
                         }
                     };
-                    if terminal_events_tx.send(frame).is_err() {
+                    if terminal_output_tx.send(frame).await.is_err() {
                         break;
                     }
                 }
             }
             Err(e) => {
-                let _ = terminal_events_tx.send(serde_json::json!({
-                    "t": "terminal_error",
-                    "host_id": host_id,
-                    "terminal_id": terminal_id,
-                    "error": e.to_string(),
-                }));
+                let _ = terminal_output_tx
+                    .send(serde_json::json!({
+                        "t": "terminal_error",
+                        "host_id": host_id,
+                        "terminal_id": terminal_id,
+                        "error": e.to_string(),
+                    }))
+                    .await;
             }
         }
     });
@@ -2913,7 +3031,7 @@ mod tests {
             },
             ..runtime()
         };
-        let mut pending = HashMap::new();
+        let mut pending = PendingControlRequests::new();
         let mut inbound_uploads = HashMap::new();
 
         // A filesystem-write grant must not reach runtime-control surface
@@ -2996,11 +3114,12 @@ mod tests {
         let mut rt = runtime();
         rt.project_root = Some(project.path().to_path_buf());
         let mut events = rt.bus.subscribe();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let bytes = b"hello upload";
@@ -3028,6 +3147,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3049,6 +3169,7 @@ mod tests {
                 &mut outbound,
                 &mut inbound_uploads,
                 &terminal_tx,
+                &terminal_output_tx,
                 &mut terminal_forwarders,
                 &display_input_tx,
             )
@@ -3068,16 +3189,17 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
         .is_none());
 
-        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, response) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "up1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -3108,11 +3230,12 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let mut rt = runtime();
         rt.project_root = Some(project.path().to_path_buf());
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
 
@@ -3137,6 +3260,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3156,16 +3280,17 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
         .is_none());
 
-        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, response) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "up-empty");
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["_httpOk"], true);
@@ -3182,11 +3307,12 @@ mod tests {
         rt.terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(
             project.path().to_path_buf(),
         ));
-        let (task_tx, _task_rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (task_tx, _task_rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
-        let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (terminal_output_tx, mut terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let terminal_id = "dash-control-test-shell";
@@ -3206,6 +3332,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3216,7 +3343,7 @@ mod tests {
         // tens of seconds before the shell paints; a passing run returns
         // the moment each frame arrives and never waits the budget out.
         let budget = Duration::from_secs(60);
-        let opened = tokio::time::timeout(budget, terminal_rx.recv())
+        let opened = tokio::time::timeout(budget, terminal_output_rx.recv())
             .await
             .expect("no terminal frame within budget after terminal_open")
             .expect("terminal frame channel closed before terminal_opened");
@@ -3228,7 +3355,7 @@ mod tests {
         // deadline. Matching runs on the accumulated transcript, not per
         // frame, so output split across chunks still matches.
         async fn drain_output_until(
-            terminal_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            terminal_rx: &mut mpsc::Receiver<serde_json::Value>,
             budget: Duration,
             phase: &str,
             until: impl Fn(&str) -> bool,
@@ -3265,7 +3392,10 @@ mod tests {
         // during shell startup can be silently discarded (see terminal.rs
         // tests); a dashboard user typing at a rendered prompt never races
         // this.
-        drain_output_until(&mut terminal_rx, budget, "shell startup", |t| !t.is_empty()).await;
+        drain_output_until(&mut terminal_output_rx, budget, "shell startup", |t| {
+            !t.is_empty()
+        })
+        .await;
 
         let token = "dashboard_terminal_frame_ok";
         let input = serde_json::json!({
@@ -3283,12 +3413,13 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
         .is_none());
 
-        drain_output_until(&mut terminal_rx, budget, "token echo", |t| {
+        drain_output_until(&mut terminal_output_rx, budget, "token echo", |t| {
             t.contains(token)
         })
         .await;
@@ -3306,6 +3437,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         );
@@ -3323,16 +3455,17 @@ mod tests {
         let payload = b"written via upload frames";
 
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let mut frame = |text: &str,
                          rt: &mut ControlRuntime,
-                         pending: &mut HashMap<String, CancellationToken>,
+                         pending: &mut PendingControlRequests,
                          inbound: &mut HashMap<String, InboundUploadState>|
          -> Option<serde_json::Value> {
             control_frame_response(
@@ -3343,6 +3476,7 @@ mod tests {
                 &mut outbound,
                 inbound,
                 &terminal_tx,
+                &terminal_output_tx,
                 &mut terminal_forwarders,
                 &display_input_tx,
             )
@@ -3417,7 +3551,7 @@ mod tests {
         );
         assert!(end.is_none());
 
-        let response = rx.recv().await.unwrap();
+        let (_, response) = rx.recv().await.unwrap();
         assert_eq!(response.id, "up1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");

@@ -4,6 +4,7 @@
 //! the data-channel message codecs it speaks.
 
 use super::*;
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Driver task
@@ -53,7 +54,15 @@ pub(crate) struct DriverState {
     /// commit 2 lights up multi-encoding), the map has exactly one
     /// entry per active spec — same shape as the previous keying,
     /// just with the RID dimension along for the ride.
-    video_specs: HashMap<(crate::encode::PayloadSpec, SimulcastRid), SpecState>,
+    /// Keyed by `(PayloadSpec, SimulcastRid)` via
+    /// [`video_spec_key_matches`] — the per-RID independence contract
+    /// is pinned by `video_specs_lookup_distinguishes_rids_sharing_a_spec`,
+    /// which exercises this container shape through that same
+    /// predicate. Stored as a small linear vector (a handful of
+    /// entries at most: codecs × rids for one peer) so the per-frame
+    /// lookup compares by reference instead of cloning the spec + rid
+    /// into an owned `HashMap` key on every frame.
+    video_specs: Vec<((crate::encode::PayloadSpec, SimulcastRid), SpecState)>,
     /// Map of channel label → DataChannelId for routing channel data and clipboard sends.
     channels: HashMap<String, RTCDataChannelId>,
     /// F-1.2: queued `display_input_authority_state` messages awaiting
@@ -73,13 +82,12 @@ pub(crate) struct DriverState {
     /// producer side is not throttled by the channel's send-await
     /// semantics.
     pending_authority_state: Vec<(u32, DisplayInputAuthorityState)>,
-    /// D-3b: queued tile control frames awaiting `tile-control`
-    /// channel open. Low-rate reliable control only; never per-frame.
-    pending_tile_control: Vec<Vec<u8>>,
-    /// D-3b: queued snapshot chunks awaiting `tile-snapshot` channel
-    /// open. Reliable snapshot delivery is allowed to delay rather
-    /// than drop. Tile deltas intentionally have no queue.
-    pending_tile_snapshot: Vec<Vec<u8>>,
+    /// D-3b: the queued-before-open reliable tile state (control
+    /// queue, the one complete pending snapshot, and the snapshot
+    /// admission watermark). Grouped in [`PendingTileQueues`] so the
+    /// production placement/drain policy is directly unit-testable —
+    /// tests call the same methods this driver calls, not a mirror.
+    pending_tiles: PendingTileQueues,
     /// D-4c: event-driven backpressure state for the supersedable
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
@@ -106,11 +114,15 @@ pub(crate) struct DriverState {
 pub(crate) struct RidRtpState {
     ssrc: u32,
     packetizer: Box<dyn Packetizer + Send>,
+    /// The RID as an RTP `sdes:rtp-stream-id` header-extension payload,
+    /// precomputed once — the write loop stamps it onto every packet
+    /// (hundreds per keyframe), so building a fresh `Vec` + `Bytes`
+    /// there was steady per-packet allocator churn.
+    rid_ext: Bytes,
 }
 
 pub(crate) struct RtpSendState {
     sender_id: RTCRtpSenderId,
-    mid: String,
     codec: RTCRtpCodec,
     /// Per-RID send state. Looked up by the
     /// [`OutboundEncodedFrame::rid`] of each incoming frame so the
@@ -119,6 +131,10 @@ pub(crate) struct RtpSendState {
     by_rid: HashMap<SimulcastRid, RidRtpState>,
     mid_ext_id: Option<u8>,
     rid_ext_id: Option<u8>,
+    /// The mid as an RTP `sdes:mid` header-extension payload,
+    /// precomputed for the same per-packet reason as
+    /// [`RidRtpState::rid_ext`].
+    mid_ext: Bytes,
 }
 
 /// Inbound packet from one of the per-interface forwarder tasks or a
@@ -155,7 +171,10 @@ pub(crate) struct InboundPacket {
 /// single error owner that tears the peer down on the first write failure
 /// rather than re-flooding a dead socket.
 pub(crate) const TCP_OUT_QUEUE: usize = 256;
-pub(crate) type TcpFrameSender = mpsc::Sender<Vec<u8>>;
+/// Payloads are `Bytes`: `drain_outputs` freezes the engine's
+/// `BytesMut` transmit (zero-copy) instead of `to_vec`-copying every
+/// media packet onto the TCP lane.
+pub(crate) type TcpFrameSender = mpsc::Sender<Bytes>;
 
 struct InteractiveSourceGuard(Option<Arc<crate::BrowserInputSource>>);
 
@@ -178,6 +197,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     _tcp_registration: Option<PeerRegistration>,
     mut frame_rx: mpsc::Receiver<OutboundEncodedFrame>,
     mut command_rx: mpsc::Receiver<Command>,
+    snapshot_mailbox: Arc<SnapshotMailbox>,
     input_handler: Arc<dyn Fn(InputEvent) + Send + Sync>,
     interactive_source: Option<Arc<crate::BrowserInputSource>>,
     clipboard_handler: Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -240,24 +260,25 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
             RidRtpState {
                 ssrc: *ssrc,
                 packetizer: Box::new(packetizer),
+                rid_ext: Bytes::copy_from_slice(rid.as_str().as_bytes()),
             },
         );
     }
+    let mid_ext = Bytes::copy_from_slice(rtp_config.mid.as_bytes());
     let mut state = DriverState {
-        video_specs: HashMap::new(),
+        video_specs: Vec::new(),
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
-        pending_tile_control: Vec::new(),
-        pending_tile_snapshot: Vec::new(),
+        pending_tiles: PendingTileQueues::default(),
         tile_delta_backpressure: TileDeltaBackpressure::new(),
         first_frame_at: None,
         rtp: RtpSendState {
             sender_id: rtp_config.sender_id,
-            mid: rtp_config.mid,
             codec: rtp_config.codec,
             by_rid,
             mid_ext_id: None,
             rid_ext_id: None,
+            mid_ext,
         },
     };
 
@@ -446,7 +467,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
     // Once the allocation lands, this is the relayed address ICE advertises
     // and the channel that routes relay-destined RTC output to the relay task.
     let mut relay_addr: Option<SocketAddr> = None;
-    let mut relay_out_tx: Option<mpsc::Sender<(SocketAddr, Vec<u8>)>> = None;
+    let mut relay_out_tx: Option<mpsc::Sender<(SocketAddr, Bytes)>> = None;
 
     // Phase 4d.1: poll-driven observed-send-bitrate computation.
     // Each tick samples `bytes_sent` per outbound stream and computes
@@ -581,7 +602,7 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 // the peer's shutdown token, tearing the connection down
                 // instead of letting every later transmit re-flood the log
                 // on a dead socket.
-                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Vec<u8>>(TCP_OUT_QUEUE);
+                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Bytes>(TCP_OUT_QUEUE);
                 tcp_senders.insert(remote_addr, tcp_out_tx);
                 let writer_shutdown = shutdown.clone();
                 tokio::spawn(async move {
@@ -697,6 +718,26 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!(
                         "[display/webrtc] peer {peer_id}: handle_timeout after command failed: {e:?}"
+                    );
+                    shutdown.cancel();
+                    for h in forwarder_handles {
+                        let _ = h.await;
+                    }
+                    return;
+                }
+            }
+            // Latest-wins snapshot mailbox: complete groups bypass the
+            // bounded command channel (a queue of multi-MB groups would
+            // retain up to its capacity in full generations — see
+            // `SnapshotMailbox`). At most one group is ever pending;
+            // the drain loop below empties whatever raced in.
+            _ = snapshot_mailbox.ready() => {
+                while let Some((snapshot_id, chunks)) = snapshot_mailbox.take() {
+                    handle_snapshot_group(&mut rtc, &mut state, snapshot_id, chunks);
+                }
+                if let Err(e) = rtc.handle_timeout(Instant::now()) {
+                    eprintln!(
+                        "[display/webrtc] peer {peer_id}: handle_timeout after snapshot failed: {e:?}"
                     );
                     shutdown.cancel();
                     for h in forwarder_handles {
@@ -899,7 +940,7 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
     // TURN relay task, which wraps it toward coturn. `None` until/unless a
     // relay allocation succeeds.
     relay_addr: Option<SocketAddr>,
-    relay_out_tx: Option<&mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    relay_out_tx: Option<&mpsc::Sender<(SocketAddr, Bytes)>>,
     state: &mut DriverState,
     input_handler: &Arc<dyn Fn(InputEvent) + Send + Sync>,
     clipboard_handler: &Arc<dyn Fn(ClipboardContent) + Send + Sync>,
@@ -921,8 +962,9 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
             if let Some(tx) = relay_out_tx {
                 // try_send keeps the rtc poll loop non-blocking; a full relay
                 // queue drops this packet as backpressure (RTP recovery /
-                // ICE retransmit covers the loss).
-                let _ = tx.try_send((t.transport.peer_addr, t.message.to_vec()));
+                // ICE retransmit covers the loss). freeze() hands the
+                // engine's own buffer over without copying the packet.
+                let _ = tx.try_send((t.transport.peer_addr, t.message.freeze()));
             }
             continue;
         }
@@ -937,7 +979,9 @@ pub(crate) async fn drain_outputs<I: rtc::interceptor::Interceptor>(
         // transmits key on our relayed *local* address, which is never a
         // TCP peer tuple.)
         if let Some(sender) = tcp_senders.get(&t.transport.peer_addr) {
-            let contents: Vec<u8> = t.message.to_vec();
+            // freeze() is zero-copy: the writer task borrows the
+            // engine's own transmit buffer for the RFC 4571 write.
+            let contents: Bytes = t.message.freeze();
             // Enqueue onto the connection's ordered writer channel.
             // `try_send` (never `send().await`) keeps the rtc poll loop
             // non-blocking: a full queue means the writer task can't
@@ -1441,33 +1485,45 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     // Phase-4c-prep: the keyframe gate is keyed by `(payload_spec, rid)`,
     // not `payload_spec` alone. See `DriverState::video_specs` for why
     // — VP8 simulcast layers share the same payload_spec but each
-    // RID's keyframe gate must be independent.
-    let spec_key = (frame.payload_spec.clone(), rid.clone());
-    if !state.video_specs.contains_key(&spec_key) {
-        let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
-            SpecState::Ready {
-                keyframe_seen: false,
-            }
-        } else {
-            eprintln!(
-                "[display/webrtc] encoded frame spec {} (rid {}) does not match \
-                 negotiated codec {}; dropping this (spec, rid)",
-                frame.payload_spec.codec_mime,
-                rid.as_str(),
-                state.rtp.codec.mime_type,
-            );
-            SpecState::Unsupported
-        };
-        state.video_specs.insert(spec_key.clone(), new);
-    }
+    // RID's keyframe gate must be independent. Looked up by reference
+    // (linear scan of a ≤handful-entry vector) so the steady state
+    // clones nothing; the owned key is built only when a new
+    // `(spec, rid)` pair first appears.
+    let spec_idx = match state
+        .video_specs
+        .iter()
+        .position(|(key, _)| video_spec_key_matches(key, &frame.payload_spec, rid))
+    {
+        Some(idx) => idx,
+        None => {
+            let new = if payload_spec_matches_codec(&frame.payload_spec, &state.rtp.codec) {
+                SpecState::Ready {
+                    keyframe_seen: false,
+                }
+            } else {
+                eprintln!(
+                    "[display/webrtc] encoded frame spec {} (rid {}) does not match \
+                     negotiated codec {}; dropping this (spec, rid)",
+                    frame.payload_spec.codec_mime,
+                    rid.as_str(),
+                    state.rtp.codec.mime_type,
+                );
+                SpecState::Unsupported
+            };
+            state
+                .video_specs
+                .push(((frame.payload_spec.clone(), rid.clone()), new));
+            state.video_specs.len() - 1
+        }
+    };
 
     // Step 2: extract current keyframe readiness from the spec state.
     // Copy out immutably so we can mutate `state.first_frame_at` below
     // without borrow conflicts with `state.video_specs`.
-    let keyframe_ready = match state.video_specs.get(&spec_key) {
-        Some(SpecState::Ready { keyframe_seen }) => *keyframe_seen,
-        // Unsupported or (impossibly) missing — drop silently. The
-        // first arm already emitted a log on entering Unsupported.
+    let keyframe_ready = match state.video_specs[spec_idx].1 {
+        SpecState::Ready { keyframe_seen } => keyframe_seen,
+        // Unsupported — drop silently. The insert arm already emitted
+        // a log on entering Unsupported.
         _ => return,
     };
 
@@ -1516,7 +1572,13 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     // packetizer (its own sequence + RTP-timestamp continuation
     // state) and stamp the per-RID SSRC onto every packet so
     // `RTCRtpSender::write_rtp` routes to the matching encoding.
-    let payload = Bytes::from(frame.data.clone());
+    //
+    // `frame.data` is `Bytes`: the clone is a refcount bump, not a
+    // copy of the encoded payload — the pool broadcasts one
+    // `Arc<EncodedFrame>` to every peer precisely so the fan-out
+    // stays copy-free, and the packetizer slices the `Bytes`
+    // refcounted from here on.
+    let payload = frame.data.clone();
     let packets = match rid_state.packetizer.packetize(&payload, samples) {
         Ok(p) => p,
         Err(e) => {
@@ -1528,24 +1590,23 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
         }
     };
     let rid_ssrc = rid_state.ssrc;
+    let rid_ext = rid_state.rid_ext.clone();
 
     let (mid_ext_id, rid_ext_id) = rtp_header_extension_ids(rtc, state);
+    // One sender lookup per frame, not per packet — a 1440p keyframe
+    // packetizes into hundreds of packets.
+    let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
+        return;
+    };
     for mut packet in packets {
         packet.header.ssrc = rid_ssrc;
         if let Some(id) = mid_ext_id {
-            let _ = packet
-                .header
-                .set_extension(id, Bytes::from(state.rtp.mid.as_bytes().to_vec()));
+            let _ = packet.header.set_extension(id, state.rtp.mid_ext.clone());
         }
         if let Some(id) = rid_ext_id {
-            let _ = packet
-                .header
-                .set_extension(id, Bytes::from(rid.as_str().as_bytes().to_vec()));
+            let _ = packet.header.set_extension(id, rid_ext.clone());
         }
 
-        let Some(mut sender) = rtc.rtp_sender(state.rtp.sender_id) else {
-            return;
-        };
         match sender.write_rtp(packet) {
             Ok(()) => {}
             Err(e) => {
@@ -1559,7 +1620,7 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
     }
 
     if !keyframe_ready {
-        if let Some(SpecState::Ready { keyframe_seen }) = state.video_specs.get_mut(&spec_key) {
+        if let Some((_, SpecState::Ready { keyframe_seen })) = state.video_specs.get_mut(spec_idx) {
             // Only flip keyframe_seen for this (spec, rid) pair AFTER
             // a successful packet write. If the write is the first
             // keyframe on this (spec, rid), the gate opens for
@@ -1569,6 +1630,19 @@ pub(crate) fn write_video_frame<I: rtc::interceptor::Interceptor>(
             *keyframe_seen = true;
         }
     }
+}
+
+/// Identity predicate for [`DriverState::video_specs`] entries: an
+/// entry matches only its exact `(payload_spec, rid)` pair. Extracted
+/// so the per-RID keyframe-gate independence (VP8 simulcast layers
+/// share one `PayloadSpec`; each RID's gate must stay independent) is
+/// pinned by a test exercising the *same* predicate production uses.
+pub(crate) fn video_spec_key_matches(
+    key: &(crate::encode::PayloadSpec, SimulcastRid),
+    spec: &crate::encode::PayloadSpec,
+    rid: &SimulcastRid,
+) -> bool {
+    key.0 == *spec && key.1 == *rid
 }
 
 pub(crate) fn payload_spec_matches_codec(
@@ -1699,14 +1773,64 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
             } else if channel.queues_before_open() {
                 match channel {
                     TileDataChannel::Control => {
-                        state.pending_tile_control.push(data);
+                        push_pending_tile_bounded(
+                            &mut state.pending_tiles.control,
+                            data,
+                            PENDING_TILE_CONTROL_MAX_BYTES,
+                            label,
+                        );
                     }
                     TileDataChannel::Snapshot => {
-                        state.pending_tile_snapshot.push(data);
+                        // Unreachable via the public boundary: snapshot
+                        // chunks travel as whole groups through the
+                        // peer's `SnapshotMailbox`. Queueing a lone
+                        // chunk here would publish a partial
+                        // (unassemblable) baseline, so drop it.
+                        eprintln!(
+                            "[display/webrtc] dropping per-chunk snapshot \
+                             frame queued before open — snapshots must use \
+                             the whole-group snapshot mailbox"
+                        );
                     }
                     TileDataChannel::Deltas => {}
                 }
             }
+        }
+    }
+}
+
+/// Consume one complete snapshot group from the peer's
+/// [`SnapshotMailbox`]: admission against the persisted watermark,
+/// then write-now (channel open) or queue-whole (pre-open) — the
+/// decision lives in the production
+/// [`PendingTileQueues::place_snapshot_group`], which the unit tests
+/// exercise directly.
+fn handle_snapshot_group<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    state: &mut DriverState,
+    snapshot_id: u32,
+    chunks: Vec<Bytes>,
+) {
+    let open_cid = state.channels.get(TILE_SNAPSHOT_CHANNEL_LABEL).copied();
+    let Some(deliver) =
+        state
+            .pending_tiles
+            .place_snapshot_group(open_cid.is_some(), snapshot_id, chunks)
+    else {
+        return;
+    };
+    let Some(cid) = open_cid else {
+        return;
+    };
+    let Some(mut dc) = rtc.data_channel(cid) else {
+        return;
+    };
+    for chunk in &deliver {
+        if let Err(e) = dc.send(BytesMut::from(&chunk[..])) {
+            eprintln!(
+                "[display/webrtc] tile channel write failed on \
+                 {TILE_SNAPSHOT_CHANNEL_LABEL}: {e:?}"
+            );
         }
     }
 }
@@ -1840,12 +1964,172 @@ pub(crate) fn drain_pending_authority_for_label(
     }
 }
 
-pub(crate) fn drain_pending_tile_for_label(state: &mut DriverState, label: &str) -> Vec<Vec<u8>> {
-    match label {
-        TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
-        TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot),
-        _ => Vec::new(),
+pub(crate) fn drain_pending_tile_for_label(
+    state: &mut DriverState,
+    label: &str,
+) -> VecDeque<Bytes> {
+    state.pending_tiles.drain_for_label(label)
+}
+
+/// The queued-before-open reliable tile state for one driver: the
+/// control frame queue, the (at most one, complete) pending snapshot,
+/// and the snapshot admission watermark. Grouped in one plainly
+/// constructible struct so the unit tests exercise the **production**
+/// placement/drain methods below — not a re-implementation.
+#[derive(Default)]
+pub(crate) struct PendingTileQueues {
+    /// D-3b: queued tile control frames awaiting `tile-control`
+    /// channel open. Low-rate reliable control only; never per-frame.
+    /// Byte-capped drop-oldest (see [`push_pending_tile_bounded`]): a
+    /// channel that closed (OnClose removes its label) while the peer
+    /// stays a tile subscriber would otherwise grow this without
+    /// bound, and control frames are self-contained — the latest
+    /// state wins.
+    pub(crate) control: VecDeque<Bytes>,
+    /// D-3b: the **one complete snapshot** (producer snapshot id +
+    /// every wire chunk, in send order) awaiting `tile-snapshot`
+    /// channel open. A snapshot is only decodable as a complete chunk
+    /// set, and the peer's `SnapshotMailbox` hands groups over
+    /// atomically, so this holds at most one complete group *by
+    /// construction*: a newer accepted group replaces the old one
+    /// whole, and a producer cancelled mid-encode never publishes at
+    /// all — no partial baseline can exist here.
+    ///
+    /// Bound story: ≤1 complete group by construction. No sanity
+    /// byte-cap on that group — it is one bounded burst from our own
+    /// packer (a u16 chunk count of ≤32KiB messages, in practice a
+    /// few MB), and dropping any of it would strand the browser on an
+    /// unassemblable baseline, which is exactly the failure this
+    /// design exists to prevent. Tile deltas intentionally have no
+    /// queue.
+    snapshot: Option<(u32, Vec<Bytes>)>,
+    /// Newest snapshot id ever accepted by this driver (written or
+    /// queued). Persisted here — NOT derived from queue contents — so
+    /// it survives open/drain/close cycles: a late group from an
+    /// older, superseded producer is rejected even when the queue is
+    /// empty, instead of resurrecting a stale baseline. See
+    /// [`admit_snapshot_group`].
+    snapshot_watermark: Option<u32>,
+}
+
+impl PendingTileQueues {
+    /// Production admission + placement for one complete snapshot
+    /// group — the single code path [`handle_snapshot_group`] calls.
+    ///
+    /// Admission first, shared by both paths: stale groups (id at or
+    /// below the persisted watermark) are rejected, so a late producer
+    /// for a superseded snapshot can neither hit the wire after a
+    /// newer baseline nor resurrect itself into an emptied queue.
+    /// Returns `Some(chunks)` when the group was admitted and the
+    /// channel is open (the caller writes them now); `None` when the
+    /// group was rejected as stale or queued whole for the pre-open
+    /// flush.
+    pub(crate) fn place_snapshot_group(
+        &mut self,
+        snapshot_open: bool,
+        snapshot_id: u32,
+        chunks: Vec<Bytes>,
+    ) -> Option<Vec<Bytes>> {
+        if !admit_snapshot_group(&mut self.snapshot_watermark, snapshot_id) {
+            return None;
+        }
+        if snapshot_open {
+            return Some(chunks);
+        }
+        // Pre-open: swap complete-for-complete — see the `snapshot`
+        // field doc for the bound story.
+        if let Some((old_id, old_chunks)) = self.snapshot.replace((snapshot_id, chunks)) {
+            eprintln!(
+                "[display/webrtc] pending tile-snapshot: snapshot \
+                 {snapshot_id} supersedes queued snapshot {old_id} \
+                 ({} chunks) before the channel opened",
+                old_chunks.len(),
+            );
+        }
+        None
     }
+
+    /// Production drain for a just-opened reliable tile channel:
+    /// returns every queued frame for `label` in send order.
+    ///
+    /// Draining the snapshot deliberately leaves `snapshot_watermark`
+    /// in place: the watermark is the stale-group rejector and must
+    /// survive open/drain/close cycles (deriving it from queue
+    /// contents would let a late producer of a superseded snapshot
+    /// repopulate the emptied queue with a stale baseline).
+    pub(crate) fn drain_for_label(&mut self, label: &str) -> VecDeque<Bytes> {
+        match label {
+            TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut self.control),
+            TILE_SNAPSHOT_CHANNEL_LABEL => self
+                .snapshot
+                .take()
+                .map(|(_, chunks)| chunks.into())
+                .unwrap_or_default(),
+            _ => VecDeque::new(),
+        }
+    }
+}
+
+/// Byte cap for the queued-before-open `tile-control` queue. A channel
+/// that closes (its label leaves `state.channels`) while the peer
+/// remains a tile subscriber keeps producing into the queue, so an
+/// uncapped queue is an unbounded memory leak on a wedged channel.
+/// Sized far above what any real negotiation delay could accumulate.
+///
+/// Drop-oldest is correct **only** for control frames, which are
+/// self-contained and superseded by later state. Snapshot chunks are
+/// not self-contained — see
+/// [`PendingTileQueues::place_snapshot_group`] for the whole-snapshot
+/// policy that bounds that store instead.
+pub(crate) const PENDING_TILE_CONTROL_MAX_BYTES: usize = 1024 * 1024;
+
+/// Push onto the queued-before-open control queue, dropping oldest
+/// entries until the queue (including `data`) fits under `max_bytes`.
+pub(crate) fn push_pending_tile_bounded(
+    queue: &mut VecDeque<Bytes>,
+    data: Bytes,
+    max_bytes: usize,
+    label: &str,
+) {
+    let mut total: usize = queue.iter().map(Bytes::len).sum::<usize>() + data.len();
+    let mut dropped = 0usize;
+    while total > max_bytes {
+        let Some(oldest) = queue.pop_front() else {
+            break;
+        };
+        total -= oldest.len();
+        dropped += 1;
+    }
+    if dropped > 0 {
+        eprintln!(
+            "[display/webrtc] pending {label} queue exceeded {max_bytes}B \
+             before the channel opened; dropped {dropped} oldest frame(s)"
+        );
+    }
+    queue.push_back(data);
+}
+
+/// Admit or reject one complete snapshot group against the driver's
+/// persisted watermark, advancing the watermark on admission.
+///
+/// Rejects ids older than **or equal to** the newest ever accepted:
+/// producer snapshot ids are minted by a session-monotonic
+/// `AtomicU32::fetch_add`, so an id at-or-below the watermark is a
+/// stale (superseded) producer whose baseline must reach neither the
+/// wire nor the pre-open queue.
+///
+/// Plain (non-wrapping) compare, deliberately: wrap needs ~4.3 billion
+/// snapshots — decades at real snapshot cadence within one driver's
+/// lifetime — and the browser applies the same plain
+/// `snapshotId <= lastAppliedSnapshotId` rejection on its side, so a
+/// wrapping-aware compare here would diverge from the actual wire
+/// contract rather than harden it.
+pub(crate) fn admit_snapshot_group(watermark: &mut Option<u32>, snapshot_id: u32) -> bool {
+    if watermark.is_some_and(|newest| snapshot_id <= newest) {
+        return false;
+    }
+    *watermark = Some(snapshot_id);
+    true
 }
 
 pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
@@ -1926,67 +2210,94 @@ mod tests {
         assert_eq!(resolved, c);
     }
 
-    /// **Phase-4c-prep**: `DriverState::video_specs` keying changed
-    /// from `PayloadSpec` to `(PayloadSpec, SimulcastRid)`. This is a
-    /// data-shape pin: a HashMap with `(spec, rid)` keys treats two
-    /// distinct rids as distinct entries even when they share the
-    /// same payload_spec — which is exactly the VP8 simulcast case
-    /// where every layer has the same `PayloadSpec` but each layer's
-    /// keyframe gate must remain independent.
-    ///
+    /// **Phase-4c-prep** contract: `DriverState::video_specs` is keyed
+    /// by `(PayloadSpec, SimulcastRid)`, not `PayloadSpec` alone — the
+    /// VP8 simulcast case gives every layer the same `PayloadSpec`,
+    /// but each layer's keyframe gate must remain independent.
     /// Without per-RID keying, a keyframe seen on RID `full` would
-    /// open the gate for P-frames on RIDs `half` and `quarter`. Those
-    /// P-frames would reference keyframes the half/quarter
-    /// subscribers never received, decoding to garbage.
+    /// open the gate for P-frames on RIDs `half` and `quarter`, which
+    /// would reference keyframes those subscribers never received and
+    /// decode to garbage.
     ///
-    /// This test pins the keying directly. It can't easily exercise
-    /// `write_video_frame` end-to-end without an `RTCPeerConnection`,
-    /// but the data-shape contract is what matters — if the keying
-    /// regresses to `PayloadSpec`-only the map would conflate the
-    /// three layers and this test would compile-fail (or assert).
+    /// This test exercises the **production shape**: the linear
+    /// `Vec<((PayloadSpec, SimulcastRid), SpecState)>` container that
+    /// `DriverState::video_specs` holds, probed and inserted through
+    /// [`video_spec_key_matches`] — the same predicate
+    /// `write_video_frame` uses for its per-frame lookup. A predicate
+    /// regression that matched spec but ignored rid would collapse
+    /// the three layers here and fail the assertions.
     #[test]
-    fn driver_state_video_specs_keys_by_spec_and_rid() {
+    fn video_specs_lookup_distinguishes_rids_sharing_a_spec() {
         use crate::encode::PayloadSpec;
         let spec = PayloadSpec::vp8();
-        let mut specs: HashMap<(PayloadSpec, SimulcastRid), SpecState> = HashMap::new();
-        // Insert under three distinct rids with the same spec. They
-        // must be three distinct entries — pre-fix keying by
-        // `PayloadSpec` alone would have collapsed them to one.
+        let mut specs: Vec<((PayloadSpec, SimulcastRid), SpecState)> = Vec::new();
+        // Same insert-if-absent walk as write_video_frame.
         for rid in [
             SimulcastRid::full(),
             SimulcastRid::half(),
             SimulcastRid::quarter(),
         ] {
-            specs.insert(
-                (spec.clone(), rid),
-                SpecState::Ready {
-                    keyframe_seen: false,
-                },
-            );
+            if !specs
+                .iter()
+                .any(|(key, _)| video_spec_key_matches(key, &spec, &rid))
+            {
+                specs.push((
+                    (spec.clone(), rid),
+                    SpecState::Ready {
+                        keyframe_seen: false,
+                    },
+                ));
+            }
         }
         assert_eq!(
             specs.len(),
             3,
-            "(PayloadSpec, SimulcastRid) keying must keep three rids \
-             with the same spec as three distinct entries; got {} \
-             entries — keying regressed to spec-only?",
+            "three rids sharing one spec must be three distinct \
+             entries; got {} — predicate regressed to spec-only?",
             specs.len(),
         );
-        // Flipping one rid's keyframe_seen must not affect the others.
-        if let Some(SpecState::Ready { keyframe_seen }) =
-            specs.get_mut(&(spec.clone(), SimulcastRid::full()))
-        {
+
+        // The predicate matches only the exact (spec, rid) pair:
+        // same spec + wrong rid and wrong spec + same rid both miss.
+        let h264 = PayloadSpec::h264_constrained_baseline();
+        assert!(video_spec_key_matches(
+            &specs[0].0,
+            &spec,
+            &SimulcastRid::full()
+        ));
+        assert!(!video_spec_key_matches(
+            &specs[0].0,
+            &spec,
+            &SimulcastRid::half()
+        ));
+        assert!(!video_spec_key_matches(
+            &specs[0].0,
+            &h264,
+            &SimulcastRid::full()
+        ));
+
+        // Flipping one rid's gate through the production lookup must
+        // not affect the other rids.
+        let full_idx = specs
+            .iter()
+            .position(|(key, _)| video_spec_key_matches(key, &spec, &SimulcastRid::full()))
+            .expect("full entry present");
+        if let (_, SpecState::Ready { keyframe_seen }) = &mut specs[full_idx] {
             *keyframe_seen = true;
         }
         for rid in [SimulcastRid::half(), SimulcastRid::quarter()] {
-            match specs.get(&(spec.clone(), rid.clone())) {
-                Some(SpecState::Ready { keyframe_seen }) => assert!(
+            let idx = specs
+                .iter()
+                .position(|(key, _)| video_spec_key_matches(key, &spec, &rid))
+                .unwrap_or_else(|| panic!("rid {} entry missing", rid.as_str()));
+            match &specs[idx].1 {
+                SpecState::Ready { keyframe_seen } => assert!(
                     !keyframe_seen,
-                    "rid {} keyframe_seen leaked across rids — keying \
-                     is wrong",
+                    "rid {} keyframe_seen leaked across rids — \
+                     predicate is wrong",
                     rid.as_str(),
                 ),
-                _ => panic!("rid {} entry missing", rid.as_str()),
+                _ => panic!("rid {} entry in wrong state", rid.as_str()),
             }
         }
     }
@@ -2838,5 +3149,180 @@ mod tests {
         assert_eq!(watermark_to_u32(1024), 1024);
         assert_eq!(watermark_to_u32(u32::MAX as usize), u32::MAX);
         assert_eq!(watermark_to_u32(u32::MAX as usize + 1), u32::MAX);
+    }
+
+    fn chunk(byte: u8, len: usize) -> Bytes {
+        Bytes::from(vec![byte; len])
+    }
+
+    /// The pre-open snapshot store holds at most **one complete
+    /// group**, exercised through the production
+    /// [`PendingTileQueues::place_snapshot_group`] /
+    /// [`PendingTileQueues::drain_for_label`] — the same methods the
+    /// driver's mailbox drain and OnOpen flush call. "Cancelled
+    /// mid-group" needs no queue-side handling by construction: the
+    /// whole-group boundary means a cancelled producer never publishes,
+    /// so nothing partial and nothing stale-partial can exist here.
+    #[test]
+    fn pending_snapshot_holds_only_complete_groups() {
+        let mut q = PendingTileQueues::default();
+
+        // A complete snapshot queues whole (channel not open).
+        assert!(q
+            .place_snapshot_group(false, 7, vec![chunk(7, 100); 3])
+            .is_none());
+
+        // A newer complete snapshot swaps complete-for-complete.
+        assert!(q
+            .place_snapshot_group(false, 9, vec![chunk(9, 100); 2])
+            .is_none());
+
+        // The production drain yields exactly the newest complete
+        // group, in order — never a partial mix.
+        let drained = q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL);
+        assert_eq!(drained.len(), 2);
+        assert!(
+            drained.iter().all(|c| c[0] == 9),
+            "no chunk of the superseded group survives"
+        );
+    }
+
+    /// An open channel delivers the admitted group to the caller for
+    /// immediate write; nothing is queued and the watermark still
+    /// advances (a stale group arriving while open is rejected too).
+    #[test]
+    fn open_channel_snapshot_delivers_and_advances_watermark() {
+        let mut q = PendingTileQueues::default();
+
+        let delivered = q
+            .place_snapshot_group(true, 5, vec![chunk(5, 10); 2])
+            .expect("admitted group on an open channel is delivered");
+        assert_eq!(delivered.len(), 2);
+        assert!(
+            q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).is_empty(),
+            "open-path delivery must not also queue"
+        );
+
+        // Stale group while open: rejected by the same watermark.
+        assert!(q
+            .place_snapshot_group(true, 5, vec![chunk(5, 10)])
+            .is_none());
+        assert!(q
+            .place_snapshot_group(true, 4, vec![chunk(4, 10)])
+            .is_none());
+    }
+
+    /// The watermark persists across drains: a late group from an
+    /// older, superseded producer must be rejected even when the queue
+    /// is empty — deriving freshness from queue contents would let it
+    /// resurrect a stale baseline between a drain and the next channel
+    /// open.
+    #[test]
+    fn stale_snapshot_group_rejected_after_drain() {
+        let mut q = PendingTileQueues::default();
+
+        assert!(q
+            .place_snapshot_group(false, 5, vec![chunk(5, 10); 2])
+            .is_none());
+        // Channel opens: the production drain empties the queue, the
+        // watermark stays.
+        assert_eq!(q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).len(), 2);
+
+        // Late group from an older producer: rejected, queue stays empty.
+        assert!(q
+            .place_snapshot_group(false, 4, vec![chunk(4, 10)])
+            .is_none());
+        // Same id as already accepted: also rejected (<=).
+        assert!(q
+            .place_snapshot_group(false, 5, vec![chunk(5, 10)])
+            .is_none());
+        assert!(
+            q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL).is_empty(),
+            "stale groups must not repopulate the queue"
+        );
+
+        // A genuinely newer group is admitted and queued.
+        assert!(q
+            .place_snapshot_group(false, 6, vec![chunk(6, 10)])
+            .is_none());
+        let drained = q.drain_for_label(TILE_SNAPSHOT_CHANNEL_LABEL);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0][0], 6);
+    }
+
+    /// N rapid publishes retain at most one group upstream: the
+    /// mailbox is latest-wins, so a snapshot-request storm holds one
+    /// complete generation per peer — never a queue of them.
+    #[test]
+    fn snapshot_mailbox_retains_only_latest_group() {
+        let mailbox = SnapshotMailbox::new();
+        for id in 0..64u32 {
+            mailbox.publish(id, vec![chunk(id as u8, 10); 4]);
+        }
+        let (id, chunks) = mailbox.take().expect("latest group retained");
+        assert_eq!(id, 63);
+        assert_eq!(chunks.len(), 4, "retained group is complete");
+        assert!(mailbox.take().is_none(), "exactly one group retained");
+    }
+
+    /// The mailbox keeps the **id-newest** group, not the
+    /// arrival-newest: producers mint ids before their (independently
+    /// scheduled) encodes, so an older snapshot can finish after a
+    /// newer one — it must not overwrite the newer baseline, which may
+    /// be the only correct-epoch one after a resize.
+    #[test]
+    fn snapshot_mailbox_keeps_newest_id_regardless_of_arrival_order() {
+        let mailbox = SnapshotMailbox::new();
+        // Snapshot 8 encodes fast and publishes first...
+        mailbox.publish(8, vec![chunk(8, 10); 4]);
+        // ...then the slower, older snapshot 7 finishes: dropped.
+        mailbox.publish(7, vec![chunk(7, 10); 2]);
+        let (id, chunks) = mailbox.take().expect("newest-id group retained");
+        assert_eq!(id, 8, "stale arrival must not overwrite a newer id");
+        assert_eq!(chunks.len(), 4, "retained group is the complete newer one");
+        assert!(mailbox.take().is_none());
+
+        // After a drain, a genuinely newer publish lands normally.
+        mailbox.publish(9, vec![chunk(9, 10)]);
+        assert_eq!(mailbox.take().expect("newer id accepted").0, 9);
+    }
+
+    /// Plain increasing admission: ids only ever move forward (the
+    /// documented no-wrap contract, matching the browser's own plain
+    /// `snapshotId <= lastAppliedSnapshotId` rejection).
+    #[test]
+    fn snapshot_admission_is_plainly_increasing() {
+        let mut watermark: Option<u32> = None;
+        assert!(admit_snapshot_group(&mut watermark, 10));
+        assert!(!admit_snapshot_group(&mut watermark, 10));
+        assert!(!admit_snapshot_group(&mut watermark, 9));
+        assert!(admit_snapshot_group(&mut watermark, 11));
+        assert_eq!(watermark, Some(11));
+        // No wrap heroics: after u32::MAX nothing is admitted — by
+        // design, and unreachable in practice (~4.3B snapshots).
+        assert!(admit_snapshot_group(&mut watermark, u32::MAX));
+        assert!(!admit_snapshot_group(&mut watermark, 0));
+    }
+
+    /// Pre-open control queue: self-contained frames under a byte
+    /// cap, oldest dropped first (later control state supersedes
+    /// earlier).
+    #[test]
+    fn pending_control_queue_drops_oldest_over_byte_cap() {
+        let mut q: VecDeque<Bytes> = VecDeque::new();
+        // Cap of 250 bytes: four 100-byte frames can never all fit.
+        for byte in 1..=4u8 {
+            push_pending_tile_bounded(&mut q, chunk(byte, 100), 250, "tile-control");
+        }
+        assert_eq!(q.len(), 2, "queue must stay under the byte cap");
+        // The two newest frames survive.
+        assert_eq!(q[0][0], 3);
+        assert_eq!(q[1][0], 4);
+
+        // An oversize single frame empties the queue but is itself
+        // kept (a frame can never fit by dropping others).
+        push_pending_tile_bounded(&mut q, chunk(9, 400), 250, "tile-control");
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0][0], 9);
     }
 }

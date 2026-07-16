@@ -28448,7 +28448,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = '382dda32e011734c';
+const INTENDANT_APP_BUILD = 'c5cafedb0132cd27';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -29905,6 +29905,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_worktrees_inspect: { verb: 'POST', path: '/api/worktrees/inspect' },
   api_worktrees_scan: { verb: 'POST', path: '/api/worktrees/scan' },
   api_worktrees_remove: { verb: 'POST', path: '/api/worktrees/remove' },
+  api_worktrees_clean: { verb: 'POST', path: '/api/worktrees/clean' },
   api_worktrees_merge: { verb: 'POST', path: '/api/worktrees/merge' },
   api_settings: { verb: 'GET', path: '/api/settings' },
   api_settings_save: { verb: 'POST', path: '/api/settings' },
@@ -80252,6 +80253,8 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_worktrees_inspect':
     case 'api_worktrees_scan':
     case 'api_worktrees_remove':
+    case 'api_worktrees_clean':
+    case 'api_worktrees_merge':
     case 'api_fs_mkdir':
     case 'api_fs_read':
     case 'api_transfer_jobs':

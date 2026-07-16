@@ -929,6 +929,12 @@ impl WebRtcPeer {
         let (encoded_frame_tx, encoded_frame_rx) =
             mpsc::channel::<OutboundEncodedFrame>(ENCODED_FRAME_CHANNEL);
         let (command_tx, command_rx) = mpsc::channel::<Command>(COMMAND_CHANNEL);
+        // Latest-wins snapshot hand-off, deliberately outside the
+        // command channel — see `SnapshotMailbox` for the retention
+        // argument (≤1 complete group per stage — mailbox + the
+        // driver's pre-open store — ≤2 per peer total, both stages
+        // superseded latest-wins).
+        let snapshot_mailbox = Arc::new(SnapshotMailbox::new());
         // Phase 4d.1: per-peer observed send bitrate (`bytes_sent`
         // delta, local egress only — see WebRtcPeer::observed_send_bitrate_rx
         // for the semantic distinction from capacity). Initial value
@@ -991,6 +997,7 @@ impl WebRtcPeer {
             peer_registration,
             encoded_frame_rx,
             command_rx,
+            Arc::clone(&snapshot_mailbox),
             input_handler,
             interactive_source.clone(),
             clipboard_handler,
@@ -1014,6 +1021,7 @@ impl WebRtcPeer {
             Self {
                 peer_id,
                 command_tx,
+                snapshot_mailbox,
                 clipboard_authorized,
                 interactive_source,
                 observed_send_bitrate_rx,
@@ -1346,27 +1354,35 @@ impl WebRtcPeer {
 
     /// D-3b: send a reliable tile-control binary frame to the browser.
     /// Queues in the driver until `tile-control` opens.
-    pub async fn send_tile_control_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+    pub async fn send_tile_control_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
         self.send_tile_frame(TileDataChannel::Control, data).await
     }
 
-    /// D-3b: send a reliable tile-snapshot binary frame to the browser.
-    /// Queues in the driver until `tile-snapshot` opens.
-    pub async fn send_tile_snapshot_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
-        self.send_tile_frame(TileDataChannel::Snapshot, data).await
+    /// D-3b: publish one **complete** tile snapshot (every wire chunk
+    /// of `snapshot_id`, in send order) to this peer's latest-wins
+    /// mailbox. Synchronous by design: the producer never awaits while
+    /// holding a group, and the id-newest snapshot supersedes an
+    /// unconsumed one, so mailbox retention is one group (≤2 per peer
+    /// across the mailbox + pre-open stages) — see [`SnapshotMailbox`].
+    /// The driver admits (watermark) and either writes the whole set
+    /// to an open `tile-snapshot` channel or queues it whole for the
+    /// pre-open flush; a partial snapshot is unassemblable, so no
+    /// per-chunk snapshot boundary exists.
+    pub fn send_tile_snapshot_group(&self, snapshot_id: u32, chunks: Vec<bytes::Bytes>) {
+        self.snapshot_mailbox.publish(snapshot_id, chunks);
     }
 
     /// D-3b: send an unreliable/supersedable tile-delta binary frame
     /// to the browser. If the channel is not open, the driver drops
     /// the frame rather than queueing stale deltas.
-    pub async fn send_tile_delta_frame(&self, data: Vec<u8>) -> Result<bool, CallerError> {
+    pub async fn send_tile_delta_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
         self.send_tile_frame(TileDataChannel::Deltas, data).await
     }
 
     pub(crate) async fn send_tile_frame(
         &self,
         channel: TileDataChannel,
-        data: Vec<u8>,
+        data: bytes::Bytes,
     ) -> Result<bool, CallerError> {
         match self
             .command_tx

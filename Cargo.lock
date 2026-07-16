@@ -2638,6 +2638,7 @@ dependencies = [
  "pipewire",
  "portable-pty",
  "presence-core",
+ "presence-web",
  "qrcode",
  "rand 0.8.6",
  "rcgen",

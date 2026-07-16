@@ -591,7 +591,25 @@ pub fn sampled_avg_byte(data: &[u8]) -> u32 {
 /// The output layout is: Y plane (width*height) followed by U plane
 /// (width/2 * height/2) followed by V plane (width/2 * height/2).
 /// U and V are subsampled 2x2 by averaging the four contributing pixels.
+///
+/// Allocates a fresh output buffer; per-frame callers should prefer
+/// [`bgra_to_i420_into`] with a recycled buffer.
 pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    bgra_to_i420_into(bgra, width, height, stride, &mut out);
+    out
+}
+
+/// [`bgra_to_i420`] into a caller-provided buffer (resized to fit; a
+/// buffer already at the right length is overwritten without the
+/// zero-fill a fresh `vec![0; …]` would pay).
+///
+/// **Single fused pass:** luma for a pair of rows and the 2×2-averaged
+/// chroma for that row pair are computed together, so the (large) BGRA
+/// source streams through the cache once — the previous split Y-then-UV
+/// implementation read every pixel twice. Fixed-point BT.601 math is
+/// unchanged, so output bytes are identical.
+pub fn bgra_to_i420_into(bgra: &[u8], width: u32, height: u32, stride: u32, out: &mut Vec<u8>) {
     let w = width as usize;
     let h = height as usize;
     let s = stride as usize;
@@ -601,61 +619,99 @@ pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8
 
     let y_size = w * h;
     let uv_size = uv_w * uv_h;
-    let mut out = vec![0u8; y_size + 2 * uv_size];
+    let total = y_size + 2 * uv_size;
+    if out.len() != total {
+        out.clear();
+        out.resize(total, 0);
+    }
 
     let (y_plane, uv_planes) = out.split_at_mut(y_size);
     let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
 
-    // Compute luma in row-major order. This is the largest plane and the
-    // most cache-sensitive loop; fixed-point math avoids the old per-pixel
-    // floating-point conversions while preserving the BT.601 coefficients.
-    for row in 0..h {
-        let row_start = row * s;
-        let y_row_start = row * w;
-        for col in 0..w {
-            let px = row_start + col * 4;
-            y_plane[y_row_start + col] =
-                rgb_to_y(bgra[px + 2] as i32, bgra[px + 1] as i32, bgra[px] as i32);
+    // Full 2×2 interior blocks (even spans). Odd right column / bottom
+    // row are handled separately below so this hot loop stays
+    // branch-free per block.
+    let w2 = w & !1;
+    let h2 = h & !1;
+
+    for uv_row in 0..h2 / 2 {
+        let row0 = uv_row * 2;
+        let src0 = row0 * s;
+        let src1 = src0 + s;
+        let y0 = row0 * w;
+        let y1 = y0 + w;
+        let uv_base = uv_row * uv_w;
+        for uv_col in 0..w2 / 2 {
+            let x = uv_col * 8;
+            let p00 = src0 + x;
+            let p01 = p00 + 4;
+            let p10 = src1 + x;
+            let p11 = p10 + 4;
+
+            let (b00, g00, r00) = bgra_px(bgra, p00);
+            let (b01, g01, r01) = bgra_px(bgra, p01);
+            let (b10, g10, r10) = bgra_px(bgra, p10);
+            let (b11, g11, r11) = bgra_px(bgra, p11);
+
+            let col = uv_col * 2;
+            y_plane[y0 + col] = rgb_to_y(r00, g00, b00);
+            y_plane[y0 + col + 1] = rgb_to_y(r01, g01, b01);
+            y_plane[y1 + col] = rgb_to_y(r10, g10, b10);
+            y_plane[y1 + col + 1] = rgb_to_y(r11, g11, b11);
+
+            let sum_r = r00 + r01 + r10 + r11;
+            let sum_g = g00 + g01 + g10 + g11;
+            let sum_b = b00 + b01 + b10 + b11;
+            u_plane[uv_base + uv_col] = rgb_sum_to_u(sum_r, sum_g, sum_b, 4);
+            v_plane[uv_base + uv_col] = rgb_sum_to_v(sum_r, sum_g, sum_b, 4);
+        }
+
+        // Odd width: rightmost column contributes a 1×2 block.
+        if w2 < w {
+            let col = w - 1;
+            let p0 = src0 + col * 4;
+            let p1 = src1 + col * 4;
+            let (b0, g0, r0) = bgra_px(bgra, p0);
+            let (b1, g1, r1) = bgra_px(bgra, p1);
+            y_plane[y0 + col] = rgb_to_y(r0, g0, b0);
+            y_plane[y1 + col] = rgb_to_y(r1, g1, b1);
+            u_plane[uv_base + uv_w - 1] = rgb_sum_to_u(r0 + r1, g0 + g1, b0 + b1, 2);
+            v_plane[uv_base + uv_w - 1] = rgb_sum_to_v(r0 + r1, g0 + g1, b0 + b1, 2);
         }
     }
 
-    // Compute U, V by averaging 2x2 blocks.
-    for uv_row in 0..uv_h {
-        for uv_col in 0..uv_w {
-            let mut sum_r: i32 = 0;
-            let mut sum_g: i32 = 0;
-            let mut sum_b: i32 = 0;
-            let mut count: i32 = 0;
-
-            for dy in 0..2usize {
-                let row = uv_row * 2 + dy;
-                if row >= h {
-                    continue;
-                }
-                let row_start = row * s;
-                for dx in 0..2usize {
-                    let col = uv_col * 2 + dx;
-                    if col >= w {
-                        continue;
-                    }
-                    let px = row_start + col * 4;
-                    let b = bgra[px] as i32;
-                    let g = bgra[px + 1] as i32;
-                    let r = bgra[px + 2] as i32;
-                    sum_b += b;
-                    sum_g += g;
-                    sum_r += r;
-                    count += 1;
-                }
-            }
-
-            let idx = uv_row * uv_w + uv_col;
-            u_plane[idx] = rgb_sum_to_u(sum_r, sum_g, sum_b, count);
-            v_plane[idx] = rgb_sum_to_v(sum_r, sum_g, sum_b, count);
+    // Odd height: bottom row contributes 2×1 blocks (and a 1×1 corner
+    // when the width is odd too).
+    if h2 < h {
+        let row = h - 1;
+        let src = row * s;
+        let y_row = row * w;
+        let uv_base = (uv_h - 1) * uv_w;
+        for uv_col in 0..w2 / 2 {
+            let col = uv_col * 2;
+            let p0 = src + col * 4;
+            let p1 = p0 + 4;
+            let (b0, g0, r0) = bgra_px(bgra, p0);
+            let (b1, g1, r1) = bgra_px(bgra, p1);
+            y_plane[y_row + col] = rgb_to_y(r0, g0, b0);
+            y_plane[y_row + col + 1] = rgb_to_y(r1, g1, b1);
+            u_plane[uv_base + uv_col] = rgb_sum_to_u(r0 + r1, g0 + g1, b0 + b1, 2);
+            v_plane[uv_base + uv_col] = rgb_sum_to_v(r0 + r1, g0 + g1, b0 + b1, 2);
+        }
+        if w2 < w {
+            let col = w - 1;
+            let (b, g, r) = bgra_px(bgra, src + col * 4);
+            y_plane[y_row + col] = rgb_to_y(r, g, b);
+            u_plane[uv_base + uv_w - 1] = rgb_sum_to_u(r, g, b, 1);
+            v_plane[uv_base + uv_w - 1] = rgb_sum_to_v(r, g, b, 1);
         }
     }
+}
 
-    out
+/// Load one BGRA pixel as `(b, g, r)` i32 components.
+#[inline]
+fn bgra_px(bgra: &[u8], idx: usize) -> (i32, i32, i32) {
+    (bgra[idx] as i32, bgra[idx + 1] as i32, bgra[idx + 2] as i32)
 }
 
 #[inline]
@@ -705,6 +761,24 @@ fn rounded_fixed_avg_clamped_u8(n: i32, count: i32) -> u8 {
 /// CPU budget actually binds, swapping the per-plane loop to a libyuv call
 /// is local — the function signature and output shape don't change.
 pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    downscale_i420_into(src, src_w, src_h, dst_w, dst_h, &mut out);
+    out
+}
+
+/// [`downscale_i420`] into a caller-provided buffer (resized to fit; a
+/// buffer already at the right length is overwritten in place) — the
+/// per-layer encoder threads call this per frame, and a fresh
+/// multi-hundred-KB zeroed allocation per frame per layer was pure
+/// allocator churn.
+pub fn downscale_i420_into(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    out: &mut Vec<u8>,
+) {
     debug_assert!(
         src_w.is_multiple_of(2) && src_h.is_multiple_of(2),
         "downscale_i420: src dims must be even, got {src_w}x{src_h}"
@@ -731,15 +805,19 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
 
     let dst_y_size = dst_w * dst_h;
     let dst_uv_size = (dst_w / 2) * (dst_h / 2);
-    let mut out = vec![0u8; dst_y_size + 2 * dst_uv_size];
+    let total = dst_y_size + 2 * dst_uv_size;
+    if out.len() != total {
+        out.clear();
+        out.resize(total, 0);
+    }
 
     let (src_y, src_uv) = src.split_at(src_y_size);
     let (src_u, src_v) = src_uv.split_at(src_uv_size);
     let (dst_y_plane, dst_uv) = out.split_at_mut(dst_y_size);
     let (dst_u_plane, dst_v_plane) = dst_uv.split_at_mut(dst_uv_size);
 
-    downscale_plane_bilinear(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
-    downscale_plane_bilinear(
+    downscale_plane(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
+    downscale_plane(
         src_u,
         src_w / 2,
         src_h / 2,
@@ -747,7 +825,7 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         dst_w / 2,
         dst_h / 2,
     );
-    downscale_plane_bilinear(
+    downscale_plane(
         src_v,
         src_w / 2,
         src_h / 2,
@@ -755,8 +833,47 @@ pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
         dst_w / 2,
         dst_h / 2,
     );
+}
 
-    out
+/// Per-plane downscale dispatch: the common simulcast case is an exact
+/// integer 2× reduction (full → half layer), where bilinear sampling
+/// at pixel centers degenerates to an equal-weight 2×2 box average —
+/// the integer box filter computes the identical bytes (the +0.5
+/// sampling puts every weight at exactly ¼, and `(sum + 2) >> 2`
+/// rounds the same direction as `f32::round` on the only possible
+/// fractions .0/.25/.5/.75) several times faster and without per-pixel
+/// float math. Everything else takes the generic bilinear path.
+fn downscale_plane(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) {
+    if src_w == dst_w * 2 && src_h == dst_h * 2 && dst_w > 0 && dst_h > 0 {
+        downscale_plane_box2x(src, src_w, dst, dst_w, dst_h);
+    } else {
+        downscale_plane_bilinear(src, src_w, src_h, dst, dst_w, dst_h);
+    }
+}
+
+/// Exact 2× reduction: equal-weight 2×2 box average in integer math.
+/// See [`downscale_plane`] for the bilinear-equivalence argument.
+fn downscale_plane_box2x(src: &[u8], src_w: usize, dst: &mut [u8], dst_w: usize, dst_h: usize) {
+    for dy in 0..dst_h {
+        let s0 = (dy * 2) * src_w;
+        let s1 = s0 + src_w;
+        let d = dy * dst_w;
+        for dx in 0..dst_w {
+            let sx = dx * 2;
+            let sum = src[s0 + sx] as u16
+                + src[s0 + sx + 1] as u16
+                + src[s1 + sx] as u16
+                + src[s1 + sx + 1] as u16;
+            dst[d + dx] = ((sum + 2) >> 2) as u8;
+        }
+    }
 }
 
 /// Bilinear single-plane downscale. The `dst` slice is written in
@@ -821,7 +938,8 @@ impl EncodedPacket {
     /// Convert to the shared `EncodedFrame` type used by the display session.
     pub fn into_encoded_frame(self) -> EncodedFrame {
         EncodedFrame {
-            data: self.data,
+            // Vec -> Bytes is an ownership move, not a copy.
+            data: self.data.into(),
             pts_ms: self.pts_ms,
             duration_ms: self.duration_ms,
             is_keyframe: self.is_keyframe,
@@ -1455,6 +1573,96 @@ a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
                 (actual - expected).abs() <= 1,
                 "dst col {dx}: expected ~{expected}, got {actual}",
             );
+        }
+    }
+
+    /// Deterministic pseudo-random plane bytes (LCG) — non-constant
+    /// input for the exact-2× equivalence pins below.
+    fn lcg_plane(len: usize, mut seed: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            out.push((seed >> 24) as u8);
+        }
+        out
+    }
+
+    /// Pin for `downscale_plane_box2x`'s bilinear equivalence claim: at
+    /// an exact 2× reduction the integer box filter must produce
+    /// byte-identical output to the pixel-center bilinear sampler on
+    /// arbitrary (non-constant) content. The constant-color tests never
+    /// reach the interesting rounding paths; this randomized plane does
+    /// — and pins the equivalence against future edits to either
+    /// implementation.
+    #[test]
+    fn downscale_plane_box2x_matches_bilinear_bit_for_bit() {
+        let (src_w, src_h, dst_w, dst_h) = (64usize, 32usize, 32usize, 16usize);
+        let src = lcg_plane(src_w * src_h, 0xD15C0DE);
+
+        let mut via_box = vec![0u8; dst_w * dst_h];
+        downscale_plane_box2x(&src, src_w, &mut via_box, dst_w, dst_h);
+
+        let mut via_bilinear = vec![0u8; dst_w * dst_h];
+        downscale_plane_bilinear(&src, src_w, src_h, &mut via_bilinear, dst_w, dst_h);
+
+        assert_eq!(
+            via_box, via_bilinear,
+            "exact-2× box filter must be bit-identical to bilinear",
+        );
+    }
+
+    /// End-to-end exact-2× I420 downscale on a gradient: every plane
+    /// (Y and the half-size U/V) satisfies `src == 2*dst`, so all
+    /// three take the box2x path, and every output byte must be the
+    /// rounded 2×2 box average of its source block.
+    #[test]
+    fn downscale_i420_exact_2x_gradient_takes_box_average() {
+        let (src_w, src_h, dst_w, dst_h) = (16u32, 8u32, 8u32, 4u32);
+        let y_size = (src_w * src_h) as usize;
+        let uv_size = (src_w / 2 * src_h / 2) as usize;
+        let src = lcg_plane(y_size + 2 * uv_size, 0xBEEF);
+
+        let out = downscale_i420(&src, src_w, src_h, dst_w, dst_h);
+
+        // Reference: rounded equal-weight 2×2 box average per plane.
+        let box_avg = |plane: &[u8], w: usize, dx: usize, dy: usize| -> u8 {
+            let s0 = (dy * 2) * w + dx * 2;
+            let s1 = s0 + w;
+            let sum =
+                plane[s0] as u16 + plane[s0 + 1] as u16 + plane[s1] as u16 + plane[s1 + 1] as u16;
+            ((sum + 2) >> 2) as u8
+        };
+
+        let (src_y, src_uv) = src.split_at(y_size);
+        let (src_u, src_v) = src_uv.split_at(uv_size);
+        let dst_y_size = (dst_w * dst_h) as usize;
+        let dst_uv_size = (dst_w / 2 * dst_h / 2) as usize;
+        let (out_y, out_uv) = out.split_at(dst_y_size);
+        let (out_u, out_v) = out_uv.split_at(dst_uv_size);
+
+        for dy in 0..dst_h as usize {
+            for dx in 0..dst_w as usize {
+                assert_eq!(
+                    out_y[dy * dst_w as usize + dx],
+                    box_avg(src_y, src_w as usize, dx, dy),
+                    "Y plane ({dx},{dy})",
+                );
+            }
+        }
+        for dy in 0..(dst_h / 2) as usize {
+            for dx in 0..(dst_w / 2) as usize {
+                let idx = dy * (dst_w / 2) as usize + dx;
+                assert_eq!(
+                    out_u[idx],
+                    box_avg(src_u, (src_w / 2) as usize, dx, dy),
+                    "U plane ({dx},{dy})",
+                );
+                assert_eq!(
+                    out_v[idx],
+                    box_avg(src_v, (src_w / 2) as usize, dx, dy),
+                    "V plane ({dx},{dy})",
+                );
+            }
         }
     }
 }

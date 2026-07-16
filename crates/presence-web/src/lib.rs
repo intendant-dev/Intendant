@@ -10,6 +10,11 @@
 // app_state is pure Rust (no WASM deps) — available on all targets for testing.
 pub mod app_state;
 
+// Pure-Rust envelope builders for the voice media send paths — compiled on
+// native too so their template-parity tests run in `cargo test`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod media_envelopes;
+
 // Everything below is WASM-only: browser WebSocket transport, voice providers, bindings.
 #[cfg(target_arch = "wasm32")]
 mod callbacks;
@@ -71,6 +76,18 @@ fn truncate_str(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// True when `s` can be spliced verbatim inside a JSON string literal
+/// without escaping: the base64 / base64url alphabets only (none of which
+/// need JSON escaping). Lets the realtime media send paths build their
+/// fixed-shape envelopes with `format!` — one copy — instead of paying a
+/// `serde_json::Value` copy plus a full escape-scanning `to_string` copy
+/// per mic chunk / video frame.
+#[cfg(any(target_arch = "wasm32", test))]
+fn json_safe_base64(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -154,9 +171,17 @@ mod wasm_impl {
             _ => {}
         }
 
-        if fire_raw_message {
-            cb.invoke_raw_message(&to_js(&msg));
+        // One JS mirror of the message, shared by every callback that needs
+        // it (raw-message interception, state-snapshot, server-event) — the
+        // JS handlers treat it as read-only. Presence-state updates below
+        // use the Rust-native `*_value` twins on the already-parsed `msg`,
+        // so no arm re-crosses the WASM boundary just to parse it back.
+        let raw_js = fire_raw_message.then(|| to_js(&msg));
+        if let Some(ref js) = raw_js {
+            cb.invoke_raw_message(js);
         }
+        let msg_js =
+            |raw_js: &Option<JsValue>| -> JsValue { raw_js.clone().unwrap_or_else(|| to_js(&msg)) };
 
         match t {
             Some("term") => {
@@ -166,35 +191,38 @@ mod wasm_impl {
             }
             Some("state_snapshot") => {
                 if let Some(state) = msg.get("state") {
-                    presence.borrow_mut().set_state(to_js(state));
+                    presence.borrow_mut().set_state_value(state);
                 }
-                cb.invoke_state_snapshot(&to_js(&msg));
+                cb.invoke_state_snapshot(&msg_js(&raw_js));
             }
             Some("presence_welcome") => {
+                // Detect server session change (binary restarted). If the
+                // session ID differs, the voice model's context is stale —
+                // JS must reconnect it.
                 if let Some(sid) = msg.get("session_id").and_then(|v| v.as_str()) {
                     let mut last = last_session_id.borrow_mut();
                     if let Some(ref prev) = *last {
                         if prev != sid {
-                            cb.invoke_diagnostic(
-                                "session_changed",
-                                &format!("{} -> {}", prev, sid),
-                            );
+                            cb.invoke_diagnostic("session_changed", &format!("{} → {}", prev, sid));
                             cb.invoke_session_changed();
                         }
                     }
                     *last = Some(sid.to_string());
                 }
                 if let Some(state) = msg.get("state") {
-                    presence.borrow_mut().set_state(to_js(state));
+                    presence.borrow_mut().set_state_value(state);
                 }
+                // Replay events from the window — Rust-native, zero boundary
+                // crossings per replayed event (bundles run to multiple MB).
                 if let Some(events) = msg.get("events").and_then(|v| v.as_array()) {
+                    let mut presence = presence.borrow_mut();
                     for event in events {
                         if let Some(inner) = event.get("event") {
-                            presence.borrow_mut().update_from_event(to_js(inner));
+                            presence.update_from_value(inner);
                         }
                     }
                 }
-                cb.invoke_state_snapshot(&to_js(&msg));
+                cb.invoke_state_snapshot(&msg_js(&raw_js));
             }
             Some("presence_checkpoint_ack") => {}
             Some("force_disconnect_voice") => {
@@ -254,9 +282,11 @@ mod wasm_impl {
             }
             _ => {
                 if msg.get("event").is_some() {
-                    let event_js = to_js(&msg);
-                    presence.borrow_mut().update_from_event(event_js.clone());
-                    cb.invoke_server_event(&event_js);
+                    // Update presence state on the parsed value (no bounce),
+                    // then notify JS for voice model narration reusing the
+                    // raw-message JS object when it exists.
+                    presence.borrow_mut().update_from_value(&msg);
+                    cb.invoke_server_event(&msg_js(&raw_js));
                 }
             }
         }
@@ -418,188 +448,28 @@ mod wasm_impl {
 
         #[wasm_bindgen]
         pub fn connect_server(&self, url: &str) {
-            let pending = self.pending_tool_requests.clone();
-            let pending_async = self.pending_async_calls.clone();
-            let presence = self.presence.clone();
-
-            // Create the message handler
+            // One routing implementation for both transports: the WebSocket
+            // handler installed here is `route_server_message` with raw-message
+            // interception on, sharing the session-change tracking with the
+            // tunneled (DataChannel) path in `handle_tunneled_server_message`.
+            // (This replaced a ~150-line inline duplicate of the router that
+            // had already drifted from it.)
             let handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>> = Rc::new(RefCell::new({
                 let cb = self.callbacks.clone();
-                let pending = pending;
-                let pending_async = pending_async;
-                let presence = presence;
-                let last_session_id: RefCell<Option<String>> = RefCell::new(None);
+                let pending = self.pending_tool_requests.clone();
+                let pending_async = self.pending_async_calls.clone();
+                let presence = self.presence.clone();
+                let last_session_id = self.last_server_session_id.clone();
                 Box::new(move |msg: serde_json::Value| {
-                    let t = msg.get("t").and_then(|v| v.as_str());
-
-                    match t {
-                        Some("terminal_output") => {
-                            let host_id = msg
-                                .get("host_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("local");
-                            let terminal_id = msg
-                                .get("terminal_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("shell-0");
-                            if let Some(data) = msg.get("data").and_then(|v| v.as_str()) {
-                                cb.invoke_terminal_output(host_id, terminal_id, data);
-                            }
-                            return;
-                        }
-                        Some("terminal_exited") => {
-                            let host_id = msg
-                                .get("host_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("local");
-                            let terminal_id = msg
-                                .get("terminal_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("shell-0");
-                            let status = msg.get("status").and_then(|v| v.as_i64()).unwrap_or(-1);
-                            cb.invoke_terminal_exited(host_id, terminal_id, status as i32);
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    // Fire raw message callback (for dashboard interception)
-                    cb.invoke_raw_message(&to_js(&msg));
-
-                    // Route by message type
-                    match t {
-                        Some("term") => {
-                            if let Some(d) = msg["d"].as_str() {
-                                cb.invoke_term(d);
-                            }
-                        }
-                        Some("state_snapshot") => {
-                            // Update presence state from bootstrap/reconnect
-                            if let Some(state) = msg.get("state") {
-                                presence.borrow_mut().set_state(to_js(state));
-                            }
-                            // Notify JS for voice model narration
-                            cb.invoke_state_snapshot(&to_js(&msg));
-                        }
-                        Some("presence_welcome") => {
-                            // Detect server session change (binary restarted).
-                            // If the session ID differs, the voice model's Gemini
-                            // context is stale — JS must reconnect it.
-                            if let Some(sid) = msg.get("session_id").and_then(|v| v.as_str()) {
-                                let mut last = last_session_id.borrow_mut();
-                                if let Some(ref prev) = *last {
-                                    if prev != sid {
-                                        cb.invoke_diagnostic(
-                                            "session_changed",
-                                            &format!("{} → {}", prev, sid),
-                                        );
-                                        cb.invoke_session_changed();
-                                    }
-                                }
-                                *last = Some(sid.to_string());
-                            }
-                            // Update presence state from welcome
-                            if let Some(state) = msg.get("state") {
-                                presence.borrow_mut().set_state(to_js(state));
-                            }
-                            // Replay events from the window
-                            if let Some(events) = msg.get("events").and_then(|v| v.as_array()) {
-                                for event in events {
-                                    if let Some(inner) = event.get("event") {
-                                        presence.borrow_mut().update_from_event(to_js(inner));
-                                    }
-                                }
-                            }
-                            // Notify JS (same callback as state_snapshot)
-                            cb.invoke_state_snapshot(&to_js(&msg));
-                        }
-                        Some("presence_checkpoint_ack") => {
-                            // Acknowledged — no action needed on browser side
-                        }
-                        Some("force_disconnect_voice") => {
-                            let reason = msg["reason"].as_str().unwrap_or("unknown");
-                            cb.invoke_force_disconnect(reason);
-                        }
-                        Some("active_granted") => {
-                            let handover_context = msg["handover_context"].as_str().unwrap_or("");
-                            let conversation_context =
-                                msg["conversation_context"].as_str().unwrap_or("");
-                            cb.invoke_active_granted(handover_context, conversation_context);
-                        }
-                        Some("tool_response") => {
-                            if let Some(id) = msg["id"].as_str() {
-                                let resolver = pending.borrow_mut().remove(id);
-                                if let Some(f) = resolver {
-                                    let result_js = to_js(
-                                        msg.get("result").unwrap_or(&serde_json::Value::Null),
-                                    );
-                                    let _ = f.call1(&JsValue::NULL, &result_js);
-                                }
-                            }
-                        }
-                        Some("async_query_result") => {
-                            let req_id = msg["id"].as_str().unwrap_or("");
-                            let tool = msg["tool"].as_str().unwrap_or("query");
-                            let result_text = msg["result"].as_str().unwrap_or("");
-                            let truncated = if result_text.len() > 2000 {
-                                format!("{}...(truncated)", truncate_str(result_text, 2000))
-                            } else {
-                                result_text.to_string()
-                            };
-
-                            // If images are included (e.g. from inspect_frame), inject them
-                            // into the voice model via send_frame before the tool response
-                            // so the model sees the image in the same context.
-                            if let Some(images) = msg["images"].as_array() {
-                                for (i, img) in images.iter().enumerate() {
-                                    if let Some(data) = img["data"].as_str() {
-                                        let label = format!("{}_{}", tool, i);
-                                        cb.invoke_inject_voice_image(data, &label);
-                                    }
-                                }
-                            }
-
-                            // Resolve the pending tool call with a proper tool_response.
-                            // This replaces the old placeholder approach — the model was
-                            // ignoring passively injected results because it had already
-                            // moved past the tool call turn.
-                            let pending_call = pending_async.borrow_mut().remove(req_id);
-                            if let Some(original_call) = pending_call {
-                                let result = serde_json::json!({"result": truncated});
-                                cb.invoke_tool_response(&original_call, &to_js(&result));
-                            } else {
-                                // Fallback: no pending call (e.g. fire-and-forget query)
-                                let text = format!("[System: {} result] {}", tool, truncated);
-                                cb.invoke_inject_voice_text_passive(&text);
-                            }
-                        }
-                        Some("display_input_authority_state") => {
-                            // Phase 5a.1: per-display input-authority state for
-                            // this browser.  Server has already resolved the
-                            // holder against this connection's id; we receive
-                            // the resolved `you|other|unclaimed` and forward to
-                            // JS.  Skips the generic event/raw-message paths so
-                            // dashboard JS doesn't accidentally route this
-                            // through `on_server_event` for narration or
-                            // unrelated state machinery.
-                            if let (Some(display_id), Some(state)) = (
-                                msg.get("display_id").and_then(|v| v.as_u64()),
-                                msg.get("state").and_then(|v| v.as_str()),
-                            ) {
-                                cb.invoke_display_input_authority_change(display_id as u32, state);
-                            }
-                        }
-                        _ => {
-                            // Event messages (have "event" field)
-                            if msg.get("event").is_some() {
-                                let event_js = to_js(&msg);
-                                // Update presence state (drop borrow before callback)
-                                presence.borrow_mut().update_from_event(event_js.clone());
-                                // Notify JS for voice model narration
-                                cb.invoke_server_event(&event_js);
-                            }
-                        }
-                    }
+                    route_server_message(
+                        &cb,
+                        &pending,
+                        &pending_async,
+                        &presence,
+                        &last_session_id,
+                        msg,
+                        true,
+                    );
                 })
             }));
 
@@ -1486,10 +1356,12 @@ mod wasm_impl {
 // ---------------------------------------------------------------------------
 // Native-buildable wire-format invariant tests (Phase 5a.1)
 //
-// The actual dispatch arm in `connect_server`'s message handler is
-// gated on `#[cfg(target_arch = "wasm32")]`, so it can't be exercised
-// directly from a native `cargo test`.  Instead we pin the *wire
-// contract* the dispatch reads — same shape that
+// The actual dispatch arm lives in `route_server_message` (the shared
+// router behind both `connect_server`'s WebSocket handler and
+// `handle_tunneled_server_message`), which is gated on
+// `#[cfg(target_arch = "wasm32")]`, so it can't be exercised directly
+// from a native `cargo test`.  Instead we pin the *wire contract* the
+// dispatch reads — same shape that
 // `web_gateway::apply_grant_input_authority` (and friends) emit.  If
 // either side drifts (server changes the field name, dispatch reads a
 // different field), one of these tests fires and the integration
@@ -1507,11 +1379,29 @@ mod authority_wire_tests {
         assert_eq!(super::truncate_str(&text, 2000), "a".repeat(1999));
     }
 
-    /// The dispatch in `connect_server` matches `t == "display_input_authority_state"`
-    /// and reads `display_id: u64` + `state: &str`.  This test pins
-    /// that exact shape against the JSON the gateway actually emits,
-    /// failing loudly if either side renames a field or changes a
-    /// type.
+    /// The realtime media paths splice payloads that pass this check
+    /// verbatim into JSON string literals; anything JSON-meaningful must
+    /// be rejected so those envelopes can never be malformed.
+    #[test]
+    fn json_safe_base64_accepts_payload_alphabets_only() {
+        assert!(super::json_safe_base64(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+        ));
+        assert!(super::json_safe_base64("SGVsbG8tV29ybGRf")); // base64url - and _
+        assert!(super::json_safe_base64("")); // empty payload is safe to splice
+        for bad in ["a\"b", "a\\b", "a b", "a\nb", "{}", "a,b", "é"] {
+            assert!(
+                !super::json_safe_base64(bad),
+                "{bad:?} must not be spliced raw"
+            );
+        }
+    }
+
+    /// The dispatch in `route_server_message` matches
+    /// `t == "display_input_authority_state"` and reads `display_id: u64` +
+    /// `state: &str`.  This test pins that exact shape against the JSON the
+    /// gateway actually emits, failing loudly if either side renames a
+    /// field or changes a type.
     #[test]
     fn display_input_authority_state_shape_matches_dispatch() {
         // Construct the JSON the way `web_gateway` emits it (see

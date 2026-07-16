@@ -7,6 +7,7 @@
 //! send a fresh snapshot instead of trying to reconstruct unbounded
 //! history.
 
+use bytes::Bytes;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,10 @@ pub const GAP_RINGBUFFER_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub struct ReplayFrame {
     pub epoch: u32,
     pub seq: u32,
-    pub bytes: Vec<u8>,
+    /// Wire frame payload. `Bytes` so pushing into the buffer and
+    /// replaying to a peer are refcount bumps of the frame the send
+    /// path already built, not per-entry copies.
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +74,7 @@ impl TileUpdateReplayBuffer {
         self.total_bytes
     }
 
-    pub fn push(&mut self, epoch: u32, seq: u32, bytes: Vec<u8>, now: Instant) {
+    pub fn push(&mut self, epoch: u32, seq: u32, bytes: Bytes, now: Instant) {
         self.prune_expired(now);
         self.total_bytes = self.total_bytes.saturating_add(bytes.len());
         self.entries.push_back(Entry {
@@ -157,8 +161,8 @@ mod tests {
         Instant::now()
     }
 
-    fn payload(byte: u8, len: usize) -> Vec<u8> {
-        vec![byte; len]
+    fn payload(byte: u8, len: usize) -> Bytes {
+        Bytes::from(vec![byte; len])
     }
 
     #[test]

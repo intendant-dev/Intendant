@@ -1173,3 +1173,33 @@ pub fn format_model_summary(content: &str) -> String {
 
     summaries.join(" | ")
 }
+
+#[cfg(test)]
+mod js_handled_events_parity {
+    use super::OutboundEvent;
+
+    /// The dashboard's WASM reducer (`presence_web::app_state`) swallows a
+    /// hand-listed set of daemon events instead of dumping them into its
+    /// debug log buffer. That list is a mirror of this crate's
+    /// `OutboundEvent` wire names, so pin it here (derive-don't-mirror):
+    /// every listed name must deserialize to a *recognized* variant. A
+    /// daemon-side rename or removal makes the stale name parse to the
+    /// `#[serde(other)]` `Unknown` fallback and fails this test, instead of
+    /// silently turning the swallow back into per-event debug-row noise.
+    ///
+    /// A known tag with missing payload fields is `Err` (the tag matched,
+    /// the fields didn't) — that still proves the name is in the
+    /// vocabulary, so only `Ok(Unknown)` is drift.
+    #[test]
+    fn js_handled_events_match_outbound_event_vocabulary() {
+        for name in presence_web::app_state::JS_HANDLED_EVENTS {
+            match serde_json::from_value::<OutboundEvent>(serde_json::json!({"event": name})) {
+                Ok(OutboundEvent::Unknown) => panic!(
+                    "JS_HANDLED_EVENTS entry {name:?} is not an OutboundEvent wire name — \
+                     the reducer's swallow list has drifted from the daemon vocabulary"
+                ),
+                Ok(_) | Err(_) => {}
+            }
+        }
+    }
+}

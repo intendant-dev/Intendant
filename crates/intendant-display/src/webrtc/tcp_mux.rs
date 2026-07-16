@@ -442,6 +442,11 @@ pub async fn read_rfc4571_frame_pub(stream: &mut TcpStream) -> std::io::Result<V
 
 /// Write one RFC 4571 framed payload: prepend a 2-byte BE length header,
 /// then the payload bytes.
+///
+/// Header + payload are coalesced into a single `write_all`: the write
+/// halves this feeds are unbuffered, so two writes meant two syscalls
+/// (and potentially two TCP segments) per RTP packet — ~600 syscalls/s
+/// per connection at typical media rates. One small copy beats that.
 pub async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     payload: &[u8],
@@ -453,8 +458,10 @@ pub async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
         ));
     }
     let len = payload.len() as u16;
-    w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(payload).await?;
+    let mut framed = Vec::with_capacity(2 + payload.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(payload);
+    w.write_all(&framed).await?;
     Ok(())
 }
 

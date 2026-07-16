@@ -137,8 +137,10 @@ impl GeminiProvider {
         // Per-turn counters for hallucination detection diagnostics.
         let turn_tool_calls = Rc::new(Cell::new(0u32));
         let turn_has_speech = Rc::new(Cell::new(false));
+        let turn_audio_msgs = Rc::new(Cell::new(0u32));
         let turn_tool_calls_inner = turn_tool_calls.clone();
         let turn_has_speech_inner = turn_has_speech.clone();
+        let turn_audio_msgs_inner = turn_audio_msgs.clone();
         let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
             let text = if let Some(s) = e.data().as_string() {
                 Some(s)
@@ -156,6 +158,7 @@ impl GeminiProvider {
                         &msg,
                         &turn_tool_calls_inner,
                         &turn_has_speech_inner,
+                        &turn_audio_msgs_inner,
                     );
                 }
             }
@@ -273,6 +276,7 @@ impl GeminiProvider {
         msg: &serde_json::Value,
         turn_tool_calls: &Cell<u32>,
         turn_has_speech: &Cell<bool>,
+        turn_audio_msgs: &Cell<u32>,
     ) {
         // usageMetadata can appear alongside any server message.
         // Normalize Gemini-specific fields into provider-agnostic LiveUsage.
@@ -368,16 +372,29 @@ impl GeminiProvider {
                 }
                 callbacks.invoke_diagnostic(
                     "gemini_msg",
-                    &format!("turnComplete (tools={}, spoke={})", tools, spoke),
+                    &format!(
+                        "turnComplete (tools={}, spoke={}, audio_msgs={})",
+                        tools,
+                        spoke,
+                        turn_audio_msgs.get()
+                    ),
                 );
                 // Reset for next turn
                 turn_tool_calls.set(0);
                 turn_has_speech.set(false);
+                turn_audio_msgs.set(0);
                 return;
             }
             if response.get("interrupted").is_some() {
                 callbacks.invoke_diagnostic("gemini_msg", "interrupted");
                 callbacks.invoke_voice_interrupted();
+                // An interruption ends the model's turn without a
+                // turnComplete: reset all per-turn diagnostic state so the
+                // counters (and the audio_msgs rollup) don't bleed into
+                // the next turn's line.
+                turn_tool_calls.set(0);
+                turn_has_speech.set(false);
+                turn_audio_msgs.set(0);
                 return;
             }
             if let Some(model_turn) = response.get("modelTurn") {
@@ -411,20 +428,29 @@ impl GeminiProvider {
                             callbacks.invoke_voice_tool_call(&call_js);
                         }
                     }
-                    let mut kinds = Vec::new();
-                    if has_audio {
-                        kinds.push("audio");
+                    // Audio-only modelTurn chunks are the continuous steady
+                    // stream of a speaking model — a JS diagnostic call per
+                    // chunk is realtime-path overhead for no signal, so they
+                    // are counted and rolled into the turnComplete line
+                    // instead. Text/tool parts stay per-message.
+                    if has_audio && !has_text && !has_tool {
+                        turn_audio_msgs.set(turn_audio_msgs.get() + 1);
+                    } else {
+                        let mut kinds = Vec::new();
+                        if has_audio {
+                            kinds.push("audio");
+                        }
+                        if has_text {
+                            kinds.push("text");
+                        }
+                        if has_tool {
+                            kinds.push("functionCall");
+                        }
+                        callbacks.invoke_diagnostic(
+                            "gemini_msg",
+                            &format!("serverContent({})", kinds.join("+")),
+                        );
                     }
-                    if has_text {
-                        kinds.push("text");
-                    }
-                    if has_tool {
-                        kinds.push("functionCall");
-                    }
-                    callbacks.invoke_diagnostic(
-                        "gemini_msg",
-                        &format!("serverContent({})", kinds.join("+")),
-                    );
                 }
             }
         }
@@ -438,26 +464,10 @@ impl GeminiProvider {
     /// `turn_complete: true` annotation could cancel an in-progress tool call.
     pub fn send_frame(&self, base64_jpeg: &str, frame_id: &str) {
         if let Some(ref ws) = self.ws {
-            let msg = serde_json::json!({
-                "client_content": {
-                    "turns": [{
-                        "role": "user",
-                        "parts": [
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/jpeg",
-                                    "data": base64_jpeg
-                                }
-                            },
-                            {
-                                "text": format!("[frame:{}]", frame_id)
-                            }
-                        ]
-                    }],
-                    "turn_complete": false
-                }
-            });
-            let _ = ws.send_with_str(&msg.to_string());
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::gemini_frame(base64_jpeg, frame_id);
+            let _ = ws.send_with_str(&msg);
             self.callbacks.invoke_diagnostic(
                 "video_send",
                 &format!("frame {} ({}B)", frame_id, base64_jpeg.len()),
@@ -465,23 +475,25 @@ impl GeminiProvider {
         }
     }
 
+    /// Every how many audio chunks the `audio_send` diagnostic fires (the
+    /// first chunk always logs). Chunks flow continuously while the mic is
+    /// live; a JS diagnostic call per chunk is steady overhead for no signal.
+    const AUDIO_DIAG_SAMPLE: u64 = 25;
+
     pub fn send_audio(&self, base64_pcm: &str) {
         if let Some(ref ws) = self.ws {
-            let msg = serde_json::json!({
-                "realtime_input": {
-                    "media_chunks": [{
-                        "mime_type": format!("audio/pcm;rate={}", self.input_sample_rate),
-                        "data": base64_pcm
-                    }]
-                }
-            });
-            let _ = ws.send_with_str(&msg.to_string());
+            // Fixed-shape envelope, base64 spliced verbatim; see
+            // `media_envelopes` for the template and its parity tests.
+            let msg = crate::media_envelopes::gemini_audio(base64_pcm, self.input_sample_rate);
+            let _ = ws.send_with_str(&msg);
             let count = self.audio_send_count.get() + 1;
             self.audio_send_count.set(count);
-            self.callbacks.invoke_diagnostic(
-                "audio_send",
-                &format!("chunk #{} ({}B)", count, base64_pcm.len()),
-            );
+            if count == 1 || count.is_multiple_of(Self::AUDIO_DIAG_SAMPLE) {
+                self.callbacks.invoke_diagnostic(
+                    "audio_send",
+                    &format!("chunk #{} ({}B)", count, base64_pcm.len()),
+                );
+            }
         } else {
             self.callbacks
                 .invoke_diagnostic("audio_send", "DROPPED — no WebSocket");

@@ -65,6 +65,117 @@ const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
 const CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES: usize = 64 * 1024;
 const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_BYTE_STREAM_CHUNK_BYTES: usize = 16 * 1024;
+/// Capacity of the per-connection bounded PTY-output lane (the tunnel twin
+/// of `ws_session::TERMINAL_FORWARD_LANE_CAP`). Entries are one JSON frame
+/// around a base64 chunk (terminal.rs merges output up to 64 KiB per
+/// entry), so the lane holds ~1.4 MiB worst case — the same order as
+/// terminal.rs's own 1 MiB per-listener bound that takes over
+/// (drop-oldest) once this lane fills and the forwarders park.
+const TERMINAL_OUTPUT_LANE_CAP: usize = 16;
+/// Stop draining the terminal-output lane once the control channel's SCTP
+/// send buffer holds this much; resume at the low watermark. The response
+/// lane is client-credit-gated, but PTY output had no end-to-end
+/// backpressure — a stalled tab grew the unbounded SCTP pending queue at
+/// PTY rate.
+const TERMINAL_LANE_BUFFERED_HIGH_WATERMARK_BYTES: usize = 1024 * 1024;
+/// Low watermark paired with [`TERMINAL_LANE_BUFFERED_HIGH_WATERMARK_BYTES`].
+const TERMINAL_LANE_BUFFERED_LOW_WATERMARK_BYTES: usize = 256 * 1024;
+/// Per-connection cap on bytes resident in the credit-gated outbound
+/// queue. Sized above the single largest legitimate response (the 100 MB
+/// fs-read cap) so one full-size download always fits, while N stalled
+/// downloads to a quiet client can no longer pin N full payloads.
+const CONTROL_OUTBOUND_QUEUE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Companion frame-count cap: small immediate frames parked behind a
+/// zero-credit chunked head are byte-cheap but were unbounded in number.
+const CONTROL_OUTBOUND_QUEUE_MAX_FRAMES: usize = 4096;
+
+/// Clamp a byte watermark into the `u32` the rtc data-channel threshold
+/// setters take (shared with the peer file-transfer driver).
+pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
+
+/// ERROR-class classification for the immediate-frame budget seam: the
+/// plain error envelope (`ok: false` — auth denials, unknown methods,
+/// admission refusals) and the injected-status error shape
+/// (`result._httpOk: false` — the upload lane's 4xx/5xx envelopes).
+/// These are the frames a client can mint cheaply by spamming invalid
+/// requests; success frames are never budgeted.
+pub(crate) fn is_error_class_frame(frame: &serde_json::Value) -> bool {
+    if frame.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return true;
+    }
+    frame
+        .get("result")
+        .and_then(|result| result.get("_httpOk"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+}
+
+/// Token budget for DIRECT error frames — the admission-refusal and
+/// rejection replies that deliberately bypass the queue/backpressure
+/// lanes (they must be deliverable exactly when those lanes are the
+/// problem). While the wire is below its high watermark the budget stays
+/// full (frames drain as fast as they are sent); while congested each
+/// direct error spends one token, and at zero the frame is DROPPED and
+/// counted (logged once per connection, summarized at teardown) — the
+/// protocol contract is best-effort error delivery under abuse, bounded
+/// memory always. Shared by the dashboard tunnel and the peer
+/// file-transfer driver.
+pub(crate) struct DirectErrorBudget {
+    label: &'static str,
+    remaining: u32,
+    dropped: u64,
+}
+
+/// Direct error frames spendable while the wire stays congested.
+pub(crate) const DIRECT_ERROR_BUDGET_FRAMES: u32 = 64;
+
+impl DirectErrorBudget {
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            remaining: DIRECT_ERROR_BUDGET_FRAMES,
+            dropped: 0,
+        }
+    }
+
+    /// Whether one direct error frame may be sent right now.
+    pub(crate) fn allow(&mut self, wire_congested: bool) -> bool {
+        if !wire_congested {
+            // Uncongested wire drains what it is handed; refill.
+            self.remaining = DIRECT_ERROR_BUDGET_FRAMES;
+            return true;
+        }
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            return true;
+        }
+        self.dropped = self.dropped.saturating_add(1);
+        if self.dropped == 1 {
+            eprintln!(
+                "[{}] direct error-frame budget exhausted while congested; dropping further error frames",
+                self.label
+            );
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Log the drop tally at connection teardown (silent when zero).
+    pub(crate) fn log_teardown(&self) {
+        if self.dropped > 0 {
+            eprintln!(
+                "[{}] dropped {} direct error frame(s) under congestion this session",
+                self.label, self.dropped
+            );
+        }
+    }
+}
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
@@ -346,9 +457,22 @@ fn all_control_methods() -> &'static [ControlMethodSpec] {
 }
 
 fn control_method_spec(method: &str) -> Option<&'static ControlMethodSpec> {
-    all_control_methods()
-        .iter()
-        .find(|spec| spec.name == method)
+    // Indexed once: this lookup runs at least twice per tunnel request
+    // (authorizer + dispatch), and the effective table is ~150 entries.
+    // `or_insert` preserves the table's first-wins resolution order.
+    static INDEX: std::sync::OnceLock<HashMap<&'static str, &'static ControlMethodSpec>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let methods = all_control_methods();
+            let mut index = HashMap::with_capacity(methods.len());
+            for spec in methods {
+                index.entry(spec.name).or_insert(spec);
+            }
+            index
+        })
+        .get(method)
+        .copied()
 }
 
 /// Transport/frame-family features that aren't request methods (chunking,
@@ -1742,7 +1866,9 @@ impl DashboardControlPeer {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
-            config: serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
+            config: Arc::new(
+                serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
+            ),
             bus,
             peer_registry,
             mcp_server,
@@ -1751,7 +1877,7 @@ impl DashboardControlPeer {
             worktree_inventory_cache,
             terminal_registry,
             task_tx,
-            agent_card,
+            agent_card: Arc::new(agent_card),
             bootstrap_caches,
             display_authority,
             presence,
@@ -1825,7 +1951,9 @@ pub(crate) struct ControlRuntime {
     events_subscribed: bool,
     events_sent: u64,
     response_credit_enabled: bool,
-    config: serde_json::Value,
+    /// Shared, not owned: `ControlRuntime` is cloned per spawned request,
+    /// and an owned tree deep-copied this multi-KB JSON every time.
+    config: Arc<serde_json::Value>,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
     mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
@@ -1834,7 +1962,9 @@ pub(crate) struct ControlRuntime {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
-    agent_card: serde_json::Value,
+    /// Shared like `config` (multi-KB tree; `ControlRuntime` is cloned
+    /// per spawned request).
+    agent_card: Arc<serde_json::Value>,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
     presence: Option<DashboardPresenceBridge>,
@@ -1921,6 +2051,197 @@ pub(crate) struct ControlTaskResponse {
     done: bool,
 }
 
+/// One spawned-lane response paired with the reservation generation that
+/// produced it (see [`PendingControlRequests`]): the driver forwards a
+/// response only while its generation still owns the id's reservation,
+/// so a superseded task can neither reach the wire under a reused id nor
+/// free its replacement's reservation.
+pub(crate) type SequencedTaskResponse = (u64, ControlTaskResponse);
+
+/// The spawned-request reservations for one tunnel connection, keyed by
+/// request id with a per-admission GENERATION (the peer-transfer read
+/// registry's pattern): same-id replacement cancels its predecessor and
+/// mints a new generation, completion frees only its own generation, and
+/// stale-generation responses are dropped.
+///
+/// Admission is bounded by LIVE WORK, not addressable entries: every
+/// admit hands out an RAII [`LiveWorkSlot`] that the spawned task owns
+/// until its work ACTUALLY ends (the handler future runs to completion —
+/// awaited `spawn_blocking` segments included). A cancelled predecessor
+/// therefore keeps holding its slot while it drains, so rapid same-id
+/// cycling saturates [`MAX_PENDING_CONTROL_REQUESTS`] and gets refused
+/// instead of stacking untracked work onto the blocking pool.
+pub(crate) struct PendingControlRequests {
+    entries: HashMap<String, PendingControlRequest>,
+    /// Live-work ledger: strong count − 1 = slots currently held.
+    live_work: Arc<()>,
+    /// Committing-upload ledger: commits in flight with their byte
+    /// weights (they left `inbound_uploads` but their work — and spool —
+    /// lives until the commit finishes; the upload 8-cap counts them and
+    /// the 256 MiB aggregate counts their bytes).
+    committing_uploads: Arc<UploadCommitLedger>,
+    next_generation: u64,
+}
+
+#[derive(Default)]
+struct UploadCommitLedger {
+    count: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+}
+
+struct PendingControlRequest {
+    cancel: CancellationToken,
+    generation: u64,
+}
+
+/// RAII live-work slot: dropping it is the ONLY thing that frees
+/// admission capacity, so a slot must be owned by the spawned task (or
+/// the upload state that becomes one) and live until the work ends.
+pub(crate) struct LiveWorkSlot(#[allow(dead_code)] Arc<()>);
+
+/// RAII committing-upload slot (see `committing_uploads`): carries the
+/// commit's byte weight, debited from the ledger only when the commit
+/// actually finishes.
+pub(crate) struct UploadCommitSlot {
+    ledger: Arc<UploadCommitLedger>,
+    bytes: usize,
+}
+
+impl Drop for UploadCommitSlot {
+    fn drop(&mut self) {
+        self.ledger
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.ledger
+            .bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl PendingControlRequests {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            live_work: Arc::new(()),
+            committing_uploads: Arc::new(UploadCommitLedger::default()),
+            next_generation: 0,
+        }
+    }
+
+    /// Reserve a live-work slot for `id`, cancelling and replacing any
+    /// predecessor ENTRY. The predecessor's SLOT stays with its task —
+    /// capacity frees when that work exits, never at replacement.
+    pub(crate) fn admit(&mut self, id: &str) -> (CancellationToken, u64, LiveWorkSlot) {
+        if let Some(previous) = self.entries.remove(id) {
+            previous.cancel.cancel();
+        }
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        let cancel = CancellationToken::new();
+        self.entries.insert(
+            id.to_string(),
+            PendingControlRequest {
+                cancel: cancel.clone(),
+                generation,
+            },
+        );
+        (
+            cancel,
+            generation,
+            LiveWorkSlot(Arc::clone(&self.live_work)),
+        )
+    }
+
+    /// Slots currently held by live work (draining predecessors included).
+    pub(crate) fn live_work(&self) -> usize {
+        Arc::strong_count(&self.live_work).saturating_sub(1)
+    }
+
+    /// One committing upload's cap + byte presence (held until the
+    /// commit ends; `bytes` is the upload's actual received size).
+    pub(crate) fn upload_commit_slot(&self, bytes: usize) -> UploadCommitSlot {
+        self.committing_uploads
+            .count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.committing_uploads
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        UploadCommitSlot {
+            ledger: Arc::clone(&self.committing_uploads),
+            bytes,
+        }
+    }
+
+    /// Commits currently in flight.
+    pub(crate) fn committing_uploads(&self) -> usize {
+        self.committing_uploads
+            .count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes held by commits in flight (counted against the aggregate
+    /// declared-bytes budget until each commit completes).
+    pub(crate) fn committing_upload_bytes(&self) -> usize {
+        self.committing_uploads
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The client's `cancel` frame: cancel and free the reservation.
+    pub(crate) fn cancel_remove(&mut self, id: &str) -> bool {
+        match self.entries.remove(id) {
+            Some(entry) => {
+                entry.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `generation` still owns `id`'s reservation.
+    pub(crate) fn matches(&self, id: &str, generation: u64) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|entry| entry.generation == generation)
+    }
+
+    /// Free the reservation on completion — only for its own generation.
+    pub(crate) fn complete(&mut self, id: &str, generation: u64) -> bool {
+        if self.matches(id, generation) {
+            self.entries.remove(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Test-only observers (production reads go through `matches` /
+    /// `live_work` / `at_capacity`).
+    #[cfg(test)]
+    pub(crate) fn contains_key(&self, id: &str) -> bool {
+        self.entries.contains_key(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Spawn-time admission against LIVE WORK. Deliberately no same-id
+    /// exemption: a replacement cannot make its predecessor's in-flight
+    /// work disappear, so it must fit under the same bound.
+    pub(crate) fn at_capacity(&self) -> bool {
+        self.live_work() >= MAX_PENDING_CONTROL_REQUESTS
+    }
+
+    /// Teardown: cancel every reservation.
+    pub(crate) fn cancel_all(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            entry.cancel.cancel();
+        }
+    }
+}
+
 pub(crate) struct ControlByteStream {
     id: String,
     stream_id: String,
@@ -1930,14 +2251,162 @@ pub(crate) struct ControlByteStream {
     result: serde_json::Value,
 }
 
+/// Where an in-flight tunnel upload accumulates.
+///
+/// Payloads whose declared size fits [`UPLOAD_MEMORY_SPOOL_MAX_BYTES`]
+/// accumulate in memory: every payload — including each recurring
+/// presence webcam frame (~30–100 KB) — used to pay a tempfile
+/// create/write/seek/read/unlink round-trip, with the per-chunk blocking
+/// `write_all` running on the tunnel's wire-driver task (latency jitter
+/// for everything multiplexed on the connection). Larger uploads spool
+/// to a tempfile as before, with chunk writes batched through a small
+/// buffer instead of one blocking write per 16 KiB frame.
+pub(crate) enum UploadSpool {
+    Memory(Vec<u8>),
+    Disk {
+        tmp: tempfile::NamedTempFile,
+        /// Chunk bytes not yet written to `tmp`; flushed at
+        /// [`UPLOAD_DISK_SPOOL_BUFFER_BYTES`] and at upload end.
+        buf: Vec<u8>,
+    },
+}
+
+/// Uploads at or under this declared size accumulate in memory. The
+/// declared size is enforced by the chunk-lane byte checks, so the spool
+/// can never grow past it.
+const UPLOAD_MEMORY_SPOOL_MAX_BYTES: usize = 1024 * 1024;
+/// Batch size for disk-spool writes on the wire-driver task.
+const UPLOAD_DISK_SPOOL_BUFFER_BYTES: usize = 256 * 1024;
+/// Concurrent in-flight upload transfers per tunnel connection.
+const MAX_INBOUND_UPLOADS_PER_CONNECTION: usize = 8;
+/// Aggregate DECLARED bytes across a connection's in-flight uploads —
+/// admission control at upload_start, so a burst of starts cannot
+/// reserve unbounded spool space regardless of the per-upload cap.
+const MAX_INBOUND_UPLOAD_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// LIVE spawned-work slots per tunnel connection (request tasks, stream
+/// framers + their line producers, upload states and their commit
+/// tasks). Each spawned handler may construct a response as large as the
+/// fs-read cap before queue admission runs, so the reservation happens
+/// at spawn time and — via the RAII [`LiveWorkSlot`] — frees only when
+/// the work actually ends, covering cancelled-but-draining predecessors.
+///
+/// Deliberate fail-closed occupancy: a WEDGED operation (an fs read
+/// stuck on a dead mount, a producer that never finishes) legitimately
+/// HOLDS its slot — slots measure live work, so 64 wedged operations
+/// mean a fully occupied connection until teardown. That is the design:
+/// the bound guarantees bounded memory, not bounded latency, and a
+/// connection that has genuinely wedged 64 operations has no business
+/// admitting more work it also cannot finish.
+const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
+
+impl UploadSpool {
+    fn for_declared_size(total_bytes: usize) -> std::io::Result<Self> {
+        if total_bytes <= UPLOAD_MEMORY_SPOOL_MAX_BYTES {
+            // Allocate as chunks arrive — reserving the declared size up
+            // front let a burst of no-data upload_starts reserve
+            // gigabytes; the received-bytes checks bound actual growth.
+            Ok(Self::Memory(Vec::new()))
+        } else {
+            Ok(Self::Disk {
+                tmp: tempfile::NamedTempFile::new()?,
+                buf: Vec::with_capacity(UPLOAD_DISK_SPOOL_BUFFER_BYTES),
+            })
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Memory(data) => {
+                data.extend_from_slice(bytes);
+                Ok(())
+            }
+            Self::Disk { tmp, buf } => {
+                buf.extend_from_slice(bytes);
+                if buf.len() >= UPLOAD_DISK_SPOOL_BUFFER_BYTES {
+                    tmp.as_file_mut().write_all(buf)?;
+                    buf.clear();
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Settle the spool at upload end: drain the write buffer and flush.
+    fn finish(&mut self) -> std::io::Result<()> {
+        if let Self::Disk { tmp, buf } = self {
+            if !buf.is_empty() {
+                tmp.as_file_mut().write_all(buf)?;
+                buf.clear();
+            }
+            tmp.as_file_mut().flush()?;
+        }
+        Ok(())
+    }
+
+    /// The whole payload as bytes (the media handlers' shape): a memory
+    /// spool moves out with zero I/O; a disk spool settles and reads
+    /// back, exactly as the tempfile path always did.
+    pub(crate) fn take_bytes(&mut self, expected_len: usize) -> Result<Vec<u8>, String> {
+        self.finish()
+            .map_err(|e| format!("flush upload spool: {e}"))?;
+        let bytes = match self {
+            Self::Memory(data) => std::mem::take(data),
+            Self::Disk { tmp, .. } => {
+                tmp.as_file_mut()
+                    .seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| format!("seek upload tempfile: {e}"))?;
+                let mut bytes = Vec::with_capacity(expected_len);
+                tmp.as_file_mut()
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| format!("read upload tempfile: {e}"))?;
+                bytes
+            }
+        };
+        if bytes.len() != expected_len {
+            return Err(format!(
+                "upload byte count changed while committing: expected {}, got {}",
+                expected_len,
+                bytes.len()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The whole payload as a [`crate::web_gateway::SpooledBody`]
+    /// tempfile (the staged-upload / transfer-chunk / fs-write commit
+    /// shape): a disk spool settles and hands over its tempfile; a
+    /// memory spool writes once.
+    fn into_spooled_tempfile(mut self) -> std::io::Result<tempfile::NamedTempFile> {
+        self.finish()?;
+        match self {
+            Self::Memory(data) => {
+                let mut tmp = tempfile::NamedTempFile::new()?;
+                tmp.as_file_mut().write_all(&data)?;
+                tmp.as_file_mut().flush()?;
+                Ok(tmp)
+            }
+            Self::Disk { tmp, .. } => Ok(tmp),
+        }
+    }
+}
+
 pub(crate) struct InboundUploadState {
     method: String,
     params: serde_json::Value,
-    tmp: tempfile::NamedTempFile,
+    spool: UploadSpool,
     total_bytes: usize,
     expected_chunks: usize,
     next_seq: usize,
     received_bytes: usize,
+    /// The pending-request reservation generation minted at
+    /// `upload_start` — the terminal task's response carries it so the
+    /// driver can match it against the live reservation.
+    generation: u64,
+    /// The live-work slot minted at `upload_start`, carried through the
+    /// receiving state and taken by the commit task at `upload_end` —
+    /// one continuous slot from first frame to commit completion.
+    /// `None` only in hermetic fixtures.
+    slot: Option<LiveWorkSlot>,
 }
 
 impl InboundUploadState {
@@ -1945,21 +2414,25 @@ impl InboundUploadState {
     /// (transport-unification S8): the frame params plus the spooled
     /// bytes, for handlers that commit the spool wholesale — the staged
     /// upload today, the S9 transfer-chunk appends next. The media
-    /// handlers keep reading the tempfile in-memory instead (their
-    /// stores take byte slices).
-    pub(crate) fn into_spooled_body(self) -> (serde_json::Value, crate::web_gateway::SpooledBody) {
-        (
-            self.params,
-            crate::web_gateway::SpooledBody {
-                tmp: self.tmp,
-                len: self.received_bytes,
-            },
-        )
+    /// handlers read bytes out instead ([`UploadSpool::take_bytes`]).
+    pub(crate) fn into_spooled_body(
+        self,
+    ) -> std::io::Result<(serde_json::Value, crate::web_gateway::SpooledBody)> {
+        let len = self.received_bytes;
+        let tmp = self.spool.into_spooled_tempfile()?;
+        Ok((self.params, crate::web_gateway::SpooledBody { tmp, len }))
     }
 }
 
 pub(crate) struct OutboundControlQueue {
     frames: VecDeque<QueuedControlFrame>,
+    /// Bytes resident in `frames` (immediate texts + chunked payloads with
+    /// their start/end envelopes), maintained on every enqueue/removal.
+    /// Chunked enqueues are refused above
+    /// [`CONTROL_OUTBOUND_QUEUE_MAX_BYTES`] — before this cap, N stalled
+    /// credit-gated downloads pinned N full payload materializations for
+    /// as long as the client stayed quiet.
+    queued_bytes: usize,
 }
 
 enum QueuedControlFrame {
@@ -1967,32 +2440,166 @@ enum QueuedControlFrame {
     Chunked(QueuedChunkedFrame),
 }
 
+impl QueuedControlFrame {
+    /// Byte accounting for [`OutboundControlQueue::queued_bytes`], captured
+    /// at enqueue and debited verbatim at removal (chunked frames memoize
+    /// theirs, so draining `start`/`end` out of the plan cannot skew it).
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Immediate { text, .. } => text.len(),
+            Self::Chunked(queued) => queued.accounted_bytes,
+        }
+    }
+}
+
 struct QueuedChunkedFrame {
-    request_id: String,
-    chunk_id: String,
-    start: String,
-    chunks: Vec<String>,
-    end: String,
+    plan: ChunkedFramePlan,
+    /// `plan` size at enqueue (see [`QueuedControlFrame::queued_bytes`]).
+    accounted_bytes: usize,
     next_chunk: usize,
     credit: usize,
     started: bool,
 }
 
-pub(crate) enum ControlFrameTexts {
-    Immediate(Vec<String>),
-    Chunked {
+/// A chunked wire frame with its payload held raw and every
+/// `*_chunk` frame rendered lazily at send time. The old shape
+/// materialized each base64+JSON chunk String up front — ~1.37× the
+/// payload held simultaneously with the payload itself — and the drain
+/// cloned each chunk String again at send: ~5 copies end to end and
+/// ~2.4× payload peak RSS per queued download.
+pub(crate) struct ChunkedFramePlan {
+    pub(crate) request_id: String,
+    pub(crate) chunk_id: String,
+    /// Small header/footer frames, rendered eagerly (they carry counts and
+    /// metadata, not payload).
+    pub(crate) start: String,
+    pub(crate) end: String,
+    envelope: ChunkEnvelope,
+    payload: Vec<u8>,
+    chunk_bytes: usize,
+}
+
+/// Which chunk-frame envelope [`ChunkedFramePlan::render_chunk`] emits.
+enum ChunkEnvelope {
+    /// `response_chunk` frames around chunked JSON response text.
+    Response,
+    /// `byte_stream_chunk` frames around raw byte payloads.
+    ByteStream,
+}
+
+impl ChunkedFramePlan {
+    /// Plan for chunked JSON response text (`response_chunk` envelopes).
+    pub(crate) fn response(
         request_id: String,
         chunk_id: String,
         start: String,
-        chunks: Vec<String>,
         end: String,
-    },
+        payload: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            chunk_id,
+            start,
+            end,
+            envelope: ChunkEnvelope::Response,
+            payload,
+            chunk_bytes,
+        }
+    }
+
+    /// Plan for a raw byte download (`byte_stream_chunk` envelopes).
+    pub(crate) fn byte_stream(
+        request_id: String,
+        chunk_id: String,
+        start: String,
+        end: String,
+        payload: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            chunk_id,
+            start,
+            end,
+            envelope: ChunkEnvelope::ByteStream,
+            payload,
+            chunk_bytes,
+        }
+    }
+
+    pub(crate) fn chunk_count(&self) -> usize {
+        // Zero chunk size renders zero chunks (`render_chunk` returns
+        // `None` for it); reporting payload-length chunks here would
+        // wedge the credit queue on a frame that can never complete.
+        if self.chunk_bytes == 0 {
+            return 0;
+        }
+        self.payload.len().div_ceil(self.chunk_bytes)
+    }
+
+    /// Render the `seq`-th chunk frame (base64 slice + envelope), `None`
+    /// past the end. Byte-identical to the frames the eager path built.
+    pub(crate) fn render_chunk(&self, seq: usize) -> Option<String> {
+        let offset = seq.checked_mul(self.chunk_bytes)?;
+        if offset >= self.payload.len() || self.chunk_bytes == 0 {
+            return None;
+        }
+        let end = offset
+            .saturating_add(self.chunk_bytes)
+            .min(self.payload.len());
+        let data = base64::engine::general_purpose::STANDARD.encode(&self.payload[offset..end]);
+        let frame = match self.envelope {
+            ChunkEnvelope::Response => serde_json::json!({
+                "t": "response_chunk",
+                "id": self.request_id,
+                "chunk_id": self.chunk_id,
+                "seq": seq,
+                "data": data,
+            }),
+            ChunkEnvelope::ByteStream => serde_json::json!({
+                "t": "byte_stream_chunk",
+                "id": self.request_id,
+                "stream_id": self.chunk_id,
+                "seq": seq,
+                "data": data,
+            }),
+        };
+        Some(frame.to_string())
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.payload
+            .len()
+            .saturating_add(self.start.len())
+            .saturating_add(self.end.len())
+    }
+
+    /// All frames in order (start, chunks, end) — test helpers and the
+    /// no-credit immediate send path.
+    pub(crate) fn render_all(&self) -> Vec<String> {
+        let mut frames = Vec::with_capacity(self.chunk_count() + 2);
+        frames.push(self.start.clone());
+        for seq in 0..self.chunk_count() {
+            if let Some(text) = self.render_chunk(seq) {
+                frames.push(text);
+            }
+        }
+        frames.push(self.end.clone());
+        frames
+    }
+}
+
+pub(crate) enum ControlFrameTexts {
+    Immediate(Vec<String>),
+    Chunked(ChunkedFramePlan),
 }
 
 impl OutboundControlQueue {
     fn new() -> Self {
         Self {
             frames: VecDeque::new(),
+            queued_bytes: 0,
         }
     }
 
@@ -2000,31 +2607,52 @@ impl OutboundControlQueue {
         self.frames.is_empty()
     }
 
-    fn enqueue_immediate(&mut self, request_id: String, text: String) {
-        self.frames
-            .push_back(QueuedControlFrame::Immediate { request_id, text });
+    /// Queue an immediate frame; `false` when the per-connection byte or
+    /// frame-count cap is exhausted (the caller answers with an error
+    /// instead — immediate frames parked behind a zero-credit chunked
+    /// head used to accumulate without bound).
+    #[must_use]
+    fn enqueue_immediate(&mut self, request_id: String, text: String) -> bool {
+        if self.frames.len() >= CONTROL_OUTBOUND_QUEUE_MAX_FRAMES
+            || self.queued_bytes.saturating_add(text.len()) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
+        {
+            return false;
+        }
+        let frame = QueuedControlFrame::Immediate { request_id, text };
+        self.queued_bytes = self.queued_bytes.saturating_add(frame.queued_bytes());
+        self.frames.push_back(frame);
+        true
     }
 
-    fn enqueue_chunked(
-        &mut self,
-        request_id: String,
-        chunk_id: String,
-        start: String,
-        chunks: Vec<String>,
-        end: String,
-    ) {
-        self.cancel_chunk(&chunk_id);
+    /// Queue a chunked frame; `false` when the per-connection byte cap is
+    /// exhausted (the caller answers the request with an error instead —
+    /// admission control, never a silent drop).
+    #[must_use]
+    fn enqueue_chunked(&mut self, plan: ChunkedFramePlan) -> bool {
+        self.cancel_chunk(&plan.chunk_id.clone());
+        let accounted_bytes = plan.resident_bytes();
+        if self.frames.len() >= CONTROL_OUTBOUND_QUEUE_MAX_FRAMES
+            || self.queued_bytes.saturating_add(accounted_bytes) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
+        {
+            return false;
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(accounted_bytes);
         self.frames
             .push_back(QueuedControlFrame::Chunked(QueuedChunkedFrame {
-                request_id,
-                chunk_id,
-                start,
-                chunks,
-                end,
+                plan,
+                accounted_bytes,
                 next_chunk: 0,
                 credit: CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT,
                 started: false,
             }));
+        true
+    }
+
+    /// Remove and return the front frame, keeping the byte accounting.
+    fn pop_front(&mut self) -> Option<QueuedControlFrame> {
+        let frame = self.frames.pop_front()?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(frame.queued_bytes());
+        Some(frame)
     }
 
     fn grant_credit(&mut self, request_id: &str, chunk_id: Option<&str>, chunks: usize) {
@@ -2036,33 +2664,48 @@ impl OutboundControlQueue {
             let QueuedControlFrame::Chunked(queued) = frame else {
                 continue;
             };
-            let matches_chunk = chunk_id.map(|id| queued.chunk_id == id).unwrap_or(false);
-            if matches_chunk || (chunk_id.is_none() && queued.request_id == request_id) {
+            let matches_chunk = chunk_id
+                .map(|id| queued.plan.chunk_id == id)
+                .unwrap_or(false);
+            if matches_chunk || (chunk_id.is_none() && queued.plan.request_id == request_id) {
                 queued.credit = queued.credit.saturating_add(granted);
             }
         }
     }
 
     fn cancel(&mut self, request_id: &str) -> bool {
-        let before = self.frames.len();
-        self.frames.retain(|frame| match frame {
+        self.retain_accounted(|frame| match frame {
             QueuedControlFrame::Immediate {
                 request_id: queued_id,
                 ..
             } => queued_id != request_id,
             QueuedControlFrame::Chunked(queued) => {
-                queued.request_id != request_id && queued.chunk_id != request_id
+                queued.plan.request_id != request_id && queued.plan.chunk_id != request_id
             }
-        });
-        self.frames.len() != before
+        })
     }
 
     fn cancel_chunk(&mut self, chunk_id: &str) -> bool {
-        let before = self.frames.len();
-        self.frames.retain(|frame| match frame {
+        self.retain_accounted(|frame| match frame {
             QueuedControlFrame::Immediate { .. } => true,
-            QueuedControlFrame::Chunked(queued) => queued.chunk_id != chunk_id,
+            QueuedControlFrame::Chunked(queued) => queued.plan.chunk_id != chunk_id,
+        })
+    }
+
+    /// `retain` that debits removed frames from the byte accounting;
+    /// returns whether anything was removed.
+    fn retain_accounted(&mut self, keep: impl Fn(&QueuedControlFrame) -> bool) -> bool {
+        let before = self.frames.len();
+        let mut removed_bytes = 0usize;
+        self.frames.retain(|frame| {
+            if keep(frame) {
+                true
+            } else {
+                removed_bytes = removed_bytes.saturating_add(frame.queued_bytes());
+                false
+            }
         });
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
         self.frames.len() != before
     }
 }
@@ -2885,6 +3528,50 @@ fn json_body_response(id: String, body: String, label: &str) -> serde_json::Valu
     }
 }
 
+/// Splice a core-serialized JSON body into a complete, PRE-SERIALIZED
+/// `{"t":"response","id":…,"ok":true,"result":<body>}` envelope by string
+/// concatenation — the response lane's twin of the event lane's
+/// `event_lane_frame` splice. The core memoizes its hottest bodies as
+/// strings (routes_sessions' documented multi-MB list cache); parsing
+/// such a body into a full `Value` tree and re-serializing the envelope
+/// made every tunnel poll pay three complete JSON passes.
+///
+/// The caller must have validated `body` as JSON (see
+/// `json_body_response_preserialized`); `id` is JSON-escaped here.
+fn spliced_response_frame_text(id: &str, body: &str) -> String {
+    let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
+    let mut text = String::with_capacity(
+        body.len() + id_json.len() + "{\"t\":\"response\",\"id\":,\"ok\":true,\"result\":}".len(),
+    );
+    text.push_str("{\"t\":\"response\",\"id\":");
+    text.push_str(&id_json);
+    text.push_str(",\"ok\":true,\"result\":");
+    text.push_str(body);
+    text.push('}');
+    text
+}
+
+/// `json_body_response`, pre-serialized: the returned frame is
+/// `Value::String(<complete envelope text>)` — the task lane's
+/// pre-serialized carrier. Response objects never serialize as top-level
+/// JSON strings, so the variant is unambiguous;
+/// `send_control_task_response` sends the text verbatim (chunking on the
+/// same thresholds, keyed by the task's own request id). Only legal on
+/// the spawned task-response lane. The body is still validated — one
+/// full parse into `IgnoredAny`, no tree allocation — so an invalid body
+/// answers with the historical error frame.
+fn json_body_response_preserialized(id: &str, body: String, label: &str) -> serde_json::Value {
+    if serde_json::from_str::<serde::de::IgnoredAny>(&body).is_err() {
+        return serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("{label} returned invalid JSON"),
+        });
+    }
+    serde_json::Value::String(spliced_response_frame_text(id, &body))
+}
+
 fn http_body_response(id: String, status: u16, body: String, label: &str) -> serde_json::Value {
     match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(mut result) => {
@@ -2916,8 +3603,12 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
 pub(crate) use crate::web_gateway::status_line_code;
 
 fn params_body_text(params: Option<&serde_json::Value>) -> String {
-    serde_json::to_string(&params.cloned().unwrap_or_else(|| serde_json::json!({})))
-        .unwrap_or_else(|_| "{}".to_string())
+    // Serialize the borrow — cloning the params subtree first cost a
+    // second deep copy of every request's params just to stringify it.
+    match params {
+        Some(params) => serde_json::to_string(params).unwrap_or_else(|_| "{}".to_string()),
+        None => "{}".to_string(),
+    }
 }
 
 fn missing_param_response(id: String, name: &str) -> serde_json::Value {
@@ -2989,21 +3680,24 @@ async fn api_sessions_response_from_home(
             "error": "session list returned an unexpected byte response",
         });
     };
-    // Historical result-shape guard: the list must be a JSON array.
-    match serde_json::from_str::<serde_json::Value>(&body.into_string()) {
-        Ok(result) if result.is_array() => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": true,
-            "result": result,
-        }),
-        _ => serde_json::json!({
+    // Historical result-shape guard: the list must be a JSON array —
+    // enforced without materializing the multi-MB Value tree (the SPA
+    // polls this with limit:'all' every 15s per tab, and the core already
+    // serves the body from its serialized-string cache): a full validating
+    // parse into `IgnoredAny` plus the leading-token check, then the body
+    // splices verbatim into a pre-serialized envelope.
+    let body = body.into_string();
+    let is_array = body.trim_start().starts_with('[')
+        && serde_json::from_str::<serde::de::IgnoredAny>(&body).is_ok();
+    if !is_array {
+        return serde_json::json!({
             "t": "response",
             "id": id,
             "ok": false,
             "error": "session list returned invalid JSON",
-        }),
+        });
     }
+    serde_json::Value::String(spliced_response_frame_text(&id, &body))
 }
 
 fn control_session_limit(params: &serde_json::Value) -> Option<usize> {
@@ -3377,22 +4071,351 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Empty/absent request ids are rejected at dispatch BEFORE any
+    /// spawn: an id-less request cannot receive a correlated response,
+    /// and an empty-id carrier would bypass the outbound queue and
+    /// chunking (the last congestion bypass). The rejection is an
+    /// error-class frame, so the budget seam bounds the spam.
+    #[tokio::test]
+    async fn empty_id_requests_are_rejected_before_spawning() {
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        for frame in [
+            r#"{"t":"request","method":"api_sessions"}"#,
+            r#"{"t":"request","id":"","method":"api_sessions"}"#,
+            r#"{"t":"request","id":"","method":"status"}"#,
+        ] {
+            let rejected =
+                test_control_frame_response(frame, &mut rt, &tx, &mut pending, &mut outbound)
+                    .expect("id-less requests answer inline");
+            assert_eq!(rejected["ok"], false, "{rejected}");
+            assert!(rejected["error"].as_str().unwrap().contains("non-empty id"));
+            assert!(
+                is_error_class_frame(&rejected),
+                "the rejection must ride the budgeted error-class seam"
+            );
+        }
+        assert_eq!(
+            pending.live_work(),
+            0,
+            "nothing may spawn for id-less requests"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no task response lane traffic for id-less requests"
+        );
+    }
+
+    /// Committing uploads hold their BYTE weight against the aggregate
+    /// declared-bytes budget until the commit completes: with enough
+    /// bytes mid-commit, a new upload_start is refused on bytes even
+    /// though `inbound_uploads` itself is empty.
+    #[tokio::test]
+    async fn committing_upload_bytes_count_against_the_aggregate() {
+        let mut rt = runtime();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        // Two slow 90 MiB commits still in flight (left inbound_uploads,
+        // commit not finished): 180 MiB held by the ledger.
+        let weight = 90 * 1024 * 1024;
+        let _slow_commits = [
+            pending.upload_commit_slot(weight),
+            pending.upload_commit_slot(weight),
+        ];
+        assert_eq!(pending.committing_upload_bytes(), 2 * weight);
+
+        // A third 90 MiB upload_start busts the 256 MiB aggregate.
+        let start = serde_json::json!({
+            "t": "upload_start",
+            "id": "u-agg",
+            "method": "api_session_current_upload",
+            "params": { "name": "big.bin", "mime": "application/octet-stream" },
+            "total_bytes": weight,
+            "chunks": 90 * 64,
+        });
+        let refused = test_control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("over-budget upload_start must answer");
+        assert_eq!(refused["result"]["_httpStatus"], 429, "{refused}");
+        assert!(refused["result"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("declared-bytes budget"));
+
+        // Commits finishing (slots dropping) release the budget.
+        drop(_slow_commits);
+        assert_eq!(pending.committing_upload_bytes(), 0);
+        let admitted = test_control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(
+            admitted.is_none(),
+            "with the commits finished the same start admits: {admitted:?}"
+        );
+    }
+
+    /// Immediate-frame spam is bounded by the queue's frame-count cap —
+    /// the seam R4-3 routes congested pre-serialized frames through.
+    #[test]
+    fn immediate_frame_cap_bounds_queued_spam() {
+        let mut queue = OutboundControlQueue::new();
+        for index in 0..CONTROL_OUTBOUND_QUEUE_MAX_FRAMES {
+            assert!(queue.enqueue_immediate(format!("r{index}"), "{\"ok\":true}".to_string()));
+        }
+        assert!(
+            !queue.enqueue_immediate("over".to_string(), "{}".to_string()),
+            "the frame-count cap must refuse the next enqueue"
+        );
+    }
+
+    /// The direct-error budget: while congested, exactly
+    /// [`DIRECT_ERROR_BUDGET_FRAMES`] error frames pass, further ones drop
+    /// and are counted; an uncongested beat (the wire drained) refills.
+    #[test]
+    fn direct_error_budget_bounds_congested_error_frames() {
+        let mut budget = DirectErrorBudget::new("test");
+        for index in 0..DIRECT_ERROR_BUDGET_FRAMES {
+            assert!(budget.allow(true), "frame {index} rides the budget");
+        }
+        assert!(!budget.allow(true), "budget exhausted while congested");
+        assert!(!budget.allow(true));
+        assert_eq!(budget.dropped(), 2, "drops are counted per connection");
+        // A drained wire refills the budget.
+        assert!(budget.allow(false));
+        assert!(budget.allow(true));
+        assert_eq!(budget.dropped(), 2);
+    }
+
+    /// The immediate-frame seam's ERROR classification: the plain error
+    /// envelope and the injected-status error shape are budgeted; success
+    /// shapes never are.
+    #[test]
+    fn error_class_frames_are_classified() {
+        assert!(is_error_class_frame(&dashboard_control_error_response(
+            "r1".into(),
+            "denied"
+        )));
+        assert!(is_error_class_frame(&serde_json::json!({
+            "t": "response",
+            "id": "u1",
+            "ok": true,
+            "result": { "_httpStatus": 429, "_httpOk": false, "error": "too many" },
+        })));
+        assert!(!is_error_class_frame(&serde_json::json!({
+            "t": "response",
+            "id": "ok1",
+            "ok": true,
+            "result": { "_httpStatus": 200, "_httpOk": true },
+        })));
+        assert!(!is_error_class_frame(&serde_json::json!({
+            "t": "hello_ack",
+            "id": "h1",
+        })));
+    }
+
+    /// Generation-keyed reservations: same-id replacement cancels its
+    /// predecessor and mints a new generation; a superseded generation
+    /// can neither claim ownership nor free the replacement's
+    /// reservation.
+    #[test]
+    fn pending_request_generations_protect_replacements() {
+        let mut pending = PendingControlRequests::new();
+        let (first_cancel, first_generation, _first_slot) = pending.admit("r1");
+        let (second_cancel, second_generation, _second_slot) = pending.admit("r1");
+        assert!(
+            first_cancel.is_cancelled(),
+            "replacement cancels the predecessor"
+        );
+        assert!(!second_cancel.is_cancelled());
+        assert_ne!(first_generation, second_generation);
+        assert!(!pending.matches("r1", first_generation));
+        assert!(pending.matches("r1", second_generation));
+        assert!(
+            !pending.complete("r1", first_generation),
+            "a superseded completion must not free the replacement"
+        );
+        assert!(pending.contains_key("r1"));
+        assert!(pending.complete("r1", second_generation));
+        assert!(!pending.contains_key("r1"));
+    }
+
+    /// The admission bound counts LIVE WORK, not addressable entries:
+    /// rapid same-id cycling accumulates one slot per still-draining
+    /// predecessor (held via RAII until that task actually exits), so a
+    /// spammer saturates the bound and gets refused instead of stacking
+    /// untracked work onto the blocking pool — and capacity frees only
+    /// when a predecessor's own slot drops.
+    #[test]
+    fn live_work_slots_bound_same_id_cycling() {
+        let mut pending = PendingControlRequests::new();
+        let mut draining = Vec::new();
+        for _ in 0..MAX_PENDING_CONTROL_REQUESTS {
+            let (_cancel, _generation, slot) = pending.admit("spam");
+            draining.push(slot);
+        }
+        assert_eq!(pending.len(), 1, "one addressable entry");
+        assert_eq!(
+            pending.live_work(),
+            MAX_PENDING_CONTROL_REQUESTS,
+            "every draining predecessor still holds its slot"
+        );
+        assert!(
+            pending.at_capacity(),
+            "cycling one id saturates the live-work bound"
+        );
+        // Only a predecessor's own exit frees capacity.
+        draining.pop();
+        assert!(!pending.at_capacity());
+        // Entry removal (cancel frame) does not free the drained work.
+        assert!(pending.cancel_remove("spam"));
+        assert_eq!(pending.live_work(), MAX_PENDING_CONTROL_REQUESTS - 1);
+        drop(draining);
+        assert_eq!(pending.live_work(), 0);
+
+        // The committing-upload ledger is RAII the same way, bytes
+        // included.
+        let commit_slot = pending.upload_commit_slot(1024);
+        assert_eq!(pending.committing_uploads(), 1);
+        assert_eq!(pending.committing_upload_bytes(), 1024);
+        drop(commit_slot);
+        assert_eq!(pending.committing_uploads(), 0);
+        assert_eq!(pending.committing_upload_bytes(), 0);
+    }
+
+    /// The pre-serialized response carrier: byte-verbatim body embedding,
+    /// JSON-equivalence with the parse-path envelope, escaped ids, and
+    /// the historical error frame for invalid bodies.
+    #[test]
+    fn preserialized_response_envelope_matches_the_parsed_shape() {
+        let body = r#"{"a":1,"nested":{"b":[1,2,3]}}"#;
+        let frame = json_body_response_preserialized("req-1", body.to_string(), "test");
+        let serde_json::Value::String(text) = &frame else {
+            panic!("expected the pre-serialized carrier, got {frame}");
+        };
+        assert!(
+            text.contains(body),
+            "the body must embed verbatim (proof of no reserialization): {text}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["t"], "response");
+        assert_eq!(parsed["id"], "req-1");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(parsed["result"]["nested"]["b"][1], 2);
+        // JSON-equivalent to the parse-path envelope.
+        let legacy = json_body_response("req-1".into(), body.to_string(), "test");
+        assert_eq!(parsed, legacy);
+
+        // Invalid bodies keep the historical error frame (an object).
+        let error = json_body_response_preserialized("req-2", "not json".into(), "test");
+        assert_eq!(error["ok"], false);
+        assert!(error["error"].as_str().unwrap().contains("invalid JSON"));
+
+        // Ids embed JSON-escaped.
+        let quoted = json_body_response_preserialized("has\"quote", "{}".to_string(), "test");
+        let serde_json::Value::String(text) = quoted else {
+            panic!("expected the pre-serialized carrier");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["id"], "has\"quote");
+
+        // Non-ASCII and control characters survive both positions: the
+        // body embeds verbatim (the core already escaped it), the id is
+        // escaped here.
+        let unicode_body = serde_json::json!({
+            "name": "résumé — 日本語 🚀",
+            "ctrl": "tab\tnewline\nbell\u{7}",
+        })
+        .to_string();
+        let frame = json_body_response_preserialized("id-é\u{1}", unicode_body.clone(), "test");
+        let serde_json::Value::String(text) = &frame else {
+            panic!("expected the pre-serialized carrier, got {frame}");
+        };
+        assert!(text.contains(&unicode_body), "body embeds verbatim");
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["id"], "id-é\u{1}");
+        assert_eq!(parsed["result"]["name"], "résumé — 日本語 🚀");
+        assert_eq!(parsed["result"]["ctrl"], "tab\tnewline\nbell\u{7}");
+        assert_eq!(
+            parsed,
+            json_body_response("id-é\u{1}".into(), unicode_body, "test"),
+            "JSON-equivalent to the parse-path envelope"
+        );
+    }
+
     pub(crate) fn test_upload_state(
         method: &str,
         params: serde_json::Value,
         bytes: &[u8],
     ) -> InboundUploadState {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.as_file_mut().write_all(bytes).unwrap();
-        tmp.as_file_mut().flush().unwrap();
+        let mut spool = UploadSpool::for_declared_size(bytes.len()).unwrap();
+        spool.append(bytes).unwrap();
+        spool.finish().unwrap();
         InboundUploadState {
             method: method.to_string(),
             params,
-            tmp,
+            spool,
             total_bytes: bytes.len(),
             expected_chunks: if bytes.is_empty() { 0 } else { 1 },
             next_seq: if bytes.is_empty() { 0 } else { 1 },
             received_bytes: bytes.len(),
+            generation: 0,
+            slot: None,
+        }
+    }
+
+    /// Both spool variants round-trip bytes identically through both
+    /// consumption shapes (take_bytes for the media handlers, the
+    /// SpooledBody tempfile for the commit handlers), and the memory
+    /// threshold routes small payloads off disk.
+    #[test]
+    fn upload_spool_round_trips_both_variants() {
+        for (len, expect_memory) in [
+            (16usize, true),
+            (UPLOAD_MEMORY_SPOOL_MAX_BYTES, true),
+            (UPLOAD_MEMORY_SPOOL_MAX_BYTES + 1, false),
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            assert_eq!(
+                matches!(spool, UploadSpool::Memory(_)),
+                expect_memory,
+                "threshold routing for {len} bytes"
+            );
+            // Chunked appends like the wire delivers them.
+            for chunk in payload.chunks(7 * 1024) {
+                spool.append(chunk).unwrap();
+            }
+            assert_eq!(spool.take_bytes(len).unwrap(), payload);
+
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            for chunk in payload.chunks(7 * 1024) {
+                spool.append(chunk).unwrap();
+            }
+            let mut tmp = spool.into_spooled_tempfile().unwrap();
+            let mut on_disk = Vec::new();
+            tmp.as_file_mut().seek(std::io::SeekFrom::Start(0)).unwrap();
+            tmp.as_file_mut().read_to_end(&mut on_disk).unwrap();
+            assert_eq!(on_disk, payload);
+
+            // A short payload is caught by the byte-count guard.
+            let mut spool = UploadSpool::for_declared_size(len).unwrap();
+            spool.append(&payload[..len - 1]).unwrap();
+            assert!(spool.take_bytes(len).is_err());
         }
     }
 
@@ -3404,11 +4427,11 @@ mod tests {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
-            config: serde_json::json!({"provider":"openai"}),
-            agent_card: serde_json::json!({
+            config: Arc::new(serde_json::json!({"provider":"openai"})),
+            agent_card: Arc::new(serde_json::json!({
                 "id": "intendant:test-daemon",
                 "label": "test-daemon",
-            }),
+            })),
             bus: crate::event::EventBus::new(),
             peer_registry: None,
             mcp_server: None,
@@ -3496,12 +4519,13 @@ mod tests {
     fn test_control_frame_response(
         text: &str,
         runtime: &mut ControlRuntime,
-        task_tx: &mpsc::Sender<ControlTaskResponse>,
-        pending_requests: &mut HashMap<String, CancellationToken>,
+        task_tx: &mpsc::Sender<SequencedTaskResponse>,
+        pending_requests: &mut PendingControlRequests,
         outbound_queue: &mut OutboundControlQueue,
     ) -> Option<serde_json::Value> {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(
@@ -3512,6 +4536,7 @@ mod tests {
             outbound_queue,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3577,8 +4602,8 @@ mod tests {
 
     #[test]
     fn peer_dashboard_grants_split_access_and_peer_permissions() {
-        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let mut peer_root = runtime();
         peer_root.grant = DashboardControlGrant::Peer {
@@ -3711,8 +4736,8 @@ mod tests {
     #[tokio::test]
     async fn control_frames_answer_hello_ping_and_config() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let hello = test_control_frame_response(
             r#"{"t":"hello","id":"h1"}"#,
@@ -4028,8 +5053,8 @@ mod tests {
         );
         assert!(project_root.is_none());
         assert!(pending.contains_key("pr1"));
-        let project_root = rx.recv().await.unwrap();
-        assert!(pending.remove(&project_root.id).is_some());
+        let (_, project_root) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&project_root.id));
         assert_eq!(project_root.id, "pr1");
         assert!(project_root.done);
         let project_root = project_root.frame;
@@ -4057,7 +5082,7 @@ mod tests {
         assert_eq!(cancelled["t"], "response");
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
-        assert!(pending.get("q1").is_none());
+        assert!(!pending.contains_key("q1"));
     }
 
     /// The operation a method's declaration carries (route-row tunnel
@@ -4672,6 +5697,7 @@ mod tests {
             "api_worktrees_inspect",
             "api_worktrees_scan",
             "api_worktrees_remove",
+            "api_worktrees_clean",
             "api_worktrees_merge",
             "api_settings",
             "api_settings_save",
@@ -4969,7 +5995,7 @@ mod tests {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
         let (task_tx, _task_rx) = mpsc::channel(1);
-        let mut pending = HashMap::new();
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let ack = test_control_frame_response(
@@ -5009,7 +6035,7 @@ mod tests {
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         rt.control_frames_tx = Some(control_tx);
         let (task_tx, _task_rx) = mpsc::channel(1);
-        let mut pending = HashMap::new();
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let ack = test_control_frame_response(
@@ -5040,8 +6066,8 @@ mod tests {
     async fn control_frame_routes_session_control_msg_requests() {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let immediate = test_control_frame_response(
             r#"{"t":"request","id":"session-ctrl-frame","method":"api_session_control_msg","params":{"message":{"action":"interrupt","session_id":"session-frame"}}}"#,
@@ -5052,7 +6078,7 @@ mod tests {
         );
         assert!(immediate.is_none(), "session control request should spawn");
 
-        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, task) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -5084,8 +6110,8 @@ mod tests {
     async fn control_frame_routes_dashboard_action_msg_requests() {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let immediate = test_control_frame_response(
             r#"{"t":"request","id":"dash-action-frame","method":"api_dashboard_action_msg","params":{"message":{"action":"close_browser_workspace","workspace_id":"workspace-frame"}}}"#,
@@ -5096,7 +6122,7 @@ mod tests {
         );
         assert!(immediate.is_none(), "dashboard action request should spawn");
 
-        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, task) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -5131,8 +6157,8 @@ mod tests {
     #[tokio::test]
     async fn current_agent_output_without_active_log_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -5145,8 +6171,8 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("out1"));
 
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "out1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -5159,8 +6185,8 @@ mod tests {
     #[tokio::test]
     async fn current_history_without_file_watcher_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         for (idx, (method, params)) in [
@@ -5192,8 +6218,8 @@ mod tests {
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
-            let response = rx.recv().await.unwrap();
-            assert!(pending.remove(&response.id).is_some());
+            let (_, response) = rx.recv().await.unwrap();
+            assert!(pending.cancel_remove(&response.id));
             assert_eq!(response.id, id);
             assert!(response.done);
             assert_eq!(response.frame["t"], "response");
@@ -5207,8 +6233,8 @@ mod tests {
     #[tokio::test]
     async fn current_changes_without_file_watcher_preserves_http_status() {
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -5221,8 +6247,8 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("chg1"));
 
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "chg1");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -5238,8 +6264,8 @@ mod tests {
         std::fs::write(dir.path().join("note.txt"), b"hello").unwrap();
 
         let mut rt = runtime();
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         for (idx, (method, path)) in [
@@ -5268,8 +6294,8 @@ mod tests {
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
-            let response = rx.recv().await.unwrap();
-            assert!(pending.remove(&response.id).is_some());
+            let (_, response) = rx.recv().await.unwrap();
+            assert!(pending.cancel_remove(&response.id));
             assert_eq!(response.id, id);
             assert!(response.done);
             assert_eq!(response.frame["t"], "response");
@@ -5327,8 +6353,8 @@ mod tests {
             };
             rt
         };
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
         let request = |id: &str, method: &str, params: serde_json::Value| {
             serde_json::json!({
@@ -5431,8 +6457,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["renamed"], true);
         assert!(!from.exists());
@@ -5470,8 +6496,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 409);
         assert_eq!(response.frame["result"]["code"], "not_empty");
         assert!(sub.exists());
@@ -5488,8 +6514,8 @@ mod tests {
             &mut outbound,
         );
         assert!(queued.is_none());
-        let response = rx.recv().await.unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        let (_, response) = rx.recv().await.unwrap();
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.frame["result"]["_httpStatus"], 200);
         assert_eq!(response.frame["result"]["deleted"], true);
         assert!(!sub.exists());
@@ -5503,8 +6529,8 @@ mod tests {
 
         let mut rt = runtime();
         rt.project_root = Some(project);
-        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let queued = test_control_frame_response(
@@ -5517,11 +6543,11 @@ mod tests {
         assert!(queued.is_none());
         assert!(pending.contains_key("transfer-jobs-frame"));
 
-        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        let (_, response) = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
             .unwrap();
-        assert!(pending.remove(&response.id).is_some());
+        assert!(pending.cancel_remove(&response.id));
         assert_eq!(response.id, "transfer-jobs-frame");
         assert!(response.done);
         assert_eq!(response.frame["t"], "response");
@@ -5562,8 +6588,8 @@ mod tests {
     #[tokio::test]
     async fn control_frames_negotiate_and_apply_response_credit() {
         let mut rt = runtime();
-        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
-        let mut pending = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
         let mut outbound = OutboundControlQueue::new();
 
         let hello = test_control_frame_response(
@@ -5587,13 +6613,14 @@ mod tests {
         .unwrap();
         assert_eq!(status["result"]["response_credit_enabled"], true);
 
-        outbound.enqueue_chunked(
+        assert!(outbound.enqueue_chunked(ChunkedFramePlan::response(
             "large".into(),
             "large:0".into(),
             "start".into(),
-            vec!["chunk".into()],
             "end".into(),
-        );
+            b"chunk".to_vec(),
+            CONTROL_RESPONSE_CHUNK_BYTES,
+        )));
         if let Some(QueuedControlFrame::Chunked(queued)) = outbound.frames.front_mut() {
             queued.credit = 0;
         }
