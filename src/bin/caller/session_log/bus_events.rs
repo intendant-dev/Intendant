@@ -407,12 +407,26 @@ impl SessionLog {
             file: None,
             file2: None,
         });
-        let _ = crate::external_wrapper_index::upsert_from_log_dir(
-            source,
-            backend_session_id,
-            session_id,
-            &self.dir,
-        );
+        // Register the wrapper binding only when the event names THIS log's
+        // session. The daemon session's log receives the bus tee's copy of
+        // every session's identity events — indexing those would register
+        // the daemon session itself as the wrapper of another session's
+        // backend thread and demote the real wrapper (observed live
+        // 2026-07-16: the daemon head session became the "active" wrapper of
+        // a claude-code thread, and the catalog then served that thread
+        // another agent's launch config).
+        if crate::session_identity::event_names_session(
+            Some(session_id),
+            &self.session_id,
+            crate::session_identity::canonical_session_id_from_meta(&self.dir).as_deref(),
+        ) {
+            let _ = crate::external_wrapper_index::upsert_from_log_dir(
+                source,
+                backend_session_id,
+                session_id,
+                &self.dir,
+            );
+        }
     }
 
     /// Log that a frontend-visible session is attached to an external agent.
@@ -2009,6 +2023,47 @@ mod tests {
             .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("context_snapshot"))
             .filter_map(|v| v.get("file").and_then(|f| f.as_str()).map(String::from))
             .collect()
+    }
+
+    /// The identity event always lands in the log, but only an event that
+    /// names THIS log's session registers a wrapper-index binding: the
+    /// daemon session's log receives the bus tee's copy of every session's
+    /// identity events, and indexing those re-attributed other sessions'
+    /// backend threads to the daemon session (2026-07-16).
+    #[test]
+    fn session_identity_indexes_only_own_session() {
+        let home = tempfile::tempdir().unwrap();
+        let own_id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let log_dir = home.path().join(".intendant").join("logs").join(own_id);
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+
+        // A tee'd copy naming another session: logged, not indexed.
+        log.session_identity(
+            "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+            "codex",
+            "019ea8b9-0000-7000-8000-0000000000a1",
+        );
+        assert!(crate::external_wrapper_index::wrappers_for(
+            home.path(),
+            "codex",
+            "019ea8b9-0000-7000-8000-0000000000a1"
+        )
+        .is_empty());
+        let event = read_last_event(&log_dir, "session_identity");
+        assert_eq!(
+            event["data"]["session_id"].as_str(),
+            Some("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+        );
+
+        // The session's own identity: logged AND indexed under this dir.
+        log.session_identity(own_id, "codex", "019ea8b9-0000-7000-8000-0000000000a2");
+        let wrappers = crate::external_wrapper_index::wrappers_for(
+            home.path(),
+            "codex",
+            "019ea8b9-0000-7000-8000-0000000000a2",
+        );
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].intendant_session_id, own_id);
     }
 
     #[test]

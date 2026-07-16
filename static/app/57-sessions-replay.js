@@ -1143,7 +1143,9 @@ function resumeSession(s) {
   ensureSessionWindow(sid, meta);
   if (source !== 'intendant') setSessionWindowDetached(sid, true, 'resume requested');
   focusSessionWindow(sid);
-  const overrides = sessionLaunchOverridesForSession(s);
+  // No launch overrides on an implicit resume: the daemon applies the
+  // session's persisted launch config itself (see
+  // detachedSessionResumeMessage for the incident this prevents).
   dispatchSessionControlMsg({
     action: 'resume_session',
     source,
@@ -1151,7 +1153,6 @@ function resumeSession(s) {
     resume_id: resumeId,
     project_root: projectRoot,
     direct: true,
-    ...overrides,
   });
   // Resuming from the rendered Station must not yank the user out of the
   // canvas (routeTo deactivates the Station renderer — the surface looked

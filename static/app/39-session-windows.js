@@ -3787,9 +3787,12 @@ function sessionConfigSource(meta = {}) {
 }
 
 function sessionConfigCommand(meta = {}) {
+  const command = String(meta.agentCommand || meta.agent_command || '').trim();
+  if (command) return command;
+  // The codex_command fields are codex-only; for any other source they can
+  // only be cross-session contamination, never this session's binary.
+  if (sessionConfigSource(meta) !== 'codex') return '';
   return String(
-    meta.agentCommand ||
-    meta.agent_command ||
     meta.codexCommand ||
     meta.codex_command ||
     meta.capabilities?.codexCommand ||

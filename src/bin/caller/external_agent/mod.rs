@@ -1673,7 +1673,14 @@ mod tests {
     #[test]
     fn backend_availability_reports_missing_installed_and_last_used() {
         let home = tempfile::tempdir().unwrap();
-        let log_dir = tempfile::tempdir().unwrap();
+        // The wrapper id must name the log dir (upsert's attribution
+        // guard): shape the dir like a real session store.
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("0198aa11-intendant-session");
+        std::fs::create_dir_all(&log_dir).unwrap();
         let mut config = crate::project::ExternalAgentConfig::default();
         config.codex.command = "intendant-test-absent-codex".to_string();
         config.claude_code.command = "intendant-test-absent-claude".to_string();
@@ -1684,7 +1691,7 @@ mod tests {
             "codex",
             "0198aa11-backend-thread",
             "0198aa11-intendant-session",
-            log_dir.path(),
+            &log_dir,
             None,
         )
         .unwrap();

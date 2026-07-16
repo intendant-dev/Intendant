@@ -518,12 +518,18 @@ function wireTaskTextarea(id, submit) {
   resizeTaskTextarea(input);
 }
 
+// Implicit resumes (auto-attach after a dropped follow-up, station/window
+// reattach) carry NO launch overrides: the daemon owns each session's
+// persisted launch config and applies it itself. Echoing dashboard-derived
+// config back as overrides let a contaminated metadata row relaunch a
+// claude-code session on the codex binary (2026-07-16); only the explicit
+// launch-config flows (configure_session_agent / restart_session) send
+// launch settings.
 function detachedSessionResumeMessage(sessionId, task, direct, attachments = []) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
   const meta = sessionMetadataById.get(sid) || {};
   const source = externalSourceForSessionWindow(sid) || normalizeAgentId(meta.backendSource || meta.source) || 'intendant';
-  const overrides = sessionLaunchOverridesForSession(sid);
   const msg = {
     action: 'resume_session',
     source,
@@ -532,7 +538,6 @@ function detachedSessionResumeMessage(sessionId, task, direct, attachments = [])
     project_root: meta.projectRoot || null,
     task,
     direct: direct !== false,
-    ...overrides,
   };
   if (attachments.length > 0) msg.attachments = attachments;
   return msg;

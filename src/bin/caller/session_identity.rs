@@ -136,10 +136,43 @@ fn identity_from_event(value: &serde_json::Value) -> Option<PersistedExternalIde
     })
 }
 
+/// Whether an event's session id names THIS session: equal to the session
+/// id (or extending it — events carry full ids, dirs are sometimes
+/// addressed by a prefix), or equal to the `session_meta.json` canonical
+/// id of a renamed dir.
+///
+/// This is the strict *attribution* predicate — "does this event belong to
+/// this session?" — for readers walking a log that can contain other
+/// sessions' events (the daemon session's log receives the bus tee's copy
+/// of every session's lifecycle events). Contrast [`wrapper_matches`],
+/// which answers the looser *addressing* question ("does the requested
+/// lookup id name this dir?") and deliberately accepts any event once the
+/// requested id is a prefix of the dir's canonical id — using it for
+/// attribution let the daemon session's row absorb other sessions'
+/// identities and launch configs (the codex-for-claude-code incident,
+/// 2026-07-16).
+pub(crate) fn event_names_session(
+    event_session_id: Option<&str>,
+    session_id: &str,
+    canonical_session_id: Option<&str>,
+) -> bool {
+    let Some(event_session_id) = event_session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    event_session_id == session_id
+        || event_session_id.starts_with(session_id)
+        || canonical_session_id == Some(event_session_id)
+}
+
 /// Whether an identity event's wrapper id names the requested session:
 /// equal, an extension of the requested id (dirs are often addressed by a
 /// prefix of their full name), or equal to / extending toward the
 /// `session_meta.json` canonical id the dir was renamed to.
+///
+/// NOTE: this is the *addressing* predicate for lookups that already chose
+/// a dir — once the requested id is a prefix of the dir's canonical id, it
+/// accepts ANY event id. Never use it to decide whether an event belongs
+/// to a session; that is [`event_names_session`].
 pub(crate) fn wrapper_matches(
     identity_session_id: Option<&str>,
     requested_id: &str,
@@ -287,6 +320,38 @@ mod tests {
         let scan = scan_session_log(&ambiguous, "sess-1", None);
         assert_eq!(scan.count, 2);
         assert!(scan.matching_or_unique().is_none());
+    }
+
+    /// The attribution predicate stays strict where the addressing
+    /// predicate deliberately opens up: a foreign event id never "names"
+    /// the session just because meta and dir agree on the session's own id
+    /// (the tautology that let daemon-lane logs contaminate rows).
+    #[test]
+    fn event_names_session_is_strict_about_foreign_ids() {
+        assert!(event_names_session(Some("sess-1"), "sess-1", None));
+        assert!(event_names_session(
+            Some("sess-1-full-name"),
+            "sess-1",
+            None
+        ));
+        assert!(event_names_session(
+            Some("canonical"),
+            "sess-1",
+            Some("canonical")
+        ));
+        // The addressing predicate accepts this; attribution must not.
+        assert!(!event_names_session(
+            Some("anything"),
+            "sess-1",
+            Some("sess-1-canonical")
+        ));
+        assert!(!event_names_session(
+            Some("other-session"),
+            "sess-1",
+            Some("sess-1")
+        ));
+        assert!(!event_names_session(None, "sess-1", None));
+        assert!(!event_names_session(Some("  "), "sess-1", None));
     }
 
     #[test]

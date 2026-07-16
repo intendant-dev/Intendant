@@ -215,6 +215,19 @@ pub fn upsert(
     {
         return Ok(());
     }
+    // Attribution guard: the record is stored under the log dir's identity,
+    // so the caller's wrapper id must actually name that dir (directly, or
+    // via the meta-canonical id of a renamed dir). A mismatch means the
+    // caller is holding someone else's log — e.g. an identity event the bus
+    // tee copied into the daemon session's log — and indexing it would
+    // re-attribute the wrapper binding to that log's session and demote the
+    // real wrapper as an identity conflict.
+    if intendant_session_id != stored_intendant_session_id
+        && crate::session_identity::canonical_session_id_from_meta(log_dir).as_deref()
+            != Some(intendant_session_id)
+    {
+        return Ok(());
+    }
 
     let _guard = INDEX_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -658,6 +671,58 @@ mod tests {
             .expect("demoted row persisted");
         assert_eq!(demoted["updated_at_secs"], 0);
         assert_eq!(demoted["state"], "superseded");
+    }
+
+    /// A caller holding someone else's log dir must not register that dir
+    /// as the wrapper: the daemon session's log receives the bus tee's
+    /// copies of every session's identity events, and indexing those made
+    /// the daemon session the "active" wrapper of another session's thread
+    /// (demoting the real wrapper as a conflict).
+    #[test]
+    fn upsert_skips_wrapper_id_that_does_not_name_the_log_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let daemon_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("11111111-aaaa-4aaa-8aaa-111111111111");
+        std::fs::create_dir_all(&daemon_dir).unwrap();
+        let backend_id = "019ea8b9-0000-7000-8000-0000000000f1";
+
+        // Wrapper id names a DIFFERENT session than the dir: skipped.
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            "22222222-bbbb-4bbb-8bbb-222222222222",
+            &daemon_dir,
+            None,
+        )
+        .unwrap();
+        assert!(wrappers_for(home.path(), "codex", backend_id).is_empty());
+
+        // The meta-canonical id of a renamed dir still counts as naming it.
+        std::fs::write(
+            daemon_dir.join("session_meta.json"),
+            serde_json::json!({ "session_id": "33333333-cccc-4ccc-8ccc-333333333333" }).to_string(),
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            "33333333-cccc-4ccc-8ccc-333333333333",
+            &daemon_dir,
+            None,
+        )
+        .unwrap();
+        let wrappers = wrappers_for(home.path(), "codex", backend_id);
+        assert_eq!(wrappers.len(), 1);
+        // Records store the dir's identity.
+        assert_eq!(
+            wrappers[0].intendant_session_id,
+            "11111111-aaaa-4aaa-8aaa-111111111111"
+        );
     }
 
     #[test]

@@ -28448,7 +28448,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'c5cafedb0132cd27';
+const INTENDANT_APP_BUILD = 'a1ccdc7343c34ada';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
@@ -51444,9 +51444,12 @@ function sessionConfigSource(meta = {}) {
 }
 
 function sessionConfigCommand(meta = {}) {
+  const command = String(meta.agentCommand || meta.agent_command || '').trim();
+  if (command) return command;
+  // The codex_command fields are codex-only; for any other source they can
+  // only be cross-session contamination, never this session's binary.
+  if (sessionConfigSource(meta) !== 'codex') return '';
   return String(
-    meta.agentCommand ||
-    meta.agent_command ||
     meta.codexCommand ||
     meta.codex_command ||
     meta.capabilities?.codexCommand ||
@@ -51605,24 +51608,11 @@ function sessionConfigMetadata(sessionOrId) {
   return managedContextNormalizeSessionMeta(merged, sid || backendId);
 }
 
-function sessionLaunchOverridesForSession(sessionOrId) {
-  const meta = sessionConfigMetadata(sessionOrId);
-  const source = sessionConfigSource(meta);
-  const overrides = {};
-  const command = sessionConfigCommand(meta);
-  if (command) overrides.agent_command = command;
-  if (source === 'codex') {
-    const sandbox = sessionLaunchSandboxMode(meta);
-    const approvalPolicy = sessionLaunchApprovalPolicy(meta);
-    const managedMode = sessionLaunchManagedMode(meta);
-    const archiveMode = sessionLaunchArchiveMode(meta);
-    if (sandbox) overrides.codex_sandbox = sandbox;
-    if (approvalPolicy) overrides.codex_approval_policy = approvalPolicy;
-    if (managedMode) overrides.codex_managed_context = managedMode;
-    if (archiveMode) overrides.codex_context_archive = archiveMode;
-  }
-  return overrides;
-}
+// (There is deliberately no "launch overrides from session metadata"
+// helper anymore: resume messages carry no launch config — the daemon
+// applies each session's persisted config itself. Echoing metadata-derived
+// config back over the wire is how a contaminated row once relaunched a
+// claude-code session on the codex binary.)
 
 function openSessionConfigModal(sessionOrId) {
   const meta = sessionConfigMetadata(sessionOrId);
@@ -89761,12 +89751,18 @@ function wireTaskTextarea(id, submit) {
   resizeTaskTextarea(input);
 }
 
+// Implicit resumes (auto-attach after a dropped follow-up, station/window
+// reattach) carry NO launch overrides: the daemon owns each session's
+// persisted launch config and applies it itself. Echoing dashboard-derived
+// config back as overrides let a contaminated metadata row relaunch a
+// claude-code session on the codex binary (2026-07-16); only the explicit
+// launch-config flows (configure_session_agent / restart_session) send
+// launch settings.
 function detachedSessionResumeMessage(sessionId, task, direct, attachments = []) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
   const meta = sessionMetadataById.get(sid) || {};
   const source = externalSourceForSessionWindow(sid) || normalizeAgentId(meta.backendSource || meta.source) || 'intendant';
-  const overrides = sessionLaunchOverridesForSession(sid);
   const msg = {
     action: 'resume_session',
     source,
@@ -89775,7 +89771,6 @@ function detachedSessionResumeMessage(sessionId, task, direct, attachments = [])
     project_root: meta.projectRoot || null,
     task,
     direct: direct !== false,
-    ...overrides,
   };
   if (attachments.length > 0) msg.attachments = attachments;
   return msg;
@@ -100754,7 +100749,9 @@ function resumeSession(s) {
   ensureSessionWindow(sid, meta);
   if (source !== 'intendant') setSessionWindowDetached(sid, true, 'resume requested');
   focusSessionWindow(sid);
-  const overrides = sessionLaunchOverridesForSession(s);
+  // No launch overrides on an implicit resume: the daemon applies the
+  // session's persisted launch config itself (see
+  // detachedSessionResumeMessage for the incident this prevents).
   dispatchSessionControlMsg({
     action: 'resume_session',
     source,
@@ -100762,7 +100759,6 @@ function resumeSession(s) {
     resume_id: resumeId,
     project_root: projectRoot,
     direct: true,
-    ...overrides,
   });
   // Resuming from the rendered Station must not yank the user out of the
   // canvas (routeTo deactivates the Station renderer — the surface looked

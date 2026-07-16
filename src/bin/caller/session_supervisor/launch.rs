@@ -246,6 +246,18 @@ impl SessionSupervisor {
                 );
                 return None;
             };
+            if let Some(owner) = crate::session_config::agent_command_conflicts_with_source(
+                backend.as_short_str(),
+                &command,
+            ) {
+                self.loop_error(format!(
+                    "Session create failed: agent command '{}' is the {} CLI but the session's agent is {}",
+                    command,
+                    owner,
+                    backend.as_short_str()
+                ));
+                return None;
+            }
             apply_session_agent_command(&mut project, backend, command);
         }
         if let Some(model) = claude_model
@@ -574,6 +586,30 @@ impl SessionSupervisor {
         } else {
             Vec::new()
         };
+        if let (Some(backend), Some(command)) = (
+            external_backend.as_ref(),
+            overrides
+                .agent_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|command| !command.is_empty()),
+        ) {
+            if let Some(owner) = crate::session_config::agent_command_conflicts_with_source(
+                backend.as_short_str(),
+                command,
+            ) {
+                // from_wire_fields drops the conflicting command below; say
+                // so instead of silently resuming on a different binary than
+                // the request named.
+                self.warn(&format!(
+                    "Ignoring agent command '{}' for {} session {}: that is the {} CLI; resuming with the session's saved command",
+                    command,
+                    backend.as_short_str(),
+                    short_session(&session_id),
+                    owner
+                ));
+            }
+        }
         let mut session_agent_config = external_backend.as_ref().map(|backend| {
             let mut config = crate::session_config::from_wire_fields(
                 overrides.as_wire_fields(backend.as_short_str()),
@@ -721,6 +757,12 @@ impl SessionSupervisor {
                 });
 
                 write_session_meta(&session_log, &project.root, None, None);
+                write_eager_resume_identity(
+                    &session_log,
+                    external_backend.as_ref(),
+                    &resume_token,
+                    fork,
+                );
                 self.register_git_vitals(&session_id, &project.root);
                 if let Some(config) = effective_session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
@@ -844,6 +886,7 @@ impl SessionSupervisor {
         let display_task = crate::thread_actions::side_respawn_display_task(&resume_task)
             .unwrap_or_else(|| resume_task.clone());
         write_session_meta(&session_log, &project.root, Some(&display_task), None);
+        write_eager_resume_identity(&session_log, external_backend.as_ref(), &resume_token, fork);
         // Forks announce under the child wrapper id (see SessionStarted
         // below); key the git probe the same way so the row lands on the
         // child window, not the parent's.
@@ -1636,6 +1679,32 @@ pub(crate) fn short_text(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// A resume names the backend thread up front — persist the wrapper's
+/// identity into its OWN log at spawn time (the `session_identity` module
+/// contract: write identity facts the moment they become known). This
+/// write is what registers the wrapper index against the real wrapper
+/// dir; the daemon-lane tee copy of the same event must not (see
+/// `SessionLog::session_identity`). Forks skip it: a fork's own thread id
+/// is only known once the backend announces it.
+pub(crate) fn write_eager_resume_identity(
+    session_log: &Arc<Mutex<session_log::SessionLog>>,
+    backend: Option<&external_agent::AgentBackend>,
+    resume_token: &str,
+    fork: bool,
+) {
+    let Some(backend) = backend else { return };
+    if fork || !external_agent::source_session_id_is_canonical(backend.as_short_str(), resume_token)
+    {
+        return;
+    }
+    slog(session_log, |log| {
+        let wrapper_id = log.session_id().to_string();
+        if wrapper_id != resume_token {
+            log.session_identity(&wrapper_id, backend.as_short_str(), resume_token);
+        }
+    });
+}
+
 pub(crate) fn external_attach_dedupe_keys(
     source: &str,
     session_id: &str,
@@ -1673,6 +1742,42 @@ mod tests {
         let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
         log.write_meta(None, Some("old task"));
         log.session_identity(wrapper_id, source, backend_session_id);
+    }
+
+    /// The eager resume-identity write lands in the wrapper's own log and
+    /// registers the wrapper index there — and skips forks and
+    /// non-canonical tokens.
+    #[test]
+    fn eager_resume_identity_registers_wrapper_index_from_own_log() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_id = "e9532107-8c7f-4c1f-b88d-410d6d365542";
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        let backend = external_agent::AgentBackend::ClaudeCode;
+        let token = "0caf4660-7345-4f3b-b8e7-407e59aefa5d";
+
+        let log = Arc::new(Mutex::new(
+            session_log::SessionLog::open(wrapper_dir.clone()).unwrap(),
+        ));
+        // Fork: no identity yet (the backend announces the fork's own id).
+        write_eager_resume_identity(&log, Some(&backend), token, true);
+        assert!(
+            crate::external_wrapper_index::wrappers_for(home.path(), "claude-code", token)
+                .is_empty()
+        );
+        // Placeholder token: not canonical, never persisted as identity.
+        write_eager_resume_identity(&log, Some(&backend), "claude-code-session", false);
+        // Plain resume: identity in the wrapper's own log + index record
+        // attributed to the wrapper dir.
+        write_eager_resume_identity(&log, Some(&backend), token, false);
+        let wrappers =
+            crate::external_wrapper_index::wrappers_for(home.path(), "claude-code", token);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(wrappers[0].intendant_session_id, wrapper_id);
+        let identity = crate::session_identity::scan_session_dir(&wrapper_dir, wrapper_id)
+            .and_then(|scan| scan.matching_or_unique())
+            .expect("identity event persisted");
+        assert_eq!(identity.backend_session_id, token);
+        assert_eq!(identity.source, "claude-code");
     }
 
     #[tokio::test]
