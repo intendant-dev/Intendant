@@ -170,9 +170,14 @@ len=$(jq -r '.data.stderr_bytes // empty' <<<"$row")
 dd if="$S/$file" bs=1 skip="$off" count="$len" 2>/dev/null
 ```
 
-Show model input files:
+Show exact model input (prefer the latest context sidecar — snapshot
+files rotate to latest-only per stream, and `messages_input` rows exist
+only in debug mode or for providers without a request snapshot):
 
 ```bash
+jq . "$S/$(jq -r 'select(.event=="context_snapshot") | .file' "$S/session.jsonl" | tail -1)" | less
+# Conditional/debug-only fallback (INTENDANT_LOG_MESSAGES_JSON=1 or a
+# snapshot-less provider):
 jq -r 'select(.event=="messages_input") | [.turn, .file] | @tsv' "$S/session.jsonl"
 jq . "$S/turns/turn_005_messages.json" | less
 ```

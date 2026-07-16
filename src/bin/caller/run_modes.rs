@@ -3223,10 +3223,23 @@ pub(crate) async fn run_direct_mode(
                 conv
             }
             Err(e) => {
+                // Preserve the damaged history BEFORE starting fresh: the
+                // next autosave writes this same path, and an
+                // interior-corrupt file (a hard load error by design)
+                // would otherwise be overwritten — total loss where the
+                // bytes were still manually recoverable.
+                let preserved = crate::conversation::quarantine_damaged_file(&conv_path);
                 slog(&session_log, |l| {
                     l.warn(&format!(
-                        "Failed to load conversation, starting fresh: {}",
-                        e
+                        "Failed to load conversation, starting fresh: {}{}",
+                        e,
+                        match &preserved {
+                            Ok(path) => format!("; damaged file preserved at {}", path.display()),
+                            Err(rename_err) => format!(
+                                "; damaged file could NOT be preserved ({rename_err}) — \
+                                 the next save will overwrite it"
+                            ),
+                        }
                     ))
                 });
                 fresh_conversation = true;

@@ -1,6 +1,6 @@
 use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 fn is_false(v: &bool) -> bool {
     !v
@@ -127,6 +127,116 @@ pub struct Conversation {
     /// The next seq to assign. Monotonic for the life of the conversation:
     /// truncation/rewind never rewinds it (see [`Message::seq`]).
     next_seq: u64,
+    /// Persistence cursor for [`Self::save_to_file`]'s append fast path:
+    /// how many leading messages are already on disk at [`Self::persisted_to`].
+    /// Only meaningful while `persist_dirty` is false.
+    persisted_messages: usize,
+    /// The file the cursor describes; saving to any other path rewrites.
+    persisted_to: Option<std::path::PathBuf>,
+    /// Byte length of the file as of our last save/load — the append
+    /// guard: a target whose length differs was written out-of-band, and
+    /// the next save falls back to the atomic full rewrite.
+    persisted_bytes: u64,
+    /// (device, inode) of the file as of our last save/load, where the
+    /// platform provides a cheap identity (`None` elsewhere): catches the
+    /// file being replaced rather than edited.
+    persisted_identity: Option<(u64, u64)>,
+    /// Set whenever already-persisted history is mutated (compaction,
+    /// rollback, image stripping, pairing repair, seq renumbering): the
+    /// next save must rewrite the whole file instead of appending.
+    persist_dirty: bool,
+}
+
+/// Minimum age before a sibling rewrite temp counts as a crash orphan.
+/// Age-gating keeps the sweep gentle toward a hypothetical concurrent
+/// writer mid-rewrite (already a contract violation, but destroying its
+/// in-flight temp would compound it).
+const STALE_REWRITE_TEMP_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove crash-orphaned rewrite temps (`<name>.tmp.<other-pid>`): a
+/// process that died between creating its temp and renaming it leaves a
+/// file nothing would ever clean up. Swept opportunistically at
+/// full-rewrite time; our own temp and anything younger than
+/// [`STALE_REWRITE_TEMP_MAX_AGE`] are left alone.
+fn sweep_stale_rewrite_temps(path: &std::path::Path, our_tmp: &std::path::Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let prefix = format!("{name}.tmp.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path == our_tmp {
+            continue;
+        }
+        let Some(entry_name) = entry_path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !entry_name.starts_with(&prefix) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_REWRITE_TEMP_MAX_AGE);
+        if old_enough {
+            let _ = std::fs::remove_file(&entry_path);
+        }
+    }
+}
+
+/// Rename a conversation file that failed to load aside as
+/// `<name>.damaged-<unix-ts>[-N]` and return the new path. The resume
+/// path starts a fresh conversation on a load error, and its next
+/// autosave writes the same file — without this rename-aside, an
+/// interior-corrupt history (a hard load error by design, see
+/// [`Conversation::load_from_file`]) would be overwritten outright:
+/// total loss where the damaged bytes were still manually recoverable.
+pub fn quarantine_damaged_file(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("conversation.jsonl");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for attempt in 0..100u32 {
+        let candidate = if attempt == 0 {
+            path.with_file_name(format!("{name}.damaged-{ts}"))
+        } else {
+            path.with_file_name(format!("{name}.damaged-{ts}-{attempt}"))
+        };
+        if candidate.exists() {
+            continue;
+        }
+        std::fs::rename(path, &candidate)?;
+        return Ok(candidate);
+    }
+    Err(std::io::Error::other(
+        "no free damaged-file name after 100 attempts",
+    ))
+}
+
+/// Stable (device, inode) file identity where the platform provides one;
+/// `None` on platforms without a cheap equivalent (Windows file indices
+/// need an open handle — the byte-length guard stands alone there).
+fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 impl Conversation {
@@ -144,7 +254,18 @@ impl Conversation {
             turn: 0,
             protect_user_layer: false,
             next_seq: 2,
+            persisted_messages: 0,
+            persisted_to: None,
+            persisted_bytes: 0,
+            persisted_identity: None,
+            persist_dirty: false,
         }
+    }
+
+    /// Record that already-persisted history changed shape or content, so
+    /// the append fast path in [`Self::save_to_file`] is no longer sound.
+    fn mark_history_mutated(&mut self) {
+        self.persist_dirty = true;
     }
 
     #[allow(dead_code)]
@@ -341,6 +462,9 @@ impl Conversation {
             msg.seq = seq;
         }
         self.next_seq = seq + 1;
+        // The renumber rewrote persisted rows (a legacy no-seq file), so
+        // the on-disk copy no longer matches message-for-message.
+        self.mark_history_mutated();
         true
     }
 
@@ -420,6 +544,7 @@ impl Conversation {
     /// interrupt case); mutation can strand pairs anywhere in history.
     pub fn repair_tool_call_pairing(&mut self) -> usize {
         let mut repaired = 0;
+        let before_len = self.messages.len();
         let old = std::mem::take(&mut self.messages);
         let mut out: Vec<Message> = Vec::with_capacity(old.len());
         // Unanswered (id, name) pairs from the most recent assistant
@@ -482,6 +607,11 @@ impl Conversation {
         }
         self.next_seq = next_seq;
         self.messages = out;
+        // The pass only moves, inserts, or removes whole messages — so
+        // "changed" is exactly "inserted a repair or dropped an orphan".
+        if repaired > 0 || self.messages.len() != before_len {
+            self.mark_history_mutated();
+        }
         repaired
     }
 
@@ -501,10 +631,18 @@ impl Conversation {
             .iter()
             .rposition(|m| m.images.is_some() && !m.is_cu_result);
         if let Some(last_idx) = last_non_cu {
+            let mut changed = false;
             for (i, msg) in self.messages.iter_mut().enumerate() {
-                if i < last_idx && !msg.is_cu_result {
+                if i < last_idx && !msg.is_cu_result && msg.images.is_some() {
                     msg.images = None;
+                    changed = true;
                 }
+            }
+            // Only an actual strip invalidates the persisted prefix — the
+            // common repeat call (no new screenshot since the last strip)
+            // must keep the append fast path.
+            if changed {
+                self.mark_history_mutated();
             }
         }
     }
@@ -713,6 +851,7 @@ impl Conversation {
         }
         let removed = current - target;
         self.messages.truncate(target);
+        self.mark_history_mutated();
         // Resolve any dangling tool calls at the new tail so the API
         // doesn't reject the next request.
         self.resolve_dangling_tool_calls();
@@ -744,6 +883,9 @@ impl Conversation {
         to_remove.dedup();
 
         // Remove in reverse order to preserve indices
+        if !to_remove.is_empty() {
+            self.mark_history_mutated();
+        }
         for &i in to_remove.iter().rev() {
             self.messages.remove(i);
         }
@@ -784,6 +926,7 @@ impl Conversation {
         }
 
         let insert_pos = valid[0];
+        self.mark_history_mutated();
 
         // Remove in reverse order
         for &i in valid.iter().rev() {
@@ -809,34 +952,160 @@ impl Conversation {
 
     /// Save conversation messages to a JSONL file (one JSON object per line).
     /// Note: `raw_output` and `layer` are `#[serde(skip)]` and will be lost on roundtrip.
-    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
-        let mut writer = std::io::BufWriter::new(file);
-        for msg in &self.messages {
-            let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
-            writeln!(writer, "{}", json)?;
+    ///
+    /// Called once per turn by the agent loop, so persistence is
+    /// incremental: while history has only been appended to since the last
+    /// save of the same path, only the new tail rows are appended
+    /// (previously this rewrote the whole file every turn — O(turns²) disk
+    /// over a session). History mutations (compaction, rollback, image
+    /// stripping, pairing repair) set `persist_dirty` and force a full
+    /// rewrite — done atomically via temp+rename with an fsync before the
+    /// rename (power-loss window), which also closes the old
+    /// crash-truncates-the-resume-file window of `File::create` in place.
+    /// The file format is unchanged either way.
+    ///
+    /// Persistence is **single-writer by contract**: one live session owns
+    /// its log dir and this file. The append fast path additionally
+    /// verifies the target still has exactly the byte length (and, where
+    /// the platform provides one, the (dev, ino) identity) we recorded —
+    /// out-of-band truncation or replacement falls back to the atomic full
+    /// rewrite, self-healing the divergence. A same-length same-identity
+    /// content edit is the documented residual: catching it would mean
+    /// hashing the file every turn, against the append-only trust model.
+    pub fn save_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let append_ok = !self.persist_dirty
+            && self.persisted_to.as_deref() == Some(path)
+            && self.persisted_messages <= self.messages.len()
+            && self.persisted_file_matches(path);
+        if append_ok {
+            if self.persisted_messages < self.messages.len() {
+                match self.append_new_messages(path) {
+                    Ok(written) => {
+                        self.persisted_bytes = self.persisted_bytes.saturating_add(written);
+                    }
+                    Err(err) => {
+                        // A failed or partial append can leave a torn tail;
+                        // make the next save rewrite the file clean.
+                        self.persist_dirty = true;
+                        return Err(err);
+                    }
+                }
+            }
+            self.persisted_messages = self.messages.len();
+            return Ok(());
         }
-        writer.flush()?;
+
+        // Per-process temp name: concurrent rewriters (the contract
+        // violation case) each splice their own temp file instead of
+        // interleaving through one fixed name; last rename wins whole.
+        let tmp = path.with_extension(format!("jsonl.tmp.{}", std::process::id()));
+        sweep_stale_rewrite_temps(path, &tmp);
+        let mut buf: Vec<u8> = Vec::new();
+        for msg in &self.messages {
+            serde_json::to_writer(&mut buf, msg).map_err(std::io::Error::other)?;
+            buf.push(b'\n');
+        }
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&buf)?;
+            // fsync before rename: without it a power loss can promote a
+            // zero-length or partial temp file over the good history.
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        self.persisted_to = Some(path.to_path_buf());
+        self.persisted_messages = self.messages.len();
+        self.persisted_bytes = buf.len() as u64;
+        self.persisted_identity = std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| file_identity(&meta));
+        self.persist_dirty = false;
         Ok(())
+    }
+
+    /// Whether the on-disk file still matches the state our persistence
+    /// cursor describes (length always; (dev, ino) identity where
+    /// recorded). See the single-writer contract on [`Self::save_to_file`].
+    fn persisted_file_matches(&self, path: &std::path::Path) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        if meta.len() != self.persisted_bytes {
+            return false;
+        }
+        match self.persisted_identity {
+            Some(recorded) => file_identity(&meta) == Some(recorded),
+            None => true,
+        }
+    }
+
+    /// Append the not-yet-persisted tail rows to an existing save file.
+    /// Returns the number of bytes appended.
+    fn append_new_messages(&self, path: &std::path::Path) -> std::io::Result<u64> {
+        let mut buf: Vec<u8> = Vec::new();
+        for msg in &self.messages[self.persisted_messages..] {
+            serde_json::to_writer(&mut buf, msg).map_err(std::io::Error::other)?;
+            buf.push(b'\n');
+        }
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(&buf)?;
+        Ok(buf.len() as u64)
     }
 
     /// Load conversation from a JSONL file. Creates a new Conversation with the
     /// given context window and populates it with the saved messages.
     /// Note: `raw_output` and `layer` are lost on roundtrip (they are `#[serde(skip)]`).
+    ///
+    /// Interrupted-append recovery works on bytes (a partial append can
+    /// split a multibyte UTF-8 character — that must stay tail-local, never
+    /// abort the load) and distinguishes the final record's three states:
+    /// - **unterminated + parseable** — the crash landed between the row
+    ///   write and its newline. The row is accepted and the file marked
+    ///   dirty so the next save rewrites it newline-terminated (appending
+    ///   after it would fuse two rows into one `}{` line).
+    /// - **unterminated + unparseable** — a torn append. The row is
+    ///   dropped, the file marked dirty (heal on next save), and the seq
+    ///   counter advanced past the torn row's seq: its canonical
+    ///   `conversation_message` row was already flushed to session.jsonl
+    ///   before the conversation save, so re-minting that seq would give
+    ///   message search / rewind cuts two messages sharing one seq.
+    /// - **terminated + unparseable** — not an interrupted-append
+    ///   signature; treated as interior corruption: a loud error, exactly
+    ///   like a malformed line anywhere else in the file.
     pub fn load_from_file(path: &std::path::Path, context_window: u64) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
-        let mut messages = Vec::new();
+        let bytes = std::fs::read(path)?;
+        let records: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+        // `split` yields one trailing element after the last newline; the
+        // only unterminated record a file can have is that final element.
+        let unterminated_index = records.len() - 1;
+        let non_empty: Vec<(usize, &[u8])> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| (index, record.trim_ascii()))
+            .filter(|(_, record)| !record.is_empty())
+            .collect();
 
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        let mut messages = Vec::with_capacity(non_empty.len());
+        let mut dropped_torn_tail = false;
+        let mut accepted_unterminated_tail = false;
+
+        for (position, (record_index, record)) in non_empty.iter().enumerate() {
+            let is_final = position + 1 == non_empty.len();
+            let unterminated = *record_index == unterminated_index;
+            match serde_json::from_slice::<Message>(record) {
+                Ok(msg) => {
+                    messages.push(msg);
+                    if is_final && unterminated {
+                        accepted_unterminated_tail = true;
+                    }
+                }
+                Err(_) if is_final && unterminated => {
+                    dropped_torn_tail = true;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                }
             }
-            let msg: Message = serde_json::from_str(trimmed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            messages.push(msg);
         }
 
         // Count non-system user+assistant pairs to estimate turn count
@@ -844,13 +1113,23 @@ impl Conversation {
         // Resume the monotonic counter past the highest persisted seq
         // (all-zero legacy files start at 1; `ensure_seqs_assigned` is the
         // resume-time renumber pass for those).
-        let next_seq = messages
+        let mut next_seq = messages
             .iter()
             .map(|m| m.seq)
             .max()
             .unwrap_or(0)
             .saturating_add(1);
+        if dropped_torn_tail {
+            // Seqs assign monotonically at append time, so the torn row
+            // carried max(survivors)+1 — skip it (see doc comment above).
+            next_seq = next_seq.saturating_add(1);
+        }
 
+        let persisted_messages = messages.len();
+        let persist_dirty = dropped_torn_tail || accepted_unterminated_tail;
+        let persisted_identity = std::fs::metadata(path)
+            .ok()
+            .and_then(|meta| file_identity(&meta));
         Ok(Self {
             messages,
             last_usage: None,
@@ -858,6 +1137,11 @@ impl Conversation {
             turn,
             protect_user_layer: false,
             next_seq,
+            persisted_messages,
+            persisted_to: Some(path.to_path_buf()),
+            persisted_bytes: bytes.len() as u64,
+            persisted_identity,
+            persist_dirty,
         })
     }
 }
@@ -1455,13 +1739,490 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conversation.jsonl");
 
-        let conv = Conversation::new("system prompt".to_string(), 100_000);
+        let mut conv = Conversation::new("system prompt".to_string(), 100_000);
         conv.save_to_file(&path).unwrap();
 
         let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.messages()[0].role, "system");
         assert_eq!(loaded.turn(), 0);
+    }
+
+    // --- Incremental persistence ---
+
+    fn file_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn save_appends_new_tail_and_keeps_prefix_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "turn one".to_string());
+        conv.save_to_file(&path).unwrap();
+        let first_save = std::fs::read_to_string(&path).unwrap();
+
+        conv.add_assistant("reply".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "turn two".to_string());
+        conv.save_to_file(&path).unwrap();
+        let second_save = std::fs::read_to_string(&path).unwrap();
+
+        // Pure appends never rewrite the persisted prefix.
+        assert!(second_save.starts_with(&first_save));
+        assert_eq!(file_lines(&path).len(), 4);
+
+        // Round trip stays intact.
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 4);
+        assert_eq!(loaded.messages()[3].content, "turn two");
+    }
+
+    #[test]
+    fn save_with_no_new_messages_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
+        conv.save_to_file(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        conv.save_to_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn history_mutation_forces_full_rewrite_that_matches_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        for i in 0..8 {
+            conv.add_user(MessageProvenance::FollowUp, format!("msg {i}"));
+            conv.add_assistant(format!("resp {i}"));
+        }
+        conv.save_to_file(&path).unwrap();
+
+        // Mutate persisted history (compaction path), then save again.
+        conv.summarize_turns(&[3, 4, 5, 6], "compacted middle");
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), conv.messages().len());
+        assert!(loaded
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("[Context Summary]")));
+    }
+
+    #[test]
+    fn torn_final_line_is_dropped_and_next_save_rewrites_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        // Simulate a crash mid-append: garbage tail without newline.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"role\":\"user\",\"cont").unwrap();
+        }
+
+        let mut loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 2, "torn tail dropped");
+
+        // The next save must rewrite the file clean, not append after junk.
+        loaded.add_assistant("recovered".to_string());
+        loaded.save_to_file(&path).unwrap();
+        let reloaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(reloaded.messages().len(), 3);
+        assert_eq!(reloaded.messages()[2].content, "recovered");
+    }
+
+    #[test]
+    fn malformed_interior_line_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"system\",\"content\":\"sys\"}\nnot json\n{\"role\":\"user\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        assert!(Conversation::load_from_file(&path, 100_000).is_err());
+    }
+
+    #[test]
+    fn quarantine_preserves_damaged_history_before_a_fresh_save() {
+        // The resume path's contract: load error → rename the damaged
+        // file aside → a fresh conversation saving to the original path
+        // must not destroy the preserved bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let damaged_bytes =
+            "{\"role\":\"system\",\"content\":\"sys\"}\nnot json\n{\"role\":\"user\",\"content\":\"hi\"}\n";
+        std::fs::write(&path, damaged_bytes).unwrap();
+
+        assert!(Conversation::load_from_file(&path, 100_000).is_err());
+        let preserved = quarantine_damaged_file(&path).unwrap();
+        assert!(!path.exists(), "original path freed for the fresh start");
+        assert_eq!(
+            std::fs::read_to_string(&preserved).unwrap(),
+            damaged_bytes,
+            "damaged bytes preserved verbatim"
+        );
+
+        let mut fresh = Conversation::new("sys".to_string(), 100_000);
+        fresh.add_user(MessageProvenance::Task, "new task".to_string());
+        fresh.save_to_file(&path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&preserved).unwrap(),
+            damaged_bytes,
+            "fresh save must not touch the quarantined file"
+        );
+        assert_eq!(
+            Conversation::load_from_file(&path, 100_000)
+                .unwrap()
+                .messages()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn terminated_malformed_final_line_errors_like_interior_corruption() {
+        // A bad final record that DOES end in a newline is not an
+        // interrupted-append signature — it must fail loudly, never be
+        // silently dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"system\",\"content\":\"sys\"}\nnot json\n",
+        )
+        .unwrap();
+        assert!(Conversation::load_from_file(&path, 100_000).is_err());
+    }
+
+    #[test]
+    fn unterminated_parseable_tail_is_accepted_and_newline_healed() {
+        // Crash between the row write and its newline: the row is complete
+        // JSON, just missing the terminator. It must be ACCEPTED — and the
+        // file marked dirty, or the next append would fuse two rows into
+        // one `}{` line and a later load would drop both.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "kept row".to_string());
+        conv.save_to_file(&path).unwrap();
+        // Strip the trailing newline to simulate the crash.
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 2, "unterminated row accepted");
+        assert_eq!(loaded.messages()[1].content, "kept row");
+
+        // Next save rewrites (dirty); a subsequent append must not fuse.
+        loaded.add_assistant("after crash".to_string());
+        loaded.save_to_file(&path).unwrap();
+        let reloaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(reloaded.messages().len(), 3, "no `}}{{` row fusion");
+        assert_eq!(reloaded.messages()[1].content, "kept row");
+        assert_eq!(reloaded.messages()[2].content, "after crash");
+        assert_eq!(std::fs::read(&path).unwrap().last(), Some(&b'\n'));
+    }
+
+    #[test]
+    fn multibyte_split_torn_tail_is_dropped_without_aborting_the_load() {
+        // A partial append can cut mid-UTF-8-sequence; recovery must stay
+        // tail-local (a string-based read of the whole file would fail
+        // before any tail handling could run).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "intact héllo".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        // Append a row containing multibyte content, then truncate inside
+        // the final multibyte character (and before any newline).
+        let torn = serde_json::to_string(&Message {
+            role: "assistant".to_string(),
+            content: "réponse".to_string(),
+            seq: 3,
+            ..Default::default()
+        })
+        .unwrap();
+        let torn_bytes = torn.as_bytes();
+        // Cut one byte INTO the two-byte `é` sequence: the tail is not
+        // just incomplete JSON, it is invalid UTF-8.
+        let cut = torn.find('é').unwrap() + 1;
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&torn_bytes[..cut]).unwrap();
+        }
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 2, "torn multibyte tail dropped");
+        assert_eq!(loaded.messages()[1].content, "intact héllo");
+    }
+
+    #[test]
+    fn torn_tail_advances_the_seq_past_the_dropped_row() {
+        // The torn row's seq was already durably referenced: the canonical
+        // conversation_message row flushes to session.jsonl BEFORE the
+        // conversation file saves. Re-minting it would give message search
+        // and rewind cuts two messages sharing one seq.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "one".to_string()); // seq 2
+        conv.add_assistant("two".to_string()); // seq 3
+        conv.save_to_file(&path).unwrap();
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            // Torn row that would have carried seq 4.
+            f.write_all(b"{\"role\":\"user\",\"cont").unwrap();
+        }
+
+        let mut loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 3);
+        let next = loaded.add_user(MessageProvenance::FollowUp, "resume".to_string());
+        assert_eq!(next, 5, "seq 4 belonged to the torn row and is skipped");
+    }
+
+    #[test]
+    fn out_of_band_file_change_forces_full_rewrite_not_silent_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "one".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        // Another writer truncates/replaces the file behind our back.
+        std::fs::write(&path, "{\"role\":\"system\",\"content\":\"sys\"}\n").unwrap();
+
+        conv.add_assistant("two".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        // The save must have healed the divergence: disk == memory.
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), conv.messages().len());
+        assert_eq!(loaded.messages()[1].content, "one");
+        assert_eq!(loaded.messages()[2].content, "two");
+    }
+
+    // --- FIX8: every history mutator must invalidate the append cursor ---
+
+    /// Build → save → mutate → save → load: the loaded file must equal the
+    /// in-memory conversation message-for-message. If a mutator forgets
+    /// `mark_history_mutated`, the second save appends nothing (no new
+    /// rows) while memory changed — and this assertion fails.
+    /// A properly paired image-bearing tool exchange: assistant call +
+    /// matching result. Pairing matters — orphan results would make the
+    /// `repair_tool_call_pairing` pass (run inside `drop_turns` /
+    /// `summarize_turns`) mutate history on its own, masking whether those
+    /// mutators set the dirty flag themselves.
+    fn add_paired_screenshot(conv: &mut Conversation, call_id: &str, data: &str) {
+        conv.add_assistant_tool_calls(
+            format!("taking {call_id}"),
+            vec![ToolCallRef {
+                id: call_id.to_string(),
+                call_id: call_id.to_string(),
+                name: "capture_screen".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            None,
+        );
+        conv.add_tool_result_with_images(
+            call_id,
+            "capture_screen",
+            "shot",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: data.to_string(),
+            }],
+        );
+    }
+
+    fn assert_mutator_roundtrip(label: &str, mutate: impl FnOnce(&mut Conversation)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        add_paired_screenshot(&mut conv, "call_img_1", "AAAA");
+        for i in 0..6 {
+            conv.add_user(MessageProvenance::FollowUp, format!("msg {i}"));
+            conv.add_assistant(format!("resp {i}"));
+        }
+        add_paired_screenshot(&mut conv, "call_img_2", "BBBB");
+        conv.save_to_file(&path).unwrap();
+        let persisted_len = conv.len();
+
+        mutate(&mut conv);
+        // Pad shrinking mutators back to at least the persisted length:
+        // the append guard rewrites whenever the conversation is SHORTER
+        // than the persisted cursor, which would mask a missing
+        // mark_history_mutated — with the pad, the dirty flag is the only
+        // thing forcing the rewrite, so deleting the mark from any mutator
+        // fails this assertion.
+        let mut pad = 0usize;
+        while conv.len() < persisted_len {
+            conv.add_user(MessageProvenance::FollowUp, format!("pad {pad}"));
+            pad += 1;
+        }
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        let memory: Vec<serde_json::Value> = conv
+            .messages()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let disk: Vec<serde_json::Value> = loaded
+            .messages()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(memory, disk, "{label}: disk diverged from memory");
+    }
+
+    #[test]
+    fn every_history_mutator_invalidates_the_append_cursor() {
+        assert_mutator_roundtrip("strip_old_images", |conv| {
+            conv.strip_old_images();
+        });
+        assert_mutator_roundtrip("truncate_to", |conv| {
+            let target = conv.len() - 3;
+            conv.truncate_to(target);
+        });
+        assert_mutator_roundtrip("drop_turns", |conv| {
+            conv.drop_turns(&[3, 4]);
+        });
+        assert_mutator_roundtrip("summarize_turns", |conv| {
+            conv.summarize_turns(&[3, 4, 5], "compacted");
+        });
+    }
+
+    #[test]
+    fn repair_tool_call_pairing_mutation_round_trips() {
+        // The orphan must be PERSISTED before the repair runs: an orphan
+        // added and repaired away between two saves is a net content no-op
+        // that cannot distinguish a missing dirty mark. With it on disk,
+        // the repair genuinely rewrites persisted history — and the pad
+        // keeps the length at the persisted count so the dirty flag is
+        // the only thing forcing the rewrite.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        add_paired_screenshot(&mut conv, "call_img_1", "AAAA");
+        conv.add_tool_result("call_orphan", "exec_command", "orphan output");
+        conv.add_user(MessageProvenance::FollowUp, "after orphan".to_string());
+        conv.save_to_file(&path).unwrap();
+        let persisted_len = conv.len();
+
+        let before = conv.len();
+        conv.repair_tool_call_pairing();
+        assert!(
+            conv.len() < before,
+            "fixture must make the repair drop the persisted orphan"
+        );
+        let mut pad = 0usize;
+        while conv.len() < persisted_len {
+            conv.add_user(MessageProvenance::FollowUp, format!("pad {pad}"));
+            pad += 1;
+        }
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        let memory: Vec<serde_json::Value> = conv
+            .messages()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        let disk: Vec<serde_json::Value> = loaded
+            .messages()
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        assert_eq!(memory, disk, "repair_tool_call_pairing: disk diverged");
+    }
+
+    #[test]
+    fn ensure_seqs_assigned_renumber_round_trips() {
+        // Legacy no-seq file: the resume-time renumber rewrites every
+        // persisted row, so it must invalidate the append cursor too.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"system\",\"content\":\"sys\"}\n{\"role\":\"user\",\"content\":\"legacy\"}\n",
+        )
+        .unwrap();
+        let mut conv = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert!(conv.ensure_seqs_assigned());
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 2);
+        assert_eq!(loaded.messages()[0].seq, 1);
+        assert_eq!(loaded.messages()[1].seq, 2);
+    }
+
+    #[test]
+    fn repeat_strip_without_new_images_keeps_append_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_tool_result_with_images(
+            "call_1",
+            "capture_screen",
+            "old shot",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        );
+        conv.add_tool_result_with_images(
+            "call_2",
+            "capture_screen",
+            "new shot",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "BBBB".to_string(),
+            }],
+        );
+        // First strip mutates history (drops call_1's image) → rewrite.
+        conv.strip_old_images();
+        conv.save_to_file(&path).unwrap();
+        let after_strip = std::fs::read_to_string(&path).unwrap();
+
+        // A repeat strip with no new screenshot changes nothing and must
+        // not dirty the persistence cursor: the next save appends.
+        conv.strip_old_images();
+        conv.add_user(MessageProvenance::FollowUp, "next".to_string());
+        conv.save_to_file(&path).unwrap();
+        let after_append = std::fs::read_to_string(&path).unwrap();
+        assert!(after_append.starts_with(&after_strip));
     }
 
     // --- Auto-compaction tests ---

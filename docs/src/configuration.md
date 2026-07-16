@@ -114,6 +114,13 @@ needs a normal build. A read failure serves a loud 500 naming the override
 rather than silently falling back to the embedded copy, and the gateway
 logs the active override at startup.
 
+### Session-log retention variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_LOG_MESSAGES_JSON` | unset (off) | Write the per-turn full-conversation dump `turns/turn_NNN_messages.json`. Off by default — the context snapshot already archives the exact provider request. The dump is still written automatically, gate or no gate, when a provider cannot produce a request snapshot (mock/custom providers), so every turn keeps at least one exact input record |
+| `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL` | unset (rotate) | Keep every per-turn context-snapshot sidecar instead of rotating to the latest one per (source, session id) stream. Debugging aid — latest-only rotation is what keeps per-session context disk O(1) instead of O(turns × context) |
+
 ### Process-plumbing variables
 
 Sub-agents no longer travel through the environment — they are supervised

@@ -3,7 +3,7 @@ use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use uuid::Uuid;
@@ -333,6 +333,82 @@ pub struct SessionLog {
     /// Flushed to transcript on turnComplete or user_transcript.
     voice_utterance_buf: String,
     last_approval_resolved: Option<(u64, String)>,
+    /// Latest context-snapshot sidecar per (source, session id) stream,
+    /// for the rotate-on-write policy in
+    /// [`Self::context_snapshot_for_session`]: writing a new snapshot
+    /// deletes the previous file of the same stream, keeping per-session
+    /// context disk O(1) instead of O(turns × context). Seeded at open
+    /// from the rows an earlier process persisted, so a resumed session
+    /// keeps rotating instead of stranding its predecessor's sidecar.
+    last_context_snapshots: std::collections::HashMap<String, String>,
+    /// Snapshot retention policy, resolved from the environment once at
+    /// open (`INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1` keeps every sidecar).
+    /// Injected as state — not read ambiently per call — so tests pin the
+    /// policy they exercise instead of inheriting the shell's.
+    keep_all_context_snapshots: bool,
+}
+
+/// The rotation-map key for one context-snapshot stream. One derivation
+/// shared by the write path and the open-time reseed, so the two can
+/// never drift.
+pub(super) fn context_snapshot_stream_key(source: &str, session_id: Option<&str>) -> String {
+    format!("{}\u{1f}{}", source, session_id.unwrap_or_default())
+}
+
+/// Rebuild the latest-sidecar-per-stream rotation state from the rows an
+/// earlier process persisted. Without this, every restart/`--continue`
+/// strands the previous process's latest sidecar forever — retention
+/// would grow O(session reopenings). Streams session.jsonl line by line
+/// (a resident session's log can be tens of MB — never buffered whole)
+/// with a substring prefilter so only `context_snapshot` rows are parsed;
+/// a damaged line or torn/invalid-UTF-8 tail is skipped per line (lossy)
+/// without aborting the rows already folded. Run once per session open,
+/// and only when rotation is active.
+fn seed_context_snapshot_rotation(dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut latest = std::collections::HashMap::new();
+    let Ok(file) = File::open(dir.join("session.jsonl")) else {
+        return latest;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // Keep whatever was folded so far; a damaged region ends the
+            // seed, not the session open.
+            Err(_) => break,
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if !line.contains("\"context_snapshot\"") {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if row.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+            continue;
+        }
+        let Some(file) = row.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let data = row.get("data");
+        let source = data
+            .and_then(|d| d.get("source"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let session_id = data
+            .and_then(|d| d.get("session_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+        latest.insert(
+            context_snapshot_stream_key(source, session_id),
+            file.to_string(),
+        );
+    }
+    latest
 }
 
 /// Accumulates session statistics as events are logged.
@@ -398,6 +474,18 @@ impl SessionLog {
     /// The `path` argument is the directory (not a file).
     /// If resuming an existing session, reads the session_id from session_meta.json.
     pub fn open(dir: PathBuf) -> std::io::Result<Self> {
+        Self::open_with_retention(dir, bus_events::context_snapshot_keep_all())
+    }
+
+    /// [`Self::open`] with the snapshot-retention policy injected instead
+    /// of resolved from the environment. Production goes through `open`
+    /// (env resolved once per process); tests construct through this seam
+    /// so an ambient `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL` can neither
+    /// skip the rotation-state seeding nor mask rotation itself.
+    pub(crate) fn open_with_retention(
+        dir: PathBuf,
+        keep_all_context_snapshots: bool,
+    ) -> std::io::Result<Self> {
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("turns"))?;
         let log_dir = dir.clone();
@@ -439,6 +527,14 @@ impl SessionLog {
             },
             voice_utterance_buf: String::new(),
             last_approval_resolved: None,
+            // Seeding only matters when rotation is active — under
+            // keep-all nothing is ever deleted, so skip the log pass.
+            last_context_snapshots: if keep_all_context_snapshots {
+                std::collections::HashMap::new()
+            } else {
+                seed_context_snapshot_rotation(&log_dir)
+            },
+            keep_all_context_snapshots,
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -728,20 +824,40 @@ impl SessionLog {
     }
 
     fn emit(&mut self, event: LogEvent) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            if let Err(e) = writeln!(self.writer, "{}", json) {
-                eprintln!("session_log: failed to write log event: {}", e);
-            }
-            let _ = self.writer.flush();
+        if let Err(e) = self.emit_checked(event) {
+            eprintln!("session_log: failed to write log event: {}", e);
+        }
+    }
+
+    /// Fallible emit: serialize straight into the writer (the intermediate
+    /// String per event bought nothing on this universal append path) and
+    /// flush — the flush per record is the durability contract for tail
+    /// readers. Callers whose follow-up is only safe once the row is
+    /// durably queued (context-snapshot rotation deletes its predecessor)
+    /// branch on the result; everything else uses the fire-and-forget
+    /// [`Self::emit`].
+    fn emit_checked(&mut self, event: LogEvent) -> std::io::Result<()> {
+        serde_json::to_writer(&mut self.writer, &event).map_err(std::io::Error::other)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()
+    }
+
+    /// Test seam: swap the session.jsonl writer for a read-only handle so
+    /// the next emit fails at flush — exercises contracts that must hold
+    /// when a row cannot be made durable (disk full, revoked handle).
+    #[cfg(test)]
+    pub(crate) fn sabotage_writer_for_tests(&mut self) {
+        if let Ok(file) = File::open(self.dir.join("session.jsonl")) {
+            self.writer = BufWriter::new(file);
         }
     }
 
     fn emit_transcript(&mut self, entry: TranscriptEntry) {
         if let Some(ref mut w) = self.transcript_writer {
-            if let Ok(json) = serde_json::to_string(&entry) {
-                let _ = writeln!(w, "{}", json);
-                let _ = w.flush();
-            }
+            let _ = serde_json::to_writer(&mut *w, &entry)
+                .map_err(std::io::Error::other)
+                .and_then(|()| w.write_all(b"\n"));
+            let _ = w.flush();
         }
     }
 
@@ -1038,16 +1154,18 @@ impl SessionLog {
     fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        let already_has_content = fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .ok()?;
-        if already_has_content {
-            let _ = file.write_all(b"\n");
+        // One post-open fstat serves both the has-content test and the
+        // span offset (the pre-open stat was a wasted syscall on this
+        // per-output-chunk path).
+        let mut offset = file.metadata().ok()?.len();
+        if offset > 0 && file.write_all(b"\n").is_ok() {
+            offset += 1;
         }
-        let offset = file.metadata().ok()?.len();
         if file.write_all(content.as_bytes()).is_ok() {
             Some(TurnFileSpan {
                 relative,

@@ -96,6 +96,11 @@ impl TestRig {
             .env_remove("PRESENCE_MODEL")
             .env_remove("CU_PROVIDER")
             .env_remove("CU_MODEL")
+            // Session-log retention toggles: an ambient debug gate would
+            // satisfy the snapshot-less-provider fallback assertion without
+            // exercising the fallback, and keep-all would mask rotation.
+            .env_remove("INTENDANT_LOG_MESSAGES_JSON")
+            .env_remove("INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL")
             // A host shell exporting the Connect rendezvous URL would make
             // the daemon-lane tests dial out; the suite is no-network.
             .env_remove("INTENDANT_CONNECT_RENDEZVOUS_URL")
@@ -503,6 +508,25 @@ async fn direct_mode_completes_a_scripted_task_through_the_real_stack() {
     assert!(
         logs.contains("auto_approved"),
         "session log missing the autonomy decision:\n{logs}"
+    );
+    // The mock provider has no request_snapshot, so no context snapshot
+    // exists for any turn — the messages dump must then be written as the
+    // turn's only exact input record, debug gate or not.
+    let logs_dir = rig.home.path().join(".intendant").join("logs");
+    let messages_dump_present = std::fs::read_dir(&logs_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|session| {
+            session
+                .path()
+                .join("turns/turn_001_messages.json")
+                .is_file()
+        });
+    assert!(
+        messages_dump_present,
+        "snapshot-less provider must fall back to the messages dump"
     );
     // The done signal fires only after the mock's expectation saw the
     // runtime's output in the transcript — the round-trip proof.

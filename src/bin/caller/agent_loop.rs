@@ -1044,13 +1044,25 @@ pub(crate) async fn run_agent_loop(
             conversation.strip_old_images();
         }
 
-        // Log the full messages array being sent to the API
-        slog(&session_log, |l| {
-            if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
-                l.messages_input(&json);
-            }
-        });
-        match provider.request_snapshot(conversation.messages(), true) {
+        // The per-turn full-conversation dump is debug-only: it
+        // re-serialized the entire transcript (base64 screenshots
+        // included) into turns/turn_NNN_messages.json every turn — O(turns
+        // × context) disk with no consumer, and near-identical to the
+        // context snapshot below, which carries the exact provider request
+        // (a superset). Opt back in with INTENDANT_LOG_MESSAGES_JSON=1.
+        // Exception: when the provider can't produce a request snapshot
+        // (the trait default errors — mock and custom providers), the
+        // messages dump is the turn's ONLY exact input record, so it is
+        // written regardless of the gate.
+        let request_snapshot = provider.request_snapshot(conversation.messages(), true);
+        if messages_json_dump_enabled() || request_snapshot.is_err() {
+            slog(&session_log, |l| {
+                if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
+                    l.messages_input(&json);
+                }
+            });
+        }
+        match request_snapshot {
             Ok((context_format, raw_context)) => {
                 bus.send(AppEvent::ContextSnapshot {
                     session_id: local_session_id.clone(),
@@ -3061,6 +3073,22 @@ pub(crate) async fn run_round_loop(
     }
 
     Ok(cumulative_stats)
+}
+
+/// Whether to write the per-turn full-conversation dump
+/// (`turns/turn_NNN_messages.json`). Off by default — the context
+/// snapshot already archives the exact provider request — and read once:
+/// it's a debugging aid, not a runtime toggle.
+fn messages_json_dump_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("INTENDANT_LOG_MESSAGES_JSON")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    });
+    *ENABLED
 }
 
 /// Index of the batch result that carries the per-turn context-budget line:

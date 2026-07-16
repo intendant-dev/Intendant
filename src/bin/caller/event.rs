@@ -1025,12 +1025,6 @@ fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
         || raw.get("summary_parts").is_some()
 }
 
-fn context_snapshot_raw_size(raw: &serde_json::Value) -> usize {
-    serde_json::to_vec(raw)
-        .map(|bytes| bytes.len())
-        .unwrap_or_else(|_| raw.to_string().len())
-}
-
 fn mark_context_snapshot_exact_available(raw: &mut serde_json::Value) {
     if let Some(context) = raw
         .get_mut("_intendant_context")
@@ -1061,9 +1055,19 @@ fn compact_context_snapshot_raw_for_outbound(
     request_index: Option<u64>,
     format: &str,
 ) -> serde_json::Value {
-    if context_snapshot_raw_is_compact(raw)
-        || context_snapshot_raw_size(raw) <= OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT
-    {
+    if context_snapshot_raw_is_compact(raw) {
+        return raw.clone();
+    }
+    // Serialize exactly once: the same bytes decide the inline limit AND
+    // feed the summary's len/hash fields. This used to serialize the
+    // multi-MB tree once just for `.len()`, deep-clone it for a by-value
+    // summary call that only borrowed it, and re-serialize it a second
+    // time inside for the same len/hash.
+    let raw_bytes = match serde_json::to_vec(raw) {
+        Ok(bytes) => bytes,
+        Err(_) => raw.to_string().into_bytes(),
+    };
+    if raw_bytes.len() <= OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT {
         return raw.clone();
     }
 
@@ -1072,12 +1076,12 @@ fn compact_context_snapshot_raw_for_outbound(
         .filter(|value| !value.is_empty())
         .unwrap_or("live");
     let request_index = request_index.unwrap_or(0);
-    let mut compact = crate::external_agent::codex::codex_context_archive_payload(
-        raw.clone(),
+    let mut compact = crate::external_agent::codex::codex_context_archive_summary(
+        raw,
+        &raw_bytes,
         request_id,
         request_index,
         format,
-        false,
     );
     mark_context_snapshot_exact_available(&mut compact);
     compact
