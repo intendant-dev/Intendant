@@ -499,6 +499,9 @@ impl TailConvertCtx<'_> {
             &mut value,
             &entry_json,
             self.log_dir,
+            // The cache path carries no pre-computed stat; the injector's
+            // stamped-value-then-stat fallback keeps it at ≤1 per row.
+            None,
             self.replay_session_id.as_deref(),
             self.external_replay_session_id.as_deref(),
             self.wrapper_replay_session_id.as_deref(),

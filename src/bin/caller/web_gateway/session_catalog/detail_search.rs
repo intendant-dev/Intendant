@@ -319,7 +319,18 @@ pub(crate) fn exact_context_snapshot_from_log_entry(
     {
         return None;
     }
-    let raw_bytes = std::fs::read(log_dir.join(relative)).ok()?;
+    // The lexical check above rejects absolute/`..` components, but the
+    // read itself resolves symlinks — a row naming a sidecar that IS a
+    // symlink would serve bytes from outside the session dir. Verify
+    // containment on the RESOLVED paths (both sides canonicalized, so a
+    // legitimately symlinked log dir keeps working); a missing file fails
+    // canonicalize and takes the caller's 404 arm.
+    let canonical_file = std::fs::canonicalize(log_dir.join(relative)).ok()?;
+    let canonical_dir = std::fs::canonicalize(log_dir).ok()?;
+    if !canonical_file.starts_with(&canonical_dir) {
+        return None;
+    }
+    let raw_bytes = std::fs::read(&canonical_file).ok()?;
     let raw_loaded: serde_json::Value = serde_json::from_slice(&raw_bytes).ok()?;
 
     let external_replay_session_id = external_backend_session_id_from_replay(contents);
@@ -328,15 +339,19 @@ pub(crate) fn exact_context_snapshot_from_log_entry(
         .clone()
         .or_else(|| wrapper_replay_session_id.clone());
     // Build the outbound shape from the row's metadata, then substitute
-    // the raw we hold — no second read, no converter involvement.
-    let mut value =
-        context_snapshot_replay_entry_without_raw(entry, log_dir, replay_session_id.as_deref())?;
+    // the raw we hold — no second read, no converter involvement. The
+    // bytes in hand are the availability evidence for the injector.
+    let mut value = context_snapshot_replay_entry_without_raw(
+        entry,
+        Some(raw_bytes.len() as u64),
+        replay_session_id.as_deref(),
+    )?;
     value["raw"] = raw_loaded;
-    value["exact_replay_available"] = serde_json::Value::Bool(true);
     inject_replay_entry_metadata(
         &mut value,
         entry,
         log_dir,
+        Some(true),
         replay_session_id.as_deref(),
         external_replay_session_id.as_deref(),
         wrapper_replay_session_id.as_deref(),
@@ -1866,8 +1881,7 @@ mod tests {
             .join(".intendant")
             .join("logs")
             .join("rotated-session");
-        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
-        log.set_context_snapshot_keep_all(false);
+        let mut log = crate::session_log::SessionLog::open_with_retention(log_dir, false).unwrap();
         let snapshot_raw = |turn: usize| {
             serde_json::json!({
                 "input": [{ "type": "message", "content": format!("turn {turn}") }]
@@ -1928,5 +1942,90 @@ mod tests {
             loaded["snapshot"].pointer("/raw/input/0/content"),
             Some(&serde_json::json!("turn 2"))
         );
+    }
+
+    /// A sidecar path that is a symlink escaping the session dir must not
+    /// be served: the lexical check passes (`turns/evil.json` is a plain
+    /// relative path) but the resolved read would leave log_dir.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_context_snapshot_escaping_the_session_dir_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("symlink-session");
+        let mut log =
+            crate::session_log::SessionLog::open_with_retention(log_dir.clone(), false).unwrap();
+        log.turn_start(1, 0.0, 0);
+        log.context_snapshot(
+            "native",
+            "legit",
+            Some(1),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            &serde_json::json!({"input": [{"content": "legit"}]}),
+        );
+        drop(log);
+
+        // Secret outside the session dir, symlinked into turns/.
+        let outside = dir.path().join("outside-secret.json");
+        std::fs::write(&outside, "{\"input\": [{\"content\": \"SECRET\"}]}").unwrap();
+        let evil_rel = "turns/turn_001_context_evil.json";
+        std::os::unix::fs::symlink(&outside, log_dir.join(evil_rel)).unwrap();
+        // A forged row referencing the symlink (attacker-shaped log line).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log_dir.join("session.jsonl"))
+                .unwrap();
+            writeln!(
+                f,
+                "{{\"ts\":\"00:00:00.000\",\"ts_ms\":0,\"turn\":1,\"event\":\"context_snapshot\",\"level\":\"debug\",\"message\":\"evil\",\"data\":{{\"source\":\"native\",\"format\":\"test.v1\"}},\"file\":\"{evil_rel}\"}}"
+            )
+            .unwrap();
+        }
+
+        let (status, body) = session_context_snapshot_response_body(
+            dir.path(),
+            "symlink-session",
+            "intendant",
+            Some(evil_rel.to_string()),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(status, "404 Not Found", "body: {body}");
+        assert!(!body.contains("SECRET"));
+
+        // Sanity: the legitimate sidecar still serves.
+        let detail = get_session_detail_from_home(dir.path(), "symlink-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let legit_file = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| {
+                entry["event"] == "context_snapshot" && entry["snapshot_file"] != evil_rel
+            })
+            .and_then(|entry| entry["snapshot_file"].as_str())
+            .unwrap()
+            .to_string();
+        let (status, body) = session_context_snapshot_response_body(
+            dir.path(),
+            "symlink-session",
+            "intendant",
+            Some(legit_file),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(status, "200 OK", "body: {body}");
     }
 }

@@ -1992,10 +1992,9 @@ mod tests {
     fn context_snapshots_rotate_to_latest_only_per_source() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
-        let mut log = SessionLog::open(log_dir.clone()).unwrap();
-        // Hermetic: pin the policy under test; never inherit the shell's
-        // INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL.
-        log.set_context_snapshot_keep_all(false);
+        // Hermetic: the policy is injected at construction; ambient
+        // INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL can't affect the test.
+        let mut log = SessionLog::open_with_retention(log_dir.clone(), false).unwrap();
         log.turn_start(1, 0.0, 0);
         let raw1 = serde_json::json!({"messages": ["turn one"]});
         log.context_snapshot(
@@ -2065,8 +2064,7 @@ mod tests {
         // the accepted orphan.
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
-        let mut log = SessionLog::open(log_dir.clone()).unwrap();
-        log.set_context_snapshot_keep_all(false);
+        let mut log = SessionLog::open_with_retention(log_dir.clone(), false).unwrap();
         log.turn_start(1, 0.0, 0);
         log.context_snapshot(
             "native",
@@ -2122,8 +2120,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         {
-            let mut log = SessionLog::open(log_dir.clone()).unwrap();
-            log.set_context_snapshot_keep_all(false);
+            let mut log = SessionLog::open_with_retention(log_dir.clone(), false).unwrap();
             log.turn_start(1, 0.0, 0);
             log.context_snapshot(
                 "native",
@@ -2143,8 +2140,7 @@ mod tests {
         assert!(log_dir.join(&first_files[0]).exists());
 
         // Second process resumes the same session dir.
-        let mut log = SessionLog::open(log_dir.clone()).unwrap();
-        log.set_context_snapshot_keep_all(false);
+        let mut log = SessionLog::open_with_retention(log_dir.clone(), false).unwrap();
         log.turn_start(2, 0.0, 0);
         log.context_snapshot(
             "native",

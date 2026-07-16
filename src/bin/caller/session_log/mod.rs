@@ -474,6 +474,18 @@ impl SessionLog {
     /// The `path` argument is the directory (not a file).
     /// If resuming an existing session, reads the session_id from session_meta.json.
     pub fn open(dir: PathBuf) -> std::io::Result<Self> {
+        Self::open_with_retention(dir, bus_events::context_snapshot_keep_all())
+    }
+
+    /// [`Self::open`] with the snapshot-retention policy injected instead
+    /// of resolved from the environment. Production goes through `open`
+    /// (env resolved once per process); tests construct through this seam
+    /// so an ambient `INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL` can neither
+    /// skip the rotation-state seeding nor mask rotation itself.
+    pub(crate) fn open_with_retention(
+        dir: PathBuf,
+        keep_all_context_snapshots: bool,
+    ) -> std::io::Result<Self> {
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("turns"))?;
         let log_dir = dir.clone();
@@ -493,7 +505,6 @@ impl SessionLog {
                 .unwrap_or_else(|| Uuid::new_v4().to_string())
         };
 
-        let keep_all_context_snapshots = bus_events::context_snapshot_keep_all();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -541,14 +552,6 @@ impl SessionLog {
         });
         register_open_session_log_dir(&log_dir);
         Ok(log)
-    }
-
-    /// Test seam for the snapshot retention policy: production resolves it
-    /// from the environment once at [`Self::open`]; tests inject the policy
-    /// they exercise instead of inheriting the shell's.
-    #[cfg(test)]
-    pub(crate) fn set_context_snapshot_keep_all(&mut self, keep_all: bool) {
-        self.keep_all_context_snapshots = keep_all;
     }
 
     /// Write session metadata to `session_meta.json`.

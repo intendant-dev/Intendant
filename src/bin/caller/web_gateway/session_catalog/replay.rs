@@ -177,31 +177,42 @@ fn replay_jsonl_to_outbound_entries_tracked(
             &legacy_model_spans,
             &mut legacy_model_indices,
         );
-        if compact_historical_context
-            && entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
-        {
-            let file = entry_json.get("file").and_then(|v| v.as_str());
-            if !file.is_some_and(|file| context_files_to_load.contains(file))
-                || context_snapshot_raw_file_too_large_for_replay(&entry_json, log_dir)
-            {
-                let Some(mut value) = context_snapshot_replay_entry_without_raw(
-                    &entry_json,
-                    log_dir,
-                    replay_session_id.as_deref(),
-                ) else {
+        // One stat per context row for the whole pipeline: the
+        // survivor/too-large branch, the without-raw builder, and the
+        // metadata injector all consume this result.
+        let context_sidecar_size: Option<Option<u64>> =
+            if entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot") {
+                Some(context_snapshot_raw_file_size(&entry_json, log_dir))
+            } else {
+                None
+            };
+        let sidecar_available = context_sidecar_size.map(|size| size.is_some());
+        if compact_historical_context {
+            if let Some(sidecar_size) = context_sidecar_size {
+                let file = entry_json.get("file").and_then(|v| v.as_str());
+                let too_large =
+                    sidecar_size.is_some_and(|bytes| bytes > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES);
+                if !file.is_some_and(|file| context_files_to_load.contains(file)) || too_large {
+                    let Some(mut value) = context_snapshot_replay_entry_without_raw(
+                        &entry_json,
+                        sidecar_size,
+                        replay_session_id.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    inject_replay_entry_metadata(
+                        &mut value,
+                        &entry_json,
+                        log_dir,
+                        sidecar_available,
+                        replay_session_id.as_deref(),
+                        external_replay_session_id.as_deref(),
+                        wrapper_replay_session_id.as_deref(),
+                    );
+                    entries.push(value);
+                    entry_lines.push(Some(line_no));
                     continue;
-                };
-                inject_replay_entry_metadata(
-                    &mut value,
-                    &entry_json,
-                    log_dir,
-                    replay_session_id.as_deref(),
-                    external_replay_session_id.as_deref(),
-                    wrapper_replay_session_id.as_deref(),
-                );
-                entries.push(value);
-                entry_lines.push(Some(line_no));
-                continue;
+                }
             }
         }
 
@@ -223,6 +234,7 @@ fn replay_jsonl_to_outbound_entries_tracked(
             &mut value,
             &entry_json,
             log_dir,
+            sidecar_available,
             replay_session_id.as_deref(),
             external_replay_session_id.as_deref(),
             wrapper_replay_session_id.as_deref(),
@@ -335,6 +347,7 @@ pub(crate) fn inject_replay_entry_metadata(
     value: &mut serde_json::Value,
     entry_json: &serde_json::Value,
     log_dir: &Path,
+    sidecar_available: Option<bool>,
     replay_session_id: Option<&str>,
     external_replay_session_id: Option<&str>,
     wrapper_replay_session_id: Option<&str>,
@@ -373,13 +386,14 @@ pub(crate) fn inject_replay_entry_metadata(
             // Availability derives from disk truth: sidecars rotate to
             // latest-only, so a historical row's file is usually gone —
             // advertising exact replay for it would send the viewer to a
-            // fetch that cannot succeed. An earlier stage that already
-            // established availability (the without-raw builder's stat,
-            // the exact lane's actual read) stamps the key on the value;
-            // reuse it so each snapshot row costs at most one stat.
-            let available = obj
-                .get("exact_replay_available")
-                .and_then(|v| v.as_bool())
+            // fetch that cannot succeed. The per-row callers (transcripts,
+            // compact replay, the exact lane) stat/read once and pass the
+            // result in; a value stamped on the entry by an earlier stage
+            // is the next choice; the fallback stat exists only for paths
+            // with neither (the replay cache) — ≤1 stat per snapshot row
+            // on every path.
+            let available = sidecar_available
+                .or_else(|| obj.get("exact_replay_available").and_then(|v| v.as_bool()))
                 .unwrap_or_else(|| context_snapshot_raw_file_size(entry_json, log_dir).is_some());
             obj.insert(
                 "snapshot_file".to_string(),
@@ -629,14 +643,6 @@ pub(crate) fn context_snapshot_raw_file_size(
         .map(|m| m.len())
 }
 
-pub(crate) fn context_snapshot_raw_file_too_large_for_replay(
-    entry_json: &serde_json::Value,
-    log_dir: &Path,
-) -> bool {
-    context_snapshot_raw_file_size(entry_json, log_dir)
-        .is_some_and(|bytes| bytes > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES)
-}
-
 pub(crate) fn context_snapshot_replay_entry_from_log_entry(
     entry_json: &serde_json::Value,
     log_dir: &Path,
@@ -644,13 +650,18 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
     external_replay_session_id: Option<&str>,
     wrapper_replay_session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
-    if context_snapshot_raw_file_too_large_for_replay(entry_json, log_dir) {
+    // One stat serves the whole row: the large/small branch, the
+    // without-raw builder's availability, and the metadata injector.
+    let sidecar_size = context_snapshot_raw_file_size(entry_json, log_dir);
+    let sidecar_available = Some(sidecar_size.is_some());
+    if sidecar_size.is_some_and(|bytes| bytes > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES) {
         let mut value =
-            context_snapshot_replay_entry_without_raw(entry_json, log_dir, replay_session_id)?;
+            context_snapshot_replay_entry_without_raw(entry_json, sidecar_size, replay_session_id)?;
         inject_replay_entry_metadata(
             &mut value,
             entry_json,
             log_dir,
+            sidecar_available,
             replay_session_id,
             external_replay_session_id,
             wrapper_replay_session_id,
@@ -666,6 +677,7 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
         &mut value,
         entry_json,
         log_dir,
+        sidecar_available,
         replay_session_id,
         external_replay_session_id,
         wrapper_replay_session_id,
@@ -675,7 +687,7 @@ pub(crate) fn context_snapshot_replay_entry_from_log_entry(
 
 pub(crate) fn context_snapshot_replay_entry_without_raw(
     entry_json: &serde_json::Value,
-    log_dir: &Path,
+    sidecar_size: Option<u64>,
     replay_session_id: Option<&str>,
 ) -> Option<serde_json::Value> {
     let data = entry_json.get("data");
@@ -728,14 +740,14 @@ pub(crate) fn context_snapshot_replay_entry_without_raw(
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
     // Advertise the sidecar only while it exists on disk (latest-only
-    // rotation deletes historical ones) — `context_snapshot_omitted_raw`
-    // derives `exact_replay_available` from its presence. The result is
-    // also stamped on the returned value so the metadata injector reuses
-    // it instead of statting the same file a second time per row.
+    // rotation deletes historical ones) — the caller passes the one stat
+    // it already performed, and `context_snapshot_omitted_raw` derives
+    // `exact_replay_available` from it. The result is also stamped on the
+    // returned value so the metadata injector never re-stats the row.
     let snapshot_file = entry_json
         .get("file")
         .and_then(|v| v.as_str())
-        .filter(|_| context_snapshot_raw_file_size(entry_json, log_dir).is_some());
+        .filter(|_| sidecar_size.is_some());
     let available = snapshot_file.is_some();
     let raw = context_snapshot_omitted_raw(
         request_id.as_deref(),
