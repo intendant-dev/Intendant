@@ -82,8 +82,11 @@ mod tests {
         }
     }
 
-    /// Every builder-minted vector's surfaces = a non-empty subset of
-    /// its family's R-set.
+    /// Every builder-minted vector's surfaces EQUAL its family's
+    /// R-set exactly (the two named exceptions live inside
+    /// `required_surfaces`) — the R5 hardening; the old
+    /// any-non-empty-subset rule let a vector silently drop a
+    /// required lane.
     #[test]
     fn every_vector_within_its_family_surfaces() {
         let mut all = crate::tranche::tranche();

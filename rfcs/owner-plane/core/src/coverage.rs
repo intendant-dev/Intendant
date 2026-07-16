@@ -5,9 +5,11 @@
 //! the uncovered set is pinned SHRINK-ONLY — covering an outcome
 //! requires deleting its pin entry, and losing coverage of a covered
 //! outcome fails the suite. A vector's `surfaces` array is an
-//! ANNOTATION (declared applicability), never execution: the only
-//! surfaces that EXECUTE this corpus today are the two Rust
-//! reference implementations, and the map says so explicitly.
+//! ANNOTATION (declared applicability), never execution: the map's
+//! `executed_surfaces` rider names what actually RUNS the corpus —
+//! the two Rust reference implementations, the Chromium browser
+//! lane, and the three storage-OS lanes — and each lane's run set
+//! is pinned to `coverage/lane-manifests.json`.
 //!
 //! The §13.3 obligation ledger is the hand-transcribed sibling
 //! (`coverage/obligations-13-3.json`), enforced by

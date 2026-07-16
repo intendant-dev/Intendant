@@ -147,6 +147,18 @@ runs the unmodified harness semantics; the advisory workflow
 carries the 3-OS matrix job. Chromium (lane 1) delivered
 2026-07-15 — both funded lanes now execute.
 
+**Criterion-8 hardening (2026-07-16, the criterion-12 tranche):**
+the lane additionally proves the portable flush + atomic-replacement
+pair AS the reference behavior — every `inputs.stream` (the
+framing-only vectors included) materializes through
+write-temp → `sync_all` → `rename`, each rename replaces a
+PRE-SEEDED destination on all three OSes, and the flush observation
+is coupled to the call's result by the `STORAGE_LANE_FAIL_SYNC`
+failpoint control (a probe re-exec that must go red under the
+failpoint — deleting the sync call while keeping its counter turns
+the lane red). This proves the reference lane's own write path; it
+does NOT move the Gate-B boundary below.
+
 ## Explicitly Gate-B (distinguishable production concerns)
 
 Per the repair-tranche scope ruling these stay OUT of the lanes
