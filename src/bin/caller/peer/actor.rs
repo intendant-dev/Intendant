@@ -51,10 +51,13 @@ pub(crate) const MAX_TRACKED_TASK_RECEIPTS: usize = 64;
 /// loses crash-salvage coverage; its final is unaffected).
 pub(crate) const MAX_PENDING_PARTIAL_MESSAGES: usize = 8;
 
-/// Per-fold byte cap: the fold keeps the TAIL of the accumulated text
-/// (the most recent output is the valuable part of an interrupted
-/// reply). Together with [`MAX_PENDING_PARTIAL_MESSAGES`] this bounds the
-/// whole fold structure at ~2 MiB per peer.
+/// Per-fold byte cap on LENGTH: the fold keeps the TAIL of the
+/// accumulated text (the most recent output is the valuable part of an
+/// interrupted reply), trimming down to half the cap so trims amortize.
+/// Buffer capacity is bounded at ~2× this figure (String doubling from
+/// at most cap, with an advisory shrink as the safety valve), so the
+/// whole fold structure holds ~[`MAX_PENDING_PARTIAL_MESSAGES`] × 512 KiB
+/// of heap per peer worst case.
 pub(crate) const MAX_PENDING_PARTIAL_TEXT_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -552,16 +555,37 @@ impl PeerActor {
                     reasoning,
                     text: String::new(),
                 });
-        entry.text.push_str(delta);
-        if entry.text.len() > MAX_PENDING_PARTIAL_TEXT_BYTES {
-            // Keep the tail, cutting on a char boundary.
-            let excess = entry.text.len() - MAX_PENDING_PARTIAL_TEXT_BYTES;
-            let cut = (excess..=entry.text.len())
-                .find(|index| entry.text.is_char_boundary(*index))
-                .unwrap_or(entry.text.len());
-            entry.text.drain(..cut);
-            // `drain` shrinks the length but RETAINS the capacity — the
-            // byte bound is on the heap, so release it too.
+        // Trim BEFORE appending so the length never overshoots the cap,
+        // and trim down to HALF the cap so the front-shift amortizes to
+        // one move per ~128 KiB of streamed text instead of one per
+        // delta at the boundary.
+        if entry.text.len().saturating_add(delta.len()) > MAX_PENDING_PARTIAL_TEXT_BYTES {
+            if delta.len() >= MAX_PENDING_PARTIAL_TEXT_BYTES {
+                // The delta alone exceeds the cap: keep only its tail.
+                entry.text.clear();
+                let tail_start = delta.len() - MAX_PENDING_PARTIAL_TEXT_BYTES;
+                let cut = (tail_start..=delta.len())
+                    .find(|index| delta.is_char_boundary(*index))
+                    .unwrap_or(delta.len());
+                entry.text.push_str(&delta[cut..]);
+            } else {
+                let keep = (MAX_PENDING_PARTIAL_TEXT_BYTES / 2).saturating_sub(delta.len());
+                let excess = entry.text.len().saturating_sub(keep);
+                let cut = (excess..=entry.text.len())
+                    .find(|index| entry.text.is_char_boundary(*index))
+                    .unwrap_or(entry.text.len());
+                entry.text.drain(..cut);
+                entry.text.push_str(delta);
+            }
+        } else {
+            entry.text.push_str(delta);
+        }
+        // The length invariant (≤ cap) bounds the buffer's growth at
+        // ~2× cap (String doubling from at most cap). `shrink_to` is
+        // advisory, so it stays a rare safety valve rather than a
+        // per-delta call — the earlier per-delta drain+shrink thrashed
+        // ~256 KiB of moves on every chunk at the boundary.
+        if entry.text.capacity() > 2 * MAX_PENDING_PARTIAL_TEXT_BYTES {
             entry.text.shrink_to(MAX_PENDING_PARTIAL_TEXT_BYTES);
         }
     }
@@ -906,14 +930,29 @@ mod tests {
         assert_eq!(salvaged, expected, "survivors salvage in fold order");
     }
 
-    /// The per-fold byte cap keeps the TAIL of the accumulated text.
+    /// The per-fold byte cap keeps the TAIL of the accumulated text, the
+    /// length never overshoots the cap (trim runs BEFORE append), and
+    /// buffer capacity stays within the documented ~2x cap across a long
+    /// stream of small deltas (the advisory-shrink slack).
     #[tokio::test]
-    async fn fold_byte_cap_keeps_the_tail() {
+    async fn fold_byte_cap_keeps_the_tail_and_bounds_capacity() {
         let (log_tx, mut log_rx) = mpsc::channel(64);
         let (mut actor, _guards) = test_actor(log_tx);
-        let chunk = "x".repeat(100 * 1024);
-        for _ in 0..3 {
-            actor.handle_event(partial_text("m-big", &chunk)).await;
+        // A long stream of small deltas pushes well past the cap many
+        // times over; check the invariants as the stream runs.
+        let delta = "x".repeat(4 * 1024);
+        for _ in 0..192 {
+            actor.handle_event(partial_text("m-big", &delta)).await;
+            let fold = &actor.pending_partials[&MessageId("m-big".into())];
+            assert!(
+                fold.text.len() <= MAX_PENDING_PARTIAL_TEXT_BYTES,
+                "length must never overshoot the cap"
+            );
+            assert!(
+                fold.text.capacity() <= 2 * MAX_PENDING_PARTIAL_TEXT_BYTES,
+                "capacity must stay within the documented 2x-cap slack, got {}",
+                fold.text.capacity()
+            );
         }
         actor
             .handle_event(partial_text("m-big", "THE-TAIL-MARKER"))
@@ -938,6 +977,18 @@ mod tests {
             }
             other => panic!("expected the coalesced partial, got {other:?}"),
         }
+
+        // An oversized single delta keeps only its own tail, still capped.
+        let (log_tx, _log_rx2) = mpsc::channel(64);
+        let (mut actor, _guards) = test_actor(log_tx);
+        let huge = format!(
+            "{}HUGE-TAIL",
+            "y".repeat(MAX_PENDING_PARTIAL_TEXT_BYTES + 4096)
+        );
+        actor.handle_event(partial_text("m-huge", &huge)).await;
+        let fold = &actor.pending_partials[&MessageId("m-huge".into())];
+        assert!(fold.text.len() <= MAX_PENDING_PARTIAL_TEXT_BYTES);
+        assert!(fold.text.ends_with("HUGE-TAIL"));
     }
 
     /// A final message clears its fold: nothing is salvaged at disconnect
