@@ -17,6 +17,12 @@
 //!   request's cache-hit receipt and carries the TTL anchor; the countdown
 //!   itself derives client-side from `last_activity_epoch + ttl_seconds`
 //!   (no per-second events).
+//!
+//! The two producers arrive keyed by different members of an external
+//! session's identity group (git = wrapper/log id, usage = backend-native
+//! id), so the hub folds `SessionIdentity` linkages and canonicalizes
+//! every write — one entry, and one complete emitted snapshot, per
+//! logical session.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -233,9 +239,24 @@ impl GitVitalsProber {
 /// [`SessionVitalsHub::apply`]; the hub emits the combined snapshot on the
 /// bus whenever an update actually changed something (the initial
 /// all-empty state never emits).
+///
+/// External sessions run under two ids — the wrapper/log id and the
+/// backend-native id announced mid-flight by `SessionIdentity` — and the
+/// two vitals producers arrive keyed by *different* members of that pair
+/// (git probes ride the registered wrapper id, usage snapshots the id the
+/// drain stamps, native for Codex/Claude Code). Without folding, each
+/// logical session holds two half-empty hub entries whose emissions
+/// overwrite each other on the frontend (the identity-seam drop class:
+/// the git family blanks to "not reported" the moment usage wins the
+/// race). The alias map canonicalizes every apply/remove so one entry —
+/// and therefore every emitted snapshot — carries all sections.
 struct SessionVitalsHub {
     bus: EventBus,
     sessions: Mutex<HashMap<String, SessionVitals>>,
+    /// alias id → canonical id, fed by `SessionIdentity` (native →
+    /// wrapper). Chains are flattened at link time so `resolve` is one
+    /// hop in practice; the hop cap is a cycle guard only.
+    aliases: Mutex<HashMap<String, String>>,
 }
 
 impl SessionVitalsHub {
@@ -243,30 +264,93 @@ impl SessionVitalsHub {
         Arc::new(Self {
             bus,
             sessions: Mutex::new(HashMap::new()),
+            aliases: Mutex::new(HashMap::new()),
         })
     }
 
+    /// Canonical id for any member of an identity group.
+    fn resolve(&self, session_id: &str) -> String {
+        let aliases = self.aliases.lock().expect("vitals alias lock");
+        let mut id = session_id.trim();
+        for _ in 0..4 {
+            match aliases.get(id) {
+                Some(next) => id = next,
+                None => break,
+            }
+        }
+        id.to_string()
+    }
+
+    /// Record `alias` (backend-native id) as pointing at `canonical`
+    /// (wrapper/log id) and fold any sections that already accumulated
+    /// under the alias — usage snapshots can arrive before the
+    /// `SessionIdentity` linkage lands — into the canonical entry.
+    fn link_alias(&self, alias: &str, canonical: &str) {
+        let alias = alias.trim();
+        let canonical = self.resolve(canonical);
+        if alias.is_empty() || canonical.is_empty() || alias == canonical {
+            return;
+        }
+        {
+            let mut aliases = self.aliases.lock().expect("vitals alias lock");
+            aliases.insert(alias.to_string(), canonical.clone());
+            // Flatten: anything that named `alias` canonical follows it.
+            for target in aliases.values_mut() {
+                if target == alias {
+                    *target = canonical.clone();
+                }
+            }
+        }
+        let orphan = self
+            .sessions
+            .lock()
+            .expect("vitals state lock")
+            .remove(alias);
+        if let Some(orphan) = orphan {
+            self.apply(&canonical, |vitals| {
+                if vitals.git.is_none() {
+                    vitals.git = orphan.git;
+                }
+                if vitals.cache.is_none() {
+                    vitals.cache = orphan.cache;
+                }
+                if vitals.limits.is_empty() {
+                    vitals.limits = orphan.limits;
+                }
+            });
+        }
+    }
+
     fn apply(&self, session_id: &str, update: impl FnOnce(&mut SessionVitals)) {
+        let session_id = self.resolve(session_id);
         let changed = {
             let mut sessions = self.sessions.lock().expect("vitals state lock");
-            let entry = sessions.entry(session_id.to_string()).or_default();
+            let entry = sessions.entry(session_id.clone()).or_default();
             let before = entry.clone();
             update(entry);
             (*entry != before).then(|| entry.clone())
         };
         if let Some(vitals) = changed {
-            self.bus.send(AppEvent::SessionVitals {
-                session_id: session_id.to_string(),
-                vitals,
-            });
+            self.bus
+                .send(AppEvent::SessionVitals { session_id, vitals });
         }
     }
 
     fn remove(&self, session_id: &str) {
-        self.sessions
+        let canonical = self.resolve(session_id);
+        {
+            let mut sessions = self.sessions.lock().expect("vitals state lock");
+            sessions.remove(session_id.trim());
+            sessions.remove(&canonical);
+        }
+        // Drop the group's alias records too — an ended session's ids
+        // never come back, and the map otherwise grows for daemon-life.
+        self.aliases
             .lock()
-            .expect("vitals state lock")
-            .remove(session_id);
+            .expect("vitals alias lock")
+            .retain(|alias, target| {
+                alias != session_id.trim() && target != &canonical && alias != &canonical
+            });
     }
 }
 
@@ -309,8 +393,11 @@ fn cache_vitals_from_usage(
 
 /// Bus listener feeding the cache section: every backend's usage rail
 /// converges on `AppEvent::UsageSnapshot`, so this one consumer covers
-/// native, Claude Code, and Codex sessions alike. Sessions are pruned on
-/// `SessionEnded`.
+/// native, Claude Code, and Codex sessions alike. `SessionIdentity`
+/// linkages feed the hub's alias map so usage keyed by the backend-native
+/// id and git probes keyed by the wrapper id land in one entry (split
+/// entries emit half-empty snapshots that blank each other's chips).
+/// Sessions are pruned on `SessionEnded`.
 fn spawn_cache_vitals_listener(
     bus: EventBus,
     hub: Arc<SessionVitalsHub>,
@@ -338,6 +425,11 @@ fn spawn_cache_vitals_listener(
                         }
                     });
                 }
+                Ok(AppEvent::SessionIdentity {
+                    session_id,
+                    backend_session_id,
+                    ..
+                }) => hub.link_alias(&backend_session_id, &session_id),
                 Ok(AppEvent::SessionEnded { session_id, .. }) => hub.remove(&session_id),
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -409,7 +501,7 @@ pub(crate) fn spawn_session_vitals_producer(
     }
     let hub = SessionVitalsHub::new(bus.clone());
     let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
-    let _target_pruner = spawn_git_target_pruner(bus, registry.clone());
+    let _target_pruner = spawn_git_target_pruner(bus, registry.clone(), hub.clone());
     let handle = tokio::spawn({
         let registry = registry.clone();
         async move {
@@ -428,16 +520,27 @@ pub(crate) fn spawn_session_vitals_producer(
 
 /// Prune git targets when their session ends — mirrors the cache
 /// listener's `SessionEnded` hygiene so registered sessions never leak
-/// probe work past their lifetime.
+/// probe work past their lifetime. Resolution runs through the hub's
+/// alias map: resume lanes register the live (backend-native) id while
+/// the end event carries the wrapper id, and vice versa.
 fn spawn_git_target_pruner(
     bus: EventBus,
     registry: GitVitalsTargets,
+    hub: Arc<SessionVitalsHub>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(AppEvent::SessionEnded { session_id, .. }) => registry.remove(&session_id),
+                Ok(AppEvent::SessionEnded { session_id, .. }) => {
+                    registry.remove(&session_id);
+                    let ended = hub.resolve(&session_id);
+                    for (id, _) in registry.snapshot() {
+                        if hub.resolve(&id) == ended {
+                            registry.remove(&id);
+                        }
+                    }
+                }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -624,6 +727,95 @@ mod tests {
         assert!(
             emissions[2].1.cache.is_none(),
             "removed session re-registers from scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_alias_folds_split_sections_into_one_snapshot() {
+        // The live failure shape (2026-07-15 screenshot): git probes rode
+        // the wrapper id while usage rode the codex-native id — two hub
+        // entries whose alternating emissions blanked each other's chips
+        // on the frontend. With the alias fold, everything lands in the
+        // wrapper entry and every snapshot carries all sections.
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let hub = SessionVitalsHub::new(bus.clone());
+        let _listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
+
+        // Usage arrives under the native id BEFORE the identity linkage.
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("native-1".into()),
+            main: usage_with_sample("anthropic", 80, 10, 10, Some(300)),
+            presence: None,
+        });
+        // Git probes land under the wrapper id (registered at launch).
+        let git = SessionGitVitals {
+            branch: "main".into(),
+            dirty_files: 2,
+            ..Default::default()
+        };
+        let deadline = std::time::Duration::from_secs(5);
+        async fn wait_vitals(
+            rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        ) -> (String, SessionVitals) {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    return (session_id, vitals);
+                }
+            }
+        }
+        let (sid, _) = tokio::time::timeout(deadline, wait_vitals(&mut rx))
+            .await
+            .expect("pre-identity usage emission");
+        assert_eq!(sid, "native-1", "pre-linkage usage stays under native id");
+        hub.apply("wrapper-1", |v| v.git = Some(git.clone()));
+        let (sid, vitals) = tokio::time::timeout(deadline, wait_vitals(&mut rx))
+            .await
+            .expect("git emission");
+        assert_eq!(sid, "wrapper-1");
+        assert!(vitals.cache.is_none(), "entries still split pre-linkage");
+
+        // The identity linkage migrates the native orphan into the
+        // wrapper entry and re-emits a complete snapshot.
+        bus.send(AppEvent::SessionIdentity {
+            session_id: "wrapper-1".into(),
+            source: "codex".into(),
+            backend_session_id: "native-1".into(),
+        });
+        let (sid, vitals) = tokio::time::timeout(deadline, wait_vitals(&mut rx))
+            .await
+            .expect("post-linkage merged emission");
+        assert_eq!(sid, "wrapper-1");
+        assert_eq!(vitals.git.as_ref().unwrap().dirty_files, 2);
+        assert_eq!(vitals.cache.as_ref().unwrap().hit_pct, Some(80));
+
+        // Later usage keyed by the native id resolves to the wrapper
+        // entry: the git section survives (the user-visible regression
+        // was exactly this write blanking it).
+        bus.send(AppEvent::UsageSnapshot {
+            session_id: Some("native-1".into()),
+            main: usage_with_sample("anthropic", 40, 40, 20, Some(300)),
+            presence: None,
+        });
+        let (sid, vitals) = tokio::time::timeout(deadline, wait_vitals(&mut rx))
+            .await
+            .expect("post-linkage usage emission");
+        assert_eq!(sid, "wrapper-1", "usage now emits under the canonical id");
+        assert!(
+            vitals.git.is_some(),
+            "usage writes must not blank the git section"
+        );
+        assert_eq!(vitals.cache.as_ref().unwrap().hit_pct, Some(40));
+
+        // Group teardown clears both ids and the alias record.
+        hub.remove("native-1");
+        hub.apply("native-1", |v| v.git = Some(git.clone()));
+        let (sid, _) = tokio::time::timeout(deadline, wait_vitals(&mut rx))
+            .await
+            .expect("post-removal emission");
+        assert_eq!(
+            sid, "native-1",
+            "removal drops the alias — the id starts a fresh group"
         );
     }
 
