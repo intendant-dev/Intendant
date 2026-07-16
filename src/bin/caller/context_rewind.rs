@@ -147,13 +147,46 @@ pub fn read_record(log_dir: &Path, record_id: &str) -> io::Result<ContextRewindR
 }
 
 pub fn list_records(log_dir: &Path) -> io::Result<Vec<ContextRewindRecord>> {
+    list_records_as(log_dir)
+}
+
+/// Identity/metadata view of a rewind record, for callers that never touch
+/// the heavyweight embedded snapshots. A full record carries complete
+/// `FissionLedger` + `LineageLedger` copies; listing paths that only need
+/// ids and linkage (the message-edit branch resolver walks ~500 record
+/// dirs, the surgical-recovery primer wants prior record ids) deserialize
+/// this instead — serde skips the embedded trees without materializing
+/// them. Field names match `ContextRewindRecord`, so both views read the
+/// same files.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ContextRewindRecordSummary {
+    pub record_id: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub thread_id: String,
+    #[serde(default)]
+    pub recovery_rollout_path: Option<PathBuf>,
+}
+
+pub fn list_record_summaries(log_dir: &Path) -> io::Result<Vec<ContextRewindRecordSummary>> {
+    list_records_as(log_dir)
+}
+
+/// Shared listing walk: every `*.json` under `context_rewinds/`,
+/// deserialized as `T` (full record or skinny summary), unparseable files
+/// skipped, newest first.
+fn list_records_as<T: serde::de::DeserializeOwned>(log_dir: &Path) -> io::Result<Vec<T>>
+where
+    T: RecordCreatedAt,
+{
     let dir = records_dir(log_dir);
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
-    let mut records: Vec<ContextRewindRecord> = Vec::new();
+    let mut records: Vec<T> = Vec::new();
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -167,8 +200,25 @@ pub fn list_records(log_dir: &Path) -> io::Result<Vec<ContextRewindRecord>> {
             Err(_) => continue,
         }
     }
-    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    records.sort_by(|a, b| b.created_at().cmp(a.created_at()));
     Ok(records)
+}
+
+/// Sort key shared by the two record views.
+trait RecordCreatedAt {
+    fn created_at(&self) -> &str;
+}
+
+impl RecordCreatedAt for ContextRewindRecord {
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
+}
+
+impl RecordCreatedAt for ContextRewindRecordSummary {
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
 }
 
 /// Copy the live pre-rewind rollout into the recovery archive before the

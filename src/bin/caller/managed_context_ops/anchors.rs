@@ -154,15 +154,20 @@ pub(crate) fn managed_context_edit_record_dirs(
     dirs
 }
 
+/// Rewind-record summaries for the message-edit flow, deduped across every
+/// candidate dir. Listed skinny (`ContextRewindRecordSummary`): the branch
+/// resolver only reads identity/linkage fields, and full records embed
+/// complete fission/lineage ledger copies — deserializing those for every
+/// record in ~500 candidate dirs dominated the edit action's latency.
 pub(crate) fn managed_context_edit_records(
     log_dir: &Path,
     thread_id: &str,
     session_id: Option<&str>,
-) -> Result<Vec<context_rewind::ContextRewindRecord>, String> {
+) -> Result<Vec<context_rewind::ContextRewindRecordSummary>, String> {
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     for dir in managed_context_edit_record_dirs(log_dir, thread_id, session_id) {
-        let mut from_dir = context_rewind::list_records(&dir).map_err(|err| {
+        let mut from_dir = context_rewind::list_record_summaries(&dir).map_err(|err| {
             format!(
                 "failed to list managed-context rewind records in {}: {err}",
                 dir.display()
@@ -870,9 +875,93 @@ pub(crate) fn inspect_context_rewind_anchor_from_rollout(
     serde_json::to_string(&inspection).map_err(|err| err.to_string())
 }
 
+/// One full pass over a rollout: the anchor catalog plus the per-anchor
+/// latest-rewind-outcome map the same pass derives.
+pub(crate) struct ContextRewindAnchorScan {
+    pub(crate) catalog: Vec<ContextRewindAnchorCatalogEntry>,
+    /// Latest observed post-rewind usage per anchor outcome key (see
+    /// `context_rewind_anchor_outcome_key`) — what
+    /// `latest_context_rewind_outcome_for_anchor` answers from.
+    pub(crate) latest_rewind_outcomes: HashMap<String, ContextRewindBackendUsageAtLine>,
+}
+
+/// Cached scans keyed by (path, len, mtime). One rewind/stall step
+/// re-derives the catalog up to ~9-14 times — resolve, headroom validation
+/// (plus its outcome probes), the density variant, then apply repeats all of
+/// it plus primer-facts and fission-detach prep — each pass JSON-parsing
+/// every line of a multi-MB rollout. Rollouts are append-only, so a
+/// (len, mtime) fingerprint is a sound freshness check and the whole burst
+/// is served from one scan. Slots are LRU'd so a couple of sessions
+/// rewinding concurrently don't thrash each other.
+const ANCHOR_SCAN_CACHE_SLOTS: usize = 4;
+
+struct CachedAnchorScan {
+    path: PathBuf,
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    scan: std::sync::Arc<ContextRewindAnchorScan>,
+}
+
+static ANCHOR_SCAN_CACHE: std::sync::Mutex<Vec<CachedAnchorScan>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The shared (possibly cached) scan of `source_rollout_path`. The scan is
+/// cached only when the file's (len, mtime) fingerprint is identical before
+/// and after the read, so a mid-scan append can never pin stale content
+/// under the newer fingerprint.
+pub(crate) fn shared_context_rewind_anchor_scan(
+    source_rollout_path: &Path,
+) -> io::Result<std::sync::Arc<ContextRewindAnchorScan>> {
+    let fingerprint = |meta: std::fs::Metadata| (meta.len(), meta.modified().ok());
+    let (len, mtime) = fingerprint(std::fs::metadata(source_rollout_path)?);
+    {
+        let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = cache.iter().position(|entry| {
+            entry.len == len
+                && entry.mtime.is_some()
+                && entry.mtime == mtime
+                && entry.path == source_rollout_path
+        }) {
+            let hit = cache.remove(index);
+            let scan = std::sync::Arc::clone(&hit.scan);
+            cache.insert(0, hit);
+            return Ok(scan);
+        }
+    }
+    let scan = std::sync::Arc::new(scan_context_rewind_anchor_catalog_uncached(
+        source_rollout_path,
+    )?);
+    let unchanged = std::fs::metadata(source_rollout_path)
+        .map(fingerprint)
+        .is_ok_and(|after| after == (len, mtime));
+    if unchanged && mtime.is_some() {
+        let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|entry| entry.path != source_rollout_path);
+        cache.insert(
+            0,
+            CachedAnchorScan {
+                path: source_rollout_path.to_path_buf(),
+                len,
+                mtime,
+                scan: std::sync::Arc::clone(&scan),
+            },
+        );
+        cache.truncate(ANCHOR_SCAN_CACHE_SLOTS);
+    }
+    Ok(scan)
+}
+
 pub(crate) fn scan_context_rewind_anchor_catalog(
     source_rollout_path: &Path,
 ) -> io::Result<Vec<ContextRewindAnchorCatalogEntry>> {
+    Ok(shared_context_rewind_anchor_scan(source_rollout_path)?
+        .catalog
+        .clone())
+}
+
+fn scan_context_rewind_anchor_catalog_uncached(
+    source_rollout_path: &Path,
+) -> io::Result<ContextRewindAnchorScan> {
     let file = std::fs::File::open(source_rollout_path)?;
     let reader = io::BufReader::new(file);
     let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
@@ -1149,20 +1238,10 @@ pub(crate) fn scan_context_rewind_anchor_catalog(
         // report of a model run that began at/before the anchor. Reports
         // deeper in a merged run measured more than the run-start prefix and
         // must not be used as a prefix floor.
-        anchor.backend_usage_before_anchor = backend_usage
-            .iter()
-            .rev()
-            .find(|usage| {
-                usage.line <= anchor.first_line
-                    || (usage.measures_prefix_exactly
-                        && usage.response_start_line <= anchor.first_line)
-            })
-            .map(|usage| usage.used_tokens);
-        let Some(usage) = backend_usage
-            .iter()
-            .find(|usage| context_rewind_usage_covers_anchor(usage, anchor))
-            .copied()
-        else {
+        anchor.backend_usage_before_anchor =
+            latest_prefix_usage_before(&backend_usage, anchor.first_line)
+                .map(|usage| usage.used_tokens);
+        let Some(usage) = first_usage_covering_anchor(&backend_usage, anchor).copied() else {
             continue;
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
@@ -1281,65 +1360,51 @@ pub(crate) fn scan_context_rewind_anchor_catalog(
             (!recovery_eligible_positions.is_empty()).then_some(recovery_eligible_positions);
     }
 
-    Ok(anchors)
+    Ok(ContextRewindAnchorScan {
+        catalog: anchors,
+        latest_rewind_outcomes,
+    })
 }
 
+/// Latest post-rewind outcome for one anchor/position, from the shared scan.
+/// The catalog pass already folds every `thread_rolled_back` marker into
+/// `latest_rewind_outcomes`; this used to re-derive the answer with its own
+/// dedicated full-file pass (two of which ran per headroom validation).
 pub(crate) fn latest_context_rewind_outcome_for_anchor(
     source_rollout_path: &Path,
     requested_item_id: &str,
     position: external_agent::RollbackAnchorPosition,
 ) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
     let key = context_rewind_anchor_outcome_key(requested_item_id, position);
-    let file = std::fs::File::open(source_rollout_path)?;
-    let reader = io::BufReader::new(file);
-    let mut pending = None::<PendingContextRewindOutcome>;
-    let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
-    let mut latest = None;
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let line_number = line_index.saturating_add(1);
-        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
-            if let Some(pending_key) = pending.take() {
-                if pending_key.key == key {
-                    latest = Some(context_rewind_worse_usage(pending_key.prior_usage, usage));
-                }
-            }
-            latest_backend_usage = Some(usage);
-        }
-        if let Some(outcome_key) =
-            context_rewind_rollback_anchor_outcome_key_from_rollout_entry(&entry)
-        {
-            if let Some(pending_key) = pending.take() {
-                if pending_key.key == key {
-                    if let Some(prior_usage) = pending_key.prior_usage {
-                        latest = Some(prior_usage);
-                    }
-                }
-            }
-            pending = Some(PendingContextRewindOutcome {
-                key: outcome_key,
-                prior_usage: latest_backend_usage
-                    .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
-            });
-        }
-    }
-    if let Some(pending_key) = pending {
-        if pending_key.key == key {
-            if let Some(prior_usage) = pending_key.prior_usage {
-                latest = Some(prior_usage);
-            }
-        }
-    }
-    Ok(latest)
+    Ok(shared_context_rewind_anchor_scan(source_rollout_path)?
+        .latest_rewind_outcomes
+        .get(&key)
+        .copied())
 }
 
+/// Byte-counting sink: serializes into nothing, keeping only the length.
+struct SerializedByteCount(usize);
+
+impl std::io::Write for SerializedByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// chars/4 estimate of a payload's serialized size. Counts through a sink
+/// writer — this runs once per response item in the catalog scan, and
+/// materializing every payload with `to_vec` just to read `.len()`
+/// re-allocated the entire rollout's content per scan.
 pub(crate) fn context_rewind_estimated_tokens(value: &serde_json::Value) -> u64 {
-    let chars = serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or_else(|_| value.to_string().len());
+    let mut counter = SerializedByteCount(0);
+    let chars = match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => value.to_string().len(),
+    };
     std::cmp::max(1, chars.div_ceil(4) as u64)
 }
 
@@ -1625,6 +1690,55 @@ pub(crate) fn context_rewind_usage_covers_anchor(
     }
 }
 
+/// First report satisfying [`context_rewind_usage_covers_anchor`], by binary
+/// search. `backend_usage` is in file order, so `line` is strictly
+/// increasing and `response_start_line` non-decreasing — both branch
+/// predicates are monotone over the slice, and the catalog post-pass ran
+/// this linear probe once per anchor (anchors × reports predicate
+/// evaluations per scan).
+fn first_usage_covering_anchor<'a>(
+    backend_usage: &'a [ContextRewindBackendUsageAtLine],
+    anchor: &ContextRewindAnchorCatalogEntry,
+) -> Option<&'a ContextRewindBackendUsageAtLine> {
+    let index = if anchor.last_item_is_model {
+        backend_usage.partition_point(|usage| usage.line < anchor.last_line)
+    } else {
+        backend_usage.partition_point(|usage| usage.response_start_line <= anchor.last_line)
+    };
+    // The boundary element always satisfies the predicate when the slice is
+    // ordered as documented; the filter re-checks it so a future de-sync of
+    // the partition predicates degrades to "no report" instead of a wrong
+    // attribution.
+    backend_usage
+        .get(index)
+        .filter(|usage| context_rewind_usage_covers_anchor(usage, anchor))
+}
+
+/// Last report that measured a strict prefix of an anchor at `first_line`:
+/// the latest with `line <= first_line`, or — later in the file — the
+/// latest exact run-start report of a model run that began at/before the
+/// anchor. Binary-search equivalent of the old
+/// `rev().find(line <= first || (measures_prefix_exactly && response_start
+/// <= first))`: matches past the run boundary are impossible (a report's
+/// `line` never precedes its `response_start_line`), matches between the
+/// two boundaries need the exact-run-start flag, and everything at or
+/// before the line boundary matches outright — so the last overall match is
+/// the last flagged report in the window, else the boundary report.
+fn latest_prefix_usage_before(
+    backend_usage: &[ContextRewindBackendUsageAtLine],
+    first_line: usize,
+) -> Option<ContextRewindBackendUsageAtLine> {
+    let line_boundary = backend_usage.partition_point(|usage| usage.line <= first_line);
+    let run_boundary =
+        backend_usage.partition_point(|usage| usage.response_start_line <= first_line);
+    backend_usage[line_boundary..run_boundary.max(line_boundary)]
+        .iter()
+        .rev()
+        .find(|usage| usage.measures_prefix_exactly)
+        .or_else(|| line_boundary.checked_sub(1).map(|i| &backend_usage[i]))
+        .copied()
+}
+
 pub(crate) fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
     item.get("name")
         .and_then(|value| value.as_str())
@@ -1886,24 +2000,32 @@ pub(crate) fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String
 /// model turn ran since an immediately preceding rollback it measured the
 /// pre-rollback context — recorded as-is, because nothing fresher exists
 /// locally and querying the backend would add an RPC to the rewind path.
+///
+/// Scans from the end: only lines carrying the `token_count` marker are
+/// JSON-parsed and the first (latest) parse that yields a report wins — the
+/// forward version parsed every line of a multi-MB rollout to keep one.
 pub(crate) fn latest_context_rewind_backend_usage_in_rollout(
     source_rollout_path: &Path,
 ) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
-    let file = std::fs::File::open(source_rollout_path)?;
-    let reader = io::BufReader::new(file);
-    let mut latest = None;
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line?;
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+    let contents = std::fs::read_to_string(source_rollout_path)?;
+    let mut line_number = contents.lines().count();
+    for line in contents.lines().rev() {
+        let current_line = line_number;
+        line_number = line_number.saturating_sub(1);
+        // Cheap prescan: a token_count event necessarily contains the
+        // literal; payload text can false-positive, but the parse below
+        // stays the authority.
+        if !line.contains("token_count") {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let Some(usage) =
-            context_rewind_backend_usage_from_rollout_entry(line_index.saturating_add(1), &entry)
-        {
-            latest = Some(usage);
+        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(current_line, &entry) {
+            return Ok(Some(usage));
         }
     }
-    Ok(latest)
+    Ok(None)
 }
 
 /// Pressure band for a usage measurement against the effective context
@@ -1975,6 +2097,201 @@ pub(crate) fn context_rewind_pressure_at_record_creation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_at(
+        line: usize,
+        response_start_line: usize,
+        measures_prefix_exactly: bool,
+    ) -> ContextRewindBackendUsageAtLine {
+        ContextRewindBackendUsageAtLine {
+            line,
+            used_tokens: line as u64 * 100,
+            rewind_only_limit: 1_000_000,
+            response_start_line,
+            measures_prefix_exactly,
+        }
+    }
+
+    fn anchor_probe(first_line: usize, last_line: usize, last_item_is_model: bool) -> ContextRewindAnchorCatalogEntry {
+        ContextRewindAnchorCatalogEntry {
+            ordinal: 0,
+            item_id: "probe".to_string(),
+            first_line,
+            last_line,
+            first_item_type: "function_call".to_string(),
+            last_item_type: "function_call".to_string(),
+            last_item_is_model,
+            positions: vec!["before", "after"],
+            position_hint: "after",
+            names: Vec::new(),
+            roles: Vec::new(),
+            summary: String::new(),
+            backend_usage_at_or_after_anchor: None,
+            backend_usage_before_anchor: None,
+            rewind_only_limit_at_or_after_anchor: None,
+            recommended_rewind_limit_at_or_after_anchor: None,
+            prefix_estimated_tokens_before_anchor: None,
+            prefix_estimated_tokens_after_anchor: None,
+            approx_pruned_tokens_before: None,
+            approx_pruned_tokens_after: None,
+            prefix_tokens_after: None,
+            latest_rewind_usage_after_anchor: None,
+            latest_rewind_limit_after_anchor: None,
+            recovery_eligible: None,
+            recovery_eligible_positions: None,
+            density_eligible: None,
+            density_eligible_positions: None,
+            managed_context_recovery_start_line: None,
+        }
+    }
+
+    /// The binary-search selectors must return exactly what the linear
+    /// probes they replaced returned, across run boundaries, exact-run-start
+    /// windows, and both anchor kinds.
+    #[test]
+    fn binary_search_usage_selectors_match_linear_probes() {
+        // Three model runs starting at lines 2, 10, 30; reports interleave
+        // exact run-start measurements with deeper merged-run reports.
+        let backend_usage = vec![
+            usage_at(3, 2, true),
+            usage_at(5, 2, false),
+            usage_at(12, 10, true),
+            usage_at(14, 10, false),
+            usage_at(15, 10, false),
+            usage_at(33, 30, true),
+        ];
+        for probe_line in [0, 1, 2, 3, 4, 5, 9, 10, 12, 13, 15, 29, 30, 33, 40] {
+            // covers-anchor: first report at/after (model) or first report of
+            // a later run (non-model).
+            for last_item_is_model in [true, false] {
+                let anchor = anchor_probe(probe_line, probe_line, last_item_is_model);
+                let expected = backend_usage
+                    .iter()
+                    .find(|usage| context_rewind_usage_covers_anchor(usage, &anchor));
+                let got = first_usage_covering_anchor(&backend_usage, &anchor);
+                assert_eq!(
+                    got.map(|u| u.line),
+                    expected.map(|u| u.line),
+                    "covers-anchor diverged at line {probe_line} (model={last_item_is_model})"
+                );
+            }
+            // prefix-floor: last report measuring a strict prefix.
+            let expected = backend_usage
+                .iter()
+                .rev()
+                .find(|usage| {
+                    usage.line <= probe_line
+                        || (usage.measures_prefix_exactly
+                            && usage.response_start_line <= probe_line)
+                })
+                .map(|usage| usage.line);
+            let got = latest_prefix_usage_before(&backend_usage, probe_line).map(|u| u.line);
+            assert_eq!(got, expected, "prefix-floor diverged at line {probe_line}");
+        }
+        // Empty report list answers None everywhere.
+        assert!(latest_prefix_usage_before(&[], 10).is_none());
+        assert!(first_usage_covering_anchor(&[], &anchor_probe(1, 1, true)).is_none());
+    }
+
+    /// One scan serves a same-fingerprint burst (pointer-identical Arc);
+    /// an append invalidates it.
+    #[test]
+    fn anchor_scan_cache_serves_burst_and_invalidates_on_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let item = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_cache_probe",
+                "arguments": "{}"
+            }
+        });
+        std::fs::write(&path, format!("{item}\n")).unwrap();
+
+        let first = shared_context_rewind_anchor_scan(&path).unwrap();
+        let second = shared_context_rewind_anchor_scan(&path).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unchanged rollout must be served from the cached scan"
+        );
+        assert_eq!(first.catalog.len(), 1);
+
+        let second_item = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_cache_probe_2",
+                "arguments": "{}"
+            }
+        });
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents.push_str(&format!("{second_item}\n"));
+        std::fs::write(&path, contents).unwrap();
+
+        let third = shared_context_rewind_anchor_scan(&path).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &third),
+            "append must invalidate the cached scan"
+        );
+        assert_eq!(third.catalog.len(), 2);
+    }
+
+    /// The counting-writer estimate is byte-identical to the old
+    /// serialize-then-measure implementation.
+    #[test]
+    fn estimated_tokens_counting_writer_matches_serialized_length() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"type": "message", "content": [{"type": "input_text", "text": "hello world"}]}),
+            serde_json::json!({"nested": {"array": [1, 2, 3], "text": "ütf-8 ⚙ content"}}),
+        ] {
+            let serialized_len = serde_json::to_vec(&value).unwrap().len();
+            let expected = std::cmp::max(1, serialized_len.div_ceil(4) as u64);
+            assert_eq!(context_rewind_estimated_tokens(&value), expected);
+        }
+    }
+
+    /// Reverse scan returns the LAST report with its 1-based line number and
+    /// is not fooled by the marker appearing in unrelated payload text.
+    #[test]
+    fn latest_backend_usage_reverse_scan_finds_last_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let report = |total: u64| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "model_context_window": 1000,
+                        "last_token_usage": { "total_tokens": total }
+                    }
+                }
+            })
+        };
+        let decoy = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "discussing token_count here" }]
+            }
+        });
+        std::fs::write(
+            &path,
+            [report(100).to_string(), decoy.to_string(), report(250).to_string(), decoy.to_string()]
+                .join("\n"),
+        )
+        .unwrap();
+        let usage = latest_context_rewind_backend_usage_in_rollout(&path)
+            .unwrap()
+            .expect("report expected");
+        assert_eq!(usage.used_tokens, 250);
+        assert_eq!(usage.line, 3);
+    }
 
     #[test]
     fn context_rewind_carries_unrepeated_prior_primer_facts_from_pruned_span() {
