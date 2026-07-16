@@ -94,6 +94,28 @@ check_core() {
         all_ok=false
     fi
 
+    # -sys crate link deps (parity with setup-linux.sh APT_PACKAGES:
+    # pkg-config + libvpx-dev; opus for the audio stack). Without these a
+    # plain `cargo build` dies in the crates' build scripts — a fresh CI
+    # host proved it (env-libvpx-sys panic, 2026-07-15).
+    if has_cmd pkg-config; then
+        ok "pkg-config"
+    else
+        miss "pkg-config" "brew install pkgconf"
+        all_ok=false
+    fi
+    local lib formula
+    for lib in vpx:libvpx opus:opus; do
+        formula="${lib#*:}"
+        lib="${lib%%:*}"
+        if pkg-config --exists "$lib" 2>/dev/null; then
+            ok "lib$lib ($(pkg-config --modversion "$lib" 2>/dev/null))"
+        else
+            miss "lib$lib" "brew install $formula"
+            all_ok=false
+        fi
+    done
+
     $all_ok
 }
 
@@ -465,6 +487,9 @@ run_install() {
 
     # Phase 2: Homebrew packages
     info "installing Homebrew packages..."
+    brew_install pkgconf
+    brew_install libvpx
+    brew_install opus
     brew_install ffmpeg
     brew_install switchaudio-osx
     brew_install sox

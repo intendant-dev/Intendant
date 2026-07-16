@@ -72,6 +72,17 @@ html {
 
 /* ── Tab buttons (shared contract: the ui-v2 rail stamps .tab-btn on its
    nav items so the router binds them) ── */
+
+/* ── Tab Content ──
+   Live v2 pane host, not v1 chrome: html/body/#app are unpositioned, so this
+   is the containing block that keeps the absolute .tab-pane children inside
+   #app's padded content area (under the ui2 rail/oversight/composer
+   reservations). */
+.tab-content {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
 .tab-pane {
   display: none;
   flex-direction: column;

@@ -36,6 +36,13 @@ CAP_GB=50         # total per cache root (2 listeners x 25G budget)
 #GOVERNOR_MONITOR=auto
 #GOVERNOR_CONF=/usr/local/etc/intendant-governor.toml
 
+# Supervised sccache server health probe (see README): TCP-connect the
+# server every tick, bounce the service when it stops accepting. Empty
+# port (the default) disables the probe; set it on hosts running the
+# supervised per-account server.
+#SCCACHE_HEALTH_PORT=4227
+#SCCACHE_HEALTH_SERVICE=com.intendant.ci.sccache
+
 VOLUME="/"
 STATE_DIR="/var/db/intendant-ci"        # /var/lib/intendant-ci on Linux
 LOG="/var/log/intendant-ci-watchdog.log"

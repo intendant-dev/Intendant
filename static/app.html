@@ -148,6 +148,17 @@ html {
 
 /* ── Tab buttons (shared contract: the ui-v2 rail stamps .tab-btn on its
    nav items so the router binds them) ── */
+
+/* ── Tab Content ──
+   Live v2 pane host, not v1 chrome: html/body/#app are unpositioned, so this
+   is the containing block that keeps the absolute .tab-pane children inside
+   #app's padded content area (under the ui2 rail/oversight/composer
+   reservations). */
+.tab-content {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
 .tab-pane {
   display: none;
   flex-direction: column;
@@ -4123,8 +4134,23 @@ body.context-focus-active {
   display: block;
 }
 
-/* Stop button — interrupt the current agent turn. Lives in the Activity
-   toolbar and is shown only while a turn is in flight. */
+/* ── Global Task Bar ──
+   Base layout for the composer dock: html.ui-v2 .global-task-bar
+   (ui2-chrome.css) restyles the floating card but deliberately re-declares
+   no display/gap/align — the dock's row layout (flex textarea, content-sized
+   Direct toggle) lives here. */
+.global-task-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight);
+  flex-shrink: 0;
+}
 .task-target-chip {
   display: inline-flex;
   align-items: center;
@@ -28105,7 +28131,7 @@ import * as THREE from '/three.module.min.js';
 // daemon upgrade, tabs left open would otherwise keep running old code
 // against the new daemon indefinitely (the "stale photograph" multi-tab
 // failure class).
-const INTENDANT_APP_BUILD = 'a4a0530f37ba73a3';
+const INTENDANT_APP_BUILD = 'a414dce6604782ee';
 
 let staleBuildNudged = false;
 function maybeNudgeStaleBuild(serverBuild) {
