@@ -1579,9 +1579,24 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         return false;
     }
 
+    // Snapshot/restore bracket for the daemon-global scalars a replay fold
+    // can write. Audited against every AppEvent the replay converter can
+    // produce whose applier arm writes globals (SessionIdentity,
+    // SessionCapabilities, ContextSnapshot, SessionStarted, TurnStarted,
+    // AgentStarted/AgentOutput, DoneSignal/TaskComplete, ApprovalRequired,
+    // RoundComplete, SessionEnded): turn, ROUND (both RoundComplete's
+    // direct write and note_session_round), budget_pct, phase (+
+    // phase_entered_at via set_phase), task_description, session_id,
+    // active_session_source, codex_managed_context, provider/model names,
+    // and the usage scalars (tokens x5, context/hard windows). Globals the
+    // applier can write but no replayable row reaches (presence_*,
+    // external_agent, configured_codex_managed_context, log_dir,
+    // pending_approval, human_question) are safe by unreachability, not by
+    // this bracket — re-audit when the replay converter grows a producer.
     let provider_name = s.provider_name.clone();
     let model_name = s.model_name.clone();
     let turn = s.turn;
+    let round = s.round;
     let budget_pct = s.budget_pct;
     let phase = s.phase.clone();
     let phase_entered_at = s.phase_entered_at;
@@ -1670,6 +1685,7 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
     s.provider_name = provider_name;
     s.model_name = model_name;
     s.turn = turn;
+    s.round = round;
     s.budget_pct = budget_pct;
     s.phase = phase;
     s.phase_entered_at = phase_entered_at;
@@ -1964,11 +1980,16 @@ mod tests {
             // log's FINAL row — nothing after it re-attributes.
             log.round_complete(2, 1);
 
-            // An unrelated session is live and active on the daemon.
+            // An unrelated session is live and active on the daemon, at a
+            // DISTINCT round: the replayed round_complete(2) must neither
+            // relabel the live session nor leak into the daemon-global
+            // round scalar an unscoped get_status reports.
             let state = test_state();
             let mut s = state.write().await;
             s.session_id = "sess-live".to_string();
+            s.round = 9;
             s.note_session_phase(Some("sess-live"), Some(3), Phase::RunningAgent, None);
+            s.note_session_round(Some("sess-live"), 9);
 
             // Hydrating `sess-old` must attribute the naked round_complete
             // to the HYDRATION TARGET: the requested session reaches
@@ -1995,6 +2016,11 @@ mod tests {
                     .map(|st| st.phase.clone()),
                 Some(Phase::RunningAgent)
             );
+            assert_eq!(
+                s.session_status_for_id("sess-live").map(|st| st.round),
+                Some(9)
+            );
+            assert_eq!(s.round, 9, "global round must be bracket-restored");
 
             // Stays consistent once the cursor sits at EOF.
             hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
@@ -2008,6 +2034,11 @@ mod tests {
                     .map(|st| st.phase.clone()),
                 Some(Phase::RunningAgent)
             );
+            assert_eq!(
+                s.session_status_for_id("sess-live").map(|st| st.round),
+                Some(9)
+            );
+            assert_eq!(s.round, 9, "global round must survive rehydration");
         });
     }
 
