@@ -4071,6 +4071,44 @@ fn sha256_b64u(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Empty/absent request ids are rejected at dispatch BEFORE any
+    /// spawn: an id-less request cannot receive a correlated response,
+    /// and an empty-id carrier would bypass the outbound queue and
+    /// chunking (the last congestion bypass). The rejection is an
+    /// error-class frame, so the budget seam bounds the spam.
+    #[tokio::test]
+    async fn empty_id_requests_are_rejected_before_spawning() {
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<SequencedTaskResponse>(8);
+        let mut pending = PendingControlRequests::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        for frame in [
+            r#"{"t":"request","method":"api_sessions"}"#,
+            r#"{"t":"request","id":"","method":"api_sessions"}"#,
+            r#"{"t":"request","id":"","method":"status"}"#,
+        ] {
+            let rejected =
+                test_control_frame_response(frame, &mut rt, &tx, &mut pending, &mut outbound)
+                    .expect("id-less requests answer inline");
+            assert_eq!(rejected["ok"], false, "{rejected}");
+            assert!(rejected["error"].as_str().unwrap().contains("non-empty id"));
+            assert!(
+                is_error_class_frame(&rejected),
+                "the rejection must ride the budgeted error-class seam"
+            );
+        }
+        assert_eq!(
+            pending.live_work(),
+            0,
+            "nothing may spawn for id-less requests"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no task response lane traffic for id-less requests"
+        );
+    }
+
     /// Committing uploads hold their BYTE weight against the aggregate
     /// declared-bytes budget until the commit completes: with enough
     /// bytes mid-commit, a new upload_start is refused on bytes even

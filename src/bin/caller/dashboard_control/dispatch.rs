@@ -291,6 +291,21 @@ pub(crate) fn control_frame_response(
             inbound_uploads,
         ),
         "request" => {
+            // Root rejection of empty/absent ids, BEFORE any spawn: a
+            // request without an id cannot receive a correlated response,
+            // so it has no legitimate use on this lane (the dashboard
+            // client always mints `dc-<ts>-<seq>` ids) — while an
+            // empty-id response would bypass the outbound queue (it is
+            // unaddressable) and response chunking, direct-sending
+            // successful payloads even on a congested wire. The rejection
+            // itself is an ok:false frame, budgeted at the error-class
+            // seam like every other cheap-to-mint refusal.
+            if id.is_empty() {
+                return Some(dashboard_control_error_response(
+                    id,
+                    "request frames require a non-empty id",
+                ));
+            }
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = parsed.get("params").cloned();
             if let Err(error) = authorize_dashboard_control_method(runtime, method, params.as_ref())

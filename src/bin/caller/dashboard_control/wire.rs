@@ -1465,6 +1465,63 @@ mod tests {
         assert_eq!(queue.queued_bytes, 0);
     }
 
+    /// The send-path congestion regression for the pre-serialized
+    /// carrier: on a congested wire a successful small preserialized
+    /// response QUEUES under the caps (nothing direct-sends, the gated
+    /// drain holds it), while an uncongested empty queue direct-sends.
+    #[test]
+    fn congested_preserialized_responses_queue_under_caps() {
+        let mut rtc = rtc::peer_connection::RTCPeerConnectionBuilder::new()
+            .with_configuration(
+                rtc::peer_connection::configuration::RTCConfigurationBuilder::new().build(),
+            )
+            .build()
+            .expect("offline rtc peer");
+        // No control channel: any (incorrect) direct send would be a
+        // silent no-op, so the queue observations carry the assertion.
+        let channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
+        let mut budget = DirectErrorBudget::new("test");
+        let envelope =
+            r#"{"t":"response","id":"r1","ok":true,"result":{"sessions":[]}}"#.to_string();
+
+        // Congested: the frame must queue (the congestion-gated drain
+        // leaves it there), bounded by the queue caps.
+        let mut queue = OutboundControlQueue::new();
+        send_control_frame_preserialized(
+            &mut rtc,
+            &channels,
+            &mut queue,
+            false,
+            true,
+            &mut budget,
+            "r1".to_string(),
+            envelope.clone(),
+        );
+        assert_eq!(
+            queue.frames.len(),
+            1,
+            "a congested preserialized response must queue, not direct-send"
+        );
+        assert!(queue.queued_bytes >= envelope.len());
+
+        // Uncongested + empty queue: direct send, nothing queued.
+        let mut queue = OutboundControlQueue::new();
+        send_control_frame_preserialized(
+            &mut rtc,
+            &channels,
+            &mut queue,
+            false,
+            false,
+            &mut budget,
+            "r1".to_string(),
+            envelope,
+        );
+        assert!(
+            queue.is_empty(),
+            "an uncongested empty queue direct-sends preserialized frames"
+        );
+    }
+
     /// A queued chunked frame renders each chunk lazily and exactly once,
     /// byte-identical to the eager path (`render_all` is the eager
     /// rendering the reassembly tests above already pin).
