@@ -14,3 +14,9 @@ static/app/** -text diff
 # and parity-tested against the served bytes — eol conversion would change
 # the hash per platform (and churn the regenerated pin on autocrlf runners).
 static/vault-kernel.js -text diff
+# The owner-plane D0-A corpus is vendored byte-exact from the stamped
+# asset (owner-plane-d0a @ 583f421a): the reducer's conformance suite
+# pins the spec's SHA-256 (`vendored_spec_bytes_match_the_stamp`) and
+# the vectors carry hex-encoded canonical bytes — eol conversion would
+# break the pin on autocrlf runners.
+crates/owner-plane-reducer/corpus/** -text diff

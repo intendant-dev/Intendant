@@ -1,0 +1,16 @@
+{
+  "case_kind": "canonical-encode",
+  "expected": {
+    "bytes": "8a0017181818ff19010019ffff1a000100001affffffff1b00000001000000001b001fffffffffffff"
+  },
+  "family": 1,
+  "inputs": {
+    "bytes": "8a0017181818ff19010019ffff1a000100001affffffff1b00000001000000001b001fffffffffffff"
+  },
+  "name": "uint-boundary-widths",
+  "source": "2.1",
+  "surfaces": [
+    "core",
+    "browser"
+  ]
+}
