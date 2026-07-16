@@ -200,11 +200,13 @@ function bumpDisplayStreamGeneration(displayId) {
   return next;
 }
 
-// Presence-stream HQ archival gap ceiling. Duplicate frames skip the HQ
-// encode + upload (the server already holds identical pixels — a static
-// screen otherwise re-uploads ~100-200 KB every second), but never for
-// longer than this: past it the tick uploads even a duplicate, so the
-// worst-case archival gap stays bounded.
+// Presence-stream HQ archival gap ceiling. Dup-classified frames skip the
+// HQ encode + upload (a static screen otherwise re-uploads ~100-200 KB
+// every second), but never for longer than this: past it the tick uploads
+// even a duplicate, so the worst-case archival gap stays bounded. The
+// classifier is the live lane's <2% JPEG-length heuristic, not a pixel
+// compare — a near-static change that aliases in encoded length archives
+// at this granularity instead of 1 Hz.
 const HQ_ARCHIVAL_MAX_GAP_MS = 10000;
 
 class DisplaySlot {
@@ -276,7 +278,7 @@ class DisplaySlot {
     this._streamCanvas = document.createElement('canvas');
     this._hqStreamCanvas = document.createElement('canvas');
     this._streamEncodePending = false;
-    this._lastHqUploadAt = 0;  // wall-clock of the last HQ archival upload (see HQ_ARCHIVAL_MAX_GAP_MS)
+    this._lastHqUploadAt = 0;  // wall-clock of the last successful HQ archival upload (see HQ_ARCHIVAL_MAX_GAP_MS)
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -1532,16 +1534,33 @@ class DisplaySlot {
           tickerFramesDropped++;
           sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
         }
-        // Archival lane: a duplicate frame is pixel-identical to what the
-        // server already holds, so skip its HQ encode + upload while the
-        // last upload is fresh; once HQ_ARCHIVAL_MAX_GAP_MS elapses even a
-        // duplicate goes out (the forced insurance frame). Every upload —
-        // fresh pixels or forced — resets the gap clock.
+        // Archival lane: dup-classified frames skip the HQ encode + upload
+        // while the last successful upload is fresh; once
+        // HQ_ARCHIVAL_MAX_GAP_MS elapses even a duplicate goes out (the
+        // forced insurance frame — dedupe is a JPEG-length heuristic, so
+        // this also bounds how long a length-aliased real change can stay
+        // unarchived). Every successful upload resets the gap clock.
         if (frameDup && Date.now() - this._lastHqUploadAt < HQ_ARCHIVAL_MAX_GAP_MS) return;
         return DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80).then(hqB64 => {
           if (gen !== displayStreamGeneration(this.displayId)) return;
-          this._lastHqUploadAt = Date.now();
-          sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+          // Stamp the gap clock only on confirmed success (the helper
+          // resolves false on upload failure), re-checking the generation
+          // at resolution so a restart mid-send cannot stamp the fresh
+          // run's zeroed clock and suppress its first upload. On failure
+          // the clock stays put and the next 1 Hz tick retries — the
+          // pre-skip steady-state cost, and it contains the rejection.
+          // Deliberately not returned into the tick chain: the pending
+          // flag covers encode work only, never network round-trips.
+          sendDashboardVideoFrameToServer(hqB64, frameId, streamName).then(sent => {
+            if (!sent) {
+              console.warn('[DisplaySlot] HQ archival upload failed; gap clock not reset — next tick retries');
+              return;
+            }
+            if (gen !== displayStreamGeneration(this.displayId)) return;
+            this._lastHqUploadAt = Date.now();
+          }).catch(err => {
+            console.warn('[DisplaySlot] HQ archival upload failed; gap clock not reset — next tick retries', err);
+          });
         });
       }).catch(err => {
         console.warn('[DisplaySlot] stream frame encode failed', err);
