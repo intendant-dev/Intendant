@@ -257,6 +257,17 @@ jobs:
           "relevant=$relevant" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Output "CI-relevant change detected: $relevant"
 
+      # ── Quality gate: rustfmt (Linux leg) ──────────────────────────────
+      # fmt is platform-independent, so one leg suffices — and it needs no
+      # build, so it runs before everything else: a formatting failure
+      # surfaces in seconds instead of after a compile+test cycle. Keep it
+      # AFTER the relevance detection above: its `if:` reads that step's
+      # output, and a not-yet-run step's output is empty, which passes the
+      # != 'false' test and would run fmt on docs-only diffs.
+      - name: cargo fmt --check
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo fmt --all --check
+
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
       # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
       # like the other provisioning steps: the self-hosted Windows box has
@@ -352,6 +363,22 @@ jobs:
           # its §D corpus conformance gate (170 stamped vectors).
           cargo test -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
+      # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
+      # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only
+      # cfg surface unproven, so it started report-only; the Linux delta
+      # was zeroed (30 warnings — cfg-shadowed dead code gated, mechanical
+      # rewrites, established-signature allows) and verified with the exact
+      # gate incantation on the fleet's Linux toolchain in the same change
+      # that flipped this to -D warnings. Like fmt above, it rides the
+      # required Linux context; no ruleset change. Non-test targets only:
+      # --all-targets has its own unzeroed baseline (tracked in the CI
+      # hardening program). Ordered so the deterministic cheap gates fail
+      # before the longer, flakier tail (fmt → unit tests → clippy → e2e →
+      # smokes): a lint-red PR never burns an e2e + smoke cycle.
+      - name: cargo clippy (-D warnings)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo clippy --workspace --locked --target ${{ matrix.target }} -- -D warnings
+
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
       # binaries driven by the scripted mock provider (see tests/e2e/main.rs).
       # No keys, no network, no display — exercises the production stack the
@@ -360,25 +387,6 @@ jobs:
       - name: cargo test e2e (mock provider, headless)
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
-
-      # ── Quality gates (Linux leg; baselines zeroed 2026-07-11) ──────
-      # fmt is platform-independent, so one leg suffices. clippy is
-      # cfg-sensitive: the macOS-cut baseline left the Linux-only cfg
-      # surface unproven, so it started report-only; the Linux delta was
-      # zeroed (30 warnings — cfg-shadowed dead code gated, mechanical
-      # rewrites, established-signature allows) and verified with the
-      # exact gate incantation on the fleet's Linux toolchain in the
-      # same change that flipped this to -D warnings. Both ride the
-      # required Linux context; no ruleset change. Non-test targets
-      # only: --all-targets has its own unzeroed baseline (tracked in
-      # the CI hardening program).
-      - name: cargo fmt --check
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo fmt --all --check
-
-      - name: cargo clippy (-D warnings)
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo clippy --workspace --locked --target ${{ matrix.target }} -- -D warnings
 
       # ── Linux gate tail: keyless smokes + dashboard-boot ──────────────
       # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
