@@ -392,7 +392,15 @@ jobs:
       # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
       # rationale preserved in its git history): the live-fire subset of
       # the landing battery that needs NO API keys and NO display — real
-      # binaries driven end to end by the scripted mock provider.
+      # binaries driven end to end by the scripted mock provider. The
+      # binaries are the ones the e2e step above just built and tested:
+      # compiling a package's integration tests builds its bin targets and
+      # uplifts them to <triple>/debug/ (tests/e2e/main.rs references
+      # CARGO_BIN_EXE_intendant{,-runtime}, and the daemon resolves the
+      # runtime as its on-disk sibling). No separate `cargo build --bins`
+      # here: it feature-resolves without dev-deps, so it rebuilt dep
+      # crates and re-linked all three bins (~40s median) only to replace
+      # the e2e-validated binaries with byte-different ones.
       #   - session-vitals-smoke: daemon in a dirty git repo; vitals event
       #     carries git + cache + limits sections end to end.
       #   - native-goal-smoke: the /goal engine over the control socket.
@@ -419,14 +427,6 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/pyws"
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
-
-      # The real binaries for the smoke rigs — incremental on top of the
-      # test/e2e build above (same target dir, same profile): seconds,
-      # not a second build. Debug profile deliberately (the smokes probe
-      # protocol behavior, which the profile doesn't change).
-      - name: cargo build (smoke binaries)
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo build -p intendant --bins --locked --target ${{ matrix.target }}
 
       - name: session-vitals smoke
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
