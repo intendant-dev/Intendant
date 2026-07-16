@@ -367,6 +367,16 @@ pub enum AppEvent {
         session_id: String,
         vitals: crate::types::SessionVitals,
     },
+    /// One backend's honest activity snapshot (wire-fact state machine in
+    /// `session_activity.rs`), keyed like `UsageSnapshot` by whatever id
+    /// the producer runs under. Hub-internal: the vitals hub folds it into
+    /// the session's `SessionVitals.activity` section, which is what
+    /// reaches frontends and the session log — this event itself has no
+    /// outbound twin and is never persisted.
+    SessionActivity {
+        session_id: Option<String>,
+        activity: crate::types::SessionActivityVitals,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -930,6 +940,22 @@ pub enum AppEvent {
         kind: crate::file_watcher::FileChangeKind,
         lines_added: u32,
         lines_removed: u32,
+    },
+
+    /// Structured write-activity signal: the file paths a session's tool
+    /// call is about to mutate (Write/Edit/file-op shapes), verbatim as the
+    /// tool input stated them. Emitted only where the pipeline knows the
+    /// paths structurally — the native loop's parsed command batch, the
+    /// external drain's file-change items — never recovered from rendered
+    /// previews or log text. Feeds the git-vitals activity-locus tracker
+    /// (`session_vitals`): when a session's recent writes resolve inside a
+    /// different git checkout than its registered project root, the git
+    /// chip's probe target follows the activity. The tracker ignores
+    /// relative entries (they resolve against the registered root anyway).
+    /// Internal event: not broadcast to frontends, not persisted.
+    SessionFileActivity {
+        session_id: Option<String>,
+        paths: Vec<String>,
     },
 
     /// A user-uploaded file was committed to the upload store. Emitted by
@@ -2424,6 +2450,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             vitals: vitals.clone(),
         }),
+        // Hub-internal: the vitals hub folds it into SessionVitals, which
+        // is the outbound (and session-logged) carrier.
+        AppEvent::SessionActivity { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),
@@ -3035,6 +3064,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         // Internal events — not broadcast to external consumers
         AppEvent::Tick
         | AppEvent::JsonExtracted { .. }
+        | AppEvent::SessionFileActivity { .. }
         | AppEvent::SessionDirChanged { .. }
         | AppEvent::ControlCommand(_)
         | AppEvent::PresenceReady
@@ -3626,7 +3656,12 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
                 );
             }
             if let Some(ref r) = reasoning {
-                log.reasoning_content(Some(r.as_str()), None);
+                log.reasoning_content_for_session(
+                    session_id.as_deref(),
+                    source.as_deref(),
+                    Some(r.as_str()),
+                    None,
+                );
             }
         }
 

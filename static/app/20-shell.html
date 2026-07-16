@@ -232,8 +232,10 @@
           </div>
 
           <!-- Structured User Question Panel (external agents' ask-the-user tool).
-               Body is rendered by showUserQuestion(): one block per question with
-               option buttons, a free-text input, and Submit/Skip actions. -->
+               Body is rendered by showUserQuestion(): a pinned header-chip index
+               (2+ questions), a scrollable list of question blocks (option
+               buttons + a free-text input each), and pinned Submit/Skip actions
+               with an "N of M answered" counter. -->
           <div class="bottom-panel" id="question-panel">
             <div class="panel-body">
               <div class="approval-card">
@@ -800,6 +802,7 @@
                  placeholder="Park a task or note…" aria-label="New agenda item title" />
           <button type="button" id="agenda-add-btn">Add</button>
         </div>
+        <div class="agenda-reminders-bar" id="agenda-reminders-bar"></div>
         <div class="agenda-filters" id="agenda-filters" role="tablist" aria-label="Agenda filter">
           <button type="button" class="agenda-filter active" data-filter="open">Open</button>
           <button type="button" class="agenda-filter" data-filter="done">Done</button>

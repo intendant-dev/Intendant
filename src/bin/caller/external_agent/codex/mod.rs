@@ -1327,6 +1327,7 @@ impl ExternalAgent for CodexAgent {
             latest_token_usage,
             context_pressure_floor,
             model,
+            self.reasoning_effort.clone(),
             protocol_watch.clone(),
             writer,
         ));

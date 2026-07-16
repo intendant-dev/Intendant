@@ -568,6 +568,8 @@ impl AppEventUpcaster {
             AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
+            // Hub-internal: peers see the folded SessionVitals instead.
+            | AppEvent::SessionActivity { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
@@ -589,6 +591,7 @@ impl AppEventUpcaster {
             | AppEvent::SessionRenameResult { .. }
             | AppEvent::SessionAgentConfigResult { .. }
             | AppEvent::FileChanged { .. }
+            | AppEvent::SessionFileActivity { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
             | AppEvent::SnapshotCreated { .. }
@@ -4535,6 +4538,7 @@ mod tests {
             }),
             cache: None,
             limits: Vec::new(),
+            activity: None,
         }
     }
 

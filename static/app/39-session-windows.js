@@ -774,6 +774,59 @@ function vitalsLimitLabelLong(label) {
   return label;
 }
 
+// Live activity — the honest "is the model actually doing something right
+// now" signal. Raw state + epochs arrive on the wire (the vitals
+// `activity` section: state, sinceEpoch, lastStreamByteEpoch,
+// stalledAfterSeconds, effort, resetsAtEpoch); elapsed and quiet tick
+// client-side, and the `stalled` state is DERIVED here with the same rule
+// the daemon's state machine exposes: a state that promises a live byte
+// stream (stalledAfterSeconds present) quiet past its threshold. States
+// without that promise — tool runs, backends that don't stream reasoning
+// — never claim stalled: honest silence over a fake alarm.
+function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
+  if (!activity || typeof activity !== 'object') return null;
+  const state = String(activity.state || 'idle').trim();
+  if (!state || state === 'idle') return null;
+  const since = Number(activity.sinceEpoch) || 0;
+  const lastByte = Number(activity.lastStreamByteEpoch) || 0;
+  const threshold = Number(activity.stalledAfterSeconds) || 0;
+  const quiet = lastByte ? Math.max(0, nowSec - lastByte) : 0;
+  const stalled = threshold > 0 && state !== 'rate-limited' && quiet > threshold;
+  return {
+    state: stalled ? 'stalled' : state,
+    rawState: state,
+    elapsed: since ? Math.max(0, nowSec - since) : 0,
+    quiet,
+    hasHeartbeat: threshold > 0,
+    effort: String(activity.effort || '').trim(),
+    resetsAtEpoch: Number(activity.resetsAtEpoch) || 0,
+  };
+}
+
+// Raw wire activity for a session, for consumers that need the section
+// itself (steer gating, the status pill) rather than a chip model.
+function sessionWireActivity(sessionId) {
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
+  const activity = meta.vitals && typeof meta.vitals === 'object' ? meta.vitals.activity : null;
+  return activity && typeof activity === 'object' ? activity : null;
+}
+
+const ACTIVITY_STATE_LABELS = {
+  reasoning: 'Thinking',
+  responding: 'Responding',
+  'tool-running': 'Running tools',
+  'awaiting-api': 'Awaiting model',
+  'rate-limited': 'Rate-limited',
+  stalled: 'Stalled',
+};
+
+function formatActivityElapsed(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+  return `${s}s`;
+}
+
 const VITALS_SYMBOLS = {
   health: {
     label: 'Session health',
@@ -784,6 +837,56 @@ const VITALS_SYMBOLS = {
       : v.severity === 'warn'
         ? ['Worth a look soon — the highlighted symbols say why.']
         : ['Everything looks good.', 'Tap any symbol to learn what it tracks.']),
+  },
+  activity: {
+    label: 'Model activity',
+    priority: 95,
+    quiet: 'The model is idle — no turn is running right now.',
+    chip: (v) => {
+      if (v.state === 'reasoning') return `🧠 Thinking${v.effort ? ` · ${v.effort}` : ''} · ${v.elapsedText}`;
+      if (v.state === 'responding') return `🗒 Responding · ${v.elapsedText}`;
+      if (v.state === 'tool-running') return `🔧 Running tools · ${v.elapsedText}`;
+      if (v.state === 'awaiting-api') return `⋯ Awaiting model · ${v.elapsedText}`;
+      if (v.state === 'stalled') return `⚠ Stalled · quiet ${v.quietText}`;
+      if (v.state === 'rate-limited') return `⛔ Rate-limited${v.reset ? ` · resets in ${v.reset}` : ''}`;
+      return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
+    },
+    explain: (v) => {
+      if (v.state === 'reasoning') {
+        const lines = [
+          v.hasHeartbeat
+            ? `The model is thinking right now — its reasoning has been streaming live for ${v.elapsedText}.`
+            : `The model reports a thinking step in progress (${v.elapsedText} so far). This backend doesn't stream reasoning live, so quiet stretches are normal.`,
+        ];
+        if (v.effort) lines.push(`Reasoning effort is configured to “${v.effort}” — a setting, not a measurement.`);
+        return lines;
+      }
+      if (v.state === 'responding') {
+        return [`The model is writing its answer right now (${v.elapsedText} into this part).`];
+      }
+      if (v.state === 'tool-running') {
+        return [
+          `The model handed work to a tool — a command, file edit, or similar — ${v.elapsedText} ago and is waiting for its result.`,
+          'Quiet stretches are normal here: some commands simply run long.',
+        ];
+      }
+      if (v.state === 'awaiting-api') {
+        return [`A request is with the model provider and no reply has arrived yet (${v.elapsedText}).`];
+      }
+      if (v.state === 'stalled') {
+        return [
+          `Nothing has arrived from the model for ${v.quietText}, on a connection that normally streams continuously.`,
+          'That usually means a slow or stuck connection, or the provider backing off. It often recovers on its own; if it persists, interrupting the turn is safe.',
+        ];
+      }
+      if (v.state === 'rate-limited') {
+        return [
+          `The provider is holding this session's requests because a usage allowance ran out${v.reset ? ` — it reopens in ~${v.reset}` : ''}.`,
+          'Nothing is broken: the session continues on its own once the window resets.',
+        ];
+      }
+      return [`The model reports “${v.state}”.`];
+    },
   },
   worktree: {
     label: 'Worktree',
@@ -906,7 +1009,7 @@ const VITALS_SYMBOLS = {
 // Fixed display order for chips and the glossary (semantic, not priority:
 // priority only governs which chips stay visible when space is scarce).
 const VITALS_SYMBOL_ORDER = [
-  'health', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
+  'health', 'activity', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
   'unpushed', 'primary-unpushed', 'cache-hit', 'cache-ttl', 'limit',
 ];
 
@@ -971,8 +1074,31 @@ function vitalsChipModels(vitals, meta, sessionId) {
       explainLines: def.explain({ ...value, severity }),
       action: def.action ? (def.action(value, sessionId) || null) : null,
       ticking: !!extra.ticking,
+      // Render-identity override for ticking chips: excludes the parts
+      // that move every second so the 1 Hz ticker hits the stable-DOM
+      // fast path instead of rebuilding the row.
+      sig: extra.sig,
     });
   };
+
+  const act = deriveSessionActivity(vitals?.activity);
+  if (act) {
+    push('activity', 'activity', {
+      state: act.state,
+      effort: act.effort,
+      hasHeartbeat: act.hasHeartbeat,
+      elapsedText: formatActivityElapsed(act.elapsed),
+      quietText: formatActivityElapsed(act.quiet),
+      reset: act.resetsAtEpoch ? formatLimitReset(act.resetsAtEpoch) : '',
+    }, {
+      // Calm while genuinely working; attention (health dot) only for
+      // stalled and rate-limited — the two states that mean "waiting on
+      // something other than the model's own work".
+      severity: act.state === 'stalled' || act.state === 'rate-limited' ? 'warn' : '',
+      ticking: true,
+      sig: `${act.state}|${act.effort}|${act.hasHeartbeat ? 1 : 0}`,
+    });
+  }
 
   const worktree = meta?.worktree && typeof meta.worktree === 'object' ? meta.worktree : null;
   if (worktree?.branch) {
@@ -1165,17 +1291,20 @@ function renderSessionWindowVitals(win, vitals) {
   }
   wireVitalsChipRow(win);
   // Stable-DOM fast path: the 1s countdown ticker must not rebuild the
-  // row (replaced buttons detach mid-tap). When only the cache countdown
-  // moved, update that chip's text in place.
+  // row (replaced buttons detach mid-tap). When only time-derived text
+  // moved (cache countdown, activity elapsed/quiet), update those chips'
+  // text in place — ticking chips carry a `sig` that excludes it.
   const signature = models
-    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : m.text}${m.tone}${m.elevated ? 1 : 0}`)
+    .map((m) => `${m.id}${m.key === 'cache-ttl' ? (m.text === '✗' ? 'cold' : 'warm') : (m.sig ?? m.text)}${m.tone}${m.elevated ? 1 : 0}`)
     .join('|');
   if (win.vitals.dataset.vitSig === signature) {
-    const ttl = models.find((m) => m.key === 'cache-ttl');
-    const ttlChip = win.vitals.querySelector('[data-chip="cache-ttl"]');
-    if (ttl && ttlChip) {
-      ttlChip.textContent = ttl.text;
-      ttlChip.title = ttl.explainLines[0] || ttl.label;
+    for (const key of ['cache-ttl', 'activity']) {
+      const model = models.find((m) => m.key === key);
+      const chip = win.vitals.querySelector(`[data-chip="${key}"]`);
+      if (model && chip) {
+        chip.textContent = model.text;
+        chip.title = model.explainLines[0] || model.label;
+      }
     }
     return models.some((m) => m.ticking);
   }
@@ -1500,6 +1629,11 @@ function openSessionWorktreeMergeCard(sessionId) {
       return;
     }
     if (win.minimized && typeof setSessionWindowMinimized === 'function') {
+      // Explicit open of the finish card: record the restore so the
+      // done-subagent auto-minimize rule doesn't re-collapse the window
+      // (and its card) on the next phase/metadata application.
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
       setSessionWindowMinimized(sid, false);
     }
     try { worktreeFinishCardDismissed.delete(sid); } catch (_) {}
@@ -1602,6 +1736,9 @@ function showCacheExpiryToast(sid, text) {
 // hit the stable-DOM fast path.
 function sessionVitalsNeedsTick(vitals) {
   if (!vitals || typeof vitals !== 'object') return false;
+  // A live activity state ticks: elapsed counts up and the stalled
+  // degradation is purely time-derived.
+  if (deriveSessionActivity(vitals.activity)) return true;
   const remaining = sessionCacheCountdownSeconds(vitals.cache);
   if (remaining !== null && remaining > 0) return true;
   const limits = Array.isArray(vitals.limits) ? vitals.limits : [];
@@ -1626,6 +1763,9 @@ function refreshSessionVitalsTicker() {
     if (!needsTick && !win.vitalsNeededTick) continue;
     win.vitalsNeededTick = needsTick;
     renderSessionWindowVitals(win, vitals);
+    // The stalled degradation is purely time-derived — let the status
+    // pill follow the derived state (no-op unless the state flipped).
+    maybeRefreshSessionWindowActivityPill(sid, win, vitals);
     // Arm from the predicate, not the render result: the render reports
     // only cache-ttl models as ticking, which left percentless limit-reset
     // countdowns frozen because nothing kept the interval alive for them.
@@ -1646,8 +1786,9 @@ function normalizeSessionVitals(raw) {
   const git = src.git && typeof src.git === 'object' ? src.git : null;
   const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
   const limits = Array.isArray(src.limits) ? src.limits : [];
-  if (!git && !cache && !limits.length) return null;
-  return { git, cache, limits };
+  const activity = src.activity && typeof src.activity === 'object' ? src.activity : null;
+  if (!git && !cache && !limits.length && !activity) return null;
+  return { git, cache, limits, activity };
 }
 
 // Merge an arriving vitals snapshot over what a session already has. A
@@ -1664,6 +1805,7 @@ function mergeSessionVitals(incoming, existing) {
     git: incoming.git || existing.git || null,
     cache: incoming.cache || existing.cache || null,
     limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
+    activity: incoming.activity || existing.activity || null,
   };
 }
 
@@ -1678,10 +1820,25 @@ function applySessionVitals(raw = {}) {
     const merged = mergeSessionVitals(vitals, meta.vitals);
     sessionMetadataById.set(id, { ...meta, vitals: merged });
     if (sessionWindows.has(id)) {
-      renderSessionWindowVitals(sessionWindows.get(id), merged);
+      const win = sessionWindows.get(id);
+      renderSessionWindowVitals(win, merged);
+      maybeRefreshSessionWindowActivityPill(id, win, merged);
     }
   }
   refreshSessionVitalsTicker();
+}
+
+// Re-derive the status pill from wire activity when the DERIVED state
+// (not its ticking elapsed text) changed — the pill claims "Thinking"
+// only from live wire evidence, so it must follow activity updates and
+// the time-driven stalled degradation, without re-rendering every tick.
+function maybeRefreshSessionWindowActivityPill(sid, win, vitals) {
+  if (!win || !win.phase || typeof applySessionWindowPhase !== 'function') return;
+  const act = deriveSessionActivity(vitals?.activity);
+  const key = act ? `${act.state}|${act.effort}` : '';
+  if (win.activityPillKey === key) return;
+  win.activityPillKey = key;
+  applySessionWindowPhase(win, sid, win.phase);
 }
 
 function applySessionVitalsFromReplayEntries(entries) {
@@ -2297,11 +2454,12 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
       if (!reasoning) return null;
-      content = `Reasoning: ${reasoning}`;
-      level = 'detail';
-    } else {
-      level = 'model';
+      // First-class thinking row (same grammar as the live WASM path and
+      // the transcript-sync lanes: level model + kind reasoning, raw text)
+      // so the dedupe signatures collapse this record with live copies.
+      return { ...base, level: 'model', source: source || 'model', content: reasoning, kind: 'reasoning' };
     }
+    level = 'model';
     return { ...base, level, source: source || 'model', content, kind };
   }
   if (event === 'agent_started') {
@@ -2560,9 +2718,13 @@ function sessionWindowTranscriptContentForNode(node) {
 function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
   if (!node) return [];
   const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
+  // Reasoning rows render a label + elided summary and defer their body,
+  // so the raw text comes from the reasoning store (record-lane parity).
   const content = isCommandOutput
     ? (node.querySelector?.('.command-output-summary')?.textContent || '')
-    : sessionWindowTranscriptContentForNode(node);
+    : node.dataset?.kind === 'reasoning'
+      ? reasoningLogNodeContent(node)
+      : sessionWindowTranscriptContentForNode(node);
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',

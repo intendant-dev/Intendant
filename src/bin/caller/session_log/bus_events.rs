@@ -1842,9 +1842,32 @@ impl SessionLog {
         }
     }
 
-    /// Log reasoning content from the model (full reasoning, not just summary).
-    pub fn reasoning_content(&mut self, summary: Option<&str>, full_content: Option<&str>) {
+    /// Log reasoning content from the model (full reasoning, not just
+    /// summary), with session/source attribution persisted into `data`
+    /// (same keys `model_response_for_session` writes) so replay rebuilds
+    /// the reasoning row with the identity the live broadcast had —
+    /// without them a reloaded dashboard rendered reasoning unattributed
+    /// and the session-window dedupe signatures never matched the live
+    /// copies. Pass `None, None` for an unattributed head-session row.
+    pub fn reasoning_content_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        source: Option<&str>,
+        summary: Option<&str>,
+        full_content: Option<&str>,
+    ) {
         let file = full_content.and_then(|c| self.append_turn_file("reasoning.txt", c));
+        let mut data = serde_json::json!({
+            "has_summary": summary.is_some(),
+            "has_full_content": full_content.is_some(),
+            "full_content_length": full_content.map(|c| c.len()).unwrap_or(0),
+        });
+        if let Some(src) = source {
+            data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             ts_ms: Self::ts_ms(),
@@ -1852,11 +1875,7 @@ impl SessionLog {
             event: "reasoning".to_string(),
             level: Some("info".to_string()),
             message: summary.map(|s| s.to_string()),
-            data: Some(serde_json::json!({
-                "has_summary": summary.is_some(),
-                "has_full_content": full_content.is_some(),
-                "full_content_length": full_content.map(|c| c.len()).unwrap_or(0),
-            })),
+            data: Some(data),
             file,
             file2: None,
         });
@@ -2513,7 +2532,9 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.reasoning_content(
+        log.reasoning_content_for_session(
+            None,
+            None,
             Some("The model is thinking about X"),
             Some("Full detailed reasoning about X and Y"),
         );
@@ -2535,7 +2556,7 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.reasoning_content(Some("Summary only"), None);
+        log.reasoning_content_for_session(None, None, Some("Summary only"), None);
         drop(log);
 
         // No reasoning file created when no full content

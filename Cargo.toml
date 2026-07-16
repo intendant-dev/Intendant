@@ -5,6 +5,8 @@ members = [
     "crates/intendant-core",
     "crates/intendant-display",
     "crates/intendant-platform",
+    "crates/owner-plane-core",
+    "crates/owner-plane-reducer",
     "crates/presence-core",
     "crates/presence-web",
     "crates/rustc-governor",
@@ -30,6 +32,13 @@ name = "intendant-connect"
 path = "src/bin/connect/main.rs"
 
 [dependencies]
+# The vendored owner-plane D0-A kernel (Gate-A stamp 583f421a): the
+# Memory service mints device-signed ops through core's writer and
+# admits them through the reducer's fold. `default-features = false`
+# keeps the reducer's JSON-Schema harness layers out of the daemon
+# build (they gate the corpus tests, not production folds).
+owner-plane-core = { path = "crates/owner-plane-core" }
+owner-plane-reducer = { path = "crates/owner-plane-reducer", default-features = false }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

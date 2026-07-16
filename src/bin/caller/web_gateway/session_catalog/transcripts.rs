@@ -619,6 +619,48 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
                         .map(str::to_string);
                 }
             }
+            // Reasoning response_items: surface the chain-of-thought as the
+            // same first-class thinking row the live lane emits (level model
+            // + kind reasoning, raw text via the same extractor the reader
+            // uses) so window hydration dedupes against streamed rows.
+            if payload.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                if let Some(text) = crate::external_agent::codex::extract_reasoning_text(payload)
+                    .map(|text| text.trim().to_string())
+                    .filter(|text| !text.is_empty())
+                {
+                    let mut entry = serde_json::json!({
+                        "ts": ts,
+                        "level": "model",
+                        "source": "codex",
+                        "kind": "reasoning",
+                        "content": text,
+                    });
+                    if let Some(session_id) = rollout_session_id.as_deref() {
+                        entry["session_id"] = serde_json::json!(session_id);
+                    }
+                    entries.push(entry);
+                    let reasoning_turn_id = current_turn_id
+                        .clone()
+                        .unwrap_or_else(|| "turn-unknown".to_string());
+                    let reasoning_item_id = response_item_id.clone().unwrap_or_else(|| {
+                        codex_next_synthetic_item_id(
+                            &mut synthetic_item_seq,
+                            &reasoning_turn_id,
+                            "reasoning",
+                        )
+                    });
+                    if let Some(entry) = entries.last_mut() {
+                        apply_codex_thread_projection(
+                            entry,
+                            &reasoning_item_id,
+                            "reasoning",
+                            &reasoning_turn_id,
+                            None,
+                            None,
+                        );
+                    }
+                }
+            }
             if let Some((output_id, output)) = codex_function_call_output(payload) {
                 let output_id_for_lookup = output_id.clone();
                 let command_projection = output_id_for_lookup
@@ -889,12 +931,16 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
                         .trim();
                     if !text.is_empty() {
                         // Live shape: reasoning-only ModelResponse, which
-                        // the dashboard renders as a detail-level
-                        // "Reasoning: …" row.
+                        // the dashboard renders as a first-class thinking
+                        // row (level model + kind reasoning, raw text) —
+                        // must match the live grammar exactly so the
+                        // session-window dedupe signatures collapse this
+                        // row with the streamed copy.
                         push(serde_json::json!({
-                            "level": "detail",
+                            "level": "model",
                             "source": agent_source,
-                            "content": format!("Reasoning: {text}"),
+                            "kind": "reasoning",
+                            "content": text,
                         }));
                     }
                 }
@@ -1765,6 +1811,76 @@ mod tests {
             .collect();
 
         assert_eq!(contents, vec!["Still working", "Still working"]);
+    }
+
+    /// Reasoning response_items surface as first-class thinking rows with
+    /// the SAME grammar the live lane emits (level model + kind reasoning,
+    /// raw extractor text) so window hydration dedupes against streamed
+    /// copies instead of double-rendering.
+    #[test]
+    fn codex_transcript_surfaces_reasoning_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-transcript-reasoning";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [
+                            { "type": "summary_text", "text": "Weigh the options" },
+                            { "type": "summary_text", "text": "Pick the safe path" }
+                        ]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Done" }
+                }),
+                // Empty reasoning item: no text, no summary — honest absence,
+                // no row.
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:05Z",
+                    "type": "response_item",
+                    "payload": { "id": "rs_2", "type": "reasoning" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let reasoning: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["kind"].as_str() == Some("reasoning"))
+            .collect();
+        assert_eq!(reasoning.len(), 1, "one non-empty reasoning row");
+        let row = reasoning[0];
+        assert_eq!(row["level"].as_str(), Some("model"));
+        assert_eq!(row["source"].as_str(), Some("codex"));
+        assert_eq!(
+            row["content"].as_str(),
+            Some("Weigh the options\nPick the safe path"),
+            "content is the raw extractor text (live-lane parity)"
+        );
+        assert_eq!(row["item_id"].as_str(), Some("rs_1"));
+        assert_eq!(row["session_id"].as_str(), Some(session_id));
     }
 
     #[test]
@@ -2684,8 +2800,9 @@ mod tests {
     /// The Claude transcript reconstruction mirrors the LIVE event shapes:
     /// tool_results are agent output under their tool call (never "user"
     /// speech), tool calls render as command rows with item ids, thinking
-    /// becomes a detail Reasoning row, and the source label is the live
-    /// "Claude Code" so hydration dedupes against streamed rows.
+    /// becomes a first-class reasoning row (level model + kind reasoning),
+    /// and the source label is the live "Claude Code" so hydration dedupes
+    /// against streamed rows.
     #[test]
     fn claude_transcript_parse_is_structural() {
         let dir = tempfile::tempdir().unwrap();
@@ -2724,11 +2841,11 @@ mod tests {
                     "Read README.md".into()
                 ),
                 (
-                    "detail".into(),
+                    "model".into(),
                     "Claude Code".into(),
+                    "reasoning".into(),
                     "".into(),
-                    "".into(),
-                    "Reasoning: planning the read".into()
+                    "planning the read".into()
                 ),
                 (
                     "model".into(),

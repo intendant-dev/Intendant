@@ -402,6 +402,13 @@ function ensureSessionWindow(sessionId, meta = {}) {
     pendingActiveUntil: 0,
     ended: false,
     minimized: false,
+    // Sub-agent auto-minimize bookkeeping (in-memory, like minimized):
+    // autoMinimized marks a collapse the derivation applied (only those
+    // auto-restore when the session goes active again); userRestoredWhileDone
+    // marks an explicit user restore of a done sub-agent, which the auto
+    // rule must never re-collapse.
+    autoMinimized: false,
+    userRestoredWhileDone: false,
     followOutput: true,
     pendingOutput: false,
     logHistory: [],
@@ -414,10 +421,37 @@ function ensureSessionWindow(sessionId, meta = {}) {
   updateSessionWindowHeaderCollapseState(sid);
   syncSessionWindowMetadataRefresh();
   updateSessionWindow(sid, meta);
+  // A window can be (re)built for an already-finished sub-agent with no
+  // phase in the build meta (metadata-only rebuilds, ended flag carried by
+  // sessionMetadataById) — updateSessionWindow only reaches the phase
+  // applier when meta.phase is set, so derive the auto-minimize here too.
+  maybeAutoMinimizeSubagentWindow(sid);
   updateSessionWindowMaximizeState();
   applySessionWindowGridHeight();
   scheduleSessionRelationshipRender();
   return win;
+}
+
+// The status pill's honest upgrade: while a session is in an active phase
+// AND its vitals carry a live activity section (wire facts from the
+// backend's own stream), show the derived state — "Thinking" only while
+// reasoning is actually streaming, "Stalled"/"Rate-limited" when that is
+// the truth. Without wire activity the optimistic dispatch guess survives
+// only as the generic "Awaiting model…" (PHASE_LABELS.thinking) until
+// bytes confirm or the session settles.
+function sessionWindowPhaseDisplayLabel(sessionId, phase) {
+  const p = normalizeSessionPhase(phase);
+  if (isAgentActivePhase(p)
+      && typeof deriveSessionActivity === 'function'
+      && typeof sessionWireActivity === 'function') {
+    const act = deriveSessionActivity(sessionWireActivity(sessionId));
+    if (act) {
+      const label = (typeof ACTIVITY_STATE_LABELS === 'object' && ACTIVITY_STATE_LABELS[act.state])
+        || act.state;
+      return act.state === 'reasoning' && act.effort ? `${label} (${act.effort})` : label;
+    }
+  }
+  return sessionPhaseLabel(phase);
 }
 
 // Applies a phase change to the window chrome: status chip repaint plus the
@@ -433,12 +467,18 @@ function applySessionWindowPhase(win, sid, phase) {
   if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
     win.pendingActiveUntil = 0;
   }
-  win.status.textContent = sessionPhaseLabel(win.phase);
-  win.status.title = sessionPhaseLabel(win.phase);
+  const label = sessionWindowPhaseDisplayLabel(sid, win.phase);
+  win.status.textContent = label;
+  win.status.title = label;
   win.status.className = 'session-window-status';
   const cls = sessionPhaseClass(win.phase);
   if (cls) win.status.classList.add(cls);
   maybeConfirmApprovalSendFromWindowPhase(sid, win.phase);
+  // Done sub-agents collapse on their own (and auto-applied collapses
+  // reopen when the session goes active again). Rides every phase
+  // application for the same reason the approval hook above does: the
+  // active→done crossing arrives via the fast path AND the wide render.
+  maybeAutoMinimizeSubagentWindow(sid);
 }
 
 function updateSessionWindow(sessionId, meta = {}) {
@@ -639,7 +679,95 @@ function toggleSessionWindowMinimized(sessionId) {
   const sid = String(sessionId || '').trim();
   const win = sid ? sessionWindows.get(sid) : null;
   if (!win) return;
-  setSessionWindowMinimized(sid, !win.minimized);
+  const next = !win.minimized;
+  // Explicit toggle: the user owns this window's minimize state now. A
+  // restore of a done sub-agent is recorded so the auto rule never
+  // re-collapses it; a manual minimize clears autoMinimized so the
+  // done→active crossing never pops it back open.
+  win.autoMinimized = false;
+  win.userRestoredWhileDone = !next && sessionWindowIsDoneSubagent(sid);
+  setSessionWindowMinimized(sid, next);
+}
+
+// ── Sub-agent auto-minimize (derived state) ────────────────────────────
+// A finished sub-agent's window collapses on its own so the grid stays
+// readable while a parent fans out work. The rule is a DERIVATION, not a
+// one-shot event handler: it re-runs on every phase application (both
+// updateSessionWindow paths route through applySessionWindowPhase), at
+// window build, and when relationship metadata arrives late
+// (applySessionRelationshipMetadata) — so the collapsed state reproduces
+// after a reload even though win.minimized is never persisted (the
+// replayed session_ended re-derives it).
+//
+// Scope: sub-agent windows ONLY — top-level sessions are never touched.
+
+// The bulk-control predicate — the SAME active boundary the parent
+// window's "N sub" badge counts with (sessionRelationshipSubagentIsActive),
+// so the "Minimize done" pill and the badges always agree on what "done"
+// means.
+function sessionWindowIsDoneSubagent(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid)) return false;
+  return sessionWindowIsSubagent(sid) && !sessionRelationshipSubagentIsActive(sid);
+}
+
+// The AUTO rule demands HARD done-evidence — ended, or phase
+// done/interrupted. Bare 'idle' is deliberately NOT enough here: replayed
+// windows are built at 'idle' before their real phase arrives
+// (onSessionStarted during log replay, when update_status_bar is not
+// applied), and waiting_followup normalizes to 'idle' — auto-collapsing
+// either would hide a live window. The bulk pill uses the broader badge
+// predicate above: an explicit click may collapse idle-parked sub-agents
+// too.
+//
+// User intent always wins: a maximized window is never touched, and a
+// window the user explicitly restored while done (userRestoredWhileDone —
+// set by the minimize toggle, maximize, and worktree-card paths) stays
+// open until the session goes active again. Only collapses THIS rule
+// applied (autoMinimized) reopen on the done→active crossing — a manual
+// minimize is never popped open.
+function maybeAutoMinimizeSubagentWindow(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!win || !sessionWindowIsSubagent(sid)) return;
+  if (sessionRelationshipSubagentIsActive(sid)) {
+    // Active again: retire the restore override so a future completion
+    // re-derives, and reopen a window only the auto rule closed.
+    win.userRestoredWhileDone = false;
+    if (win.minimized && win.autoMinimized) {
+      win.autoMinimized = false;
+      setSessionWindowMinimized(sid, false);
+    }
+    return;
+  }
+  if (win.minimized || win.userRestoredWhileDone) return;
+  if (maximizedSessionWindowId === sid) return;
+  const meta = sessionMetadataById.get(sid) || {};
+  const phase = normalizeSessionPhase(win.phase || meta.phase || '');
+  const hardDone = !!(win.ended || meta.ended)
+    || phase === 'done' || phase === 'interrupted';
+  if (!hardDone) return;
+  win.autoMinimized = true;
+  setSessionWindowMinimized(sid, true);
+}
+
+// Bulk action behind the "Minimize done" pill (ui2-activity.js owns the
+// button + live count): collapse every done sub-agent window. An explicit
+// click is explicit intent — it overrides per-window restore flags (and
+// re-arms them false), and marks the collapse auto-managed so a sub-agent
+// that goes active again still pops back open. Returns how many windows
+// it collapsed.
+function minimizeDoneSubagentWindows() {
+  let changed = 0;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (!sessionWindowIsDoneSubagent(sid)) continue;
+    win.userRestoredWhileDone = false;
+    win.autoMinimized = true;
+    setSessionWindowMinimized(sid, true);
+    changed += 1;
+  }
+  return changed;
 }
 
 function updateSessionWindowMaximizeState() {
@@ -667,6 +795,14 @@ function setSessionWindowMaximized(sessionId, maximized) {
   const sid = String(sessionId || '').trim();
   if (maximized) {
     if (!sid || !sessionWindows.has(sid)) return;
+    // Maximizing a minimized done sub-agent is an explicit restore: mark
+    // it user-intent so the auto-minimize derivation doesn't re-collapse
+    // the window the moment it is un-maximized.
+    const win = sessionWindows.get(sid);
+    if (win?.minimized && sessionWindowIsDoneSubagent(sid)) {
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
+    }
     setSessionWindowMinimized(sid, false);
     maximizedSessionWindowId = sid;
     focusSessionWindow(sid);
@@ -1609,6 +1745,7 @@ function registerCommandOutputCloneView(group, clone) {
     entry: clone,
     summary: clone.querySelector('.command-output-summary'),
     body: clone.querySelector('.command-output-body'),
+    tail: clone.querySelector('.command-output-tail'),
     loaded: false,
     loading: false,
   };
@@ -1617,12 +1754,40 @@ function registerCommandOutputCloneView(group, clone) {
   if (!Array.isArray(group.clones)) group.clones = [];
   group.clones.push(view);
   view.summary.innerHTML = group.summary.innerHTML;
+  if (view.tail) view.tail.textContent = group.tail?.textContent || '';
   clone.classList.toggle('finalized', group.finalized);
   clone.classList.toggle('expanded', group.entry.classList.contains('expanded'));
   if (group.finalized) {
-    view.body.innerHTML = '';
+    // Re-fetchable output starts empty (lazy-loaded on expand); output with
+    // no persisted ids keeps whatever the clone carried — it is the only copy.
+    if (group.outputIds.length) {
+      view.body.innerHTML = '';
+    } else {
+      view.loaded = view.body.childElementCount > 0;
+    }
   }
   return view;
+}
+
+// Session scope for a log command — the same `targetSid || sid || 'global'`
+// prefix commandOutputGroupKey embeds (keep the two in lockstep). Groups
+// store it so finalize can sweep "every active group of THIS session"
+// without string-parsing keys.
+function commandOutputSessionScope(c) {
+  const sid = String(c?.session_id || '').trim();
+  const targetSid = sid ? sessionWindowTargetForLogSession(sid) : '';
+  return targetSid || sid || 'global';
+}
+
+// The Activity-tab verbosity dropdown doubles as the output-visibility
+// power knob: at Verbose/Debug, command-output groups default to
+// expanded; Normal keeps them collapsed to their summary row. Read live
+// (not cached) so finalize honors the level at the moment it runs.
+function commandOutputDefaultExpanded() {
+  const level = document.getElementById('verbosity-select')?.value
+    || localStorage.getItem(VERBOSITY_KEY)
+    || 'normal';
+  return level === 'verbose' || level === 'debug';
 }
 
 function commandOutputGroupKey(c) {
@@ -1676,6 +1841,43 @@ function appendCommandOutputText(body, text) {
   code.innerHTML = highlightCommandOutput(text);
   pre.appendChild(code);
   body.appendChild(pre);
+}
+
+// ── Live streaming tail ──
+// While a group streams (created, not yet finalized) and sits collapsed,
+// a small dim region under the summary shows the LAST few output lines —
+// proof the command is alive without the full body. CSS hides it once the
+// group is expanded or finalized; finalize also empties it.
+const COMMAND_OUTPUT_TAIL_LINES = 3;
+const COMMAND_OUTPUT_TAIL_LINE_CHARS = 240;
+const COMMAND_OUTPUT_TAIL_BUFFER_CHARS = 4096;
+
+function updateCommandOutputTail(group, text) {
+  if (!group?.tail) return;
+  const merged = (group.tailText || '') + String(text || '');
+  group.tailText = merged.length > COMMAND_OUTPUT_TAIL_BUFFER_CHARS
+    ? merged.slice(-COMMAND_OUTPUT_TAIL_BUFFER_CHARS)
+    : merged;
+  const lines = group.tailText.replace(/\r/g, '').split('\n').filter(line => line.trim() !== '');
+  const rendered = lines
+    .slice(-COMMAND_OUTPUT_TAIL_LINES)
+    .map(line => line.length > COMMAND_OUTPUT_TAIL_LINE_CHARS
+      ? '…' + line.slice(-COMMAND_OUTPUT_TAIL_LINE_CHARS)
+      : line)
+    .join('\n');
+  group.tail.textContent = rendered;
+  for (const view of commandOutputCloneViews(group)) {
+    if (view.tail) view.tail.textContent = rendered;
+  }
+}
+
+function clearCommandOutputTail(group) {
+  if (!group) return;
+  group.tailText = '';
+  if (group.tail) group.tail.textContent = '';
+  for (const view of commandOutputCloneViews(group)) {
+    if (view.tail) view.tail.textContent = '';
+  }
 }
 
 async function appendCommandOutputTextProgressive(body, text, chunkChars = 65536) {
@@ -1810,11 +2012,23 @@ function appendCommandOutputChunk(group, c) {
   updateCommandOutputSummary(group);
   if (!group.finalized && text && !processingLogReplay) {
     appendCommandOutputText(group.body, text);
+    updateCommandOutputTail(group, text);
     for (const view of commandOutputCloneViews(group)) {
       if (view.entry.classList.contains('expanded')) {
         appendCommandOutputText(view.body, text);
       }
     }
+  }
+  if (!processingLogReplay && !group.itemScoped) {
+    // Uncorrelated (no item_id) output rides the native batch contract:
+    // one wire event carries the COMPLETE stdout+stderr of a finished
+    // command batch, delivered as one synchronous UiCommand burst. A
+    // microtask after that burst is therefore the command's own
+    // completion — finalize deterministically instead of waiting for
+    // whatever entry happens to arrive next. Item-scoped (external)
+    // groups stream across many wire events and finalize on their
+    // session's next non-output entry / round completion instead.
+    scheduleCommandOutputBatchFinalize(group);
   }
   for (const [win, shouldFollow] of sessionScrollStates.entries()) {
     applySessionWindowOutputScroll(win, shouldFollow);
@@ -1826,15 +2040,24 @@ function renderCommandOutputEntry(c) {
   let activeCommandOutputGroup = activeCommandOutputGroups.get(groupKey);
   if (!activeCommandOutputGroup || activeCommandOutputGroup.finalized) {
     const groupId = 'cmdout-' + (++commandOutputGroupSeq);
-    const { entry } = createLogScaffold(c, 'command-output-group expanded');
+    // Deterministic default: born COLLAPSED (like the replay lane) unless
+    // the verbosity knob says outputs default open. The streaming tail
+    // below keeps a collapsed live group visibly alive.
+    const { entry } = createLogScaffold(
+      c,
+      'command-output-group' + (commandOutputDefaultExpanded() ? ' expanded' : '')
+    );
     entry.dataset.outputGroupId = groupId;
     const wrap = document.createElement('span');
     wrap.className = 'log-content command-output-wrap';
     const summary = document.createElement('span');
     summary.className = 'command-output-summary';
+    const tail = document.createElement('span');
+    tail.className = 'command-output-tail';
     const body = document.createElement('span');
     body.className = 'command-output-body';
     wrap.appendChild(summary);
+    wrap.appendChild(tail);
     wrap.appendChild(body);
     const toggle = document.createElement('span');
     toggle.className = 'collapse-toggle';
@@ -1851,8 +2074,15 @@ function renderCommandOutputEntry(c) {
     const group = {
       id: groupId,
       key: groupKey,
+      sessionScope: commandOutputSessionScope(c),
+      // item-correlated groups stream across wire events (external
+      // backends); uncorrelated ones complete within one event (native
+      // batch contract) — see appendCommandOutputChunk.
+      itemScoped: !!itemId,
       entry,
       summary,
+      tail,
+      tailText: '',
       body,
       outputIds: [],
       outputIdSet: new Set(),
@@ -1861,6 +2091,7 @@ function renderCommandOutputEntry(c) {
       bytes: 0,
       warns: 0,
       finalized: false,
+      finalizeQueued: false,
       loaded: false,
       loading: false,
       clones: [],
@@ -1881,36 +2112,68 @@ function renderCommandOutputEntry(c) {
   if (!concurrentLogDetachedFragment && autoScroll && stream) scheduleMainLogScrollToBottom();
 }
 
+// Uncorrelated (native-batch) groups finalize one microtask after the
+// synchronous UiCommand burst that streamed them — the wire event that
+// carried the chunks IS the command's completion (stdout+stderr arrive
+// together once the batch finished). Armed per chunk, idempotent.
+function scheduleCommandOutputBatchFinalize(group) {
+  if (!group || group.finalized || group.finalizeQueued) return;
+  group.finalizeQueued = true;
+  queueMicrotask(() => {
+    group.finalizeQueued = false;
+    finalizeCommandOutputGroup(group);
+  });
+}
+
 function finalizeCommandOutputGroup(group) {
   if (!group || group.finalized) return;
   group.finalized = true;
   group.entry.classList.add('finalized');
+  // The streaming tail retires with the stream — the collapsed summary
+  // row carries the group from here.
+  clearCommandOutputTail(group);
   // A group the USER opened stays open with its streamed body — yanking
   // the output shut mid-read because the command happened to finish was
-  // the "collapsible doesn't work" experience. Auto-expanded (streaming)
-  // groups still fold to their summary line.
-  if (group.userExpanded && group.entry.classList.contains('expanded')) {
+  // the "collapsible doesn't work" experience. At Verbose/Debug the
+  // default itself is open, so auto-expanded groups keep their body too.
+  // Only groups whose body actually holds the stream stay open — replay
+  // recreations stream no DOM text, and an open-but-empty body lies.
+  const defaultExpanded = commandOutputDefaultExpanded();
+  // Output with no persisted ids cannot be re-fetched on expand — keep
+  // the streamed body (hidden while collapsed) instead of destroying the
+  // only copy.
+  const preserveBody = group.outputIds.length === 0;
+  const keepOpen = group.entry.classList.contains('expanded')
+    && (group.userExpanded || defaultExpanded)
+    && group.body.childElementCount > 0;
+  if (keepOpen) {
     group.loaded = true;
     group.loading = false;
   } else {
     group.entry.classList.remove('expanded');
-    group.body.innerHTML = '';
-    group.loaded = false;
+    if (!preserveBody) group.body.innerHTML = '';
+    group.loaded = preserveBody && group.body.childElementCount > 0;
     group.loading = false;
   }
   for (const view of commandOutputCloneViews(group)) {
     view.entry.classList.add('finalized');
-    if (view.entry.classList.contains('expanded') && group.userExpanded) {
+    if (view.entry.classList.contains('expanded')
+        && (group.userExpanded || defaultExpanded)
+        && view.body.childElementCount > 0) {
       view.loaded = true;
       view.loading = false;
       continue;
     }
     view.entry.classList.remove('expanded');
-    view.body.innerHTML = '';
-    view.loaded = false;
+    if (!preserveBody) view.body.innerHTML = '';
+    view.loaded = preserveBody && view.body.childElementCount > 0;
     view.loading = false;
   }
-  if (group.key) activeCommandOutputGroups.delete(group.key);
+  // Identity-guarded: a deferred (microtask) finalize must never evict a
+  // NEWER group that re-registered under the same key.
+  if (group.key && activeCommandOutputGroups.get(group.key) === group) {
+    activeCommandOutputGroups.delete(group.key);
+  }
 }
 
 function finalizeActiveCommandOutputGroup(groupKey = null) {
@@ -1924,8 +2187,28 @@ function finalizeActiveCommandOutputGroup(groupKey = null) {
   activeCommandOutputGroups.clear();
 }
 
+// Deterministic cross-command close: any non-output entry rendering for a
+// session means its in-flight command output is done (backends announce
+// the next tool / model text only after the previous command's output was
+// delivered). Exact-key finalize almost never fired for item-correlated
+// groups — the next entry carries a different (or no) item id, so groups
+// stayed open forever purely by timing.
+function finalizeSessionCommandOutputGroups(c) {
+  const scope = commandOutputSessionScope(c);
+  for (const group of Array.from(activeCommandOutputGroups.values())) {
+    if (group.sessionScope === scope) finalizeCommandOutputGroup(group);
+  }
+}
+
 async function loadCommandOutputIntoBody(group, body) {
   if (!group.outputIds.length) {
+    // Nothing persisted to re-fetch: finalize preserved the streamed body
+    // on the main entry in that case — serve expands from it.
+    if (body !== group.body && group.body?.childElementCount) {
+      body.innerHTML = group.body.innerHTML;
+      return;
+    }
+    if (body.childElementCount) return;
     body.textContent = 'Output is not available for lazy loading.';
     return;
   }
@@ -2001,7 +2284,7 @@ async function toggleCommandOutputGroup(group) {
 }
 
 function renderDiffLogEntry(c) {
-  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  finalizeSessionCommandOutputGroups(c);
   const diffText = diffLogContent(c);
   const parsed = parseUnifiedDiff(diffText);
   const { entry } = createLogScaffold(c, 'diff-log-entry');
@@ -2473,12 +2756,16 @@ function renderLogEntry(c) {
     renderCommandOutputEntry(c);
     return;
   }
+  if (isReasoningLog(c)) {
+    renderReasoningLogEntry(c);
+    return;
+  }
   if (isDiffLog(c)) {
     inferSessionPhaseFromLog(c);
     renderDiffLogEntry(c);
     return;
   }
-  finalizeActiveCommandOutputGroup(commandOutputGroupKey(c));
+  finalizeSessionCommandOutputGroups(c);
   if (shouldSuppressAttachmentReceiptDuplicate(c)) return;
   inferSessionPhaseFromLog(c);
 
@@ -2762,8 +3049,12 @@ function normalizeAutonomyLabel(raw) {
 // the per-window status chips (keys are the collapsed "np" form: waiting_*
 // \u2192 waiting*, running_* \u2192 running*). Extracted from setPhase so the chips
 // stop rendering raw keys like `waiting_approval`.
+// `thinking` is deliberately labeled "Awaiting model…": the phase is an
+// optimistic dispatch guess, and the honest "Thinking" claim now comes
+// only from the wire-fact activity section (sessionWindowPhaseDisplayLabel
+// upgrades the pill when live evidence exists).
 const PHASE_LABELS = {
-  idle: 'Idle', thinking: 'Thinking...', running: 'Running Agent', runningagent: 'Running Agent',
+  idle: 'Idle', thinking: 'Awaiting model…', running: 'Running Agent', runningagent: 'Running Agent',
   waiting: 'Waiting for Input', waitingapproval: 'Waiting for Approval',
   waitinghuman: 'Waiting for Response', waitingfollowup: 'Waiting for Follow-up',
   orchestrating: 'Orchestrating', done: 'Done',
@@ -3142,6 +3433,7 @@ function questionOptionClicked(qIndex, optIndex) {
     buttons.forEach((b) => b.classList.remove('selected'));
     btn.classList.add('selected');
   }
+  updateQuestionProgress();
 }
 
 function collectQuestionAnswers() {
@@ -3162,6 +3454,45 @@ function collectQuestionAnswers() {
     answers[q.question] = answer;
   }
   return { answers };
+}
+
+// Scroll a question block to the top of the panel's internal scroll region.
+// Deliberately NOT scrollIntoView: that also adjusts overflow:hidden
+// ancestors (.tab-content), which would drag the whole pane around.
+function scrollQuestionIntoView(qIndex) {
+  const scroller = document.querySelector('#question-content .question-scroll');
+  const block = document.querySelector(`#question-content .question-block[data-q="${qIndex}"]`);
+  if (!scroller || !block) return;
+  const top = block.getBoundingClientRect().top
+    - scroller.getBoundingClientRect().top
+    + scroller.scrollTop;
+  scroller.scrollTo({ top: Math.max(0, top - 4), behavior: 'smooth' });
+}
+
+// Answered = a selected option or non-empty free text (same rule as
+// collectQuestionAnswers). Drives the index chips' tick state and the
+// "N of M answered" counter; both exist only for multi-question panels,
+// so single-question panels no-op here.
+function updateQuestionProgress() {
+  if (!pendingQuestion) return;
+  const content = document.getElementById('question-content');
+  const progress = document.getElementById('question-progress');
+  if (!progress && !content.querySelector('.question-index-chip')) return;
+  const total = pendingQuestion.questions.length;
+  let answered = 0;
+  for (let i = 0; i < total; i++) {
+    const block = content.querySelector(`.question-block[data-q="${i}"]`);
+    const typed = (block?.querySelector('.question-free-text')?.value || '').trim();
+    const done = !!(block && (typed || block.querySelector('.question-option.selected')));
+    if (done) answered++;
+    const chip = content.querySelector(`.question-index-chip[data-q="${i}"]`);
+    if (chip) {
+      chip.classList.toggle('answered', done);
+      const header = pendingQuestion.questions[i]?.header || `Q${i + 1}`;
+      chip.setAttribute('aria-label', done ? `${header} (answered)` : header);
+    }
+  }
+  if (progress) progress.textContent = `${answered} of ${total} answered`;
 }
 
 function showUserQuestion(id, questions, sessionId) {
@@ -3185,10 +3516,38 @@ function showUserQuestion(id, questions, sessionId) {
 
   const content = document.getElementById('question-content');
   content.innerHTML = '';
+  const multi = list.length > 1;
   const title = document.createElement('div');
   title.className = 'approval-title';
-  title.textContent = 'The agent has a question';
+  title.textContent = multi
+    ? `The agent has ${list.length} questions`
+    : 'The agent has a question';
   content.appendChild(title);
+
+  // Pinned index (2+ questions): one chip per header, kept above the
+  // scroll region; tapping a chip jumps to its question, and
+  // updateQuestionProgress ticks chips as answers land.
+  if (multi) {
+    const index = document.createElement('div');
+    index.className = 'question-index';
+    list.forEach((q, qIndex) => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'question-index-chip';
+      chip.dataset.q = String(qIndex);
+      chip.textContent = q.header || `Q${qIndex + 1}`;
+      chip.title = q.question;
+      chip.addEventListener('click', () => scrollQuestionIntoView(qIndex));
+      index.appendChild(chip);
+    });
+    content.appendChild(index);
+  }
+
+  // The question list is the only scrolling region: the panel caps at the
+  // pane height (CSS max-height) and title/index/actions stay pinned, so
+  // Submit remains reachable however many questions arrived.
+  const scroll = document.createElement('div');
+  scroll.className = 'question-scroll';
 
   list.forEach((q, qIndex) => {
     const block = document.createElement('div');
@@ -3237,9 +3596,11 @@ function showUserQuestion(id, questions, sessionId) {
     free.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); sendQuestionAnswer(); }
     });
+    free.addEventListener('input', () => updateQuestionProgress());
     block.appendChild(free);
-    content.appendChild(block);
+    scroll.appendChild(block);
   });
+  content.appendChild(scroll);
 
   const actions = document.createElement('div');
   actions.className = 'approval-actions';
@@ -3253,7 +3614,14 @@ function showUserQuestion(id, questions, sessionId) {
   skip.title = 'Dismiss without answering (the agent proceeds on its own judgment)';
   skip.addEventListener('click', () => sendQuestionAnswer({ skip: true }));
   actions.appendChild(skip);
+  if (multi) {
+    const progress = document.createElement('span');
+    progress.className = 'question-progress';
+    progress.id = 'question-progress';
+    actions.appendChild(progress);
+  }
   content.appendChild(actions);
+  updateQuestionProgress();
 
   // Station surfaces the question through the existing human-question rail.
   const extra = list.length > 1 ? ` [+${list.length - 1} more]` : '';

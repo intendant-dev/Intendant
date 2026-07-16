@@ -1239,6 +1239,16 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     presence: None,
                 });
             }
+            external_agent::AgentEvent::ActivityUpdate { activity } => {
+                // Wire-fact activity snapshot → the vitals hub (keyed like
+                // usage; the hub's identity aliasing folds it into the
+                // session's one entry). Pure bookkeeping — never opens or
+                // completes a turn.
+                config.bus.send(AppEvent::SessionActivity {
+                    session_id: config.session_id.clone(),
+                    activity,
+                });
+            }
             external_agent::AgentEvent::GoalUpdated { goal } => {
                 emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }
@@ -2025,6 +2035,18 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         "Question resolved — continuing".to_string(),
                     )
                     .await;
+                }
+            }
+            external_agent::AgentEvent::FileActivity { paths } => {
+                // Structured write-path signal for the git-vitals
+                // activity-locus tracker. Primary-conversation activity
+                // only: a side thread's or Codex sub-agent's writes must
+                // not retarget the supervising session's git chip.
+                if event_is_primary && !paths.is_empty() {
+                    config.bus.send(AppEvent::SessionFileActivity {
+                        session_id: config.session_id.clone(),
+                        paths,
+                    });
                 }
             }
             external_agent::AgentEvent::FileApprovalRequest {

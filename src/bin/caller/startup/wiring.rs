@@ -309,19 +309,45 @@ pub(crate) fn spawn_mode_web_gateway(
     // auto-answering.
     mcp_http_state.interactive_frontends = true;
     // The daemon's agenda ledger: one single-writer handle shared by the
-    // MCP tools, the HTTP routes, and the dashboard tunnel twins. A store
-    // that fails to open degrades to "agenda unavailable" instead of
-    // failing the gateway.
-    mcp_http_state.agenda = match crate::agenda::AgendaStore::open(&crate::agenda::agenda_dir()) {
-        Ok(store) => Some(Arc::new(crate::agenda::AgendaHandle::new(
-            store,
-            bus.clone(),
-        ))),
+    // MCP tools, the HTTP routes, and the dashboard tunnel twins, plus
+    // the reminder scheduler that delivers due items through the
+    // notification ladder. A store that fails to open degrades to
+    // "agenda unavailable" instead of failing the gateway.
+    let agenda_dir = crate::agenda::agenda_dir();
+    mcp_http_state.agenda = match crate::agenda::AgendaStore::open(&agenda_dir) {
+        Ok(store) => {
+            let handle = Arc::new(crate::agenda::AgendaHandle::new(
+                store,
+                bus.clone(),
+                &agenda_dir,
+            ));
+            // Detaches on drop like the mode listeners; one per daemon.
+            let _scheduler = crate::agenda::spawn_reminder_scheduler(handle.clone());
+            Some(handle)
+        }
         Err(err) => {
             eprintln!(
                 "[agenda] store unavailable under {}: {err}",
-                crate::agenda::agenda_dir().display()
+                agenda_dir.display()
             );
+            None
+        }
+    };
+    // The P1 Memory service: an EPHEMERAL local plane (ratified write
+    // bar — nothing durable until Gate-B-lite custody + P0.5 + the
+    // tombed cutover). Bootstrap failure degrades to "memory
+    // unavailable" instead of failing the gateway; the plane id is
+    // logged so operators can tell incarnations apart across restarts.
+    mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap() {
+        Ok(handle) => {
+            println!(
+                "[memory] ephemeral plane {} (nothing persists across restarts)",
+                &handle.plane_id_hex()[..16]
+            );
+            Some(Arc::new(handle))
+        }
+        Err(err) => {
+            eprintln!("[memory] ephemeral plane bootstrap failed: {err}");
             None
         }
     };

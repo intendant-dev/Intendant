@@ -68,10 +68,76 @@ pub struct SessionLimitWindow {
     pub status: Option<String>,
 }
 
-/// Per-session vitals (git / prompt-cache / rate limits) shown by the
-/// dashboard and Station — the port of the operator statusline. Sections
-/// are independent: producers fill what they know, frontends hide what is
-/// absent.
+/// What a session's model/backend is verifiably doing right now — the
+/// states of the per-session activity machine (`session_activity.rs`).
+/// Every value is claimed from wire facts (stream deltas, item
+/// transitions, rate-limit events, our own dispatch writes), never from
+/// timing heuristics over content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionActivityState {
+    /// Reasoning/thinking evidence is on the wire: live thinking deltas
+    /// (Claude Code with partial messages) or an open reasoning item
+    /// (Codex — which promises no mid-item bytes, so
+    /// `stalled_after_seconds` is absent there).
+    Reasoning,
+    /// Assistant text / tool-call arguments are streaming.
+    Responding,
+    /// One or more tools are executing. Tool silence is normal (a quiet
+    /// long-running command), so this state never degrades to stalled.
+    ToolRunning,
+    /// A turn is dispatched (or the model must be called again after
+    /// tools settled) and no response bytes have arrived yet.
+    AwaitingApi,
+    /// The provider reported a non-allowed rate-limit status while a turn
+    /// is active; `resets_at_epoch` carries the countdown when known.
+    RateLimited,
+    /// Derived display state only: a state that promises a byte stream
+    /// (`stalled_after_seconds` present) went quiet past the threshold.
+    /// Producers never store or send it — `ActivityMachine::effective_state`
+    /// and the dashboard both derive it from the epochs, so the wire needs
+    /// no per-second traffic.
+    Stalled,
+    /// No turn is active.
+    #[default]
+    Idle,
+}
+
+/// The activity section of [`SessionVitals`]: raw state + epochs on the
+/// wire; elapsed/quiet/stall all tick client-side (the cache-countdown
+/// pattern — no per-second events).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActivityVitals {
+    pub state: SessionActivityState,
+    /// Unix seconds when `state` was entered (elapsed ticks client-side).
+    pub since_epoch: u64,
+    /// Unix seconds of the freshest evidence of forward motion: the last
+    /// stream byte/notification observed for the current state (a turn
+    /// dispatch seeds it). Quantized by the producer so heartbeats don't
+    /// emit per-delta.
+    pub last_stream_byte_epoch: u64,
+    /// Quiet threshold for the stalled degradation, present only when the
+    /// current state's evidence includes a live byte stream (so quiet
+    /// means trouble). Absent = quiet is normal here and "stalled" must
+    /// not be claimed (honest degradation for delta-less backends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_after_seconds: Option<u32>,
+    /// Configured reasoning effort, first-hand only: the backend's own
+    /// echo when it states one, else the value Intendant itself passed at
+    /// launch. Never inferred from output volume or timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Rate-limit reset epoch while `state` is `rate-limited`, when the
+    /// wire carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_epoch: Option<u64>,
+}
+
+/// Per-session vitals (git / prompt-cache / rate limits / live activity)
+/// shown by the dashboard and Station — the port of the operator
+/// statusline. Sections are independent: producers fill what they know,
+/// frontends hide what is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionVitals {
@@ -81,4 +147,6 @@ pub struct SessionVitals {
     pub cache: Option<SessionCacheVitals>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limits: Vec<SessionLimitWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivityVitals>,
 }

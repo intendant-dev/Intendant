@@ -28,10 +28,14 @@
 //! and deliberately absent here.
 
 mod handle;
+mod reminders;
+mod scheduler;
 mod store;
 mod types;
 
 pub(crate) use handle::AgendaHandle;
+pub(crate) use reminders::ReminderPolicyPatch;
+pub(crate) use scheduler::spawn_reminder_scheduler;
 pub(crate) use store::{AgendaError, AgendaStore};
 pub(crate) use types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem, AgendaStatus};
 

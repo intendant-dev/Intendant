@@ -89,6 +89,15 @@
     <button type="button" id="ui2-layout-grid-btn" data-layout="grid"
             title="Grid — session windows with the concurrent stream below">Grid</button>
   </div>
+  <!-- Bulk minimize for finished sub-agent windows (grid hygiene). Hidden
+       (JS `hidden` attr) until at least one done sub-agent window is still
+       expanded; the count chip says how many one click will collapse.
+       ui2-activity.js owns the count + click (minimizeDoneSubagentWindows
+       in 41-session-window-actions.js does the collapsing). -->
+  <button type="button" class="ui2-minimize-done" id="ui2-minimize-done-btn" hidden
+          title="Minimize every finished sub-agent window">
+    Minimize done<span class="ui2-minimize-done-count" id="ui2-minimize-done-count">0</span>
+  </button>
   <!-- Session switcher (the decision's missing half): picks the Focus
        session / composer target. Populated from the live session set by
        ui2-chrome.js; drives the same focus/target mechanism as clicking a

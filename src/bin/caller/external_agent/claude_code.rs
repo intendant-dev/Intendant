@@ -10,6 +10,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::CallerError;
+use crate::session_activity::ActivityObservation as ActivityObs;
 
 use super::{
     normalize_plan_status, AgentConfig, AgentEvent, AgentImageAttachment, AgentThread,
@@ -216,6 +217,10 @@ struct CcShared {
     /// The effective mode the CLI last echoed in `system:init`. `None`
     /// until the first init.
     effective_permission_mode: StdMutex<Option<String>>,
+    /// Wire-fact activity state machine (vitals `activity` section).
+    /// Shared because its observations span both sides of the pipe: the
+    /// writer half marks turn dispatch, the reader half everything else.
+    activity: StdMutex<crate::session_activity::ActivityMachine>,
 }
 
 impl CcShared {
@@ -229,7 +234,31 @@ impl CcShared {
             turn_active: AtomicBool::new(false),
             requested_permission_mode: StdMutex::new("default".to_string()),
             effective_permission_mode: StdMutex::new(None),
+            activity: StdMutex::new(crate::session_activity::ActivityMachine::default()),
         }
+    }
+
+    /// Feed the activity machine one wire observation; returns the vitals
+    /// snapshot to publish when it changed (see `session_activity.rs`).
+    fn observe_activity(
+        &self,
+        obs: crate::session_activity::ActivityObservation,
+    ) -> Option<crate::types::SessionActivityVitals> {
+        let mut machine = match self.activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        machine.observe(obs, crate::session_activity::epoch_seconds())
+    }
+
+    /// Adopt a first-hand effort value (launch config, or the CLI's own
+    /// echo when a future protocol states one).
+    fn set_activity_effort(&self, effort: Option<String>) {
+        let mut machine = match self.activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        machine.set_effort(effort);
     }
 
     fn lock_goal(&self) -> std::sync::MutexGuard<'_, GoalEngine> {
@@ -304,6 +333,24 @@ impl CcShared {
 // ---------------------------------------------------------------------------
 // Pure protocol helpers
 // ---------------------------------------------------------------------------
+
+/// Structured write paths of a Claude Code tool_use block, verbatim as the
+/// wire input stated them: `Write`/`Edit` carry `file_path`, `NotebookEdit`
+/// `notebook_path`. Feeds `AgentEvent::FileActivity` for the git-vitals
+/// activity-locus tracker (the Codex `fileChange` twin) — structural wire
+/// fields only, never derived from a rendered preview.
+fn cc_write_tool_paths(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    if !matches!(tool_name, "Write" | "Edit" | "NotebookEdit") {
+        return Vec::new();
+    }
+    ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /// Human preview for a tool invocation: shell command, file path (plus the
 /// model's own description when present), or a truncated JSON dump.
@@ -492,14 +539,40 @@ fn approval_response_payload(
     }
 }
 
+/// TTL flavor stated by a usage object's per-TTL `cache_creation` split:
+/// 1-hour writes → 3600, else 5-minute writes → 300, else None (split
+/// absent or all-zero — no statement). The split rides `assistant`
+/// envelope and `message_start` usage; the flat `message_delta`/`result`
+/// shapes drop it and carry only the summed counter.
+fn cache_ttl_flavor_from_split(usage: &serde_json::Value) -> Option<u32> {
+    let ephemeral = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    if ephemeral("ephemeral_1h_input_tokens") > 0 {
+        Some(3600)
+    } else if ephemeral("ephemeral_5m_input_tokens") > 0 {
+        Some(300)
+    } else {
+        None
+    }
+}
+
 /// Context-meter snapshot from an Anthropic API usage object. The reader
 /// consumes this shape from `message_delta` stream events and the turn's
 /// `result`; prompt-side tokens (fresh + cached) approximate the live
-/// context footprint.
+/// context footprint. Those shapes carry only the flat
+/// `cache_creation_input_tokens` counter, so `fallback_ttl` supplies the
+/// session's sticky flavor (learned from the shapes that DO carry the
+/// per-TTL split) for cache writes without a split of their own.
 fn usage_snapshot_from_api_usage(
     usage: &serde_json::Value,
     model: &str,
     context_window: u64,
+    fallback_ttl: Option<u32>,
 ) -> Option<AgentUsageSnapshot> {
     let read = |key: &str| usage.get(key).and_then(|v| v.as_u64());
     let input = read("input_tokens")?;
@@ -525,21 +598,13 @@ fn usage_snapshot_from_api_usage(
         0.0
     };
     // TTL flavor for the cache-vitals countdown: only cache writes make a
-    // flavor statement (the per-TTL split rides a `cache_creation` object
-    // when the extended-TTL beta is active; a flat write defaults to 5 min).
-    let ephemeral = |key: &str| {
-        usage
-            .get("cache_creation")
-            .and_then(|c| c.get(key))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
-    let cache_ttl_seconds = if ephemeral("ephemeral_1h_input_tokens") > 0 {
-        Some(3600)
-    } else if ephemeral("ephemeral_5m_input_tokens") > 0 || cache_creation > 0 {
-        Some(300)
-    } else {
-        None
+    // flavor statement. A split of this usage's own is authoritative; a
+    // flat write falls back to the session's last split-stated flavor,
+    // then to the API's 5-minute default. Read-only usage stays None.
+    let cache_ttl_seconds = match cache_ttl_flavor_from_split(usage) {
+        Some(flavor) => Some(flavor),
+        None if cache_creation > 0 => Some(fallback_ttl.unwrap_or(300)),
+        None => None,
     };
     Some(AgentUsageSnapshot {
         provider: "anthropic".to_string(),
@@ -844,6 +909,13 @@ struct CcReader {
     /// last-call usage instead (a multi-call turn's summed usage exceeds
     /// the context window and read as >100%).
     last_call_usage: Option<serde_json::Value>,
+    /// Sticky cache-TTL flavor from the most recent usage that carried the
+    /// per-TTL `cache_creation` split (`assistant` envelopes,
+    /// `message_start`). The snapshot-feeding `message_delta`/`result`
+    /// shapes carry only the flat creation counter, which alone reads as
+    /// the 5-minute default — wrong for every 1-hour-cache session
+    /// (subscription Claude Code).
+    cache_ttl_flavor: Option<u32>,
     last_intendant_mcp_status: Option<String>,
     init_logged: bool,
     /// The echoed effective permission mode a divergence warning was
@@ -875,10 +947,19 @@ impl CcReader {
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_call_usage: None,
+            cache_ttl_flavor: None,
             last_intendant_mcp_status: None,
             init_logged: false,
             permission_mode_warned: None,
             announced_session_id: None,
+        }
+    }
+
+    /// Route one wire observation through the shared activity machine and
+    /// queue the resulting vitals snapshot (if any) for the drain.
+    fn observe_activity(&self, obs: ActivityObs, out: &mut CcLineOutcome) {
+        if let Some(activity) = self.shared.observe_activity(obs) {
+            out.events.push(AgentEvent::ActivityUpdate { activity });
         }
     }
 
@@ -1175,6 +1256,16 @@ impl CcReader {
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
             self.model = model.to_string();
         }
+        // First-hand effort: adopt the CLI's own echo if an init ever
+        // states one (2.1.2xx doesn't; the launch `--effort` value seeds
+        // the machine at spawn — effort is never inferred from output).
+        if let Some(effort) = msg
+            .get("effort")
+            .or_else(|| msg.get("reasoningEffort"))
+            .and_then(|v| v.as_str())
+        {
+            self.shared.set_activity_effort(Some(effort.to_string()));
+        }
         if !self.init_logged {
             self.init_logged = true;
             let permission_mode = msg
@@ -1358,6 +1449,12 @@ impl CcReader {
         out: &mut CcLineOutcome,
         child_scope: Option<&str>,
     ) {
+        // The full assistant envelope is a shape that carries the per-TTL
+        // `cache_creation` split — remember the flavor for the flat
+        // `message_delta`/`result` usage the snapshots are built from.
+        if let Some(usage) = msg.get("message").and_then(|m| m.get("usage")) {
+            self.note_cache_ttl_flavor(usage);
+        }
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -1416,6 +1513,12 @@ impl CcReader {
                                 .map(str::to_string),
                         };
                         self.register_task_child(&tool_id, child_scope, spawn, out);
+                        if child_scope.is_none() {
+                            // The main thread is executing its Agent tool
+                            // (sync spawns block on the child; async ones
+                            // flip state again on the next API stream).
+                            self.observe_activity(ActivityObs::ToolsRunning, out);
+                        }
                         continue;
                     }
                     if tool_name == "TodoWrite" && !tool_id.is_empty() {
@@ -1491,11 +1594,28 @@ impl CcReader {
                         self.open_tools
                             .insert(tool_id.clone(), child_scope.map(str::to_string));
                     }
+                    let write_paths = cc_write_tool_paths(&tool_name, &input);
                     out.events.push(AgentEvent::ToolStarted {
                         item_id: tool_id,
                         tool_name,
                         preview: tool_input_preview(&input),
                     });
+                    if child_scope.is_none() {
+                        // Structured write-path signal for the git-vitals
+                        // activity-locus tracker (the Codex fileChange
+                        // twin). Primary-conversation writes only: a
+                        // sub-agent's edits must not retarget the
+                        // supervising session's git chip.
+                        if !write_paths.is_empty() {
+                            out.events
+                                .push(AgentEvent::FileActivity { paths: write_paths });
+                        }
+                        // Main-thread tool execution begins here (the API
+                        // message with the tool_use closed). Child-scoped
+                        // tools run concurrently and say nothing about the
+                        // main thread's phase.
+                        self.observe_activity(ActivityObs::ToolsRunning, out);
+                    }
                 }
                 "tool_result" => self.tool_result_events(block, out, false),
                 _ => {}
@@ -1640,7 +1760,13 @@ impl CcReader {
             });
         }
 
-        self.open_tools.remove(&tool_id);
+        let owner = self.open_tools.remove(&tool_id);
+        if matches!(owner, Some(None)) && !self.open_tools.values().any(|o| o.is_none()) {
+            // The main thread's last open tool settled — the CLI has to
+            // call the API again to continue, so the honest phase is
+            // awaiting the model (the next stream bytes flip it onward).
+            self.observe_activity(ActivityObs::SegmentSettled, out);
+        }
         let status = match failure_message {
             Some(message) => ToolCompletionStatus::Failed { message },
             None => ToolCompletionStatus::Success,
@@ -1651,45 +1777,99 @@ impl CcReader {
         });
     }
 
+    /// Remember the session's cache-TTL flavor whenever a usage shape
+    /// carries the per-TTL split. Splitless usage never clears it: a
+    /// read-only call makes no statement, and the flavor is a per-session
+    /// property of the account's cache configuration.
+    fn note_cache_ttl_flavor(&mut self, usage: &serde_json::Value) {
+        if let Some(flavor) = cache_ttl_flavor_from_split(usage) {
+            self.cache_ttl_flavor = Some(flavor);
+        }
+    }
+
     fn handle_stream_event(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let Some(event) = msg.get("event") else {
             return;
         };
         match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "content_block_start" => {
+                // First-hand phase evidence: a thinking block opening is the
+                // only honest ground for a "Thinking" claim, and we launch
+                // with --include-partial-messages so live thinking deltas
+                // follow as its heartbeat. Every other block type (text,
+                // tool_use args) is the model responding.
+                match event
+                    .pointer("/content_block/type")
+                    .and_then(|t| t.as_str())
+                {
+                    Some("thinking") | Some("redacted_thinking") => self.observe_activity(
+                        ActivityObs::ReasoningStarted {
+                            delta_heartbeat: true,
+                        },
+                        out,
+                    ),
+                    _ => self.observe_activity(ActivityObs::ResponseDelta, out),
+                }
+            }
             "content_block_delta" => {
                 if let Some(delta) = event.get("delta") {
-                    if delta.get("type").and_then(|t| t.as_str()) == Some("text_delta") {
-                        if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                            out.events.push(AgentEvent::MessageDelta {
-                                text: text.to_string(),
-                            });
+                    match delta.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                        "text_delta" => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                out.events.push(AgentEvent::MessageDelta {
+                                    text: text.to_string(),
+                                });
+                            }
+                            self.observe_activity(ActivityObs::ResponseDelta, out);
                         }
+                        // thinking_delta CONTENT stays skipped (reasoning is
+                        // emitted once per completed block from the assistant
+                        // message) — but each delta is the live heartbeat that
+                        // keeps the "Thinking" activity claim honest.
+                        // signature_delta closes a thinking block and counts
+                        // as the same reasoning-stream evidence.
+                        "thinking_delta" | "signature_delta" => {
+                            self.observe_activity(ActivityObs::ReasoningDelta, out);
+                        }
+                        // Streamed tool-call arguments: response bytes.
+                        "input_json_delta" => {
+                            self.observe_activity(ActivityObs::ResponseDelta, out);
+                        }
+                        _ => self.observe_activity(ActivityObs::StreamByte, out),
                     }
-                    // thinking_delta is skipped: reasoning is emitted once
-                    // per completed block from the assistant message.
                 }
             }
             "message_start" => {
-                if let Some(model) = event
-                    .get("message")
+                let message = event.get("message");
+                if let Some(model) = message
                     .and_then(|m| m.get("model"))
                     .and_then(|m| m.as_str())
                 {
                     self.model = model.to_string();
                 }
+                // message_start usage carries the per-TTL split that the
+                // flat message_delta shape drops.
+                if let Some(usage) = message.and_then(|m| m.get("usage")) {
+                    self.note_cache_ttl_flavor(usage);
+                }
+                self.observe_activity(ActivityObs::StreamByte, out);
             }
             "message_delta" => {
                 // Final usage for one API call within the turn — the live
                 // context-footprint signal during long multi-tool turns.
                 if let Some(usage) = event.get("usage") {
-                    if let Some(mut snapshot) =
-                        usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
-                    {
+                    if let Some(mut snapshot) = usage_snapshot_from_api_usage(
+                        usage,
+                        &self.model,
+                        self.context_window,
+                        self.cache_ttl_flavor,
+                    ) {
                         self.last_call_usage = Some(usage.clone());
                         snapshot.limits = self.current_limit_windows();
                         out.events.push(AgentEvent::Usage { usage: snapshot });
                     }
                 }
+                self.observe_activity(ActivityObs::StreamByte, out);
             }
             _ => {}
         }
@@ -1698,6 +1878,10 @@ impl CcReader {
     fn handle_result(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let was_interrupt = self.shared.interrupt_pending.swap(false, Ordering::SeqCst);
         self.shared.turn_active.store(false, Ordering::SeqCst);
+        // Every result path — success, error, interrupt — ends the turn's
+        // activity claim. (The absorbed out-of-band /compact result is a
+        // no-op here: no turn was dispatched, the machine is already idle.)
+        self.observe_activity(ActivityObs::TurnSettled, out);
 
         if let Some(model_usage) = msg.get("modelUsage") {
             if let Some(window) = context_window_from_model_usage(model_usage, &self.model) {
@@ -1742,9 +1926,12 @@ impl CcReader {
             // result usage only when no per-call usage was streamed (then
             // the turn had a single call and the sum IS that call).
             let meter_usage = last_call_usage.as_ref().unwrap_or(usage);
-            if let Some(mut snapshot) =
-                usage_snapshot_from_api_usage(meter_usage, &self.model, self.context_window)
-            {
+            if let Some(mut snapshot) = usage_snapshot_from_api_usage(
+                meter_usage,
+                &self.model,
+                self.context_window,
+                self.cache_ttl_flavor,
+            ) {
                 snapshot.limits = self.current_limit_windows();
                 out.events.push(AgentEvent::Usage { usage: snapshot });
             }
@@ -1964,6 +2151,20 @@ impl CcReader {
         if !status.is_empty() {
             window.status = Some(status.to_string());
         }
+        // Activity: a non-allowed status while a turn runs is the honest
+        // "rate-limited" claim (with the reset countdown when carried);
+        // an explicit allowed status retires it. `allowed_warning` still
+        // allows requests — the limits gauge carries the warning.
+        let resets_at_epoch = window.resets_at_epoch;
+        match status {
+            "" => {}
+            "allowed" | "allowed_warning" => {
+                self.observe_activity(ActivityObs::RateLimitCleared, out);
+            }
+            _ => {
+                self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
+            }
+        }
         if status.is_empty() || status == "allowed" {
             return;
         }
@@ -2011,6 +2212,10 @@ async fn reader_task(
                 }
                 let mut cleanup = CcLineOutcome::default();
                 reader_state.close_open_task_children(&mut cleanup);
+                // A process that dies mid-turn never sends its result —
+                // settle the activity claim so the chip can't show a
+                // phantom "thinking" for a dead backend.
+                reader_state.observe_activity(ActivityObs::TurnSettled, &mut cleanup);
                 for event in cleanup.events {
                     let _ = event_tx.send(event);
                 }
@@ -2403,6 +2608,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         } else {
             self.resume_session.clone()
         }));
+        // Seed the activity machine's configured effort with the value we
+        // pass at launch (`--effort`); a backend echo may upgrade it, and
+        // it is never inferred from output volume or timing.
+        self.shared.set_activity_effort(self.effort.clone());
 
         // Build command args
         let mut args = vec![
@@ -2649,6 +2858,14 @@ impl ExternalAgent for ClaudeCodeAgent {
             message
         };
         self.shared.turn_active.store(true, Ordering::SeqCst);
+        // Turn dispatch is a first-hand wire fact from our side of the
+        // pipe: the honest "awaiting model" claim starts here (and the
+        // stall clock with it) until stream bytes confirm or degrade it.
+        if let Some(activity) = self.shared.observe_activity(ActivityObs::TurnDispatched) {
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(AgentEvent::ActivityUpdate { activity });
+            }
+        }
         // send_message is non-blocking. The reader task emits events
         // (MessageDelta, ToolStarted, …) as they arrive and TurnCompleted
         // when a "result" message appears. No deadlock risk because the
@@ -2827,6 +3044,205 @@ mod tests {
             Arc::new(StdMutex::new(HashMap::new())),
             true,
         )
+    }
+
+    fn activity_states(out: &CcLineOutcome) -> Vec<crate::types::SessionActivityState> {
+        out.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ActivityUpdate { activity } => Some(activity.state),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn last_activity(out: &CcLineOutcome) -> Option<crate::types::SessionActivityVitals> {
+        out.events.iter().rev().find_map(|e| match e {
+            AgentEvent::ActivityUpdate { activity } => Some(activity.clone()),
+            _ => None,
+        })
+    }
+
+    /// The wire → activity mapping: thinking blocks (and their live
+    /// deltas) are the ONLY ground for a reasoning claim; text/args
+    /// deltas respond; tool_use runs tools; tool results settle back to
+    /// awaiting-api; the result settles the turn.
+    #[test]
+    fn activity_follows_claude_stream_wire_facts() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        // Arm the turn the way the writer half does at dispatch.
+        let dispatched = reader
+            .shared
+            .observe_activity(ActivityObs::TurnDispatched)
+            .expect("dispatch publishes");
+        assert_eq!(dispatched.state, S::AwaitingApi);
+        assert!(
+            dispatched.stalled_after_seconds.is_some(),
+            "an awaited response is a byte-stream promise"
+        );
+
+        // A thinking block opens → reasoning, heartbeat-armed.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Reasoning]);
+        assert_eq!(
+            last_activity(&out).unwrap().stalled_after_seconds,
+            Some(crate::session_activity::STALL_AFTER_SECS)
+        );
+
+        // thinking_delta content stays skipped, but it is the heartbeat —
+        // no MessageDelta, no state change (sub-quantum liveness).
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"let me think"}},"session_id":"s1"}"#,
+        );
+        assert!(out.events.is_empty(), "thinking content never renders");
+
+        // Text deltas → responding.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hi"}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Responding]);
+
+        // A tool_use on the completed assistant envelope → tools running.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 90"}}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::ToolRunning]);
+        assert_eq!(
+            last_activity(&out).unwrap().stalled_after_seconds,
+            None,
+            "quiet long-running tools are normal, never 'stalled'"
+        );
+
+        // Its result settles the segment → awaiting the next API call.
+        let out = reader.process_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"done"}]},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+
+        // The turn result settles everything.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Idle]);
+    }
+
+    /// A bare thinking_delta arriving while awaiting the API (start
+    /// missed, e.g. resume mid-block) still flips honestly to reasoning.
+    #[test]
+    fn activity_thinking_delta_alone_claims_reasoning() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"…"}},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::Reasoning]);
+    }
+
+    /// Child-scoped envelopes (in-band sub-agents) say nothing about the
+    /// main thread's activity.
+    #[test]
+    fn activity_ignores_child_scoped_tool_blocks() {
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        // A child-scoped tool_use (lazy-materialized spawn) must publish
+        // no main-thread activity claim.
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-1","message":{"content":[{"type":"tool_use","id":"ct1","name":"Bash","input":{"command":"ls"}}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            activity_states(&out).is_empty(),
+            "child tool blocks must not claim main-thread tool-running"
+        );
+    }
+
+    /// Rate-limit statuses map to the honest pause claim and clear back
+    /// to awaiting-api (the turn is still running, stream not flowing).
+    #[test]
+    fn activity_rate_limit_claims_and_clears() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783929600},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::RateLimited]);
+        assert_eq!(
+            last_activity(&out).unwrap().resets_at_epoch,
+            Some(1783929600)
+        );
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+    }
+
+    /// Write-ish tool_use blocks emit their structured paths alongside
+    /// ToolStarted (the Codex fileChange twin) — primary conversation
+    /// only, structural wire fields only.
+    #[test]
+    fn write_tools_emit_file_activity_paths() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w1","name":"Edit","input":{"file_path":"/repo/src/lib.rs","old_string":"a","new_string":"b"}}]},"session_id":"s1"}"#,
+        );
+        let paths: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::FileActivity { paths } => Some(paths.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec![vec!["/repo/src/lib.rs".to_string()]]);
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "FileActivity rides alongside the ToolStarted, not instead of it"
+        );
+
+        // NotebookEdit states notebook_path; read-ish tools state nothing.
+        assert_eq!(
+            cc_write_tool_paths(
+                "NotebookEdit",
+                &serde_json::json!({"notebook_path": "/repo/nb.ipynb", "new_source": ""})
+            ),
+            vec!["/repo/nb.ipynb".to_string()]
+        );
+        assert!(cc_write_tool_paths("Bash", &serde_json::json!({"command": "ls"})).is_empty());
+        assert!(cc_write_tool_paths("Read", &serde_json::json!({"file_path": "/x"})).is_empty());
+        assert!(cc_write_tool_paths("Write", &serde_json::json!({"file_path": "  "})).is_empty());
+
+        // Child-scoped (sub-agent) writes stay off the primary signal.
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-9","message":{"content":[{"type":"tool_use","id":"w2","name":"Write","input":{"file_path":"/repo/child.rs","content":"x"}}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            !out.events.iter().any(|e| {
+                let inner = match e {
+                    AgentEvent::Scoped { event, .. } => event.as_ref(),
+                    e => e,
+                };
+                matches!(inner, AgentEvent::FileActivity { .. })
+            }),
+            "sub-agent writes must not retarget the supervising session"
+        );
+    }
+
+    /// The launch `--effort` value rides every published snapshot as the
+    /// configured (never inferred) effort.
+    #[test]
+    fn activity_carries_configured_effort() {
+        let shared = CcShared::new(None);
+        shared.set_activity_effort(Some("max".into()));
+        let snapshot = shared
+            .observe_activity(ActivityObs::TurnDispatched)
+            .expect("dispatch publishes");
+        assert_eq!(snapshot.effort.as_deref(), Some("max"));
     }
 
     #[test]
@@ -3442,6 +3858,65 @@ mod tests {
             })
             .expect("usage event");
         assert_eq!(usage.tokens_used, 5 + 96000 + 100);
+    }
+
+    #[test]
+    fn reader_carries_split_ttl_flavor_into_flat_usage_snapshots() {
+        fn usage_of(out: &CcLineOutcome) -> AgentUsageSnapshot {
+            out.events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::Usage { usage } => Some(usage.clone()),
+                    _ => None,
+                })
+                .expect("usage event")
+        }
+        // Subscription Claude Code runs the 1-hour prompt cache, but the
+        // per-TTL split rides only the assistant envelope (and
+        // message_start) usage — the snapshot-feeding message_delta and
+        // result shapes carry the flat counter alone, which used to read
+        // as the 5-minute default on every snapshot.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":4,"output_tokens":7,"cache_read_input_tokens":11000,"cache_creation_input_tokens":62,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":62}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
+
+        // Flat per-call usage (message_delta lane) inherits the flavor.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":4,"cache_creation_input_tokens":62,"cache_read_input_tokens":11000,"output_tokens":9}},"session_id":"s1"}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+
+        // The result lane meters the stashed last-call usage — still flat,
+        // still the 1-hour flavor.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":4,"cache_creation_input_tokens":62,"cache_read_input_tokens":11000,"output_tokens":9}}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+
+        // A turn that streamed no per-call usage meters the result's own
+        // flat usage — the sticky flavor still applies.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":6,"cache_creation_input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":12}}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+    }
+
+    #[test]
+    fn reader_notes_ttl_flavor_from_message_start_usage() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":50}}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.model, "claude-opus-4-6");
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
+        // Splitless usage afterwards makes no statement — the flavor
+        // sticks rather than resetting.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":9000}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
     }
 
     #[test]
@@ -4618,12 +5093,12 @@ mod tests {
             "cache_read_input_tokens": 100_000,
             "output_tokens": 500
         });
-        let snapshot =
-            usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000).expect("snapshot");
+        let snapshot = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000, None)
+            .expect("snapshot");
         assert!(snapshot.usage_pct <= 100.0, "pct {}", snapshot.usage_pct);
         assert_eq!(snapshot.context_window, 500_500);
         // A corrected window restores the honest ratio.
-        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000)
+        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000, None)
             .expect("snapshot");
         assert!((corrected.usage_pct - 50.05).abs() < 0.01);
     }
@@ -4971,12 +5446,14 @@ mod tests {
             &serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
             "claude-haiku-4-5-20251001",
             200000,
+            None,
         )
         .is_none());
         assert!(usage_snapshot_from_api_usage(
             &serde_json::json!({"input_tokens": 3, "output_tokens": 5}),
             "claude-haiku-4-5-20251001",
             200000,
+            None,
         )
         .is_some());
     }
@@ -4996,6 +5473,8 @@ mod tests {
             }),
             "claude-haiku-4-5-20251001",
             200000,
+            // A usage's own split outranks any sticky fallback.
+            Some(300),
         )
         .expect("usage present");
         assert_eq!(snapshot.prompt_tokens, 25100);
@@ -5005,20 +5484,28 @@ mod tests {
         assert_eq!(snapshot.last_uncached_input_tokens, 10);
         assert_eq!(snapshot.cache_ttl_seconds, Some(3600), "1h split wins");
 
-        // Flat creation without the split object → the 5-minute default.
-        let flat = usage_snapshot_from_api_usage(
-            &serde_json::json!({
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_creation_input_tokens": 40
-            }),
+        // Flat creation without the split object: the sticky session
+        // flavor when one is known, else the API's 5-minute default.
+        let flat_usage = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 40
+        });
+        let flat =
+            usage_snapshot_from_api_usage(&flat_usage, "claude-haiku-4-5-20251001", 200000, None)
+                .expect("usage present");
+        assert_eq!(flat.cache_ttl_seconds, Some(300));
+        let flat_1h = usage_snapshot_from_api_usage(
+            &flat_usage,
             "claude-haiku-4-5-20251001",
             200000,
+            Some(3600),
         )
         .expect("usage present");
-        assert_eq!(flat.cache_ttl_seconds, Some(300));
+        assert_eq!(flat_1h.cache_ttl_seconds, Some(3600));
 
-        // Read-only responses make no flavor statement.
+        // Read-only responses make no flavor statement — even when the
+        // session's flavor is known (the downstream hub is sticky).
         let read_only = usage_snapshot_from_api_usage(
             &serde_json::json!({
                 "input_tokens": 10,
@@ -5027,6 +5514,7 @@ mod tests {
             }),
             "claude-haiku-4-5-20251001",
             200000,
+            Some(3600),
         )
         .expect("usage present");
         assert_eq!(read_only.cache_ttl_seconds, None);

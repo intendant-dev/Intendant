@@ -65,7 +65,14 @@ function applyDashboardVerbosity(level, options = {}) {
   if (!['normal', 'verbose', 'debug'].includes(next)) return '';
   const select = document.getElementById('verbosity-select');
   if (select) select.value = next;
-  if (app) processCommands(app.set_verbosity(next));
+  if (app) {
+    processCommands(app.set_verbosity(next));
+    // set_verbosity re-emitted the whole log buffer synchronously; every
+    // rebuilt output group is history and closes now (at Verbose/Debug the
+    // rebuilt groups stay open — that's the default finalize preserves). A
+    // command still streaming reopens a fresh group on its next chunk.
+    finalizeActiveCommandOutputGroup();
+  }
   localStorage.setItem(VERBOSITY_KEY, next);
   if (options.dispatch !== false) {
     dispatchControlMsg({ action: 'set_verbosity', level: next });
@@ -1224,6 +1231,14 @@ function stationBuildExternalTurnSummary(input = {}) {
   const command = String(input.sessionCommand || input.command || '').trim();
   const sessionId = String(input.sessionId || '').trim();
   const sourceLabel = prettyAgentName(external) || external;
+  // Derived wire activity beats the phase guess when the session carries
+  // it (39-session-windows.js owns the derivation; 'thinking' is claimed
+  // only from live reasoning evidence there).
+  const liveActivity = sessionId
+      && typeof deriveSessionActivity === 'function'
+      && typeof sessionWireActivity === 'function'
+    ? deriveSessionActivity(sessionWireActivity(sessionId))
+    : null;
   let state = 'stopped';
   if (!command && !sessionId) {
     state = 'misconfigured';
@@ -1231,6 +1246,16 @@ function stationBuildExternalTurnSummary(input = {}) {
     state = 'queued';
   } else if (input.sessionDetached) {
     state = 'stopped';
+  } else if (liveActivity && (phase === 'thinking' || phase === 'running'
+      || phase === 'orchestrating' || input.sessionActive)) {
+    state = ({
+      reasoning: 'thinking',
+      responding: 'responding',
+      'tool-running': 'running tools',
+      'awaiting-api': 'waiting on model',
+      'rate-limited': 'rate-limited',
+      stalled: 'stalled',
+    })[liveActivity.state] || 'running tools';
   } else if (phase.startsWith('waiting')) {
     state = 'waiting';
   } else if (phase === 'thinking') {

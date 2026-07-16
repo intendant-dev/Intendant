@@ -28,6 +28,13 @@ slow-timeout = { period = "60s", terminate-after = 4 }
 filter = 'test(/^worktree_inventory::/)'
 slow-timeout = { period = "60s", terminate-after = 4 }
 
+# The git-vitals activity-locus e2e inherently spans several 5s probe
+# ticks against real repos (init, worktree add, switch, fallback) on top
+# of the same git fork/exec latency class as worktree_inventory above.
+[[profile.default.overrides]]
+filter = 'test(/activity_locus_follows_worktree_and_falls_back_when_deleted/)'
+slow-timeout = { period = "60s", terminate-after = 4 }
+
 # Federation gateway rigs: each spins a real web gateway + WebSocket
 # transport (+ card fetch) and polls with multi-second deadlines; when
 # several run concurrently on a loaded box they blow the default budget
@@ -57,3 +64,12 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'package(rustc-governor)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# The vendored D0-A corpus conformance gate (§D of the stamped P1 v1
+# profile) runs all 170 stamped vectors through every structural layer
+# plus semantics in ONE test — its unity IS the gate (any red vector
+# reds the gate), and ~28s of debug-mode execution is its honest cost,
+# not a stall. Deliberate heavy test, not an environment dependency.
+[[profile.default.overrides]]
+filter = 'package(owner-plane-reducer)'
+slow-timeout = { period = "60s", terminate-after = 2 }

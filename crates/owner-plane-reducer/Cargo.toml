@@ -1,0 +1,42 @@
+# VENDORED from owner-plane-d0a @ 583f421a (rfcs/owner-plane/reducer,
+# the Gate-A stamp) — bin targets dropped (the CLI harness and the
+# per-OS storage lane stay on the asset branch); the corpus (stamped
+# spec + companion schema + 170 vectors) is vendored byte-exact under
+# corpus/ and the inline harness tests are the §D conformance gate
+# (p1-v1-profile.md). Kernel semantics are stamped: semantic changes
+# are owner acts that land on the asset branch first, never local
+# edits here.
+[package]
+name = "owner-plane-reducer"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A independent reducer + differential harness (vendored). Shares NO code with owner-plane-core (the fixture-minting reference): own strict CBOR reader, own domain framing, own fold logic — the point of the differential exercise. Third-party primitives (sha2, ed25519-dalek, serde_json) are shared dependencies, not shared code."
+publish = false
+
+[features]
+default = ["schema"]
+# The JSON-Schema structural layers (container + companion). Default
+# ON — the corpus conformance tests always run them. (The asset
+# branch's browser lane builds without them for wasm; the vendored
+# copy has no wasm consumer, so they stay on in practice.)
+schema = ["dep:jsonschema"]
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+serde_json = "1"
+# The harness validates every vector against the §13.1 container
+# schema AND the companion with a real JSON Schema engine (Draft
+# 2020-12) — hand-rolled validation is the reference core's lane.
+jsonschema = { version = "0.26", default-features = false, optional = true }
+# Families 3-5 KAT lanes (third-party primitives, not shared code).
+p256 = { version = "0.13", features = ["ecdsa"] }
+hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+pbkdf2 = "0.12"
+# The BIP-39 English wordlist as standard DATA (the index/checksum
+# math is the reducer's own — §2.4's independent rejection leg).
+bip39 = "2"
+# §2.4 NFKD normalization of mnemonic and passphrase.
+unicode-normalization = "0.1"
