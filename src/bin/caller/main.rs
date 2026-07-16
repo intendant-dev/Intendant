@@ -1149,12 +1149,26 @@ async fn maybe_auto_launch_xvfb(
     // Memoized accessible-display verdict: this function runs on every
     // exec/captureScreen batch, `is_display_accessible()` forks `xdpyinfo`
     // per call on Linux, and the probe result feeds only the one-time log
-    // line below. Only the accessible outcome is sticky — while no display
+    // line below. Only the accessible outcome is memoized — while no display
     // exists we keep probing, so a machine that gains an X server later (or
-    // retries after a failed Xvfb launch) is still picked up.
-    static EXISTING_DISPLAY: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
-    if EXISTING_DISPLAY.get().is_some() {
-        return;
+    // retries after a failed Xvfb launch) is still picked up. The memo is
+    // NOT blindly sticky: before trusting it, revalidate fork-free that the
+    // display is still alive (`existing_display_memo_still_valid`) — a
+    // session can latch onto another session's Xvfb, and once that owner's
+    // guard kills the server, a sticky memo would pin every later batch to
+    // a dead display and auto-launch could never self-heal.
+    static EXISTING_DISPLAY: std::sync::Mutex<Option<(u32, u32, u32)>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut memo = EXISTING_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.is_some() {
+            if existing_display_memo_still_valid() {
+                return;
+            }
+            // The memoized display died — clear and fall through to the
+            // full probe so Xvfb auto-launch can recover.
+            *memo = None;
+        }
     }
     // If a display is already accessible (e.g. DISPLAY was set before launch,
     // or on macOS where the native display is always available), skip Xvfb.
@@ -1168,7 +1182,8 @@ async fn maybe_auto_launch_xvfb(
             .and_then(|d| d.trim_start_matches(':').parse::<u32>().ok())
             .unwrap_or(default_display);
         let (width, height) = query_display_resolution(display_id);
-        let _ = EXISTING_DISPLAY.set((display_id, width, height));
+        *EXISTING_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((display_id, width, height));
         slog(session_log, |l| {
             l.info(&format!(
                 "Using existing display :{} ({}x{}) — no web slot (no DisplaySession)",
@@ -1211,6 +1226,36 @@ async fn maybe_auto_launch_xvfb(
             });
         }
     }
+}
+
+/// Whether the display the accessible-display memo trusted is still
+/// plausibly alive, without forking a probe.
+///
+/// macOS: the native display is always accessible
+/// (`vision::is_display_accessible` is constant `true` there), so the memo
+/// cannot go stale. X11: stat the current `DISPLAY`'s socket — an Xvfb
+/// killed by its owning session's `XvfbGuard` removes `/tmp/.X11-unix/X<n>`.
+/// Non-local `DISPLAY` values (ssh forwarding, `host:10.0`) have no socket
+/// to stat: treat as not-validated so the full probe re-runs each batch,
+/// matching pre-memo behavior for those setups.
+fn existing_display_memo_still_valid() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    match std::env::var("DISPLAY") {
+        Ok(display) => x11_socket_path_in(std::path::Path::new("/tmp/.X11-unix"), &display)
+            .map(|path| path.exists())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// `<socket_dir>/X<n>` for a local `:<n>[.screen]` DISPLAY value; `None`
+/// for non-local forms (anything not starting with `:`).
+fn x11_socket_path_in(socket_dir: &std::path::Path, display: &str) -> Option<std::path::PathBuf> {
+    let rest = display.strip_prefix(':')?;
+    let num: u32 = rest.split('.').next()?.parse().ok()?;
+    Some(socket_dir.join(format!("X{num}")))
 }
 
 /// Query the resolution of the native display.
@@ -1423,6 +1468,35 @@ fn normalize_command_batch(json_str: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accessible-display memo must stop being trusted the moment the
+    /// memoized X display's socket disappears (another session's XvfbGuard
+    /// killing its server), so the probe path is re-entered and auto-launch
+    /// can self-heal. `x11_socket_path_in` is the fork-free liveness check
+    /// behind `existing_display_memo_still_valid`.
+    #[test]
+    fn x11_socket_liveness_tracks_socket_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Local display forms resolve to their socket path.
+        let sock = x11_socket_path_in(dir.path(), ":99").unwrap();
+        assert_eq!(sock, dir.path().join("X99"));
+        assert_eq!(
+            x11_socket_path_in(dir.path(), ":0.0").unwrap(),
+            dir.path().join("X0")
+        );
+        // Non-local / malformed forms have no socket to stat.
+        assert!(x11_socket_path_in(dir.path(), "localhost:10.0").is_none());
+        assert!(x11_socket_path_in(dir.path(), "").is_none());
+        assert!(x11_socket_path_in(dir.path(), ":abc").is_none());
+
+        // Memo-trust flow: socket present → still valid; socket removed
+        // (guard killed the Xvfb) → stale, probe path re-entered.
+        std::fs::write(&sock, b"").unwrap();
+        assert!(sock.exists());
+        std::fs::remove_file(&sock).unwrap();
+        assert!(!sock.exists());
+    }
 
     /// The idle queued-steer flush synthesizes an EMPTY task envelope per
     /// flush; logging it produced spurious "[runtime] Task dispatched: "
