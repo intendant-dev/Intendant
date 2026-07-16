@@ -61,6 +61,13 @@ MEM_RESUME_TICKS="${MEM_RESUME_TICKS:-2}"
 # detector should surface — cannot silence the detector with it.
 GOVERNOR_MONITOR="${GOVERNOR_MONITOR:-auto}"
 GOVERNOR_CONF="${GOVERNOR_CONF:-/usr/local/etc/intendant-governor.toml}"
+# Supervised sccache server health probe: port to check (empty = probe
+# disabled) and the service to bounce on failure (launchd label / systemd
+# unit). A server can wedge or be firewalled ALIVE — process running,
+# socket listening, connects timing out — which fails every governed
+# compile while the supervisor sees a healthy child (live 2026-07-15).
+SCCACHE_HEALTH_PORT="${SCCACHE_HEALTH_PORT:-}"
+SCCACHE_HEALTH_SERVICE="${SCCACHE_HEALTH_SERVICE:-com.intendant.ci.sccache}"
 mkdir -p "$STATE_DIR"
 
 log() {
@@ -239,8 +246,25 @@ monitor_ungoverned_rustc() {
     detect_ungoverned_rustc
 }
 
+# Accept-probe the supervised sccache server and bounce it when dead. Runs
+# every tick INCLUDING mid-job: an unreachable cache server is failing the
+# running job's every compile already — a restart is strictly better. The
+# probe is a full TCP connect, not a process check: the observed failure
+# mode is exactly "process fine, connects time out".
+check_sccache_health() {
+    [ -n "$SCCACHE_HEALTH_PORT" ] || return 0
+    nc -z -w 5 127.0.0.1 "$SCCACHE_HEALTH_PORT" >/dev/null 2>&1 && return 0
+    log "sccache server on 127.0.0.1:$SCCACHE_HEALTH_PORT not accepting — bouncing $SCCACHE_HEALTH_SERVICE"
+    if is_macos; then
+        launchctl kickstart -k "system/$SCCACHE_HEALTH_SERVICE" 2>/dev/null             || log "kickstart failed for $SCCACHE_HEALTH_SERVICE — check manually"
+    else
+        systemctl restart "$SCCACHE_HEALTH_SERVICE" 2>/dev/null             || log "restart failed for $SCCACHE_HEALTH_SERVICE — check manually"
+    fi
+}
+
 main() {
     monitor_ungoverned_rustc
+    check_sccache_health
 
     free=$(free_gb)
 
