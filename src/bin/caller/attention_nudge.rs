@@ -225,6 +225,17 @@ struct MonitorState {
     last_nudge: HashMap<String, u64>,
     /// session key → user-set display name (explicit renames only).
     names: HashMap<String, String>,
+    /// superseded session id → canonical session id, from `SessionIdentity`
+    /// rotations: an external backend announcing its native id re-keys
+    /// lifecycle events (TaskComplete/SessionEnded) while the fixed
+    /// session-scoped MCP URL keeps `notify_user` emitting the wrapper id
+    /// for the session's whole life. Every map touch resolves through
+    /// these links so the two id streams meet on one key — without that,
+    /// SessionEnded under the backend id would strand a wrapper-keyed
+    /// escalation that then pushes for a dead session. Bounded: one entry
+    /// per announced identity, and the links die with their session on
+    /// SessionEnded.
+    aliases: HashMap<String, String>,
 }
 
 impl MonitorState {
@@ -234,22 +245,100 @@ impl MonitorState {
             escalations: HashMap::new(),
             last_nudge: HashMap::new(),
             names: HashMap::new(),
+            aliases: HashMap::new(),
+        }
+    }
+
+    /// Resolve a session key through the identity links. Chains stay short
+    /// (wrapper → native → resumed-native); the hop cap keeps a malformed
+    /// cycle from wedging the monitor.
+    fn canon(&self, key: &str) -> String {
+        let mut current = key;
+        for _ in 0..8 {
+            match self.aliases.get(current) {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        current.to_string()
+    }
+
+    fn canon_key(&self, session_id: &Option<String>) -> String {
+        self.canon(&session_key(session_id))
+    }
+
+    /// Record an identity rotation `old → new` and migrate any state
+    /// already parked under the old key. Migration alone is not enough —
+    /// the wrapper id keeps arriving after rotation (`notify_user` is
+    /// scoped to a fixed MCP URL) — and the alias alone is not enough —
+    /// pre-rotation entries already sit under the old key. So: both.
+    fn link_identity(&mut self, old_id: &str, new_id: &str) {
+        let old = old_id.trim();
+        let new = new_id.trim();
+        if old.is_empty() || new.is_empty() || old == new {
+            return;
+        }
+        let source_key = self.canon(old);
+        let target = self.canon(new);
+        if source_key == target {
+            // Already linked: just keep the direct edge short. `target`
+            // can equal `old` here (the announcement inverted an existing
+            // link) — never record a self-edge, so no cycle can form.
+            if old != target {
+                self.aliases.insert(old.to_string(), target);
+            }
+            return;
+        }
+        self.aliases.insert(old.to_string(), target.clone());
+        if source_key != old {
+            // A superseded canonical (chained rotation) forwards too.
+            self.aliases.insert(source_key.clone(), target.clone());
+        }
+        // Migrate pending requests…
+        let stranded: Vec<_> = self
+            .pending
+            .keys()
+            .filter(|(k, _, _)| *k == source_key)
+            .cloned()
+            .collect();
+        for (k, space, id) in stranded {
+            if let Some(request) = self.pending.remove(&(k, space, id)) {
+                self.pending
+                    .entry((target.clone(), space, id))
+                    .or_insert(request);
+            }
+        }
+        // …the escalation slot (keep the oldest undelivered)…
+        if let Some(since) = self.escalations.remove(&source_key) {
+            let slot = self.escalations.entry(target.clone()).or_insert(since);
+            *slot = (*slot).min(since);
+        }
+        // …the cooldown (keep the most recent nudge — strongest pacing)…
+        if let Some(nudged) = self.last_nudge.remove(&source_key) {
+            let slot = self.last_nudge.entry(target.clone()).or_insert(nudged);
+            *slot = (*slot).max(nudged);
+        }
+        // …and the display name (a name set under the new key is newer).
+        if let Some(name) = self.names.remove(&source_key) {
+            self.names.entry(target).or_insert(name);
         }
     }
 
     fn observe(&mut self, event: &AppEvent) {
         match event {
             AppEvent::ApprovalRequired { session_id, id, .. } => {
+                let key = self.canon_key(session_id);
                 self.pending
-                    .entry((session_key(session_id), IdSpace::Approval, *id))
+                    .entry((key, IdSpace::Approval, *id))
                     .or_insert(PendingRequest {
                         kind: AttentionKind::Approval,
                         since_unix_ms: now_unix_ms(),
                     });
             }
             AppEvent::UserQuestionRequired { session_id, id, .. } => {
+                let key = self.canon_key(session_id);
                 self.pending
-                    .entry((session_key(session_id), IdSpace::Approval, *id))
+                    .entry((key, IdSpace::Approval, *id))
                     .or_insert(PendingRequest {
                         kind: AttentionKind::Question,
                         since_unix_ms: now_unix_ms(),
@@ -259,31 +348,46 @@ impl MonitorState {
             // counter (deliberately outside the approval registry), so its
             // raise/resolve pair tracks in its own id space.
             AppEvent::DisplayRequestRaised { session_id, id, .. } => {
+                let key = self.canon_key(session_id);
                 self.pending
-                    .entry((session_key(session_id), IdSpace::DisplayRequest, *id))
+                    .entry((key, IdSpace::DisplayRequest, *id))
                     .or_insert(PendingRequest {
                         kind: AttentionKind::DisplayRequest,
                         since_unix_ms: now_unix_ms(),
                     });
             }
             AppEvent::DisplayRequestResolved { session_id, id, .. } => {
-                self.pending
-                    .remove(&(session_key(session_id), IdSpace::DisplayRequest, *id));
+                let key = self.canon_key(session_id);
+                self.pending.remove(&(key, IdSpace::DisplayRequest, *id));
             }
             // Only urgent notifications escalate off the machine; info and
             // attention stay browser-side by design.
             AppEvent::UserNotification {
                 session_id,
                 urgency: crate::types::NotificationUrgency::Urgent,
+                ts,
                 ..
             } => {
-                self.escalations
-                    .entry(session_key(session_id))
-                    .or_insert_with(now_unix_ms);
+                // Stamp with EMISSION time, not observation time: the tick
+                // arm awaits rendezvous sends inline, so the monitor can
+                // observe a queued notification well after it was emitted,
+                // and a dashboard that displayed the toast and disconnected
+                // inside that gap must still count as "seen since" —
+                // otherwise the owner who watched it gets pushed anyway.
+                // ts == 0 (absent) falls back to now; a future ts (clock
+                // skew) clamps to now so it cannot dodge the seen-since
+                // check — same clock domain, cheap insurance.
+                let now = now_unix_ms();
+                let since = match *ts {
+                    0 => now,
+                    emitted => emitted.min(now),
+                };
+                let key = self.canon_key(session_id);
+                self.escalations.entry(key).or_insert(since);
             }
             AppEvent::ApprovalResolved { session_id, id, .. } => {
-                self.pending
-                    .remove(&(session_key(session_id), IdSpace::Approval, *id));
+                let key = self.canon_key(session_id);
+                self.pending.remove(&(key, IdSpace::Approval, *id));
             }
             // A finished/interrupted task cannot still be waiting on an
             // approval or question: its blocked loop returned. Some exit
@@ -303,15 +407,28 @@ impl MonitorState {
             // dead session's undelivered escalation dies with it.
             AppEvent::TaskComplete { session_id, .. }
             | AppEvent::Interrupted { session_id, .. } => {
-                let key = session_key(session_id);
+                let key = self.canon_key(session_id);
                 self.pending
                     .retain(|(k, space, _), _| *k != key || *space == IdSpace::DisplayRequest);
             }
             AppEvent::SessionEnded { session_id, .. } => {
-                self.pending.retain(|(k, _, _), _| k != session_id);
-                self.escalations.remove(session_id);
-                self.names.remove(session_id);
-                self.last_nudge.remove(session_id);
+                let key = self.canon(session_id);
+                self.pending.retain(|(k, _, _), _| *k != key);
+                self.escalations.remove(&key);
+                self.names.remove(&key);
+                self.last_nudge.remove(&key);
+                // The identity links die with their session: sweep every
+                // alias that resolves to the ended canonical key (wrapper
+                // ids and superseded backend ids alike).
+                let dead: Vec<String> = self
+                    .aliases
+                    .keys()
+                    .filter(|alias| self.canon(alias) == key)
+                    .cloned()
+                    .collect();
+                for alias in dead {
+                    self.aliases.remove(&alias);
+                }
             }
             AppEvent::SessionRenameResult {
                 session_id,
@@ -319,7 +436,27 @@ impl MonitorState {
                 success: true,
                 ..
             } => {
-                self.names.insert(session_id.clone(), name.clone());
+                let key = self.canon(session_id);
+                self.names.insert(key, name.clone());
+            }
+            // External backends announce their native id mid-session:
+            // lifecycle events re-key to it (`rotate_external_identity`,
+            // the supervisor's `apply_session_identity`) while the
+            // session-scoped MCP URL keeps `notify_user` emitting the
+            // wrapper id. Alias exactly when the supervisor re-keys (same
+            // canonicality gate), so this monitor's canonical key is the
+            // id SessionEnded will actually carry.
+            AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            } => {
+                if crate::external_agent::source_session_id_is_canonical(
+                    source,
+                    backend_session_id,
+                ) {
+                    self.link_identity(session_id, backend_session_id);
+                }
             }
             _ => {}
         }
@@ -339,6 +476,10 @@ impl MonitorState {
     /// Escalations blocked only by the cooldown stay queued for a later
     /// tick: the owner is genuinely away and the escalation must still
     /// reach them once the pacing allows.
+    /// (A dashboard that connects DURING the send can render the replayed
+    /// notification a push is already in flight for — benign overlap: the
+    /// escalation left the queue when it dispatched, so the POST itself
+    /// still fires at most once.)
     fn take_due_escalations(
         &mut self,
         now: u64,
@@ -708,13 +849,17 @@ mod tests {
     }
 
     fn urgent_notification(session_id: &str) -> AppEvent {
+        urgent_notification_at(session_id, now_unix_ms())
+    }
+
+    fn urgent_notification_at(session_id: &str, ts: u64) -> AppEvent {
         AppEvent::UserNotification {
             session_id: Some(session_id.to_string()),
             id: "notif-1".to_string(),
             title: None,
             text: "the deploy is blocked on credentials".to_string(),
             urgency: crate::types::NotificationUrgency::Urgent,
-            ts: 1,
+            ts,
         }
     }
 
@@ -744,6 +889,50 @@ mod tests {
         // One-shot: dispatched escalations leave the queue.
         assert!(state.escalations.is_empty());
         assert!(state.take_due_escalations(now, false, None).is_empty());
+    }
+
+    #[test]
+    fn escalations_keep_their_emission_time_when_observed_late() {
+        // The tick arm awaits rendezvous sends inline, so the monitor can
+        // observe a queued urgent notification well after it was emitted.
+        // The seen-since suppression must compare against EMISSION time:
+        // a dashboard that displayed the toast and disconnected inside
+        // that gap counts as informed — no push.
+        let emitted = now_unix_ms() - 60_000;
+        let seen = emitted + 5_000; // disconnect stamped after the toast
+        let mut state = MonitorState::new();
+        state.observe(&urgent_notification_at("abc", emitted)); // observed "now"
+        assert_eq!(state.escalations["abc"], emitted);
+        assert!(state
+            .take_due_escalations(now_unix_ms(), false, Some(seen))
+            .is_empty());
+        assert!(state.escalations.is_empty(), "seen browser-side: dropped");
+
+        // Seen strictly BEFORE emission: the owner has not seen this one;
+        // it still pushes.
+        state.observe(&urgent_notification_at("abc", emitted));
+        assert_eq!(
+            state
+                .take_due_escalations(now_unix_ms(), false, Some(emitted - 1))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn escalation_timestamps_fall_back_and_clamp() {
+        // ts == 0 (absent) falls back to observation time; a future ts
+        // (clock skew) clamps to now so it cannot dodge the seen-since
+        // suppression by sitting "in the future".
+        let mut state = MonitorState::new();
+        let before = now_unix_ms();
+        state.observe(&urgent_notification_at("zero", 0));
+        state.observe(&urgent_notification_at("future", before + 3_600_000));
+        let after = now_unix_ms();
+        for key in ["zero", "future"] {
+            let since = state.escalations[key];
+            assert!(since >= before && since <= after, "{key}: {since}");
+        }
     }
 
     #[test]
@@ -859,6 +1048,152 @@ mod tests {
         assert!(state
             .take_due_escalations(now_unix_ms() + 1, false, None)
             .is_empty());
+    }
+
+    fn identity(old: &str, new: &str) -> AppEvent {
+        AppEvent::SessionIdentity {
+            session_id: old.to_string(),
+            source: "codex".to_string(),
+            backend_session_id: new.to_string(),
+        }
+    }
+
+    #[test]
+    fn identity_rotation_canonicalizes_every_touch() {
+        // External sessions rotate ids: lifecycle events re-key to the
+        // backend-native id while the fixed session-scoped MCP URL keeps
+        // notify_user emitting the wrapper id. Every map touch resolves
+        // through the identity link so the two id streams meet on one key.
+        let mut state = MonitorState::new();
+        // Pre-rotation state parks under the wrapper id…
+        state.observe(&AppEvent::SessionRenameResult {
+            session_id: "wrapper-1".to_string(),
+            source: None,
+            name: Some("deploy review".to_string()),
+            success: true,
+            message: String::new(),
+        });
+        state.observe(&urgent_notification("wrapper-1"));
+        state.observe(&identity("wrapper-1", "backend-1"));
+        // …and migrates to the canonical key at rotation.
+        assert_eq!(state.escalations.len(), 1);
+        assert!(state.escalations.contains_key("backend-1"));
+        assert_eq!(
+            state.names.get("backend-1").map(String::as_str),
+            Some("deploy review")
+        );
+
+        // A post-rotation urgent under the WRAPPER id lands on the same
+        // canonical slot (no duplicate), keeps the oldest timestamp, and
+        // the due label uses the migrated rename.
+        let first_since = state.escalations["backend-1"];
+        state.observe(&urgent_notification("wrapper-1"));
+        assert_eq!(state.escalations.len(), 1);
+        assert_eq!(state.escalations["backend-1"], first_since);
+        let due = state.take_due_escalations(now_unix_ms() + 1, false, None);
+        assert_eq!(
+            due,
+            vec![("backend-1".to_string(), "deploy review".to_string())]
+        );
+        assert!(state.escalations.is_empty(), "delivered exactly once");
+        assert!(state
+            .take_due_escalations(now_unix_ms() + 1, false, None)
+            .is_empty());
+
+        // TaskComplete arrives under the BACKEND id and still clears a
+        // wrapper-keyed pending approval (canonicalized on insert).
+        state.observe(&AppEvent::ApprovalRequired {
+            session_id: Some("wrapper-1".to_string()),
+            id: 9,
+            command_preview: String::new(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        assert!(state
+            .pending
+            .contains_key(&("backend-1".to_string(), IdSpace::Approval, 9)));
+        state.observe(&AppEvent::TaskComplete {
+            session_id: Some("backend-1".to_string()),
+            reason: "done".to_string(),
+            summary: None,
+        });
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn session_ended_clears_rotated_identity_state() {
+        // The reunification exists exactly so this holds: notify_user
+        // keeps the wrapper id for the session's whole life, lifecycle
+        // events rotate to the backend id, and SessionEnded — which
+        // carries the backend id — must still tear down EVERYTHING:
+        // pending, escalation, name, cooldown, and the identity links
+        // themselves. Chained rotations (a resume announcing another
+        // native id) resolve transitively.
+        let mut state = MonitorState::new();
+        state.observe(&identity("wrapper-1", "backend-1"));
+        state.observe(&identity("backend-1", "backend-2"));
+        state.observe(&urgent_notification("wrapper-1")); // undelivered
+        state.observe(&AppEvent::ApprovalRequired {
+            session_id: Some("wrapper-1".to_string()),
+            id: 3,
+            command_preview: String::new(),
+            category: crate::autonomy::ActionCategory::CommandExec,
+        });
+        state.observe(&AppEvent::SessionRenameResult {
+            session_id: "wrapper-1".to_string(),
+            source: None,
+            name: Some("rotating".to_string()),
+            success: true,
+            message: String::new(),
+        });
+        state.last_nudge.insert("backend-2".to_string(), 5);
+        assert!(state.escalations.contains_key("backend-2"));
+        assert!(state
+            .pending
+            .contains_key(&("backend-2".to_string(), IdSpace::Approval, 3)));
+
+        state.observe(&AppEvent::SessionEnded {
+            session_id: "backend-2".to_string(),
+            reason: "done".to_string(),
+            error_kind: None,
+        });
+        assert!(state.pending.is_empty());
+        assert!(
+            state.escalations.is_empty(),
+            "undelivered escalation dies with the session"
+        );
+        assert!(state.names.is_empty());
+        assert!(state.last_nudge.is_empty());
+        assert!(
+            state.aliases.is_empty(),
+            "identity links die with the session"
+        );
+    }
+
+    #[test]
+    fn identity_links_mirror_the_supervisor_gate() {
+        // The alias must move exactly when the supervisor's canonical key
+        // moves (apply_session_identity): a placeholder announcement the
+        // supervisor rejects must not redirect attention state toward an
+        // id lifecycle events will never carry.
+        let mut state = MonitorState::new();
+        state.observe(&AppEvent::SessionIdentity {
+            session_id: "wrapper-1".to_string(),
+            source: "claude-code".to_string(),
+            backend_session_id: "claude-code-session".to_string(), // placeholder
+        });
+        state.observe(&AppEvent::SessionIdentity {
+            session_id: "wrapper-1".to_string(),
+            source: "unknown-backend".to_string(),
+            backend_session_id: "backend-9".to_string(),
+        });
+        assert!(state.aliases.is_empty());
+        // Self-links are refused too (a backend re-announcing the id the
+        // monitor already treats as canonical).
+        state.observe(&identity("same", "same"));
+        state.observe(&identity("wrapper-1", "backend-1"));
+        state.observe(&identity("backend-1", "wrapper-1")); // inversion
+        assert_eq!(state.canon("wrapper-1"), "backend-1");
+        assert_eq!(state.canon("backend-1"), "backend-1");
     }
 
     #[test]
