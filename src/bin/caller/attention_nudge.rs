@@ -450,13 +450,12 @@ impl MonitorState {
                 session_id,
                 source,
                 backend_session_id,
-            } => {
-                if crate::external_agent::source_session_id_is_canonical(
-                    source,
-                    backend_session_id,
-                ) {
-                    self.link_identity(session_id, backend_session_id);
-                }
+            } if crate::external_agent::source_session_id_is_canonical(
+                source,
+                backend_session_id,
+            ) =>
+            {
+                self.link_identity(session_id, backend_session_id);
             }
             _ => {}
         }
