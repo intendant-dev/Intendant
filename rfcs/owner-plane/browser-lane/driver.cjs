@@ -598,9 +598,21 @@ async function main() {
     }
     child.kill('SIGTERM');
     await Promise.race([new Promise((r) => child.once('exit', r)), delay(3000)]);
-    if (child.exitCode === null) child.kill('SIGKILL');
+    if (child.exitCode === null) {
+      child.kill('SIGKILL');
+      await Promise.race([new Promise((r) => child.once('exit', r)), delay(1000)]);
+    }
     server.close();
-    fs.rmSync(userDataDir, { recursive: true, force: true });
+    // Best-effort: Chromium can still be flushing profile files as it
+    // dies, so the removal races fresh writes (observed live on CI:
+    // ENOTEMPTY on Default/ AFTER a 56/56-green run — the throw from
+    // this finally block skipped process.exit and turned green red).
+    // Retry, and never let teardown override the verdict.
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      console.error(`[driver] profile-dir cleanup failed (ignored): ${error.message}`);
+    }
   }
   process.exit(exitCode);
 }
