@@ -370,7 +370,8 @@ pub(crate) fn scan_worktree_inventory_response(home: &Path, project_root: Option
 }
 
 /// Transport-neutral worktrees cores (tunnel twins `api_worktrees`,
-/// `api_worktrees_inspect`, `api_worktrees_scan`, `api_worktrees_remove`):
+/// `api_worktrees_inspect`, `api_worktrees_scan`, `api_worktrees_remove`,
+/// `api_worktrees_clean`):
 /// the inventory (status, body) helpers plus the shared cache
 /// side-effects, rendered as [`ApiResponse`]s. Spawn placement and
 /// task-failure shapes stay transport-owned — and so is `home`: the
