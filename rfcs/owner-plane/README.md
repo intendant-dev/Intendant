@@ -79,7 +79,9 @@ review record, and the byte-exact baseline outranks path cosmetics.
   set-derived fold makes order convergence structural (all eight
   review orders committed as regressions + a metamorphic order
   suite + an arrival-order restoration control), the D-99 pipeline
-  order and D-130 fork selection are implemented, Journal reopen
+  order and the D-130 exact-reference rule are implemented (unheld
+  named heads pend; full two-variant fork selection stays honestly
+  deferred), Journal reopen
   kills verify against authenticated ADMITTED facts, audit-partition
   release derives from an independent read-release event, both
   execution-lane run sets pin to `coverage/lane-manifests.json`, the

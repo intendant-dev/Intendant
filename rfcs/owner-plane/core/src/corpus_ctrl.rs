@@ -746,16 +746,21 @@ pub fn f7_revoke_cutoff_carried_head() -> Vector {
     )
 }
 
-/// D-130 committed-boundary selection: the carried head names the
-/// held coordinate (gen 1, seq 1) with a DIFFERENT op hash — fork
-/// evidence the committing revoke RESOLVES as the coordinate's first
-/// committed selector: the revoke admits selecting its named
-/// (unheld) variant, and the held variant `i` quarantines as the
-/// losing branch. The original expectation rejected the revoke
-/// `body-invariant` — the v0.5.9 differing-hash rejection D-93's own
-/// rider records as superseded by D-130 (an arrival-relative rule;
-/// found while implementing the review's R1 repair; the reviews did
-/// not flag this fixture).
+/// The §7.1 referenced-Head lifecycle under the exact-reference rule
+/// (the criterion-12 F2 repair): the carried head names the held
+/// coordinate (gen 1, seq 1) with an op hash whose BYTES are not
+/// held anywhere — that is a pending reference, `(ref-unresolved,
+/// pending-dependency)` until the exact bytes arrive, NOT a D-130
+/// selection (selection is over the coordinate's genuinely held
+/// byte-variants). The held `i` stays admitted, and later control
+/// operations pass the pending reference (only the referencing
+/// operation waits). History: v0.5.9 rejected this `body-invariant`
+/// (superseded — D-93's rider); the prior tranche over-rotated to
+/// admit-and-select against a randomly drawn hash, which the
+/// criterion-12 review's F2 refuted with the fixture's own bytes.
+/// Full two-variant fork-selection stays honestly deferred (the
+/// `fork-selection` coverage row; the selected-variant revival arm
+/// remains an Unimplemented marker).
 pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
     let name = "f7-revoke-head-mismatch";
     let mut rig = PlaneRig::new(name);
@@ -787,7 +792,7 @@ pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
     );
     let c1 = rig.genesis_op.clone();
     ctrl_vector(
-        "revoke-cutoff-head-mismatch-selects",
+        "revoke-cutoff-unheld-head-pends",
         "fold",
         "7.1",
         rig,
@@ -795,9 +800,9 @@ pub fn f7_revoke_cutoff_head_mismatch() -> Vector {
         json!([
             { "item": "c1" },
             { "item": "c2" },
-            { "item": "i", "outcome": "cutoff", "disposition": "quarantine-reproposal" },
+            { "item": "i" },
             { "item": "k1" },
-            { "item": "r" },
+            { "item": "r", "outcome": "ref-unresolved", "disposition": "pending-dependency" },
         ]),
         None,
     )

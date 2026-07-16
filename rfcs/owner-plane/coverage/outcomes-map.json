@@ -50,7 +50,6 @@
     ],
     "cutoff": [
       "collision-loser-reenters-on-winner-death",
-      "revoke-cutoff-head-mismatch-selects",
       "txn-internal-order-and-competing-terminals",
       "walkthrough-c3-branch-cut-below-head"
     ],
@@ -162,6 +161,7 @@
       "reopen-basis-op-kind-and-unheld-invalidation",
       "reopen-recovery-invalidation-unheld-pends",
       "reopen-unadmitted-recovery-pends",
+      "revoke-cutoff-unheld-head-pends",
       "second-live-compound-rejects",
       "walkthrough-c3-branch-cut-below-head"
     ],

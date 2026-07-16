@@ -86,7 +86,7 @@ ob("f7-zone-policy-position", 7, 19, 28, "zone-policy-advances-epoch",
 
 ob("f7-compound-pipeline", 7, 29, 37, "one-live-compound-per-revocation_id",
    "One live compound per revocation_id; derived grant revocation; the arm-indexed control pipeline (body-before-precedence, D-99); cutoff algebra (D-93); authored-but-unwrapped revocation.",
-   ["second-live-compound-rejects","control-body-tamper","control-signature-tamper","control-wrong-proof-arm","c2-post-freeze-valid-op-frozen","c2-post-freeze-sig-invalid-kept","revoke-refs-post-wrap-exclusion-completes","revoke-refs-stale-rotation-rejects","revoke-cutoff-carried-head-completes","revoke-cutoff-head-mismatch-selects","revoke-cutoff-empty-heads-with-history-rejects","header-unknown-version-rejects"],
+   ["second-live-compound-rejects","control-body-tamper","control-signature-tamper","control-wrong-proof-arm","c2-post-freeze-valid-op-frozen","c2-post-freeze-sig-invalid-kept","revoke-refs-post-wrap-exclusion-completes","revoke-refs-stale-rotation-rejects","revoke-cutoff-carried-head-completes","revoke-cutoff-unheld-head-pends","revoke-cutoff-empty-heads-with-history-rejects","header-unknown-version-rejects"],
    status="partial", note="post-C.1: the D-71 rotation-refs linkage pair, the D-93 carried-head/mismatch/D-143-exactness triple, and the unknown-version parse negative are vectored; the ratify/snapshot cutoff-algebra ceremonies and authored-but-unwrapped revocation remain deferred sagas (D-203).")
 
 ob("f7-revocation-constructibility", 7, 38, 47, "revocation constructibility",

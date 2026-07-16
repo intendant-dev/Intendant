@@ -1385,11 +1385,15 @@ impl State {
     }
 
     /// Parse a frontierclose's `heads` into `(gen, seq)` caps,
-    /// resolving each against the HELD chain (D-93's letter): the
-    /// named coordinate must hold exactly the named op — an unheld
-    /// head pends `ref-unresolved`, a held-but-different hash is
-    /// `(body-invariant, reject-permanent)` ("unheld-Head pending →
-    /// mismatched-hash reject").
+    /// resolving each against the HELD chain: an unheld coordinate
+    /// pends `ref-unresolved`; a named hash genuinely held at the
+    /// coordinate (the accepted op or a registered fork variant)
+    /// resolves, committing a D-130 selection where fork evidence
+    /// exists; a named hash whose BYTES are not held pends
+    /// `ref-unresolved` until they arrive (§7.1's referenced-Head
+    /// lifecycle — the exact-reference rule, the criterion-12 F2
+    /// repair); a hash conflicting a committed selection is
+    /// `(body-invariant, reject-permanent)`.
     fn parse_heads(
         &self,
         cn: &Node,
@@ -1426,22 +1430,43 @@ impl State {
                     )))
                 }
                 Some(r) => {
-                    // D-130: bytes at the coordinate differing from
-                    // the named hash are fork evidence resolved by
-                    // SELECTION — the committing boundary selects its
-                    // named variant when it is the coordinate's first
-                    // committed selector; `body-invariant` only
-                    // against a PRIOR committed selection of a
-                    // different variant (the v0.5.9 differing-hash
-                    // rejection is superseded — D-93's own rider).
+                    // D-130 under the exact-reference rule (§7.1's
+                    // referenced-Head lifecycle; the criterion-12 F2
+                    // repair): a boundary selects only a byte-variant
+                    // genuinely HELD at the coordinate — the accepted
+                    // op or a registered fork variant. A named hash
+                    // whose bytes are NOT held is a pending reference
+                    // (`ref-unresolved` until the exact bytes
+                    // arrive), never a selection — the v0.5.9
+                    // differing-hash REJECTION stays superseded
+                    // (D-93's rider); `body-invariant` only against a
+                    // PRIOR committed selection of a different
+                    // variant (that conflict is with the committed
+                    // selection fact, independent of byte content).
                     match self.fork_selected.get(&coord) {
                         Some(&sel) if sel != hop => {
                             return ok(Err(Verdict::Rejected("body-invariant", "reject-permanent")))
                         }
                         Some(_) => {}
                         None => {
-                            if r.op_hash != hop || self.tenant_forks.contains_key(&coord) {
+                            let held_variant = self
+                                .tenant_forks
+                                .get(&coord)
+                                .is_some_and(|v| v.contains(&hop));
+                            if r.op_hash == hop {
+                                // The held accepted op — a selection
+                                // commits only where fork evidence
+                                // exists to resolve.
+                                if self.tenant_forks.contains_key(&coord) {
+                                    selections.push((coord, hop));
+                                }
+                            } else if held_variant {
                                 selections.push((coord, hop));
+                            } else {
+                                return ok(Err(Verdict::Pending(
+                                    "ref-unresolved",
+                                    "pending-dependency",
+                                )));
                             }
                         }
                     }
