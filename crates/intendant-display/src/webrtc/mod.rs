@@ -581,22 +581,36 @@ pub(crate) enum Command {
         display_id: u32,
         state: DisplayInputAuthorityState,
     },
-    /// D-3b: binary tile-stream frame. Control/snapshot frames queue
-    /// until their reliable data channel opens; delta frames are
-    /// latest-wins and are dropped when the channel is unavailable.
-    /// `Bytes` end-to-end: one wire frame is encoded once and fanned
-    /// out to every subscriber as refcount bumps; the only remaining
-    /// copy is rtc's `BytesMut` boundary at the datachannel write.
+    /// D-3b: binary tile-stream frame for the **control** and
+    /// **deltas** channels. Control frames queue until their reliable
+    /// data channel opens; delta frames are latest-wins and are
+    /// dropped when the channel is unavailable. `Bytes` end-to-end:
+    /// one wire frame is encoded once and fanned out to every
+    /// subscriber as refcount bumps; the only remaining copy is rtc's
+    /// `BytesMut` boundary at the datachannel write.
     ///
-    /// `snapshot_group` is the producer's snapshot id for
-    /// [`TileDataChannel::Snapshot`] frames (`None` on the other
-    /// channels). The pre-open snapshot queue evicts at whole-group
-    /// granularity — a snapshot is only decodable as a complete chunk
-    /// set, so the queue must never hold (or deliver) a partial one.
+    /// Snapshot chunks do NOT travel through this command — a snapshot
+    /// is only decodable as a complete chunk set, so it crosses the
+    /// boundary atomically via [`Command::SendTileSnapshot`]; a
+    /// per-chunk snapshot path would let a cancelled producer publish
+    /// a partial (unassemblable) baseline into the pre-open queue.
     SendTileFrame {
         channel: TileDataChannel,
         data: bytes::Bytes,
-        snapshot_group: Option<u32>,
+    },
+    /// D-3b: one **complete** tile snapshot — every wire chunk of one
+    /// producer snapshot id, in send order, in a single command.
+    ///
+    /// Atomic whole-group hand-off is the partial-baseline defense: a
+    /// producer cancelled mid-encode (peer detach, resize mid-send)
+    /// simply never issues the command, so a partial chunk set cannot
+    /// reach the driver's pre-open queue; supersession there swaps
+    /// complete-for-complete. The chunk vector is finite by
+    /// construction (the packer caps chunks at a u16 count of ≤32KiB
+    /// messages).
+    SendTileSnapshot {
+        snapshot_id: u32,
+        chunks: Vec<bytes::Bytes>,
     },
 }
 

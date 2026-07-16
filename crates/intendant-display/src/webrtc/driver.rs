@@ -90,17 +90,30 @@ pub(crate) struct DriverState {
     /// bound, and control frames are self-contained — the latest
     /// state wins.
     pending_tile_control: VecDeque<Bytes>,
-    /// D-3b: queued snapshot chunks awaiting `tile-snapshot` channel
-    /// open, tagged with their producer snapshot id. A snapshot is
-    /// only decodable as a complete chunk set, so eviction happens at
-    /// whole-snapshot granularity (see
-    /// [`push_pending_snapshot_group`]): when a newer snapshot starts
-    /// queueing, every older snapshot's chunks are superseded and
-    /// dropped — the queue never holds a partial group, and it is
-    /// bounded at ~one snapshot's bytes without any byte-cap eviction
-    /// that could strand the browser on an unassemblable baseline.
-    /// Tile deltas intentionally have no queue.
-    pending_tile_snapshot: VecDeque<(u32, Bytes)>,
+    /// D-3b: the **one complete snapshot** (producer snapshot id +
+    /// every wire chunk, in send order) awaiting `tile-snapshot`
+    /// channel open. A snapshot is only decodable as a complete chunk
+    /// set, and [`Command::SendTileSnapshot`] hands groups over
+    /// atomically, so this holds at most one complete group *by
+    /// construction*: a newer accepted group replaces the old one
+    /// whole, and a producer cancelled mid-encode never issues the
+    /// command at all — no partial baseline can be published here.
+    ///
+    /// Bound story: ≤1 complete group by construction. No sanity
+    /// byte-cap on that group — it is one bounded burst from our own
+    /// packer (a u16 chunk count of ≤32KiB messages, in practice a
+    /// few MB), and dropping any of it would strand the browser on an
+    /// unassemblable baseline, which is exactly the failure this
+    /// design exists to prevent. Tile deltas intentionally have no
+    /// queue.
+    pending_tile_snapshot: Option<(u32, Vec<Bytes>)>,
+    /// Newest snapshot id ever accepted by this driver (written or
+    /// queued). Persisted here — NOT derived from queue contents — so
+    /// it survives open/drain/close cycles: a late group from an
+    /// older, superseded producer is rejected even when the queue is
+    /// empty, instead of resurrecting a stale baseline. See
+    /// [`admit_snapshot_group`].
+    tile_snapshot_watermark: Option<u32>,
     /// D-4c: event-driven backpressure state for the supersedable
     /// `tile-deltas` channel. Control and snapshot channels are
     /// reliable and never use this drop policy.
@@ -282,7 +295,8 @@ pub(crate) async fn driver<I: rtc::interceptor::Interceptor + Send + Sync + 'sta
         channels: HashMap::new(),
         pending_authority_state: Vec::new(),
         pending_tile_control: VecDeque::new(),
-        pending_tile_snapshot: VecDeque::new(),
+        pending_tile_snapshot: None,
+        tile_snapshot_watermark: None,
         tile_delta_backpressure: TileDeltaBackpressure::new(),
         first_frame_at: None,
         rtp: RtpSendState {
@@ -1743,11 +1757,7 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                 state.pending_authority_state.push((display_id, auth_state));
             }
         }
-        Command::SendTileFrame {
-            channel,
-            data,
-            snapshot_group,
-        } => {
+        Command::SendTileFrame { channel, data } => {
             let label = channel.label();
             let data_len = data.len();
             if channel == TileDataChannel::Deltas
@@ -1778,13 +1788,58 @@ pub(crate) fn handle_command<I: rtc::interceptor::Interceptor>(
                         );
                     }
                     TileDataChannel::Snapshot => {
-                        push_pending_snapshot_group(
-                            &mut state.pending_tile_snapshot,
-                            snapshot_group.unwrap_or_default(),
-                            data,
+                        // Unreachable via the public boundary: snapshot
+                        // chunks travel as whole groups through
+                        // `Command::SendTileSnapshot`. Queueing a lone
+                        // chunk here would publish a partial
+                        // (unassemblable) baseline, so drop it.
+                        eprintln!(
+                            "[display/webrtc] dropping per-chunk snapshot \
+                             frame queued before open — snapshots must use \
+                             SendTileSnapshot (whole-group boundary)"
                         );
                     }
                     TileDataChannel::Deltas => {}
+                }
+            }
+        }
+        Command::SendTileSnapshot {
+            snapshot_id,
+            chunks,
+        } => {
+            // Admission first, shared by the open and pre-open paths:
+            // stale groups are rejected against the persisted
+            // watermark (which survives drains), so a late producer
+            // for a superseded snapshot can neither hit the wire after
+            // a newer baseline nor resurrect itself into an emptied
+            // queue.
+            if !admit_snapshot_group(&mut state.tile_snapshot_watermark, snapshot_id) {
+                return;
+            }
+            if let Some(cid) = state.channels.get(TILE_SNAPSHOT_CHANNEL_LABEL).copied() {
+                if let Some(mut dc) = rtc.data_channel(cid) {
+                    for chunk in &chunks {
+                        if let Err(e) = dc.send(BytesMut::from(&chunk[..])) {
+                            eprintln!(
+                                "[display/webrtc] tile channel write failed on \
+                                 {TILE_SNAPSHOT_CHANNEL_LABEL}: {e:?}"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Pre-open: swap complete-for-complete. The queue holds
+                // at most one complete group by construction — see the
+                // `pending_tile_snapshot` field doc for the bound story.
+                if let Some((old_id, old_chunks)) =
+                    state.pending_tile_snapshot.replace((snapshot_id, chunks))
+                {
+                    eprintln!(
+                        "[display/webrtc] pending tile-snapshot: snapshot \
+                         {snapshot_id} supersedes queued snapshot {old_id} \
+                         ({} chunks) before the channel opened",
+                        old_chunks.len(),
+                    );
                 }
             }
         }
@@ -1926,10 +1981,17 @@ pub(crate) fn drain_pending_tile_for_label(
 ) -> VecDeque<Bytes> {
     match label {
         TILE_CONTROL_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_control),
-        TILE_SNAPSHOT_CHANNEL_LABEL => std::mem::take(&mut state.pending_tile_snapshot)
-            .into_iter()
-            .map(|(_, bytes)| bytes)
-            .collect(),
+        // Draining the queued snapshot deliberately leaves
+        // `tile_snapshot_watermark` in place: the watermark is the
+        // stale-group rejector and must survive open/drain/close
+        // cycles (deriving it from queue contents would let a late
+        // producer of a superseded snapshot repopulate the emptied
+        // queue with a stale baseline).
+        TILE_SNAPSHOT_CHANNEL_LABEL => state
+            .pending_tile_snapshot
+            .take()
+            .map(|(_, chunks)| chunks.into())
+            .unwrap_or_default(),
         _ => VecDeque::new(),
     }
 }
@@ -1972,55 +2034,27 @@ pub(crate) fn push_pending_tile_bounded(
     queue.push_back(data);
 }
 
-/// Push one snapshot chunk onto the queued-before-open snapshot queue.
+/// Admit or reject one complete snapshot group against the driver's
+/// persisted watermark, advancing the watermark on admission.
 ///
-/// A snapshot is only decodable from its complete chunk set, so this
-/// queue evicts at **whole-snapshot granularity** — byte-capped
-/// drop-oldest here would shed a snapshot's *leading* chunks and leave
-/// the browser unable to assemble any baseline until the next periodic
-/// snapshot (~30s of blank/partial canvas):
+/// Rejects ids older than **or equal to** the newest ever accepted:
+/// producer snapshot ids are minted by a session-monotonic
+/// `AtomicU32::fetch_add`, so an id at-or-below the watermark is a
+/// stale (superseded) producer whose baseline must reach neither the
+/// wire nor the pre-open queue.
 ///
-/// - Chunks of the same group as the newest queued entry append.
-/// - A chunk of a **newer** group supersedes: every older group's
-///   chunks are dropped whole (a late-opening channel wants the newest
-///   baseline; stale ones would be repainted immediately anyway).
-/// - A chunk of an **older** group than the newest queued is dropped:
-///   its snapshot is already superseded, and enqueueing it would
-///   recreate a partial group.
-///
-/// The queue therefore never holds a partial group and is bounded at
-/// ~one snapshot's bytes — even a single snapshot larger than any
-/// fixed cap is kept whole, because it is one bounded burst, and the
-/// leak this policy guards against (a wedged channel re-queueing every
-/// periodic snapshot forever) is exactly what supersession caps.
-pub(crate) fn push_pending_snapshot_group(
-    queue: &mut VecDeque<(u32, Bytes)>,
-    group: u32,
-    data: Bytes,
-) {
-    if let Some(&(newest, _)) = queue.back() {
-        if group != newest {
-            // Producer snapshot ids are monotonically allocated;
-            // wrapping-aware comparison so the policy survives id
-            // wraparound on very long sessions.
-            let incoming_is_newer = (group.wrapping_sub(newest) as i32) > 0;
-            if incoming_is_newer {
-                let dropped = queue.len();
-                queue.clear();
-                eprintln!(
-                    "[display/webrtc] pending tile-snapshot queue: snapshot \
-                     {group} supersedes {dropped} queued chunk(s) of older \
-                     snapshot(s) before the channel opened"
-                );
-            } else {
-                // Stale chunk of an already-superseded snapshot
-                // (interleaved producer): keeping it would recreate a
-                // partial group.
-                return;
-            }
-        }
+/// Plain (non-wrapping) compare, deliberately: wrap needs ~4.3 billion
+/// snapshots — decades at real snapshot cadence within one driver's
+/// lifetime — and the browser applies the same plain
+/// `snapshotId <= lastAppliedSnapshotId` rejection on its side, so a
+/// wrapping-aware compare here would diverge from the actual wire
+/// contract rather than harden it.
+pub(crate) fn admit_snapshot_group(watermark: &mut Option<u32>, snapshot_id: u32) -> bool {
+    if watermark.is_some_and(|newest| snapshot_id <= newest) {
+        return false;
     }
-    queue.push_back((group, data));
+    *watermark = Some(snapshot_id);
+    true
 }
 
 pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
@@ -3046,68 +3080,130 @@ mod tests {
         Bytes::from(vec![byte; len])
     }
 
-    /// Pre-open snapshot queue: a newer snapshot's chunks supersede
-    /// every older snapshot's chunks **whole** — the queue never holds
-    /// a partial group. Byte-capped drop-oldest here would shed a
-    /// snapshot's leading chunks and leave the browser unable to
-    /// assemble any baseline until the next periodic snapshot.
-    #[test]
-    fn pending_snapshot_queue_never_holds_a_partial_group() {
-        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
-        for _ in 0..4 {
-            push_pending_snapshot_group(&mut q, 7, chunk(7, 100));
+    /// Mirror of the `Command::SendTileSnapshot` pre-open arm's policy
+    /// (admission against the persisted watermark, then a
+    /// complete-for-complete swap), operating on the same state fields
+    /// the driver holds. Returns whether the group was accepted.
+    fn admit_and_queue(
+        watermark: &mut Option<u32>,
+        pending: &mut Option<(u32, Vec<Bytes>)>,
+        snapshot_id: u32,
+        chunks: Vec<Bytes>,
+    ) -> bool {
+        if !admit_snapshot_group(watermark, snapshot_id) {
+            return false;
         }
-        assert_eq!(q.len(), 4);
+        *pending = Some((snapshot_id, chunks));
+        true
+    }
 
-        // A newer snapshot begins queueing: all of snapshot 7 drops.
-        push_pending_snapshot_group(&mut q, 8, chunk(8, 100));
-        assert_eq!(q.len(), 1, "older snapshot must be dropped whole");
+    /// The pre-open snapshot store holds at most **one complete
+    /// group**: supersession swaps complete-for-complete, and a
+    /// cancelled producer never publishes anything at all — the
+    /// whole-group `SendTileSnapshot` boundary means "cancelled
+    /// mid-group" is simply "the command was never sent", so no
+    /// partial baseline can exist here. (v1 of this queue accepted
+    /// per-chunk pushes; a producer cancelled after one chunk left an
+    /// unassemblable baseline queued.)
+    #[test]
+    fn pending_snapshot_holds_only_complete_groups() {
+        let mut watermark: Option<u32> = None;
+        let mut pending: Option<(u32, Vec<Bytes>)> = None;
+
+        // A complete snapshot queues whole...
+        assert!(admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            7,
+            vec![chunk(7, 100); 3],
+        ));
+        // ...and a cancelled newer producer (id 8 minted, command
+        // never sent) leaves it fully intact: nothing to enqueue means
+        // nothing partial and nothing lost.
+        let (id, chunks) = pending.clone().expect("snapshot 7 queued");
+        assert_eq!(id, 7);
+        assert_eq!(chunks.len(), 3, "complete group retained");
+
+        // A newer complete snapshot swaps complete-for-complete.
+        assert!(admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            9,
+            vec![chunk(9, 100); 2],
+        ));
+        let (id, chunks) = pending.clone().expect("snapshot 9 queued");
+        assert_eq!(id, 9);
+        assert_eq!(chunks.len(), 2);
         assert!(
-            q.iter().all(|(g, _)| *g == 8),
-            "queue must only hold the newest snapshot's chunks"
+            chunks.iter().all(|c| c[0] == 9),
+            "no chunk of the superseded group survives"
+        );
+    }
+
+    /// The watermark persists in DriverState across drains: a late
+    /// group from an older, superseded producer must be rejected even
+    /// when the queue is empty — deriving freshness from queue
+    /// contents would let it resurrect a stale baseline between a
+    /// drain and the next channel open.
+    #[test]
+    fn stale_snapshot_group_rejected_after_drain() {
+        let mut watermark: Option<u32> = None;
+        let mut pending: Option<(u32, Vec<Bytes>)> = None;
+
+        assert!(admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            5,
+            vec![chunk(5, 10); 2],
+        ));
+        // Channel opens: the queue drains, the watermark stays.
+        let drained = pending.take().expect("snapshot 5 drained");
+        assert_eq!(drained.1.len(), 2);
+
+        // Late group from an older producer: rejected, queue stays empty.
+        assert!(!admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            4,
+            vec![chunk(4, 10)],
+        ));
+        // Same id as already accepted: also rejected (<=).
+        assert!(!admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            5,
+            vec![chunk(5, 10)],
+        ));
+        assert!(
+            pending.is_none(),
+            "stale groups must not repopulate the queue"
         );
 
-        // Remaining chunks of the newest snapshot keep appending.
-        push_pending_snapshot_group(&mut q, 8, chunk(8, 100));
-        assert_eq!(q.len(), 2);
-        assert!(q.iter().all(|(g, _)| *g == 8));
+        // A genuinely newer group is admitted.
+        assert!(admit_and_queue(
+            &mut watermark,
+            &mut pending,
+            6,
+            vec![chunk(6, 10)],
+        ));
+        assert_eq!(pending.expect("snapshot 6 queued").0, 6);
     }
 
-    /// A single snapshot larger than any nominal cap is kept whole:
-    /// it is one bounded burst, and evicting any of its chunks would
-    /// make the whole group undecodable.
+    /// Plain increasing admission: ids only ever move forward (the
+    /// documented no-wrap contract, matching the browser's own plain
+    /// `snapshotId <= lastAppliedSnapshotId` rejection).
     #[test]
-    fn pending_snapshot_queue_keeps_single_oversize_snapshot_whole() {
-        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
-        // 64 chunks x 1MB = 64MB, far above any byte cap this queue
-        // ever had — every chunk must survive.
-        for _ in 0..64 {
-            push_pending_snapshot_group(&mut q, 3, chunk(3, 1024 * 1024));
-        }
-        assert_eq!(q.len(), 64, "one snapshot is never partially evicted");
-        assert!(q.iter().all(|(g, _)| *g == 3));
-    }
-
-    /// Supersession drops stale baselines: chunks of an
-    /// already-superseded snapshot (an interleaved late producer)
-    /// must not re-enter the queue — that would recreate a partial
-    /// group. Wrapping ids compare monotonically.
-    #[test]
-    fn pending_snapshot_queue_supersedes_stale_baselines() {
-        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
-        push_pending_snapshot_group(&mut q, 10, chunk(10, 50));
-        push_pending_snapshot_group(&mut q, 11, chunk(11, 50));
-        // Late chunk of superseded snapshot 10: dropped, not queued.
-        push_pending_snapshot_group(&mut q, 10, chunk(10, 50));
-        assert_eq!(q.len(), 1);
-        assert!(q.iter().all(|(g, _)| *g == 11));
-
-        // Monotonic comparison survives id wraparound.
-        let mut q: VecDeque<(u32, Bytes)> = VecDeque::new();
-        push_pending_snapshot_group(&mut q, u32::MAX, chunk(1, 50));
-        push_pending_snapshot_group(&mut q, 0, chunk(2, 50));
-        assert_eq!(q.len(), 1, "wrapped id 0 supersedes u32::MAX");
-        assert!(q.iter().all(|(g, _)| *g == 0));
+    fn snapshot_admission_is_plainly_increasing() {
+        let mut watermark: Option<u32> = None;
+        assert!(admit_snapshot_group(&mut watermark, 10));
+        assert!(!admit_snapshot_group(&mut watermark, 10));
+        assert!(!admit_snapshot_group(&mut watermark, 9));
+        assert!(admit_snapshot_group(&mut watermark, 11));
+        assert_eq!(watermark, Some(11));
+        // No wrap heroics: after u32::MAX nothing is admitted — by
+        // design, and unreachable in practice (~4.3B snapshots).
+        assert!(admit_snapshot_group(&mut watermark, u32::MAX));
+        assert!(!admit_snapshot_group(&mut watermark, 0));
     }
 
     /// Pre-open control queue: self-contained frames under a byte

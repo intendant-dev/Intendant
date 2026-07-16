@@ -1347,44 +1347,48 @@ impl WebRtcPeer {
     /// D-3b: send a reliable tile-control binary frame to the browser.
     /// Queues in the driver until `tile-control` opens.
     pub async fn send_tile_control_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
-        self.send_tile_frame(TileDataChannel::Control, data, None)
-            .await
+        self.send_tile_frame(TileDataChannel::Control, data).await
     }
 
-    /// D-3b: send a reliable tile-snapshot binary frame to the browser.
-    /// Queues in the driver until `tile-snapshot` opens. `snapshot_id`
-    /// groups the chunks of one snapshot so the pre-open queue can
-    /// supersede stale snapshots at whole-group granularity.
-    pub async fn send_tile_snapshot_frame(
+    /// D-3b: send one **complete** tile snapshot (every wire chunk of
+    /// `snapshot_id`, in send order) to the browser. Atomic hand-off:
+    /// the driver either writes the whole set to an open
+    /// `tile-snapshot` channel or queues it whole for the pre-open
+    /// flush — a partial snapshot is unassemblable, so no per-chunk
+    /// snapshot boundary exists (see [`Command::SendTileSnapshot`]).
+    pub async fn send_tile_snapshot_group(
         &self,
-        data: bytes::Bytes,
         snapshot_id: u32,
+        chunks: Vec<bytes::Bytes>,
     ) -> Result<bool, CallerError> {
-        self.send_tile_frame(TileDataChannel::Snapshot, data, Some(snapshot_id))
+        match self
+            .command_tx
+            .send(Command::SendTileSnapshot {
+                snapshot_id,
+                chunks,
+            })
             .await
+        {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        }
     }
 
     /// D-3b: send an unreliable/supersedable tile-delta binary frame
     /// to the browser. If the channel is not open, the driver drops
     /// the frame rather than queueing stale deltas.
     pub async fn send_tile_delta_frame(&self, data: bytes::Bytes) -> Result<bool, CallerError> {
-        self.send_tile_frame(TileDataChannel::Deltas, data, None)
-            .await
+        self.send_tile_frame(TileDataChannel::Deltas, data).await
     }
 
     pub(crate) async fn send_tile_frame(
         &self,
         channel: TileDataChannel,
         data: bytes::Bytes,
-        snapshot_group: Option<u32>,
     ) -> Result<bool, CallerError> {
         match self
             .command_tx
-            .send(Command::SendTileFrame {
-                channel,
-                data,
-                snapshot_group,
-            })
+            .send(Command::SendTileFrame { channel, data })
             .await
         {
             Ok(()) => Ok(true),

@@ -1477,22 +1477,21 @@ async fn encode_tile_snapshot_frames(
     Some(out)
 }
 
-/// Send already-encoded snapshot wire frames to one peer (refcount
-/// bumps per frame; see [`encode_tile_snapshot_frames`]).
-/// `snapshot_id` tags every chunk so the driver's pre-open queue can
-/// supersede stale snapshots at whole-group granularity.
+/// Send already-encoded snapshot wire frames to one peer as one
+/// **complete group** (refcount bumps per chunk; see
+/// [`encode_tile_snapshot_frames`]). The atomic hand-off is what keeps
+/// a partial baseline out of the driver's pre-open queue: a producer
+/// cancelled before this call publishes nothing.
 async fn send_tile_snapshot_frames_to_peer(
     peer: &Arc<webrtc::WebRtcPeer>,
     frames: &[bytes::Bytes],
     snapshot_id: u32,
 ) {
-    for bytes in frames {
-        if let Err(e) = peer
-            .send_tile_snapshot_frame(bytes.clone(), snapshot_id)
-            .await
-        {
-            eprintln!("[display/tile] send snapshot failed: {e}");
-        }
+    if let Err(e) = peer
+        .send_tile_snapshot_group(snapshot_id, frames.to_vec())
+        .await
+    {
+        eprintln!("[display/tile] send snapshot failed: {e}");
     }
 }
 
