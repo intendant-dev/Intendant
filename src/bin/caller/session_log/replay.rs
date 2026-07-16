@@ -2090,6 +2090,48 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// A FAILED flush must not publish the generation: the row is not
+    /// readable, so a bump would let a fetch memoize the miss under a
+    /// generation this write never moves again — the same trap the
+    /// post-emit ordering closes on the success path, reopened on the
+    /// failure path (retained buffered bytes can surface later via an
+    /// unrelated flush, with no further bump). No bump on emit failure;
+    /// the next successful output append bumps and the id resolves.
+    #[test]
+    fn agent_output_generation_holds_on_failed_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_root = dir.path().join("logs");
+        let log_dir = logs_root.join("writer");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let before = agent_output_generation(&logs_root);
+
+        log.sabotage_writer_for_tests();
+        log.agent_output_with_id("never lands", "", None, Some("gen-fail-probe"));
+        assert_eq!(
+            agent_output_generation(&logs_root),
+            before,
+            "a failed flush must not publish the generation"
+        );
+        assert!(
+            agent_output_chunks_by_id(&log_dir, &["gen-fail-probe".to_string()]).is_empty(),
+            "the sabotaged row must not be readable"
+        );
+
+        // Recover the writer (fresh append handle on the same log) and land
+        // the row: the successful emit bumps, and the id resolves.
+        drop(log);
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("recovered", "", None, Some("gen-fail-probe"));
+        drop(log);
+        assert!(
+            agent_output_generation(&logs_root) > before,
+            "the successful append must bump the generation"
+        );
+        let chunks = agent_output_chunks_by_id(&log_dir, &["gen-fail-probe".to_string()]);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].stdout, "recovered");
+    }
+
     /// Writer and reader can reach one logs root through different
     /// spellings (path-form session resolution canonicalizes; the
     /// home-derived fallback root does not): the generation must be shared
