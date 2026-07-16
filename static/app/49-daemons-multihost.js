@@ -464,6 +464,22 @@ async function refreshVirtualDisplayAvailability() {
   updateVirtualDisplayAvailabilityUi();
 }
 
+// Coalesced twin for PROGRESS-driven callers (per-chunk response/byte-stream
+// frames). dashboardUpdateTransportStatus rebuilds the full debugStatus
+// object, re-renders four target summaries, and refreshes several dependent
+// surfaces — running that per 16 KiB chunk burned ~0.3–1 ms of main thread
+// per chunk on large pulls. Steady-state progress coalesces into one
+// trailing 100 ms tick; state TRANSITIONS (open/close/error, stream
+// start/end/complete/reject) keep calling the immediate form.
+let dashboardTransportStatusTickTimer = 0;
+function dashboardScheduleTransportStatusUpdate() {
+  if (dashboardTransportStatusTickTimer) return;
+  dashboardTransportStatusTickTimer = window.setTimeout(() => {
+    dashboardTransportStatusTickTimer = 0;
+    dashboardUpdateTransportStatus();
+  }, 100);
+}
+
 function dashboardUpdateTransportStatus() {
   const group = document.getElementById('sb-dashboard-transport');
   const dot = document.getElementById('sb-dashboard-transport-dot');

@@ -595,9 +595,16 @@ function mergeSessionWindowMetadata(sessionId, meta = {}) {
   const merged = Object.keys(normalized).length > 0
     ? { ...previous, ...normalized }
     : previous;
-  const changed = sessionWindowMetadataSignature(previous) !== sessionWindowMetadataSignature(merged);
+  // The merged signature rides the return value so updateSessionWindow —
+  // reached per rendered log line via inferSessionPhaseFromLog — doesn't
+  // recompute the ~35-field join a third time per call.
+  const previousSignature = sessionWindowMetadataSignature(previous);
+  const signature = merged === previous
+    ? previousSignature
+    : sessionWindowMetadataSignature(merged);
+  const changed = previousSignature !== signature;
   if (sid && changed) sessionMetadataById.set(sid, merged);
-  return { meta: merged, changed };
+  return { meta: merged, changed, signature };
 }
 
 function currentSessionGoalElapsedSeconds(goal) {
@@ -629,22 +636,27 @@ function goalStatusClass(status) {
 
 function renderSessionWindowGoal(win, goal) {
   if (!win?.goal || !win?.goalText) return false;
+  // Write-guards throughout: this runs for EVERY window on the 1 Hz goal
+  // ticker, and unconditional textContent/className assignment churns text
+  // nodes (and feeds every subtree MutationObserver watching the grid)
+  // even when the rendered second hasn't rolled over.
+  const setText = (el, prop, value) => { if (el[prop] !== value) el[prop] = value; };
   if (!goal?.objective) {
-    win.goal.className = 'session-window-goal hidden';
-    win.goalText.textContent = '';
-    win.goal.title = '';
+    setText(win.goal, 'className', 'session-window-goal hidden');
+    setText(win.goalText, 'textContent', '');
+    setText(win.goal, 'title', '');
     return false;
   }
   const status = normalizeGoalStatus(goal.status);
   const elapsed = formatGoalElapsed(currentSessionGoalElapsedSeconds(goal));
-  win.goal.className = `session-window-goal ${goalStatusClass(status)}`;
-  win.goalText.textContent = status === 'active'
+  setText(win.goal, 'className', `session-window-goal ${goalStatusClass(status)}`);
+  setText(win.goalText, 'textContent', status === 'active'
     ? `${goal.objective} · ${elapsed}`
-    : `${status} · ${goal.objective} · ${elapsed}`;
+    : `${status} · ${goal.objective} · ${elapsed}`);
   const tokenText = goal.tokensUsed !== null && goal.tokensUsed !== undefined
     ? `\nTokens: ${goal.tokensUsed.toLocaleString()}${goal.tokenBudget ? ` / ${goal.tokenBudget.toLocaleString()}` : ''}`
     : (goal.tokenBudget ? `\nBudget: ${goal.tokenBudget.toLocaleString()} tokens` : '');
-  win.goal.title = `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`;
+  setText(win.goal, 'title', `Goal: ${goal.objective}\nStatus: ${status}\nElapsed: ${elapsed}${tokenText}`);
   return status === 'active';
 }
 
@@ -680,6 +692,16 @@ function refreshSessionGoalTicker() {
   } else if (!hasActiveGoal && sessionGoalTicker) {
     clearInterval(sessionGoalTicker);
     sessionGoalTicker = null;
+  }
+}
+
+// Arm-only twin for per-window update paths: updateSessionWindow already
+// rendered ITS window's goal — re-rendering every other window's goal per
+// metadata tick (the old refreshSessionGoalTicker call) was pure waste.
+// The 1 s ticker still owns elapsed-time repaints and disarms itself.
+function ensureSessionGoalTickerArmed(hasActiveGoal) {
+  if (hasActiveGoal && !sessionGoalTicker) {
+    sessionGoalTicker = setInterval(refreshSessionGoalTicker, 1000);
   }
 }
 
@@ -1559,11 +1581,43 @@ function showCacheExpiryToast(sid, text) {
   setTimeout(() => { if (toast.parentNode) toast.remove(); }, 12000);
 }
 
+// Cheap per-tick predicate: does this session's vitals row need a 1 Hz
+// repaint at all? True for the warm-cache countdown (the only `ticking`
+// model vitalsChipModels emits) and for status-only rate-limit chips whose
+// "resets in ~Xm" text is time-derived. Everything else changes only on
+// real vitals/metadata events, which re-render directly — so the ticker no
+// longer rebuilds every window's full chip-model array each second just to
+// hit the stable-DOM fast path.
+function sessionVitalsNeedsTick(vitals) {
+  if (!vitals || typeof vitals !== 'object') return false;
+  const remaining = sessionCacheCountdownSeconds(vitals.cache);
+  if (remaining !== null && remaining > 0) return true;
+  const limits = Array.isArray(vitals.limits) ? vitals.limits : [];
+  return limits.some((w) => {
+    // Mirrors the chip model: the reset countdown only renders when the
+    // provider reports no percentage (status-only limits).
+    const pctRaw = Number(w?.usedPct);
+    const hasPct = Number.isFinite(pctRaw) && w?.usedPct !== null && w?.usedPct !== undefined;
+    return !hasPct && Number(w?.resetsAtEpoch) > Date.now() / 1000;
+  });
+}
+
 function refreshSessionVitalsTicker() {
   let ticking = false;
   for (const [sid, win] of sessionWindows) {
     const vitals = (sessionMetadataById.get(sid) || {}).vitals || null;
-    if (renderSessionWindowVitals(win, vitals)) ticking = true;
+    const needsTick = sessionVitalsNeedsTick(vitals);
+    // One trailing render after ticking stops (win.vitalsNeededTick holds
+    // the previous pass's verdict) settles the row — the cache chip flips
+    // to its cold glyph and a passed limit-reset drops its "↻~Xm" text —
+    // instead of freezing mid-count.
+    if (!needsTick && !win.vitalsNeededTick) continue;
+    win.vitalsNeededTick = needsTick;
+    renderSessionWindowVitals(win, vitals);
+    // Arm from the predicate, not the render result: the render reports
+    // only cache-ttl models as ticking, which left percentless limit-reset
+    // countdowns frozen because nothing kept the interval alive for them.
+    if (needsTick) ticking = true;
     maybeAlertCacheExpiry(sid, win, vitals);
   }
   if (ticking && !sessionVitalsTicker) {
@@ -1897,8 +1951,41 @@ function persistedSessionWindowRecord(sessionId, win = null) {
   return record;
 }
 
+// Trailing-debounced twin for the streaming path. updateSessionWindow runs
+// per rendered log line (inferSessionPhaseFromLog flips phase on model/agent
+// lines) and used to re-derive every window's record, JSON.stringify it, and
+// synchronously localStorage.setItem — tens of disk-backed writes per second
+// under load, forever. Metadata churn now coalesces into at most one write
+// per second; structural transitions (open/close/layout ops) keep calling
+// the immediate form, and pagehide/hidden flush a pending write so a closing
+// tab still persists its newest state.
+let sessionWindowPersistTimer = 0;
+function schedulePersistSessionWindowState() {
+  if (restoringPersistedSessionWindows || sessionWindowPersistTimer) return;
+  sessionWindowPersistTimer = window.setTimeout(() => {
+    sessionWindowPersistTimer = 0;
+    persistSessionWindowState();
+  }, 1000);
+}
+
+function flushPendingSessionWindowPersist() {
+  if (!sessionWindowPersistTimer) return;
+  clearTimeout(sessionWindowPersistTimer);
+  sessionWindowPersistTimer = 0;
+  persistSessionWindowState();
+}
+window.addEventListener('pagehide', flushPendingSessionWindowPersist);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) flushPendingSessionWindowPersist();
+});
+
 function persistSessionWindowState() {
   if (restoringPersistedSessionWindows) return;
+  // A direct persist supersedes any scheduled one.
+  if (sessionWindowPersistTimer) {
+    clearTimeout(sessionWindowPersistTimer);
+    sessionWindowPersistTimer = 0;
+  }
   let windows = [];
   for (const [sid, win] of sessionWindows) {
     const record = persistedSessionWindowRecord(sid, win);
@@ -3050,6 +3137,13 @@ function pruneMainLogContainer(container = currentMainLogContainer()) {
     while (logEntryCount > 10000) {
       const first = container.querySelector('.log-entry, .log-turn-sep');
       if (!first) break;
+      // A pruned command-output group must leave the strong registry too:
+      // commandOutputGroups otherwise pins the detached entry DOM, its
+      // clone views, and the full accumulated copy text for the lifetime
+      // of the page (clearLogs was the only eviction). Live clones keep
+      // the group reachable through their own click closures.
+      const groupId = first.dataset ? first.dataset.outputGroupId : '';
+      if (groupId) commandOutputGroups.delete(groupId);
       first.remove();
       logEntryCount--;
     }
@@ -3384,6 +3478,23 @@ function getLogEntryCopyText(entry) {
   return entry?.querySelector?.('.log-content')?.innerText || '';
 }
 
+// Async twin for capped copy refs: a command-output group whose streamed
+// text outgrew COMMAND_OUTPUT_COPY_TEXT_CAP carries a fetchText resolver
+// (the persisted-output lane) instead of retaining megabytes in the ref.
+// Falls back to the captured prefix if the fetch fails.
+async function resolveLogEntryCopyText(entry) {
+  const ref = entry ? logEntryCopyTextByEntry.get(entry) : null;
+  if (ref && typeof ref.fetchText === 'function') {
+    try {
+      const text = await ref.fetchText();
+      if (text) return String(text);
+    } catch (err) {
+      console.warn('lazy copy-text fetch failed; copying captured prefix', err);
+    }
+  }
+  return getLogEntryCopyText(entry);
+}
+
 function resetLogCopyButton(btn) {
   if (!btn) return;
   btn.classList.remove('copied');
@@ -3398,7 +3509,7 @@ async function onLogCopyButtonClick(ev) {
   const btn = ev.currentTarget;
   const entry = btn.closest('.log-entry');
   try {
-    await copyTextToClipboard(getLogEntryCopyText(entry));
+    await copyTextToClipboard(await resolveLogEntryCopyText(entry));
     btn.classList.add('copied');
     btn.innerHTML = '&#x2713;';
     btn.title = 'Copied';

@@ -459,6 +459,10 @@ const contextViz = {
   rotationX: 0.34,
   rotationY: -0.48,
   zoom: 38,
+  // Identity of the analyzed snapshot + timeline shape the current Three
+  // scene was built from; contextBuildThree skips the teardown/rebuild
+  // when it matches (48b-context-viz.js).
+  sceneKey: '',
 };
 
 // analyzeContextSnapshot walks the entire raw payload, which is expensive at

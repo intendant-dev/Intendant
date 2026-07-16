@@ -1626,6 +1626,9 @@ async function stationRefreshDisplayTelemetry(key, pc) {
   if (!pc || typeof pc.getStats !== 'function') return;
   const stats = await pc.getStats();
   const cached = stationDisplayTelemetry.get(key) || {};
+  // Snapshot the DISPLAYED values before folding the fresh sample in: the
+  // completion below only reschedules when they moved.
+  const labelBefore = stationDisplayTelemetryLabel(cached);
   const codecs = new Map();
   const inbound = [];
   stats.forEach(report => {
@@ -1657,7 +1660,13 @@ async function stationRefreshDisplayTelemetry(key, pc) {
     cached.quality = 'steady';
   }
   stationDisplayTelemetry.set(key, cached);
-  stationScheduleUpdate();
+  // Unconditional rescheduling here made the pipeline self-perpetuating:
+  // snapshot build → telemetry poll (1.5 s throttle) → this completion →
+  // schedule (300 ms) → next build → next poll — a full rebuild every
+  // ~1.8 s on an idle Station tab with any stream open. The snapshot only
+  // renders the ROUNDED label, so reschedule only when that label moved;
+  // real fps/codec/quality changes still repaint.
+  if (stationDisplayTelemetryLabel(cached) !== labelBefore) stationScheduleUpdate();
 }
 
 function stationDisplayRunwayPayload(controlsSummary = null) {

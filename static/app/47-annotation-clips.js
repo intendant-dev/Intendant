@@ -2205,19 +2205,31 @@ async function* extractClipFrames(player, inSecs, outSecs, fps, keyframes, annot
     }
 
     const blob = await new Promise(r => captureCanvas.toBlob(r, 'image/jpeg', quality));
-    const b64 = await new Promise(r => {
-      const reader = new FileReader();
-      reader.onload = () => r(reader.result.split(',')[1]);
-      reader.readAsDataURL(blob);
-    });
+    // Raw bytes are the canonical yield: the tunnel lane uploads them
+    // directly, and only the legacy /ws payload and attach data-URLs
+    // derive base64 (clipFrameBase64) — the old per-frame FileReader
+    // base64 round-tripped 20-60 MB per clip through encode → decode.
+    const bytes = new Uint8Array(await blob.arrayBuffer());
 
-    yield { index: i, total: timestamps.length, t, isKeyframe, annotated: hasAnnotation, b64, blob };
+    yield { index: i, total: timestamps.length, t, isKeyframe, annotated: hasAnnotation, bytes, blob };
   }
+}
+
+// Base64 for the lanes that still speak it (legacy /ws media messages,
+// pending-attachment data URLs). Chunked conversion — see
+// dashboardControlBytesToBase64 (50-control-transport.js).
+function clipFrameBase64(frame) {
+  return dashboardControlBytesToBase64(frame.bytes);
 }
 
 async function generateClipPreview() {
   if (clipInSecs === null || clipOutSecs === null || !recPlayer) return;
   const strip = document.getElementById('clip-preview-strip');
+  // Revoke the previous preview's object URLs before discarding the DOM —
+  // innerHTML='' alone pinned every prior strip's frame blobs until unload.
+  strip.querySelectorAll('img[src^="blob:"]').forEach(img => {
+    try { URL.revokeObjectURL(img.src); } catch (_) {}
+  });
   strip.innerHTML = '';
   strip.classList.remove('hidden');
 
@@ -2332,17 +2344,8 @@ async function submitClip(action) {
       progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
 
       const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
-      const framePayload = {
-        t: 'clip_frame',
-        clip_id: clipId,
-        frame_id: frameId,
-        frame_index: frame.index,
-        timestamp_secs: frame.t,
-        is_keyframe: frame.isKeyframe,
-        annotated: frame.annotated,
-        data: frame.b64,
-      };
       if (useMediaTunnel) {
+        // Binary lane: raw bytes straight through — no base64 round trip.
         await uploadDashboardMediaTunnel('api_media_clip_frame', {
           clip_id: clipId,
           frame_id: frameId,
@@ -2350,12 +2353,21 @@ async function submitClip(action) {
           timestamp_secs: frame.t,
           is_keyframe: frame.isKeyframe,
           annotated: frame.annotated,
-        }, dashboardControlBase64ToBytes(frame.b64), 'clip frame');
+        }, frame.bytes, 'clip frame');
       } else {
-        sendLegacyMediaEditorMessage(framePayload);
+        sendLegacyMediaEditorMessage({
+          t: 'clip_frame',
+          clip_id: clipId,
+          frame_id: frameId,
+          frame_index: frame.index,
+          timestamp_secs: frame.t,
+          is_keyframe: frame.isKeyframe,
+          annotated: frame.annotated,
+          data: clipFrameBase64(frame),
+        });
       }
       if (action === 'attach') {
-        sentFrames.push({ frameId, b64: frame.b64 });
+        sentFrames.push({ frameId, b64: clipFrameBase64(frame) });
       }
       frameIndex++;
 

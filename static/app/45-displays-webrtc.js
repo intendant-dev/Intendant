@@ -182,6 +182,24 @@ const DISPLAY_SLOT_POLICY = {
   },
 };
 
+// Presence-stream generations, keyed by DISPLAY id at module level — not on
+// the slot instance. A removed display slot can be re-granted as a brand-new
+// DisplaySlot object whose stream reuses the same display_N identity; an
+// instance-local counter would let the old object's in-flight encode pass
+// its own generation check and emit stale pre-teardown pixels into the new
+// slot's stream. Bumped on every stream start AND on removeDisplaySlot;
+// completions compare against this map.
+const displayStreamGenerations = new Map();
+function displayStreamGeneration(displayId) {
+  return displayStreamGenerations.get(Number(displayId) || 0) || 0;
+}
+function bumpDisplayStreamGeneration(displayId) {
+  const id = Number(displayId) || 0;
+  const next = (displayStreamGenerations.get(id) || 0) + 1;
+  displayStreamGenerations.set(id, next);
+  return next;
+}
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -245,7 +263,12 @@ class DisplaySlot {
     // is waiting for display signaling to return instead of burning its
     // bounded retry budget on offers that cannot leave the browser.
     this._transportWaitTimer = null;
+    // Presence streaming: dedicated capture canvases per lane, sized on
+    // dimension change only (assigning canvas.width reallocates the backing
+    // store — the old single shared canvas paid two reallocations per tick).
     this._streamCanvas = document.createElement('canvas');
+    this._hqStreamCanvas = document.createElement('canvas');
+    this._streamEncodePending = false;
     this._focusResizeObserver = null;
     this._boundHandlers = {};
     this._fullscreenInertRecords = [];
@@ -1407,60 +1430,116 @@ class DisplaySlot {
   toggleStreaming() {
     if (this.streaming) { this.stopStreaming(); } else { this.startStreaming(); }
   }
+  // Size a capture canvas once per dimension change — width/height
+  // assignment reallocates the backing store even when the value is equal
+  // in some engines, so guard both.
+  static _sizeCanvas(canvas, w, h) {
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+  }
+  // Async JPEG→base64: toBlob lets the browser encode off the main thread
+  // where it can; only the byte→base64 conversion (chunked) stays on it.
+  // The old toDataURL path blocked the main thread for encode AND base64
+  // (~10-40 ms/tick at retina), on the same thread as remote-control input.
+  static _canvasJpegBase64(canvas, quality) {
+    return new Promise((resolve, reject) => {
+      if (typeof canvas.toBlob !== 'function') {
+        resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+        return;
+      }
+      canvas.toBlob(blob => {
+        if (!blob) { reject(new Error('canvas JPEG encode failed')); return; }
+        blob.arrayBuffer()
+          .then(buf => resolve(dashboardControlBytesToBase64(new Uint8Array(buf))))
+          .catch(reject);
+      }, 'image/jpeg', quality);
+    });
+  }
   startStreaming() {
     if (this.streaming || !this.connected) return;
     this.streaming = true;
+    // New generation for this DISPLAY id (module-level; see the map above):
+    // late completions from a previous run — same slot object or a removed
+    // predecessor — compare against it and drop; the pending flag belongs
+    // to the new run (a leftover true from a stopped run must not eat the
+    // first ticks).
+    const gen = bumpDisplayStreamGeneration(this.displayId);
+    this._streamEncodePending = false;
     this.streamBtn.classList.add('active');
     this.streamBtn.setAttribute('aria-pressed', 'true');
     this.streamBtn.innerHTML = '&#x1F441; Streaming';
     this.frameIdEl.style.display = '';
     const streamName = 'display_' + this.displayId;
-    const ctx = this._streamCanvas.getContext('2d');
+    const liveCtx = this._streamCanvas.getContext('2d');
+    const hqCtx = this._hqStreamCanvas.getContext('2d');
     this._streamIntervalId = setInterval(() => {
       if (!this.streaming || !this.connected || !app) return;
       const vid = this.videoEl;
       if (!vid.videoWidth || !vid.videoHeight) return;
+      // Last tick's encode still in flight (slow machine / huge retina
+      // frame): skip this tick instead of stacking encodes.
+      if (this._streamEncodePending) return;
       const sw = vid.videoWidth;
       const sh = vid.videoHeight;
       this._streamFrameCounter++;
       const frameId = streamName + '-f' + String(this._streamFrameCounter).padStart(5, '0');
       // Live-res: scale to LIVE_RES maintaining aspect ratio within a square
       const scale = Math.min(LIVE_RES / sw, LIVE_RES / sh);
-      const lw = Math.round(sw * scale);
-      const lh = Math.round(sh * scale);
-      this._streamCanvas.width = lw;
-      this._streamCanvas.height = lh;
-      ctx.drawImage(vid, 0, 0, lw, lh);
-      const liveJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.8);
-      const liveB64 = liveJpeg.split(',')[1];
-      // Skip duplicate frames for voice model — still send HQ to server for archival
-      const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
-      const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
-      if (!frameDup) {
-        this._lastFrameLen = liveB64.length;
-        app.send_frame(liveB64, frameId);
-        this.frameIdEl.textContent = frameId.split('-').pop();
-        this.frameIdEl.style.color = 'var(--overlay0)';
-        tickerFramesSent++;
-      } else {
-        this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
-        this.frameIdEl.style.color = 'var(--yellow)';
-        tickerFramesDropped++;
-        sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
-      }
-      // HQ: logical resolution — always sent for archival
+      DisplaySlot._sizeCanvas(this._streamCanvas, Math.round(sw * scale), Math.round(sh * scale));
+      liveCtx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
+      // HQ: logical resolution — always sent for archival. Drawn in the
+      // same tick as the live lane so both lanes capture the same instant.
       const dpr = window.devicePixelRatio || 1;
-      this._streamCanvas.width = Math.round(sw / dpr);
-      this._streamCanvas.height = Math.round(sh / dpr);
-      ctx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
-      const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.80);
-      const hqB64 = hqJpeg.split(',')[1];
-      sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+      DisplaySlot._sizeCanvas(this._hqStreamCanvas, Math.round(sw / dpr), Math.round(sh / dpr));
+      hqCtx.drawImage(vid, 0, 0, this._hqStreamCanvas.width, this._hqStreamCanvas.height);
+      this._streamEncodePending = true;
+      Promise.all([
+        DisplaySlot._canvasJpegBase64(this._streamCanvas, 0.8),
+        DisplaySlot._canvasJpegBase64(this._hqStreamCanvas, 0.80),
+      ]).then(([liveB64, hqB64]) => {
+        // Restarted since capture — by this slot object, or by a new slot
+        // re-granted the same display id after this one was removed: these
+        // pixels belong to the retired sequence, never emit them.
+        if (gen !== displayStreamGeneration(this.displayId)) return;
+        // Stopped (not restarted): the frame captured pre-stop pixels —
+        // still deliver it (it is the stream's final frame), but leave the
+        // torn-down chrome (frame-id chip) alone.
+        const chromeLive = this.streaming;
+        // Skip duplicate frames for voice model — still send HQ to server for archival
+        const sizeDelta = Math.abs(liveB64.length - (this._lastFrameLen || 0)) / (this._lastFrameLen || 1);
+        const frameDup = sizeDelta < 0.02 && this._lastFrameLen > 0;
+        if (!frameDup) {
+          this._lastFrameLen = liveB64.length;
+          app.send_frame(liveB64, frameId);
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop();
+            this.frameIdEl.style.color = 'var(--overlay0)';
+          }
+          tickerFramesSent++;
+        } else {
+          if (chromeLive) {
+            this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
+            this.frameIdEl.style.color = 'var(--yellow)';
+          }
+          tickerFramesDropped++;
+          sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
+        }
+        sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
+      }).catch(err => {
+        console.warn('[DisplaySlot] stream frame encode failed', err);
+      }).finally(() => {
+        // Only the live generation may clear its own pending flag — a late
+        // completion must not unblock (or race) a restarted stream's ticks.
+        if (gen === displayStreamGeneration(this.displayId)) this._streamEncodePending = false;
+      });
     }, 1000);
   }
   stopStreaming() {
     this.streaming = false;
     if (this._streamIntervalId) { clearInterval(this._streamIntervalId); this._streamIntervalId = null; }
+    // The in-flight encode (if any) still delivers its final frame above;
+    // the flag itself must not leak into a subsequent start.
+    this._streamEncodePending = false;
     this.streamBtn.classList.remove('active');
     this.streamBtn.setAttribute('aria-pressed', 'false');
     this.streamBtn.innerHTML = '&#x1F441; Stream';
@@ -1723,6 +1802,11 @@ function removeDisplaySlot(displayId) {
   slot.disconnect({ userInitiated: true });
   if (slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
   displaySlots.delete(displayId);
+  // Invalidate the removed slot's stream generation: an in-flight encode
+  // from this slot must not deliver into a successor slot that reuses the
+  // display_N stream identity (the plain stop path deliberately still
+  // delivers its final frame; removal does not).
+  bumpDisplayStreamGeneration(displayId);
   if (typeof window.retireLiveDisplayWorkspaceSlot === 'function') {
     window.retireLiveDisplayWorkspaceSlot(displayId);
   }
@@ -3384,9 +3468,34 @@ function applyDisplayStripState() {
     railRaf = requestAnimationFrame(renderWorkspace);
   }
 
-  function observe(element, options) {
+  // Self-feed filter: the 3 s getStats sampler writes the metrics chip and
+  // the 1 Hz presence-stream tick writes the frame-id chip — both INSIDE
+  // the observed container — so every sample re-rendered the whole rail
+  // forever, even on a tab the user wasn't looking at. Mutations that only
+  // touch those periodic chips are dropped here; every rail-visible state
+  // they correlate with (streaming class flips, status text, connection
+  // classes) still arrives through its own mutation. characterData records
+  // target TEXT nodes — classify by the parent element.
+  const RAIL_SELF_FEED_SELECTOR = '.display-live-metrics, .stream-frame-id';
+  function railMutationIgnored(record) {
+    const target = record.target;
+    const el = target.nodeType === 1 ? target : target.parentElement;
+    return Boolean(el && el.closest && el.closest(RAIL_SELF_FEED_SELECTOR));
+  }
+  function observe(element, options, filterSelfFeed = false) {
     if (!element) return;
-    new MutationObserver(scheduleWorkspace).observe(element, options);
+    if (!filterSelfFeed) {
+      new MutationObserver(scheduleWorkspace).observe(element, options);
+      return;
+    }
+    new MutationObserver((records) => {
+      for (const record of records) {
+        if (!railMutationIgnored(record)) {
+          scheduleWorkspace();
+          return;
+        }
+      }
+    }).observe(element, options);
   }
   // The observer catches legacy direct DOM writes without rebuilding the
   // rail. Keyed rows and stable authority/screen controls preserve focus;
@@ -3398,7 +3507,7 @@ function applyDisplayStripState() {
     characterData: true,
     attributes: true,
     attributeFilter: ['class', 'style', 'aria-pressed', 'disabled'],
-  });
+  }, true);
   observe(document.getElementById('station-peer-chips'), {
     subtree: true,
     childList: true,

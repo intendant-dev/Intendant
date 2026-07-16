@@ -392,20 +392,10 @@ function renderFilesIdeTree() {
     );
   }
   container.innerHTML = html.join('') || '<div class="files-ide-tree-notice">Empty directory</div>';
-  container.querySelectorAll('.files-ide-tree-row').forEach(rowEl => {
-    const path = rowEl.dataset.path || '';
-    const isDir = rowEl.dataset.dir === '1';
-    const open = () => (isDir ? filesIdeToggleDir(path) : filesIdeOpenFile(filesIdeSelectedHostId(), path));
-    rowEl.addEventListener('click', ev => {
-      if (ev.target.closest('.files-ide-row-act')) return;
-      state.focusedPath = path; // keep the roving tab stop on the clicked row
-      open();
-    });
-    // Keyboard activation (Enter/Space) rides the delegated container
-    // listener (filesIdeTreeKeydown), not a per-row handler.
-    rowEl.querySelector('[data-act="rename"]')?.addEventListener('click', () => filesIdeBeginRename(path, isDir));
-    rowEl.querySelector('[data-act="delete"]')?.addEventListener('click', () => filesIdeDeleteRequested(path, isDir));
-  });
+  // Row and action clicks ride ONE delegated container listener
+  // (filesIdeTreeClick), exactly like keydown always has — the per-row
+  // wiring this replaces attached three fresh listeners per row on every
+  // rebuild (each expand/collapse/arrow-key near the 500-entry cap).
   // Re-renders triggered from the keyboard (expand/collapse/arming) must
   // not dump focus onto <body>: put it back on the roving row. The create
   // and rename inputs are focused below and win when present.
@@ -524,11 +514,37 @@ function filesIdeTreeKeydown(ev) {
   ev.preventDefault();
 }
 
+// Delegated click twin of filesIdeTreeKeydown: rows are re-rendered
+// wholesale via innerHTML, so per-row listeners cost three attaches per row
+// per render. Same guards as the old per-row handlers — action buttons
+// resolve before the row, and clicks inside create/rename inputs fall
+// through to the fields.
+function filesIdeTreeClick(ev) {
+  const target = ev.target instanceof Element ? ev.target : null;
+  if (!target || target.closest('input, textarea')) return;
+  const row = target.closest('.files-ide-tree-row');
+  if (!row) return;
+  const path = row.dataset.path || '';
+  const isDir = row.dataset.dir === '1';
+  const act = target.closest('.files-ide-row-act');
+  if (act) {
+    if (act.dataset.act === 'rename') filesIdeBeginRename(path, isDir);
+    else if (act.dataset.act === 'delete') filesIdeDeleteRequested(path, isDir);
+    return;
+  }
+  const state = filesIdeTreeState(filesIdeSelectedHostId());
+  state.focusedPath = path; // keep the roving tab stop on the clicked row
+  if (isDir) filesIdeToggleDir(path);
+  else filesIdeOpenFile(filesIdeSelectedHostId(), path);
+}
+
 // The container survives renders (only its innerHTML is rebuilt), so this
 // attaches exactly once. DOMContentLoaded per the shared-module-script
 // convention for wiring.
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('files-ide-tree')?.addEventListener('keydown', filesIdeTreeKeydown);
+  const tree = document.getElementById('files-ide-tree');
+  tree?.addEventListener('keydown', filesIdeTreeKeydown);
+  tree?.addEventListener('click', filesIdeTreeClick);
 });
 
 function filesIdeBeginCreate(kind) {

@@ -367,6 +367,11 @@ function filesTransferPersistable(transfer) {
 }
 
 function filesTransferPersistState() {
+  // A direct persist supersedes any scheduled one.
+  if (filesTransferPersistTimer) {
+    clearTimeout(filesTransferPersistTimer);
+    filesTransferPersistTimer = 0;
+  }
   try {
     const state = filesTransfers
       .map(filesTransferPersistable)
@@ -377,6 +382,24 @@ function filesTransferPersistState() {
     console.warn('Persist transfer state failed:', err);
   }
 }
+
+// Trailing-throttled twin for the per-chunk progress paths: a fast LAN
+// download lands ~50 chunks/s, and each chunk used to JSON.stringify up to
+// 50 transfer records into a synchronous localStorage.setItem. Progress
+// coalesces to ≤1 write/s; status transitions keep the immediate form, and
+// chunk-level resume state already lives durably in IndexedDB (losing ≤1 s
+// of rangeCount on a crash just re-fetches that tail on resume).
+let filesTransferPersistTimer = 0;
+function filesTransferPersistStateSoon() {
+  if (filesTransferPersistTimer) return;
+  filesTransferPersistTimer = window.setTimeout(() => {
+    filesTransferPersistTimer = 0;
+    filesTransferPersistState();
+  }, 1000);
+}
+window.addEventListener('pagehide', () => {
+  if (filesTransferPersistTimer) filesTransferPersistState();
+});
 
 function restoreFilesTransferState() {
   let state = [];
@@ -929,74 +952,143 @@ function renderFilesTransfers() {
     renderFilesTransfersNow();
   });
 }
+// Keyed rows, patched in place. The rAF-coalesced full rebuild above still
+// rebuilt EVERY row — titles, meters, fresh action buttons for ~100 history
+// entries — per animation frame during a fast download. A row's structure
+// (status classes, actions, title) rebuilds only when its structure
+// signature moves; per-chunk progress patches just the meta text and meter
+// width on the existing nodes.
+const filesTransferRowCache = new Map(); // transfer.id → { row, meta, fill, sig }
+
+function filesTransferRowStructureSig(transfer) {
+  return [
+    transfer.status || 'queued',
+    transfer.kind || '',
+    transfer.serverJobId || transfer.resumeToken ? 'server' : '',
+    filesTransferTitle(transfer),
+    transfer.sourceLabel || transfer.path || transfer.file?.name || '',
+    transfer.error || '',
+    transfer.destination || '',
+    // Action-set inputs beyond status/kind:
+    (transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored) ? 'resumable-upload' : '',
+    transfer.loaded > 0 ? 'has-progress' : '',
+    transfer.result?.blob ? 'has-blob' : '',
+    transfer.rangeCount > 0 ? 'has-ranges' : '',
+  ].join('|');
+}
+
+function filesTransferRowMetaText(transfer) {
+  const direction = transfer.kind === 'upload' ? 'upload' : 'download';
+  const range = transfer.kind === 'download' && transfer.rangeCount
+    ? ` · ${transfer.rangeCount} range${transfer.rangeCount === 1 ? '' : 's'}`
+    : '';
+  const error = transfer.error ? ` · ${transfer.error}` : '';
+  const destination = transfer.kind === 'upload' && transfer.destination ? ` · ${transfer.destination}` : '';
+  const sourceText = transfer.kind === 'download' ? (transfer.sourceLabel || transfer.path || '') : '';
+  const source = sourceText ? ` · ${sourceText}` : '';
+  return `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${destination}${source}${error}`;
+}
+
+function filesTransferMeterWidth(transfer) {
+  const total = Number(transfer.totalSize || transfer.file?.size || 0);
+  const loaded = Number(transfer.loaded || 0);
+  return total > 0 ? `${Math.max(0, Math.min(100, loaded * 100 / total))}%` : '0%';
+}
+
+function buildFilesTransferRow(transfer) {
+  const row = document.createElement('div');
+  row.className = `files-transfer-row ${transfer.status || 'queued'}${transfer.serverJobId || transfer.resumeToken ? ' server' : ''}`;
+  row.dataset.transferId = transfer.id;
+  const main = document.createElement('div');
+  main.className = 'files-transfer-main';
+  const title = document.createElement('div');
+  title.className = 'files-transfer-title';
+  title.textContent = filesTransferTitle(transfer);
+  title.title = transfer.sourceLabel || transfer.path || transfer.file?.name || '';
+  const meta = document.createElement('div');
+  meta.className = 'files-transfer-meta';
+  meta.textContent = filesTransferRowMetaText(transfer);
+  const meter = document.createElement('div');
+  meter.className = 'files-transfer-meter';
+  const fill = document.createElement('div');
+  fill.className = 'files-transfer-meter-fill';
+  fill.style.width = filesTransferMeterWidth(transfer);
+  meter.appendChild(fill);
+  main.append(title, meta, meter);
+  const actions = document.createElement('div');
+  actions.className = 'files-transfer-actions';
+  const addAction = (label, handler, className = '') => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = label;
+    btn.className = className ? `ui-btn ${className}` : 'ui-btn';
+    btn.addEventListener('click', () => handler(transfer.id));
+    actions.appendChild(btn);
+  };
+  const canResumeUpload = transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored;
+  if (transfer.status === 'running' && transfer.kind === 'download') addAction('Pause', pauseFilesTransfer);
+  if (transfer.status === 'running') addAction('Cancel', cancelFilesTransfer, 'danger');
+  if (transfer.status === 'queued') addAction('Cancel', cancelFilesTransfer, 'danger');
+  if (transfer.status === 'paused' && canResumeUpload) addAction('Resume', resumeFilesTransfer);
+  if (transfer.status === 'failed' && transfer.kind === 'download' && transfer.loaded > 0) addAction('Resume', resumeFilesTransfer);
+  if (['failed', 'cancelled'].includes(transfer.status)) addAction('Retry', retryFilesTransfer);
+  if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.result?.blob) {
+    addAction('Save', () => downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type));
+  } else if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.rangeCount > 0) {
+    addAction('Save', saveCompletedFilesDownload);
+  }
+  row.append(main, actions);
+  return { row, meta, fill };
+}
+
 function renderFilesTransfersNow() {
   pruneFinishedFilesTransfers();
   const list = document.getElementById('files-transfer-list');
   if (!list) return;
-  list.innerHTML = '';
   if (filesTransfers.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'files-transfer-empty ui-empty compact';
-    empty.innerHTML = '<div class="ui-empty-title">No transfers</div>' +
-      '<div class="ui-empty-hint">Downloads and uploads show up here with live progress.</div>';
-    list.appendChild(empty);
+    filesTransferRowCache.clear();
+    if (!list.querySelector('.files-transfer-empty')) {
+      list.innerHTML = '';
+      const empty = document.createElement('div');
+      empty.className = 'files-transfer-empty ui-empty compact';
+      empty.innerHTML = '<div class="ui-empty-title">No transfers</div>' +
+        '<div class="ui-empty-hint">Downloads and uploads show up here with live progress.</div>';
+      list.appendChild(empty);
+    }
     return;
   }
-  for (const transfer of filesTransfers) {
-    const row = document.createElement('div');
-    row.className = `files-transfer-row ${transfer.status || 'queued'}${transfer.serverJobId || transfer.resumeToken ? ' server' : ''}`;
-    row.dataset.transferId = transfer.id;
-    const main = document.createElement('div');
-    main.className = 'files-transfer-main';
-    const title = document.createElement('div');
-    title.className = 'files-transfer-title';
-    title.textContent = filesTransferTitle(transfer);
-    title.title = transfer.sourceLabel || transfer.path || transfer.file?.name || '';
-    const meta = document.createElement('div');
-    meta.className = 'files-transfer-meta';
-    const direction = transfer.kind === 'upload' ? 'upload' : 'download';
-    const range = transfer.kind === 'download' && transfer.rangeCount
-      ? ` · ${transfer.rangeCount} range${transfer.rangeCount === 1 ? '' : 's'}`
-      : '';
-    const error = transfer.error ? ` · ${transfer.error}` : '';
-    const destination = transfer.kind === 'upload' && transfer.destination ? ` · ${transfer.destination}` : '';
-    const sourceText = transfer.kind === 'download' ? (transfer.sourceLabel || transfer.path || '') : '';
-    const source = sourceText ? ` · ${sourceText}` : '';
-    meta.textContent = `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${destination}${source}${error}`;
-    const meter = document.createElement('div');
-    meter.className = 'files-transfer-meter';
-    const fill = document.createElement('div');
-    fill.className = 'files-transfer-meter-fill';
-    const total = Number(transfer.totalSize || transfer.file?.size || 0);
-    const loaded = Number(transfer.loaded || 0);
-    fill.style.width = total > 0 ? `${Math.max(0, Math.min(100, loaded * 100 / total))}%` : '0%';
-    meter.appendChild(fill);
-    main.append(title, meta, meter);
-    const actions = document.createElement('div');
-    actions.className = 'files-transfer-actions';
-    const addAction = (label, handler, className = '') => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = label;
-      btn.className = className ? `ui-btn ${className}` : 'ui-btn';
-      btn.addEventListener('click', () => handler(transfer.id));
-      actions.appendChild(btn);
-    };
-    const canResumeUpload = transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored;
-    if (transfer.status === 'running' && transfer.kind === 'download') addAction('Pause', pauseFilesTransfer);
-    if (transfer.status === 'running') addAction('Cancel', cancelFilesTransfer, 'danger');
-    if (transfer.status === 'queued') addAction('Cancel', cancelFilesTransfer, 'danger');
-    if (transfer.status === 'paused' && canResumeUpload) addAction('Resume', resumeFilesTransfer);
-    if (transfer.status === 'failed' && transfer.kind === 'download' && transfer.loaded > 0) addAction('Resume', resumeFilesTransfer);
-    if (['failed', 'cancelled'].includes(transfer.status)) addAction('Retry', retryFilesTransfer);
-    if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.result?.blob) {
-      addAction('Save', () => downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type));
-    } else if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.rangeCount > 0) {
-      addAction('Save', saveCompletedFilesDownload);
+  list.querySelector('.files-transfer-empty')?.remove();
+  const liveIds = new Set(filesTransfers.map(t => t.id));
+  for (const [id, record] of filesTransferRowCache) {
+    if (!liveIds.has(id)) {
+      record.row.remove();
+      filesTransferRowCache.delete(id);
     }
-    row.append(main, actions);
-    list.appendChild(row);
   }
+  const orderedRows = [];
+  for (const transfer of filesTransfers) {
+    const sig = filesTransferRowStructureSig(transfer);
+    let record = filesTransferRowCache.get(transfer.id);
+    if (!record || record.sig !== sig) {
+      const built = buildFilesTransferRow(transfer);
+      if (record) record.row.replaceWith(built.row);
+      record = { ...built, sig };
+      filesTransferRowCache.set(transfer.id, record);
+    } else {
+      // Progress-only tick: meta text + meter width, guarded writes.
+      const metaText = filesTransferRowMetaText(transfer);
+      if (record.meta.textContent !== metaText) record.meta.textContent = metaText;
+      const width = filesTransferMeterWidth(transfer);
+      if (record.fill.style.width !== width) record.fill.style.width = width;
+    }
+    orderedRows.push(record.row);
+  }
+  // Reconcile order/membership only when it actually changed — moving
+  // nodes re-appends them (listeners survive, but focus does not).
+  const currentRows = Array.from(list.children).filter(el => el.classList.contains('files-transfer-row'));
+  const orderMatches = currentRows.length === orderedRows.length &&
+    currentRows.every((el, i) => el === orderedRows[i]);
+  if (!orderMatches) list.replaceChildren(...orderedRows);
 }
 
 function filesUpdateActiveDownloadSummary(transfer = null) {
@@ -1104,6 +1196,11 @@ function queueDashboardArtifactDownload(artifact, options = {}) {
 }
 
 function resetFilesDownloadTransfer(transfer) {
+  // Capture before zeroing: the persisted rangeCount bounds the IndexedDB
+  // cleanup — the unconditional 512 default issued up to 512 sequential
+  // no-op deletes per reset (IDB delete succeeds on missing keys, so the
+  // early-break never fired).
+  const rangeCount = Number(transfer.rangeCount || 0) || 512;
   transfer.loaded = 0;
   transfer.totalSize = 0;
   transfer.parts = [];
@@ -1116,7 +1213,7 @@ function resetFilesDownloadTransfer(transfer) {
   transfer.cancelRequested = false;
   transfer.abortController = null;
   transfer.debugFailedOnce = false;
-  filesTransferDeleteDownloadParts(transfer.id, 512);
+  filesTransferDeleteDownloadParts(transfer.id, rangeCount);
   filesTransferPersistState();
 }
 
@@ -1320,7 +1417,7 @@ async function runFilesDownloadTransfer(transfer) {
       transfer.parts.push(range.bytes);
       transfer.loaded = range.rangeEnd;
       transfer.rangeCount += 1;
-      filesTransferPersistState();
+      filesTransferPersistStateSoon();
       if (typeof transfer.onProgress === 'function') {
         transfer.onProgress({
           loaded: transfer.loaded,
@@ -1377,7 +1474,6 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
   const result = {
     ok: true,
     blob,
-    parts: transfer.parts.slice(),
     filename: transfer.filename || 'download.bin',
     content_type: transfer.contentType,
     size: blob.size,
@@ -1387,6 +1483,14 @@ function settleCompletedFilesDownload(transfer, { resumable }) {
     range_count: transfer.rangeCount,
     resumable,
   };
+  // Drop the raw chunk arrays now that the Blob owns a snapshot of the
+  // bytes: keeping transfer.parts (plus a second result.parts copy of the
+  // same references) pinned the entire download in JS heap for as long as
+  // the terminal transfer sat in history — one 512 MB download held ~1 GB
+  // until reload. The chunks are durably in IndexedDB; Save-after-eviction
+  // rehydrates through filesTransferLoadDownloadParts, and completion
+  // consumers read result.blob, which stays.
+  transfer.parts = [];
   transfer.result = result;
   filesTransferTransition(transfer, 'completed', { actor: 'runner', result });
   setFilesDownloadProgress(result.size, result.total_size || result.size);
@@ -1749,7 +1853,7 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     filesTransferApplyServerJob(transfer, result.body.job);
     transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
-    filesTransferPersistState();
+    filesTransferPersistStateSoon();
     renderFilesTransfers();
     setFilesUploadStatus('warn', `Uploading ${filesTransferProgressText(transfer)}`);
     if (
