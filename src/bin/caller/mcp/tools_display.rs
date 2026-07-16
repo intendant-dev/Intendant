@@ -979,8 +979,11 @@ impl IntendantServer {
         )
         .await;
 
-        if let Some(result) = outcome.results.first() {
-            if let Some(ref screenshot) = result.screenshot {
+        // Take the result by value: the base64 PNG runs 1-5 MB and the
+        // outcome is owned locally, so move it into the response instead of
+        // cloning it.
+        if let Some(result) = outcome.results.into_iter().next() {
+            if let Some(screenshot) = result.screenshot {
                 clear_wayland_user_session_activation_pending_after_capture(
                     &self.state,
                     target,
@@ -998,10 +1001,10 @@ impl IntendantServer {
                 }
                 return Ok(image_tool_result(
                     metadata.to_string(),
-                    screenshot.base64_png.clone(),
+                    screenshot.base64_png,
                 ));
             }
-            if let Some(ref err) = result.error {
+            if let Some(err) = result.error {
                 let message = match activation_request.hint() {
                     Some(hint) => format!("{hint}\nScreenshot error: {err}"),
                     None => format!("Screenshot error: {}", err),
@@ -1191,7 +1194,7 @@ impl IntendantServer {
             annotate: params.annotate.unwrap_or(false),
             settle: params.settle.and_then(|s| s.resolve()),
         };
-        let outcome = execute_actions(
+        let mut outcome = execute_actions(
             &actions,
             target,
             backend,
@@ -1267,7 +1270,15 @@ impl IntendantServer {
         // tree rides inline as text; for compact (managed-context) callers
         // that is the whole win — an actual observation instead of a
         // stripped image.
-        let last_screenshot = outcome.last_screenshot();
+        // Same selection as `outcome.last_screenshot()`, but taken by value:
+        // the base64 PNG runs 1-5 MB and nothing reads the results'
+        // screenshots after this point, so move it into the response instead
+        // of cloning it.
+        let last_screenshot = outcome
+            .results
+            .iter_mut()
+            .rev()
+            .find_map(|result| result.screenshot.take());
         if let Some(ss) = last_screenshot {
             clear_wayland_user_session_activation_pending_after_capture(
                 &self.state,
@@ -1296,9 +1307,9 @@ impl IntendantServer {
                 });
             }
             return Ok(if all_failed {
-                image_tool_error(summaries.join("\n"), ss.base64_png.clone())
+                image_tool_error(summaries.join("\n"), ss.base64_png)
             } else {
-                image_tool_result(summaries.join("\n"), ss.base64_png.clone())
+                image_tool_result(summaries.join("\n"), ss.base64_png)
             });
         }
 

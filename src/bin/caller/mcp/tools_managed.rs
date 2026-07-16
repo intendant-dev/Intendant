@@ -960,6 +960,10 @@ impl IntendantServer {
             })
             .to_string();
         }
+        self.state
+            .read()
+            .await
+            .invalidate_controller_loop_raw_status_cache();
         collect_controller_loop_status(&loop_dir).to_string()
     }
 
@@ -973,6 +977,10 @@ impl IntendantServer {
             })
             .to_string();
         }
+        self.state
+            .read()
+            .await
+            .invalidate_controller_loop_raw_status_cache();
         collect_controller_loop_status(&loop_dir).to_string()
     }
 
@@ -986,6 +994,10 @@ impl IntendantServer {
         let loop_dir = controller_loop_dir();
         match request_loop_intervention_marker(&loop_dir, &params.mode) {
             Ok(intervention) => {
+                self.state
+                    .read()
+                    .await
+                    .invalidate_controller_loop_raw_status_cache();
                 let mut status = collect_controller_loop_status(&loop_dir);
                 add_controller_loop_intervention_report(&mut status, &intervention);
                 serde_json::json!({

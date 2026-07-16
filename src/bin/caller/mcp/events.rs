@@ -126,6 +126,59 @@ pub(crate) fn codex_thread_action_result_targets_session(
 /// [`McpAppState`], exactly as the TUI's `handle_event` does.
 ///
 /// Returns a handle for cleanup.
+/// How long resource-update notifications are coalesced before flushing.
+/// During output bursts every fold-loop event used to produce an immediate
+/// per-event stdout JSON-RPC write (and a conforming client re-reads the
+/// resource per notification); one debounced notification per URI per window
+/// carries the same information.
+const RESOURCE_NOTIFY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Upper bound on one notification flush. Notifications are best-effort by
+/// design: an open-but-not-draining peer (a wedged stdio reader) must not
+/// park the listener — and especially not a teardown flush — indefinitely;
+/// on expiry the remaining notifications are dropped.
+const RESOURCE_NOTIFY_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Send `notifications/resources/updated` for every dirty URI the client
+/// subscribed to, then clear the dirty set. Unsubscribed URIs are dropped:
+/// resource notifications are subscription-scoped in MCP, so a client that
+/// never subscribes no longer receives (and re-reads on) unsolicited spam.
+/// Bounded by [`RESOURCE_NOTIFY_FLUSH_BUDGET`] — best effort, never a park.
+async fn flush_resource_notifications(
+    state: &SharedMcpState,
+    peer: &Arc<Mutex<Option<rmcp::Peer<RoleServer>>>>,
+    dirty: &mut std::collections::HashSet<String>,
+) {
+    if dirty.is_empty() {
+        return;
+    }
+    let mut subscribed: Vec<String> = {
+        let s = state.read().await;
+        dirty
+            .iter()
+            .filter(|uri| s.subscribed_resource_uris.contains(*uri))
+            .cloned()
+            .collect()
+    };
+    dirty.clear();
+    if subscribed.is_empty() {
+        return;
+    }
+    subscribed.sort();
+    let send_all = async {
+        let peer_guard = peer.lock().await;
+        let Some(ref p) = *peer_guard else {
+            return;
+        };
+        for uri in subscribed {
+            let _ = p
+                .notify_resource_updated(ResourceUpdatedNotificationParam { uri })
+                .await;
+        }
+    };
+    let _ = tokio::time::timeout(RESOURCE_NOTIFY_FLUSH_BUDGET, send_all).await;
+}
+
 pub fn spawn_event_listener(
     state: SharedMcpState,
     mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
@@ -135,11 +188,42 @@ pub fn spawn_event_listener(
     control_tx: Option<broadcast::Sender<String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut dirty_resources: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut flush_deadline: Option<tokio::time::Instant> = None;
         loop {
-            let event = match event_rx.recv().await {
-                Ok(event) => event,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            let event = tokio::select! {
+                event = event_rx.recv() => match event {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Liveness note: this arm is UNREACHABLE in the
+                        // production wiring. This task owns `bus` (an
+                        // EventBus holding a `broadcast::Sender<AppEvent>`)
+                        // for its whole life to serve deferred control
+                        // commands, and a broadcast receiver only reports
+                        // Closed once every sender is dropped — our own
+                        // clone keeps the channel open. Real teardown is
+                        // process exit (`run_mcp_server` detaches the
+                        // JoinHandle), where the stdio peer is gone anyway;
+                        // the reachable final-flush seam is the should_quit
+                        // check after control commands below. Kept as
+                        // defense in depth for a future wiring where the
+                        // listener no longer holds a sender.
+                        flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                        break;
+                    }
+                },
+                // NOTE: the async expression is evaluated even when the
+                // precondition is false, so the disabled arm must not
+                // unwrap a missing deadline.
+                _ = tokio::time::sleep_until(
+                    flush_deadline.unwrap_or_else(tokio::time::Instant::now),
+                ), if flush_deadline.is_some() => {
+                    flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                    flush_deadline = None;
+                    continue;
+                }
             };
             let mut resource_changed: Option<&str> = None;
             let mut deferred_control_msg: Option<ControlMsg> = None;
@@ -390,6 +474,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         message,
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(
@@ -454,6 +539,7 @@ pub fn spawn_event_listener(
                         reason,
                         ..
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(LogLevel::Info, format!("Task complete: {}", reason));
@@ -482,6 +568,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::SafetyCapReached => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Error,
@@ -491,6 +578,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::LoopError(msg) => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Done);
                         s.push_log(LogLevel::Error, format!("Error: {}", msg));
                         resource_changed = Some("intendant://status");
@@ -781,6 +869,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref task,
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.session_id = session_id.clone();
                         s.task_description = task.clone().unwrap_or_default();
                         s.turn = 0;
@@ -926,6 +1015,7 @@ pub fn spawn_event_listener(
                         ref reason,
                         ..
                     } => {
+                        s.note_live_session_lifecycle_change();
                         s.set_phase(Phase::Interrupted);
                         s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
@@ -1048,23 +1138,31 @@ pub fn spawn_event_listener(
                 }
             }
 
+            // Mark changed resources dirty and coalesce the notifications:
+            // both the event's own resource and a control command's are
+            // recorded (the historical single slot dropped the first when a
+            // deferred control command followed in the same iteration).
+            if let Some(uri) = resource_changed {
+                dirty_resources.insert(uri.to_string());
+            }
+            let mut control_processed = false;
             if let Some(msg) = deferred_control_msg {
+                control_processed = true;
                 if let Some(uri) = handle_control_command_mcp(&state, &bus, &control_tx, msg).await
                 {
-                    resource_changed = Some(uri);
+                    dirty_resources.insert(uri.to_string());
                 }
             }
-
-            // Send resource update notification if something changed
-            if let Some(uri) = resource_changed {
-                let peer_guard = peer.lock().await;
-                if let Some(ref p) = *peer_guard {
-                    let _ = p
-                        .notify_resource_updated(ResourceUpdatedNotificationParam {
-                            uri: uri.to_string(),
-                        })
-                        .await;
-                }
+            // The Quit control command is the only in-process teardown seam
+            // this task can observe (the channel cannot close under us —
+            // see the Closed-arm note): flush pending notifications now
+            // instead of letting the process exit inside the debounce
+            // window.
+            if control_processed && state.read().await.should_quit {
+                flush_resource_notifications(&state, &peer, &mut dirty_resources).await;
+                flush_deadline = None;
+            } else if !dirty_resources.is_empty() && flush_deadline.is_none() {
+                flush_deadline = Some(tokio::time::Instant::now() + RESOURCE_NOTIFY_DEBOUNCE);
             }
         }
     })
@@ -1151,6 +1249,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             raw,
         ),
         AppEvent::SessionStarted { session_id, task } => {
+            s.note_live_session_lifecycle_change();
             s.session_id = session_id.clone();
             s.task_description = task.clone().unwrap_or_default();
             s.turn = 0;
@@ -1281,6 +1380,7 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             true
         }
         AppEvent::DoneSignal { session_id, .. } | AppEvent::TaskComplete { session_id, .. } => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Done);
             s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
             true
@@ -1310,11 +1410,13 @@ pub(crate) fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &App
             true
         }
         AppEvent::Interrupted { session_id, .. } => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Interrupted);
             s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
             true
         }
         AppEvent::LoopError(_) => {
+            s.note_live_session_lifecycle_change();
             s.set_phase(Phase::Done);
             true
         }
@@ -1477,9 +1579,28 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         return false;
     }
 
+    // Snapshot/restore bracket for the daemon-global scalars a replay fold
+    // can write. Audited against every AppEvent the replay converter can
+    // produce whose applier arm writes globals (SessionIdentity,
+    // SessionCapabilities, ContextSnapshot, SessionStarted, TurnStarted,
+    // AgentStarted/AgentOutput, DoneSignal/TaskComplete, ApprovalRequired,
+    // RoundComplete, SessionEnded): turn, ROUND (both RoundComplete's
+    // direct write and note_session_round), budget_pct, phase (+
+    // phase_entered_at via set_phase), task_description, session_id,
+    // active_session_source, codex_managed_context, provider/model names,
+    // and the usage scalars (tokens x5, context/hard windows). Two other
+    // buckets are safe WITHOUT this bracket, each with its own re-audit
+    // trigger: globals the applier can write but no replayable row reaches
+    // (presence_*, external_agent, configured_codex_managed_context,
+    // log_dir) — re-audit when the replay converter grows a producer; and
+    // fields with replayable producers that the hydration applier never
+    // writes (pending_approval, human_question — ApprovalRequired's arm
+    // writes only phase state, HumanQuestionDetected has no applier arm) —
+    // re-audit when the applier grows a write to them.
     let provider_name = s.provider_name.clone();
     let model_name = s.model_name.clone();
     let turn = s.turn;
+    let round = s.round;
     let budget_pct = s.budget_pct;
     let phase = s.phase.clone();
     let phase_entered_at = s.phase_entered_at;
@@ -1497,24 +1618,78 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
 
     let mut changed = false;
     for dir in dirs {
-        let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+        // Replay only the tail appended since the last hydration of this
+        // log: the fold is a pure last-write-wins state fold (no log-ring
+        // pushes), so folding just the new lines lands on the same state
+        // as a full replay — without re-reading and re-parsing a growing
+        // multi-MB log on every session-scoped `get_status` poll. The
+        // cursor is validated against the live file and never advances
+        // past an unterminated final line, so partially flushed writes are
+        // re-read (and re-applied, idempotently) once complete.
+        let path = dir.join("session.jsonl");
+        let mut prior = s.session_log_hydration_cursors.get(&path).copied();
+        // Coherence backstop: a cursor is only meaningful together with the
+        // folded state its consumed prefix produced. If this session has no
+        // folded status (pruned bookkeeping, or a cursor left behind by a
+        // dir whose basename didn't match the pruned ids), skipping the
+        // prefix would answer the query from absent state — force a full
+        // replay instead.
+        if prior.is_some_and(|cursor| cursor.bytes > 0)
+            && s.session_status_for_id(session_id).is_none()
+        {
+            prior = None;
+            s.session_log_hydration_cursors.remove(&path);
+        }
+        let Some((tail, base)) = read_session_jsonl_tail(&path, prior) else {
             continue;
         };
-        for line in contents.lines() {
+        // Ordering contract (bounded skew, self-healing): the session log
+        // is a LOSSLESS, order-preserving serialization of the same event
+        // stream the live listener folds (EventBus::send feeds both lanes
+        // the same objects; the broadcast lane may drop under lag, the log
+        // lane may not). Rows therefore apply UNGATED, and folding to the
+        // log's final state is permanently correct — including through
+        // stale terminal rows (Done/Interrupted are resumable here: a
+        // later resume row supersedes them in the fold, so suppressing
+        // "regressions" by phase kind wedges resumed sessions; proven
+        // wrong twice). The only divergence this allows is TRANSIENT: the
+        // log-sink consumer lags the live fold by its queue depth, so a
+        // replay can land on a state a few events older than live. The
+        // window is the sink lag, it self-heals on the next appended rows
+        // or live event, and it is strictly narrower than the pre-cursor
+        // semantics (which re-folded the whole log on every call).
+        // Eliminating even the transient window needs an emission-stamped
+        // ordering token on lifecycle events — a cross-lane follow-up
+        // noted on PR #343, not patchable here without one.
+        //
+        // Enter the replay scope (RAII — a panic mid-fold must not leave
+        // the state stuck in "hydrating" mode), carrying the hydration
+        // TARGET: replays never trigger the over-cap prune, never
+        // invalidate the controller-loop cache, and rows lacking a session
+        // id (round_complete predates stamping) attribute to the target —
+        // never to the daemon's active session (see
+        // note_session_ended / note_live_session_lifecycle_change /
+        // unattributed_event_session_id).
+        let mut replay = s.begin_hydration_replay(session_id);
+        let advanced = walk_session_jsonl_tail(&tail, base, |_, line| {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
+                return true;
             };
             let Some(event) = crate::session_log::session_log_entry_to_app_event(&entry, &dir)
             else {
-                continue;
+                return true;
             };
-            changed |= apply_observed_event_to_mcp_state(s, &event);
-        }
+            changed |= apply_observed_event_to_mcp_state(replay.state(), &event);
+            true
+        });
+        drop(replay);
+        s.session_log_hydration_cursors.insert(path, advanced);
     }
 
     s.provider_name = provider_name;
     s.model_name = model_name;
     s.turn = turn;
+    s.round = round;
     s.budget_pct = budget_pct;
     s.phase = phase;
     s.phase_entered_at = phase_entered_at;
@@ -1564,6 +1739,482 @@ mod tests {
     use crate::mcp::tests::test_state;
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn pruned_ended_session_rehydrates_to_done_and_stays_consistent() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-prune-poison";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("prune poison task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "do things",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+
+            let state = test_state();
+            let mut s = state.write().await;
+            // The daemon is busy with an unrelated live session.
+            s.session_id = "live-session".to_string();
+            s.note_session_phase(Some("live-session"), Some(9), Phase::Thinking, None);
+            // Blow past the cap, then end the requested session live: its
+            // component is pruned.
+            for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+                s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+            }
+            s.note_session_phase(Some(session_id), Some(1), Phase::Thinking, None);
+            s.note_session_ended(session_id);
+            assert!(s.session_status_for_id(session_id).is_none());
+
+            // Query-driven rebuild: hydration must fold the whole log,
+            // leave the rebuilt component RESIDENT (no re-prune from the
+            // replayed session_ended), and answer Done.
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+
+            // The poisoning regression: a second query must still answer
+            // Done from the requested session's own state — never fall
+            // through to the daemon's current (unrelated) session because a
+            // re-prune erased the rebuild while the cursor sat at EOF.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
+
+    #[test]
+    fn full_replay_applies_a_missed_terminal_fact_from_the_lossless_log() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-lossy-live";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("lossy live task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "edit files",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+
+            let state = test_state();
+            let mut s = state.write().await;
+            // The live lane observed the session running but MISSED the
+            // SessionEnded — the listener is a lossy broadcast, the log is
+            // lossless. The ungated fold must land on the log's final state
+            // (Done); any live-favoring suppression here left the session
+            // permanently stuck at the stale live phase with the cursor
+            // committed at EOF.
+            s.note_session_phase(Some(session_id), Some(1), Phase::Thinking, None);
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+
+            // And it stays Done on the next (tail) hydration.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
+
+    #[test]
+    fn full_replay_folds_through_stale_terminal_rows_to_the_logs_final_state() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-resumed-after-done";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("resumed task"));
+            // Round 1 ends (a terminal row mid-log), then the session
+            // RESUMES — Done/Interrupted are resumable in this system
+            // (follow-ups are accepted in Done), so terminal rows are not
+            // monotonic.
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "round one",
+                None,
+                Some("Codex"),
+            );
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "round one done",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "resumed round two",
+                None,
+                Some("Codex"),
+            );
+
+            // Live observed the resume (newest truth = RunningAgent).
+            let state = test_state();
+            let mut s = state.write().await;
+            s.note_session_phase(Some(session_id), Some(2), Phase::RunningAgent, None);
+
+            // A FULL replay must fold THROUGH the stale terminal row to the
+            // log's final state — never freeze the session at the old Done
+            // (the round-2 phase-kind lattice did exactly that).
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+        });
+    }
+
+    #[test]
+    fn hydration_attributes_unattributed_rows_to_the_target_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-old";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("old session task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "round one",
+                None,
+                Some("Codex"),
+            );
+            // The REAL writer: round_complete rows persist NO session id
+            // (replay reconstructs session_id: None), and this one is the
+            // log's FINAL row — nothing after it re-attributes.
+            log.round_complete(2, 1);
+
+            // An unrelated session is live and active on the daemon, at a
+            // DISTINCT round: the replayed round_complete(2) must neither
+            // relabel the live session nor leak into the daemon-global
+            // round scalar an unscoped get_status reports.
+            let state = test_state();
+            let mut s = state.write().await;
+            s.session_id = "sess-live".to_string();
+            s.round = 9;
+            s.note_session_phase(Some("sess-live"), Some(3), Phase::RunningAgent, None);
+            s.note_session_round(Some("sess-live"), 9);
+
+            // Hydrating `sess-old` must attribute the naked round_complete
+            // to the HYDRATION TARGET: the requested session reaches
+            // WaitingFollowUp and the live session is untouched. (The
+            // active-session fallback here both missed the target and
+            // corrupted the live session — with the cursor then committed
+            // past the row, so neither side ever healed.)
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+            assert_eq!(
+                s.session_status_for_id(session_id).map(|st| st.round),
+                Some(2)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live")
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live").map(|st| st.round),
+                Some(9)
+            );
+            assert_eq!(s.round, 9, "global round must be bracket-restored");
+
+            // Stays consistent once the cursor sits at EOF.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live")
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live").map(|st| st.round),
+                Some(9)
+            );
+            assert_eq!(s.round, 9, "global round must survive rehydration");
+        });
+    }
+
+    #[test]
+    fn delayed_tail_rows_apply_and_self_heal_when_the_log_catches_up() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-delayed-tail";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("delayed tail task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "round one",
+                None,
+                Some("Codex"),
+            );
+
+            let state = test_state();
+            let mut s = state.write().await;
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+
+            // Live is AHEAD of the log: the listener already folded the
+            // round's end (WaitingFollowUp) while the lossless log-sink
+            // consumer still lags.
+            s.note_session_phase(Some(session_id), None, Phase::WaitingFollowUp, None);
+
+            // The delayed terminal row lands: the tail replay applies it —
+            // the DOCUMENTED transient (bounded by the sink lag): the
+            // replay reports the log's latest state, a few events behind
+            // live.
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "round one done",
+                        "data": { "session_id": session_id, "reason": "done" },
+                    })
+                )
+                .unwrap();
+            }
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+
+            // The log catches up with the session's later activity (a
+            // session-id-carrying row — round_complete rows persist no
+            // session id, so the per-session heal rides the next round's
+            // agent_started): the next tail replay self-heals to the log's
+            // newest state.
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "round two",
+                None,
+                Some("Codex"),
+            );
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+        });
+    }
+
+    #[test]
+    fn hydration_replays_only_the_appended_log_tail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-hydrate-cursor";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("cursor test task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                2,
+                "edit files",
+                None,
+                Some("Codex"),
+            );
+
+            let state = test_state();
+            let mut s = state.write().await;
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+
+            // Simulate a live-observed phase the log has not caught up to.
+            // Re-hydration must fold nothing (no appended lines) instead of
+            // replaying the whole log and regressing the live phase — that
+            // is the cursor's contract.
+            s.note_session_phase(Some(session_id), None, Phase::WaitingFollowUp, None);
+            assert!(!hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+
+            // Append a session_ended line; the next hydration folds exactly
+            // the appended tail.
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(log_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:01.000",
+                        "event": "session_ended",
+                        "level": "info",
+                        "message": "session ended",
+                        "data": {
+                            "session_id": session_id,
+                            "reason": "done",
+                        },
+                    })
+                )
+                .unwrap();
+            }
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::Done)
+            );
+        });
+    }
 
     #[test]
     fn managed_watch_context_pressure_satisfied_after_rewind_across_alias_and_compact_cu_growth() {

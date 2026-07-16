@@ -212,22 +212,41 @@ impl IntendantServer {
             .read()
             .await
             .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
-        let mut tools: Vec<serde_json::Value> = self
-            .tool_router
-            .list_all()
+        // Router tool definitions are static per process, but every call
+        // used to re-serialize and ref-inline all ~50 schemas. Build the
+        // unfiltered set once; per-request work is the name-keyed
+        // profile/managed-context filter plus a clone of the surviving
+        // definitions.
+        let router_definitions: &'static [serde_json::Value] = {
+            static DEFINITIONS: std::sync::OnceLock<Vec<serde_json::Value>> =
+                std::sync::OnceLock::new();
+            DEFINITIONS.get_or_init(|| {
+                self.tool_router
+                    .list_all()
+                    .iter()
+                    .map(|tool| {
+                        let mut schema =
+                            serde_json::to_value(&*tool.input_schema).unwrap_or_default();
+                        inline_schema_refs(&mut schema);
+                        serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": schema,
+                        })
+                    })
+                    .collect()
+            })
+        };
+        let mut tools: Vec<serde_json::Value> = router_definitions
             .iter()
             .filter(|tool| {
-                tool_allowed_for_profile(tool.name.as_ref(), managed_context, tool_profile)
+                tool.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| {
+                        tool_allowed_for_profile(name, managed_context, tool_profile)
+                    })
             })
-            .map(|tool| {
-                let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
-                inline_schema_refs(&mut schema);
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": schema,
-                })
-            })
+            .cloned()
             .collect();
         append_manual_http_tool_definitions(&mut tools, managed_context, tool_profile);
         serde_json::json!({ "tools": tools })
@@ -1021,6 +1040,39 @@ impl IntendantServer {
         session_id_override: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> String {
+        // Pre-warm the controller-loop raw sample OUTSIDE the state locks:
+        // the collection spawns `ps` and scans the loop/wrapper stores, and
+        // running it under the write lock below would head-of-line-block the
+        // event-fold listener and every other MCP tool for its duration. The
+        // promote/active/stale checks then consume the warmed cache entry
+        // (one shared sample per call instead of two to three collections).
+        let needs_collect = {
+            let s = self.state.read().await;
+            let has_target = session_id_override
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_some()
+                || !s.session_id.is_empty();
+            if has_target && s.controller_loop_status_override.is_none() {
+                let loop_dir = mcp_state_controller_loop_dir(&s);
+                let (hit, generation) = s.probe_controller_loop_raw_status(&loop_dir);
+                hit.is_none()
+                    .then(|| (loop_dir, mcp_state_session_logs_home(&s), generation))
+            } else {
+                None
+            }
+        };
+        if let Some((loop_dir, wrapper_index_home, generation)) = needs_collect {
+            let raw = collect_controller_loop_raw_status(&loop_dir, &wrapper_index_home);
+            // Store at the pre-collection generation: if a lifecycle or
+            // marker mutation invalidated the cache while we collected
+            // unlocked, this pre-mutation sample is discarded rather than
+            // reinstated.
+            self.state
+                .read()
+                .await
+                .store_controller_loop_raw_status_at(generation, raw);
+        }
         {
             let mut s = self.state.write().await;
             if let Some(requested_session_id) = session_id_override
@@ -1059,7 +1111,11 @@ impl IntendantServer {
                     target_phase = Some(Phase::Thinking);
                 }
                 if target_phase.as_ref().is_some_and(|phase| {
-                    mcp_state_codex_active_phase_has_stale_controller(&s, &target_session_id, phase)
+                    mcp_state_codex_active_phase_has_stale_controller(
+                        &mut s,
+                        &target_session_id,
+                        phase,
+                    )
                 }) {
                     s.note_session_phase(Some(&target_session_id), None, Phase::Done, None);
                 }
@@ -1394,6 +1450,16 @@ impl IntendantServer {
                             session_id
                         );
                     }
+                    // An unreadable persisted log is an error, not a
+                    // fall-through: the generic start path below discards
+                    // the requested session id and would silently launch a
+                    // FRESH session in its place.
+                    PersistedStartTarget::Unreadable => {
+                        return format!(
+                            "Cannot start task: session {}'s persisted log exists but could not be read; retry, or resume from the dashboard with an explicit source/resume_id",
+                            session_id
+                        );
+                    }
                     PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
                 }
             }
@@ -1476,7 +1542,7 @@ impl IntendantServer {
             phase = Some(Phase::Thinking);
         }
         if phase.as_ref().is_some_and(|phase| {
-            mcp_state_codex_active_phase_has_stale_controller(&s, session_id, phase)
+            mcp_state_codex_active_phase_has_stale_controller(&mut s, session_id, phase)
         }) {
             s.note_session_phase(Some(session_id), None, Phase::Done, None);
             return Some(Phase::Done);
@@ -1532,8 +1598,18 @@ struct PersistedExternalStartTarget {
 enum PersistedStartTarget {
     NotFound,
     NonExternal,
+    /// The session's log dir exists but its `session.jsonl` could not be
+    /// read (partially materialized, transient I/O failure) and no other
+    /// signal named a source. Distinct from both `NotFound` (nothing there)
+    /// and `NonExternal` (successfully read, provably native): source
+    /// memoization may retry it later (never negative-cached), but an
+    /// explicit resume request must surface an error instead of silently
+    /// falling through to a fresh session.
+    Unreadable,
     External(PersistedExternalStartTarget),
-    ExternalMissingResume { source: Option<String> },
+    ExternalMissingResume {
+        source: Option<String>,
+    },
 }
 
 fn resolve_persisted_start_target(
@@ -1556,7 +1632,14 @@ fn resolve_persisted_start_target(
     // Preference order for identity facts: a structured event naming this
     // wrapper (else the log's sole identity), then the launch config's
     // source, then — pre-2026-07 dirs only — the legacy prose scrape.
-    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap_or_default();
+    // A read FAILURE is not evidence of anything: a partially materialized
+    // or transiently unreadable log must resolve as NotFound-class (which
+    // callers never negative-cache), not as NonExternal — otherwise a
+    // still-appearing external session gets memoized as native forever.
+    let (contents, log_read_failed) = match std::fs::read_to_string(log_dir.join("session.jsonl")) {
+        Ok(contents) => (contents, false),
+        Err(_) => (String::new(), true),
+    };
     let scan = crate::session_identity::scan_session_log(
         &contents,
         session_id,
@@ -1577,7 +1660,11 @@ fn resolve_persisted_start_target(
     };
 
     let Some(source) = source else {
-        return PersistedStartTarget::NonExternal;
+        return if log_read_failed {
+            PersistedStartTarget::Unreadable
+        } else {
+            PersistedStartTarget::NonExternal
+        };
     };
     // The scan above is target DISCOVERY; the supervisor's resolver is the
     // authority on resume identity (canonical backend-id filtering plus the
@@ -1736,6 +1823,20 @@ const RESOURCE_APPROVAL_URI: &str = "intendant://pending-approval";
 const RESOURCE_INPUT_URI: &str = "intendant://pending-input";
 const RESOURCE_RESTART_URI: &str = "intendant://controller-restart";
 const RESOURCE_LOOP_URI: &str = "intendant://controller-loop";
+
+/// Every resource URI this server serves — the subscription vocabulary.
+/// `subscribe` validates against this set (rejecting unknown URIs), which
+/// also caps the subscription set at this fixed size; a parity test pins it
+/// to [`resource_definitions`].
+const RESOURCE_URIS: [&str; 7] = [
+    RESOURCE_STATUS_URI,
+    RESOURCE_USAGE_URI,
+    RESOURCE_LOGS_URI,
+    RESOURCE_APPROVAL_URI,
+    RESOURCE_INPUT_URI,
+    RESOURCE_RESTART_URI,
+    RESOURCE_LOOP_URI,
+];
 
 fn make_resource(uri: &str, name: &str, description: &str) -> Resource {
     Resource {
@@ -1911,19 +2012,42 @@ impl ServerHandler for IntendantServer {
 
     async fn subscribe(
         &self,
-        _request: SubscribeRequestParams,
+        request: SubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        // We push notifications for all resources on every relevant event change
-        // (handled in spawn_event_listener). Accept all subscriptions.
+        // Record the subscription: the event listener pushes
+        // `notifications/resources/updated` only for subscribed URIs
+        // (resource notifications are subscription-scoped in MCP; the
+        // historical behavior of broadcasting every change to every client
+        // regardless made each fold-loop event a stdout JSON-RPC write).
+        // Unknown URIs are rejected — nothing would ever notify them, and
+        // validating against the served vocabulary keeps the subscription
+        // set bounded at the resource count instead of growing with
+        // whatever strings a client sends.
+        if !RESOURCE_URIS.contains(&request.uri.as_str()) {
+            return Err(McpError::invalid_params(
+                format!("Unknown resource URI: {}", request.uri),
+                Some(serde_json::json!({ "uri": request.uri })),
+            ));
+        }
+        self.state
+            .write()
+            .await
+            .subscribed_resource_uris
+            .insert(request.uri);
         Ok(())
     }
 
     async fn unsubscribe(
         &self,
-        _request: UnsubscribeRequestParams,
+        request: UnsubscribeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
+        self.state
+            .write()
+            .await
+            .subscribed_resource_uris
+            .remove(&request.uri);
         Ok(())
     }
 }
@@ -2235,12 +2359,26 @@ pub(crate) mod tests {
 
     pub(crate) fn test_state_with_log_dir(log_dir: std::path::PathBuf) -> SharedMcpState {
         let autonomy = autonomy::shared_autonomy(AutonomyState::default());
-        Arc::new(RwLock::new(McpAppState::new(
-            "openai".to_string(),
-            "gpt-5".to_string(),
-            autonomy,
-            log_dir,
-        )))
+        let mut state =
+            McpAppState::new("openai".to_string(), "gpt-5".to_string(), autonomy, log_dir);
+        // Hermetic defaults: status paths otherwise collect controller-loop
+        // reality from the REAL machine — run-dir scans under the real loop
+        // dir, wrapper-index reads under the real home — and on a live box
+        // that costs seconds and makes test duration machine state. Point
+        // both roots at never-existing dirs (deterministically empty, no
+        // tempdir guard needed); tests that exercise loop-dir or persisted
+        // -log behavior override these themselves. Honest scope: the
+        // collection still spawns one `ps` to probe THIS process's
+        // descendants (platform probe, not overridable state) — its result
+        // for a test process is deterministically empty (tests spawn no
+        // codex children), and with the wrapper-index home threaded above
+        // even a match could no longer read the real home's index.
+        state.controller_loop_dir_override = Some(std::path::PathBuf::from(
+            "/nonexistent/intendant-test-controller-loop",
+        ));
+        state.session_logs_home_override =
+            Some(std::path::PathBuf::from("/nonexistent/intendant-test-home"));
+        Arc::new(RwLock::new(state))
     }
 
     /// Test server over an injected temp home. Session-id-driven paths
@@ -3669,6 +3807,75 @@ pub(crate) mod tests {
     fn resource_definitions_has_seven_entries() {
         let defs = resource_definitions();
         assert_eq!(defs.len(), 7);
+    }
+
+    #[test]
+    fn unreadable_persisted_log_errors_instead_of_spawning_a_fresh_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-unreadable-log";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({ "session_id": session_id }).to_string(),
+            )
+            .unwrap();
+            // A session.jsonl that cannot be read as a file (a directory in
+            // its place — the partially-materialized / transient-IO class).
+            std::fs::create_dir_all(log_dir.join("session.jsonl")).unwrap();
+
+            assert_eq!(
+                resolve_persisted_start_target(home.path(), session_id),
+                PersistedStartTarget::Unreadable
+            );
+
+            let state = test_state();
+            state.write().await.session_logs_home_override = Some(home.path().to_path_buf());
+            let bus = EventBus::new();
+            let mut bus_rx = bus.subscribe();
+            let server =
+                IntendantServer::new_with_home(state, bus.clone(), home.path().to_path_buf());
+            let result = server
+                .start_task(Parameters(StartTaskParams {
+                    session_id: Some(session_id.to_string()),
+                    task: "resume the work".to_string(),
+                    orchestrate: None,
+                    reference_frame_ids: Vec::new(),
+                    display_target: None,
+                }))
+                .await;
+            assert!(
+                result.contains("could not be read"),
+                "expected an unreadable-log error, got: {result}"
+            );
+            // No StartTask/ResumeSession may have been dispatched: the
+            // requested session id must never be silently replaced by a
+            // fresh session.
+            assert!(matches!(
+                bus_rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        });
+    }
+
+    #[test]
+    fn resource_uris_pin_resource_definitions() {
+        // The subscription vocabulary (RESOURCE_URIS) must be exactly the
+        // set resource_definitions() serves — a new resource that forgets
+        // the vocabulary would be silently unsubscribable.
+        let served: std::collections::BTreeSet<String> = resource_definitions()
+            .iter()
+            .map(|resource| resource.raw.uri.clone())
+            .collect();
+        let vocabulary: std::collections::BTreeSet<String> =
+            RESOURCE_URIS.iter().map(|uri| uri.to_string()).collect();
+        assert_eq!(served, vocabulary);
+        assert_eq!(RESOURCE_URIS.len(), resource_definitions().len());
     }
 
     #[test]

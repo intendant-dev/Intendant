@@ -858,28 +858,202 @@ pub(crate) fn read_persisted_log_entries_for_session(
     read_persisted_log_entries_from_dir(&log_dir, params)
 }
 
+/// Bytes covered by a cursor's frozen prefix-identity window (mirrors the
+/// message-search `SourceCursor` discipline, `PREFIX_HASH_BYTES`).
+const SESSION_JSONL_PREFIX_WINDOW: usize = 4096;
+
+/// First-8-bytes-of-SHA-256 as a number — the same fingerprint shape as
+/// message-search's `prefix_hash16` / `session_log::content_hash_hex16`,
+/// kept numeric because these cursors live in memory only.
+fn session_jsonl_prefix_hash(bytes: &[u8]) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or([0u8; 8]))
+}
+
+/// Byte/line cursor into an append-only `session.jsonl`.
+///
+/// `lines` counts the newline-terminated lines fully consumed from the start
+/// of the file and `bytes` is the offset just past the last consumed
+/// terminator, so a later pass can resume at a stable line id without
+/// re-reading (or re-parsing) the whole log.
+///
+/// Identity: length + a newline at the boundary cannot detect a
+/// same-or-longer-length replacement (log rotation, dir reuse), so the
+/// cursor also freezes a hash over the file's first
+/// `min(consumed, SESSION_JSONL_PREFIX_WINDOW)` bytes when it is first
+/// established from a full read. Append-only writers never rewrite that
+/// window, so the frozen hash stays comparable as the cursor advances;
+/// a mismatch on resume forces a full replay. The claim is exactly the
+/// window: a same-or-longer-length rewrite that preserves the frozen
+/// window (and the boundary byte) but diverges only beyond it is NOT
+/// detected — acceptable because the in-repo writer is append-only, so
+/// any real replacement (a different session's log) diverges from its
+/// first line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionJsonlCursor {
+    pub(crate) lines: u64,
+    pub(crate) bytes: u64,
+    pub(crate) prefix_len: u32,
+    pub(crate) prefix_hash: u64,
+}
+
+/// Read `path` from `cursor` when the cursor still describes a valid prefix
+/// of the (append-only) file: the offset must sit inside the file, the
+/// frozen prefix-identity window must hash to the same value, and the byte
+/// before the offset must be a `\n`. Any mismatch — a truncated, replaced,
+/// or rotated file — falls back to a full read from byte 0 so callers
+/// self-heal with one full pass. Returns the unread tail plus the validated
+/// base cursor it starts at.
+pub(crate) fn read_session_jsonl_tail(
+    path: &std::path::Path,
+    cursor: Option<SessionJsonlCursor>,
+) -> Option<(String, SessionJsonlCursor)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut base = cursor.unwrap_or_default();
+    // A consumed prefix always has an identity window (frozen at first
+    // capture); a cursor without one is not trustworthy.
+    let mut valid = base.bytes > 0
+        && base.prefix_len > 0
+        && u64::from(base.prefix_len) <= base.bytes
+        && file
+            .metadata()
+            .map(|meta| meta.len() >= base.bytes)
+            .unwrap_or(false);
+    if valid {
+        let mut window = vec![0u8; base.prefix_len as usize];
+        valid = file.seek(SeekFrom::Start(0)).is_ok()
+            && file.read_exact(&mut window).is_ok()
+            && session_jsonl_prefix_hash(&window) == base.prefix_hash;
+    }
+    if valid {
+        let mut byte = [0u8; 1];
+        valid = file.seek(SeekFrom::Start(base.bytes - 1)).is_ok()
+            && file.read_exact(&mut byte).is_ok()
+            && byte[0] == b'\n';
+    }
+    if !valid {
+        base = SessionJsonlCursor::default();
+        file.seek(SeekFrom::Start(0)).ok()?;
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    Some((contents, base))
+}
+
+/// Walk the lines of a `session.jsonl` tail read at `base`, invoking `visit`
+/// with each line's stable id (its line index from the start of the file).
+/// Returns the advanced cursor. The cursor only moves past newline-terminated
+/// lines: an unterminated final fragment is still visited (matching the
+/// historical `str::lines` behavior) but stays ahead of the cursor, so the
+/// next pass re-reads it once the writer finishes the line. `visit` returns
+/// `false` to stop before consuming the current line (pagination limits).
+pub(crate) fn walk_session_jsonl_tail(
+    tail: &str,
+    base: SessionJsonlCursor,
+    mut visit: impl FnMut(u64, &str) -> bool,
+) -> SessionJsonlCursor {
+    let mut cursor = base;
+    let bytes = tail.as_bytes();
+    let mut line_start = 0usize;
+    let mut line_id = base.lines;
+    while line_start < bytes.len() {
+        let (line_end, next_start, terminated) =
+            match bytes[line_start..].iter().position(|byte| *byte == b'\n') {
+                Some(nl) => (line_start + nl, line_start + nl + 1, true),
+                None => (bytes.len(), bytes.len(), false),
+            };
+        let mut line = &tail[line_start..line_end];
+        if let Some(stripped) = line.strip_suffix('\r') {
+            line = stripped;
+        }
+        if !visit(line_id, line) {
+            break;
+        }
+        line_id += 1;
+        if terminated {
+            cursor.lines = line_id;
+            cursor.bytes = base.bytes + next_start as u64;
+        }
+        line_start = next_start;
+    }
+    // First establishment (base at byte 0): freeze the prefix-identity
+    // window over the consumed head bytes. Tail walks (base.bytes > 0)
+    // carry the frozen identity forward untouched — the window bytes are
+    // immutable under an append-only writer.
+    if base.bytes == 0 && cursor.bytes > 0 {
+        let window = &bytes[..(cursor.bytes as usize).min(SESSION_JSONL_PREFIX_WINDOW)];
+        cursor.prefix_len = window.len() as u32;
+        cursor.prefix_hash = session_jsonl_prefix_hash(window);
+    }
+    cursor
+}
+
+/// Last read position per `session.jsonl` path for `get_logs` pagination.
+/// Bounded like the session-dir lookup cache: crude clear-on-overflow keeps
+/// it from growing with daemon lifetime.
+fn persisted_log_read_cursors(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>> {
+    static CURSORS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>>,
+    > = std::sync::OnceLock::new();
+    CURSORS.get_or_init(Default::default)
+}
+
+const PERSISTED_LOG_READ_CURSOR_CAP: usize = 256;
+
+fn load_persisted_log_read_cursor(path: &std::path::Path) -> Option<SessionJsonlCursor> {
+    persisted_log_read_cursors()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(path)
+        .copied()
+}
+
+fn store_persisted_log_read_cursor(path: &std::path::Path, cursor: SessionJsonlCursor) {
+    let mut cursors = persisted_log_read_cursors()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cursors.len() >= PERSISTED_LOG_READ_CURSOR_CAP && !cursors.contains_key(path) {
+        cursors.clear();
+    }
+    cursors.insert(path.to_path_buf(), cursor);
+}
+
 pub(crate) fn read_persisted_log_entries_from_dir(
     log_dir: &std::path::Path,
     params: &GetLogsParams,
 ) -> Option<Vec<LogEntrySnapshot>> {
-    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
+    let path = log_dir.join("session.jsonl");
+    // A stored cursor is only usable when every line before it is skippable
+    // anyway, i.e. the caller's since_id covers the whole consumed prefix
+    // (ids are line indexes, so lines 0..cursor.lines all have id <=
+    // cursor.lines - 1). The designed poller pattern — page forward with
+    // since_id = last returned id — always qualifies; filtered pollers whose
+    // since_id lags the consumed prefix fall back to the historical full
+    // scan.
+    let prior = params.since_id.and_then(|since| {
+        let cursor = load_persisted_log_read_cursor(&path)?;
+        (cursor.lines > 0 && since >= cursor.lines - 1).then_some(cursor)
+    });
+    let (tail, base) = read_session_jsonl_tail(&path, prior)?;
     let limit = params.limit.unwrap_or(100);
     let mut entries = Vec::new();
 
-    for (line_idx, line) in contents.lines().enumerate() {
+    let advanced = walk_session_jsonl_tail(&tail, base, |line_id, line| {
         if entries.len() >= limit {
-            break;
+            return false;
         }
-        let line_id = line_idx as u64;
         if params
             .since_id
             .map(|since| line_id <= since)
             .unwrap_or(false)
         {
-            continue;
+            return true;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
+            return true;
         };
         let level = persisted_log_entry_level(&value);
         if params
@@ -888,7 +1062,7 @@ pub(crate) fn read_persisted_log_entries_from_dir(
             .map(|filter| filter != level)
             .unwrap_or(false)
         {
-            continue;
+            return true;
         }
         entries.push(LogEntrySnapshot {
             id: line_id,
@@ -896,7 +1070,9 @@ pub(crate) fn read_persisted_log_entries_from_dir(
             level,
             content: persisted_log_entry_content(&value),
         });
-    }
+        true
+    });
+    store_persisted_log_read_cursor(&path, advanced);
 
     Some(entries)
 }
@@ -924,42 +1100,13 @@ pub(crate) fn find_session_log_dir_in_home(
     if session_id.is_empty() {
         return None;
     }
-    // Path-form ids resolve through the anchored helper (inside the logs
-    // root only), and BEFORE the direct join below — joining an absolute
-    // path would silently replace the logs dir as the base.
-    if crate::session_names::session_id_looks_like_path(session_id) {
-        return crate::session_names::intendant_session_dir_from_slash_path(home, session_id);
-    }
-    let logs_dir = crate::platform::intendant_home_in(home).join("logs");
-    let direct = logs_dir.join(session_id);
-    if direct.is_dir() && direct.join("session_meta.json").exists() {
-        return Some(direct);
-    }
-
-    let entries = std::fs::read_dir(logs_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(session_id) && entry.path().is_dir() {
-            return Some(entry.path());
-        }
-        let meta_path = entry.path().join("session_meta.json");
-        let meta_session_id = std::fs::read_to_string(meta_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .and_then(|value| {
-                value
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
-        if meta_session_id
-            .as_deref()
-            .is_some_and(|id| id == session_id || id.starts_with(session_id))
-        {
-            return Some(entry.path());
-        }
-    }
-    None
+    // Derive, don't mirror: this used to be a hand-rolled copy of the
+    // session-log lookup (path-form anchor, direct join, then a full store
+    // scan interleaving name-prefix checks with per-dir session_meta.json
+    // reads). The canonical [`SessionLog::find_session_by_id_in_home`] does
+    // the same resolution behind a validated memo and a two-pass scan, so
+    // alias-id lookups stop paying a whole-store scan per `get_logs` poll.
+    crate::session_log::SessionLog::find_session_by_id_in_home(home, session_id)
 }
 
 pub(crate) fn persisted_log_entry_level(value: &serde_json::Value) -> String {
@@ -1060,5 +1207,219 @@ mod tests {
         .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "live wrapper follow-up");
+    }
+
+    fn info_line(message: &str) -> String {
+        serde_json::json!({
+            "ts": "2026-07-15T12:00:00",
+            "event": "info",
+            "level": "info",
+            "message": message,
+        })
+        .to_string()
+    }
+
+    fn get_logs_params(since_id: Option<u64>, limit: Option<usize>) -> GetLogsParams {
+        GetLogsParams {
+            session_id: None,
+            since_id,
+            level_filter: None,
+            limit,
+        }
+    }
+
+    #[test]
+    fn cursor_paginated_get_logs_serves_appended_tail_with_stable_ids() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &log_path,
+            format!("{}\n{}\n", info_line("a"), info_line("b")),
+        )
+        .unwrap();
+
+        let first =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].id, 1);
+
+        // Append two more lines; the cursored follow-up (since_id = last id)
+        // must serve exactly the appended tail with continuous ids.
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        use std::io::Write as _;
+        write!(appended, "{}\n{}\n", info_line("c"), info_line("d")).unwrap();
+        drop(appended);
+
+        let tail = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(first[1].id), None),
+        )
+        .unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|entry| (entry.id, entry.content.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, "c".to_string()), (3, "d".to_string())]
+        );
+    }
+
+    #[test]
+    fn replaced_log_file_invalidates_the_read_cursor() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &log_path,
+            format!("{}\n{}\n", info_line("a"), info_line("b")),
+        )
+        .unwrap();
+
+        // Seed the cursor with a full pass.
+        let seeded =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(seeded.len(), 2);
+
+        // Replace the file with different content that is LONGER than the
+        // stored byte offset but has no line boundary there. Without the
+        // boundary validation, a cursored read would seek into the middle
+        // of the first line and serve a torn fragment as a phantom new id.
+        let long_first = info_line("a much longer replacement first line than before");
+        std::fs::write(&log_path, format!("{}\n{}\n", long_first, info_line("z"))).unwrap();
+        let cursored = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(seeded[1].id), None),
+        )
+        .unwrap();
+        assert!(
+            cursored.is_empty(),
+            "stale cursor must self-heal to a full scan (ids 0..=1 are all \
+             covered by since_id), not serve torn phantom lines: {cursored:?}"
+        );
+
+        // And an uncursored pass sees the replacement content under fresh ids.
+        let rescanned =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(rescanned.len(), 2);
+        assert_eq!(rescanned[1].content, "z");
+    }
+
+    #[test]
+    fn unterminated_tail_line_is_served_and_re_read_once_completed() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+        // Final line lacks its terminator (a partially flushed write).
+        std::fs::write(
+            &log_path,
+            format!("{}\n{}", info_line("done"), info_line("partial")),
+        )
+        .unwrap();
+
+        let first =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[1].content, "partial");
+
+        // Terminate the line and append another; the cursored follow-up must
+        // re-serve the (now complete) line under its stable id, then the new
+        // one.
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        use std::io::Write as _;
+        write!(appended, "\n{}\n", info_line("next")).unwrap();
+        drop(appended);
+
+        let tail = read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(Some(0), None))
+            .unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|entry| (entry.id, entry.content.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, "partial".to_string()), (2, "next".to_string())]
+        );
+    }
+
+    #[test]
+    fn same_length_replacement_is_detected_by_the_prefix_identity_window() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+
+        // Replacement: four short lines.
+        let replacement_lines: Vec<String> = ["r0", "r1", "r2", "r3"]
+            .iter()
+            .map(|msg| info_line(msg))
+            .collect();
+        let replacement = replacement_lines.join("\n") + "\n";
+
+        // Original: two lines padded to EXACTLY the replacement's byte
+        // length, so metadata length and the newline at the cursor
+        // boundary both still match after the swap.
+        let first = info_line("orig-0");
+        let overhead = info_line("").len();
+        let second_message_len = replacement.len() - (first.len() + 1) - 1 - overhead;
+        let second = info_line(&"p".repeat(second_message_len));
+        let original = format!("{first}\n{second}\n");
+        assert_eq!(original.len(), replacement.len());
+        std::fs::write(&log_path, &original).unwrap();
+
+        // Seed the cursor with a full pass (2 lines consumed).
+        let seeded =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, None)).unwrap();
+        assert_eq!(seeded.len(), 2);
+
+        // Rotate: same total length, same trailing newline — only the
+        // frozen prefix hash can tell the file was replaced. A resumed
+        // cursor would report "nothing new"; the heal is a full replay
+        // that serves the replacement's lines past since_id.
+        std::fs::write(&log_path, &replacement).unwrap();
+        let healed = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(seeded[1].id), None),
+        )
+        .unwrap();
+        assert_eq!(
+            healed
+                .iter()
+                .map(|entry| (entry.id, entry.content.clone()))
+                .collect::<Vec<_>>(),
+            vec![(2, "r2".to_string()), (3, "r3".to_string())]
+        );
+    }
+
+    #[test]
+    fn limit_break_keeps_cursor_resumable_from_last_served_id() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("session.jsonl");
+        let lines: Vec<String> = (0..5).map(|i| info_line(&format!("m{i}"))).collect();
+        std::fs::write(&log_path, lines.join("\n") + "\n").unwrap();
+
+        let page1 =
+            read_persisted_log_entries_from_dir(dir.path(), &get_logs_params(None, Some(2)))
+                .unwrap();
+        assert_eq!(
+            page1.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        let page2 = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(page1[1].id), Some(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            page2.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let page3 = read_persisted_log_entries_from_dir(
+            dir.path(),
+            &get_logs_params(Some(page2[1].id), Some(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            page3.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 }

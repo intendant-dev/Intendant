@@ -58,6 +58,37 @@ pub struct McpAppState {
     /// Test override for the home that anchors persisted-session lookup
     /// (path-form session ids must resolve inside `<home>/.intendant/logs`).
     pub(crate) session_logs_home_override: Option<std::path::PathBuf>,
+    /// Short-TTL cache of the raw (state-independent) controller-loop
+    /// collection — the `ps` spawn + run-dir/wrapper-index scan half of
+    /// [`collect_controller_loop_status_inner`]. Interior mutability so the
+    /// polled read paths (which only hold `&McpAppState`) can serve and
+    /// re-seed it; see [`CONTROLLER_LOOP_RAW_STATUS_TTL`]. Guarded by a
+    /// generation counter: invalidation bumps it, and a collection started
+    /// before the bump refuses to store — otherwise a lock-free pre-warm
+    /// racing a lifecycle mutation could reinstate a pre-mutation sample.
+    controller_loop_raw_status_cache: std::sync::Mutex<ControllerLoopRawStatusCache>,
+    /// Per-`session.jsonl` replay cursors for
+    /// [`hydrate_requested_session_status_from_logs`]: session-scoped
+    /// `get_status` used to re-read and re-fold the whole log on every call;
+    /// the cursor limits each hydration to the appended tail. Validated
+    /// against the live file on use, so a replaced/truncated log self-heals
+    /// with one full replay.
+    pub(crate) session_log_hydration_cursors:
+        std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>,
+    /// Set while [`hydrate_requested_session_status_from_logs`] folds a log
+    /// into this state, carrying the hydration TARGET session id. Three
+    /// jobs: a replayed `session_ended` line must not re-run the over-cap
+    /// prune (the rebuild the query is performing would erase itself and
+    /// record an EOF cursor against absent state); replayed lifecycle rows
+    /// must not invalidate the controller-loop raw cache (historic events
+    /// do not change process reality — see
+    /// [`McpAppState::note_live_session_lifecycle_change`]); and a replayed
+    /// row WITHOUT a session id attributes to this target, never to the
+    /// daemon's active session (see
+    /// [`McpAppState::unattributed_event_session_id`]). The replay itself
+    /// applies rows UNGATED: the ordering contract lives at the hydrate
+    /// fold site in `events.rs`.
+    pub(crate) hydration_replay: Option<String>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -119,6 +150,11 @@ pub struct McpAppState {
     pub active_session_source: Option<String>,
     /// Map Intendant wrapper session IDs and backend session IDs to their external source.
     pub session_sources: std::collections::HashMap<String, String>,
+    /// Session ids whose persisted log resolved to a non-external session —
+    /// the negative memo for [`mcp_state_session_source_for_id`]'s fallback,
+    /// which otherwise re-reads and identity-scans the whole session log on
+    /// every status poll of a native session.
+    pub(crate) session_known_non_external: std::collections::HashSet<String>,
     /// Successful rewind records awaiting the next backend usage sample, keyed
     /// by Intendant/backend session id.
     pub(crate) pending_rewind_pressure_checks: std::collections::HashMap<String, String>,
@@ -139,6 +175,11 @@ pub struct McpAppState {
     /// `ask_user` auto-answers immediately with best-judgment guidance
     /// instead of blocking on nobody.
     pub interactive_frontends: bool,
+    /// Resource URIs the stdio MCP client subscribed to. The event listener
+    /// only pushes `notifications/resources/updated` for these (MCP resource
+    /// notifications are subscription-scoped); with no subscriptions the
+    /// per-event stdout writes are skipped entirely.
+    pub(crate) subscribed_resource_uris: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +205,42 @@ pub(crate) struct DensityMaintenanceSatisfaction {
     recommended_rewind_limit: u64,
     rewind_only_limit: u64,
     round: usize,
+}
+
+/// Soft cap on the per-session bookkeeping maps. Entries for every session
+/// id and alias ever observed used to accumulate for the daemon's lifetime;
+/// once the status map outgrows this, ended sessions are pruned on
+/// [`McpAppState::note_session_ended`] instead of lingering.
+pub(crate) const ENDED_SESSION_PRUNE_THRESHOLD: usize = 1024;
+
+/// RAII scope for [`McpAppState::hydration_replay`]: constructed via
+/// [`McpAppState::begin_hydration_replay`], resets the flag on drop so a
+/// panic (or early return) inside a replay can never leave the state
+/// permanently in "hydrating" mode — which would suppress live lifecycle
+/// invalidations and the over-cap prune indefinitely.
+pub(crate) struct HydrationReplayGuard<'a> {
+    state: &'a mut McpAppState,
+}
+
+impl HydrationReplayGuard<'_> {
+    pub(crate) fn state(&mut self) -> &mut McpAppState {
+        self.state
+    }
+}
+
+impl Drop for HydrationReplayGuard<'_> {
+    fn drop(&mut self) {
+        self.state.hydration_replay = None;
+    }
+}
+
+/// Cache slot for the raw controller-loop sample, with the invalidation
+/// generation. See the field doc on
+/// [`McpAppState::controller_loop_raw_status_cache`].
+#[derive(Default)]
+pub(crate) struct ControllerLoopRawStatusCache {
+    generation: u64,
+    entry: Option<(std::time::Instant, ControllerLoopRawStatus)>,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -209,6 +286,11 @@ impl McpAppState {
             controller_loop_dir_override: None,
             controller_loop_status_override: None,
             session_logs_home_override: None,
+            controller_loop_raw_status_cache: std::sync::Mutex::new(
+                ControllerLoopRawStatusCache::default(),
+            ),
+            session_log_hydration_cursors: std::collections::HashMap::new(),
+            hydration_replay: None,
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -236,10 +318,12 @@ impl McpAppState {
             session_status: std::collections::HashMap::new(),
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
+            session_known_non_external: std::collections::HashSet::new(),
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
             insufficient_rewind_notices: std::collections::HashMap::new(),
             density_maintenance_satisfied: std::collections::HashMap::new(),
             interactive_frontends: false,
+            subscribed_resource_uris: std::collections::HashSet::new(),
         }
     }
 
@@ -248,6 +332,102 @@ impl McpAppState {
             self.phase = phase;
             self.phase_entered_at = std::time::Instant::now();
         }
+    }
+
+    /// Probe the raw controller-loop cache: a still-fresh sample for
+    /// `loop_dir` (a stale entry or one collected for a different loop dir
+    /// misses) plus the current invalidation generation. Callers that miss
+    /// collect WITHOUT any lock held, then store through
+    /// [`Self::store_controller_loop_raw_status_at`] with this generation —
+    /// if a lifecycle mutation invalidated meanwhile, the pre-mutation
+    /// sample is discarded instead of reinstated.
+    pub(crate) fn probe_controller_loop_raw_status(
+        &self,
+        loop_dir: &std::path::Path,
+    ) -> (Option<ControllerLoopRawStatus>, u64) {
+        let cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let hit = cache.entry.as_ref().and_then(|(collected_at, raw)| {
+            (collected_at.elapsed() < CONTROLLER_LOOP_RAW_STATUS_TTL && raw.loop_dir() == loop_dir)
+                .then(|| raw.clone())
+        });
+        (hit, cache.generation)
+    }
+
+    /// Store a raw sample collected while the cache was at `generation`.
+    /// A no-op when the generation has moved (an invalidation raced the
+    /// collection): the sample predates the mutation that bumped it.
+    pub(crate) fn store_controller_loop_raw_status_at(
+        &self,
+        generation: u64,
+        raw: ControllerLoopRawStatus,
+    ) {
+        let mut cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.generation == generation {
+            cache.entry = Some((std::time::Instant::now(), raw));
+        }
+    }
+
+    /// Enter a hydration-replay scope for `target_session_id`. The returned
+    /// guard resets [`Self::hydration_replay`] on drop (panic-safe); mutate
+    /// the state through [`HydrationReplayGuard::state`] for the replay's
+    /// duration.
+    pub(crate) fn begin_hydration_replay(
+        &mut self,
+        target_session_id: &str,
+    ) -> HydrationReplayGuard<'_> {
+        self.hydration_replay = Some(target_session_id.trim().to_string());
+        HydrationReplayGuard { state: self }
+    }
+
+    /// The session an event WITHOUT a session id belongs to. Live events
+    /// from the bus belong to the daemon's active session — the historical
+    /// fallback, unchanged. During a hydration replay the answer is the
+    /// HYDRATION TARGET instead: some persisted rows carry no session id
+    /// (`round_complete` predates stamping), and reconstructing them
+    /// against the active session would both miss the session being
+    /// hydrated and corrupt the live session's status — a divergence that
+    /// is neither sink-lag-bounded nor self-healing once the cursor
+    /// commits past the row.
+    fn unattributed_event_session_id(&self) -> Option<String> {
+        if let Some(target) = &self.hydration_replay {
+            let target = target.trim();
+            return (!target.is_empty()).then(|| target.to_string());
+        }
+        let id = self.session_id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    /// Invalidate the raw controller-loop cache for a LIVE-observed session
+    /// lifecycle transition (task dispatch, session start/end, completion,
+    /// interruption): process reality just changed, so a pre-transition
+    /// sample must not answer the next poll. Hydration replays of historic
+    /// logs pass through the same fold arms and are ignored here — they do
+    /// not change process reality.
+    pub(crate) fn note_live_session_lifecycle_change(&self) {
+        if self.hydration_replay.is_none() {
+            self.invalidate_controller_loop_raw_status_cache();
+        }
+    }
+
+    /// Drop the cached raw controller-loop sample and bump the generation.
+    /// Called wherever process/marker reality changes — loop-marker tools
+    /// (halt/intervene/clear), task dispatch, and observed session
+    /// lifecycle transitions — so a status poll right after the mutation
+    /// re-collects instead of serving a sub-TTL stale sample, and so an
+    /// in-flight unlocked collection cannot reinstate one.
+    pub(crate) fn invalidate_controller_loop_raw_status_cache(&self) {
+        let mut cache = self
+            .controller_loop_raw_status_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.entry = None;
     }
 
     pub(crate) fn push_log(&mut self, level: LogLevel, content: String) {
@@ -521,6 +701,61 @@ impl McpAppState {
         self.remove_pending_rewind_pressure_check_for_key(session_id);
         self.remove_insufficient_rewind_notice_for_key(session_id);
         self.remove_density_maintenance_satisfied_for_key(session_id);
+        // A session ending changes process reality: a cached raw
+        // controller-loop sample from before the exit must not answer the
+        // next status poll. (No-op during hydration replays.)
+        self.note_live_session_lifecycle_change();
+        // Never prune from a hydration replay: the replayed `session_ended`
+        // line belongs to the very session a query is rebuilding — pruning
+        // here would erase the rebuild and leave an EOF cursor pointing at
+        // absent state, so a later query would answer with the daemon's
+        // current (unrelated) status under the requested id. Query-driven
+        // rebuilds stay resident instead.
+        if self.hydration_replay.is_none()
+            && self.session_status.len() > ENDED_SESSION_PRUNE_THRESHOLD
+        {
+            self.prune_ended_session_bookkeeping(session_id);
+        }
+    }
+
+    /// Drop an ended session's per-session bookkeeping (status, usage,
+    /// sources, aliases, managed-context latch). Only invoked once the
+    /// status map outgrows [`ENDED_SESSION_PRUNE_THRESHOLD`]: under the cap
+    /// an ended session stays resident so post-end queries (get_status of a
+    /// finished session, get_logs by backend alias) answer from memory;
+    /// over it, a later query rebuilds the entries from the persisted log
+    /// via hydration — correct, just one full replay slower.
+    fn prune_ended_session_bookkeeping(&mut self, session_id: &str) {
+        let ids = self.session_related_ids(session_id);
+        for id in &ids {
+            self.session_status.remove(id);
+            self.session_usage.remove(id);
+            self.session_sources.remove(id);
+            self.session_codex_managed_context.remove(id);
+            self.session_known_non_external.remove(id);
+            self.session_aliases.remove(id);
+        }
+        // Drop ONLY the ended component's hydration cursors (log-dir
+        // basenames carry the session id, with the store's prefix-match
+        // semantics), so live sessions keep theirs — on a long-lived daemon
+        // permanently over the cap, wiping every cursor on every session
+        // end would re-trigger the full-replay-under-write-lock cost this
+        // module exists to avoid. A cursor a rename/meta mismatch leaves
+        // behind is caught by hydration's pruned-state backstop, which
+        // forces a full replay whenever the requested session has no folded
+        // status.
+        self.session_log_hydration_cursors.retain(|path, _| {
+            let Some(dir_name) = path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+            else {
+                return false;
+            };
+            !ids.iter().any(|id| {
+                !id.is_empty() && (dir_name == id.as_str() || dir_name.starts_with(id.as_str()))
+            })
+        });
     }
 
     pub(crate) fn session_id_applies_to_current_session(&self, session_id: Option<&str>) -> bool {
@@ -564,10 +799,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                (!id.is_empty()).then(|| id.to_string())
-            });
+            .or_else(|| self.unattributed_event_session_id());
         let Some(target_id) = target_id else {
             if let Some(turn) = turn {
                 self.turn = turn;
@@ -634,10 +866,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                (!id.is_empty()).then(|| id.to_string())
-            });
+            .or_else(|| self.unattributed_event_session_id());
         let Some(target_id) = target_id else {
             self.round = round;
             return;
@@ -729,14 +958,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                if id.is_empty() {
-                    None
-                } else {
-                    Some(id.to_string())
-                }
-            })
+            .or_else(|| self.unattributed_event_session_id())
     }
 
     pub(crate) fn rewind_related_keys(&self, key: &str) -> Vec<String> {
@@ -1611,5 +1833,110 @@ mod tests {
             assert_eq!(snap.id, 42);
             assert_eq!(snap.category, "destructive");
         });
+    }
+
+    #[test]
+    fn over_cap_prune_drops_only_the_ended_components_cursors() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        let cursor = SessionJsonlCursor {
+            lines: 2,
+            bytes: 64,
+            prefix_len: 32,
+            prefix_hash: 7,
+        };
+        let ended_path = std::path::PathBuf::from("/tmp/logs/sess-ended/session.jsonl");
+        let live_path = std::path::PathBuf::from("/tmp/logs/sess-live/session.jsonl");
+        s.session_log_hydration_cursors
+            .insert(ended_path.clone(), cursor);
+        s.session_log_hydration_cursors
+            .insert(live_path.clone(), cursor);
+        s.link_session_aliases("sess-ended", "backend-ended");
+
+        for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+            s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+        }
+        s.note_session_phase(Some("sess-ended"), Some(2), Phase::Thinking, None);
+        s.note_session_ended("sess-ended");
+
+        // Only the ended component's cursor is dropped; a long-lived daemon
+        // permanently over the cap must not wipe live sessions' cursors on
+        // every unrelated session end.
+        assert!(!s.session_log_hydration_cursors.contains_key(&ended_path));
+        assert!(s.session_log_hydration_cursors.contains_key(&live_path));
+    }
+
+    #[test]
+    fn raw_status_cache_store_respects_invalidation_generation() {
+        let s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        let loop_dir = tempfile::tempdir().unwrap();
+        let (hit, generation) = s.probe_controller_loop_raw_status(loop_dir.path());
+        assert!(hit.is_none());
+
+        let raw = collect_controller_loop_raw_status(loop_dir.path(), loop_dir.path());
+        s.store_controller_loop_raw_status_at(generation, raw.clone());
+        assert!(s
+            .probe_controller_loop_raw_status(loop_dir.path())
+            .0
+            .is_some());
+
+        // Invalidation bumps the generation; a sample collected before the
+        // bump (a lock-free pre-warm racing a lifecycle mutation) must not
+        // be reinstated.
+        s.invalidate_controller_loop_raw_status_cache();
+        let (hit, new_generation) = s.probe_controller_loop_raw_status(loop_dir.path());
+        assert!(hit.is_none());
+        assert_ne!(generation, new_generation);
+        s.store_controller_loop_raw_status_at(generation, raw);
+        assert!(s
+            .probe_controller_loop_raw_status(loop_dir.path())
+            .0
+            .is_none());
+    }
+
+    #[test]
+    fn ended_sessions_keep_done_status_under_cap_and_prune_over_it() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        // Under the cap: an ended session's status (and aliases) stay
+        // resident so post-end status/log queries answer from memory.
+        s.link_session_aliases("wrapper-under", "backend-under");
+        s.note_session_phase(Some("wrapper-under"), Some(3), Phase::Thinking, None);
+        s.note_session_ended("wrapper-under");
+        assert_eq!(
+            s.session_status_for_id("backend-under")
+                .map(|st| st.phase.clone()),
+            Some(Phase::Done)
+        );
+
+        // Blow past the cap with unrelated sessions, then end one: its
+        // whole related-id component must be pruned from the bookkeeping.
+        for i in 0..=ENDED_SESSION_PRUNE_THRESHOLD {
+            s.note_session_phase(Some(&format!("filler-{i}")), Some(1), Phase::Thinking, None);
+        }
+        s.link_session_aliases("wrapper-over", "backend-over");
+        s.note_session_phase(Some("wrapper-over"), Some(5), Phase::Thinking, None);
+        s.session_sources
+            .insert("wrapper-over".to_string(), "codex".to_string());
+        s.note_session_ended("wrapper-over");
+        assert!(s.session_status_for_id("wrapper-over").is_none());
+        assert!(s.session_status_for_id("backend-over").is_none());
+        assert!(s.session_source_for_id("wrapper-over").is_none());
+        assert!(!s.session_aliases.contains_key("wrapper-over"));
+        assert!(!s.session_aliases.contains_key("backend-over"));
     }
 }
