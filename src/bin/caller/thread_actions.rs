@@ -1305,8 +1305,19 @@ async fn cleanup_fission_worktree(
     let display_path = wt.path.display().to_string();
     let root = project_root.to_path_buf();
     let wt = wt.clone();
-    match tokio::task::spawn_blocking(move || worktree::remove_worktree_and_branch(&root, &wt))
-        .await
+    let permit = match worktree::git_ops_semaphore().clone().acquire_owned().await {
+        Ok(permit) => permit,
+        Err(err) => {
+            return format!(
+                "; cleanup of worktree {display_path} skipped (git-ops slot unavailable: {err})"
+            );
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        worktree::remove_worktree_and_branch(&root, &wt)
+    })
+    .await
     {
         Ok(Ok(())) => String::new(),
         Ok(Err(err)) => format!("; cleanup of worktree {display_path} also failed: {err}"),
@@ -1332,16 +1343,24 @@ pub(crate) async fn spawn_single_fission_branch(
         ctx.use_worktree_override,
     );
     // Worktree create/remove spawn git and materialize/delete full checkouts;
-    // both run on the blocking pool so the fission drain task's worker is
-    // never parked behind them.
+    // both run on the blocking pool (worker not parked; a panic fails this
+    // branch spawn, not the drain task) under the daemon-wide git-ops bound
+    // so a wide fission cannot queue unbounded multi-second blocking jobs.
     let branch_worktree = if use_worktree {
+        let permit = worktree::git_ops_semaphore()
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("worktree git-ops slot unavailable: {e}"))?;
         let blocking_root = config.project_root.to_path_buf();
         let branch = fission_branch_git_name(ctx.group_id, ordinal);
-        let wt =
-            tokio::task::spawn_blocking(move || worktree::create(&blocking_root, &branch, "HEAD"))
-                .await
-                .map_err(|e| format!("worktree creation task failed: {e}"))?
-                .map_err(|e| format!("worktree creation failed: {e}"))?;
+        let wt = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            worktree::create(&blocking_root, &branch, "HEAD")
+        })
+        .await
+        .map_err(|e| format!("worktree creation task failed: {e}"))?
+        .map_err(|e| format!("worktree creation failed: {e}"))?;
         Some(wt)
     } else {
         None

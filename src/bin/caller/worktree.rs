@@ -2,6 +2,20 @@ use crate::error::CallerError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Bounds concurrent worktree git operations daemon-wide. The lifecycle
+/// helpers here spawn git and materialize/delete full checkouts (seconds on
+/// large projects); callers run them via `spawn_blocking`, and without a
+/// bound a burst of session/fission/sub-agent launches could queue an
+/// unbounded pile of multi-second blocking-pool jobs. Callers acquire an
+/// owned permit BEFORE spawning and move it into the blocking closure, so
+/// the permit is released when the git work actually finishes — even if the
+/// awaiting future is dropped mid-operation.
+pub fn git_ops_semaphore() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static GIT_OPS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    GIT_OPS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)))
+}
+
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub branch_name: String,
