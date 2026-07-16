@@ -106,7 +106,10 @@ impl ActivityMachine {
     /// Adopt the backend's own effort echo (first-hand only — callers
     /// pass values the backend itself stated, or the launch config).
     pub(crate) fn set_effort(&mut self, effort: Option<String>) {
-        if let Some(effort) = effort.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()) {
+        if let Some(effort) = effort
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+        {
             self.effort = Some(effort);
         }
     }
@@ -330,7 +333,9 @@ mod tests {
     #[test]
     fn dispatch_then_first_bytes_walk_awaiting_reasoning_responding() {
         let mut m = ActivityMachine::new(Some("max".into()));
-        let s = m.observe(Obs::TurnDispatched, 100).expect("dispatch publishes");
+        let s = m
+            .observe(Obs::TurnDispatched, 100)
+            .expect("dispatch publishes");
         assert_eq!(s.state, SessionActivityState::AwaitingApi);
         assert_eq!(s.since_epoch, 100);
         assert_eq!(s.last_stream_byte_epoch, 100);
@@ -342,7 +347,12 @@ mod tests {
         );
 
         let s = m
-            .observe(Obs::ReasoningStarted { delta_heartbeat: true }, 103)
+            .observe(
+                Obs::ReasoningStarted {
+                    delta_heartbeat: true,
+                },
+                103,
+            )
             .expect("state flip publishes");
         assert_eq!(s.state, SessionActivityState::Reasoning);
         assert_eq!(s.since_epoch, 103);
@@ -350,7 +360,10 @@ mod tests {
 
         // Same-state deltas keep `since` (the thinking block's elapsed
         // anchor) while advancing liveness.
-        assert!(m.observe(Obs::ReasoningDelta, 104).is_none(), "sub-quantum heartbeat");
+        assert!(
+            m.observe(Obs::ReasoningDelta, 104).is_none(),
+            "sub-quantum heartbeat"
+        );
         let s = m
             .observe(Obs::ReasoningDelta, 103 + HEARTBEAT_QUANTUM_SECS)
             .expect("quantum-aligned heartbeat publishes");
@@ -358,7 +371,9 @@ mod tests {
         assert_eq!(s.since_epoch, 103, "since anchors the thinking block");
         assert_eq!(s.last_stream_byte_epoch, 103 + HEARTBEAT_QUANTUM_SECS);
 
-        let s = m.observe(Obs::ResponseDelta, 110).expect("state flip publishes");
+        let s = m
+            .observe(Obs::ResponseDelta, 110)
+            .expect("state flip publishes");
         assert_eq!(s.state, SessionActivityState::Responding);
         assert_eq!(s.since_epoch, 110);
     }
@@ -367,7 +382,12 @@ mod tests {
     fn thinking_requires_recent_deltas_quiet_degrades_to_stalled() {
         let mut m = ActivityMachine::new(None);
         m.observe(Obs::TurnDispatched, 100);
-        m.observe(Obs::ReasoningStarted { delta_heartbeat: true }, 101);
+        m.observe(
+            Obs::ReasoningStarted {
+                delta_heartbeat: true,
+            },
+            101,
+        );
         m.observe(Obs::ReasoningDelta, 102);
         // Deltas recent: the reasoning claim holds.
         let within = 102 + u64::from(STALL_AFTER_SECS);
@@ -393,10 +413,18 @@ mod tests {
         let mut m = ActivityMachine::new(Some("high".into()));
         m.observe(Obs::TurnDispatched, 100);
         let s = m
-            .observe(Obs::ReasoningStarted { delta_heartbeat: false }, 101)
+            .observe(
+                Obs::ReasoningStarted {
+                    delta_heartbeat: false,
+                },
+                101,
+            )
             .expect("state flip publishes");
         assert_eq!(s.state, SessionActivityState::Reasoning);
-        assert_eq!(s.stalled_after_seconds, None, "no byte promise, no stall claim");
+        assert_eq!(
+            s.stalled_after_seconds, None,
+            "no byte promise, no stall claim"
+        );
         assert_eq!(
             m.effective_state(101 + 10 * u64::from(STALL_AFTER_SECS)),
             SessionActivityState::Reasoning,
@@ -422,7 +450,9 @@ mod tests {
         );
         // Tools settle → the model must be called again → awaiting-api,
         // whose stall clock starts at settle time.
-        let s = m.observe(Obs::SegmentSettled, 500).expect("state flip publishes");
+        let s = m
+            .observe(Obs::SegmentSettled, 500)
+            .expect("state flip publishes");
         assert_eq!(s.state, SessionActivityState::AwaitingApi);
         assert_eq!(s.last_stream_byte_epoch, 500);
     }
@@ -447,9 +477,14 @@ mod tests {
             SessionActivityState::RateLimited
         );
 
-        let s = m.observe(Obs::RateLimitCleared, 200).expect("state flip publishes");
+        let s = m
+            .observe(Obs::RateLimitCleared, 200)
+            .expect("state flip publishes");
         assert_eq!(s.state, SessionActivityState::AwaitingApi);
-        assert_eq!(s.resets_at_epoch, None, "reset countdown retired with the state");
+        assert_eq!(
+            s.resets_at_epoch, None,
+            "reset countdown retired with the state"
+        );
 
         // Cleared while already streaming: no-op (never regress a live state).
         m.observe(Obs::ResponseDelta, 210);
@@ -482,7 +517,9 @@ mod tests {
         assert_eq!(m.effective_state(500), SessionActivityState::Idle);
 
         // The next dispatch starts a fresh turn.
-        let s = m.observe(Obs::TurnDispatched, 300).expect("dispatch publishes");
+        let s = m
+            .observe(Obs::TurnDispatched, 300)
+            .expect("dispatch publishes");
         assert_eq!(s.state, SessionActivityState::AwaitingApi);
         assert_eq!(s.since_epoch, 300);
     }
@@ -516,7 +553,9 @@ mod tests {
         // Effort changes publish even without a state change.
         m.observe(Obs::TurnDispatched, 100);
         m.set_effort(Some("low".into()));
-        let s = m.observe(Obs::StreamByte, 101).expect("effort change publishes");
+        let s = m
+            .observe(Obs::StreamByte, 101)
+            .expect("effort change publishes");
         assert_eq!(s.effort.as_deref(), Some("low"));
     }
 
@@ -524,7 +563,10 @@ mod tests {
     fn idle_machine_publishes_nothing_until_first_turn() {
         let mut m = ActivityMachine::new(None);
         assert!(m.observe(Obs::StreamByte, 50).is_none());
-        assert!(m.observe(Obs::TurnSettled, 60).is_none(), "idle → idle is not news");
+        assert!(
+            m.observe(Obs::TurnSettled, 60).is_none(),
+            "idle → idle is not news"
+        );
         assert!(m.observe(Obs::TurnDispatched, 70).is_some());
     }
 

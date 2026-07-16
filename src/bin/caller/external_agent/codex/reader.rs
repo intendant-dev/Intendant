@@ -1114,7 +1114,10 @@ pub(crate) fn observe_codex_activity(
                 delta_heartbeat: false,
             },
             "agentMessage" => Obs::ResponseDelta,
-            "commandExecution" | "fileChange" | "mcpToolCall" | "webSearch"
+            "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "webSearch"
             | "collabAgentToolCall" => {
                 if let Some(id) = codex_item_event_id(params, item) {
                     state.open_tool_items.insert(id.to_string());
@@ -5350,7 +5353,10 @@ error: build failed
         let s = observe_codex_activity(&mut state, "turn/started", &none, 100)
             .expect("dispatch publishes");
         assert_eq!(s.state, S::AwaitingApi);
-        assert!(s.stalled_after_seconds.is_some(), "an unanswered turn can stall");
+        assert!(
+            s.stalled_after_seconds.is_some(),
+            "an unanswered turn can stall"
+        );
 
         let reasoning = serde_json::json!({"item": {"id": "r1", "type": "reasoning"}});
         let s = observe_codex_activity(&mut state, "item/started", &reasoning, 101)
@@ -5362,18 +5368,24 @@ error: build failed
         );
 
         // Long silence: the claim holds (liveness-only honesty, no fake stall).
-        assert!(observe_codex_activity(&mut state, "item/completed", &reasoning, 400)
-            .is_some_and(|s| s.state == S::AwaitingApi));
+        assert!(
+            observe_codex_activity(&mut state, "item/completed", &reasoning, 400)
+                .is_some_and(|s| s.state == S::AwaitingApi)
+        );
 
         let delta = serde_json::json!({"itemId": "m1", "delta": "hel"});
         let s = observe_codex_activity(&mut state, "item/agentMessage/delta", &delta, 401)
             .expect("state flip publishes");
         assert_eq!(s.state, S::Responding);
-        assert!(s.stalled_after_seconds.is_some(), "message deltas are a live stream");
+        assert!(
+            s.stalled_after_seconds.is_some(),
+            "message deltas are a live stream"
+        );
 
         // Two tools open; the first settling keeps tool-running, the last
         // settles back to awaiting the model.
-        let tool_a = serde_json::json!({"item": {"id": "c1", "type": "commandExecution", "command": "ls"}});
+        let tool_a =
+            serde_json::json!({"item": {"id": "c1", "type": "commandExecution", "command": "ls"}});
         let tool_b = serde_json::json!({"item": {"id": "c2", "type": "mcpToolCall", "tool": "take_screenshot"}});
         let s = observe_codex_activity(&mut state, "item/started", &tool_a, 402)
             .expect("state flip publishes");
@@ -5392,7 +5404,9 @@ error: build failed
         assert_eq!(s.state, S::Idle);
 
         // Ambient between-turn notifications resurrect nothing.
-        assert!(observe_codex_activity(&mut state, "thread/tokenUsage/updated", &none, 501).is_none());
+        assert!(
+            observe_codex_activity(&mut state, "thread/tokenUsage/updated", &none, 501).is_none()
+        );
         assert_eq!(state.activity.snapshot().state, S::Idle);
     }
 

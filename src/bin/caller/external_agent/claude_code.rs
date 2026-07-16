@@ -334,6 +334,24 @@ impl CcShared {
 // Pure protocol helpers
 // ---------------------------------------------------------------------------
 
+/// Structured write paths of a Claude Code tool_use block, verbatim as the
+/// wire input stated them: `Write`/`Edit` carry `file_path`, `NotebookEdit`
+/// `notebook_path`. Feeds `AgentEvent::FileActivity` for the git-vitals
+/// activity-locus tracker (the Codex `fileChange` twin) — structural wire
+/// fields only, never derived from a rendered preview.
+fn cc_write_tool_paths(tool_name: &str, input: &serde_json::Value) -> Vec<String> {
+    if !matches!(tool_name, "Write" | "Edit" | "NotebookEdit") {
+        return Vec::new();
+    }
+    ["file_path", "notebook_path"]
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Human preview for a tool invocation: shell command, file path (plus the
 /// model's own description when present), or a truncated JSON dump.
 /// `pub(crate)`: the disk-transcript reconstruction
@@ -1576,12 +1594,22 @@ impl CcReader {
                         self.open_tools
                             .insert(tool_id.clone(), child_scope.map(str::to_string));
                     }
+                    let write_paths = cc_write_tool_paths(&tool_name, &input);
                     out.events.push(AgentEvent::ToolStarted {
                         item_id: tool_id,
                         tool_name,
                         preview: tool_input_preview(&input),
                     });
                     if child_scope.is_none() {
+                        // Structured write-path signal for the git-vitals
+                        // activity-locus tracker (the Codex fileChange
+                        // twin). Primary-conversation writes only: a
+                        // sub-agent's edits must not retarget the
+                        // supervising session's git chip.
+                        if !write_paths.is_empty() {
+                            out.events
+                                .push(AgentEvent::FileActivity { paths: write_paths });
+                        }
                         // Main-thread tool execution begins here (the API
                         // message with the tool_use closed). Child-scoped
                         // tools run concurrently and say nothing about the
@@ -3029,13 +3057,10 @@ mod tests {
     }
 
     fn last_activity(out: &CcLineOutcome) -> Option<crate::types::SessionActivityVitals> {
-        out.events
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                AgentEvent::ActivityUpdate { activity } => Some(activity.clone()),
-                _ => None,
-            })
+        out.events.iter().rev().find_map(|e| match e {
+            AgentEvent::ActivityUpdate { activity } => Some(activity.clone()),
+            _ => None,
+        })
     }
 
     /// The wire → activity mapping: thinking blocks (and their live
@@ -3153,6 +3178,59 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
         );
         assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+    }
+
+    /// Write-ish tool_use blocks emit their structured paths alongside
+    /// ToolStarted (the Codex fileChange twin) — primary conversation
+    /// only, structural wire fields only.
+    #[test]
+    fn write_tools_emit_file_activity_paths() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"w1","name":"Edit","input":{"file_path":"/repo/src/lib.rs","old_string":"a","new_string":"b"}}]},"session_id":"s1"}"#,
+        );
+        let paths: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::FileActivity { paths } => Some(paths.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec![vec!["/repo/src/lib.rs".to_string()]]);
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolStarted { .. })),
+            "FileActivity rides alongside the ToolStarted, not instead of it"
+        );
+
+        // NotebookEdit states notebook_path; read-ish tools state nothing.
+        assert_eq!(
+            cc_write_tool_paths(
+                "NotebookEdit",
+                &serde_json::json!({"notebook_path": "/repo/nb.ipynb", "new_source": ""})
+            ),
+            vec!["/repo/nb.ipynb".to_string()]
+        );
+        assert!(cc_write_tool_paths("Bash", &serde_json::json!({"command": "ls"})).is_empty());
+        assert!(cc_write_tool_paths("Read", &serde_json::json!({"file_path": "/x"})).is_empty());
+        assert!(cc_write_tool_paths("Write", &serde_json::json!({"file_path": "  "})).is_empty());
+
+        // Child-scoped (sub-agent) writes stay off the primary signal.
+        let out = reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-9","message":{"content":[{"type":"tool_use","id":"w2","name":"Write","input":{"file_path":"/repo/child.rs","content":"x"}}]},"session_id":"s1"}"#,
+        );
+        assert!(
+            !out.events.iter().any(|e| {
+                let inner = match e {
+                    AgentEvent::Scoped { event, .. } => event.as_ref(),
+                    e => e,
+                };
+                matches!(inner, AgentEvent::FileActivity { .. })
+            }),
+            "sub-agent writes must not retarget the supervising session"
+        );
     }
 
     /// The launch `--effort` value rides every published snapshot as the
