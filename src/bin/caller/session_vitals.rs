@@ -9,7 +9,12 @@
 //!   fallback), a merge-parity preview via in-memory
 //!   `git merge-tree --write-tree` (git ≥ 2.38, cached by SHA pair), and
 //!   unpushed counts for the current and primary branches. Periodic, for
-//!   the fixed target list.
+//!   the live target registry. Each target follows the session's write
+//!   activity: when `AppEvent::SessionFileActivity` paths resolve inside a
+//!   different git checkout than the registered root (e.g. a worktree the
+//!   session entered by absolute path without registering it), the probe
+//!   target switches to that checkout — most-recent-wins with mild
+//!   hysteresis, registered root kept as the fallback identity.
 //! - **Cache segment**: a bus listener over `AppEvent::UsageSnapshot` —
 //!   every backend's usage rail converges there (external drains, the
 //!   native derivation in `tui/app.rs`), so one listener covers Claude
@@ -439,20 +444,125 @@ fn spawn_cache_vitals_listener(
     })
 }
 
+/// Activity events that must resolve to the same non-current checkout
+/// before the probe target switches to it (mild anti-flap hysteresis; the
+/// same threshold applies to switching back to the registered root).
+const LOCUS_SWITCH_SIGHTINGS: u32 = 2;
+
+/// Resolve the git checkout containing `path`: the nearest ancestor with a
+/// `.git` entry — a directory for ordinary checkouts, a FILE for linked
+/// worktrees — via pure filesystem stats (no subprocess). `None` when no
+/// ancestor is a checkout. The leaf itself may not exist yet (a write
+/// about to create it): nonexistent components simply don't match and the
+/// walk climbs on.
+fn resolve_git_checkout_root(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.join(".git").symlink_metadata().is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+/// One session's probe target: the registered root (the session's durable
+/// identity — never lost) plus the activity-locus overlay.
+struct GitTarget {
+    registered_root: PathBuf,
+    /// Checkout the session's recent write activity resolved into, when it
+    /// differs from the registered root's checkout. Overrides the probe
+    /// target while set; cleared when activity returns home or the locus
+    /// stops probing (worktree deleted).
+    active_locus: Option<PathBuf>,
+    /// Pending switch: (proposed override, activity events seen). A `None`
+    /// proposal is "switch back to the registered root". Reset whenever an
+    /// event confirms the current target instead.
+    candidate: Option<(Option<PathBuf>, u32)>,
+}
+
+impl GitTarget {
+    fn new(registered_root: PathBuf) -> Self {
+        Self {
+            registered_root,
+            active_locus: None,
+            candidate: None,
+        }
+    }
+
+    fn effective(&self) -> PathBuf {
+        self.active_locus
+            .clone()
+            .unwrap_or_else(|| self.registered_root.clone())
+    }
+
+    /// Fold one activity event's write paths into the locus state.
+    /// Relative paths and paths outside any checkout are ignored; each
+    /// distinct checkout counts once per event, so a burst of writes in
+    /// one batch is a single sighting.
+    fn observe_write_activity(&mut self, paths: &[String]) {
+        let home_checkout = resolve_git_checkout_root(&self.registered_root);
+        let mut seen_this_event: Vec<PathBuf> = Vec::new();
+        for path in paths {
+            let path = Path::new(path);
+            if !path.is_absolute() {
+                continue;
+            }
+            let Some(checkout) = resolve_git_checkout_root(path) else {
+                continue;
+            };
+            if seen_this_event.contains(&checkout) {
+                continue;
+            }
+            seen_this_event.push(checkout.clone());
+            let proposal = if Some(&checkout) == home_checkout.as_ref() {
+                None
+            } else {
+                Some(checkout)
+            };
+            if proposal == self.active_locus {
+                // Activity confirms the current target — most-recent-wins
+                // means a stale candidate no longer represents the recent
+                // trend, so drop it.
+                self.candidate = None;
+                continue;
+            }
+            match &mut self.candidate {
+                Some((candidate, sightings)) if *candidate == proposal => {
+                    *sightings += 1;
+                    if *sightings >= LOCUS_SWITCH_SIGHTINGS {
+                        self.active_locus = proposal;
+                        self.candidate = None;
+                    }
+                }
+                _ => self.candidate = Some((proposal, 1)),
+            }
+        }
+    }
+}
+
 /// Live registry of (session id → working dir) git-probe targets. The
 /// daemon seeds the primary session at startup; the session supervisor
 /// registers every managed session at launch — which is what puts the
 /// dirty-count / merge-parity / unpushed rows on dashboard-spawned
 /// sessions and on projectless daemons (whose primary has no repo).
 /// `SessionEnded` prunes entries, so a handle owner only has to register.
+///
+/// Each entry also tracks the session's activity locus: write paths from
+/// `AppEvent::SessionFileActivity` that resolve inside a different git
+/// checkout retarget the probe (see [`GitTarget`]), so the git chip shows
+/// the checkout actually being worked in — e.g. a nested worktree the
+/// session entered by absolute path without registering it.
 #[derive(Clone, Default)]
 pub(crate) struct GitVitalsTargets {
-    targets: Arc<Mutex<HashMap<String, PathBuf>>>,
+    targets: Arc<Mutex<HashMap<String, GitTarget>>>,
 }
 
 impl GitVitalsTargets {
     /// Register (or retarget) a session's git probe root. No-ops on empty
     /// ids so callers can pass through unresolved values unchecked.
+    /// Re-registering resets any activity-locus override — registration is
+    /// an explicit statement of where the session lives.
     pub(crate) fn register(&self, session_id: &str, cwd: PathBuf) {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -461,7 +571,7 @@ impl GitVitalsTargets {
         self.targets
             .lock()
             .expect("git vitals targets lock")
-            .insert(session_id.to_string(), cwd);
+            .insert(session_id.to_string(), GitTarget::new(cwd));
     }
 
     pub(crate) fn remove(&self, session_id: &str) {
@@ -471,13 +581,38 @@ impl GitVitalsTargets {
             .remove(session_id.trim());
     }
 
+    /// Effective probe targets: the activity locus where one is active,
+    /// the registered root otherwise.
     fn snapshot(&self) -> Vec<(String, PathBuf)> {
         self.targets
             .lock()
             .expect("git vitals targets lock")
             .iter()
-            .map(|(id, cwd)| (id.clone(), cwd.clone()))
+            .map(|(id, target)| (id.clone(), target.effective()))
             .collect()
+    }
+
+    /// Fold a session's write activity into its locus state (no-op for
+    /// unregistered ids).
+    fn observe_write_activity(&self, session_id: &str, paths: &[String]) {
+        let mut targets = self.targets.lock().expect("git vitals targets lock");
+        if let Some(target) = targets.get_mut(session_id.trim()) {
+            target.observe_write_activity(paths);
+        }
+    }
+
+    /// The active locus stopped probing (worktree deleted, repo gone):
+    /// fall back to the registered root. Returns the root to re-probe when
+    /// `failed_target` was indeed the session's active locus.
+    fn demote_locus(&self, session_id: &str, failed_target: &Path) -> Option<PathBuf> {
+        let mut targets = self.targets.lock().expect("git vitals targets lock");
+        let target = targets.get_mut(session_id.trim())?;
+        if target.active_locus.as_deref() != Some(failed_target) {
+            return None;
+        }
+        target.active_locus = None;
+        target.candidate = None;
+        Some(target.registered_root.clone())
     }
 }
 
@@ -501,14 +636,22 @@ pub(crate) fn spawn_session_vitals_producer(
     }
     let hub = SessionVitalsHub::new(bus.clone());
     let _cache_listener = spawn_cache_vitals_listener(bus.clone(), hub.clone());
-    let _target_pruner = spawn_git_target_pruner(bus, registry.clone(), hub.clone());
+    let _target_maintainer = spawn_git_target_maintainer(bus, registry.clone(), hub.clone());
     let handle = tokio::spawn({
         let registry = registry.clone();
         async move {
             let mut prober = GitVitalsProber::default();
             loop {
                 for (session_id, cwd) in registry.snapshot() {
-                    let probed = prober.probe(&cwd).await;
+                    let mut probed = prober.probe(&cwd).await;
+                    if probed.is_none() {
+                        // A dead activity locus (worktree deleted, checkout
+                        // gone) falls back to the registered root in the
+                        // same tick so the chip never blanks.
+                        if let Some(root) = registry.demote_locus(&session_id, &cwd) {
+                            probed = prober.probe(&root).await;
+                        }
+                    }
                     hub.apply(&session_id, |vitals| vitals.git = probed);
                 }
                 tokio::time::sleep(PROBE_INTERVAL).await;
@@ -518,12 +661,18 @@ pub(crate) fn spawn_session_vitals_producer(
     (registry, handle)
 }
 
-/// Prune git targets when their session ends — mirrors the cache
-/// listener's `SessionEnded` hygiene so registered sessions never leak
-/// probe work past their lifetime. Resolution runs through the hub's
-/// alias map: resume lanes register the live (backend-native) id while
-/// the end event carries the wrapper id, and vice versa.
-fn spawn_git_target_pruner(
+/// Bus maintenance for the git-target registry:
+///
+/// - `SessionEnded` prunes targets — mirrors the cache listener's hygiene
+///   so registered sessions never leak probe work past their lifetime.
+/// - `SessionFileActivity` folds a session's structured write paths into
+///   its activity-locus state, retargeting the probe when the work moved
+///   into a different checkout (see [`GitTarget::observe_write_activity`]).
+///
+/// Resolution runs through the hub's alias map both ways: resume lanes
+/// register the live (backend-native) id while events may carry the
+/// wrapper id, and vice versa.
+fn spawn_git_target_maintainer(
     bus: EventBus,
     registry: GitVitalsTargets,
     hub: Arc<SessionVitalsHub>,
@@ -538,6 +687,17 @@ fn spawn_git_target_pruner(
                     for (id, _) in registry.snapshot() {
                         if hub.resolve(&id) == ended {
                             registry.remove(&id);
+                        }
+                    }
+                }
+                Ok(AppEvent::SessionFileActivity {
+                    session_id: Some(session_id),
+                    paths,
+                }) => {
+                    let canonical = hub.resolve(&session_id);
+                    for (id, _) in registry.snapshot() {
+                        if hub.resolve(&id) == canonical {
+                            registry.observe_write_activity(&id, &paths);
                         }
                     }
                 }
@@ -817,6 +977,216 @@ mod tests {
             sid, "native-1",
             "removal drops the alias — the id starts a fresh group"
         );
+    }
+
+    #[test]
+    fn checkout_resolution_walks_to_git_dir_or_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // Ordinary checkout: `.git` directory.
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        // Linked worktree nested INSIDE the repo (the real failure case:
+        // `<root>/.claude/worktrees/<name>`): `.git` is a FILE.
+        let worktree = repo.join(".claude/worktrees/session-fork");
+        std::fs::create_dir_all(worktree.join("src")).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        assert_eq!(
+            resolve_git_checkout_root(&repo.join("src/main.rs")),
+            Some(repo.clone()),
+            "file under an ordinary checkout resolves to it"
+        );
+        assert_eq!(
+            resolve_git_checkout_root(&worktree.join("src/lib.rs")),
+            Some(worktree.clone()),
+            "a nested worktree's .git FILE wins over the enclosing repo"
+        );
+        // The leaf need not exist (a write about to create it).
+        assert_eq!(
+            resolve_git_checkout_root(&worktree.join("deep/new/dir/file.rs")),
+            Some(worktree.clone()),
+            "nonexistent leading components climb to the checkout"
+        );
+        assert_eq!(
+            resolve_git_checkout_root(&worktree),
+            Some(worktree.clone()),
+            "the checkout root itself resolves to itself"
+        );
+        // No checkout anywhere up the chain.
+        let bare = root.join("no-repo/sub");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(resolve_git_checkout_root(&bare.join("f.txt")), None);
+    }
+
+    #[test]
+    fn write_activity_switches_target_with_hysteresis_both_ways() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let targets = GitVitalsTargets::default();
+        targets.register("s1", repo.clone());
+        let effective = |targets: &GitVitalsTargets| targets.snapshot()[0].1.clone();
+        let wt_file = || vec![worktree.join("src/a.rs").to_string_lossy().into_owned()];
+        let home_file = || vec![repo.join("src/b.rs").to_string_lossy().into_owned()];
+
+        // One sighting is not enough (anti-flap).
+        targets.observe_write_activity("s1", &wt_file());
+        assert_eq!(effective(&targets), repo, "single sighting must not switch");
+        // Second sighting switches to the worktree.
+        targets.observe_write_activity("s1", &wt_file());
+        assert_eq!(effective(&targets), worktree, "two sightings switch");
+        // Alternating activity never flaps: a home sighting arms a
+        // candidate, but the next worktree write confirms the current
+        // target and clears it.
+        targets.observe_write_activity("s1", &home_file());
+        assert_eq!(effective(&targets), worktree);
+        targets.observe_write_activity("s1", &wt_file());
+        assert_eq!(effective(&targets), worktree);
+        targets.observe_write_activity("s1", &home_file());
+        assert_eq!(
+            effective(&targets),
+            worktree,
+            "one home sighting is not enough"
+        );
+        // Two consecutive home sightings switch back to the registered root.
+        targets.observe_write_activity("s1", &home_file());
+        assert_eq!(
+            effective(&targets),
+            repo,
+            "activity back home switches back"
+        );
+
+        // Relative paths and non-checkout paths are ignored entirely.
+        targets.observe_write_activity("s1", &["relative/path.rs".to_string()]);
+        targets.observe_write_activity("s1", &["relative/path.rs".to_string()]);
+        let outside = temp.path().join("no-repo/x.rs");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        let outside = vec![outside.to_string_lossy().into_owned()];
+        targets.observe_write_activity("s1", &outside);
+        targets.observe_write_activity("s1", &outside);
+        assert_eq!(
+            effective(&targets),
+            repo,
+            "relative / checkout-less paths never retarget"
+        );
+
+        // A multi-path burst in ONE event counts once per checkout.
+        let burst = vec![
+            worktree.join("one.rs").to_string_lossy().into_owned(),
+            worktree.join("two.rs").to_string_lossy().into_owned(),
+        ];
+        targets.observe_write_activity("s1", &burst);
+        assert_eq!(effective(&targets), repo, "one burst = one sighting");
+        targets.observe_write_activity("s1", &burst);
+        assert_eq!(
+            effective(&targets),
+            worktree,
+            "second event completes the switch"
+        );
+
+        // Re-registering resets the locus override.
+        targets.register("s1", repo.clone());
+        assert_eq!(effective(&targets), repo, "re-register resets the locus");
+    }
+
+    #[test]
+    fn dead_locus_demotes_to_registered_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let worktree = repo.join(".claude/worktrees/wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let targets = GitVitalsTargets::default();
+        targets.register("s1", repo.clone());
+        let path = vec![worktree.join("f.rs").to_string_lossy().into_owned()];
+        targets.observe_write_activity("s1", &path);
+        targets.observe_write_activity("s1", &path);
+        assert_eq!(targets.snapshot()[0].1, worktree);
+
+        // Demoting a path that is NOT the active locus is a no-op.
+        assert_eq!(targets.demote_locus("s1", &repo), None);
+        assert_eq!(targets.snapshot()[0].1, worktree);
+        // The active locus failing its probe falls back to the root.
+        assert_eq!(targets.demote_locus("s1", &worktree), Some(repo.clone()));
+        assert_eq!(targets.snapshot()[0].1, repo);
+        // Unknown sessions are a calm no-op.
+        assert_eq!(targets.demote_locus("nope", &worktree), None);
+    }
+
+    #[tokio::test]
+    async fn activity_locus_follows_worktree_and_falls_back_when_deleted() {
+        // End-to-end through the producer: a session registered at the
+        // repo root writes (via absolute paths) inside a nested linked
+        // worktree it never registered — the git chip must follow the
+        // activity and report the worktree's branch, then fall back to the
+        // registered root when the worktree disappears.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "base"]);
+        let worktree = root.join(".claude/worktrees/session-fork");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        git_cmd(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "worktree-session-fork",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let bus = EventBus::new();
+        // Subscribed before the producer spawns, so every change-only hub
+        // emission is queued here — sequential waits never miss one.
+        let mut rx = bus.subscribe();
+        let (targets, _producer) = spawn_session_vitals_producer(bus.clone(), Vec::new());
+        targets.register("s-fork", root.to_path_buf());
+
+        let deadline = std::time::Duration::from_secs(20);
+        async fn wait_for_branch(rx: &mut tokio::sync::broadcast::Receiver<AppEvent>, want: &str) {
+            loop {
+                if let Ok(AppEvent::SessionVitals { session_id, vitals }) = rx.recv().await {
+                    assert_eq!(session_id, "s-fork");
+                    if vitals.git.as_ref().is_some_and(|g| g.branch == want) {
+                        return;
+                    }
+                }
+            }
+        }
+        tokio::time::timeout(deadline, wait_for_branch(&mut rx, "main"))
+            .await
+            .expect("registered root probes on main before activity");
+
+        // Two write-activity events inside the (unregistered) worktree.
+        let wt_path = worktree.join("src/new.rs").to_string_lossy().into_owned();
+        for _ in 0..2 {
+            bus.send(AppEvent::SessionFileActivity {
+                session_id: Some("s-fork".into()),
+                paths: vec![wt_path.clone()],
+            });
+        }
+        tokio::time::timeout(deadline, wait_for_branch(&mut rx, "worktree-session-fork"))
+            .await
+            .expect("git chip follows the activity into the worktree");
+
+        // Worktree deleted out from under the session: fall back to the
+        // registered root (same tick — the chip never blanks).
+        std::fs::remove_dir_all(&worktree).unwrap();
+        tokio::time::timeout(deadline, wait_for_branch(&mut rx, "main"))
+            .await
+            .expect("dead locus falls back to the registered root");
     }
 
     #[tokio::test]
