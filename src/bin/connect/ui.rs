@@ -233,8 +233,12 @@ impl StaticPage {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| {
                 value.split(',').any(|candidate| {
-                    candidate.trim().trim_start_matches("W/")
-                        == self.etag.to_str().unwrap_or_default()
+                    let candidate = candidate.trim();
+                    // RFC 9110: `If-None-Match: *` matches any current
+                    // representation.
+                    candidate == "*"
+                        || candidate.trim_start_matches("W/")
+                            == self.etag.to_str().unwrap_or_default()
                 })
             });
         let mut headers = HeaderMap::new();
@@ -2333,6 +2337,11 @@ mod tests {
         stale.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"stale\""));
         assert_eq!(page.respond(&stale).status(), StatusCode::OK);
 
+        // RFC 9110: `*` matches any current representation.
+        let mut any = HeaderMap::new();
+        any.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+        assert_eq!(page.respond(&any).status(), StatusCode::NOT_MODIFIED);
+
         // Installers keep their plain-text identity and skip CSP framing.
         let script = StaticPage::script("#!/bin/sh\n".to_string()).respond(&HeaderMap::new());
         assert_eq!(
@@ -2475,7 +2484,7 @@ mod tests {
             .lock()
             .await
             .contains_key("legacy-session"));
-        assert!(state.rate_limits.lock().await.is_empty());
+        assert!(state.rate_limits.lock().await.buckets.is_empty());
         server.abort();
     }
 

@@ -264,7 +264,13 @@ struct LogFindIndex {
 /// `store.log_entries` stable across the extend; the cache lock is a short
 /// synchronous hold nested inside it (always store → cache order).
 pub(crate) fn cached_log_leaves(state: &AppState, store: &Store) -> Arc<Vec<[u8; 32]>> {
-    let mut caches = state.log_caches.lock().expect("log cache lock poisoned");
+    // Derived, rebuildable state: recover from a poisoned lock instead of
+    // propagating the panic — a partially extended cache re-extends (or
+    // fully rebuilds) idempotently from the store under the caller's lock.
+    let mut caches = state
+        .log_caches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let total = store.log_entries.len();
     if caches.leaf_hashes.len() != total {
         let mut hashes = Vec::with_capacity(total);
@@ -315,7 +321,11 @@ pub(crate) fn find_log_entry_indexed(
     daemon_id: &str,
     handle: &str,
 ) -> Option<usize> {
-    let mut caches = state.log_caches.lock().expect("log cache lock poisoned");
+    // Same poison-recovery rationale as `cached_log_leaves`.
+    let mut caches = state
+        .log_caches
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     extend_find_index(&mut caches.find, store);
     if !daemon_id.is_empty() {
         caches.find.daemon_claimed_last.get(daemon_id).copied()

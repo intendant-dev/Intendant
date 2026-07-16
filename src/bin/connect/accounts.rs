@@ -505,12 +505,31 @@ pub(crate) fn header_string(headers: &HeaderMap, name: &'static str) -> Option<S
 }
 
 pub(crate) fn client_rate_key(headers: &HeaderMap, scope: &str) -> String {
-    let peer = header_string(headers, "x-forwarded-for")
+    format!("{scope}:{}", forwarded_peer_token(headers))
+}
+
+/// Canonicalized, bounded source token for rate keys. The first forwarded
+/// hop is parsed as an IP address (accepting an `ip:port` form some proxies
+/// emit) and re-rendered canonically, so the key cap is also a byte cap
+/// (≤45 chars) and textual IPv6 variants of one address share a bucket. A
+/// present-but-unparseable value collapses to one bounded "invalid" bucket
+/// (previously it became an attacker-mintable arbitrary-length key); the
+/// absent-header fallback stays "unknown", unchanged.
+fn forwarded_peer_token(headers: &HeaderMap) -> String {
+    let raw = header_string(headers, "x-forwarded-for")
         .and_then(|v| v.split(',').next().map(str::trim).map(str::to_string))
         .filter(|v| !v.is_empty())
-        .or_else(|| header_string(headers, "x-real-ip"))
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{scope}:{peer}")
+        .or_else(|| header_string(headers, "x-real-ip"));
+    let Some(value) = raw else {
+        return "unknown".to_string();
+    };
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return ip.to_string();
+    }
+    if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+        return addr.ip().to_string();
+    }
+    "invalid".to_string()
 }
 
 /// The caller's public IP as this service observed it (first
@@ -529,50 +548,55 @@ pub(crate) fn client_observed_ip(headers: &HeaderMap) -> Option<String> {
         .map(|ip| ip.to_string())
 }
 
-/// The largest window any `check_rate_limit` call site uses (the hourly
-/// new-daemon-identity budget). A bucket idle past this is expired for every
-/// scope — the next request would reset it anyway — so pruning such buckets
-/// never changes a limit decision. Asserted at use so a wider window cannot
-/// silently outlive the sweep.
-pub(crate) const RATE_LIMIT_WINDOW_MAX_MS: u64 = 60 * 60_000;
-
 /// Hard bound on distinct rate-limit keys held in memory. Keys derive from
 /// client-controlled forwarded-address headers, so an attacker (or plain
 /// IPv6 churn) can mint fresh keys freely; the table must not grow with
 /// them. At roughly 100 bytes per entry this is a few MB.
 pub(crate) const RATE_LIMIT_MAX_KEYS: usize = 50_000;
 
-/// Drop buckets whose window has expired under every scope's window size.
-pub(crate) fn prune_rate_limits(buckets: &mut HashMap<String, RateLimitBucket>, now: u64) {
-    buckets.retain(|_, bucket| {
-        now.saturating_sub(bucket.window_start_unix_ms) <= RATE_LIMIT_WINDOW_MAX_MS
-    });
+/// At-capacity prune scans are amortized to at most one per this interval:
+/// after a saturated prune the table is all-live, so an immediate re-scan
+/// could only reclaim buckets whose windows elapsed in between.
+const RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS: u64 = 1_000;
+
+fn rate_bucket_expired(bucket: &RateLimitBucket, now: u64) -> bool {
+    now.saturating_sub(bucket.window_start_unix_ms) > bucket.window_ms
 }
 
-/// Bound the table before inserting a new key: prune expired windows first;
-/// if the table is still saturated with live windows, evict the stalest
-/// bucket (the one closest to expiring anyway) rather than growing without
-/// bound or refusing brand-new legitimate clients. An attacker gains nothing
-/// they lack: minting fresh keys was always free via forwarded headers.
+/// Drop buckets whose OWN window has expired — such a bucket grants no
+/// restriction a fresh entry would not (its next request resets it), so
+/// removal never changes a limit decision. Expiry is strictly per-bucket:
+/// judging a short-window bucket by a longer global bound would rank it
+/// "live" long after its own window died, letting churned short-window keys
+/// crowd out genuinely live long-window buckets.
+pub(crate) fn prune_rate_limits(buckets: &mut HashMap<String, RateLimitBucket>, now: u64) {
+    buckets.retain(|_, bucket| !rate_bucket_expired(bucket, now));
+}
+
+/// Capacity gate for inserting a new key. Reclaims genuinely expired
+/// buckets first (full scan amortized to once per
+/// `RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS` while saturated); if the
+/// table is still full of LIVE buckets, it fails closed on the new key —
+/// a live bucket is never evicted, because evicting one resets an active
+/// counter (an attacker flooding cheap short-window keys could otherwise
+/// reset a security-sensitive budget like the hourly new-daemon-identity
+/// cap). Existing keys always pass.
 fn reserve_rate_limit_slot(
-    buckets: &mut HashMap<String, RateLimitBucket>,
+    table: &mut RateLimitTable,
     key: &str,
     now: u64,
     max_keys: usize,
-) {
-    if buckets.len() < max_keys || buckets.contains_key(key) {
-        return;
+) -> bool {
+    if table.buckets.len() < max_keys || table.buckets.contains_key(key) {
+        return true;
     }
-    prune_rate_limits(buckets, now);
-    if buckets.len() >= max_keys {
-        let stalest = buckets
-            .iter()
-            .min_by_key(|(_, bucket)| bucket.window_start_unix_ms)
-            .map(|(key, _)| key.clone());
-        if let Some(stalest) = stalest {
-            buckets.remove(&stalest);
-        }
+    if now.saturating_sub(table.last_saturated_prune_unix_ms)
+        >= RATE_LIMIT_SATURATED_PRUNE_MIN_INTERVAL_MS
+    {
+        table.last_saturated_prune_unix_ms = now;
+        prune_rate_limits(&mut table.buckets, now);
     }
+    table.buckets.len() < max_keys
 }
 
 pub(crate) async fn check_rate_limit(
@@ -582,18 +606,21 @@ pub(crate) async fn check_rate_limit(
     limit: u32,
     window_ms: u64,
 ) -> ApiResult<()> {
-    debug_assert!(
-        window_ms <= RATE_LIMIT_WINDOW_MAX_MS,
-        "rate window {window_ms}ms exceeds the sweep bound — widen RATE_LIMIT_WINDOW_MAX_MS"
-    );
     let now = now_unix_ms();
     let key = client_rate_key(headers, scope);
-    let mut buckets = state.rate_limits.lock().await;
-    reserve_rate_limit_slot(&mut buckets, &key, now, RATE_LIMIT_MAX_KEYS);
-    let bucket = buckets.entry(key).or_insert(RateLimitBucket {
+    let mut table = state.rate_limits.lock().await;
+    if !reserve_rate_limit_slot(&mut table, &key, now, RATE_LIMIT_MAX_KEYS) {
+        // Table saturated with live windows: fail closed on the unseen key.
+        return Err(ApiError::too_many_requests("rate limit exceeded"));
+    }
+    let bucket = table.buckets.entry(key).or_insert(RateLimitBucket {
         window_start_unix_ms: now,
         count: 0,
+        window_ms,
     });
+    // Scope-stable by construction (each scope passes one window); refresh
+    // defensively so a changed literal takes effect without a restart.
+    bucket.window_ms = window_ms;
     if now.saturating_sub(bucket.window_start_unix_ms) > window_ms {
         bucket.window_start_unix_ms = now;
         bucket.count = 0;
@@ -1036,70 +1063,134 @@ pub(crate) async fn auth_login_finish(
 mod tests {
     use super::*;
 
-    fn bucket(window_start_unix_ms: u64) -> RateLimitBucket {
+    const HOUR_MS: u64 = 60 * 60_000;
+
+    fn bucket(window_start_unix_ms: u64, window_ms: u64) -> RateLimitBucket {
         RateLimitBucket {
             window_start_unix_ms,
             count: 1,
+            window_ms,
         }
     }
 
+    fn table_with(entries: Vec<(&str, RateLimitBucket)>) -> RateLimitTable {
+        let mut table = RateLimitTable::default();
+        for (key, bucket) in entries {
+            table.buckets.insert(key.to_string(), bucket);
+        }
+        table
+    }
+
     #[test]
-    fn rate_limit_prune_removes_only_universally_expired_windows() {
-        let now = RATE_LIMIT_WINDOW_MAX_MS * 3;
+    fn rate_limit_prune_judges_each_bucket_by_its_own_window() {
+        let now = HOUR_MS * 3;
         let mut buckets = HashMap::new();
-        buckets.insert("scope:fresh".to_string(), bucket(now));
-        buckets.insert(
-            "scope:edge".to_string(),
-            bucket(now - RATE_LIMIT_WINDOW_MAX_MS),
-        );
-        buckets.insert(
-            "scope:expired".to_string(),
-            bucket(now - RATE_LIMIT_WINDOW_MAX_MS - 1),
-        );
+        // 2 minutes old: dead for a 60s scope, alive for the hourly scope.
+        buckets.insert("short:1.1.1.1".to_string(), bucket(now - 120_000, 60_000));
+        buckets.insert("hourly:2.2.2.2".to_string(), bucket(now - 120_000, HOUR_MS));
+        // Exactly at its own bound is still live (strict `>` expiry).
+        buckets.insert("edge:3.3.3.3".to_string(), bucket(now - 60_000, 60_000));
         prune_rate_limits(&mut buckets, now);
-        assert!(buckets.contains_key("scope:fresh"));
         assert!(
-            buckets.contains_key("scope:edge"),
-            "a bucket exactly at the bound may still gate the hourly scope"
+            !buckets.contains_key("short:1.1.1.1"),
+            "expired by its own window despite being young globally"
         );
-        assert!(!buckets.contains_key("scope:expired"));
+        assert!(buckets.contains_key("hourly:2.2.2.2"));
+        assert!(buckets.contains_key("edge:3.3.3.3"));
     }
 
     #[test]
-    fn rate_limit_table_is_bounded_and_evicts_the_stalest_live_window() {
-        let now = RATE_LIMIT_WINDOW_MAX_MS * 3;
-        let mut buckets = HashMap::new();
-        // Saturate with live windows, one strictly stalest.
-        buckets.insert("scope:stalest".to_string(), bucket(now - 50_000));
-        for index in 0..3 {
-            buckets.insert(format!("scope:live-{index}"), bucket(now - 1_000));
-        }
-        reserve_rate_limit_slot(&mut buckets, "scope:new", now, 4);
-        assert_eq!(buckets.len(), 3, "one slot was reclaimed for the new key");
+    fn rate_limit_capacity_reclaims_expired_before_touching_live_buckets() {
+        let now = HOUR_MS * 3;
+        // At cap 3: one live hourly bucket + two short-window buckets that
+        // are dead by their own windows (the churn-attack shape).
+        let mut table = table_with(vec![
+            ("hourly:victim", bucket(now - 300_000, HOUR_MS)),
+            ("short:churn-1", bucket(now - 300_000, 60_000)),
+            ("short:churn-2", bucket(now - 300_000, 60_000)),
+        ]);
         assert!(
-            !buckets.contains_key("scope:stalest"),
-            "the bucket closest to expiring is the one evicted"
+            reserve_rate_limit_slot(&mut table, "hourly:newcomer", now, 3),
+            "expired churn is reclaimed"
         );
-
-        // An existing key never evicts anything.
-        let before = buckets.len();
-        reserve_rate_limit_slot(&mut buckets, "scope:live-0", now, 3);
-        assert_eq!(buckets.len(), before);
-
-        // Expired windows are reclaimed before any live eviction.
-        buckets.insert(
-            "scope:expired".to_string(),
-            bucket(now - RATE_LIMIT_WINDOW_MAX_MS - 1),
+        assert!(
+            table.buckets.contains_key("hourly:victim"),
+            "the active hourly bucket survives cap pressure from short-window churn"
         );
-        let live_before: Vec<String> = buckets
-            .keys()
-            .filter(|key| *key != "scope:expired")
-            .cloned()
-            .collect();
-        reserve_rate_limit_slot(&mut buckets, "scope:new-2", now, 4);
-        assert!(!buckets.contains_key("scope:expired"));
-        for key in live_before {
-            assert!(buckets.contains_key(&key), "{key} must survive");
+        assert!(!table.buckets.contains_key("short:churn-1"));
+        assert!(!table.buckets.contains_key("short:churn-2"));
+    }
+
+    #[test]
+    fn rate_limit_capacity_fails_closed_instead_of_evicting_live_buckets() {
+        let now = HOUR_MS * 3;
+        let mut table = table_with(vec![
+            ("hourly:a", bucket(now - 1_000, HOUR_MS)),
+            ("hourly:b", bucket(now - 2_000, HOUR_MS)),
+        ]);
+        assert!(
+            !reserve_rate_limit_slot(&mut table, "hourly:new", now, 2),
+            "a table full of live buckets rejects the new key"
+        );
+        assert_eq!(table.buckets.len(), 2, "no live bucket was evicted");
+        assert!(table.buckets.contains_key("hourly:a"));
+        assert!(table.buckets.contains_key("hourly:b"));
+        assert!(
+            reserve_rate_limit_slot(&mut table, "hourly:a", now, 2),
+            "existing keys always pass"
+        );
+    }
+
+    #[test]
+    fn rate_limit_saturated_prune_scans_are_amortized() {
+        let now = HOUR_MS * 3;
+        let mut table = table_with(vec![
+            ("hourly:live", bucket(now - 1_000, HOUR_MS)),
+            ("short:soon-dead", bucket(now - 30_000, 60_000)),
+        ]);
+        // First saturated insert prunes (nothing expired yet) and fails.
+        assert!(!reserve_rate_limit_slot(&mut table, "k:new", now, 2));
+        // The short bucket expires 30s later, but within the amortization
+        // interval the scan is skipped — the insert still fails closed.
+        // (Bounded staleness: at most one interval, trading scan cost.)
+        let later = now + 31_000;
+        table.last_saturated_prune_unix_ms = later - 500;
+        assert!(!reserve_rate_limit_slot(&mut table, "k:new", later, 2));
+        assert!(table.buckets.contains_key("short:soon-dead"));
+        // Past the interval the prune runs and the slot frees up.
+        table.last_saturated_prune_unix_ms = 0;
+        assert!(reserve_rate_limit_slot(&mut table, "k:new", later, 2));
+        assert!(!table.buckets.contains_key("short:soon-dead"));
+    }
+
+    #[test]
+    fn rate_keys_are_canonical_bounded_ip_tokens() {
+        fn key_for(value: Option<&str>) -> String {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert("x-forwarded-for", value.parse().unwrap());
+            }
+            client_rate_key(&headers, "scope")
         }
+        assert_eq!(key_for(None), "scope:unknown");
+        assert_eq!(key_for(Some("203.0.113.9")), "scope:203.0.113.9");
+        // Textual IPv6 variants of one address share a bucket.
+        assert_eq!(
+            key_for(Some("2001:0db8:0000:0000:0000:0000:0000:0001")),
+            "scope:2001:db8::1"
+        );
+        assert_eq!(key_for(Some("2001:db8::1")), "scope:2001:db8::1");
+        // ip:port proxy forms resolve to the address.
+        assert_eq!(key_for(Some("203.0.113.9:5678")), "scope:203.0.113.9");
+        // Garbage collapses to one bounded bucket instead of minting an
+        // attacker-controlled arbitrary-length key.
+        let garbage = "x".repeat(4096);
+        assert_eq!(key_for(Some(garbage.as_str())), "scope:invalid");
+        assert_eq!(key_for(Some("not an ip, at all")), "scope:invalid");
+        // Only the first hop counts, as before.
+        assert_eq!(
+            key_for(Some("203.0.113.9, 198.51.100.7")),
+            "scope:203.0.113.9"
+        );
     }
 }

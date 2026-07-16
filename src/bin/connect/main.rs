@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_queues: Mutex::new(HashMap::new()),
         event_notify: Notify::new(),
         daemon_sessions: Mutex::new(HashMap::new()),
-        rate_limits: Mutex::new(HashMap::new()),
+        rate_limits: Mutex::new(RateLimitTable::default()),
         active_sessions: Mutex::new(HashMap::new()),
         store_dirty: StoreDirty::default(),
         log_caches: std::sync::Mutex::new(LogCaches::default()),
@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let app = connect_router(state);
+    let app = connect_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     eprintln!(
@@ -180,8 +180,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.listen, config.public_origin, config.rp_id
     );
     eprintln!("[connect] state file {}", config.data_file.display());
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // Deploy-time restarts land here: without a final flush, every restart
+    // would discard the pending debounce window (a daemon that went offline
+    // during it would permanently lose its last presence hours).
+    final_store_flush(&state).await;
     Ok(())
+}
+
+/// Resolves on SIGTERM (what systemd/deploy tooling sends) or ctrl-c. A
+/// failed signal-handler registration degrades to the other signal rather
+/// than aborting startup.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {}
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(err) = result {
+                            eprintln!("[connect] ctrl-c handler failed: {err}");
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("[connect] SIGTERM handler registration failed: {err}");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    eprintln!("[connect] ctrl-c handler failed: {err}");
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("[connect] ctrl-c handler failed: {err}");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Synchronously flush any pending debounced marks; called once after the
+/// server drains on shutdown. Failure re-marks for invariant uniformity
+/// (the process is exiting, but the flag state stays truthful).
+async fn final_store_flush(state: &AppState) {
+    let store = state.store.lock().await;
+    if !state.store_dirty.take() {
+        return;
+    }
+    if let Err(err) = save_store(&state.config.data_file, &store) {
+        eprintln!("[connect] final store flush failed: {err}");
+        state.store_dirty.mark();
+    }
 }
 
 /// The complete production HTTP surface. Startup and route-boundary tests use
@@ -528,7 +584,7 @@ struct AppState {
     event_queues: Mutex<HashMap<String, VecDeque<RendezvousEvent>>>,
     event_notify: Notify,
     daemon_sessions: Mutex<HashMap<String, DaemonSessionCredential>>,
-    rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    rate_limits: Mutex<RateLimitTable>,
     active_sessions: Mutex<HashMap<String, ActiveDashboardSession>>,
     /// Dirty flag + wakeup for the debounced store flusher: hot paths that
     /// only refresh presence-grade fields mark instead of persisting.
@@ -587,7 +643,7 @@ fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> 
         event_queues: Mutex::new(HashMap::new()),
         event_notify: Notify::new(),
         daemon_sessions: Mutex::new(HashMap::new()),
-        rate_limits: Mutex::new(HashMap::new()),
+        rate_limits: Mutex::new(RateLimitTable::default()),
         active_sessions: Mutex::new(HashMap::new()),
         store_dirty: StoreDirty::default(),
         log_caches: std::sync::Mutex::new(LogCaches::default()),
@@ -993,6 +1049,21 @@ struct SessionRecord {
 struct RateLimitBucket {
     window_start_unix_ms: u64,
     count: u32,
+    /// The bucket's own window (scope-stable: every call site uses one
+    /// window per scope). Expiry decisions use this, never a global bound —
+    /// a short-window bucket must not rank as live under a longer scope's
+    /// lifetime, and vice versa.
+    window_ms: u64,
+}
+
+/// The rate-limit table plus the bookkeeping that amortizes full-scan
+/// pruning when the table sits at capacity.
+#[derive(Default)]
+struct RateLimitTable {
+    buckets: HashMap<String, RateLimitBucket>,
+    /// When the last at-capacity prune ran; saturated inserts within the
+    /// interval skip the O(table) scan and fail closed directly.
+    last_saturated_prune_unix_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1251,6 +1322,10 @@ async fn store_flush_monitor_with(state: Arc<AppState>, debounce: Duration) {
             Ok(bytes) => bytes,
             Err(err) => {
                 eprintln!("[connect] debounced store flush serialize failed: {err}");
+                // Uniform retry invariant: every failure arm re-marks — the
+                // mutations are still memory-only, and take() consumed the
+                // mark.
+                state.store_dirty.mark();
                 continue;
             }
         };
@@ -1263,7 +1338,10 @@ async fn store_flush_monitor_with(state: Arc<AppState>, debounce: Duration) {
                 // window retries even without new activity.
                 state.store_dirty.mark();
             }
-            Err(err) => eprintln!("[connect] debounced store flush task failed: {err}"),
+            Err(err) => {
+                eprintln!("[connect] debounced store flush task failed: {err}");
+                state.store_dirty.mark();
+            }
         }
         drop(store);
     }
@@ -1319,7 +1397,7 @@ async fn sweep_in_memory_state(state: &AppState) {
     state.active_sessions.lock().await.retain(|_, session| {
         now.saturating_sub(session.created_unix_ms) <= ACTIVE_DASHBOARD_SESSION_TTL_MS
     });
-    prune_rate_limits(&mut *state.rate_limits.lock().await, now);
+    prune_rate_limits(&mut state.rate_limits.lock().await.buckets, now);
 }
 
 /// Apply a durable store mutation transactionally: serialize/write the cloned
@@ -1676,6 +1754,39 @@ mod tests {
         );
     }
 
+    /// Deploy-time restarts must not discard the pending debounce window:
+    /// the graceful-shutdown path flushes marked state once, and a clean
+    /// flag writes nothing.
+    #[tokio::test]
+    async fn final_store_flush_covers_the_pending_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = production_router_test_state(root.path(), Store::default());
+
+        // Clean flag: nothing to write (the store file does not appear).
+        final_store_flush(&state).await;
+        assert!(!state.config.data_file.exists());
+
+        {
+            let mut store = state.store.lock().await;
+            store.users.push(UserRecord {
+                id: Uuid::new_v4(),
+                account_name: "late-window".to_string(),
+                display_name: "Late".to_string(),
+                passkeys: Vec::new(),
+                created_unix_ms: 1,
+                updated_unix_ms: 1,
+                last_login_unix_ms: 1,
+                attestations: Vec::new(),
+            });
+            mark_store_dirty(&state);
+        }
+        final_store_flush(&state).await;
+        let on_disk = load_store(&state.config.data_file).unwrap();
+        assert_eq!(on_disk.users.len(), 1);
+        assert_eq!(on_disk.users[0].account_name, "late-window");
+        assert!(!state.store_dirty.take(), "flush consumed the mark");
+    }
+
     #[tokio::test]
     async fn sweeper_drops_only_entries_dead_to_their_consumers() {
         let root = tempfile::tempdir().unwrap();
@@ -1724,18 +1835,20 @@ mod tests {
         }
         {
             let mut limits = state.rate_limits.lock().await;
-            limits.insert(
-                "scope:1.2.3.4".to_string(),
+            limits.buckets.insert(
+                "hourly:1.2.3.4".to_string(),
                 RateLimitBucket {
-                    window_start_unix_ms: now,
+                    window_start_unix_ms: now - 120_000,
                     count: 3,
+                    window_ms: 60 * 60_000,
                 },
             );
-            limits.insert(
-                "scope:5.6.7.8".to_string(),
+            limits.buckets.insert(
+                "short:5.6.7.8".to_string(),
                 RateLimitBucket {
-                    window_start_unix_ms: now - RATE_LIMIT_WINDOW_MAX_MS - 1,
+                    window_start_unix_ms: now - 120_000,
                     count: 900,
+                    window_ms: 60_000,
                 },
             );
         }
@@ -1747,10 +1860,13 @@ mod tests {
         assert!(claims.contains_key("fresh"));
         assert!(!claims.contains_key("ancient"));
         let limits = state.rate_limits.lock().await;
-        assert!(limits.contains_key("scope:1.2.3.4"));
         assert!(
-            !limits.contains_key("scope:5.6.7.8"),
-            "buckets past every window are expired for every scope"
+            limits.buckets.contains_key("hourly:1.2.3.4"),
+            "a bucket inside its own window stays"
+        );
+        assert!(
+            !limits.buckets.contains_key("short:5.6.7.8"),
+            "a bucket past its own window is expired even when younger than other scopes' windows"
         );
     }
 }

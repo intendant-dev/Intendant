@@ -444,14 +444,12 @@ struct DaemonRegistrationOutcome {
     claimed_by: Option<(Uuid, String)>,
     claim_code_expires_unix_ms: Option<u64>,
     stale_daemon_ids: Vec<String>,
-    /// Whether this registration changed durable route state (new record,
-    /// route-code rotation, stale-record sweep) as opposed to a pure
-    /// presence refresh (same identity, same code, newer proof watermark).
-    /// Refreshes arrive once a minute per daemon and skip the synchronous
-    /// full-store persist; the proof watermark is monotonic, so a
-    /// crash-lost bump can at worst re-admit a replay of the daemon's own
-    /// newer-than-disk proof — an idempotent refresh — until the daemon's
-    /// next (strictly newer) proof lands.
+    /// Whether this registration changed durable state: a new record, a
+    /// route-code rotation, a stale-record sweep, or a proof-watermark
+    /// advance (the anti-replay floor for daemon-session issuance — see the
+    /// comment at the advance site). Only mutations with no security effect
+    /// — presence fields on a proof-less operator probe — report false and
+    /// ride the debounced flusher.
     durable_change: bool,
 }
 
@@ -526,6 +524,14 @@ fn apply_daemon_registration(
                 }
             }
             existing.last_registration_proof_unix_ms = Some(issued_at_unix_ms);
+            // The watermark is the anti-replay floor for a TOKEN-MINTING
+            // side effect: every accepted proof earns the caller a fresh
+            // daemon-session credential. If an advance were only debounced,
+            // a restart inside the window would roll it back and a captured
+            // refresh (valid for the 5-minute skew) could replay and win
+            // the sole post-restart daemon session. An advance is therefore
+            // always a durable change, persisted before the token is issued.
+            durable_change = true;
         }
         existing.last_seen_unix_ms = now;
         record_presence_hour(&mut existing.presence_hours, now);
@@ -656,11 +662,11 @@ pub(crate) async fn daemon_register(
                 durable_change.set(outcome.durable_change);
                 Ok(outcome)
             },
-            // Pure presence refreshes (same identity, same route code, newer
-            // proof watermark) arrive once a minute per daemon; they skip
-            // the synchronous full-store fsync and ride the debounced
-            // flusher instead. Anything that changes durable route state
-            // still persists before publication, exactly as before.
+            // Everything with a security effect — including the proof
+            // watermark that floors replay for the daemon-session token
+            // minted below — persists before publication, exactly as
+            // before. Only proof-less presence refreshes (operator probes)
+            // skip the fsync and ride the debounced flusher.
             |next| {
                 if durable_change.get() {
                     persist_locked(&state, next)
@@ -849,21 +855,21 @@ pub(crate) async fn daemon_next(
 }
 
 /// Refresh a polling daemon's presence. This runs on every `daemon_next`
-/// long-poll (~4/min/daemon), so it never persists synchronously: the
-/// fields it touches are display-grade (`last_seen`, presence hours), they
-/// ride along with every other persist, and the debounced flusher bounds
-/// their loss window. The dirty mark fires only when the presence hour
-/// bucket actually changes (~1/hour/daemon; the stale-unclaimed sweep's
-/// 24h TTL keeps a wide margin over that worst-case disk staleness).
+/// long-poll (~4/min/daemon), so it never persists synchronously: every
+/// field it touches is presence-display data (`last_seen`, `updated`,
+/// presence hours) whose crash-loss window is bounded by the debounced
+/// flusher — the mark fires on every touch, and in practice each daemon's
+/// once-a-minute re-register persists the whole store anyway (its proof
+/// watermark is durable), so disk staleness stays well inside the
+/// stale-unclaimed sweep's 24h TTL.
 pub(crate) async fn touch_daemon(state: &AppState, daemon_id: &str) -> ApiResult<()> {
     let mut store = state.store.lock().await;
     if let Some(daemon) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) {
         let now = now_unix_ms();
         daemon.last_seen_unix_ms = now;
         daemon.updated_unix_ms = now;
-        if record_presence_hour(&mut daemon.presence_hours, now) {
-            mark_store_dirty(state);
-        }
+        record_presence_hour(&mut daemon.presence_hours, now);
+        mark_store_dirty(state);
         Ok(())
     } else {
         Err(ApiError::not_found("daemon is not registered"))
@@ -2073,7 +2079,7 @@ mod tests {
             event_queues: Mutex::new(HashMap::new()),
             event_notify: Notify::new(),
             daemon_sessions: Mutex::new(HashMap::new()),
-            rate_limits: Mutex::new(HashMap::new()),
+            rate_limits: Mutex::new(RateLimitTable::default()),
             active_sessions: Mutex::new(HashMap::new()),
             store_dirty: StoreDirty::default(),
             log_caches: std::sync::Mutex::new(LogCaches::default()),
@@ -2187,7 +2193,7 @@ mod tests {
             .lock()
             .await
             .contains_key("legacy-session"));
-        assert!(state.rate_limits.lock().await.is_empty());
+        assert!(state.rate_limits.lock().await.buckets.is_empty());
     }
 
     #[test]
@@ -2278,12 +2284,14 @@ mod tests {
         );
     }
 
-    /// Pins which registrations may skip the synchronous persist: only the
-    /// once-a-minute presence refresh (same identity, same route code,
-    /// newer proof watermark). Everything that changes durable route state
-    /// must report durable and take the persist-before-publish path.
+    /// Pins which registrations may skip the synchronous persist: ONLY
+    /// proof-less operator probes that change nothing but presence fields.
+    /// Every security-effective mutation — record creation, code rotation,
+    /// stale sweep, and every proof-watermark advance (the anti-replay
+    /// floor for daemon-session issuance) — must report durable and take
+    /// the persist-before-publish path.
     #[test]
-    fn registration_reports_pure_refreshes_as_non_durable() {
+    fn registration_durability_classification_is_pinned() {
         let now = 1_700_000_000_000u64;
         let mut store = Store::default();
         let hash_a = "A".repeat(43);
@@ -2310,13 +2318,26 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !refresh.durable_change,
-            "same identity + same code + newer proof is a presence refresh"
+            refresh.durable_change,
+            "a proof-watermark advance is durable — it floors replay for the session token"
         );
         assert_eq!(
             store.daemons[0].last_registration_proof_unix_ms,
-            Some(now + 60_000),
-            "the watermark still advances in memory"
+            Some(now + 60_000)
+        );
+
+        let probe = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash_a,
+            None,
+            now + 90_000,
+        )
+        .unwrap();
+        assert!(
+            !probe.durable_change,
+            "a proof-less operator probe touching only presence fields defers"
         );
 
         let rotated = apply_daemon_registration(
@@ -2336,30 +2357,77 @@ mod tests {
             "daemon-1",
             "daemon-key",
             &hash_b,
-            Some(now + 180_000),
+            None,
             now + 180_000,
         )
         .unwrap();
         assert_eq!(sweeping.stale_daemon_ids, vec!["stale".to_string()]);
         assert!(
             sweeping.durable_change,
-            "a refresh that swept stale records must persist the removal"
+            "even a probe that swept stale records must persist the removal"
         );
 
         store.daemons[0].owner_user_id = Some(Uuid::new_v4());
-        let claimed = apply_daemon_registration(
+        let claimed_probe = apply_daemon_registration(
             &mut store,
             "daemon-1",
             "daemon-key",
             &"C".repeat(43),
-            Some(now + 240_000),
+            None,
             now + 240_000,
         )
         .unwrap();
         assert!(
-            !claimed.durable_change,
-            "claimed daemons never touch code state on re-register"
+            !claimed_probe.durable_change,
+            "claimed daemons never touch code state; a proof-less refresh defers"
         );
+    }
+
+    /// FIX for the restart-replay hole: a registration proof accepted just
+    /// before a restart must stay consumed across that restart — otherwise
+    /// a captured refresh (valid for the 5-minute skew window) replays
+    /// against the reloaded store and wins the sole post-restart daemon
+    /// session. The watermark advance is durable, so the reloaded state
+    /// already knows the proof.
+    #[test]
+    fn restart_cannot_resurrect_a_consumed_registration_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let now = 1_700_000_000_000u64;
+        let hash = "A".repeat(43);
+        let mut store = Store::default();
+        apply_daemon_registration(&mut store, "daemon-1", "daemon-key", &hash, Some(now), now)
+            .unwrap();
+        save_store(&path, &store).unwrap();
+
+        // The once-a-minute refresh: durable, persisted before the daemon
+        // session token would be issued.
+        let refresh = apply_daemon_registration(
+            &mut store,
+            "daemon-1",
+            "daemon-key",
+            &hash,
+            Some(now + 60_000),
+            now + 60_000,
+        )
+        .unwrap();
+        assert!(refresh.durable_change);
+        save_store(&path, &store).unwrap();
+
+        // Simulated restart: reload from disk. The exact captured proof
+        // must be dead against the reloaded state.
+        let mut reloaded = load_store(&path).unwrap();
+        let replay = apply_daemon_registration(
+            &mut reloaded,
+            "daemon-1",
+            "daemon-key",
+            &hash,
+            Some(now + 60_000),
+            now + 60_001,
+        );
+        let error = replay.expect_err("replayed proof must be rejected after restart");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("not newer"));
     }
 
     #[test]
