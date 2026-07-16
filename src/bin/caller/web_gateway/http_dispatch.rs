@@ -949,6 +949,15 @@ pub(crate) async fn serve_http_request(
                 return handle_session_sub_router(stream, request_line, session_log, query_ctx)
                     .await;
             }
+            RouteHandlerId::SessionForkPoints => {
+                return handle_session_fork_points(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::McAnchors => {
                 return handle_mc_anchors(
                     stream,

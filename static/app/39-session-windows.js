@@ -1500,6 +1500,11 @@ function openSessionWorktreeMergeCard(sessionId) {
       return;
     }
     if (win.minimized && typeof setSessionWindowMinimized === 'function') {
+      // Explicit open of the finish card: record the restore so the
+      // done-subagent auto-minimize rule doesn't re-collapse the window
+      // (and its card) on the next phase/metadata application.
+      win.userRestoredWhileDone = true;
+      win.autoMinimized = false;
       setSessionWindowMinimized(sid, false);
     }
     try { worktreeFinishCardDismissed.delete(sid); } catch (_) {}
@@ -2297,11 +2302,12 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     if (!content) {
       const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
       if (!reasoning) return null;
-      content = `Reasoning: ${reasoning}`;
-      level = 'detail';
-    } else {
-      level = 'model';
+      // First-class thinking row (same grammar as the live WASM path and
+      // the transcript-sync lanes: level model + kind reasoning, raw text)
+      // so the dedupe signatures collapse this record with live copies.
+      return { ...base, level: 'model', source: source || 'model', content: reasoning, kind: 'reasoning' };
     }
+    level = 'model';
     return { ...base, level, source: source || 'model', content, kind };
   }
   if (event === 'agent_started') {
@@ -2560,9 +2566,13 @@ function sessionWindowTranscriptContentForNode(node) {
 function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
   if (!node) return [];
   const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
+  // Reasoning rows render a label + elided summary and defer their body,
+  // so the raw text comes from the reasoning store (record-lane parity).
   const content = isCommandOutput
     ? (node.querySelector?.('.command-output-summary')?.textContent || '')
-    : sessionWindowTranscriptContentForNode(node);
+    : node.dataset?.kind === 'reasoning'
+      ? reasoningLogNodeContent(node)
+      : sessionWindowTranscriptContentForNode(node);
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',

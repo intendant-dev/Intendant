@@ -379,6 +379,42 @@ html.ui-v2[data-ui2-layout="grid"] #ui2-layout-grid-btn {
   box-shadow: inset 0 0 0 1px var(--line);
 }
 
+/* ── "Minimize done" bulk pill: one click collapses every finished
+   sub-agent window. Activity-tab-scoped like the layout toggle it sits
+   beside; JS keeps the `hidden` attribute on until the count is > 0, and
+   `:not([hidden])` keeps this display rule from overriding it. ── */
+html.ui-v2 .ui2-minimize-done { display: none; }
+html.ui-v2[data-ui2-tab="activity"] .ui2-minimize-done:not([hidden]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-3);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+html.ui-v2 .ui2-minimize-done:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+html.ui-v2 .ui2-minimize-done-count {
+  min-width: 16px;
+  padding: 1px 5px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--text);
+  font-size: 10.5px;
+  line-height: 1.4;
+  text-align: center;
+}
+
 /* ── v1 strips absorbed (post-flip): the status bar and token ticker
    duplicated the oversight bar; their unique facts (provider·model,
    turn, tok/cost) now live in #ui2-ovs-facts as mirrors. The elements

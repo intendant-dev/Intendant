@@ -1,0 +1,25 @@
+# VENDORED from owner-plane-d0a @ 583f421a (rfcs/owner-plane/core, the
+# Gate-A stamp) — trimmed to the writer-side modules the daemon
+# consumes; src/lib.rs states the adaptation contract. Kernel semantics
+# are stamped: semantic changes are owner acts that land on the asset
+# branch first, never local edits here.
+[package]
+name = "owner-plane-core"
+version = "0.1.0"
+edition = "2021"
+description = "D0-A reference core, vendored writer-side subset: canonical CBOR (E1-E10 writer side), the closed hash-domain inventory, suite-v1 crypto, the Appendix A shapes with signing composition, the key schedule, and the outcome vocabulary. Mints device-signed plane operations; must share NO code with owner-plane-reducer."
+publish = false
+
+[dependencies]
+sha2 = "0.10"
+ed25519-dalek = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+hpke = { version = "0.14.0", default-features = false, features = ["nistp", "hkdfsha2", "aes", "alloc"] }
+rand_core = "0.10"
+
+[dev-dependencies]
+# The companion drift gate in domains::tests parses the vendored
+# companion schema (../owner-plane-reducer/corpus/).
+serde_json = "1"

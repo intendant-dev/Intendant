@@ -642,6 +642,11 @@ async function main() {
         d.session_id
       ) {
         serverMsgStep(d, 'transcript_sync', () => scheduleExternalSessionWindowTranscriptSync(d.session_id, 300));
+        // The round is over: whatever this session still streamed is
+        // complete. Catches a command that was the LAST thing in the
+        // round — no later entry would ever have finalized its group.
+        serverMsgStep(d, 'finalize_command_output', () =>
+          finalizeSessionCommandOutputGroups({ session_id: d.session_id }));
       }
       serverMsgStep(d, 'external_identity', () => applyExternalIdentityFromLogEntry(d));
       if (d.event === 'session_relationship') {

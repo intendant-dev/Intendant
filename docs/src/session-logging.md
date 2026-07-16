@@ -142,7 +142,7 @@ The event vocabulary is broad and grows with the system. Grouped by area
 
 Each is written by a typed method on `SessionLog` (e.g. `turn_start`,
 `model_response`, `agent_input`, `agent_output`, `approval`, `json_extracted`,
-`reasoning_content`), not by hand-formatting JSON.
+`reasoning_content_for_session`), not by hand-formatting JSON.
 
 ### The message lane (`conversation_message`)
 

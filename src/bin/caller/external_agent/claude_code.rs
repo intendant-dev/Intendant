@@ -492,14 +492,40 @@ fn approval_response_payload(
     }
 }
 
+/// TTL flavor stated by a usage object's per-TTL `cache_creation` split:
+/// 1-hour writes → 3600, else 5-minute writes → 300, else None (split
+/// absent or all-zero — no statement). The split rides `assistant`
+/// envelope and `message_start` usage; the flat `message_delta`/`result`
+/// shapes drop it and carry only the summed counter.
+fn cache_ttl_flavor_from_split(usage: &serde_json::Value) -> Option<u32> {
+    let ephemeral = |key: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    };
+    if ephemeral("ephemeral_1h_input_tokens") > 0 {
+        Some(3600)
+    } else if ephemeral("ephemeral_5m_input_tokens") > 0 {
+        Some(300)
+    } else {
+        None
+    }
+}
+
 /// Context-meter snapshot from an Anthropic API usage object. The reader
 /// consumes this shape from `message_delta` stream events and the turn's
 /// `result`; prompt-side tokens (fresh + cached) approximate the live
-/// context footprint.
+/// context footprint. Those shapes carry only the flat
+/// `cache_creation_input_tokens` counter, so `fallback_ttl` supplies the
+/// session's sticky flavor (learned from the shapes that DO carry the
+/// per-TTL split) for cache writes without a split of their own.
 fn usage_snapshot_from_api_usage(
     usage: &serde_json::Value,
     model: &str,
     context_window: u64,
+    fallback_ttl: Option<u32>,
 ) -> Option<AgentUsageSnapshot> {
     let read = |key: &str| usage.get(key).and_then(|v| v.as_u64());
     let input = read("input_tokens")?;
@@ -525,21 +551,13 @@ fn usage_snapshot_from_api_usage(
         0.0
     };
     // TTL flavor for the cache-vitals countdown: only cache writes make a
-    // flavor statement (the per-TTL split rides a `cache_creation` object
-    // when the extended-TTL beta is active; a flat write defaults to 5 min).
-    let ephemeral = |key: &str| {
-        usage
-            .get("cache_creation")
-            .and_then(|c| c.get(key))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-    };
-    let cache_ttl_seconds = if ephemeral("ephemeral_1h_input_tokens") > 0 {
-        Some(3600)
-    } else if ephemeral("ephemeral_5m_input_tokens") > 0 || cache_creation > 0 {
-        Some(300)
-    } else {
-        None
+    // flavor statement. A split of this usage's own is authoritative; a
+    // flat write falls back to the session's last split-stated flavor,
+    // then to the API's 5-minute default. Read-only usage stays None.
+    let cache_ttl_seconds = match cache_ttl_flavor_from_split(usage) {
+        Some(flavor) => Some(flavor),
+        None if cache_creation > 0 => Some(fallback_ttl.unwrap_or(300)),
+        None => None,
     };
     Some(AgentUsageSnapshot {
         provider: "anthropic".to_string(),
@@ -844,6 +862,13 @@ struct CcReader {
     /// last-call usage instead (a multi-call turn's summed usage exceeds
     /// the context window and read as >100%).
     last_call_usage: Option<serde_json::Value>,
+    /// Sticky cache-TTL flavor from the most recent usage that carried the
+    /// per-TTL `cache_creation` split (`assistant` envelopes,
+    /// `message_start`). The snapshot-feeding `message_delta`/`result`
+    /// shapes carry only the flat creation counter, which alone reads as
+    /// the 5-minute default — wrong for every 1-hour-cache session
+    /// (subscription Claude Code).
+    cache_ttl_flavor: Option<u32>,
     last_intendant_mcp_status: Option<String>,
     init_logged: bool,
     /// The echoed effective permission mode a divergence warning was
@@ -875,6 +900,7 @@ impl CcReader {
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
             last_call_usage: None,
+            cache_ttl_flavor: None,
             last_intendant_mcp_status: None,
             init_logged: false,
             permission_mode_warned: None,
@@ -1358,6 +1384,12 @@ impl CcReader {
         out: &mut CcLineOutcome,
         child_scope: Option<&str>,
     ) {
+        // The full assistant envelope is a shape that carries the per-TTL
+        // `cache_creation` split — remember the flavor for the flat
+        // `message_delta`/`result` usage the snapshots are built from.
+        if let Some(usage) = msg.get("message").and_then(|m| m.get("usage")) {
+            self.note_cache_ttl_flavor(usage);
+        }
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -1651,6 +1683,16 @@ impl CcReader {
         });
     }
 
+    /// Remember the session's cache-TTL flavor whenever a usage shape
+    /// carries the per-TTL split. Splitless usage never clears it: a
+    /// read-only call makes no statement, and the flavor is a per-session
+    /// property of the account's cache configuration.
+    fn note_cache_ttl_flavor(&mut self, usage: &serde_json::Value) {
+        if let Some(flavor) = cache_ttl_flavor_from_split(usage) {
+            self.cache_ttl_flavor = Some(flavor);
+        }
+    }
+
     fn handle_stream_event(&mut self, msg: &serde_json::Value, out: &mut CcLineOutcome) {
         let Some(event) = msg.get("event") else {
             return;
@@ -1670,21 +1712,29 @@ impl CcReader {
                 }
             }
             "message_start" => {
-                if let Some(model) = event
-                    .get("message")
+                let message = event.get("message");
+                if let Some(model) = message
                     .and_then(|m| m.get("model"))
                     .and_then(|m| m.as_str())
                 {
                     self.model = model.to_string();
+                }
+                // message_start usage carries the per-TTL split that the
+                // flat message_delta shape drops.
+                if let Some(usage) = message.and_then(|m| m.get("usage")) {
+                    self.note_cache_ttl_flavor(usage);
                 }
             }
             "message_delta" => {
                 // Final usage for one API call within the turn — the live
                 // context-footprint signal during long multi-tool turns.
                 if let Some(usage) = event.get("usage") {
-                    if let Some(mut snapshot) =
-                        usage_snapshot_from_api_usage(usage, &self.model, self.context_window)
-                    {
+                    if let Some(mut snapshot) = usage_snapshot_from_api_usage(
+                        usage,
+                        &self.model,
+                        self.context_window,
+                        self.cache_ttl_flavor,
+                    ) {
                         self.last_call_usage = Some(usage.clone());
                         snapshot.limits = self.current_limit_windows();
                         out.events.push(AgentEvent::Usage { usage: snapshot });
@@ -1742,9 +1792,12 @@ impl CcReader {
             // result usage only when no per-call usage was streamed (then
             // the turn had a single call and the sum IS that call).
             let meter_usage = last_call_usage.as_ref().unwrap_or(usage);
-            if let Some(mut snapshot) =
-                usage_snapshot_from_api_usage(meter_usage, &self.model, self.context_window)
-            {
+            if let Some(mut snapshot) = usage_snapshot_from_api_usage(
+                meter_usage,
+                &self.model,
+                self.context_window,
+                self.cache_ttl_flavor,
+            ) {
                 snapshot.limits = self.current_limit_windows();
                 out.events.push(AgentEvent::Usage { usage: snapshot });
             }
@@ -3445,6 +3498,65 @@ mod tests {
     }
 
     #[test]
+    fn reader_carries_split_ttl_flavor_into_flat_usage_snapshots() {
+        fn usage_of(out: &CcLineOutcome) -> AgentUsageSnapshot {
+            out.events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::Usage { usage } => Some(usage.clone()),
+                    _ => None,
+                })
+                .expect("usage event")
+        }
+        // Subscription Claude Code runs the 1-hour prompt cache, but the
+        // per-TTL split rides only the assistant envelope (and
+        // message_start) usage — the snapshot-feeding message_delta and
+        // result shapes carry the flat counter alone, which used to read
+        // as the 5-minute default on every snapshot.
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":4,"output_tokens":7,"cache_read_input_tokens":11000,"cache_creation_input_tokens":62,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":62}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
+
+        // Flat per-call usage (message_delta lane) inherits the flavor.
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":4,"cache_creation_input_tokens":62,"cache_read_input_tokens":11000,"output_tokens":9}},"session_id":"s1"}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+
+        // The result lane meters the stashed last-call usage — still flat,
+        // still the 1-hour flavor.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":4,"cache_creation_input_tokens":62,"cache_read_input_tokens":11000,"output_tokens":9}}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+
+        // A turn that streamed no per-call usage meters the result's own
+        // flat usage — the sticky flavor still applies.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","result":"done","session_id":"s1","usage":{"input_tokens":6,"cache_creation_input_tokens":40,"cache_read_input_tokens":12000,"output_tokens":12}}"#,
+        );
+        assert_eq!(usage_of(&out).cache_ttl_seconds, Some(3600));
+    }
+
+    #[test]
+    fn reader_notes_ttl_flavor_from_message_start_usage() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":50}}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.model, "claude-opus-4-6");
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
+        // Splitless usage afterwards makes no statement — the flavor
+        // sticks rather than resetting.
+        reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":3,"output_tokens":1,"cache_read_input_tokens":9000}}},"session_id":"s1"}"#,
+        );
+        assert_eq!(reader.cache_ttl_flavor, Some(3600));
+    }
+
+    #[test]
     fn reader_tracks_model_from_init_and_message_start() {
         let mut reader = test_reader();
         reader.process_line(
@@ -4618,12 +4730,12 @@ mod tests {
             "cache_read_input_tokens": 100_000,
             "output_tokens": 500
         });
-        let snapshot =
-            usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000).expect("snapshot");
+        let snapshot = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 200_000, None)
+            .expect("snapshot");
         assert!(snapshot.usage_pct <= 100.0, "pct {}", snapshot.usage_pct);
         assert_eq!(snapshot.context_window, 500_500);
         // A corrected window restores the honest ratio.
-        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000)
+        let corrected = usage_snapshot_from_api_usage(&usage, "claude-sonnet-4-5", 1_000_000, None)
             .expect("snapshot");
         assert!((corrected.usage_pct - 50.05).abs() < 0.01);
     }
@@ -4971,12 +5083,14 @@ mod tests {
             &serde_json::json!({"input_tokens": 0, "output_tokens": 0}),
             "claude-haiku-4-5-20251001",
             200000,
+            None,
         )
         .is_none());
         assert!(usage_snapshot_from_api_usage(
             &serde_json::json!({"input_tokens": 3, "output_tokens": 5}),
             "claude-haiku-4-5-20251001",
             200000,
+            None,
         )
         .is_some());
     }
@@ -4996,6 +5110,8 @@ mod tests {
             }),
             "claude-haiku-4-5-20251001",
             200000,
+            // A usage's own split outranks any sticky fallback.
+            Some(300),
         )
         .expect("usage present");
         assert_eq!(snapshot.prompt_tokens, 25100);
@@ -5005,20 +5121,28 @@ mod tests {
         assert_eq!(snapshot.last_uncached_input_tokens, 10);
         assert_eq!(snapshot.cache_ttl_seconds, Some(3600), "1h split wins");
 
-        // Flat creation without the split object → the 5-minute default.
-        let flat = usage_snapshot_from_api_usage(
-            &serde_json::json!({
-                "input_tokens": 10,
-                "output_tokens": 5,
-                "cache_creation_input_tokens": 40
-            }),
+        // Flat creation without the split object: the sticky session
+        // flavor when one is known, else the API's 5-minute default.
+        let flat_usage = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 40
+        });
+        let flat =
+            usage_snapshot_from_api_usage(&flat_usage, "claude-haiku-4-5-20251001", 200000, None)
+                .expect("usage present");
+        assert_eq!(flat.cache_ttl_seconds, Some(300));
+        let flat_1h = usage_snapshot_from_api_usage(
+            &flat_usage,
             "claude-haiku-4-5-20251001",
             200000,
+            Some(3600),
         )
         .expect("usage present");
-        assert_eq!(flat.cache_ttl_seconds, Some(300));
+        assert_eq!(flat_1h.cache_ttl_seconds, Some(3600));
 
-        // Read-only responses make no flavor statement.
+        // Read-only responses make no flavor statement — even when the
+        // session's flavor is known (the downstream hub is sticky).
         let read_only = usage_snapshot_from_api_usage(
             &serde_json::json!({
                 "input_tokens": 10,
@@ -5027,6 +5151,7 @@ mod tests {
             }),
             "claude-haiku-4-5-20251001",
             200000,
+            Some(3600),
         )
         .expect("usage present");
         assert_eq!(read_only.cache_ttl_seconds, None);
