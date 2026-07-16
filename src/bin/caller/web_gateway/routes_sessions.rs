@@ -13,6 +13,59 @@ use super::*;
 #[cfg(test)]
 pub(crate) static SESSIONS_SEARCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Most-recent session dirs the missing-id fallback sweep will read. Output
+/// ids reference recent activity (the primary — active — log dir is always
+/// searched in full first); the sweep exists for cross-session references
+/// and dir races, not for archaeology, and unbounded it read+parsed every
+/// session.jsonl in a store that grows forever (~3.2k dirs observed).
+const AGENT_OUTPUT_SWEEP_MAX_DIRS: usize = 64;
+
+/// How long a store-sweep miss is remembered per (logs root, output id).
+/// Output rows are append-once historical records: an id the sweep could
+/// not find does not appear later in swept dirs (a *live* session's rows
+/// land in the primary dir, which is never memoized). The TTL exists so the
+/// memo self-heals anyway, e.g. across a session-dir move.
+const AGENT_OUTPUT_NEGATIVE_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const AGENT_OUTPUT_NEGATIVE_MEMO_CAP: usize = 1024;
+
+static AGENT_OUTPUT_NEGATIVE_MEMO: std::sync::Mutex<
+    Option<HashMap<(PathBuf, String), std::time::Instant>>,
+> = std::sync::Mutex::new(None);
+
+fn agent_output_negative_memo_fresh(logs_dir: &Path, id: &str) -> bool {
+    let memo = AGENT_OUTPUT_NEGATIVE_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    memo.as_ref()
+        .and_then(|memo| memo.get(&(logs_dir.to_path_buf(), id.to_string())))
+        .is_some_and(|expiry| *expiry > std::time::Instant::now())
+}
+
+fn agent_output_negative_memo_insert(logs_dir: &Path, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let mut memo = AGENT_OUTPUT_NEGATIVE_MEMO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let memo = memo.get_or_insert_with(HashMap::new);
+    let now = std::time::Instant::now();
+    if memo.len() + ids.len() > AGENT_OUTPUT_NEGATIVE_MEMO_CAP {
+        memo.retain(|_, expiry| *expiry > now);
+        // Still over cap after pruning expired entries: drop the memo rather
+        // than let a scripted id flood grow it; the cost is re-sweeping.
+        if memo.len() + ids.len() > AGENT_OUTPUT_NEGATIVE_MEMO_CAP {
+            memo.clear();
+        }
+    }
+    for id in ids {
+        memo.insert(
+            (logs_dir.to_path_buf(), id.clone()),
+            now + AGENT_OUTPUT_NEGATIVE_MEMO_TTL,
+        );
+    }
+}
+
 pub(crate) fn agent_output_chunks_with_fallback(
     primary_log_dir: &Path,
     ids: &[String],
@@ -26,32 +79,49 @@ pub(crate) fn agent_output_chunks_with_fallback(
 
     if found.len() < ids.len() {
         if let Some(logs_dir) = fallback_logs_dir {
-            let mut dirs = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(logs_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir()
-                        && path.join("session.jsonl").is_file()
-                        && !same_path(&path, primary_log_dir)
-                    {
-                        dirs.push(path);
+            // Ids a recent sweep of this store already failed to resolve are
+            // not re-swept — dashboard retries otherwise re-read the store
+            // per poll for as long as a stale id stays on screen.
+            let sweep_ids: Vec<String> = ids
+                .iter()
+                .filter(|id| !found.contains_key(id.as_str()))
+                .filter(|id| !agent_output_negative_memo_fresh(logs_dir, id))
+                .cloned()
+                .collect();
+            if !sweep_ids.is_empty() {
+                let mut dirs = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(logs_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir()
+                            && path.join("session.jsonl").is_file()
+                            && !same_path(&path, primary_log_dir)
+                        {
+                            dirs.push(path);
+                        }
                     }
                 }
-            }
-            dirs.sort_by_key(|b| std::cmp::Reverse(session_log_mtime(b)));
+                dirs.sort_by_key(|b| std::cmp::Reverse(session_log_mtime(b)));
+                dirs.truncate(AGENT_OUTPUT_SWEEP_MAX_DIRS);
 
-            for dir in dirs {
-                let missing: Vec<String> = ids
-                    .iter()
+                for dir in dirs {
+                    let missing: Vec<String> = sweep_ids
+                        .iter()
+                        .filter(|id| !found.contains_key(id.as_str()))
+                        .cloned()
+                        .collect();
+                    if missing.is_empty() {
+                        break;
+                    }
+                    for chunk in crate::session_log::agent_output_chunks_by_id(&dir, &missing) {
+                        found.entry(chunk.output_id.clone()).or_insert(chunk);
+                    }
+                }
+                let still_missing: Vec<String> = sweep_ids
+                    .into_iter()
                     .filter(|id| !found.contains_key(id.as_str()))
-                    .cloned()
                     .collect();
-                if missing.is_empty() {
-                    break;
-                }
-                for chunk in crate::session_log::agent_output_chunks_by_id(&dir, &missing) {
-                    found.entry(chunk.output_id.clone()).or_insert(chunk);
-                }
+                agent_output_negative_memo_insert(logs_dir, &still_missing);
             }
         }
     }
@@ -2840,9 +2910,19 @@ pub(crate) async fn handle_current_agent_output(
     let log_dir = current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
     let response = match log_dir {
         // The transport edge resolves the real home for the fallback
-        // sweep — only when there is an active log to serve from.
+        // sweep — only when there is an active log to serve from. On the
+        // blocking pool: this reads and filters the full session log (plus
+        // the bounded store sweep on a miss), which stalled a gateway
+        // worker per fetch when run inline.
         Some(dir) => {
-            current_agent_output_api_response(&crate::platform::home_dir(), &body_text, &dir)
+            let home = crate::platform::home_dir();
+            tokio::task::spawn_blocking(move || {
+                current_agent_output_api_response(&home, &body_text, &dir)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                session_wildcard_json_error(500, &format!("agent output task failed: {e}"))
+            })
         }
         None => session_wildcard_json_error(404, "no active session log"),
     };
@@ -6353,6 +6433,58 @@ mod tests {
             golden_transcript(&response),
             golden_session_wildcard_json_transcript("200 OK", &body)
         );
+    }
+
+    /// A store-sweep miss is remembered per (logs root, id) and expires;
+    /// distinct roots never share a verdict. (The memo only ever guards the
+    /// fallback sweep — the primary dir is re-read on every fetch.)
+    #[test]
+    fn agent_output_negative_memo_is_root_scoped_and_expiring() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let ids = vec!["memo-probe-1".to_string()];
+        assert!(!agent_output_negative_memo_fresh(root_a.path(), &ids[0]));
+        agent_output_negative_memo_insert(root_a.path(), &ids);
+        assert!(agent_output_negative_memo_fresh(root_a.path(), &ids[0]));
+        assert!(
+            !agent_output_negative_memo_fresh(root_b.path(), &ids[0]),
+            "a miss under one logs root must not veto sweeps under another"
+        );
+        assert!(!agent_output_negative_memo_fresh(root_a.path(), "memo-probe-other"));
+    }
+
+    /// The bounded sweep still resolves ids from sibling dirs and reports
+    /// what it could not find; a memoized miss suppresses only re-sweeps.
+    #[test]
+    fn agent_output_fallback_resolves_sibling_and_memoizes_miss() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_root = home.path().join("logs");
+        let primary = logs_root.join("primary");
+        let sibling = logs_root.join("sibling");
+        let mut log = crate::session_log::SessionLog::open(primary.clone()).unwrap();
+        log.agent_output_with_id("primary out", "", None, Some("fb-primary"));
+        drop(log);
+        let mut log = crate::session_log::SessionLog::open(sibling.clone()).unwrap();
+        log.agent_output_with_id("sibling out", "", None, Some("fb-sibling"));
+        drop(log);
+
+        let ids = vec![
+            "fb-primary".to_string(),
+            "fb-sibling".to_string(),
+            "fb-nowhere".to_string(),
+        ];
+        let chunks = agent_output_chunks_with_fallback(&primary, &ids, Some(&logs_root));
+        let found: Vec<&str> = chunks.iter().map(|c| c.output_id.as_str()).collect();
+        assert_eq!(found, vec!["fb-primary", "fb-sibling"]);
+        assert!(
+            agent_output_negative_memo_fresh(&logs_root, "fb-nowhere"),
+            "the unresolved id must be memoized against immediate re-sweeps"
+        );
+        assert!(!agent_output_negative_memo_fresh(&logs_root, "fb-sibling"));
+
+        // Second query: identical answer (memo affects IO, not results).
+        let chunks = agent_output_chunks_with_fallback(&primary, &ids, Some(&logs_root));
+        assert_eq!(chunks.len(), 2);
     }
 
     #[tokio::test]

@@ -94,6 +94,17 @@ pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOut
         std::collections::HashMap::new();
 
     for line in contents.lines() {
+        // Resolving a few ids used to JSON-parse every line of the whole
+        // log — including the ~99% that are not agent_output rows — on
+        // every dashboard output fetch. Prescan for the event marker
+        // (payload text can false-positive; the parse stays the authority)
+        // and stop once every requested id is resolved.
+        if found.len() == wanted.len() {
+            break;
+        }
+        if !line.contains("agent_output") {
+            continue;
+        }
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
