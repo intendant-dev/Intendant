@@ -448,7 +448,9 @@ mod tests {
         // 68 plus txn-internal-order, keeps-basis, and the two new
         // R3 arms (forged, unadmitted). Only the stmt basis-typing
         // and unheld-pends journal fixtures remain frame/aux-only.
-        assert_eq!(geneses, 78);
+        // +2: the criterion-12 D-99 multi-fault pair (CDDL-invalid
+        // × C2, CDDL-invalid × consumed-request-ID).
+        assert_eq!(geneses, 80);
     }
 
     /// Tampering any byte of the header breaks the signature; the

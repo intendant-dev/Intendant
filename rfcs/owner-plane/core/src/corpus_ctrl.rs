@@ -25,8 +25,9 @@
 
 use crate::cbor::{self, Value};
 use crate::domains::{h_tag, Tag};
-use crate::shapes::control::{AdminKey, Crecovsucc};
+use crate::shapes::control::{AdminKey, Cgrant, Crecovsucc};
 use crate::shapes::envelope::{ActorKind, Signedop};
+use crate::shapes::identity::Authproof;
 use crate::shapes::memory::Merasereq;
 use crate::shapes::{
     DeadlineFallback, Erasemref, Frontierclose, Head, Sigalg, Strictness, TimeWitness, ToValue,
@@ -388,6 +389,57 @@ pub fn f7_post_freeze_sig_invalid_kept() -> Vector {
             { "item": "c1" },
             { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
             { "item": "g4", "outcome": "sig-invalid", "disposition": "reject-permanent" },
+            { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+        ]),
+        None,
+    );
+    push_review_order(&mut v, &["c1", "g4", "x2", "e2"]);
+    v
+}
+
+/// D4 (c), the criterion-12 F1 trace: a validly signed, hash-valid
+/// post-freeze `c.grant` whose body violates the arm's CDDL
+/// (`{bogus: 1}` — no `grant` member) keeps its BODY outcome.
+/// Complete body validity — hash, registry row, CDDL — precedes the
+/// C2 classification (§10.2 `admit_ctrl`, D-99), so the frozen plane
+/// never converts a body-invalid operation into fork evidence — the
+/// D4 pair's third leg: the valid op freezes, the forged op keeps
+/// `sig-invalid`, the CDDL-invalid op keeps `body-invariant`.
+pub fn f7_post_freeze_cddl_invalid_kept() -> Vector {
+    let name = "f7-post-freeze-cddl";
+    let mut rig = PlaneRig::new(name);
+    let d1 = rig.dev1.clone();
+    let x2 = {
+        let fc = Frontierclose {
+            zone_id: rig.zone_id,
+            lineage: d1.lineage,
+            heads: vec![],
+        };
+        rig.epoch_bump_candidate("x2", 2, vec![fc])
+    };
+    let d2 = rig.mint_device("dev2");
+    let g2 = rig.simple_grant("grant2", &d2, vec![Verb::Propose]);
+    let c2 = rig.enroll_new(&d2, vec![g2], "wrap.dev2.eph");
+    let g4 = rig.seal_ctrl_candidate(
+        "g4bogus",
+        Cgrant::OP_TYPE,
+        Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: c2.op_hash(),
+        },
+        Value::Map(vec![(Value::Text("bogus".into()), Value::Uint(1))]),
+    );
+    let c1 = rig.genesis_op.clone();
+    let mut v = ctrl_vector(
+        "c2-post-freeze-cddl-invalid-kept",
+        "fold",
+        "10.2",
+        rig,
+        &[("c1", &c1), ("e2", &c2), ("x2", &x2), ("g4", &g4)],
+        json!([
+            { "item": "c1" },
+            { "item": "e2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
+            { "item": "g4", "outcome": "body-invariant", "disposition": "reject-permanent" },
             { "item": "x2", "outcome": "ctrl-fork", "disposition": "freeze-control" },
         ]),
         None,
@@ -845,6 +897,7 @@ pub fn corpus_ctrl() -> Vec<Vector> {
         f7_c3_branch_cut_below_head(),
         f7_post_freeze_valid_op_frozen(),
         f7_post_freeze_sig_invalid_kept(),
+        f7_post_freeze_cddl_invalid_kept(),
         f7_kek_rotate_manifest_admits(),
         f7_kek_rotate_manifest_target_outside(),
         f7_revoke_refs_valid_exclusion(),

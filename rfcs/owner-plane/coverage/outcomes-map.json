@@ -16,6 +16,8 @@
       "audit-chunk-index-out-of-range",
       "audit-duplicate-chunk-index",
       "audit-overlapping-result-sets",
+      "c2-post-freeze-cddl-invalid-kept",
+      "consumed-request-id-cddl-invalid",
       "issuance-to-revoked-device-rejects",
       "kek-rotate-manifest-target-outside-rejects",
       "merkle-leftover-sibling-rejects",
@@ -41,6 +43,7 @@
       "shape1-revoked-device"
     ],
     "ctrl-fork": [
+      "c2-post-freeze-cddl-invalid-kept",
       "c2-post-freeze-sig-invalid-kept",
       "c2-post-freeze-valid-op-frozen",
       "walkthrough-c2-freeze-both"

@@ -484,6 +484,52 @@ pub fn f7_request_fork() -> Vector {
     )
 }
 
+/// D-99 body-before-replay (the criterion-12 F1 sibling): a validly
+/// signed, hash-valid `c.grant` whose body violates the arm's CDDL
+/// (`{bogus: 1}` — no `grant` member) arriving under a CONSUMED
+/// `request_id`. Complete body validity — hash, registry row, CDDL —
+/// precedes the replay consult (§10.2 `admit_ctrl`), so the verdict
+/// is the body outcome, never `request-fork`.
+pub fn f7_request_consumed_cddl_invalid() -> Vector {
+    let name = "consumed-request-id-cddl-invalid";
+    let mut rig = PlaneRig::new(name);
+    let dev2 = rig.mint_device("dev2");
+    let c2 = rig.enroll_new(&dev2, vec![], "wrap.dev2.eph");
+    let grant_a = rig.simple_grant("grant-a", &dev2, vec![Verb::Propose]);
+    let g1 = rig.grant_op(grant_a);
+    let consumed = g1.header.request_id;
+    let g2 = rig.seal_ctrl_with_request(
+        Cgrant::OP_TYPE,
+        Authproof::Admin {
+            epoch: 1,
+            ctrl_frontier: g1.op_hash(),
+        },
+        cbor::Value::Map(vec![(
+            cbor::Value::Text("bogus".into()),
+            cbor::Value::Uint(1),
+        )]),
+        consumed,
+    );
+    let c1 = rig.genesis_op.clone();
+    fold_vector(
+        7,
+        name,
+        "10.2",
+        rig,
+        &[("c1", &c1), ("c2", &c2), ("g1", &g1), ("g2", &g2)],
+        json!([["c1", "c2", "g1", "g2"], ["c2", "c1", "g1", "g2"]]),
+        json!({
+            "per_item": [
+                admits("c1"),
+                admits("c2"),
+                admits("g1"),
+                rejected("g2", "body-invariant", "reject-permanent"),
+            ],
+            "converge": true,
+        }),
+    )
+}
+
 /// O5 replay, the idempotent half: byte-identical redelivery of an
 /// accepted operation → `duplicate` (duplicate-idempotent) — the
 /// items map carries the SAME bytes under two names.
@@ -787,6 +833,7 @@ pub fn corpus_fold() -> Vec<Vector> {
         f7_control_body_tamper(),
         f7_wrong_proof_arm(),
         f7_request_fork(),
+        f7_request_consumed_cddl_invalid(),
         f7_duplicate_idempotent(),
         f10_grant_epoch_lower_bound(),
         f10_epoch_unopened_converges(),

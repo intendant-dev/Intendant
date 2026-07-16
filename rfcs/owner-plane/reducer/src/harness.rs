@@ -1180,7 +1180,11 @@ mod tests {
     #[test]
     fn tranche_structural_layers_green() {
         let reports = run_all(&plane_root().join("vectors")).unwrap();
-        assert_eq!(reports.len(), 165, "the corpus through the repair tranche");
+        assert_eq!(
+            reports.len(),
+            167,
+            "the corpus through the criterion-12 tranche"
+        );
         for r in &reports {
             assert!(
                 r.structural_ok(),

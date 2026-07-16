@@ -3268,6 +3268,450 @@ impl State {
         Ok(())
     }
 
+    /// The body stage's arm-indexed CDDL/shape residue (§10.2
+    /// `admit_ctrl`: body = hash → registry row → CDDL; D-99): the
+    /// required members, coarse types, static caps, and byte-internal
+    /// equalities of each DISPATCHED arm's registered body shape —
+    /// every check the transition rejects `body-invariant` without
+    /// reading state — evaluated BEFORE the replay consult and the
+    /// placement gate (the criterion-12 F1 repair: a validly signed,
+    /// hash-valid `c.grant` over `{bogus: 1}` classifies
+    /// `(body-invariant, reject-permanent)`; it never derives
+    /// `request-fork` or `ctrl-fork`). Taking NO `&self` makes
+    /// byte-onlyness structural. What stays behind, deliberately:
+    /// state-dependent invariants (the §10.2 state stage), wrap
+    /// fields the transition only reaches after a state read (the
+    /// enroll path's epoch gate), and every branch whose transition
+    /// is an honest `Unimplemented` marker — where the transition
+    /// aborts before a shape check, this stage returns `Ok` at the
+    /// same point rather than inventing law for an unimplemented
+    /// mechanism. `c.genesis` stays fully self-contained in its
+    /// transition (arm/signature/body are one composition and C2/C5
+    /// skip it), and `c.recovery_succession`'s base-binding and
+    /// arm-agreement equalities stay in its §7.4 lane (prec-stage
+    /// facts, not body shape).
+    fn ctrl_intrinsic_shape(op: &SignedOp) -> Result<(), Verdict> {
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let body = &op.body;
+        match op.header.operation_type {
+            "c.enroll" => {
+                let Some(cert) = body.get("cert") else {
+                    return Err(bad());
+                };
+                if cert.get("renews").is_some() {
+                    // Renewal union arm: honest Unimplemented.
+                    return Ok(());
+                }
+                let Some(device_id) = b16_field(cert, "device_id") else {
+                    return Err(bad());
+                };
+                let sig_alg = cert.get("sig_alg").and_then(|n| n.as_text()).unwrap_or("");
+                let sig_pk = cert.get("sig_pk").and_then(|n| n.as_bytes()).unwrap_or(&[]);
+                let kem_pk = cert.get("kem_pk").and_then(|n| n.as_bytes()).unwrap_or(&[]);
+                if sig_alg == "p256" && sig_pk == kem_pk {
+                    // Intra-certificate role reuse (D-175).
+                    return Err(bad());
+                }
+                let Some(lineage) = body.get("lineage") else {
+                    return Err(bad());
+                };
+                let Some(lineage_id) = b16_field(lineage, "lineage") else {
+                    return Err(bad());
+                };
+                if b16_field(lineage, "device_id") != Some(device_id) {
+                    return Err(bad());
+                }
+                if let Some(grants) = body.get("grants").and_then(|g| g.as_array()) {
+                    for gn in grants {
+                        if b16_field(gn, "subject_device") != Some(device_id) {
+                            return Err(bad());
+                        }
+                        Self::grant_intrinsic_shape(gn, Some((lineage_id, device_id)))?;
+                    }
+                }
+                if let Some(wraps) = body.get("wraps").and_then(|w| w.as_array()) {
+                    for wn in wraps {
+                        // Only the pre-epoch-gate member is bytes;
+                        // the remaining wrap fields sit behind the
+                        // transition's state read + Unimplemented
+                        // epoch gate.
+                        if b16_field(wn, "zone_id").is_none() {
+                            return Err(bad());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            "c.grant" => {
+                let Some(gn) = body.get("grant") else {
+                    return Err(bad());
+                };
+                Self::grant_intrinsic_shape(gn, None)?;
+                if b16_field(gn, "subject_device").is_none() {
+                    return Err(bad());
+                }
+                Ok(())
+            }
+            "c.revoke_grant" => {
+                if b16_field(body, "grant_id").is_none() {
+                    return Err(bad());
+                }
+                // Whose zone/lineage the cutoff must name is the
+                // revoked grant's (state); the frontierclose's own
+                // shape is bytes.
+                match body.get("cutoff") {
+                    Some(cn) => Self::frontierclose_shape(cn),
+                    None => Ok(()),
+                }
+            }
+            "c.revoke_device" => {
+                let compromise = match body.get("mode").and_then(|m| m.as_text()) {
+                    Some("exclude") => false,
+                    Some("compromise") => true,
+                    _ => return Err(bad()),
+                };
+                // Fully byte-only by construction (a static fn).
+                Self::compound_receipt_cutoffs(body, compromise)?;
+                if b16_field(body, "revocation_id").is_none() {
+                    return Err(bad());
+                }
+                match body.get("rotation_refs").and_then(|r| r.as_array()) {
+                    None => return Err(bad()),
+                    Some(a) => {
+                        if a.len() > 64 {
+                            // E8.
+                            return Err(bad());
+                        }
+                        for r in a {
+                            if r.bytes_n::<32>().is_none() {
+                                return Err(bad());
+                            }
+                        }
+                    }
+                }
+                let Some(cs) = body.get("cutoffs").and_then(|c| c.as_array()) else {
+                    return Err(bad());
+                };
+                for cn in cs {
+                    Self::frontierclose_shape(cn)?;
+                }
+                Ok(())
+            }
+            "c.cutoff" => {
+                if body.get("requester").is_some() {
+                    // Requester attestation: honest Unimplemented.
+                    return Ok(());
+                }
+                let Some(ratify) = body.get("cutoffs").and_then(|c| c.as_array()) else {
+                    return Err(bad());
+                };
+                if !ratify.is_empty() {
+                    // The ratify machine: honest Unimplemented.
+                    return Ok(());
+                }
+                let closes = match body.get("closes").and_then(|c| c.as_array()) {
+                    Some(a) if !a.is_empty() => a,
+                    _ => return Err(bad()),
+                };
+                for cn in closes {
+                    Self::frontierclose_shape(cn)?;
+                }
+                Ok(())
+            }
+            "c.cap_epoch_bump" => {
+                let Some(zone) = b16_field(body, "zone_id") else {
+                    return Err(bad());
+                };
+                if body.get("new_epoch").and_then(|n| n.as_uint()).is_none() {
+                    return Err(bad());
+                }
+                Self::zone_cutoffs_shape(body, zone)
+            }
+            "c.zone_policy" => {
+                let Some(policy) = body.get("policy") else {
+                    return Err(bad());
+                };
+                if policy.get("v").and_then(|n| n.as_uint()) != Some(1) {
+                    return Err(bad());
+                }
+                let Some(zone) = b16_field(policy, "zone_id") else {
+                    return Err(bad());
+                };
+                let strictness = policy.get("strictness").and_then(|n| n.as_text());
+                if !matches!(strictness, Some("strict") | Some("lenient")) {
+                    return Err(bad());
+                }
+                let fallback = policy.get("deadline_fallback").and_then(|n| n.as_text());
+                let require_cert = policy
+                    .get("require_cert_deadlines")
+                    .and_then(|n| n.as_bool());
+                match (fallback, require_cert) {
+                    (Some("fail-closed"), Some(true)) | (Some("budgets"), Some(_)) => {}
+                    _ => return Err(bad()),
+                }
+                match policy_witness_devices(Some(policy)) {
+                    // A "connect" witness aborts the transition
+                    // before its remaining checks — mirror the abort
+                    // point, don't overtake it.
+                    Err(_) => return Ok(()),
+                    Ok(w) if w.len() > 64 => return Err(bad()),
+                    Ok(_) => {}
+                }
+                if policy.get("connect_service_key").is_some() {
+                    return Err(bad());
+                }
+                Self::zone_cutoffs_shape(body, zone)
+            }
+            "c.kek_rotate" => {
+                let zone = b16_field(body, "zone_id");
+                if zone.is_none() {
+                    return Err(bad());
+                }
+                let new_epoch = body.get("new_epoch").and_then(|n| n.as_uint());
+                if new_epoch.is_none() {
+                    return Err(bad());
+                }
+                match body.get("erase_manifest").and_then(|m| m.as_array()) {
+                    None => return Err(bad()),
+                    Some(entries) => {
+                        if entries.len() > 128 {
+                            // E8.
+                            return Err(bad());
+                        }
+                        let mut prev_addr: Option<[u8; 32]> = None;
+                        for e in entries {
+                            if !keys_are_map(e, &["item_addr", "erase_op", "target_op"]) {
+                                return Err(bad());
+                            }
+                            let (Some(addr), Some(_erase), Some(_target)) = (
+                                e.get("item_addr").and_then(|v| v.bytes_n::<32>()),
+                                e.get("erase_op").and_then(|v| v.bytes_n::<32>()),
+                                e.get("target_op").and_then(|v| v.bytes_n::<32>()),
+                            ) else {
+                                return Err(bad());
+                            };
+                            if prev_addr.is_some_and(|p| p >= addr) {
+                                return Err(bad());
+                            }
+                            prev_addr = Some(addr);
+                        }
+                    }
+                }
+                let wraps = match body.get("wraps").and_then(|w| w.as_array()) {
+                    Some(a) if !a.is_empty() => a,
+                    _ => return Err(bad()),
+                };
+                let mut recipients: Vec<[u8; 16]> = Vec::new();
+                for wn in wraps {
+                    // The wrap's static fields against the op's OWN
+                    // zone/new_epoch (byte-internal; the plane and
+                    // recipient-certificate checks are state).
+                    if wn.get("v").and_then(|n| n.as_uint()) != Some(1)
+                        || wn.get("kem").and_then(|n| n.as_text()) != Some("hpke-p256-v1")
+                        || wn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none()
+                        || b16_field(wn, "zone_id") != zone
+                        || wn.get("epoch").and_then(|n| n.as_uint()) != new_epoch
+                    {
+                        return Err(bad());
+                    }
+                    let Some(r) = b16_field(wn, "recipient_device") else {
+                        return Err(bad());
+                    };
+                    if recipients.contains(&r) {
+                        // Duplicate set key (zone, epoch, device).
+                        return Err(bad());
+                    }
+                    recipients.push(r);
+                }
+                Ok(())
+            }
+            "c.zone_create" => {
+                let Some(zone_id) = b16_field(body, "zone_id") else {
+                    return Err(bad());
+                };
+                if body.get("initial_epoch").and_then(|n| n.as_uint()) != Some(1) {
+                    return Err(bad());
+                }
+                let Some(policy) = body.get("zone_policy") else {
+                    return Err(bad());
+                };
+                if b16_field(policy, "zone_id") != Some(zone_id) {
+                    return Err(bad());
+                }
+                let wraps = match body.get("wraps").and_then(|w| w.as_array()) {
+                    Some(a) if !a.is_empty() => a,
+                    _ => return Err(bad()),
+                };
+                for wn in wraps {
+                    if wn.get("v").and_then(|n| n.as_uint()) != Some(1)
+                        || wn.get("kem").and_then(|n| n.as_text()) != Some("hpke-p256-v1")
+                        || wn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none()
+                        || b16_field(wn, "zone_id") != Some(zone_id)
+                        || wn.get("epoch").and_then(|n| n.as_uint()) != Some(1)
+                        || b16_field(wn, "recipient_device").is_none()
+                    {
+                        return Err(bad());
+                    }
+                }
+                Ok(())
+            }
+            "c.space_create" => {
+                if b16_field(body, "space_id").is_none() || b16_field(body, "zone_id").is_none() {
+                    return Err(bad());
+                }
+                Ok(())
+            }
+            "c.drill" => {
+                if body.get("nonce").and_then(|n| n.bytes_n::<16>()).is_none() {
+                    return Err(bad());
+                }
+                Ok(())
+            }
+            "c.recovery_succession" => {
+                let Some(base) = body.get("base") else {
+                    return Err(bad());
+                };
+                if base.get("seq").and_then(|n| n.as_uint()).is_none()
+                    || base.get("op").and_then(|n| n.bytes_n::<32>()).is_none()
+                {
+                    return Err(bad());
+                }
+                if body.get("repoch").and_then(|n| n.as_uint()).is_none()
+                    || body.get("epoch").and_then(|n| n.as_uint()).is_none()
+                {
+                    return Err(bad());
+                }
+                let Some(new_admin) = body.get("new_admin") else {
+                    return Err(bad());
+                };
+                if new_admin.get("alg").and_then(|a| a.as_text()) != Some("ed25519") {
+                    // Non-ed25519 successor: honest Unimplemented.
+                    return Ok(());
+                }
+                if new_admin
+                    .get("pk")
+                    .and_then(|n| n.bytes_n::<32>())
+                    .is_none()
+                {
+                    return Err(bad());
+                }
+                if body
+                    .get("new_recovery_commitment")
+                    .and_then(|n| n.bytes_n::<32>())
+                    .is_none()
+                {
+                    return Err(bad());
+                }
+                if body.get("adopted_renewals").is_some() || body.get("retired_keys").is_some() {
+                    // Renewal/freshness carriage: honest Unimplemented.
+                    return Ok(());
+                }
+                match body.get("adopted_rotations").and_then(|a| a.as_array()) {
+                    Some([]) => {}
+                    // Adopted rotations: honest Unimplemented.
+                    Some(_) => return Ok(()),
+                    None => return Err(bad()),
+                }
+                let Some(cutoffs) = body.get("tenant_cutoffs").and_then(|c| c.as_array()) else {
+                    return Err(bad());
+                };
+                for cn in cutoffs {
+                    Self::frontierclose_shape(cn)?;
+                }
+                Ok(())
+            }
+            // `c.genesis` (self-contained transition) and the
+            // registry rows whose mechanisms are honest
+            // `Unimplemented` markers carry no intrinsic law here.
+            _ => Ok(()),
+        }
+    }
+
+    /// The grant object's byte-only gates (`grant_static_checks`
+    /// minus its state reads): `plane_id` present, the verb rules,
+    /// and — for op-authoring grants — the finite zone plus the
+    /// lineage/subject members. `enrolling` supplies the enroll/
+    /// genesis shapes' byte-internal ownership equality; ownership
+    /// against the lineage registry is state.
+    fn grant_intrinsic_shape(
+        gn: &Node,
+        enrolling: Option<([u8; 16], [u8; 16])>,
+    ) -> Result<(), Verdict> {
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        if gn.get("plane_id").and_then(|n| n.bytes_n::<32>()).is_none() {
+            return Err(bad());
+        }
+        let verbs: Vec<&str> = gn
+            .get("ops")
+            .and_then(|n| n.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_text()).collect())
+            .unwrap_or_default();
+        if verbs.is_empty() || verbs.iter().any(|v| !VERBS.contains(v)) || verbs.contains(&"admin")
+        {
+            return Err(bad());
+        }
+        if verbs.iter().any(|v| OP_AUTHORING.contains(v)) {
+            let zone_finite = gn.get("zone").is_some_and(|z| z.bytes_n::<16>().is_some());
+            let (l, s) = (b16_field(gn, "lineage"), b16_field(gn, "subject_device"));
+            let (Some(l), Some(s)) = (l, s) else {
+                return Err(bad());
+            };
+            if !zone_finite || enrolling.is_some_and(|e| e != (l, s)) {
+                return Err(bad());
+            }
+        }
+        Ok(())
+    }
+
+    /// A frontierclose's byte-only shape (App A.3): `zone_id` and
+    /// `lineage` present, `heads` an array of `{lineage, gen, seq,
+    /// op}` heads each naming the close's OWN lineage. Resolution
+    /// against held chains (unheld pends, D-130 selection) is state.
+    fn frontierclose_shape(cn: &Node) -> Result<(), Verdict> {
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let (Some(cl), Some(_cz)) = (b16_field(cn, "lineage"), b16_field(cn, "zone_id")) else {
+            return Err(bad());
+        };
+        let Some(heads) = cn.get("heads").and_then(|h| h.as_array()) else {
+            return Err(bad());
+        };
+        for hn in heads {
+            let (Some(hl), Some(_gen), Some(_seq), Some(_hop)) = (
+                b16_field(hn, "lineage"),
+                hn.get("gen").and_then(|n| n.as_uint()),
+                hn.get("seq").and_then(|n| n.as_uint()),
+                hn.get("op").and_then(|n| n.bytes_n::<32>()),
+            ) else {
+                return Err(bad());
+            };
+            if hl != cl {
+                return Err(bad());
+            }
+        }
+        Ok(())
+    }
+
+    /// The `cutoffs` member's byte-only shape on the zone-scoped
+    /// advances (`c.cap_epoch_bump` / `c.zone_policy`): every entry
+    /// names THIS operation's zone with a well-formed frontierclose
+    /// (live-lineage membership is state).
+    fn zone_cutoffs_shape(body: &Node, zone: [u8; 16]) -> Result<(), Verdict> {
+        let bad = || Verdict::Rejected("body-invariant", "reject-permanent");
+        let Some(cs) = body.get("cutoffs") else {
+            return Ok(());
+        };
+        let Some(cs) = cs.as_array() else {
+            return Err(bad());
+        };
+        for cn in cs {
+            if b16_field(cn, "zone_id") != Some(zone) {
+                return Err(bad());
+            }
+            Self::frontierclose_shape(cn)?;
+        }
+        Ok(())
+    }
+
     /// The pre-admission control gate (C2/C5, §7.4): a frozen plane
     /// admits no control op but the resolving recovery; a differing
     /// op at a HELD position is cut-branch material where a cut or
@@ -4944,6 +5388,16 @@ pub(crate) fn classify(state: &mut State, bytes: &[u8]) -> Result<Verdict, Unimp
         }
         if !REGISTRY_OP_TYPES.contains(&op.header.operation_type) {
             return Ok(Verdict::Rejected("op-unknown", "reject-permanent"));
+        }
+        // ...and the arm's intrinsic CDDL shape completes the body
+        // stage (hash → registry row → CDDL, §10.2/D-99) before ANY
+        // precedence consult — the criterion-12 F1 repair: a validly
+        // signed, hash-valid `c.grant` over `{bogus: 1}` classifies
+        // `(body-invariant, reject-permanent)`, never `request-fork`
+        // or `ctrl-fork`. State-dependent invariants stay in the
+        // transition.
+        if let Err(v) = State::ctrl_intrinsic_shape(&op) {
+            return Ok(v);
         }
         // replay: consulted post-validity; consumed at acceptance.
         if let Some(v) = state.request_check(&op) {
