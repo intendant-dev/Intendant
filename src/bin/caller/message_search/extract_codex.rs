@@ -39,7 +39,10 @@ use std::path::Path;
 /// `prior` is the session's previously published shard; pass it — with a
 /// bumped, strictly higher `generation` — when the source was detected
 /// REWRITTEN (a same-path cursor returning `CursorCheck::Rewritten`: a
-/// Codex same-thread restore rewrites the rollout in place). The prior
+/// Codex same-thread restore rewrites the rollout in place — note for
+/// other rollout readers: this rewrite is why the anchor-scan cache in
+/// `managed_context_ops/anchors.rs` keys on the file CHANGE STAMP, never
+/// on (len, mtime), which a same-length in-place rewrite can alias). The prior
 /// generations' records are then retained and republished alongside the
 /// new generation's, never discarded (plan §5 index-everything), with a
 /// [`SupersessionMark::GenerationRestore`] recording that the freshly

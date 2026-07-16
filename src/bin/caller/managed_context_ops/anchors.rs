@@ -883,44 +883,67 @@ pub(crate) struct ContextRewindAnchorScan {
     /// `context_rewind_anchor_outcome_key`) — what
     /// `latest_context_rewind_outcome_for_anchor` answers from.
     pub(crate) latest_rewind_outcomes: HashMap<String, ContextRewindBackendUsageAtLine>,
+    /// Last backend `token_count` report in file order (the loop's EOF
+    /// value) — what `latest_context_rewind_backend_usage_in_rollout`
+    /// answers from. Carries the scan's run-tracking enrichment
+    /// (`response_start_line`/`measures_prefix_exactly`); consumers read
+    /// `used_tokens`/`rewind_only_limit`.
+    pub(crate) latest_backend_usage: Option<ContextRewindBackendUsageAtLine>,
 }
 
-/// Cached scans keyed by (path, len, mtime). One rewind/stall step
-/// re-derives the catalog up to ~9-14 times — resolve, headroom validation
-/// (plus its outcome probes), the density variant, then apply repeats all of
-/// it plus primer-facts and fission-detach prep — each pass JSON-parsing
-/// every line of a multi-MB rollout. Rollouts are append-only, so a
-/// (len, mtime) fingerprint is a sound freshness check and the whole burst
-/// is served from one scan. Slots are LRU'd so a couple of sessions
-/// rewinding concurrently don't thrash each other.
+/// Cached scans keyed by the rollout's (path, len, change stamp). One
+/// rewind/stall step re-derives the catalog up to ~9-14 times — resolve,
+/// headroom validation (plus its outcome probes), the density variant, then
+/// apply repeats all of it plus primer-facts and fission-detach prep — each
+/// pass JSON-parsing every line of a multi-MB rollout.
+///
+/// Rollouts are NOT strictly append-only: a Codex same-thread restore
+/// REWRITES the rollout in place (see `message_search/extract_codex.rs`,
+/// whose cursor layer detects exactly that as `Rewritten`), so a
+/// (len, mtime) fingerprint can alias a same-length rewrite inside one
+/// mtime granule and serve a stale catalog into rewind anchor selection.
+/// The key is therefore [`crate::platform::file_change_stamp`] — ctime /
+/// ChangeTime plus dev/ino identity, the same signal the file watcher's
+/// fingerprint cache uses — which the platform bumps on every in-place
+/// write and which replace-by-rename cannot alias. A file with no stamp
+/// (exotic filesystems) is UNCACHEABLE: every call rescans.
+///
+/// Slots are LRU'd so a couple of sessions rewinding concurrently don't
+/// thrash each other.
 const ANCHOR_SCAN_CACHE_SLOTS: usize = 4;
 
 struct CachedAnchorScan {
     path: PathBuf,
     len: u64,
-    mtime: Option<std::time::SystemTime>,
+    stamp: crate::platform::FileChangeStamp,
     scan: std::sync::Arc<ContextRewindAnchorScan>,
 }
 
 static ANCHOR_SCAN_CACHE: std::sync::Mutex<Vec<CachedAnchorScan>> =
     std::sync::Mutex::new(Vec::new());
 
+/// (len, change stamp) of the rollout; `None` stamp means no usable change
+/// signal — treat as uncacheable, never as unchanged.
+fn anchor_scan_fingerprint(
+    path: &Path,
+) -> io::Result<(u64, Option<crate::platform::FileChangeStamp>)> {
+    let meta = std::fs::metadata(path)?;
+    let stamp = crate::platform::file_change_stamp(path, &meta);
+    Ok((meta.len(), stamp))
+}
+
 /// The shared (possibly cached) scan of `source_rollout_path`. The scan is
-/// cached only when the file's (len, mtime) fingerprint is identical before
-/// and after the read, so a mid-scan append can never pin stale content
-/// under the newer fingerprint.
+/// cached only when the file's (len, change-stamp) fingerprint is available
+/// and identical before and after the read, so a mid-scan write can never
+/// pin stale content under the newer fingerprint.
 pub(crate) fn shared_context_rewind_anchor_scan(
     source_rollout_path: &Path,
 ) -> io::Result<std::sync::Arc<ContextRewindAnchorScan>> {
-    let fingerprint = |meta: std::fs::Metadata| (meta.len(), meta.modified().ok());
-    let (len, mtime) = fingerprint(std::fs::metadata(source_rollout_path)?);
-    {
+    let (len, stamp) = anchor_scan_fingerprint(source_rollout_path)?;
+    if let Some(stamp) = stamp {
         let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = cache.iter().position(|entry| {
-            entry.len == len
-                && entry.mtime.is_some()
-                && entry.mtime == mtime
-                && entry.path == source_rollout_path
+            entry.len == len && entry.stamp == stamp && entry.path == source_rollout_path
         }) {
             let hit = cache.remove(index);
             let scan = std::sync::Arc::clone(&hit.scan);
@@ -931,22 +954,23 @@ pub(crate) fn shared_context_rewind_anchor_scan(
     let scan = std::sync::Arc::new(scan_context_rewind_anchor_catalog_uncached(
         source_rollout_path,
     )?);
-    let unchanged = std::fs::metadata(source_rollout_path)
-        .map(fingerprint)
-        .is_ok_and(|after| after == (len, mtime));
-    if unchanged && mtime.is_some() {
-        let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache.retain(|entry| entry.path != source_rollout_path);
-        cache.insert(
-            0,
-            CachedAnchorScan {
-                path: source_rollout_path.to_path_buf(),
-                len,
-                mtime,
-                scan: std::sync::Arc::clone(&scan),
-            },
-        );
-        cache.truncate(ANCHOR_SCAN_CACHE_SLOTS);
+    if let Some(stamp) = stamp {
+        let unchanged = anchor_scan_fingerprint(source_rollout_path)
+            .is_ok_and(|after| after == (len, Some(stamp)));
+        if unchanged {
+            let mut cache = ANCHOR_SCAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            cache.retain(|entry| entry.path != source_rollout_path);
+            cache.insert(
+                0,
+                CachedAnchorScan {
+                    path: source_rollout_path.to_path_buf(),
+                    len,
+                    stamp,
+                    scan: std::sync::Arc::clone(&scan),
+                },
+            );
+            cache.truncate(ANCHOR_SCAN_CACHE_SLOTS);
+        }
     }
     Ok(scan)
 }
@@ -1363,6 +1387,7 @@ fn scan_context_rewind_anchor_catalog_uncached(
     Ok(ContextRewindAnchorScan {
         catalog: anchors,
         latest_rewind_outcomes,
+        latest_backend_usage,
     })
 }
 
@@ -1994,38 +2019,23 @@ pub(crate) fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String
     }
 }
 
-/// Latest backend `token_count` report in a rollout, in file order. Rollouts
-/// are append-only, so the chronologically last report is the backend's
-/// freshest usage measurement at read time. It can still be stale: when no
-/// model turn ran since an immediately preceding rollback it measured the
-/// pre-rollback context — recorded as-is, because nothing fresher exists
-/// locally and querying the backend would add an RPC to the rewind path.
+/// Latest backend `token_count` report in a rollout, in file order — the
+/// backend's freshest usage measurement at read time. It can still be
+/// stale: when no model turn ran since an immediately preceding rollback it
+/// measured the pre-rollback context — recorded as-is, because nothing
+/// fresher exists locally and querying the backend would add an RPC to the
+/// rewind path.
 ///
-/// Scans from the end: only lines carrying the `token_count` marker are
-/// JSON-parsed and the first (latest) parse that yields a report wins — the
-/// forward version parsed every line of a multi-MB rollout to keep one.
+/// Served from the shared anchor scan rather than its own file pass: the
+/// only production caller is the rewind-record writer, which runs right
+/// after the validate/apply chain has populated the scan cache for this
+/// exact rollout, so this is a map read — no additional I/O — while a
+/// dedicated pass (streaming or not) would re-read the multi-MB file the
+/// burst just parsed. One pass also means one definition of "last report".
 pub(crate) fn latest_context_rewind_backend_usage_in_rollout(
     source_rollout_path: &Path,
 ) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
-    let contents = std::fs::read_to_string(source_rollout_path)?;
-    let mut line_number = contents.lines().count();
-    for line in contents.lines().rev() {
-        let current_line = line_number;
-        line_number = line_number.saturating_sub(1);
-        // Cheap prescan: a token_count event necessarily contains the
-        // literal; payload text can false-positive, but the parse below
-        // stays the authority.
-        if !line.contains("token_count") {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(current_line, &entry) {
-            return Ok(Some(usage));
-        }
-    }
-    Ok(None)
+    Ok(shared_context_rewind_anchor_scan(source_rollout_path)?.latest_backend_usage)
 }
 
 /// Pressure band for a usage measurement against the effective context
@@ -2197,50 +2207,90 @@ mod tests {
         assert!(first_usage_covering_anchor(&[], &anchor_probe(1, 1, true)).is_none());
     }
 
-    /// One scan serves a same-fingerprint burst (pointer-identical Arc);
-    /// an append invalidates it.
+    fn cache_probe_item(call_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": call_id,
+                "arguments": "{}"
+            }
+        })
+    }
+
+    fn scan_item_ids(scan: &ContextRewindAnchorScan) -> Vec<String> {
+        scan.catalog
+            .iter()
+            .map(|anchor| anchor.item_id.clone())
+            .collect()
+    }
+
+    /// A same-fingerprint burst answers identically, and an append
+    /// invalidates the cached scan. Content equality, not `Arc::ptr_eq`:
+    /// the cache is a 4-slot process-global LRU, so parallel tests scanning
+    /// other rollouts can evict this entry between the two calls — a miss
+    /// re-derives the same content, which is the contract under test.
     #[test]
     fn anchor_scan_cache_serves_burst_and_invalidates_on_append() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
-        let item = serde_json::json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": "call_cache_probe",
-                "arguments": "{}"
-            }
-        });
-        std::fs::write(&path, format!("{item}\n")).unwrap();
+        std::fs::write(&path, format!("{}\n", cache_probe_item("call_cache_probe"))).unwrap();
 
         let first = shared_context_rewind_anchor_scan(&path).unwrap();
         let second = shared_context_rewind_anchor_scan(&path).unwrap();
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
-            "unchanged rollout must be served from the cached scan"
-        );
-        assert_eq!(first.catalog.len(), 1);
+        assert_eq!(scan_item_ids(&first), vec!["call_cache_probe"]);
+        assert_eq!(scan_item_ids(&first), scan_item_ids(&second));
 
-        let second_item = serde_json::json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "name": "exec_command",
-                "call_id": "call_cache_probe_2",
-                "arguments": "{}"
-            }
-        });
         let mut contents = std::fs::read_to_string(&path).unwrap();
-        contents.push_str(&format!("{second_item}\n"));
+        contents.push_str(&format!("{}\n", cache_probe_item("call_cache_probe_2")));
         std::fs::write(&path, contents).unwrap();
 
         let third = shared_context_rewind_anchor_scan(&path).unwrap();
-        assert!(
-            !std::sync::Arc::ptr_eq(&first, &third),
+        assert_eq!(
+            scan_item_ids(&third),
+            vec!["call_cache_probe", "call_cache_probe_2"],
             "append must invalidate the cached scan"
         );
-        assert_eq!(third.catalog.len(), 2);
+    }
+
+    /// The stale shape the change-stamp key exists for: a same-length
+    /// in-place rewrite whose mtime is restored to the original (the Codex
+    /// same-thread restore class — `message_search/extract_codex.rs`
+    /// detects the rewrite; a (len, mtime) key would serve the old
+    /// catalog). The change stamp moves on every write, so the rewritten
+    /// content must be re-scanned.
+    #[test]
+    fn anchor_scan_cache_rescans_same_size_mtime_restored_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, format!("{}\n", cache_probe_item("call_rewrite_a"))).unwrap();
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let before = shared_context_rewind_anchor_scan(&path).unwrap();
+        assert_eq!(scan_item_ids(&before), vec!["call_rewrite_a"]);
+
+        // Same byte length, different content; then restore the mtime so a
+        // (len, mtime) fingerprint would alias the original file.
+        std::fs::write(&path, format!("{}\n", cache_probe_item("call_rewrite_b"))).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), original_len);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            original_mtime,
+            "test setup must reproduce the mtime-restored rewrite"
+        );
+
+        let after = shared_context_rewind_anchor_scan(&path).unwrap();
+        assert_eq!(
+            scan_item_ids(&after),
+            vec!["call_rewrite_b"],
+            "an mtime-restored same-size rewrite must not be served stale"
+        );
     }
 
     /// The counting-writer estimate is byte-identical to the old
@@ -2258,10 +2308,11 @@ mod tests {
         }
     }
 
-    /// Reverse scan returns the LAST report with its 1-based line number and
-    /// is not fooled by the marker appearing in unrelated payload text.
+    /// The LAST report wins, with its 1-based line number, and unrelated
+    /// payload text mentioning the marker is ignored (the lookup is served
+    /// from the shared anchor scan).
     #[test]
-    fn latest_backend_usage_reverse_scan_finds_last_report() {
+    fn latest_backend_usage_finds_last_report() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let report = |total: u64| {
