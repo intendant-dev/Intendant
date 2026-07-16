@@ -1,23 +1,44 @@
-//! Windows display backend with two capture paths -- GDI `BitBlt` (default) and
-//! DXGI Desktop Duplication (opt-in) -- plus `SendInput` for input injection.
+//! Windows display backend with two capture paths -- DXGI Desktop Duplication
+//! (default, with automatic GDI fallback) and GDI `BitBlt` -- plus `SendInput`
+//! for input injection.
 //!
 //! ## Capture
 //!
 //! Two implementations sit behind the same `DisplayBackend` seam, selected by
-//! [`CaptureMethod`]:
+//! [`CaptureMethod`]; which one runs first, and what its init failure means,
+//! is the `CaptureSelection` policy (see "Selection and fallback" below):
 //!
-//! ### GDI `BitBlt` (default -- [`CaptureMethod::Gdi`])
+//! ### DXGI Desktop Duplication (default -- [`CaptureMethod::Dxgi`])
+//!
+//! `IDXGIOutputDuplication` is the GPU-accelerated path: zero-copy from the
+//! GPU into a CPU-readable staging texture, and -- decisively -- the only
+//! path with real change detection. An unchanged desktop yields
+//! `DXGI_ERROR_WAIT_TIMEOUT` from `AcquireNextFrame`, which the loop turns
+//! into a 1 s cached-frame heartbeat, so an idle desktop costs roughly one
+//! frame per second downstream instead of driving the full
+//! capture + convert + encode pipeline at the target fps. That idle
+//! efficiency is why it is the default.
+//!
+//! The duplication interface, the D3D11 device, and the device context are
+//! single-threaded COM objects **not** `Send` across `await` points, so the
+//! loop runs on a dedicated `std::thread`. Per frame: `AcquireNextFrame`
+//! (`DXGI_ERROR_WAIT_TIMEOUT` -> re-emit the last frame at the heartbeat
+//! cadence), `CopyResource` into a staging texture, `Map` and copy the BGRA
+//! rows, `ReleaseFrame`. `DXGI_ERROR_ACCESS_LOST` (resolution change,
+//! exclusive full-screen, secure-desktop / UAC transition, GPU mode switch)
+//! tears down the duplication and re-acquires it.
+//!
+//! ### GDI `BitBlt` (automatic fallback -- [`CaptureMethod::Gdi`])
 //!
 //! `BitBlt` from the screen DC reads the **DWM-composed** desktop, the same
-//! pixels a user sees. Crucially it works on *every* display adapter, including
-//! the virtual/indirect ones Intendant's "always-on steward" actually runs on:
-//! RDP indirect display, GCP/cloud virtual display, headless. On those adapters
-//! DXGI Desktop Duplication captures **all-black** frames -- it requires real
-//! frame presentation/scanout that virtual/headless/RDP displays don't provide,
-//! so it "succeeds" yet duplicates black. (Proven live on a GCP Windows VM: DDA
-//! streamed black on both RDP and the console session with a virtual display
-//! device, while a GDI `BitBlt` capture at the same instant showed the real
-//! desktop.) GDI is therefore the robust, default capture path.
+//! pixels a user sees, and works on *every* display adapter -- including the
+//! virtual/indirect ones an always-on host may run on (RDP indirect display,
+//! GCP/cloud virtual display, headless) where Desktop Duplication cannot
+//! initialize. It has no change signal, though: every iteration copies the
+//! full frame (`BitBlt` into the cached DIB, DIB bits into a `Vec`, plus the
+//! heartbeat-cache clone) at the target fps whether or not anything changed,
+//! which is why it is the fallback and the explicit opt-out rather than the
+//! default.
 //!
 //! The capture loop runs on a dedicated `std::thread` because GDI device
 //! contexts and bitmaps are raw `HDC`/`HBITMAP` handles that are **not** `Send`.
@@ -27,27 +48,46 @@
 //! memory DC, and DIB are cached across frames and recreated only on a
 //! resolution change. The DIB is created BGRA8 top-down (`biHeight` negative,
 //! `biBitCount = 32`, `biCompression = BI_RGB`), so the emitted rows are the
-//! identical `DXGI_FORMAT_B8G8R8A8_UNORM` byte layout the DDA path produced --
+//! identical `DXGI_FORMAT_B8G8R8A8_UNORM` byte layout the DDA path produces --
 //! `FrameFormat::Bgra`, `stride = width * 4` -- and feed the existing
 //! `bgra_to_i420` / Media Foundation H.264 encoder unchanged.
 //!
-//! ### DXGI Desktop Duplication (opt-in -- [`CaptureMethod::Dxgi`])
+//! ### Selection and fallback
 //!
-//! `IDXGIOutputDuplication` is the GPU-accelerated path: zero-copy from the GPU
-//! into a CPU-readable staging texture, lowest overhead on physical hardware. It
-//! is retained as an opt-in fast path (constructor or
-//! `INTENDANT_WINDOWS_CAPTURE=dxgi`) for hosts with a real GPU/scanout where it
-//! works, but it is **not** the default because it silently captures black on
-//! the cloud/RDP/headless adapters this project commonly targets.
+//! `INTENDANT_WINDOWS_CAPTURE` (case-insensitive) picks the path at runtime:
 //!
-//! Like GDI, the duplication interface, the D3D11 device, and the device context
-//! are single-threaded COM objects **not** `Send` across `await` points, so the
-//! loop runs on a dedicated `std::thread`. Per frame: `AcquireNextFrame`
-//! (`DXGI_ERROR_WAIT_TIMEOUT` -> re-emit the last frame to keep cadence),
-//! `CopyResource` into a staging texture, `Map` and copy the BGRA rows,
-//! `ReleaseFrame`. `DXGI_ERROR_ACCESS_LOST` (resolution change, exclusive
-//! full-screen, secure-desktop / UAC transition, GPU mode switch) tears down the
-//! duplication and re-acquires it.
+//! - **unset / unrecognized (the default):** DXGI is tried first. If DXGI
+//!   init fails -- no output duplication available (RDP or service session),
+//!   access denied, driver reset, another process already holding the
+//!   duplication -- the backend logs one warning naming the concrete cause
+//!   and falls back to GDI for the session. Every `start_capture` re-runs
+//!   the policy, so a later restart re-tries DXGI.
+//! - **`dxgi` (explicit):** fail-loud. The operator asked for DXGI
+//!   specifically, so an init failure surfaces as an error instead of being
+//!   silently substituted with GDI.
+//! - **`gdi` (explicit):** forces the GDI path, unchanged.
+//!
+//! **Caveat -- silent black duplication.** On some virtual/indirect adapters
+//! DDA *initializes successfully yet duplicates all-black* frames: they don't
+//! perform the real frame presentation/scanout duplication requires. (Proven
+//! live on a GCP Windows VM: DDA streamed black on both RDP and the console
+//! session with a virtual display device, while a GDI `BitBlt` capture at the
+//! same instant showed the real desktop.) An init-failure fallback cannot
+//! catch that class -- on such hosts set `INTENDANT_WINDOWS_CAPTURE=gdi`.
+//! This residual class is why flipping the default was gated on an
+//! interactive-desktop soak (black/stale-frame checks across lock, RDP, and
+//! topology transitions).
+//!
+//! **Mid-stream failure.** The automatic fallback covers *init time* only. A
+//! DXGI session that dies mid-stream -- `DXGI_ERROR_ACCESS_LOST` whose
+//! re-acquire keeps failing past the retry budget, or a persistent fatal
+//! error streak -- ends the capture thread exactly like a persistent GDI
+//! failure does: the frame channel closes and the capture bridge reports
+//! `CaptureLost` so the session is torn down loudly rather than switched
+//! silently. Restarting the display session re-runs the default selection,
+//! which falls back to GDI at init if DXGI can no longer initialize.
+//! (Transient interruptions -- lock screen, UAC, resolution changes -- are
+//! absorbed by the in-loop re-acquire before any of that.)
 //!
 //! Both paths talk to the tokio runtime via a bounded `mpsc` channel (capacity
 //! 4, `try_send`, drop on full -- the same backpressure policy as the macOS and
@@ -71,11 +111,13 @@
 //!
 //! ## Status
 //!
-//! Compiles and links for `x86_64-pc-windows-msvc`. The GDI default path
-//! captures the real desktop on the cloud/RDP/headless hosts this project
-//! targets (validated live). Input injection via `SendInput` still requires an
-//! interactive desktop session (it is blocked on the headless service "Session
-//! 0" desktop) -- see the crate-level Windows-port notes.
+//! Compiles and links for `x86_64-pc-windows-msvc`. The GDI path captures the
+//! real desktop on the cloud/RDP/headless hosts this project targets
+//! (validated live); the DXGI default targets interactive desktops with real
+//! scanout and falls back to GDI where duplication can't initialize. Input
+//! injection via `SendInput` still requires an interactive desktop session
+//! (it is blocked on the headless service "Session 0" desktop) -- see the
+//! crate-level Windows-port notes.
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use async_trait::async_trait;
@@ -141,27 +183,72 @@ struct CaptureState {
 /// width * 4`; only the OS path that fills them differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMethod {
-    /// GDI `BitBlt` of the screen DC. **Default.** Reads the DWM-composed
-    /// desktop and works on virtual/indirect/headless/RDP/cloud display
-    /// adapters where DXGI Desktop Duplication captures black.
+    /// GDI `BitBlt` of the screen DC. The automatic **fallback** (and the
+    /// explicit `INTENDANT_WINDOWS_CAPTURE=gdi` opt-out): reads the
+    /// DWM-composed desktop and works on virtual/indirect/headless/RDP/cloud
+    /// display adapters where DXGI Desktop Duplication can't initialize --
+    /// but it has no change detection, so it drives the full capture+encode
+    /// pipeline at the target fps even on an idle desktop.
     Gdi,
-    /// DXGI Desktop Duplication. GPU-accelerated fast path for hosts with a
-    /// real GPU + scanout; opt-in because it captures black on the cloud/RDP/
-    /// headless adapters this project commonly targets.
+    /// DXGI Desktop Duplication. **Default.** GPU-accelerated, and the only
+    /// path with real change detection (an unchanged desktop yields
+    /// `DXGI_ERROR_WAIT_TIMEOUT`, throttling an idle session to the 1 s
+    /// heartbeat). Under the default selection an init failure falls back to
+    /// [`CaptureMethod::Gdi`]; an explicit request stays fail-loud.
     Dxgi,
 }
 
-impl CaptureMethod {
-    /// Resolve the default capture method, honoring an
-    /// `INTENDANT_WINDOWS_CAPTURE` override (`gdi` | `dxgi`, case-insensitive)
-    /// so the fast path can be opted into at runtime without a code change.
-    /// Anything unrecognized (or unset) falls back to the GDI default.
-    fn from_env_or_default() -> Self {
-        match std::env::var("INTENDANT_WINDOWS_CAPTURE") {
-            Ok(v) if v.eq_ignore_ascii_case("dxgi") => CaptureMethod::Dxgi,
-            Ok(v) if v.eq_ignore_ascii_case("gdi") => CaptureMethod::Gdi,
-            _ => CaptureMethod::Gdi,
+/// How the capture method was chosen -- which decides the init-failure policy.
+///
+/// [`CaptureMethod`] says *what* to run; the selection says *what an init
+/// failure means*: an explicit operator choice is honored fail-loud (no
+/// silent substitution), while the default DXGI pick automatically falls back
+/// to GDI so a host without Desktop Duplication (RDP/service session, access
+/// denied, driver reset) still gets a capture session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureSelection {
+    /// Explicitly requested (`INTENDANT_WINDOWS_CAPTURE` or
+    /// [`WindowsBackend::with_method`]): run exactly this method and surface
+    /// its init failure -- the operator asked for it specifically.
+    Explicit(CaptureMethod),
+    /// Nothing (recognizable) was requested: try DXGI first for its idle
+    /// efficiency, and fall back to GDI if DXGI init fails.
+    DxgiWithGdiFallback,
+}
+
+impl CaptureSelection {
+    /// Selection policy for a raw `INTENDANT_WINDOWS_CAPTURE` value (`None` =
+    /// unset; matching is case-insensitive). Pure, so the precedence --
+    /// explicit `gdi` > explicit fail-loud `dxgi` > default DXGI with GDI
+    /// fallback (unset or unrecognized) -- is unit-testable.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        match raw {
+            Some(v) if v.eq_ignore_ascii_case("gdi") => Self::Explicit(CaptureMethod::Gdi),
+            Some(v) if v.eq_ignore_ascii_case("dxgi") => Self::Explicit(CaptureMethod::Dxgi),
+            _ => Self::DxgiWithGdiFallback,
         }
+    }
+
+    /// Resolve the selection from the process environment, honoring the
+    /// `INTENDANT_WINDOWS_CAPTURE` override (`gdi` | `dxgi`) so either path
+    /// can be forced at runtime without a code change.
+    fn from_env() -> Self {
+        Self::from_env_value(std::env::var("INTENDANT_WINDOWS_CAPTURE").ok().as_deref())
+    }
+
+    /// The capture method attempted first.
+    fn initial_method(self) -> CaptureMethod {
+        match self {
+            Self::Explicit(m) => m,
+            Self::DxgiWithGdiFallback => CaptureMethod::Dxgi,
+        }
+    }
+
+    /// Whether an init failure of [`Self::initial_method`] automatically
+    /// falls back to GDI. Only the default selection does; an explicit
+    /// choice is fail-loud.
+    fn falls_back_to_gdi(self) -> bool {
+        matches!(self, Self::DxgiWithGdiFallback)
     }
 }
 
@@ -180,9 +267,10 @@ struct CaptureRect {
 
 /// Windows screen capture and input injection backend.
 ///
-/// Captures the full desktop via GDI `BitBlt` (default) or DXGI Desktop
-/// Duplication (opt-in -- see [`CaptureMethod`]) and injects keyboard/mouse/
-/// scroll via `SendInput`. Resolution is resolved when `start_capture()` runs
+/// Captures the full desktop via DXGI Desktop Duplication (default, with
+/// automatic GDI fallback when duplication init fails) or GDI `BitBlt`
+/// (the fallback / explicit opt-out -- see [`CaptureMethod`]) and injects
+/// keyboard/mouse/scroll via `SendInput`. Resolution is resolved when `start_capture()` runs
 /// (from `GetSystemMetrics` for the primary GDI path, or the monitor/output
 /// rect when a specific monitor is targeted); `with_output_index` targets a
 /// specific monitor by its DXGI output ordinal. The resolved capture rect's
@@ -205,23 +293,27 @@ pub struct WindowsBackend {
     /// Target DXGI output index on adapter 0. `None` captures the primary /
     /// first available output (backwards-compatible single-monitor behavior).
     target_output_index: Option<u32>,
-    /// Capture implementation to drive.
-    method: CaptureMethod,
+    /// Capture implementation to drive, plus what an init failure of it
+    /// means (automatic GDI fallback for the default selection, fail-loud
+    /// for an explicit choice).
+    selection: CaptureSelection,
 }
 
 impl WindowsBackend {
     /// Create a new Windows backend capturing the primary output with the
-    /// default (GDI) capture path, honoring the `INTENDANT_WINDOWS_CAPTURE`
-    /// override. Resolution is populated once `start_capture()` runs.
+    /// default capture selection -- DXGI Desktop Duplication with automatic
+    /// GDI fallback -- honoring the `INTENDANT_WINDOWS_CAPTURE` override.
+    /// Resolution is populated once `start_capture()` runs.
     pub fn new() -> Self {
-        Self::with_method(None, CaptureMethod::from_env_or_default())
+        Self::with_selection(None, CaptureSelection::from_env())
     }
 
     /// Create a backend targeting a specific DXGI output (monitor) by its
-    /// ordinal on adapter 0, with the default (GDI) capture path. Mirrors
-    /// `MacOSBackend::with_display_id`.
+    /// ordinal on adapter 0, with the default capture selection (DXGI with
+    /// automatic GDI fallback, honoring `INTENDANT_WINDOWS_CAPTURE`).
+    /// Mirrors `MacOSBackend::with_display_id`.
     pub fn with_output_index(output_index: u32) -> Self {
-        Self::with_method(Some(output_index), CaptureMethod::from_env_or_default())
+        Self::with_selection(Some(output_index), CaptureSelection::from_env())
     }
 
     /// The active capture rectangle in virtual-desktop pixel coordinates, as a
@@ -237,9 +329,17 @@ impl WindowsBackend {
     }
 
     /// Create a backend with an explicit output target and capture method.
-    /// Lets callers force the DXGI fast path (e.g. on a known-good GPU host)
-    /// without relying on the environment override.
+    /// An explicit method is honored fail-loud -- no automatic fallback --
+    /// mirroring the `INTENDANT_WINDOWS_CAPTURE` env override's explicit
+    /// semantics; use it to force either path (e.g. GDI on a known
+    /// black-duplicating virtual adapter) without relying on the environment.
     pub fn with_method(target_output_index: Option<u32>, method: CaptureMethod) -> Self {
+        Self::with_selection(target_output_index, CaptureSelection::Explicit(method))
+    }
+
+    /// Shared constructor: an explicit output target plus the full capture
+    /// selection (method + init-failure policy).
+    fn with_selection(target_output_index: Option<u32>, selection: CaptureSelection) -> Self {
         Self {
             capture: Mutex::new(None),
             width: Arc::new(AtomicU32::new(0)),
@@ -248,7 +348,95 @@ impl WindowsBackend {
             capture_top: Arc::new(AtomicI32::new(0)),
             shutdown: Arc::new(AtomicBool::new(false)),
             target_output_index,
-            method,
+            selection,
+        }
+    }
+
+    /// Spawn the capture thread for `method` and await its init handshake.
+    ///
+    /// The thread probes the capture itself and reports the initial
+    /// resolution back through a oneshot, so the caller fails loudly (rather
+    /// than returning a silent black session) if init fails -- e.g. Desktop
+    /// Duplication unavailable on the headless Session 0 desktop, no GPU, or
+    /// a GDI DC that can't be acquired. This mirrors the X11 backend
+    /// surfacing connect failures, but here init happens on the thread
+    /// because the COM/GDI objects are not `Send`.
+    ///
+    /// On success the thread is registered as the active capture state and
+    /// the frame receiver is returned; on failure the thread has already
+    /// exited and is joined before the (fully formatted) error is returned,
+    /// so a fallback attempt starts from a clean slate.
+    async fn try_start_method(
+        &self,
+        method: CaptureMethod,
+        fps: u32,
+    ) -> Result<mpsc::Receiver<Frame>, String> {
+        let (tx, rx) = mpsc::channel::<Frame>(4);
+        let shutdown_flag = Arc::clone(&self.shutdown);
+        let shared_w = Arc::clone(&self.width);
+        let shared_h = Arc::clone(&self.height);
+        let shared_left = Arc::clone(&self.capture_left);
+        let shared_top = Arc::clone(&self.capture_top);
+        let target_output = self.target_output_index;
+
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(u32, u32), String>>();
+
+        let thread = std::thread::spawn(move || match method {
+            CaptureMethod::Gdi => {
+                run_gdi_capture(
+                    tx,
+                    shutdown_flag,
+                    fps,
+                    target_output,
+                    shared_w,
+                    shared_h,
+                    shared_left,
+                    shared_top,
+                    init_tx,
+                );
+            }
+            CaptureMethod::Dxgi => {
+                run_dxgi_capture(
+                    tx,
+                    shutdown_flag,
+                    fps,
+                    target_output,
+                    shared_w,
+                    shared_h,
+                    shared_left,
+                    shared_top,
+                    init_tx,
+                );
+            }
+        });
+
+        match init_rx.await {
+            Ok(Ok((w, h))) => {
+                self.width.store(w, Ordering::SeqCst);
+                self.height.store(h, Ordering::SeqCst);
+                *self.capture.lock().await = Some(CaptureState { thread });
+                Ok(rx)
+            }
+            Ok(Err(e)) => {
+                // Init failed; the thread has already returned. Join it to
+                // avoid a detached-thread warning, then surface the error.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = thread.join();
+                })
+                .await;
+                Err(format!("Windows {method:?} capture init failed: {e}"))
+            }
+            Err(_) => {
+                // The thread dropped the sender without sending (panicked
+                // before init). Join and report.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = thread.join();
+                })
+                .await;
+                Err(format!(
+                    "Windows {method:?} capture thread exited before initialization"
+                ))
+            }
         }
     }
 }
@@ -416,82 +604,33 @@ impl DisplayBackend for WindowsBackend {
 
         self.shutdown.store(false, Ordering::SeqCst);
 
-        let (tx, rx) = mpsc::channel::<Frame>(4);
-        let shutdown_flag = Arc::clone(&self.shutdown);
-        let shared_w = Arc::clone(&self.width);
-        let shared_h = Arc::clone(&self.height);
-        let shared_left = Arc::clone(&self.capture_left);
-        let shared_top = Arc::clone(&self.capture_top);
-        let target_output = self.target_output_index;
-        let method = self.method;
-
-        // Probe the capture on its own thread and report the initial resolution
-        // back through a oneshot, so `start_capture` fails loudly (rather than
-        // returning a silent black session) if init fails -- e.g. Desktop
-        // Duplication unavailable on the headless Session 0 desktop, no GPU, or
-        // a GDI DC that can't be acquired. This mirrors the X11 backend
-        // surfacing connect failures, but here init happens on the thread
-        // because the COM/GDI objects are not `Send`.
-        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(u32, u32), String>>();
-
-        let thread = std::thread::spawn(move || match method {
-            CaptureMethod::Gdi => {
-                run_gdi_capture(
-                    tx,
-                    shutdown_flag,
-                    fps,
-                    target_output,
-                    shared_w,
-                    shared_h,
-                    shared_left,
-                    shared_top,
-                    init_tx,
+        // Run the selection policy: try the selected method, and -- for the
+        // default selection only -- fall back to GDI when DXGI init fails.
+        let initial = self.selection.initial_method();
+        match self.try_start_method(initial, fps).await {
+            Ok(rx) => Ok(rx),
+            Err(dxgi_err) if self.selection.falls_back_to_gdi() => {
+                // Default-selection fallback: DXGI init failed (no output
+                // duplication available -- RDP/service session, access
+                // denied, driver reset, duplication already claimed, ...).
+                // Fall back to GDI so the session still captures, and say so
+                // once, loudly, with the concrete cause. An EXPLICIT
+                // `INTENDANT_WINDOWS_CAPTURE=dxgi` never reaches this arm:
+                // the operator asked for DXGI specifically, so its failure
+                // surfaces via the arm below instead of being substituted.
+                eprintln!(
+                    "[display/windows] warning: default DXGI capture unavailable, \
+                     falling back to GDI BitBlt ({dxgi_err})"
                 );
+                self.try_start_method(CaptureMethod::Gdi, fps)
+                    .await
+                    .map_err(|gdi_err| {
+                        CallerError::Display(format!(
+                            "{dxgi_err}; GDI fallback also failed: {gdi_err}"
+                        ))
+                    })
             }
-            CaptureMethod::Dxgi => {
-                run_dxgi_capture(
-                    tx,
-                    shutdown_flag,
-                    fps,
-                    target_output,
-                    shared_w,
-                    shared_h,
-                    shared_left,
-                    shared_top,
-                    init_tx,
-                );
-            }
-        });
-
-        match init_rx.await {
-            Ok(Ok((w, h))) => {
-                self.width.store(w, Ordering::SeqCst);
-                self.height.store(h, Ordering::SeqCst);
-                *self.capture.lock().await = Some(CaptureState { thread });
-                Ok(rx)
-            }
-            Ok(Err(e)) => {
-                // Init failed; the thread has already returned. Join it to
-                // avoid a detached-thread warning, then surface the error.
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = thread.join();
-                })
-                .await;
-                Err(CallerError::Display(format!(
-                    "Windows {method:?} capture init failed: {e}"
-                )))
-            }
-            Err(_) => {
-                // The thread dropped the sender without sending (panicked
-                // before init). Join and report.
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = thread.join();
-                })
-                .await;
-                Err(CallerError::Display(format!(
-                    "Windows {method:?} capture thread exited before initialization"
-                )))
-            }
+            Err(e) => Err(CallerError::Display(e)),
         }
     }
 
@@ -1133,6 +1272,12 @@ fn run_dxgi_capture(
             shared_height.store(h, Ordering::SeqCst);
             shared_left.store(left, Ordering::SeqCst);
             shared_top.store(top, Ordering::SeqCst);
+            // Init-success marker (the counterpart of the loud init failure):
+            // says which path is live without waiting for frame #1.
+            eprintln!(
+                "[display/windows] DXGI Desktop Duplication capture initialized \
+                 ({w}x{h} at ({left},{top}))"
+            );
             let _ = init_tx.send(Ok((w, h)));
             dup
         }
@@ -1540,7 +1685,7 @@ fn open_default_desktop() -> Option<HDESK> {
 }
 
 // ---------------------------------------------------------------------------
-// GDI BitBlt capture (default path)
+// GDI BitBlt capture (automatic fallback / explicit opt-out path)
 // ---------------------------------------------------------------------------
 
 /// Resolve the source rect to `BitBlt` from the screen DC, in physical pixels:
@@ -1929,6 +2074,13 @@ fn run_gdi_capture(
     shared_height.store(init_h, Ordering::SeqCst);
     shared_left.store(rect_x, Ordering::SeqCst);
     shared_top.store(rect_y, Ordering::SeqCst);
+    // Init-success marker (the counterpart of the loud init failure): says
+    // which path is live without waiting for frame #1 -- and, after a DXGI
+    // fallback, confirms GDI actually took over.
+    eprintln!(
+        "[display/windows] GDI BitBlt capture initialized \
+         ({init_w}x{init_h} at ({rect_x},{rect_y}))"
+    );
     let _ = init_tx.send(Ok((init_w, init_h)));
 
     let mut last_frame: Option<Frame> = None;
@@ -2146,36 +2298,83 @@ mod tests {
     }
 
     #[test]
-    fn default_capture_method_is_gdi() {
-        // GDI is the robust default; DXGI captures black on cloud/RDP/headless.
-        // The constructors must default to GDI (absent an env override).
+    fn default_capture_selection_is_dxgi_with_gdi_fallback() {
+        // DXGI idles correctly (WAIT_TIMEOUT -> 1 s heartbeat) where GDI
+        // BitBlts blind at full fps, so DXGI is the default -- with automatic
+        // GDI fallback for hosts where duplication can't initialize. The
+        // constructors must pick that selection absent an env override.
         let _env = CaptureEnvGuard::lock();
         std::env::remove_var("INTENDANT_WINDOWS_CAPTURE");
-        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
-        assert_eq!(WindowsBackend::new().method, CaptureMethod::Gdi);
         assert_eq!(
-            WindowsBackend::with_output_index(0).method,
-            CaptureMethod::Gdi
+            CaptureSelection::from_env(),
+            CaptureSelection::DxgiWithGdiFallback
+        );
+        assert_eq!(
+            WindowsBackend::new().selection,
+            CaptureSelection::DxgiWithGdiFallback
+        );
+        assert_eq!(
+            WindowsBackend::with_output_index(0).selection,
+            CaptureSelection::DxgiWithGdiFallback
         );
     }
 
     #[test]
-    fn capture_method_env_override_opts_into_dxgi() {
-        // The override is the documented runtime opt-in for the fast path.
+    fn capture_method_env_override_is_explicit_and_fail_loud() {
+        // The env override is the operator's word: an explicit method runs
+        // as-is, with no automatic substitution on init failure.
         let _env = CaptureEnvGuard::lock();
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "dxgi");
-        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Dxgi);
+        assert_eq!(
+            CaptureSelection::from_env(),
+            CaptureSelection::Explicit(CaptureMethod::Dxgi)
+        );
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "GDI");
-        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
-        // Anything unrecognized falls back to the GDI default.
+        assert_eq!(
+            CaptureSelection::from_env(),
+            CaptureSelection::Explicit(CaptureMethod::Gdi)
+        );
+        // Anything unrecognized falls back to the default selection
+        // (DXGI first, GDI on init failure).
         std::env::set_var("INTENDANT_WINDOWS_CAPTURE", "nonsense");
-        assert_eq!(CaptureMethod::from_env_or_default(), CaptureMethod::Gdi);
+        assert_eq!(
+            CaptureSelection::from_env(),
+            CaptureSelection::DxgiWithGdiFallback
+        );
     }
 
     #[test]
-    fn explicit_method_overrides_default() {
+    fn capture_selection_precedence_is_pinned() {
+        // The full selection/fallback precedence on the pure parser (no env
+        // mutation): explicit-gdi > explicit-dxgi-fail-loud > default-dxgi >
+        // fallback-gdi.
+        //
+        // 1. Explicit gdi: GDI runs; nothing to fall back to.
+        let gdi = CaptureSelection::from_env_value(Some("gdi"));
+        assert_eq!(gdi, CaptureSelection::Explicit(CaptureMethod::Gdi));
+        assert_eq!(gdi.initial_method(), CaptureMethod::Gdi);
+        assert!(!gdi.falls_back_to_gdi());
+        // 2. Explicit dxgi (case-insensitive): DXGI runs and its init failure
+        //    is FAIL-LOUD -- the operator asked for DXGI specifically.
+        let dxgi = CaptureSelection::from_env_value(Some("DXGI"));
+        assert_eq!(dxgi, CaptureSelection::Explicit(CaptureMethod::Dxgi));
+        assert_eq!(dxgi.initial_method(), CaptureMethod::Dxgi);
+        assert!(!dxgi.falls_back_to_gdi());
+        // 3+4. Default (unset or unrecognized): DXGI is tried first, and its
+        //      init failure falls back to GDI automatically.
+        for raw in [None, Some("nonsense"), Some("")] {
+            let sel = CaptureSelection::from_env_value(raw);
+            assert_eq!(sel, CaptureSelection::DxgiWithGdiFallback, "raw={raw:?}");
+            assert_eq!(sel.initial_method(), CaptureMethod::Dxgi, "raw={raw:?}");
+            assert!(sel.falls_back_to_gdi(), "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_method_constructor_is_fail_loud() {
         let b = WindowsBackend::with_method(Some(1), CaptureMethod::Dxgi);
-        assert_eq!(b.method, CaptureMethod::Dxgi);
+        assert_eq!(b.selection, CaptureSelection::Explicit(CaptureMethod::Dxgi));
+        assert!(!b.selection.falls_back_to_gdi());
         assert_eq!(b.target_output_index, Some(1));
     }
 
@@ -2479,12 +2678,12 @@ mod tests {
         assert!((0..=65535).contains(&got.1));
     }
 
-    /// Real-desktop teardown-contract stress (GDI default path): fast
-    /// start/stop cycles with per-cycle bounded channel-close assertions,
-    /// plus a post-stop linger (see `crate::capture_stress`). Ignored by
-    /// default — needs an interactive desktop (skips itself cleanly on the
-    /// headless Session 0 desktop, where capture init fails loudly). Run on
-    /// operator hardware:
+    /// Real-desktop teardown-contract stress (default selection: DXGI with
+    /// automatic GDI fallback): fast start/stop cycles with per-cycle bounded
+    /// channel-close assertions, plus a post-stop linger (see
+    /// `crate::capture_stress`). Ignored by default — needs an interactive
+    /// desktop (skips itself cleanly on the headless Session 0 desktop, where
+    /// capture init fails loudly on both paths). Run on operator hardware:
     ///
     /// ```text
     /// cargo test -p intendant-display --lib -- --ignored real_capture_stress
@@ -2492,7 +2691,8 @@ mod tests {
     ///
     /// Tunables: `INTENDANT_DISPLAY_STRESS_CYCLES` (default 10),
     /// `INTENDANT_DISPLAY_STRESS_LINGER_SECS` (default 60).
-    /// `INTENDANT_WINDOWS_CAPTURE=dxgi` stresses the DXGI path instead.
+    /// `INTENDANT_WINDOWS_CAPTURE=gdi` stresses the GDI path specifically;
+    /// `=dxgi` pins fail-loud DXGI.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "real Windows desktop capture: needs an interactive desktop; run via -- --ignored real_capture_stress on operator hardware"]
     async fn windows_real_capture_stress_cycles() {

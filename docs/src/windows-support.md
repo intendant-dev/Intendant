@@ -7,11 +7,12 @@ known limitations of the Windows port.
 > **Maturity.** The Windows backends compile and link cleanly for
 > `x86_64-pc-windows-msvc` and mirror the structure of the X11/macOS backends.
 > The display pipeline has been **live-validated** end-to-end on a real Windows
-> host: GDI `BitBlt` capture, Media Foundation H.264 encode, `SendInput`
-> keyboard/mouse injection, and the encrypted WebRTC transport all work with
-> real remote clients (display and input, over WebRTC). The voice **audio
-> bridge** (VB-CABLE / WASAPI) is the one runtime path still pending end-to-end
-> validation. Remaining gaps are called out under
+> host: desktop capture (see [Capture](#capture--dxgi-desktop-duplication-default--gdi-bitblt-automatic-fallback)
+> for the DXGI-default / GDI-fallback policy), Media Foundation H.264 encode,
+> `SendInput` keyboard/mouse injection, and the encrypted WebRTC transport all
+> work with real remote clients (display and input, over WebRTC). The voice
+> **audio bridge** (VB-CABLE / WASAPI) is the one runtime path still pending
+> end-to-end validation. Remaining gaps are called out under
 > [Known Limitations](#known-limitations) — the port never panics or silently
 > no-ops; unsupported paths return a clear error.
 
@@ -167,39 +168,60 @@ Intendant prefers platform-agnostic code; where the OS forces a difference, the
 Windows implementation slots in behind the same trait or `cfg` gate the X11,
 Wayland, and macOS backends use. The Windows-specific backends are:
 
-### Capture — GDI `BitBlt` (default) + DXGI Desktop Duplication (opt-in)
+### Capture — DXGI Desktop Duplication (default) + GDI `BitBlt` (automatic fallback)
 
 `display/windows.rs` ships two capture paths behind the same `DisplayBackend`
 seam, selected at runtime by the `INTENDANT_WINDOWS_CAPTURE` environment
-variable (`gdi` | `dxgi`, case-insensitive; anything unset or unrecognized uses
-the GDI default).
+variable (`gdi` | `dxgi`, case-insensitive). Unset or unrecognized picks the
+default policy: **DXGI first, with automatic GDI fallback if DXGI init
+fails.** An *explicit* `dxgi` is fail-loud — no silent substitution, the
+operator asked for DXGI specifically — and an explicit `gdi` forces the GDI
+path.
 
-**GDI `BitBlt` — the default.** `BitBlt` from the screen device context reads
-the **DWM-composed** desktop — the same pixels a user sees. Crucially it works
-on *every* display adapter, including the virtual / indirect displays an
-always-on host commonly runs on (RDP indirect display, cloud virtual display,
-headless). The capture loop runs on a dedicated `std::thread` (GDI `HDC` /
-`HBITMAP` handles are not `Send`) and `BitBlt`s the screen DC into a cached
-top-down 32-bit DIB (`SRCCOPY | CAPTUREBLT`, so layered/overlay windows are
-included). The DIB is BGRA8 top-down, so emitted rows are the identical
+**DXGI Desktop Duplication — the default.** `IDXGIOutputDuplication` is the
+GPU-accelerated path (zero-copy from the GPU into a CPU-readable staging
+texture) and the only one with real change detection: an unchanged desktop
+yields `DXGI_ERROR_WAIT_TIMEOUT`, which the capture loop turns into a 1 s
+cached-frame heartbeat — an idle desktop costs about one frame per second
+downstream instead of a full capture + convert + encode pipeline running at
+the target framerate. That idle efficiency is why it is the default. The
+duplication interface, the Direct3D 11 device, and the device context are
+single-threaded COM objects that are not `Send` across `await`, so the loop
+runs on a dedicated `std::thread` and feeds the tokio runtime over a bounded
+`mpsc` channel (the same drop-on-full backpressure policy as the macOS and
+X11 backends). `DXGI_ERROR_ACCESS_LOST` (resolution change, full-screen
+exclusive app, secure-desktop/UAC transition, GPU mode switch) tears down and
+re-acquires the duplication on the next iteration.
+
+**GDI `BitBlt` — the automatic fallback.** `BitBlt` from the screen device
+context reads the **DWM-composed** desktop — the same pixels a user sees —
+and works on *every* display adapter, including the virtual / indirect
+displays an always-on host may run on (RDP indirect display, cloud virtual
+display, headless) where Desktop Duplication cannot initialize. When DXGI
+init fails under the default policy (no output duplication in an RDP/service
+session, access denied, driver reset), the backend logs one warning naming
+the concrete cause and continues via GDI. GDI has no change signal, so it
+copies the full frame at the target framerate even when nothing changed —
+the idle cost that makes it the fallback rather than the default. The capture
+loop runs on a dedicated `std::thread` (GDI `HDC` / `HBITMAP` handles are not
+`Send`) and `BitBlt`s the screen DC into a cached top-down 32-bit DIB
+(`SRCCOPY | CAPTUREBLT`, so layered/overlay windows are included). The DIB is
+BGRA8 top-down, so emitted rows are the identical
 `DXGI_FORMAT_B8G8R8A8_UNORM` byte layout the DXGI path produces and feed the
 existing `bgra_to_i420` / Media Foundation H.264 encoder unchanged.
 
-**DXGI Desktop Duplication — opt-in fast path.** `IDXGIOutputDuplication` is the
-GPU-accelerated path (zero-copy from the GPU into a CPU-readable staging
-texture, lowest overhead on physical hardware). It is retained as an **opt-in**
-fast path (`INTENDANT_WINDOWS_CAPTURE=dxgi`) for hosts with a real GPU/scanout.
-It is **not** the default because it captures **all-black** frames on
-virtual / RDP / cloud / headless adapters: those displays don't perform the
-real frame presentation/scanout that Desktop Duplication requires, so it
-"succeeds" yet duplicates black. Like the GDI path, the duplication interface,
-the Direct3D 11 device, and the device context are single-threaded COM objects
-that are not `Send` across `await`, so the loop runs on a dedicated
-`std::thread` and feeds the tokio runtime over a bounded `mpsc` channel (the
-same drop-on-full backpressure policy as the macOS and X11 backends).
-`DXGI_ERROR_ACCESS_LOST` (resolution change, full-screen exclusive app,
-secure-desktop/UAC transition, GPU mode switch) tears down and re-acquires the
-duplication on the next iteration.
+Two caveats the selection policy is built around. First, on some virtual /
+indirect adapters DDA *initializes successfully yet duplicates all-black*
+frames (observed live on a cloud VM with a virtual display device — DDA
+streamed black on both RDP and console sessions while GDI captured the real
+desktop at the same instant): an init-failure fallback cannot catch that
+class, so `INTENDANT_WINDOWS_CAPTURE=gdi` is the remedy on such hosts.
+Second, the fallback covers **init time only**: a DXGI session that dies
+mid-stream (a persistent `ACCESS_LOST` that outlives the in-loop re-acquire
+retries) closes the frame channel and tears the display session down loudly,
+exactly like a persistent GDI failure; restarting the display session re-runs
+the default selection, which falls back to GDI at init if DXGI can no longer
+initialize.
 
 ### Input — SendInput
 

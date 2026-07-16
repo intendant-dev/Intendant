@@ -338,7 +338,7 @@ pressure.
 | **Linux / X11** | XShm/root-window capture via `x11rb` (`display/x11.rs`), `XGetImage` fallback | `x11rb`/XTest in-process | ffmpeg VA-API, `libx264` software fallback (`encode/h264_linux.rs`) | `x11rb` clipboard in-process |
 | **Linux / Wayland** | PipeWire via XDG Desktop Portal `ScreenCast` (`display/wayland.rs`) | XDG Desktop Portal `RemoteDesktop` `notify_*` D-Bus methods (via `ashpd`) | same as X11 | `wl-copy` / `wl-paste` |
 | **macOS** | ScreenCaptureKit (`display/macos.rs`) | CoreGraphics `CGEvent` in-process | VideoToolbox, zero-copy from SCK frames (`encode/h264_macos.rs`) | `pbcopy` / `pbpaste`, `osascript` for images |
-| **Windows** | GDI `BitBlt` default, DXGI Desktop Duplication opt-in via `INTENDANT_WINDOWS_CAPTURE=dxgi` (`display/windows.rs`) | Win32 `SendInput` | Media Foundation software MFT, NVENC where available (`encode/h264_windows.rs`) — this is the **baseline** codec on Windows | `arboard` crate (in-process Win32) |
+| **Windows** | DXGI Desktop Duplication default with automatic GDI `BitBlt` fallback when duplication init fails; explicit `INTENDANT_WINDOWS_CAPTURE=dxgi` / `gdi` forces a path (`display/windows.rs`) | Win32 `SendInput` | Media Foundation software MFT, NVENC where available (`encode/h264_windows.rs`) — this is the **baseline** codec on Windows | `arboard` crate (in-process Win32) |
 
 VP8 (`encode/vp8.rs`, libvpx) is the always-on baseline on macOS/Linux and is
 gated off Windows entirely. See [Windows Support](./windows-support.md) for the
