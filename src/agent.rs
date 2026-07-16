@@ -73,10 +73,19 @@ const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
 // (see `pty_marker_emit`), so the assembled string is proof of execution.
 const PTY_MARKER_START_PREFIX: &str = "__PTY_START";
 const PTY_MARKER_END_PREFIX: &str = "__PTY_END";
-/// cmd.exe marker-assembly variable (see `PtyShellFlavor::Cmd`).
+/// Prefix of the cmd.exe marker-assembly variable; the per-command variable
+/// is nonce-suffixed (see `pty_cmd_marker_var`).
 const PTY_CMD_MARKER_VAR: &str = "__PTY_MVAR";
 
-/// Emit the shell line(s) that print `{prefix}{suffix}` without the typed
+/// The cmd.exe marker-assembly variable for one command. Nonce-suffixed so
+/// it can never collide with (or clobber) a user variable or a concurrent
+/// harness value, and unset again by `pty_marker_cleanup` once the end
+/// marker has printed.
+fn pty_cmd_marker_var(nonce: u64) -> String {
+    format!("{}_{}", PTY_CMD_MARKER_VAR, nonce)
+}
+
+/// Emit the shell line(s) that print `{prefix}_{nonce}__` without the typed
 /// input ever containing the assembled string. The tty driver echoes raw
 /// input bytes whenever they arrive before a line editor has turned echo
 /// off — guaranteed for bytes racing a fresh shell's startup — so a marker
@@ -87,24 +96,67 @@ const PTY_CMD_MARKER_VAR: &str = "__PTY_MVAR";
 fn pty_marker_emit(
     flavor: crate::utils::PtyShellFlavor,
     prefix: &str,
-    suffix: &str,
+    nonce: u64,
     nl: &str,
 ) -> String {
     use crate::utils::PtyShellFlavor;
     match flavor {
         // Adjacent double-quoted strings concatenate in POSIX shells.
-        PtyShellFlavor::Posix => format!("echo \"{prefix}\"\"{suffix}\"{nl}"),
+        PtyShellFlavor::Posix => format!("echo \"{prefix}\"\"_{nonce}__\"{nl}"),
         // PowerShell string concatenation, parenthesized so echo
         // (Write-Output) receives one argument.
-        PtyShellFlavor::PowerShell => format!("echo (\"{prefix}\" + \"{suffix}\"){nl}"),
+        PtyShellFlavor::PowerShell => format!("echo (\"{prefix}\" + \"_{nonce}__\"){nl}"),
         // cmd.exe cannot concatenate inline; assemble via a variable set on
         // the *previous* line (%X% on the same line would expand at parse
-        // time, before the set runs).
+        // time, before the set runs). The variable is visible to children
+        // the shell spawns while it is set — unavoidable for this
+        // mechanism — but it is nonce-scoped, carries only a marker prefix,
+        // and is unset right after the marker prints.
         PtyShellFlavor::Cmd => format!(
-            "set {var}={prefix}{nl}echo %{var}%{suffix}{nl}",
-            var = PTY_CMD_MARKER_VAR,
+            "set {var}={prefix}{nl}echo %{var}%_{nonce}__{nl}",
+            var = pty_cmd_marker_var(nonce),
         ),
     }
+}
+
+/// Cmd-only epilogue written after the end-marker emit: unset the
+/// nonce-scoped assembly variable so nothing persists in the session once
+/// the command's markers have printed. Empty for shells that never set one.
+fn pty_marker_cleanup(flavor: crate::utils::PtyShellFlavor, nonce: u64, nl: &str) -> String {
+    use crate::utils::PtyShellFlavor;
+    match flavor {
+        PtyShellFlavor::Cmd => format!("set {var}={nl}", var = pty_cmd_marker_var(nonce)),
+        PtyShellFlavor::Posix | PtyShellFlavor::PowerShell => String::new(),
+    }
+}
+
+/// The exact harness line shapes for one command's nonce: the split-form
+/// typed lines (which arrive as tty/readline echoes, possibly with a prompt
+/// prefix — hence tail matching at the call site), the assembled marker
+/// output lines, and the cmd.exe variable lines. Used to strip harness
+/// noise from captured output while leaving user output that merely
+/// mentions a sentinel prefix (e.g. "__PTY_ENDURANCE ready") intact.
+fn pty_harness_line_patterns(flavor: crate::utils::PtyShellFlavor, nonce: u64) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for prefix in [PTY_MARKER_START_PREFIX, PTY_MARKER_END_PREFIX] {
+        for line in pty_marker_emit(flavor, prefix, nonce, "\n").split('\n') {
+            if !line.is_empty() {
+                patterns.push(line.to_string());
+            }
+        }
+        // The assembled marker output line.
+        patterns.push(format!("{prefix}_{nonce}__"));
+    }
+    if flavor == crate::utils::PtyShellFlavor::Cmd {
+        for line in pty_marker_cleanup(flavor, nonce, "\n").split('\n') {
+            if !line.is_empty() {
+                patterns.push(line.to_string());
+            }
+        }
+        // The literal echo output when the variable failed to set.
+        patterns.push(format!("%{}%_{nonce}__", pty_cmd_marker_var(nonce)));
+    }
+    patterns
 }
 
 #[derive(Clone)]
@@ -261,12 +313,29 @@ impl Agent {
         })
     }
 
+    /// Invalidate the completeness manifest BEFORE a merge pass mutates the
+    /// merged file. Crash-consistency: a crash mid-pass must leave "no
+    /// manifest" (re-merge next invocation), never a stale manifest beside
+    /// a merged file whose mtime the partial pass already bumped — that
+    /// combination would certify sources the pass never reached. Returns
+    /// true when invalidation could not be proven (delete failed with
+    /// something other than NotFound); the caller treats that as a pass
+    /// failure so completeness is never certified on top of it.
+    #[cfg(any(test, not(target_os = "macos")))]
+    fn invalidate_xauth_manifest_before_pass(merged: &Path) -> bool {
+        match fs::remove_file(Self::xauth_manifest_path(merged)) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        }
+    }
+
     /// Conclude a merge pass. Nothing merged → drop the merged file and
     /// manifest (a zero-cookie or stale file must not be served later, and
     /// a nonzero-exit `nmerge` can still have created it). Merged but with
     /// failures → keep the file for this invocation, drop the manifest so
     /// the next invocation retries the missing sources. Fully clean pass →
-    /// record every source that currently exists as resolved.
+    /// atomically record every source that currently exists as resolved.
     #[cfg(any(test, not(target_os = "macos")))]
     fn finalize_xauth_merge_pass(
         merged: &Path,
@@ -276,11 +345,19 @@ impl Agent {
     ) -> Option<PathBuf> {
         let manifest = Self::xauth_manifest_path(merged);
         if !any_merged {
+            // Best-effort removals: the manifest was already invalidated
+            // before the pass, and a merged file that survives this remove
+            // is harmless — with no manifest, freshness fails and the next
+            // invocation re-runs the pass.
             let _ = fs::remove_file(merged);
             let _ = fs::remove_file(&manifest);
             return None;
         }
         if any_failure {
+            // Normally already gone (pre-pass invalidation); repeat in case
+            // that delete failed. A failure here leaves no manifest to
+            // mislead anyone — the pre-pass step already forced
+            // `any_failure` when it could not prove the delete.
             let _ = fs::remove_file(&manifest);
         } else {
             let listing: String = sources
@@ -288,13 +365,30 @@ impl Agent {
                 .filter(|src| src.exists())
                 .map(|src| format!("{}\n", src.display()))
                 .collect();
-            let _ = fs::write(&manifest, listing);
+            // Atomic publish (tempfile + rename): a crash mid-write must
+            // not leave a torn manifest half-certifying completeness. On
+            // any failure, make sure no manifest survives — "absent" is
+            // always safe (it just re-merges next time).
+            let mut tmp_name = manifest.file_name().unwrap_or_default().to_os_string();
+            tmp_name.push(".tmp");
+            let tmp = manifest.with_file_name(tmp_name);
+            if fs::write(&tmp, listing)
+                .and_then(|()| fs::rename(&tmp, &manifest))
+                .is_err()
+            {
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::remove_file(&manifest);
+            }
         }
         Some(merged.to_path_buf())
     }
 
     /// Merge one cookie listing into the session file; Ok(true) on success,
-    /// Ok(false) when `xauth nmerge` exits nonzero.
+    /// Ok(false) when the cookie write to `xauth nmerge` fails or the
+    /// process exits nonzero. The stdin write result matters: a failed or
+    /// partial write merges nothing (or worse, a truncated cookie) even
+    /// when xauth exits zero after stdin closes — and the child is always
+    /// reaped before the result is reported.
     #[cfg(not(target_os = "macos"))]
     fn xauth_nmerge(merged_path: &Path, cookies: &[u8]) -> std::io::Result<bool> {
         use std::io::Write;
@@ -307,10 +401,12 @@ impl Agent {
             .stderr(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .spawn()?;
-        if let Some(ref mut stdin) = child.stdin {
-            let _ = stdin.write_all(cookies);
-        }
-        Ok(child.wait()?.success())
+        let wrote_ok = match child.stdin.take() {
+            // Taking (and dropping) stdin closes the pipe so xauth sees EOF.
+            Some(mut stdin) => stdin.write_all(cookies).is_ok(),
+            None => false,
+        };
+        Ok(child.wait()?.success() && wrote_ok)
     }
 
     /// Merge xauth cookies from all discovered displays into a session-scoped file.
@@ -348,7 +444,12 @@ impl Agent {
         // written and the next invocation retries. A source that consults
         // cleanly but has no cookies for a display is a resolved outcome,
         // not a failure — its mtime staleness triggers any needed re-merge.
-        let mut any_failure = false;
+        //
+        // The stale manifest is invalidated before the first merge mutation
+        // (crash-consistency: see invalidate_xauth_manifest_before_pass);
+        // an unprovable invalidation seeds `any_failure` so this pass can
+        // never certify completeness over it.
+        let mut any_failure = Self::invalidate_xauth_manifest_before_pass(&merged_path);
         for &disp in displays {
             let display_str = format!(":{}", disp);
             // Try user's own Xauthority
@@ -917,26 +1018,26 @@ impl Agent {
 
         // Generate unique start and end markers (the assembled forms the
         // scanner and extractor look for in executed output).
-        let marker_suffix = format!("_{}__", cmd.nonce);
-        let start_marker = format!("{}{}", PTY_MARKER_START_PREFIX, marker_suffix);
-        let marker = format!("{}{}", PTY_MARKER_END_PREFIX, marker_suffix);
+        let flavor = session.flavor;
+        let start_marker = format!("{}_{}__", PTY_MARKER_START_PREFIX, cmd.nonce);
+        let marker = format!("{}_{}__", PTY_MARKER_END_PREFIX, cmd.nonce);
 
-        // Write: emit start-marker, then command, then emit end-marker. The
-        // marker `echo` lines are written in a *split* form the shell joins
-        // at execution time (see `pty_marker_emit`), so the assembled marker
-        // can only ever appear in executed output — never in the tty's echo
-        // of the typed input. The writer is shared with the reader thread
-        // (which answers DSR queries), so take the lock just for the
-        // duration of this write. Each line is terminated with the platform
-        // PTY submit byte (`\r` on Windows so ConPTY treats it as Enter;
-        // `\n` on Unix, unchanged).
+        // Write: emit start-marker, then command, then emit end-marker (plus
+        // the cmd.exe variable cleanup). The marker `echo` lines are written
+        // in a *split* form the shell joins at execution time (see
+        // `pty_marker_emit`), so the assembled marker can only ever appear
+        // in executed output — never in the tty's echo of the typed input.
+        // The writer is shared with the reader thread (which answers DSR
+        // queries), so take the lock just for the duration of this write.
+        // Each line is terminated with the platform PTY submit byte (`\r` on
+        // Windows so ConPTY treats it as Enter; `\n` on Unix, unchanged).
         let nl = crate::utils::pty_line_ending();
         let pty_input = format!(
-            "{start_emit}{cmd}{nl}{end_emit}",
-            start_emit =
-                pty_marker_emit(session.flavor, PTY_MARKER_START_PREFIX, &marker_suffix, nl),
+            "{start_emit}{cmd}{nl}{end_emit}{cleanup}",
+            start_emit = pty_marker_emit(flavor, PTY_MARKER_START_PREFIX, cmd.nonce, nl),
             cmd = command,
-            end_emit = pty_marker_emit(session.flavor, PTY_MARKER_END_PREFIX, &marker_suffix, nl),
+            end_emit = pty_marker_emit(flavor, PTY_MARKER_END_PREFIX, cmd.nonce, nl),
+            cleanup = pty_marker_cleanup(flavor, cmd.nonce, nl),
             nl = nl,
         );
         {
@@ -1036,16 +1137,18 @@ impl Agent {
             lines.pop();
         }
 
-        // Remove harness lines: assembled marker output lines and the echoed
-        // split-form `echo` input lines all contain a marker prefix, and the
-        // cmd.exe assembly lines contain the marker variable. (A user
-        // command that prints these sentinel prefixes loses those lines —
-        // the pre-existing acceptance for the assembled markers, applied to
-        // the split forms too.)
+        // Remove harness lines — matched against the exact shapes for THIS
+        // call's nonce (assembled marker outputs, the split-form typed
+        // lines, the cmd variable lines). Echoed input can arrive with a
+        // prompt prefix, so lines match by exact trimmed tail. User output
+        // that merely mentions a sentinel prefix (e.g. "__PTY_ENDURANCE
+        // ready") stays intact.
+        let harness_patterns = pty_harness_line_patterns(flavor, cmd.nonce);
         lines.retain(|line| {
-            !line.contains(PTY_MARKER_START_PREFIX)
-                && !line.contains(PTY_MARKER_END_PREFIX)
-                && !line.contains(PTY_CMD_MARKER_VAR)
+            let trimmed = line.trim();
+            !harness_patterns
+                .iter()
+                .any(|pattern| trimmed.ends_with(pattern.as_str()))
         });
 
         let final_output = lines.join("\n");
@@ -2646,7 +2749,8 @@ mod tests {
 
     /// The split-form marker input never contains the assembled marker for
     /// any shell flavor, while the shapes are the exact lines each shell
-    /// needs to print it.
+    /// needs to print it — and cmd's assembly variable is nonce-scoped and
+    /// unset by the cleanup epilogue.
     #[test]
     fn pty_marker_emit_keeps_assembled_marker_out_of_typed_input() {
         use crate::utils::PtyShellFlavor;
@@ -2656,28 +2760,109 @@ mod tests {
             PtyShellFlavor::PowerShell,
             PtyShellFlavor::Cmd,
         ] {
-            let emitted = pty_marker_emit(flavor, PTY_MARKER_END_PREFIX, "_7__", "\n");
+            let emitted = pty_marker_emit(flavor, PTY_MARKER_END_PREFIX, 7, "\n");
             assert!(
                 !emitted.contains(&assembled),
                 "{flavor:?} input must not contain the assembled marker: {emitted:?}"
             );
         }
         assert_eq!(
-            pty_marker_emit(PtyShellFlavor::Posix, PTY_MARKER_END_PREFIX, "_7__", "\n"),
+            pty_marker_emit(PtyShellFlavor::Posix, PTY_MARKER_END_PREFIX, 7, "\n"),
             "echo \"__PTY_END\"\"_7__\"\n"
         );
         assert_eq!(
-            pty_marker_emit(
-                PtyShellFlavor::PowerShell,
-                PTY_MARKER_END_PREFIX,
-                "_7__",
-                "\r"
-            ),
+            pty_marker_emit(PtyShellFlavor::PowerShell, PTY_MARKER_END_PREFIX, 7, "\r"),
             "echo (\"__PTY_END\" + \"_7__\")\r"
         );
         assert_eq!(
-            pty_marker_emit(PtyShellFlavor::Cmd, PTY_MARKER_END_PREFIX, "_7__", "\r"),
-            "set __PTY_MVAR=__PTY_END\recho %__PTY_MVAR%_7__\r"
+            pty_marker_emit(PtyShellFlavor::Cmd, PTY_MARKER_END_PREFIX, 7, "\r"),
+            "set __PTY_MVAR_7=__PTY_END\recho %__PTY_MVAR_7%_7__\r"
+        );
+        // Cleanup epilogue: cmd unsets its nonce-scoped variable so nothing
+        // persists after the markers print; the other shells set none.
+        assert_eq!(
+            pty_marker_cleanup(PtyShellFlavor::Cmd, 7, "\r"),
+            "set __PTY_MVAR_7=\r"
+        );
+        assert_eq!(pty_marker_cleanup(PtyShellFlavor::Posix, 7, "\n"), "");
+        assert_eq!(pty_marker_cleanup(PtyShellFlavor::PowerShell, 7, "\r"), "");
+    }
+
+    /// The harness filter is anchored to the exact nonce-bound line shapes:
+    /// harness lines are stripped (prompt-prefixed or bare), while user
+    /// output that merely mentions a sentinel prefix — or another nonce's
+    /// marker — survives.
+    #[test]
+    fn pty_harness_patterns_spare_user_output() {
+        use crate::utils::PtyShellFlavor;
+        for flavor in [
+            PtyShellFlavor::Posix,
+            PtyShellFlavor::PowerShell,
+            PtyShellFlavor::Cmd,
+        ] {
+            let patterns = pty_harness_line_patterns(flavor, 7);
+            let is_harness = |line: &str| {
+                patterns
+                    .iter()
+                    .any(|pattern| line.trim().ends_with(pattern.as_str()))
+            };
+
+            // Assembled marker outputs and every emitted harness line are
+            // stripped, with or without a prompt prefix.
+            assert!(is_harness("__PTY_START_7__"), "{flavor:?}");
+            assert!(is_harness("__PTY_END_7__"), "{flavor:?}");
+            for prefix in [PTY_MARKER_START_PREFIX, PTY_MARKER_END_PREFIX] {
+                for line in pty_marker_emit(flavor, prefix, 7, "\n")
+                    .split('\n')
+                    .filter(|l| !l.is_empty())
+                {
+                    assert!(is_harness(line), "{flavor:?} emit line: {line}");
+                    assert!(
+                        is_harness(&format!("bash-5.2$ {line}")),
+                        "{flavor:?} prompt-prefixed emit line: {line}"
+                    );
+                }
+            }
+            if flavor == PtyShellFlavor::Cmd {
+                assert!(is_harness("set __PTY_MVAR_7="), "cmd cleanup line");
+                assert!(is_harness("%__PTY_MVAR_7%_7__"), "cmd unset-echo output");
+            }
+
+            // User output mentioning the prefixes is NOT harness noise.
+            assert!(!is_harness("__PTY_ENDURANCE ready"), "{flavor:?}");
+            assert!(!is_harness("__PTY_START_MENU opened"), "{flavor:?}");
+            // Another nonce's marker belongs to another command, not this
+            // filter.
+            assert!(!is_harness("__PTY_END_8__"), "{flavor:?}");
+        }
+    }
+
+    /// User output that mentions harness-like prefixes must come through
+    /// end to end — the cleanup filter is anchored to this call's exact
+    /// marker shapes, not a substring match.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_pty_user_output_mentioning_prefixes_survives() {
+        let (agent, _log) = create_test_agent();
+        let cmd = AgentCommand {
+            function: "execPty".to_string(),
+            nonce: 5,
+            command: Some("echo \"__PTY_ENDURANCE ready\"".to_string()),
+            ..Default::default()
+        };
+        let result = match agent.exec_pty(&cmd).await {
+            Ok(r) => r,
+            Err(AgentError::Process(msg)) if msg.contains("Permission denied") => return,
+            Err(e) => panic!("unexpected exec_pty error: {}", e),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed["output"]
+                .as_str()
+                .unwrap()
+                .contains("__PTY_ENDURANCE ready"),
+            "user output mentioning a sentinel prefix must survive: {}",
+            parsed["output"]
         );
     }
 
@@ -3298,7 +3483,8 @@ mod tests {
         assert!(!Agent::merged_xauthority_is_fresh(&merged, &sources));
 
         // Clean pass: the manifest records existing sources (not missing
-        // ones) and freshness holds.
+        // ones) and freshness holds. The atomic publish leaves no temp
+        // sibling behind.
         let out = Agent::finalize_xauth_merge_pass(&merged, true, false, &sources);
         assert_eq!(out.as_deref(), Some(merged.as_path()));
         let listing = fs::read_to_string(&manifest).unwrap();
@@ -3308,6 +3494,57 @@ mod tests {
             "missing sources are not recorded"
         );
         assert!(Agent::merged_xauthority_is_fresh(&merged, &sources));
+        let tmp_count = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(tmp_count, 0, "atomic publish must not leave temp files");
+    }
+
+    /// Crash-consistency: the manifest is invalidated BEFORE a pass mutates
+    /// the merged file, so a crash mid-pass leaves "no manifest" — never a
+    /// stale manifest beside a newer merged file that would mask sources
+    /// the pass never reached.
+    #[test]
+    fn xauth_manifest_invalidated_before_merge_pass() {
+        let tmp = TempDir::new().unwrap();
+        let merged = tmp.path().join("session.Xauthority");
+        let source = tmp.path().join("Xauthority");
+        fs::write(&source, "cookie").unwrap();
+        let sources = vec![source.clone()];
+
+        // Start from a certified clean pass.
+        fs::write(&merged, "cookies").unwrap();
+        assert!(Agent::finalize_xauth_merge_pass(&merged, true, false, &sources).is_some());
+        assert!(Agent::merged_xauthority_is_fresh(&merged, &sources));
+
+        // A new pass invalidates first; a crash at any later point (e.g.
+        // after merging display A, before display B) now leaves freshness
+        // false, forcing the next invocation to re-run the pass.
+        assert!(
+            !Agent::invalidate_xauth_manifest_before_pass(&merged),
+            "a provable delete reports no failure"
+        );
+        assert!(!Agent::merged_xauthority_is_fresh(&merged, &sources));
+
+        // Invalidating an absent manifest is not a failure either.
+        assert!(!Agent::invalidate_xauth_manifest_before_pass(&merged));
+
+        // An unprovable delete (manifest's directory unwritable) must
+        // report failure so the pass never certifies completeness over it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked_dir = tmp.path().join("locked");
+            fs::create_dir(&locked_dir).unwrap();
+            let locked_merged = locked_dir.join("session.Xauthority");
+            fs::write(Agent::xauth_manifest_path(&locked_merged), "x\n").unwrap();
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = Agent::invalidate_xauth_manifest_before_pass(&locked_merged);
+            fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(failed, "an undeletable manifest must count as a failure");
+        }
     }
 
     #[test]
