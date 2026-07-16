@@ -85,10 +85,13 @@ const TERMINAL_LANE_BUFFERED_LOW_WATERMARK_BYTES: usize = 256 * 1024;
 /// fs-read cap) so one full-size download always fits, while N stalled
 /// downloads to a quiet client can no longer pin N full payloads.
 const CONTROL_OUTBOUND_QUEUE_MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Companion frame-count cap: small immediate frames parked behind a
+/// zero-credit chunked head are byte-cheap but were unbounded in number.
+const CONTROL_OUTBOUND_QUEUE_MAX_FRAMES: usize = 4096;
 
 /// Clamp a byte watermark into the `u32` the rtc data-channel threshold
-/// setters take.
-fn watermark_to_u32(bytes: usize) -> u32 {
+/// setters take (shared with the peer file-transfer driver).
+pub(crate) fn watermark_to_u32(bytes: usize) -> u32 {
     u32::try_from(bytes).unwrap_or(u32::MAX)
 }
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
@@ -2001,11 +2004,24 @@ pub(crate) enum UploadSpool {
 const UPLOAD_MEMORY_SPOOL_MAX_BYTES: usize = 1024 * 1024;
 /// Batch size for disk-spool writes on the wire-driver task.
 const UPLOAD_DISK_SPOOL_BUFFER_BYTES: usize = 256 * 1024;
+/// Concurrent in-flight upload transfers per tunnel connection.
+const MAX_INBOUND_UPLOADS_PER_CONNECTION: usize = 8;
+/// Aggregate DECLARED bytes across a connection's in-flight uploads —
+/// admission control at upload_start, so a burst of starts cannot
+/// reserve unbounded spool space regardless of the per-upload cap.
+const MAX_INBOUND_UPLOAD_TOTAL_BYTES: usize = 256 * 1024 * 1024;
+/// Concurrent spawned request tasks per tunnel connection. Each spawned
+/// handler may construct a response as large as the fs-read cap before
+/// queue admission runs, so the reservation has to happen at spawn time.
+const MAX_PENDING_CONTROL_REQUESTS: usize = 64;
 
 impl UploadSpool {
     fn for_declared_size(total_bytes: usize) -> std::io::Result<Self> {
         if total_bytes <= UPLOAD_MEMORY_SPOOL_MAX_BYTES {
-            Ok(Self::Memory(Vec::with_capacity(total_bytes)))
+            // Allocate as chunks arrive — reserving the declared size up
+            // front let a burst of no-data upload_starts reserve
+            // gigabytes; the received-bytes checks bound actual growth.
+            Ok(Self::Memory(Vec::new()))
         } else {
             Ok(Self::Disk {
                 tmp: tempfile::NamedTempFile::new()?,
@@ -2220,7 +2236,13 @@ impl ChunkedFramePlan {
     }
 
     pub(crate) fn chunk_count(&self) -> usize {
-        self.payload.len().div_ceil(self.chunk_bytes.max(1))
+        // Zero chunk size renders zero chunks (`render_chunk` returns
+        // `None` for it); reporting payload-length chunks here would
+        // wedge the credit queue on a frame that can never complete.
+        if self.chunk_bytes == 0 {
+            return 0;
+        }
+        self.payload.len().div_ceil(self.chunk_bytes)
     }
 
     /// Render the `seq`-th chunk frame (base64 slice + envelope), `None`
@@ -2292,10 +2314,21 @@ impl OutboundControlQueue {
         self.frames.is_empty()
     }
 
-    fn enqueue_immediate(&mut self, request_id: String, text: String) {
+    /// Queue an immediate frame; `false` when the per-connection byte or
+    /// frame-count cap is exhausted (the caller answers with an error
+    /// instead — immediate frames parked behind a zero-credit chunked
+    /// head used to accumulate without bound).
+    #[must_use]
+    fn enqueue_immediate(&mut self, request_id: String, text: String) -> bool {
+        if self.frames.len() >= CONTROL_OUTBOUND_QUEUE_MAX_FRAMES
+            || self.queued_bytes.saturating_add(text.len()) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
+        {
+            return false;
+        }
         let frame = QueuedControlFrame::Immediate { request_id, text };
         self.queued_bytes = self.queued_bytes.saturating_add(frame.queued_bytes());
         self.frames.push_back(frame);
+        true
     }
 
     /// Queue a chunked frame; `false` when the per-connection byte cap is
@@ -2305,7 +2338,9 @@ impl OutboundControlQueue {
     fn enqueue_chunked(&mut self, plan: ChunkedFramePlan) -> bool {
         self.cancel_chunk(&plan.chunk_id.clone());
         let accounted_bytes = plan.resident_bytes();
-        if self.queued_bytes.saturating_add(accounted_bytes) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES {
+        if self.frames.len() >= CONTROL_OUTBOUND_QUEUE_MAX_FRAMES
+            || self.queued_bytes.saturating_add(accounted_bytes) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
+        {
             return false;
         }
         self.queued_bytes = self.queued_bytes.saturating_add(accounted_bytes);
@@ -3778,6 +3813,29 @@ mod tests {
         };
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["id"], "has\"quote");
+
+        // Non-ASCII and control characters survive both positions: the
+        // body embeds verbatim (the core already escaped it), the id is
+        // escaped here.
+        let unicode_body = serde_json::json!({
+            "name": "résumé — 日本語 🚀",
+            "ctrl": "tab\tnewline\nbell\u{7}",
+        })
+        .to_string();
+        let frame = json_body_response_preserialized("id-é\u{1}", unicode_body.clone(), "test");
+        let serde_json::Value::String(text) = &frame else {
+            panic!("expected the pre-serialized carrier, got {frame}");
+        };
+        assert!(text.contains(&unicode_body), "body embeds verbatim");
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["id"], "id-é\u{1}");
+        assert_eq!(parsed["result"]["name"], "résumé — 日本語 🚀");
+        assert_eq!(parsed["result"]["ctrl"], "tab\tnewline\nbell\u{7}");
+        assert_eq!(
+            parsed,
+            json_body_response("id-é\u{1}".into(), unicode_body, "test"),
+            "JSON-equivalent to the parse-path envelope"
+        );
     }
 
     pub(crate) fn test_upload_state(

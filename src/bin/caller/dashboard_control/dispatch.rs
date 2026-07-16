@@ -913,6 +913,12 @@ pub(crate) fn control_frame_response(
                     &runtime.grant,
                 )),
                 "api_sessions_stream" => {
+                    if pending_requests_at_capacity(pending_requests, &id) {
+                        return Some(dashboard_control_error_response(
+                            id,
+                            "too many in-flight requests on this connection",
+                        ));
+                    }
                     spawn_control_stream(
                         id,
                         method.to_string(),
@@ -935,6 +941,18 @@ pub(crate) fn control_frame_response(
                 // with the same `unknown method` shape this match used to
                 // return inline.
                 _ => {
+                    // Reservation at spawn time: each spawned handler may
+                    // construct a response as large as the fs-read cap
+                    // before queue admission runs, so unbounded spawns
+                    // could build N full payloads the queue would then
+                    // refuse. Same-id replacement stays allowed (it
+                    // cancels its predecessor).
+                    if pending_requests_at_capacity(pending_requests, &id) {
+                        return Some(dashboard_control_error_response(
+                            id,
+                            "too many in-flight requests on this connection",
+                        ));
+                    }
                     spawn_control_request(
                         id,
                         method.to_string(),
@@ -977,6 +995,16 @@ pub(crate) fn control_frame_response(
             "error": format!("unknown frame type: {t}"),
         })),
     }
+}
+
+/// Spawn-time admission for the request lane (`MAX_PENDING_CONTROL_REQUESTS`):
+/// full only when the id would be a NEW entry — replacing an in-flight
+/// request with the same id cancels its predecessor and holds the count.
+fn pending_requests_at_capacity(
+    pending_requests: &HashMap<String, CancellationToken>,
+    id: &str,
+) -> bool {
+    !pending_requests.contains_key(id) && pending_requests.len() >= MAX_PENDING_CONTROL_REQUESTS
 }
 
 pub(crate) fn control_upload_error_response(
@@ -1056,6 +1084,28 @@ pub(crate) fn control_upload_start_frame(
             id,
             400,
             "empty upload declared chunks",
+        ));
+    }
+    // Connection-level admission (same-id restart replaces its own slot):
+    // a burst of upload_starts must not reserve unbounded spool space.
+    let concurrent_elsewhere = inbound_uploads.keys().filter(|key| *key != &id).count();
+    if concurrent_elsewhere >= MAX_INBOUND_UPLOADS_PER_CONNECTION {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            format!("too many concurrent uploads (max {MAX_INBOUND_UPLOADS_PER_CONNECTION})"),
+        ));
+    }
+    let declared_elsewhere: usize = inbound_uploads
+        .iter()
+        .filter(|(key, _)| *key != &id)
+        .map(|(_, upload)| upload.total_bytes)
+        .sum();
+    if declared_elsewhere.saturating_add(total_bytes) > MAX_INBOUND_UPLOAD_TOTAL_BYTES {
+        return Some(control_upload_error_response(
+            id,
+            429,
+            "concurrent uploads exceed the connection's declared-bytes budget",
         ));
     }
     let spool = match UploadSpool::for_declared_size(total_bytes) {
