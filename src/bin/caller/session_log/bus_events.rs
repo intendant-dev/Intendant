@@ -6,6 +6,22 @@
 
 use super::*;
 
+/// Opt-out for the latest-only context-snapshot rotation: keep every
+/// per-turn sidecar (the pre-rotation behavior) for debugging sessions
+/// where the full history of exact request payloads matters more than
+/// disk. Read once per process — a debugging aid, not a runtime toggle.
+fn context_snapshot_keep_all() -> bool {
+    static KEEP_ALL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    });
+    *KEEP_ALL
+}
+
 impl SessionLog {
     // ---- Event-bus-driven logging methods ----
     // These are called by spawn_session_log_writer() for events that flow
@@ -1304,7 +1320,11 @@ impl SessionLog {
         item_count: Option<usize>,
         raw: &serde_json::Value,
     ) {
-        let rendered = serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string());
+        // Compact, not pretty: consumers parse the sidecar as JSON (replay,
+        // the Context tab, rewind preflight); pretty-printing multi-MB
+        // context trees per turn was a fourth full serialization and ~30%
+        // extra disk for nothing.
+        let rendered = serde_json::to_string(raw).unwrap_or_else(|_| raw.to_string());
         let effective_turn = turn.or(if self.current_turn > 0 {
             Some(self.current_turn)
         } else {
@@ -1321,6 +1341,32 @@ impl SessionLog {
         } else {
             None
         };
+        // Latest-only rotation, keyed per (source, session id) so distinct
+        // snapshot streams folding through one log — a native and an
+        // external archive snapshot of the same wrapper session, or
+        // per-session sub-streams — never delete each other: the previous
+        // sidecar of the same stream is removed once the new one is safely
+        // on disk. Historical rows in session.jsonl keep their metadata
+        // (tokens, item counts, labels) and the dashboard replay already
+        // degrades a missing raw to a raw-less entry — it only ever
+        // eagerly loads the latest snapshot per session. Keeping every
+        // per-turn context dump was the measured majority of this fleet's
+        // log-store disk (O(turns × context) per session).
+        // INTENDANT_CONTEXT_SNAPSHOT_KEEP_ALL=1 opts back into the
+        // archive-everything behavior.
+        if let Some(ref new_file) = file {
+            if !context_snapshot_keep_all() {
+                let stream_key = format!("{}\u{1f}{}", source, session_id.unwrap_or_default());
+                if let Some(previous) = self
+                    .last_context_snapshots
+                    .insert(stream_key, new_file.clone())
+                {
+                    if previous != *new_file {
+                        let _ = fs::remove_file(self.dir.join(&previous));
+                    }
+                }
+            }
+        }
         let item_suffix = item_count
             .map(|n| format!(" ({} items)", n))
             .unwrap_or_default();
@@ -1596,26 +1642,31 @@ impl SessionLog {
 
     /// Log the full JSON sent to the agent runtime.
     pub fn agent_input(&mut self, json: &str) {
-        // Pretty-print the JSON for the file
-        let pretty = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json) {
-            serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| json.to_string())
-        } else {
-            json.to_string()
-        };
+        // Parse once; the pretty file body and the function-name summary
+        // both derive from the same DOM (this used to re-tokenize the full
+        // command batch a second time).
+        let parsed = serde_json::from_str::<serde_json::Value>(json).ok();
+        let pretty = parsed
+            .as_ref()
+            .and_then(|v| serde_json::to_string_pretty(v).ok())
+            .unwrap_or_else(|| json.to_string());
         let file = self.write_turn_file("agent_in.json", &pretty);
 
         // Extract function names for the summary
-        let functions: Vec<String> = serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|v| v.get("commands")?.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|cmd| {
-                cmd.get("function")
-                    .and_then(|f| f.as_str())
-                    .map(String::from)
+        let functions: Vec<String> = parsed
+            .as_ref()
+            .and_then(|v| v.get("commands")?.as_array())
+            .map(|commands| {
+                commands
+                    .iter()
+                    .filter_map(|cmd| {
+                        cmd.get("function")
+                            .and_then(|f| f.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1760,21 +1811,26 @@ impl SessionLog {
 
     /// Log the JSON extracted from a model response.
     pub fn json_extracted(&mut self, json: &str) {
-        // Extract function names for searchability
-        let functions: Vec<String> = serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|v| v.get("commands")?.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|cmd| {
-                cmd.get("function")
-                    .and_then(|f| f.as_str())
-                    .map(String::from)
+        // Parse once; both the function names and the done flag derive
+        // from the same DOM.
+        let parsed = serde_json::from_str::<serde_json::Value>(json).ok();
+        let functions: Vec<String> = parsed
+            .as_ref()
+            .and_then(|v| v.get("commands")?.as_array())
+            .map(|commands| {
+                commands
+                    .iter()
+                    .filter_map(|cmd| {
+                        cmd.get("function")
+                            .and_then(|f| f.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
-        let done = serde_json::from_str::<serde_json::Value>(json)
-            .ok()
+        let done = parsed
+            .as_ref()
             .and_then(|v| v.get("done")?.as_bool())
             .unwrap_or(false);
 
@@ -1884,6 +1940,84 @@ impl SessionLog {
 mod tests {
     use super::*;
     use crate::session_log::tests::read_last_event;
+
+    /// Relative sidecar paths of every context_snapshot event in
+    /// session.jsonl, in emit order.
+    fn snapshot_files(log_dir: &std::path::Path) -> Vec<String> {
+        fs::read_to_string(log_dir.join("session.jsonl"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("context_snapshot"))
+            .filter_map(|v| v.get("file").and_then(|f| f.as_str()).map(String::from))
+            .collect()
+    }
+
+    #[test]
+    fn context_snapshots_rotate_to_latest_only_per_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 0);
+        let raw1 = serde_json::json!({"messages": ["turn one"]});
+        log.context_snapshot(
+            "native",
+            "req 1",
+            Some(1),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(1),
+            &raw1,
+        );
+        log.turn_start(2, 0.0, 0);
+        let raw2 = serde_json::json!({"messages": ["turn one", "turn two"]});
+        log.context_snapshot(
+            "native",
+            "req 2",
+            Some(2),
+            "test.v1",
+            None,
+            None,
+            None,
+            None,
+            Some(2),
+            &raw2,
+        );
+        // A different source in the same session must not be rotated away
+        // by the native snapshots.
+        let raw_other = serde_json::json!({"summary": "external"});
+        log.context_snapshot(
+            "codex",
+            "external archive",
+            Some(2),
+            "codex.v1",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &raw_other,
+        );
+
+        let files = snapshot_files(&log_dir);
+        assert_eq!(files.len(), 3, "every event row keeps its file field");
+        // The older native sidecar is gone; the latest native one and the
+        // other-source one remain, parseable, and compact (not pretty).
+        assert!(!log_dir.join(&files[0]).exists(), "rotated: {}", files[0]);
+        let latest_native = fs::read_to_string(log_dir.join(&files[1])).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&latest_native).unwrap(),
+            raw2
+        );
+        assert!(
+            !latest_native.contains('\n'),
+            "sidecar is compact single-line JSON"
+        );
+        assert!(log_dir.join(&files[2]).exists(), "other source kept");
+    }
 
     #[test]
     fn append_turn_file_accumulates_with_separator() {

@@ -333,6 +333,12 @@ pub struct SessionLog {
     /// Flushed to transcript on turnComplete or user_transcript.
     voice_utterance_buf: String,
     last_approval_resolved: Option<(u64, String)>,
+    /// Latest context-snapshot sidecar per (source, session id) stream,
+    /// for the rotate-on-write policy in
+    /// [`Self::context_snapshot_for_session`]: writing a new snapshot
+    /// deletes the previous file of the same stream, keeping per-session
+    /// context disk O(1) instead of O(turns × context).
+    last_context_snapshots: std::collections::HashMap<String, String>,
 }
 
 /// Accumulates session statistics as events are logged.
@@ -439,6 +445,7 @@ impl SessionLog {
             },
             voice_utterance_buf: String::new(),
             last_approval_resolved: None,
+            last_context_snapshots: std::collections::HashMap::new(),
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -728,20 +735,24 @@ impl SessionLog {
     }
 
     fn emit(&mut self, event: LogEvent) {
-        if let Ok(json) = serde_json::to_string(&event) {
-            if let Err(e) = writeln!(self.writer, "{}", json) {
-                eprintln!("session_log: failed to write log event: {}", e);
-            }
-            let _ = self.writer.flush();
+        // Serialize straight into the writer — the intermediate String per
+        // event bought nothing on this universal append path. The flush per
+        // record stays: it is the durability contract for tail readers.
+        if let Err(e) = serde_json::to_writer(&mut self.writer, &event)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.writer.write_all(b"\n"))
+        {
+            eprintln!("session_log: failed to write log event: {}", e);
         }
+        let _ = self.writer.flush();
     }
 
     fn emit_transcript(&mut self, entry: TranscriptEntry) {
         if let Some(ref mut w) = self.transcript_writer {
-            if let Ok(json) = serde_json::to_string(&entry) {
-                let _ = writeln!(w, "{}", json);
-                let _ = w.flush();
-            }
+            let _ = serde_json::to_writer(&mut *w, &entry)
+                .map_err(std::io::Error::other)
+                .and_then(|()| w.write_all(b"\n"));
+            let _ = w.flush();
         }
     }
 
@@ -1038,16 +1049,18 @@ impl SessionLog {
     fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
-        let already_has_content = fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .ok()?;
-        if already_has_content {
-            let _ = file.write_all(b"\n");
+        // One post-open fstat serves both the has-content test and the
+        // span offset (the pre-open stat was a wasted syscall on this
+        // per-output-chunk path).
+        let mut offset = file.metadata().ok()?.len();
+        if offset > 0 && file.write_all(b"\n").is_ok() {
+            offset += 1;
         }
-        let offset = file.metadata().ok()?.len();
         if file.write_all(content.as_bytes()).is_ok() {
             Some(TurnFileSpan {
                 relative,

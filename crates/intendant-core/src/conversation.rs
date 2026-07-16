@@ -1,6 +1,6 @@
 use crate::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 fn is_false(v: &bool) -> bool {
     !v
@@ -127,6 +127,16 @@ pub struct Conversation {
     /// The next seq to assign. Monotonic for the life of the conversation:
     /// truncation/rewind never rewinds it (see [`Message::seq`]).
     next_seq: u64,
+    /// Persistence cursor for [`Self::save_to_file`]'s append fast path:
+    /// how many leading messages are already on disk at [`Self::persisted_to`].
+    /// Only meaningful while `persist_dirty` is false.
+    persisted_messages: usize,
+    /// The file the cursor describes; saving to any other path rewrites.
+    persisted_to: Option<std::path::PathBuf>,
+    /// Set whenever already-persisted history is mutated (compaction,
+    /// rollback, image stripping, pairing repair, seq renumbering): the
+    /// next save must rewrite the whole file instead of appending.
+    persist_dirty: bool,
 }
 
 impl Conversation {
@@ -144,7 +154,16 @@ impl Conversation {
             turn: 0,
             protect_user_layer: false,
             next_seq: 2,
+            persisted_messages: 0,
+            persisted_to: None,
+            persist_dirty: false,
         }
+    }
+
+    /// Record that already-persisted history changed shape or content, so
+    /// the append fast path in [`Self::save_to_file`] is no longer sound.
+    fn mark_history_mutated(&mut self) {
+        self.persist_dirty = true;
     }
 
     #[allow(dead_code)]
@@ -341,6 +360,9 @@ impl Conversation {
             msg.seq = seq;
         }
         self.next_seq = seq + 1;
+        // The renumber rewrote persisted rows (a legacy no-seq file), so
+        // the on-disk copy no longer matches message-for-message.
+        self.mark_history_mutated();
         true
     }
 
@@ -420,6 +442,7 @@ impl Conversation {
     /// interrupt case); mutation can strand pairs anywhere in history.
     pub fn repair_tool_call_pairing(&mut self) -> usize {
         let mut repaired = 0;
+        let before_len = self.messages.len();
         let old = std::mem::take(&mut self.messages);
         let mut out: Vec<Message> = Vec::with_capacity(old.len());
         // Unanswered (id, name) pairs from the most recent assistant
@@ -482,6 +505,11 @@ impl Conversation {
         }
         self.next_seq = next_seq;
         self.messages = out;
+        // The pass only moves, inserts, or removes whole messages — so
+        // "changed" is exactly "inserted a repair or dropped an orphan".
+        if repaired > 0 || self.messages.len() != before_len {
+            self.mark_history_mutated();
+        }
         repaired
     }
 
@@ -501,10 +529,18 @@ impl Conversation {
             .iter()
             .rposition(|m| m.images.is_some() && !m.is_cu_result);
         if let Some(last_idx) = last_non_cu {
+            let mut changed = false;
             for (i, msg) in self.messages.iter_mut().enumerate() {
-                if i < last_idx && !msg.is_cu_result {
+                if i < last_idx && !msg.is_cu_result && msg.images.is_some() {
                     msg.images = None;
+                    changed = true;
                 }
+            }
+            // Only an actual strip invalidates the persisted prefix — the
+            // common repeat call (no new screenshot since the last strip)
+            // must keep the append fast path.
+            if changed {
+                self.mark_history_mutated();
             }
         }
     }
@@ -713,6 +749,7 @@ impl Conversation {
         }
         let removed = current - target;
         self.messages.truncate(target);
+        self.mark_history_mutated();
         // Resolve any dangling tool calls at the new tail so the API
         // doesn't reject the next request.
         self.resolve_dangling_tool_calls();
@@ -744,6 +781,9 @@ impl Conversation {
         to_remove.dedup();
 
         // Remove in reverse order to preserve indices
+        if !to_remove.is_empty() {
+            self.mark_history_mutated();
+        }
         for &i in to_remove.iter().rev() {
             self.messages.remove(i);
         }
@@ -784,6 +824,7 @@ impl Conversation {
         }
 
         let insert_pos = valid[0];
+        self.mark_history_mutated();
 
         // Remove in reverse order
         for &i in valid.iter().rev() {
@@ -809,10 +850,55 @@ impl Conversation {
 
     /// Save conversation messages to a JSONL file (one JSON object per line).
     /// Note: `raw_output` and `layer` are `#[serde(skip)]` and will be lost on roundtrip.
-    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
+    ///
+    /// Called once per turn by the agent loop, so persistence is
+    /// incremental: while history has only been appended to since the last
+    /// save of the same path, only the new tail rows are appended
+    /// (previously this rewrote the whole file every turn — O(turns²) disk
+    /// over a session). History mutations (compaction, rollback, image
+    /// stripping, pairing repair) set `persist_dirty` and force a full
+    /// rewrite — done atomically via temp+rename, which also closes the
+    /// old crash-truncates-the-resume-file window of `File::create`
+    /// in place. The file format is unchanged either way.
+    pub fn save_to_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let append_ok = !self.persist_dirty
+            && self.persisted_to.as_deref() == Some(path)
+            && self.persisted_messages <= self.messages.len();
+        if append_ok {
+            if self.persisted_messages < self.messages.len() {
+                if let Err(err) = self.append_new_messages(path) {
+                    // A failed or partial append can leave a torn tail;
+                    // make the next save rewrite the file clean.
+                    self.persist_dirty = true;
+                    return Err(err);
+                }
+            }
+            self.persisted_messages = self.messages.len();
+            return Ok(());
+        }
+
+        let tmp = path.with_extension("jsonl.tmp");
+        {
+            let file = std::fs::File::create(&tmp)?;
+            let mut writer = std::io::BufWriter::new(file);
+            for msg in &self.messages {
+                let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
+                writeln!(writer, "{}", json)?;
+            }
+            writer.flush()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        self.persisted_to = Some(path.to_path_buf());
+        self.persisted_messages = self.messages.len();
+        self.persist_dirty = false;
+        Ok(())
+    }
+
+    /// Append the not-yet-persisted tail rows to an existing save file.
+    fn append_new_messages(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let file = std::fs::OpenOptions::new().append(true).open(path)?;
         let mut writer = std::io::BufWriter::new(file);
-        for msg in &self.messages {
+        for msg in &self.messages[self.persisted_messages..] {
             let json = serde_json::to_string(msg).map_err(std::io::Error::other)?;
             writeln!(writer, "{}", json)?;
         }
@@ -823,20 +909,31 @@ impl Conversation {
     /// Load conversation from a JSONL file. Creates a new Conversation with the
     /// given context window and populates it with the saved messages.
     /// Note: `raw_output` and `layer` are lost on roundtrip (they are `#[serde(skip)]`).
+    ///
+    /// A malformed FINAL line is tolerated and dropped — that is the
+    /// signature of a crash mid-append — and the next save rewrites the
+    /// file clean. A malformed interior line is still an error (real
+    /// corruption should fail loudly, not silently lose the tail).
     pub fn load_from_file(path: &std::path::Path, context_window: u64) -> std::io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let reader = std::io::BufReader::new(file);
-        let mut messages = Vec::new();
+        let contents = std::fs::read_to_string(path)?;
+        let lines: Vec<&str> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let mut messages = Vec::with_capacity(lines.len());
+        let mut torn_tail = false;
 
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
+        for (index, line) in lines.iter().enumerate() {
+            match serde_json::from_str::<Message>(line) {
+                Ok(msg) => messages.push(msg),
+                Err(_) if index + 1 == lines.len() => {
+                    torn_tail = true;
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+                }
             }
-            let msg: Message = serde_json::from_str(trimmed)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            messages.push(msg);
         }
 
         // Count non-system user+assistant pairs to estimate turn count
@@ -851,6 +948,7 @@ impl Conversation {
             .unwrap_or(0)
             .saturating_add(1);
 
+        let persisted_messages = messages.len();
         Ok(Self {
             messages,
             last_usage: None,
@@ -858,6 +956,11 @@ impl Conversation {
             turn,
             protect_user_layer: false,
             next_seq,
+            persisted_messages,
+            persisted_to: Some(path.to_path_buf()),
+            // A torn tail means the on-disk bytes have garbage after the
+            // loaded rows — appending would corrupt; rewrite instead.
+            persist_dirty: torn_tail,
         })
     }
 }
@@ -1455,13 +1558,165 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conversation.jsonl");
 
-        let conv = Conversation::new("system prompt".to_string(), 100_000);
+        let mut conv = Conversation::new("system prompt".to_string(), 100_000);
         conv.save_to_file(&path).unwrap();
 
         let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
         assert_eq!(loaded.messages().len(), 1);
         assert_eq!(loaded.messages()[0].role, "system");
         assert_eq!(loaded.turn(), 0);
+    }
+
+    // --- Incremental persistence ---
+
+    fn file_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn save_appends_new_tail_and_keeps_prefix_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "turn one".to_string());
+        conv.save_to_file(&path).unwrap();
+        let first_save = std::fs::read_to_string(&path).unwrap();
+
+        conv.add_assistant("reply".to_string());
+        conv.add_user(MessageProvenance::FollowUp, "turn two".to_string());
+        conv.save_to_file(&path).unwrap();
+        let second_save = std::fs::read_to_string(&path).unwrap();
+
+        // Pure appends never rewrite the persisted prefix.
+        assert!(second_save.starts_with(&first_save));
+        assert_eq!(file_lines(&path).len(), 4);
+
+        // Round trip stays intact.
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 4);
+        assert_eq!(loaded.messages()[3].content, "turn two");
+    }
+
+    #[test]
+    fn save_with_no_new_messages_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
+        conv.save_to_file(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        conv.save_to_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn history_mutation_forces_full_rewrite_that_matches_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        for i in 0..8 {
+            conv.add_user(MessageProvenance::FollowUp, format!("msg {i}"));
+            conv.add_assistant(format!("resp {i}"));
+        }
+        conv.save_to_file(&path).unwrap();
+
+        // Mutate persisted history (compaction path), then save again.
+        conv.summarize_turns(&[3, 4, 5, 6], "compacted middle");
+        conv.save_to_file(&path).unwrap();
+
+        let loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), conv.messages().len());
+        assert!(loaded
+            .messages()
+            .iter()
+            .any(|m| m.content.contains("[Context Summary]")));
+    }
+
+    #[test]
+    fn torn_final_line_is_dropped_and_next_save_rewrites_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_user(MessageProvenance::FollowUp, "hello".to_string());
+        conv.save_to_file(&path).unwrap();
+
+        // Simulate a crash mid-append: garbage tail without newline.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(b"{\"role\":\"user\",\"cont").unwrap();
+        }
+
+        let mut loaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(loaded.messages().len(), 2, "torn tail dropped");
+
+        // The next save must rewrite the file clean, not append after junk.
+        loaded.add_assistant("recovered".to_string());
+        loaded.save_to_file(&path).unwrap();
+        let reloaded = Conversation::load_from_file(&path, 100_000).unwrap();
+        assert_eq!(reloaded.messages().len(), 3);
+        assert_eq!(reloaded.messages()[2].content, "recovered");
+    }
+
+    #[test]
+    fn malformed_interior_line_still_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+        std::fs::write(
+            &path,
+            "{\"role\":\"system\",\"content\":\"sys\"}\nnot json\n{\"role\":\"user\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        assert!(Conversation::load_from_file(&path, 100_000).is_err());
+    }
+
+    #[test]
+    fn repeat_strip_without_new_images_keeps_append_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conversation.jsonl");
+
+        let mut conv = Conversation::new("sys".to_string(), 100_000);
+        conv.add_tool_result_with_images(
+            "call_1",
+            "capture_screen",
+            "old shot",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        );
+        conv.add_tool_result_with_images(
+            "call_2",
+            "capture_screen",
+            "new shot",
+            vec![ImageData {
+                media_type: "image/png".to_string(),
+                data: "BBBB".to_string(),
+            }],
+        );
+        // First strip mutates history (drops call_1's image) → rewrite.
+        conv.strip_old_images();
+        conv.save_to_file(&path).unwrap();
+        let after_strip = std::fs::read_to_string(&path).unwrap();
+
+        // A repeat strip with no new screenshot changes nothing and must
+        // not dirty the persistence cursor: the next save appends.
+        conv.strip_old_images();
+        conv.add_user(MessageProvenance::FollowUp, "next".to_string());
+        conv.save_to_file(&path).unwrap();
+        let after_append = std::fs::read_to_string(&path).unwrap();
+        assert!(after_append.starts_with(&after_strip));
     }
 
     // --- Auto-compaction tests ---

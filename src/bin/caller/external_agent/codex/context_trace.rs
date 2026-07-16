@@ -568,9 +568,9 @@ pub(crate) fn codex_context_archive_payload(
     exact: bool,
 ) -> serde_json::Value {
     let raw_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| payload.to_string().into());
-    let raw_len = raw_bytes.len();
-    let raw_hash = format!("{:016x}", stable_context_hash(&raw_bytes));
     if exact {
+        let raw_len = raw_bytes.len();
+        let raw_hash = format!("{:016x}", stable_context_hash(&raw_bytes));
         let mut payload = payload;
         if let serde_json::Value::Object(map) = &mut payload {
             let context = map
@@ -590,7 +590,25 @@ pub(crate) fn codex_context_archive_payload(
         }
         return payload;
     }
-    let summary_parts = codex_context_summary_parts(&payload);
+    codex_context_archive_summary(&payload, &raw_bytes, request_id, request_index, format)
+}
+
+/// Summary-mode archive entry that only borrows the payload. The by-value
+/// [`codex_context_archive_payload`] delegates here for summary mode;
+/// callers that already hold the serialized bytes (the outbound
+/// context-snapshot compactor) call this directly, avoiding both a full
+/// deep clone of the payload tree and a second whole-tree serialization
+/// for the len/hash fields.
+pub(crate) fn codex_context_archive_summary(
+    payload: &serde_json::Value,
+    raw_bytes: &[u8],
+    request_id: &str,
+    request_index: u64,
+    format: &str,
+) -> serde_json::Value {
+    let raw_len = raw_bytes.len();
+    let raw_hash = format!("{:016x}", stable_context_hash(raw_bytes));
+    let summary_parts = codex_context_summary_parts(payload);
     serde_json::json!({
         "_intendant_context": {
             "archive_mode": "summary",
