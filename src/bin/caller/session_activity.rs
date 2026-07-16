@@ -738,7 +738,10 @@ mod tests {
         assert!(json.contains("\"sinceEpoch\":1"), "{json}");
         assert!(json.contains("\"lastStreamByteEpoch\":2"), "{json}");
         assert!(json.contains("\"stalledAfterSeconds\":20"), "{json}");
-        assert!(json.contains("\"backgroundTasks\":[\"cargo test\"]"), "{json}");
+        assert!(
+            json.contains("\"backgroundTasks\":[\"cargo test\"]"),
+            "{json}"
+        );
         // An empty task list stays off the wire entirely.
         let quiet = serde_json::to_string(&SessionActivityVitals::default()).expect("serializes");
         assert!(!quiet.contains("backgroundTasks"), "{quiet}");

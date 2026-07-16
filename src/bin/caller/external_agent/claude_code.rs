@@ -733,10 +733,7 @@ fn bg_desc_snippet(text: &str) -> Option<String> {
         return None;
     }
     if trimmed.chars().count() > 60 {
-        Some(format!(
-            "{}…",
-            trimmed.chars().take(60).collect::<String>()
-        ))
+        Some(format!("{}…", trimmed.chars().take(60).collect::<String>()))
     } else {
         Some(trimmed.to_string())
     }
@@ -1534,8 +1531,8 @@ impl CcReader {
         // works, or its own TaskStop) it is calm bookkeeping.
         if let Some(pos) = self.bg_armed.iter().position(|(id, _)| id == &tool_use_id) {
             let (_, desc) = self.bg_armed.remove(pos);
-            let woke = !self.shared.activity_turn_active()
-                && matches!(status, "completed" | "failed");
+            let woke =
+                !self.shared.activity_turn_active() && matches!(status, "completed" | "failed");
             if woke {
                 out.log("info", format!("⏰ Woken by background task: {desc}"));
                 self.observe_activity(ActivityObs::WokenByTask, out);
@@ -3369,7 +3366,10 @@ mod tests {
             r#"{"type":"system","subtype":"task_started","task_id":"b9lkjn0bv","tool_use_id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","description":"sleep 8 && echo BG_DONE_MARKER","task_type":"local_bash","session_id":"ad153098"}"#,
         );
         let armed = last_activity(&out).expect("arming publishes the set");
-        assert_eq!(armed.background_tasks, vec!["sleep 8 && echo BG_DONE_MARKER"]);
+        assert_eq!(
+            armed.background_tasks,
+            vec!["sleep 8 && echo BG_DONE_MARKER"]
+        );
         assert_eq!(armed.state, S::ToolRunning, "mid-turn arming keeps state");
         let out = reader.process_line(
             r#"{"type":"user","tool_use_result":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"b9lkjn0bv"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","content":"Command running in background with ID: b9lkjn0bv. You will be notified when it completes."}]},"session_id":"ad153098"}"#,
@@ -3383,11 +3383,16 @@ mod tests {
         );
         let parked = last_activity(&out).expect("parking publishes");
         assert_eq!(parked.state, S::ParkedOnTasks);
-        assert_eq!(parked.background_tasks, vec!["sleep 8 && echo BG_DONE_MARKER"]);
+        assert_eq!(
+            parked.background_tasks,
+            vec!["sleep 8 && echo BG_DONE_MARKER"]
+        );
         assert_eq!(parked.stalled_after_seconds, None, "parked never stalls");
         assert!(
-            log_rows(&out).iter().any(|m| m
-                == "Parked — waiting on 1 background task: sleep 8 && echo BG_DONE_MARKER"),
+            log_rows(&out)
+                .iter()
+                .any(|m| m
+                    == "Parked — waiting on 1 background task: sleep 8 && echo BG_DONE_MARKER"),
             "{:?}",
             log_rows(&out)
         );
