@@ -1,14 +1,19 @@
-# Execution lanes — plan and estimates
+# Execution lanes — plan and delivery record
 
-Status: **planning document** (repair-tranche item: a concrete plan
-with estimates for the §13.2 surfaces that have never executed the
-corpus). Today exactly two surfaces execute it — the Rust core
-(minting + drift/coverage gates) and the independent Rust reducer
-(the differential harness); CI runs both as the advisory
-`owner-plane reference artifacts (Rust core + reducer)` job. A
-vector's `surfaces` array is a §13.2 applicability annotation and is
-never treated as execution (`coverage/outcomes-map.json` and
-`coverage/obligations-13-3.json` both state this).
+Status: **both funded lanes DELIVERED** (Chromium 2026-07-15;
+per-OS portable storage 2026-07-15, criterion-8 hardening
+2026-07-16). Six surfaces now execute the corpus — the Rust core
+(minting + drift/coverage gates), the independent Rust reducer (the
+differential harness), headless Chromium, and the three storage
+OSes; CI runs them as the advisory `owner-plane reference artifacts
+(Rust core + reducer)`, `browser execution (Chromium)`, and
+`portable storage execution (macOS/Linux/Windows)` jobs, each lane's
+run set pinned to `coverage/lane-manifests.json`. A vector's
+`surfaces` array is a §13.2 applicability annotation and is never
+treated as execution (`coverage/outcomes-map.json` and
+`coverage/obligations-13-3.json` both name the executed surfaces).
+The per-lane sections below keep the original plan text as the
+delivery record.
 
 ## Lane 1 — Chromium browser execution (`browser`)
 
@@ -75,9 +80,10 @@ identical report rows the Rust harness prints.
    shape; verified green (56/56 under HeadlessChrome 150 — the
    high-S rejection vector passing proves the low-S pre-check fires)
    AND red (a tampered-corpus negative control via `LANE_VECTORS_DIR`
-   exits 1 naming the row). The advisory workflow carries the job as
-   `browser execution (Chromium; f13 in-memory, IndexedDB shim
-   pending)` — the name keeps item 3's gap visible.
+   exits 1 naming the row). With item 3 delivered the advisory
+   workflow's job is plainly `browser execution (Chromium)` (the
+   interim `f13 in-memory, IndexedDB shim pending` name retired with
+   the gap it flagged).
 3. IndexedDB Txn-subset shim for the family-13 journal lane
    (transaction boundaries mapped to the Txn frames; L1 truncation
    simulated at the fixture layer) (~1–2 sessions).
@@ -99,8 +105,10 @@ identical report rows the Rust harness prints.
    fails on a zero frames/cuts aggregate (a disengaged mapping
    cannot green-wash); a flipped lock-denial-step negative control
    goes red in BOTH layers independently (the reducer's in-memory
-   lane and the real Web Locks denial). Clean run: 56/56 with 16
-   substrate vectors (records=37, bytes=30 781, frames=72, cuts=11).
+   lane and the real Web Locks denial). Clean run at the current
+   corpus: 56/56 with 16 substrate vectors (records=45,
+   bytes=40 053, frames=72, cuts=11; the delivery-day figures were
+   37/30 781 — the corpus has grown since).
 
 **STATUS: DELIVERED (2026-07-15) — all three work items.** The
 advisory job is now plainly `browser execution (Chromium)`; the

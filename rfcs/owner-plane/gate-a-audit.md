@@ -1,11 +1,11 @@
 # D0-A Gate-A Discrepancy Audit — amended after the repair tranche
 
-**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn; **re-amended 2026-07-16 after the criterion-12 tranche** (the synthesized criterion-12 review, `reviews/2026-07-15-gate-a-criterion12-synthesized-review.md`, found three executable protocol counterexamples — F1 D-99, F2 D-130, F3 D-202 — plus the criterion-8 proof gaps and this document's own drift; the owner directed the bounded repairs 2026-07-15 and they are executed below)
+**Date:** 2026-07-14 (original audit), amended 2026-07-14 after the repair tranche; owner rulings recorded 2026-07-14 (spec v0.5.20, D-201..D-203); post-ruling execution recorded 2026-07-15 (the C.1 mechanisms, the cheap-gap batch, the storage lane); the browser lane recorded 2026-07-15; **re-amended 2026-07-15 on the reconciled verification review** (`reviews/2026-07-15-gate-a-verification-reconciled-review.md`) — the interim "predicate satisfied" claim was WRONG and is withdrawn; **re-amended 2026-07-16 after the criterion-12 tranche** (the synthesized criterion-12 review, `reviews/2026-07-15-gate-a-criterion12-synthesized-review.md`, found three executable protocol counterexamples — F1 D-99, F2 D-130, F3 D-202 — plus the criterion-8 proof gaps and this document's own drift; the owner directed the bounded repairs 2026-07-15 and they are executed below); **re-amended 2026-07-16 after the ff23f1cd review round** (`reviews/2026-07-16-gate-a-ff23f1cd-review.md` — the fresh independent review at the pinned head returned FAIL with five findings, every one verified and repaired under the owner's delegated adjudication: F1 = the D-205 self-evidence exception completing D-204; F2 = closed key sets in the intrinsic body stage; F3 = three-coordinate registry dispatch; F4 = the storage proof's count-equality, verified pre-seed, and stated sync limit; F5 = this truth sweep)
 **Auditor:** the artifact-phase differential program; predicate amendments per the external audit review's mandate
-**Spec:** `owner-plane-d0a-spec.md` v0.5.21, SHA-256 `5ca12fe7a049ea223130c470e3b1234ad2b96e90f4b54c792e31d7dc1de4909a` (v0.5.20 = `ec3a9a6d…` and v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (2026-07-16): the D-202 convergence carrier narrowed to shared evidence-arrival structure — the T5 prose amendment, the D-204 decision row, and the D-202 row's supersession rider, exactly the wording the owner approved from `decisions-pending.md`; prose only, no artifact bytes changed
-**Companion:** `d0a-vector-cases.v1.json`, SHA-256 `11dd88972220cac3a120f6f729c9b3eb9cd9e6a9a332bff75b4765efd178aaba` (amendments #1–#6; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10; the criterion-12 tranche's three new vectors ride existing case kinds — no amendment #7)
-**Corpus:** 168 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×29, f08×4, f09×13, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated from the vectors directory after the criterion-12 tranche: +2 D-99 multi-fault regressions, +1 D-202 timely-first world; the f07 unheld-head fixture re-authored in place)
-**Suites at this amendment:** core 141/141 · reducer 37/37 (incl. the metamorphic-convergence corpus test, the arrival-order restoration control, and the D-202 cross-world pin) · the strict harness 168/168 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files (EVERY stream through the durable path — `sync_all=14 rename=14` — each rename replacing a pre-seeded destination, plus the flush failpoint control) · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
+**Spec:** `owner-plane-d0a-spec.md` v0.5.22, SHA-256 `30c91f941da7ba3458ed4886a5fab5a6be991703b7802668be56a4b8d531f5ef` (v0.5.21 = `5ca12fe7…`, v0.5.20 = `ec3a9a6d…`, v0.5.19 = `410880e0…`, archived byte-exact). v0.5.21 = the owner's D-204 ratification (the D-202 convergence carrier narrowed to shared evidence-arrival structure); v0.5.22 = D-205 under the owner's delegated adjudication of the ff23f1cd review round (the self-evidence exception to same-coordinate fork registration, completing D-204's late-first class on every relative delivery order; plus the §13.1 evidence-lifecycle exception to the universal-convergence sentence)
+**Companion:** `d0a-vector-cases.v1.json`, SHA-256 `8d2f880006502563b528b64f70eb2f0fd3ccdb721b894df93596dc6bfab8d859` (amendments #1–#7; #5 = the audit read-release input + derived `released` verdict, review R4; #6 = the `evidence-lifecycle` case kind, the D-202 ruling made executable, review R7; #7 = the machine-readable `evidence_class` required on evidence-lifecycle vectors, the ff23f1cd review's F1; the family-3 browser-exclusion comment re-scoped to P-256 per R8.10)
+**Corpus:** 170 vectors (f01×17, f02×7, f03×6, f04×4, f05×4, f06×6, f07×31, f08×4, f09×13, f10×7, f11×36, f12×15, f13×16, f14×4 — regenerated after the ff23f1cd round: +1 extra-field × C2 multi-fault, +1 operation_version negative; the late-first lifecycle vector gains its re-proposal-first third delivery and both lifecycle vectors declare `evidence_class`)
+**Suites at this amendment:** core 141/141 · reducer 37/37 (incl. the metamorphic-convergence corpus test, the arrival-order restoration control, and the D-202 cross-world pin) · the strict harness 170/170 with a nonzero-exit gate that also rejects an EMPTY corpus · the portable-storage lane 19/19 on real files (EVERY stream through the durable path with counter EQUALITY against the corpus-derived stream count — `sync_all=14 rename=14` of 14 — each rename replacing a read-back-verified pre-seeded destination, plus the flush failpoint control) · the browser lane 56/56 in headless Chromium (WebCrypto semantics + the f13 IndexedDB/Web-Locks substrate), both lanes pinned to `coverage/lane-manifests.json` · fmt/clippy clean all three crates · mint byte-idempotent (vectors + coverage artifacts)
 
 > **VERDICT: FAIL — both repair tranches executed; awaiting the
 > fresh independent review the acceptance criteria require.** Gate A
@@ -25,11 +25,27 @@
 > 2026-07-15 (D-202 resolved by narrowing the promise; D-130
 > honest-defer; criterion 8 by code; D-99 in full), §5 records its
 > execution, and the owner RATIFIED the D-204 narrowing 2026-07-16
-> (spec v0.5.21 — the one protocol-text consequence of the round).
-> The one criterion this repository cannot satisfy from inside
-> remains: a FRESH independent reviewer rerunning the gate from a
-> pinned commit. This document never self-stamps; the verdict stays
-> FAIL until that review reports.
+> (spec v0.5.21). The FRESH independent review then ran at the
+> pinned head `ff23f1cd` and returned FAIL with five findings (all
+> verified; filed in `reviews/`): the D-204 late class diverged when
+> the re-proposal was delivered before the original, the intrinsic
+> body stage accepted unknown fields in closed maps,
+> `operation_version` was parsed but never dispatched, the storage
+> controls proved less than criterion 8 said, and the truth pass had
+> leftovers. The owner delegated that round's adjudication
+> ("recommendations; you have the authority to decide"), and the
+> repairs are EXECUTED: the D-205 self-evidence exception (spec
+> v0.5.22 — a condemned original never freezes its own convergence
+> carrier), closed key sets across all dispatched arms and nested
+> shapes, three-coordinate registry dispatch, the storage proof's
+> count-equality + verified pre-seed + honestly stated sync limit,
+> and this truth sweep. Every finding-bearing trace is now a
+> committed regression. The one criterion this repository cannot
+> satisfy from inside remains: a fresh independent reviewer
+> rerunning the gate from a pinned commit — the reviews so far each
+> found real findings, so none closes it. This document never
+> self-stamps; the verdict stays FAIL until a fresh review reports
+> none.
 
 ## 0. Scope and method
 
@@ -340,18 +356,22 @@ implementations, the Chromium browser lane, and the three storage
 OSes — a vector's `surfaces` array is a §13.2 applicability
 ANNOTATION, never execution, and the riders name what actually
 runs. The **portable-storage lane** (`reducer --bin storage_lane`,
-2026-07-15; criterion-8 rework 2026-07-16) runs every
-storage-annotated vector on real files: byte round-trips, real
-truncations per crash cut, the lock matrix across two real
-processes on OS advisory locks, EVERY `inputs.stream` — the
-framing-only vectors included — through the durable
-write-temp → sync-seam → rename path (`sync_all=14 rename=14`),
-each rename REPLACING a pre-seeded destination on all three OSes,
-and the flush observation coupled to the call's result by the
-`STORAGE_LANE_FAIL_SYNC` failpoint control (the criterion-12
-review's counter-keeping sync-deletion mutation now turns the lane
-red — verified live). It rides the advisory workflow as a 3-OS
-matrix job. The **browser lane** (`browser-lane/`,
+2026-07-15; criterion-8 rework 2026-07-16, hardened per ff23f1cd F4
+the same day) runs every storage-annotated vector on real files:
+byte round-trips, real truncations per crash cut, the lock matrix
+across two real processes on OS advisory locks, EVERY
+`inputs.stream` — the framing-only vectors included — through the
+durable write-temp → sync-seam → rename path with counter EQUALITY
+against the corpus-derived stream count (`sync_all=14 rename=14` of
+14 — skipping any stream is red), each rename REPLACING a
+read-back-verified pre-seeded destination on all three OSes
+(deleting the pre-seed is red), and the flush observation coupled to
+the call's result by the `STORAGE_LANE_FAIL_SYNC` failpoint control
+(the counter-keeping sync-deletion mutation is red — all three
+mutation classes verified live). Stated limit: the seam's own
+`sync_all` body is source-inspection ground truth (no portable
+runtime observation distinguishes a no-op replacement). It rides the
+advisory workflow as a 3-OS matrix job. The **browser lane** (`browser-lane/`,
 2026-07-15) runs every browser-annotated vector in headless
 Chromium over raw CDP: semantics through a WebCrypto backend
 (Ed25519/P-256 verification with the §3 low-S policy enforced on
@@ -415,10 +435,12 @@ filed reviews and the git history, not here.
 
 The criteria below are the criterion-12 review round's twelve (which
 bind the NEXT review, not this self-report), stated with their
-verified condition after BOTH owner-directed repair tranches:
+verified condition after THREE owner-directed repair rounds (the
+reconciled-review tranche, the criterion-12 tranche, and the
+ff23f1cd round executed under the owner's delegated adjudication):
 
 1. *All suites green at one pinned commit* — core 141/141, reducer
-   37/37, the strict gate 168/168, browser 56/56, the 3-OS storage
+   37/37, the strict gate 170/170, browser 56/56, the 3-OS storage
    lane 19/19; every lane runs per push on the advisory workflow.
 2. *The eight orders committed + a generated convergence suite* —
    all eight ride their vectors as regression deliveries; the
@@ -431,15 +453,24 @@ verified condition after BOTH owner-directed repair tranches:
    the review's r2 order while the canonical engine converges
    (`convergence_standard_fails_under_arrival_order_restoration`).
 4. *The governing D-99 pipeline holds, not just the literal arms* —
-   the COMPLETE body stage (hash binding, registry row, arm-indexed
-   intrinsic CDDL shape for all thirteen dispatched arms) precedes
-   the replay consult and the placement gate in `classify`;
-   state-dependent invariants stay in the transitions, and honest
-   `Unimplemented` branches pass through untouched. The F1
-   multi-fault pair is committed
-   (`f07-c2-post-freeze-cddl-invalid-kept`,
-   `f07-consumed-request-id-cddl-invalid`) beside the earlier
-   body-hash and signature arms.
+   the COMPLETE body stage precedes the replay consult and the
+   placement gate in `classify`: hash binding, the registry row
+   keyed by ALL THREE coordinates (`operation_version != 1` rejects
+   `unknown-version` at the row consult — the ff23f1cd F3 repair;
+   the tenant preamble carries the same gate at its body-stage
+   boundary), and the arm-indexed intrinsic CDDL shape with CLOSED
+   KEY SETS for every dispatched arm and nested object (App-A
+   verbatim tables; unknown fields reject `body-invariant` exactly
+   as in headers — the ff23f1cd F2 repair; a deferred MECHANISM's
+   known key set is still enforced). State-dependent invariants stay
+   in the transitions. The committed regressions:
+   `f07-c2-post-freeze-cddl-invalid-kept`,
+   `f07-consumed-request-id-cddl-invalid`,
+   `f07-c2-post-freeze-extra-field-kept`, and
+   `f07-operation-version-unknown-rejects` beside the earlier
+   body-hash and signature arms (`f07-header-unknown-version-rejects`
+   stays the PROTOCOL-version negative — the header's own `v`,
+   rejected at parse).
 5. *Forged/unadmitted recoveries cannot verify a kill* — admission
    is the authentication; both arms are committed vectors
    (`f11-reopen-forged-recovery-log-corrupt`,
@@ -454,41 +485,61 @@ verified condition after BOTH owner-directed repair tranches:
 7. *Annotation loss reddens the lane* — the surfaces suite requires
    EXACT equality with the §13.2 R-set, and both drivers pin their
    run sets to `coverage/lane-manifests.json` bidirectionally.
-8. *Storage flush/replacement proven AS CLAIMED* — every
-   `inputs.stream` (framing-only vectors included) materializes
-   through the durable write-temp → sync-seam → rename path; every
-   rename replaces a pre-seeded destination on all three OSes; the
-   zero-count check stands and the flush observation is COUPLED via
-   the `STORAGE_LANE_FAIL_SYNC` failpoint control — the review's
-   counter-keeping sync-deletion mutation was applied live and the
-   lane went red. Power-loss ordering, directory fsync, keystores,
-   and fault injection remain Gate B.
-9. *The D-202 lifecycle executable in BOTH ruled worlds* — the
-   late-first world (`f09-lease-lifecycle-sticky-reproposal`, the
-   sticky registry probed non-vacuous) and the timely-first world
-   (`f09-lease-lifecycle-timely-first-forks`: the original admits at
-   evaluation, the re-proposal contests the occupied coordinate, and
-   BOTH variants freeze pending selection), with the cross-world
+8. *Storage flush/replacement proven — with the proof's exact
+   strength stated* (the ff23f1cd F4 repairs). What the executable
+   controls prove: the durable-materialization counters must EQUAL
+   the corpus-derived stream count (skipping any stream — the F4-B
+   mutation — is red, not just a zero count); every destination's
+   pre-seed is READ BACK before the durable write and the sentinel
+   must be gone after it, so each rename is a verified replacement
+   of an existing file on all three OSes (deleting the pre-seed —
+   F4-C — is red); and the `STORAGE_LANE_FAIL_SYNC` failpoint
+   control proves the sync seam is INVOKED on the durable path with
+   its error propagating (the counter-keeping sync-deletion mutation
+   is red). Stated limit (F4-A): no portable runtime observation
+   distinguishes a seam whose real `sync_all` body became a no-op —
+   that the seam performs the OS flush is source-inspection ground
+   truth, stated on the seam itself. Power-loss ordering, directory
+   fsync, keystores, and fault injection remain Gate B.
+9. *The D-202 lifecycle executable in BOTH ruled worlds — on every
+   relative delivery order* — the late-first world
+   (`f09-lease-lifecycle-sticky-reproposal`, the sticky registry
+   probed non-vacuous; its THIRD listed delivery is the ff23f1cd F1
+   regression, the re-proposal delivered before the original) and
+   the timely-first world
+   (`f09-lease-lifecycle-timely-first-forks`), with the cross-world
    relationship pinned from one byte source
-   (`d202_two_worlds_derive_ruled_states`). The convergence
-   sentence's narrowing is RATIFIED (D-204, owner 2026-07-16, spec
-   v0.5.21) — the harness's shared-structure rule for listed
-   deliveries is now the narrowed promise's normative precondition,
-   not a harness convention.
+   (`d202_two_worlds_derive_ruled_states`). D-204 (spec v0.5.21)
+   narrowed the carrier to shared evidence-arrival structure; D-205
+   (spec v0.5.22, the delegated adjudication) completes it — a
+   late-class original arriving after its re-proposal
+   self-classifies sticky `lease-stale` at the occupied coordinate
+   and registers no fork evidence, so the class converges on every
+   relative order. Each vector declares its `evidence_class`
+   (companion amendment #7), making the harness's shared-structure
+   rule machine-checkable.
 10. *Empty-corpus and non-permutation controls red* — the bin exits
     2 on an empty directory; every delivery must be a true
     permutation of the item set.
-11. *Ledgers, comments, counts, prose match* — this amendment: the
-    README counts and D-130 wording, the coverage/surfaces source
-    comments, the P1-profile frontier-head row, this document's
-    header/histogram/suite counts, the D4/D5 records, the §4
-    executed-surfaces and storage-lane paragraphs, the
-    execution-lanes-plan note, and the PR description were all
-    re-verified against the artifacts in the criterion-12 truth
-    pass.
-12. *A fresh independent reviewer reruns the gate* — OUTSTANDING by
-    construction: this document cannot satisfy it, and the verdict
-    stands FAIL until that review reports.
+11. *Ledgers, comments, counts, prose match* — the ff23f1cd truth
+    sweep repaired that review's named leftovers: the
+    execution-lanes-plan header now records the delivered six-surface
+    state (with the retired interim job name and the delivery-day vs
+    current f13 aggregates both dated), the P1 profile's
+    `Unimplemented` count is stated as grep-derived-and-moving, the
+    reducer crypto wiring comment drops its stale corpus count, §13.1
+    carries the evidence-lifecycle exception beside its
+    universal-convergence sentence, this document's header/verdict/
+    criteria reflect the round, and the PR description is rewritten
+    at each amendment. Standing rule: counts in prose are stated
+    with their derivation or dated, so the next drift is visible.
+12. *A fresh independent reviewer reruns the gate* — performed
+    TWICE now (the criterion-12 synthesis; the ff23f1cd review),
+    each returning verified findings that this branch then repaired;
+    the criterion therefore remains OUTSTANDING — it closes only
+    when a fresh review at a pinned head reports no executable
+    finding, and this document cannot satisfy it from inside. The
+    verdict stands FAIL until then.
 
 **The additional D-130 blocker (the review's un-rowed finding)** is
 repaired honest-defer per the owner's direction: `parse_heads`

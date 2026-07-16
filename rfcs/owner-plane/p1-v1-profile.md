@@ -14,10 +14,11 @@ refused at construction on the writing side); silently proceeding,
 partially applying, or downgrading is a conformance violation.
 
 The inventory below was derived from the reducer's `Unimplemented`
-markers (99 sites; `grep -rn 'Unimplemented(' reducer/src/*.rs`),
-which are the reference implementation's honest boundary: the strict
-harness treats any reachable one as RED, so none is reachable from
-the committed corpus.
+markers (`grep -rn 'Unimplemented(' reducer/src/*.rs` — 99 sites at
+derivation; the count moves as engine work lands and the grep is the
+living source), which are the reference implementation's honest
+boundary: the strict harness treats any reachable one as RED, so
+none is reachable from the committed corpus.
 
 ## A. Not profile rows — differential-lane contracts
 

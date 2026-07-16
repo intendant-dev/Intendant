@@ -10,8 +10,8 @@ twenty externally-reviewed revisions (decision record D-1..D-200).
 | Path | What |
 |---|---|
 | `agenda-owner-plane-rfc.md` | The umbrella RFC, **v3.1 — FROZEN** (changes belong in gate specs, never here) |
-| `owner-plane-d0a-spec.md` | **D0-A, v0.5.21 — the terminal cut plus the owner's ratification amendments** (D-201..D-204; SHA-256 `5ca12fe7a049ea223130c470e3b1234ad2b96e90f4b54c792e31d7dc1de4909a`; v0.5.19 and v0.5.20 archived byte-exact; D-204 ratified 2026-07-16 narrows D-202's convergence carrier to shared evidence-arrival structure). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
-| `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
+| `owner-plane-d0a-spec.md` | **D0-A, v0.5.22 — the terminal cut plus the owner's ratification amendments** (D-201..D-205; SHA-256 `30c91f941da7ba3458ed4886a5fab5a6be991703b7802668be56a4b8d531f5ef`; v0.5.19 through v0.5.21 archived byte-exact; D-204 narrows D-202's convergence carrier to shared evidence-arrival structure; D-205 — the ff23f1cd round's delegated adjudication — completes it with the self-evidence exception to fork registration). Behavioral findings enter only with a failing executable trace (D-200); owner rulings enter as decision rows |
+| `d0a-vector-cases.v1.json` | The **normative companion schema** (D-91, amendments #1–#7; #7 = the machine-readable `evidence_class` on evidence-lifecycle vectors): closed per-family `case_kind` vocabularies + exact per-kind input/result contracts. A vector is valid only if it passes BOTH this and the spec's §13.1 container schema |
 | `archive/` | Every as-reviewed draft, byte-exact (v0.1 → v0.5.19) — the red baselines |
 | `reviews/` | The full review record: per-revision peer review(s) + adjudicated syntheses |
 | `core/` | The reference core (canonical CBOR, hash domains, vector RNG, suite-v1 crypto) — the fixture-minting implementation; the independent reducer must not share its code |
@@ -107,6 +107,26 @@ review record, and the byte-exact baseline outranks path cosmetics.
   and this round's truth pass re-verified counts, comments, and
   claims across the program docs (criterion 11). The next verdict is
   a FRESH review's to make — this repo never self-stamps.
+- **The ff23f1cd fresh review returned FAIL** (five findings, filed
+  as `reviews/2026-07-16-gate-a-ff23f1cd-review.md`) and its repairs
+  are EXECUTED under the owner's delegated adjudication of that
+  round: the **D-205 self-evidence exception** (spec v0.5.22 — a
+  late-class original arriving after its re-proposal self-classifies
+  sticky `lease-stale` at the occupied coordinate and never freezes
+  its own convergence carrier; the re-proposal-first order rides the
+  late-first vector as its third listed delivery, and each
+  evidence-lifecycle vector declares a machine-readable
+  `evidence_class`, companion amendment #7); **closed CDDL key
+  sets** across every dispatched control arm and nested shape
+  (App-A-verbatim tables; the extra-field multi-fault regression
+  committed); **registry dispatch on all three coordinates** (an
+  `operation_version != 1` op rejects `unknown-version` before CDDL,
+  replay, and placement; vectored); the **storage proof hardened**
+  (counter equality against the corpus-derived stream count,
+  read-back-verified pre-seeded replacement, the sync seam's limit
+  stated honestly — all three review mutations verified red); and
+  the criterion-11 leftovers swept. Verdict unchanged: FAIL until a
+  fresh review reports no executable finding.
 - **Durable P1 Memory writes stay prohibited** until Gate B plus the
   umbrella's P0.5/tombed-cutover prerequisites (spec header) —
   independent of Gate A.

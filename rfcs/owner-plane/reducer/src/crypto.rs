@@ -356,8 +356,8 @@ mod tests {
     use super::*;
 
     /// The native backend agrees with the crates it delegates to on
-    /// a round trip (a wiring pin, not a crypto test — the 157-vector
-    /// harness is the real coverage).
+    /// a round trip (a wiring pin, not a crypto test — the committed
+    /// corpus under the strict harness is the real coverage).
     #[test]
     fn native_backend_wiring() {
         let c = NativeCrypto;
