@@ -106,6 +106,57 @@ function ui2WireLayoutToggle() {
   }
 }
 
+// ── "Minimize done" bulk pill ──────────────────────────────────────────
+// Sits beside the layout toggle; visible only while at least one done
+// sub-agent window is still expanded, with the count of what one click
+// will collapse. The predicate is 41's sessionWindowIsDoneSubagent — the
+// same active boundary the parent "N sub" badge counts with — and the
+// click delegates to minimizeDoneSubagentWindows. Freshness: 40's badge
+// refreshes and the relationship render pass both call the rAF-deduped
+// refresher below.
+function ui2CollectExpandedDoneSubagents() {
+  const out = [];
+  if (typeof sessionWindows === 'undefined'
+      || typeof sessionWindowIsDoneSubagent !== 'function') return out;
+  for (const [sid, win] of sessionWindows) {
+    if (!win || win.minimized) continue;
+    if (sessionWindowIsDoneSubagent(sid)) out.push(sid);
+  }
+  return out;
+}
+
+function ui2RefreshMinimizeDoneControl() {
+  const btn = document.getElementById('ui2-minimize-done-btn');
+  if (!btn) return;
+  const count = ui2CollectExpandedDoneSubagents().length;
+  const countEl = document.getElementById('ui2-minimize-done-count');
+  if (countEl) countEl.textContent = String(count);
+  btn.hidden = count === 0;
+  btn.title = count === 1
+    ? 'Minimize the finished sub-agent window'
+    : `Minimize all ${count} finished sub-agent windows`;
+}
+
+let ui2MinimizeDoneRefreshQueued = false;
+function ui2QueueMinimizeDoneRefresh() {
+  if (ui2MinimizeDoneRefreshQueued) return;
+  ui2MinimizeDoneRefreshQueued = true;
+  requestAnimationFrame(() => {
+    ui2MinimizeDoneRefreshQueued = false;
+    ui2RefreshMinimizeDoneControl();
+  });
+}
+
+function ui2WireMinimizeDoneControl() {
+  const btn = document.getElementById('ui2-minimize-done-btn');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    if (typeof minimizeDoneSubagentWindows === 'function') minimizeDoneSubagentWindows();
+    ui2RefreshMinimizeDoneControl();
+  });
+  ui2RefreshMinimizeDoneControl();
+}
+
 // Composer dressing: placeholder copy + the attach glyph. The send
 // button's TEXT is state (Send / ↗ Steer / Save & rerun) — left alone.
 function ui2DressComposer() {
@@ -206,6 +257,27 @@ window.qa = Object.assign(window.qa || {}, {
       );
       return log ? log.querySelectorAll('.log-entry').length : 0;
     })(),
+  }),
+  // Sub-agent auto-minimize + the "Minimize done" pill: the count the
+  // pill shows, its visibility, and the per-subagent-window flag state
+  // the derivation runs on (the failure modes — a live window collapsed,
+  // a user-restored window re-collapsed — are silent without this).
+  minimizeDone: () => ({
+    count: ui2CollectExpandedDoneSubagents().length,
+    visible: !(document.getElementById('ui2-minimize-done-btn')?.hidden ?? true),
+    subagents: (typeof sessionWindows !== 'undefined'
+      && typeof sessionWindowIsSubagent === 'function')
+      ? [...sessionWindows.entries()]
+        .filter(([sid]) => sessionWindowIsSubagent(sid))
+        .map(([sid, w]) => ({
+          sid,
+          phase: w.phase || '',
+          ended: !!w.ended,
+          minimized: !!w.minimized,
+          autoMinimized: !!w.autoMinimized,
+          userRestoredWhileDone: !!w.userRestoredWhileDone,
+        }))
+      : [],
   }),
 });
 
@@ -463,6 +535,7 @@ function ui2RailTick(force) {
   const wire = () => {
     ui2AugmentApprovalPanel();
     ui2WireLayoutToggle();
+    ui2WireMinimizeDoneControl();
     ui2DressComposer();
     ui2BuildVitalsRail();
     ui2RailTick(true);

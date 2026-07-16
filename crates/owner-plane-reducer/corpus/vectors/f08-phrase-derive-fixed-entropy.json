@@ -1,0 +1,23 @@
+{
+  "case_kind": "phrase-derive",
+  "expected": {
+    "result": {
+      "keys": {
+        "ed25519_seed": "6877fb14d502d7949fe40b16fff91484b6df933010b4b8a9229dc263bef041b6",
+        "recovery_pk": "0f0c372d406204cb70ac5443400519ddba66a2619dfe66a7f0d7db173eba0720",
+        "seed": "28ff2a1e69973dc780cd89f74f7ab2145dce35d30b116a6e5fc69fd55ee30a8fda29d5c288f24f7af2146cc12c7c89852e75d0d82d3f0a34ef25473383d56fba"
+      }
+    }
+  },
+  "family": 8,
+  "inputs": {
+    "entropy": "4242424242424242424242424242424242424242424242424242424242424242",
+    "phrase": "drastic bamboo mountain loyal category cancel animal embark drastic bamboo mountain loyal category cancel animal embark drastic bamboo mountain loyal category cancel animal embark"
+  },
+  "name": "phrase-derive-fixed-entropy",
+  "source": "2.4",
+  "surfaces": [
+    "native-crypto",
+    "browser"
+  ]
+}

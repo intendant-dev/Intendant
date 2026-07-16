@@ -1621,6 +1621,7 @@ shell only.
 | POST | `/api/session/{id}/delete` | SessionManage | own origin | none | Delete a session's data (POST fallback for WKWebView) |
 | POST | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (POST fallback) |
 | POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
+| GET | `/api/session/{id}/fork-points` | SessionInspect | own origin | none | Unified fork-point catalog for a session (anchors + eligibility, backend-tagged) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
 | GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |

@@ -5355,6 +5355,7 @@ mod tests {
             ("api_sessions", Row, Some(Op::SessionInspect)),
             ("api_sessions_stream", Row, Some(Op::SessionInspect)),
             ("api_session_detail", Row, Some(Op::SessionInspect)),
+            ("api_session_fork_points", Row, Some(Op::SessionInspect)),
             ("api_session_report", Row, Some(Op::SessionInspect)),
             ("api_session_agent_output", Row, Some(Op::SessionInspect)),
             (

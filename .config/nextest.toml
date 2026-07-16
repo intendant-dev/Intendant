@@ -64,3 +64,12 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.default.overrides]]
 filter = 'package(rustc-governor)'
 slow-timeout = { period = "60s", terminate-after = 4 }
+
+# The vendored D0-A corpus conformance gate (§D of the stamped P1 v1
+# profile) runs all 170 stamped vectors through every structural layer
+# plus semantics in ONE test — its unity IS the gate (any red vector
+# reds the gate), and ~28s of debug-mode execution is its honest cost,
+# not a stall. Deliberate heavy test, not an environment dependency.
+[[profile.default.overrides]]
+filter = 'package(owner-plane-reducer)'
+slow-timeout = { period = "60s", terminate-after = 2 }
