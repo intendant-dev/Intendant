@@ -1577,12 +1577,49 @@ pub(crate) fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Va
 }
 
 /// List all files that have changed since the session baseline.
+///
+/// When the live watcher covers exactly this (project_root, snapshot_dir),
+/// the changed-key set comes from watcher state and only changed files are
+/// read; otherwise (external session targets, watcher-less daemons,
+/// momentary lock contention) the legacy full-tree scan runs.
 pub(crate) fn handle_changes_list(
     snapshot_dir: &Path,
     baseline_dir: &Path,
     project_root: &Path,
     include_project_external_logs: bool,
 ) -> String {
+    let mut changes =
+        changes_list_summaries_via_live_watcher(snapshot_dir, baseline_dir, project_root)
+            .unwrap_or_else(|| changes_list_summaries_full_scan(baseline_dir, project_root));
+    let existing_paths: HashSet<String> = changes
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    for record in load_external_change_records(
+        snapshot_dir,
+        project_root,
+        false,
+        include_project_external_logs,
+    ) {
+        if !existing_paths.contains(&record.path) {
+            changes.push(change_record_summary_json(&record));
+        }
+    }
+    serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Legacy change-list body: read and hash every file under the project
+/// root, plus every baseline file, and diff per key. Kept as the fallback
+/// for targets the live watcher does not cover.
+fn changes_list_summaries_full_scan(
+    baseline_dir: &Path,
+    project_root: &Path,
+) -> Vec<serde_json::Value> {
     let baseline_manifest = load_baseline_manifest(baseline_dir);
     let baseline_paths = collect_baseline_text_paths(baseline_dir);
     let current_states = collect_current_change_states(project_root);
@@ -1607,26 +1644,70 @@ pub(crate) fn handle_changes_list(
             changes.push(change_record_summary_json(&record));
         }
     }
-    let existing_paths: HashSet<String> = changes
-        .iter()
-        .filter_map(|value| {
-            value
-                .get("path")
-                .and_then(|path| path.as_str())
-                .map(str::to_string)
-        })
-        .collect();
-    for record in load_external_change_records(
-        snapshot_dir,
+    changes
+}
+
+/// Watcher-state fast path: `None` when no live watcher matches this
+/// target, its lock is contended right now, or its live index is degraded
+/// (notify not yet confirmed running, or a notify error) — the caller falls
+/// back to the full scan, so correctness never depends on the fast path.
+fn changes_list_summaries_via_live_watcher(
+    snapshot_dir: &Path,
+    baseline_dir: &Path,
+    project_root: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    let watcher = crate::file_watcher::live_watcher_for(project_root, snapshot_dir)?;
+    // This runs on sync paths (HTTP handler inline, tunnel twin inside
+    // spawn_blocking), so it must not await; try_lock keeps the fast path
+    // opportunistic and contention falls back to the scan.
+    let index = watcher.try_lock().ok()?.changes_index_snapshot()?;
+    Some(changes_list_summaries_from_index(
+        baseline_dir,
         project_root,
-        false,
-        include_project_external_logs,
-    ) {
-        if !existing_paths.contains(&record.path) {
+        &index,
+    ))
+}
+
+/// Compute change-list summaries from a watcher index snapshot: the
+/// changed-key set is derived by comparing baseline hashes against the
+/// watcher's last-known content hashes (no tree walk), then only those
+/// candidate files are read so each record — kind, line counts, unsupported
+/// reasons — is computed from disk truth by the exact per-key logic the
+/// full scan uses.
+fn changes_list_summaries_from_index(
+    baseline_dir: &Path,
+    project_root: &Path,
+    index: &crate::file_watcher::ChangesIndexSnapshot,
+) -> Vec<serde_json::Value> {
+    let mut candidates: Vec<&String> = Vec::new();
+    let mut keys: HashSet<&String> = index.baseline_manifest.keys().collect();
+    keys.extend(index.current_hashes.keys());
+    for key in keys {
+        let baseline_hash = index.baseline_manifest.get(key).map(|meta| &meta.hash);
+        match (baseline_hash, index.current_hashes.get(key)) {
+            (Some(baseline), Some(current)) if baseline == current => continue,
+            _ => candidates.push(key),
+        }
+    }
+    candidates.sort();
+
+    let mut changes = Vec::new();
+    for key in candidates {
+        if crate::file_watcher::should_ignore(Path::new(key)) {
+            continue;
+        }
+        let current = inspect_current_change_state(project_root, key);
+        if let Some(record) = compute_change_record(
+            key,
+            baseline_dir,
+            current.as_ref(),
+            &index.baseline_manifest,
+            false,
+        ) {
             changes.push(change_record_summary_json(&record));
         }
     }
-    serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
+    changes
 }
 
 /// Return a unified diff for a single file.
@@ -2269,6 +2350,15 @@ pub(crate) fn append_managed_context_fission_groups_from_dir(
 }
 
 /// GET /api/session/current/history — returns serialized `History` JSON.
+///
+/// The response is the timeline view every consumer actually reads:
+/// `current_head_id`, `next_id`, and per round `id` / `parent_id` /
+/// `summary` / `timestamp_unix` / `files_changed` / `turn_count` /
+/// `native_message_count` (plus abandoned branches of the same shape). The
+/// per-round path→hash rollback maps (`files_at_end` / `all_files_at_end`)
+/// are no longer serialized — they made a long session's response grow to
+/// tens of MB while no client read them; they remain on disk in the
+/// session's `file_snapshots/rounds/round_{id}/manifest.json`.
 pub(crate) async fn handle_history_get(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> (&'static str, String) {
@@ -2278,8 +2368,10 @@ pub(crate) async fn handle_history_get(
             serde_json::json!({"error": "file watcher not active"}).to_string(),
         );
     };
-    let w = fw.lock().await;
-    let body = serde_json::to_string(w.history()).unwrap_or_else(|_| "{}".to_string());
+    // Clone the (slim) history under the lock, serialize outside it, so a
+    // large timeline never stalls event processing behind serialization.
+    let history = fw.lock().await.history().clone();
+    let body = serde_json::to_string(&history).unwrap_or_else(|_| "{}".to_string());
     ("200 OK", body)
 }
 
@@ -5716,6 +5808,170 @@ mod tests {
 
         assert_eq!(status, "400 Bad Request");
         assert_eq!(json["error"], "invalid path");
+    }
+
+    /// The watcher-index fast path must produce byte-identical change-list
+    /// summaries to the legacy full scan across every record kind: created,
+    /// modified, deleted, unchanged (absent), and unsupported files.
+    #[test]
+    fn changes_index_fast_path_matches_full_scan() {
+        let project = tempfile::TempDir::new().unwrap();
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/modified.rs"), "old line\nshared\n").unwrap();
+        std::fs::write(root.join("src/unchanged.rs"), "keep\n").unwrap();
+        std::fs::write(root.join("src/deleted.rs"), "goes away\nsoon\n").unwrap();
+        // `.dat` is not an ignored extension, so unsupported (binary) files
+        // are exercised rather than filtered out.
+        std::fs::write(root.join("data.dat"), b"static\0binary").unwrap();
+
+        let mut watcher = crate::file_watcher::FileWatcher::new(
+            root.to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("watcher");
+
+        // Mutate the tree and feed the watcher the matching events, the way
+        // the notify loop would.
+        let modify = notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        ));
+        std::fs::write(root.join("src/modified.rs"), "new line\nshared\nplus\n").unwrap();
+        watcher.process_change(&root.join("src/modified.rs"), &modify);
+        std::fs::write(root.join("src/created.rs"), "brand new\n").unwrap();
+        watcher.process_change(
+            &root.join("src/created.rs"),
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+        std::fs::write(root.join("new.dat"), b"fresh\0binary").unwrap();
+        watcher.process_change(
+            &root.join("new.dat"),
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+        std::fs::remove_file(root.join("src/deleted.rs")).unwrap();
+        watcher.process_change(
+            &root.join("src/deleted.rs"),
+            &notify::EventKind::Remove(notify::event::RemoveKind::File),
+        );
+
+        let baseline_dir = snapshot.path().join("baseline");
+        watcher.mark_live_index_healthy_for_tests();
+        let index = watcher.changes_index_snapshot().expect("healthy index");
+        let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);
+        let full = changes_list_summaries_full_scan(&baseline_dir, root);
+        assert_eq!(
+            serde_json::to_string(&fast).unwrap(),
+            serde_json::to_string(&full).unwrap(),
+            "fast path and full scan must agree"
+        );
+
+        let paths: Vec<&str> = fast
+            .iter()
+            .map(|value| value["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "new.dat",
+                "src/created.rs",
+                "src/deleted.rs",
+                "src/modified.rs"
+            ],
+            "unchanged files must be absent; the rest sorted"
+        );
+        let modified = fast
+            .iter()
+            .find(|v| v["path"] == "src/modified.rs")
+            .unwrap();
+        assert_eq!(modified["kind"], "modified");
+        assert_eq!(modified["lines_added"], 2);
+        assert_eq!(modified["lines_removed"], 1);
+        let created_bin = fast.iter().find(|v| v["path"] == "new.dat").unwrap();
+        assert_eq!(created_bin["kind"], "created");
+        assert_eq!(created_bin["diff_available"], false);
+    }
+
+    /// Resume-after-delete: a file baselined by a previous run and deleted
+    /// before this one must not surface as a phantom "deleted" row — the
+    /// stale `baseline/` copy is reconciled away at watcher construction,
+    /// keeping the full scan and the watcher-index fast path in agreement.
+    #[test]
+    fn resume_after_delete_reconciles_stale_baselines() {
+        let project = tempfile::TempDir::new().unwrap();
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join("keep.rs"), "kept\n").unwrap();
+        std::fs::write(root.join("stale.rs"), "left over\n").unwrap();
+        let first = crate::file_watcher::FileWatcher::new(
+            root.to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("first watcher");
+        drop(first);
+
+        // The file disappears between runs.
+        std::fs::remove_file(root.join("stale.rs")).unwrap();
+
+        let mut resumed = crate::file_watcher::FileWatcher::new(
+            root.to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("resumed watcher");
+        resumed.mark_live_index_healthy_for_tests();
+
+        let baseline_dir = snapshot.path().join("baseline");
+        let full = changes_list_summaries_full_scan(&baseline_dir, root);
+        let index = resumed.changes_index_snapshot().expect("healthy index");
+        let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);
+        assert_eq!(
+            serde_json::to_string(&fast).unwrap(),
+            serde_json::to_string(&full).unwrap(),
+            "fast path and full scan must agree after a resume-after-delete"
+        );
+        assert!(
+            full.iter().all(|row| row["path"] != "stale.rs"),
+            "no phantom deleted row for a file this session never had: {full:?}"
+        );
+    }
+
+    /// GET /api/session/current/history serves the slim timeline: round
+    /// scalars and changed paths, never the per-round rollback maps.
+    #[tokio::test]
+    async fn history_get_serves_slim_timeline() {
+        let project = tempfile::TempDir::new().unwrap();
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let mut watcher = crate::file_watcher::FileWatcher::new(
+            project.path().to_path_buf(),
+            snapshot.path().to_path_buf(),
+            crate::event::EventBus::new(),
+        )
+        .expect("watcher");
+        // Created after the baseline scan so round 1 records it as changed.
+        std::fs::write(project.path().join("a.txt"), "hello\n").unwrap();
+        watcher
+            .on_round_complete("R1".into(), Some(2), Some(7))
+            .expect("round");
+        let shared: crate::file_watcher::SharedFileWatcher =
+            Arc::new(tokio::sync::Mutex::new(watcher));
+
+        let (status, body) = handle_history_get(Some(&shared)).await;
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let rounds = json["rounds"].as_array().unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0]["summary"], "R1");
+        assert_eq!(rounds[0]["turn_count"], 2);
+        assert_eq!(rounds[0]["native_message_count"], 7);
+        assert_eq!(rounds[0]["files_changed"], serde_json::json!(["a.txt"]));
+        assert_eq!(json["current_head_id"], rounds[0]["id"]);
+        assert!(
+            rounds[0].get("files_at_end").is_none(),
+            "wire view must not carry rollback maps: {body}"
+        );
     }
 
     #[test]

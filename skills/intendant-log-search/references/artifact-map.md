@@ -186,14 +186,27 @@ file_snapshots/
   objects/
   rounds/
   history.json
+  store.lock
 ```
 
-`history.json` schema:
+`store.lock` is the store's advisory cross-process lock (held for the owning
+watcher's lifetime; a second process opens the store read-only). A
+`history.json.damaged-<ts>-<pid>-<seq>` file is a previous index that failed
+to parse, preserved verbatim when a fresh timeline was started (forensic
+only: the fresh timeline reuses round ids, and its epoch/maps-hash binding
+already makes the old manifests unresolvable).
+
+`history.json` schema (format 2 — a slim index; `"format": 2` marks it):
 
 - `current_head_id`: active round id.
-- `rounds[]`: `id`, `parent_id`, `summary`, `timestamp_unix`, `files_changed`, `files_at_end`, optional `all_files_at_end`, optional `turn_count`, optional `native_message_count`.
+- `rounds[]`: `id`, `parent_id`, `summary`, `timestamp_unix`, `files_changed`, optional `turn_count`, optional `native_message_count`, optional `maps_from_round`, optional `maps_hash` (content hash of the round's maps — the resolver refuses a manifest whose payload doesn't hash to it). Round stubs carry no path→hash maps — the per-round maps live in `rounds/round_<id>/manifest.json` (below). A round may exceptionally retain inline `files_at_end`/`all_files_at_end` when its manifest write failed, marked by `maps_inline: true` (the marker is what keeps an empty-tree retention alive, since empty maps serialize to nothing); the index stays authoritative for it until a later load migrates it.
 - `abandoned_branches[]`: rollback-then-new-action branches with `branched_from_id`, `rounds`, `created_at_unix`.
 - `next_id`: next round id.
+- `store_epoch`: identity stamp binding this index to its manifests. Absent on a pre-epoch store whose manifest stamping has not completed yet; while absent, restores are guarded by content binding (the manifest's scalars must match its index row) instead.
+
+`rounds/round_<id>/manifest.json` (load-bearing since format 2): the full `HistoryRound` for that round — `files_at_end` (restorable path → sha256) and `all_files_at_end` (display mirror) inline, stamped with `store_epoch`. A no-op round (tree identical to an earlier round) writes a tiny stub whose `maps_from_round` names the round holding the maps inline (backreferences are depth-1). Restore refuses manifests whose `id` or `store_epoch` doesn't match the index (fails closed rather than restoring a wrong tree).
+
+Legacy (pre-format-2) `history.json` files carried every round's maps inline; they are migrated to stamped manifests on the next load.
 
 Snapshots ignore common generated directories and binary/image/archive extensions. Files above the snapshot size cap are represented by hash/metadata, not restorable text content.
 
