@@ -3305,7 +3305,10 @@ mod tests {
         // during shell startup can be silently discarded (see terminal.rs
         // tests); a dashboard user typing at a rendered prompt never races
         // this.
-        drain_output_until(&mut terminal_output_rx, budget, "shell startup", |t| !t.is_empty()).await;
+        drain_output_until(&mut terminal_output_rx, budget, "shell startup", |t| {
+            !t.is_empty()
+        })
+        .await;
 
         let token = "dashboard_terminal_frame_ok";
         let input = serde_json::json!({

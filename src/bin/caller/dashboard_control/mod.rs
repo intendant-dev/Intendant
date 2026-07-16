@@ -1781,7 +1781,9 @@ impl DashboardControlPeer {
             events_subscribed: false,
             events_sent: 0,
             response_credit_enabled: false,
-            config: Arc::new(serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({}))),
+            config: Arc::new(
+                serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
+            ),
             bus,
             peer_registry,
             mcp_server,
@@ -2228,7 +2230,9 @@ impl ChunkedFramePlan {
         if offset >= self.payload.len() || self.chunk_bytes == 0 {
             return None;
         }
-        let end = offset.saturating_add(self.chunk_bytes).min(self.payload.len());
+        let end = offset
+            .saturating_add(self.chunk_bytes)
+            .min(self.payload.len());
         let data = base64::engine::general_purpose::STANDARD.encode(&self.payload[offset..end]);
         let frame = match self.envelope {
             ChunkEnvelope::Response => serde_json::json!({
@@ -2301,11 +2305,7 @@ impl OutboundControlQueue {
     fn enqueue_chunked(&mut self, plan: ChunkedFramePlan) -> bool {
         self.cancel_chunk(&plan.chunk_id.clone());
         let accounted_bytes = plan.resident_bytes();
-        if self
-            .queued_bytes
-            .saturating_add(accounted_bytes)
-            > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
-        {
+        if self.queued_bytes.saturating_add(accounted_bytes) > CONTROL_OUTBOUND_QUEUE_MAX_BYTES {
             return false;
         }
         self.queued_bytes = self.queued_bytes.saturating_add(accounted_bytes);
@@ -3212,8 +3212,9 @@ fn json_body_response(id: String, body: String, label: &str) -> serde_json::Valu
 /// `json_body_response_preserialized`); `id` is JSON-escaped here.
 fn spliced_response_frame_text(id: &str, body: &str) -> String {
     let id_json = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".to_string());
-    let mut text =
-        String::with_capacity(body.len() + id_json.len() + "{\"t\":\"response\",\"id\":,\"ok\":true,\"result\":}".len());
+    let mut text = String::with_capacity(
+        body.len() + id_json.len() + "{\"t\":\"response\",\"id\":,\"ok\":true,\"result\":}".len(),
+    );
     text.push_str("{\"t\":\"response\",\"id\":");
     text.push_str(&id_json);
     text.push_str(",\"ok\":true,\"result\":");
@@ -3829,9 +3830,7 @@ mod tests {
             }
             let mut tmp = spool.into_spooled_tempfile().unwrap();
             let mut on_disk = Vec::new();
-            tmp.as_file_mut()
-                .seek(std::io::SeekFrom::Start(0))
-                .unwrap();
+            tmp.as_file_mut().seek(std::io::SeekFrom::Start(0)).unwrap();
             tmp.as_file_mut().read_to_end(&mut on_disk).unwrap();
             assert_eq!(on_disk, payload);
 
@@ -3948,8 +3947,7 @@ mod tests {
     ) -> Option<serde_json::Value> {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
-        let (terminal_output_tx, _terminal_output_rx) =
-            mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(

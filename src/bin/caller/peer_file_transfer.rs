@@ -157,10 +157,7 @@ impl LiveTransferAuthority {
     /// [`LIVE_TRANSFER_AUTHORITY_MEMO_TTL`], else verify fresh.
     fn is_current(&self) -> bool {
         {
-            let verified_at = self
-                .verified_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let verified_at = self.verified_at.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(at) = *verified_at {
                 if at.elapsed() < LIVE_TRANSFER_AUTHORITY_MEMO_TTL {
                     return true;
@@ -175,10 +172,7 @@ impl LiveTransferAuthority {
     fn is_current_fresh(&self) -> bool {
         let ok = self.authorization.is_current();
         if ok {
-            *self
-                .verified_at
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            *self.verified_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
         ok
     }

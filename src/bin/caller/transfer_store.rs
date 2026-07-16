@@ -1572,8 +1572,8 @@ mod tests {
         append_upload_tempfile(&scope(&project), &id, 0, write_chunk(b"abc"), 3).unwrap();
 
         // Declared 3 bytes, delivered 5: rejected AND rolled back.
-        let err = append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"defgh"), 3)
-            .unwrap_err();
+        let err =
+            append_upload_tempfile(&scope(&project), &id, 3, write_chunk(b"defgh"), 3).unwrap_err();
         assert_eq!(err.status, 400);
         assert_eq!(
             fs::metadata(&temp_path).unwrap().len(),
