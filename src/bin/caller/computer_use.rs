@@ -3354,17 +3354,37 @@ async fn execute_via_session(
 /// poll. Either way the frame served is at most this stale.
 const FRESH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// At most this many pixel jobs run concurrently on the blocking pool.
+/// A Retina-size decode/resize/encode holds a ~30-60MB working set; without
+/// a bound, concurrent CU sessions' captures multiply peak memory and can
+/// monopolize the shared blocking pool (which also serves AX walks, type
+/// delivery, and tokio::fs). Three permits keep two busy sessions plus one
+/// straggler flowing while capping transient pixel memory under ~200MB.
+const PIXEL_OFFLOAD_PERMITS: usize = 3;
+
 /// Run CPU/disk-heavy pixel work (PNG decode/encode, resize, annotate,
 /// artifact writes, base64) on the blocking pool instead of a tokio worker:
 /// a single Retina-size decode or encode costs 50-300ms, which would
 /// otherwise stall a runtime thread that also serves the gateway, WebRTC,
 /// and the event bus. The AX and input paths in this module already use
 /// `spawn_blocking`; this gives the pixel pipeline the same treatment.
+///
+/// Await-inline semantics: the caller waits for the result either way — the
+/// permit + blocking pool only bound *whose threads* do the work and how
+/// many pixel jobs run at once ([`PIXEL_OFFLOAD_PERMITS`]).
 async fn offload_pixels<T, F>(work: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
+    static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(PIXEL_OFFLOAD_PERMITS);
+    // Held across the spawn_blocking await, releasing when the job's result
+    // is in. acquire() only errors if the semaphore is closed, which this
+    // static never is — degrade with an error rather than unwrap regardless.
+    let _permit = GATE
+        .acquire()
+        .await
+        .map_err(|e| format!("pixel gate closed: {e}"))?;
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|e| format!("screenshot task failed: {e}"))?
@@ -3574,6 +3594,13 @@ async fn capture_zoom_screenshot(
         // validated/clamped up front so offscreen requests keep the crop
         // path's actionable error instead of depending on screencapture's
         // out-of-bounds behavior.
+        //
+        // Unit contract (empirically pinned 2026-07-15 on a 2x display —
+        // see `main_display_pixel_size`'s docs and its `#[ignore]` probe
+        // test): `logical_display_size()` returns POINTS (1024x640 while
+        // the mode's backing store was 2048x1280), `-R` consumes POINTS,
+        // and `-R0,0,100,100` produced a 200x200px artifact — exactly what
+        // the old physical-capture + scale-2 crop produced for that region.
         DisplayBackend::MacOS => {
             let (x, y, w, h) = clamp_zoom_region_to_display(region)?;
             *counter += 1;
@@ -3594,18 +3621,21 @@ async fn capture_zoom_screenshot(
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|e| format!("read zoom capture: {e}"))?;
-            let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
-            use base64::Engine;
-            let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            Ok(ScreenshotData {
-                path,
-                base64_png,
-                width,
-                height,
+            // Read + base64 on the blocking pool like every other pixel
+            // site — a large-region native-res capture is still multi-MB.
+            offload_pixels(move || {
+                let bytes = std::fs::read(&path).map_err(|e| format!("read zoom capture: {e}"))?;
+                let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
+                use base64::Engine;
+                let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Ok(ScreenshotData {
+                    path,
+                    base64_png,
+                    width,
+                    height,
+                })
             })
+            .await
         }
         // Subprocess flavor: the source is PNG bytes (one decode, one
         // encode). The model saw the capture at native size — the region
