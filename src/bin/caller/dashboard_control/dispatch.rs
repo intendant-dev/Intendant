@@ -196,6 +196,7 @@ pub(crate) fn control_frame_response(
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
     display_input_tx: &DisplayInputForwarder,
 ) -> Option<serde_json::Value> {
@@ -246,7 +247,7 @@ pub(crate) fn control_frame_response(
             None
         }
         "terminal_open" => {
-            control_terminal_open_frame(parsed, runtime, terminal_events_tx, terminal_forwarders)
+            control_terminal_open_frame(parsed, runtime, terminal_output_tx, terminal_forwarders)
         }
         "terminal_input" => control_terminal_input_frame(parsed, runtime),
         "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
@@ -1240,7 +1241,7 @@ pub(crate) fn terminal_frame_dimension(frame: &serde_json::Value, key: &str, def
 pub(crate) fn control_terminal_open_frame(
     frame: serde_json::Value,
     runtime: &ControlRuntime,
-    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Option<serde_json::Value> {
     let (host_id, terminal_id) = terminal_frame_key(&frame);
@@ -1251,7 +1252,12 @@ pub(crate) fn control_terminal_open_frame(
         handle.abort();
     }
     let registry = runtime.terminal_registry.clone();
-    let terminal_events_tx = terminal_events_tx.clone();
+    // Everything this task emits — the open ack/error and the output
+    // stream — rides the BOUNDED terminal lane, so the ack keeps FIFO
+    // order ahead of the first output frame, and when the wire congests
+    // the `send().await` parks this task while terminal.rs's per-listener
+    // drop-oldest bound holds the memory line (see `control_driver`).
+    let terminal_output_tx = terminal_output_tx.clone();
     // Attach needs only the terminal.view floor already enforced by the
     // frame table; creating a shell needs shell.spawn, decided at frame
     // time so expiry mid-connection is honored. A grant-level fs scope
@@ -1280,13 +1286,16 @@ pub(crate) fn control_terminal_open_frame(
         {
             Ok((session, _created)) => {
                 let mut rx = session.attach();
-                let _ = terminal_events_tx.send(serde_json::json!({
+                let ack = serde_json::json!({
                     "t": "terminal_opened",
                     "host_id": host_id.clone(),
                     "terminal_id": terminal_id.clone(),
                     "shared": session.shared(),
                     "can_share": session.managed_by(&actor),
-                }));
+                });
+                if terminal_output_tx.send(ack).await.is_err() {
+                    return;
+                }
                 while let Some(event) = rx.recv().await {
                     let frame = match event {
                         crate::terminal::TerminalEvent::Output(bytes) => {
@@ -1307,18 +1316,20 @@ pub(crate) fn control_terminal_open_frame(
                             })
                         }
                     };
-                    if terminal_events_tx.send(frame).is_err() {
+                    if terminal_output_tx.send(frame).await.is_err() {
                         break;
                     }
                 }
             }
             Err(e) => {
-                let _ = terminal_events_tx.send(serde_json::json!({
-                    "t": "terminal_error",
-                    "host_id": host_id,
-                    "terminal_id": terminal_id,
-                    "error": e.to_string(),
-                }));
+                let _ = terminal_output_tx
+                    .send(serde_json::json!({
+                        "t": "terminal_error",
+                        "host_id": host_id,
+                        "terminal_id": terminal_id,
+                        "error": e.to_string(),
+                    }))
+                    .await;
             }
         }
     });
@@ -3001,6 +3012,7 @@ mod tests {
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let bytes = b"hello upload";
@@ -3028,6 +3040,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3049,6 +3062,7 @@ mod tests {
                 &mut outbound,
                 &mut inbound_uploads,
                 &terminal_tx,
+                &terminal_output_tx,
                 &mut terminal_forwarders,
                 &display_input_tx,
             )
@@ -3068,6 +3082,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3113,6 +3128,7 @@ mod tests {
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
 
@@ -3137,6 +3153,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3156,6 +3173,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3186,7 +3204,8 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
-        let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (terminal_output_tx, mut terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let terminal_id = "dash-control-test-shell";
@@ -3206,6 +3225,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -3216,7 +3236,7 @@ mod tests {
         // tens of seconds before the shell paints; a passing run returns
         // the moment each frame arrives and never waits the budget out.
         let budget = Duration::from_secs(60);
-        let opened = tokio::time::timeout(budget, terminal_rx.recv())
+        let opened = tokio::time::timeout(budget, terminal_output_rx.recv())
             .await
             .expect("no terminal frame within budget after terminal_open")
             .expect("terminal frame channel closed before terminal_opened");
@@ -3228,7 +3248,7 @@ mod tests {
         // deadline. Matching runs on the accumulated transcript, not per
         // frame, so output split across chunks still matches.
         async fn drain_output_until(
-            terminal_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+            terminal_rx: &mut mpsc::Receiver<serde_json::Value>,
             budget: Duration,
             phase: &str,
             until: impl Fn(&str) -> bool,
@@ -3265,7 +3285,7 @@ mod tests {
         // during shell startup can be silently discarded (see terminal.rs
         // tests); a dashboard user typing at a rendered prompt never races
         // this.
-        drain_output_until(&mut terminal_rx, budget, "shell startup", |t| !t.is_empty()).await;
+        drain_output_until(&mut terminal_output_rx, budget, "shell startup", |t| !t.is_empty()).await;
 
         let token = "dashboard_terminal_frame_ok";
         let input = serde_json::json!({
@@ -3283,12 +3303,13 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
         .is_none());
 
-        drain_output_until(&mut terminal_rx, budget, "token echo", |t| {
+        drain_output_until(&mut terminal_output_rx, budget, "token echo", |t| {
             t.contains(token)
         })
         .await;
@@ -3306,6 +3327,7 @@ mod tests {
             &mut outbound,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         );
@@ -3328,6 +3350,7 @@ mod tests {
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) = mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         let mut frame = |text: &str,
@@ -3343,6 +3366,7 @@ mod tests {
                 &mut outbound,
                 inbound,
                 &terminal_tx,
+                &terminal_output_tx,
                 &mut terminal_forwarders,
                 &display_input_tx,
             )

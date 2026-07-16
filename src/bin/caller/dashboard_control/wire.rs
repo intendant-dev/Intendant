@@ -63,6 +63,18 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
     let (terminal_events_tx, mut terminal_events_rx) =
         mpsc::unbounded_channel::<serde_json::Value>();
     runtime.control_frames_tx = Some(terminal_events_tx.clone());
+    // PTY output rides its own small BOUNDED lane (the tunnel twin of
+    // ws_session's TERMINAL_FORWARD_LANE_CAP): the per-terminal forwarders
+    // `send().await` here, and the driver drains it only while the control
+    // channel's SCTP buffer sits below the high watermark. When the wire
+    // congests (frozen tab), the lane fills, the forwarders park, and
+    // terminal.rs's per-listener drop-oldest bound re-engages — instead of
+    // bulk PTY output growing the unbounded SCTP pending queue at PTY
+    // rate. The low-rate control_frames lane (acks for share/egress/
+    // presence) stays unbounded.
+    let (terminal_output_tx, mut terminal_output_rx) =
+        mpsc::channel::<serde_json::Value>(TERMINAL_OUTPUT_LANE_CAP);
+    let mut terminal_lane_paused = false;
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
     // Per-connection ordered display-input lane (F1): `display_input`
@@ -97,8 +109,10 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
             &mut outbound_queue,
             &mut inbound_uploads,
             &terminal_events_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
+            &mut terminal_lane_paused,
         )
         .await
         {
@@ -330,6 +344,18 @@ pub(crate) async fn control_driver<I: rtc::interceptor::Interceptor + Send + Syn
                 send_control_text(&mut rtc, &channels, frame.to_string());
                 let _ = rtc.handle_timeout(Instant::now());
             }
+            // Bounded PTY-output lane, gated on the control channel's SCTP
+            // buffered-amount watermark: while paused the forwarders park
+            // on the full lane and terminal.rs's drop-oldest bound holds
+            // the memory line.
+            Some(frame) = terminal_output_rx.recv(), if !terminal_lane_paused => {
+                if !runtime.grant.opening_authority_is_current() {
+                    shutdown.cancel();
+                    break;
+                }
+                send_control_text(&mut rtc, &channels, frame.to_string());
+                let _ = rtc.handle_timeout(Instant::now());
+            }
             authority = async {
                 match display_authority_rx.as_mut() {
                     Some(rx) => Some(rx.recv().await),
@@ -484,8 +510,10 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
     terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_output_tx: &mpsc::Sender<serde_json::Value>,
     terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
     display_input_tx: &DisplayInputForwarder,
+    terminal_lane_paused: &mut bool,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         // Route by connection first, engine stamp second: rtc < 0.9.1
@@ -558,6 +586,7 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             outbound_queue,
             inbound_uploads,
             terminal_events_tx,
+            terminal_output_tx,
             terminal_forwarders,
             display_input_tx,
         ) {
@@ -579,10 +608,43 @@ pub(crate) async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
                     .map(|channel| channel.label().to_string())
                     .unwrap_or_else(|| format!("channel-{cid}"));
                 eprintln!("[dashboard/control] data channel open: {label}");
+                if label == CONTROL_CHANNEL_LABEL {
+                    // Arm the SCTP buffered-amount watermarks that gate the
+                    // bounded terminal-output lane (the display pipeline's
+                    // event-driven backpressure pattern).
+                    if let Some(mut channel) = rtc.data_channel(cid) {
+                        channel.set_buffered_amount_high_threshold(watermark_to_u32(
+                            TERMINAL_LANE_BUFFERED_HIGH_WATERMARK_BYTES,
+                        ));
+                        channel.set_buffered_amount_low_threshold(watermark_to_u32(
+                            TERMINAL_LANE_BUFFERED_LOW_WATERMARK_BYTES,
+                        ));
+                    }
+                    *terminal_lane_paused = false;
+                }
                 channels.insert(label, cid);
             }
             RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(cid)) => {
+                if channels.get(CONTROL_CHANNEL_LABEL).copied() == Some(cid) {
+                    // Never leave the terminal lane parked behind a channel
+                    // that can no longer drain.
+                    *terminal_lane_paused = false;
+                }
                 channels.retain(|_, id| *id != cid);
+            }
+            RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountHigh(
+                cid,
+            )) => {
+                if channels.get(CONTROL_CHANNEL_LABEL).copied() == Some(cid) {
+                    *terminal_lane_paused = true;
+                }
+            }
+            RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnBufferedAmountLow(
+                cid,
+            )) => {
+                if channels.get(CONTROL_CHANNEL_LABEL).copied() == Some(cid) {
+                    *terminal_lane_paused = false;
+                }
             }
             RTCPeerConnectionEvent::OnConnectionStateChangeEvent(state) => {
                 eprintln!("[dashboard/control] connection: {state:?}");
@@ -685,22 +747,28 @@ pub(crate) fn send_control_frame<I: rtc::interceptor::Interceptor>(
             }
             drain_queued_control_frames(rtc, channels, outbound_queue);
         }
-        ControlFrameTexts::Chunked {
-            request_id,
-            chunk_id,
-            start,
-            chunks,
-            end,
-        } => {
+        ControlFrameTexts::Chunked(plan) => {
             if response_credit_enabled {
-                outbound_queue.enqueue_chunked(request_id, chunk_id, start, chunks, end);
-                drain_queued_control_frames(rtc, channels, outbound_queue);
+                if outbound_queue.enqueue_chunked(plan) {
+                    drain_queued_control_frames(rtc, channels, outbound_queue);
+                } else {
+                    // Admission control: the per-connection queue byte cap
+                    // is exhausted — answer the request instead of pinning
+                    // another payload behind a quiet client.
+                    send_control_text(
+                        rtc,
+                        channels,
+                        dashboard_control_error_response(
+                            request_id,
+                            "outbound response queue is full",
+                        )
+                        .to_string(),
+                    );
+                }
             } else {
-                send_control_text(rtc, channels, start);
-                for text in chunks {
+                for text in plan.render_all() {
                     send_control_text(rtc, channels, text);
                 }
-                send_control_text(rtc, channels, end);
             }
         }
     }
@@ -719,22 +787,28 @@ pub(crate) fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
                 send_control_text(rtc, channels, text);
             }
         }
-        ControlFrameTexts::Chunked {
-            request_id,
-            chunk_id,
-            start,
-            chunks,
-            end,
-        } => {
+        ControlFrameTexts::Chunked(plan) => {
             if response_credit_enabled {
-                outbound_queue.enqueue_chunked(request_id, chunk_id, start, chunks, end);
-                drain_queued_control_frames(rtc, channels, outbound_queue);
+                let request_id = plan.request_id.clone();
+                if outbound_queue.enqueue_chunked(plan) {
+                    drain_queued_control_frames(rtc, channels, outbound_queue);
+                } else {
+                    // Admission control at the queue byte cap (see
+                    // `send_control_frame`).
+                    send_control_text(
+                        rtc,
+                        channels,
+                        dashboard_control_error_response(
+                            request_id,
+                            "outbound response queue is full",
+                        )
+                        .to_string(),
+                    );
+                }
             } else {
-                send_control_text(rtc, channels, start);
-                for text in chunks {
+                for text in plan.render_all() {
                     send_control_text(rtc, channels, text);
                 }
-                send_control_text(rtc, channels, end);
             }
         }
     }
@@ -748,15 +822,7 @@ pub(crate) fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
         CONTROL_RESPONSE_CHUNK_BYTES,
     ) {
         ControlFrameTexts::Immediate(frames) => frames,
-        ControlFrameTexts::Chunked {
-            start, chunks, end, ..
-        } => {
-            let mut frames = Vec::with_capacity(chunks.len() + 2);
-            frames.push(start);
-            frames.extend(chunks);
-            frames.push(end);
-            frames
-        }
+        ControlFrameTexts::Chunked(plan) => plan.render_all(),
     }
 }
 
@@ -783,19 +849,6 @@ pub(crate) fn byte_stream_frame_text_parts(
         "chunks": chunk_count,
     })
     .to_string();
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for (seq, chunk) in byte_stream.bytes.chunks(chunk_bytes).enumerate() {
-        chunks.push(
-            serde_json::json!({
-                "t": "byte_stream_chunk",
-                "id": request_id,
-                "stream_id": chunk_id,
-                "seq": seq,
-                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
-            })
-            .to_string(),
-        );
-    }
     let end = serde_json::json!({
         "t": "byte_stream_end",
         "id": request_id,
@@ -805,13 +858,16 @@ pub(crate) fn byte_stream_frame_text_parts(
         "result": byte_stream.result,
     })
     .to_string();
-    ControlFrameTexts::Chunked {
+    // The payload moves into the plan raw; chunk frames render lazily at
+    // send time (see `ChunkedFramePlan`).
+    ControlFrameTexts::Chunked(ChunkedFramePlan::byte_stream(
         request_id,
         chunk_id,
         start,
-        chunks,
         end,
-    }
+        byte_stream.bytes,
+        chunk_bytes,
+    ))
 }
 
 #[cfg(test)]
@@ -821,15 +877,7 @@ pub(crate) fn byte_stream_frame_texts(
 ) -> Vec<String> {
     match byte_stream_frame_text_parts(byte_stream, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
-        ControlFrameTexts::Chunked {
-            start, chunks, end, ..
-        } => {
-            let mut frames = Vec::with_capacity(chunks.len() + 2);
-            frames.push(start);
-            frames.extend(chunks);
-            frames.push(end);
-            frames
-        }
+        ControlFrameTexts::Chunked(plan) => plan.render_all(),
     }
 }
 
@@ -867,30 +915,17 @@ pub(crate) fn control_frame_text_parts(
         })
         .unwrap_or_else(|| request_id.clone());
 
-    let bytes = text.as_bytes();
-    let chunk_count = bytes.len().div_ceil(chunk_bytes);
+    let total_bytes = text.len();
+    let chunk_count = total_bytes.div_ceil(chunk_bytes);
     let start = serde_json::json!({
         "t": "response_start",
         "id": request_id,
         "chunk_id": chunk_id,
         "encoding": "base64-json-frame",
-        "total_bytes": bytes.len(),
+        "total_bytes": total_bytes,
         "chunks": chunk_count,
     })
     .to_string();
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for (seq, chunk) in bytes.chunks(chunk_bytes).enumerate() {
-        chunks.push(
-            serde_json::json!({
-                "t": "response_chunk",
-                "id": request_id,
-                "chunk_id": chunk_id,
-                "seq": seq,
-                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
-            })
-            .to_string(),
-        );
-    }
     let end = serde_json::json!({
         "t": "response_end",
         "id": request_id,
@@ -898,13 +933,16 @@ pub(crate) fn control_frame_text_parts(
         "chunks": chunk_count,
     })
     .to_string();
-    ControlFrameTexts::Chunked {
+    // The serialized response moves into the plan raw; chunk frames render
+    // lazily at send time (see `ChunkedFramePlan`).
+    ControlFrameTexts::Chunked(ChunkedFramePlan::response(
         request_id,
         chunk_id,
         start,
-        chunks,
         end,
-    }
+        text.into_bytes(),
+        chunk_bytes,
+    ))
 }
 
 #[cfg(test)]
@@ -915,15 +953,7 @@ pub(crate) fn chunk_control_response_frame(
 ) -> Vec<String> {
     match control_frame_text_parts(frame, threshold_bytes, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
-        ControlFrameTexts::Chunked {
-            start, chunks, end, ..
-        } => {
-            let mut frames = Vec::with_capacity(chunks.len() + 2);
-            frames.push(start);
-            frames.extend(chunks);
-            frames.push(end);
-            frames
-        }
+        ControlFrameTexts::Chunked(plan) => plan.render_all(),
     }
 }
 
@@ -934,36 +964,45 @@ pub(crate) fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
 ) {
     loop {
         let mut pop_front = false;
-        let mut completed_end: Option<String> = None;
+        let mut completed = false;
         match outbound_queue.frames.front_mut() {
-            Some(QueuedControlFrame::Immediate { text, .. }) => {
-                send_control_text(rtc, channels, text.clone());
+            Some(QueuedControlFrame::Immediate { .. }) => {
                 pop_front = true;
             }
             Some(QueuedControlFrame::Chunked(queued)) => {
                 if !queued.started {
-                    send_control_text(rtc, channels, queued.start.clone());
+                    // Sent exactly once; taking it avoids the clone (the
+                    // byte accounting was memoized at enqueue).
+                    let start = std::mem::take(&mut queued.plan.start);
                     queued.started = true;
+                    send_control_text(rtc, channels, start);
                 }
-                while queued.credit > 0 && queued.next_chunk < queued.chunks.len() {
-                    let text = queued.chunks[queued.next_chunk].clone();
+                while queued.credit > 0 {
+                    // Rendered lazily per credit — never materialized up
+                    // front, never cloned at send.
+                    let Some(text) = queued.plan.render_chunk(queued.next_chunk) else {
+                        break;
+                    };
                     queued.next_chunk += 1;
                     queued.credit -= 1;
                     send_control_text(rtc, channels, text);
                 }
-                if queued.next_chunk >= queued.chunks.len() {
-                    completed_end = Some(queued.end.clone());
+                if queued.next_chunk >= queued.plan.chunk_count() {
+                    completed = true;
                 }
             }
             None => break,
         }
-        if let Some(end) = completed_end {
-            outbound_queue.frames.pop_front();
-            send_control_text(rtc, channels, end);
+        if completed {
+            if let Some(QueuedControlFrame::Chunked(queued)) = outbound_queue.pop_front() {
+                send_control_text(rtc, channels, queued.plan.end);
+            }
             continue;
         }
         if pop_front {
-            outbound_queue.frames.pop_front();
+            if let Some(QueuedControlFrame::Immediate { text, .. }) = outbound_queue.pop_front() {
+                send_control_text(rtc, channels, text);
+            }
             continue;
         }
         break;
@@ -1176,5 +1215,77 @@ mod tests {
         assert_eq!(chunk_control_response_frame(response, 4096, 16).len(), 1);
         let event = serde_json::json!({"t":"event","id":"e1","payload":{"text":"large enough"}});
         assert_eq!(chunk_control_response_frame(event, 1, 1).len(), 1);
+    }
+
+    /// The outbound queue keeps exact byte accounting across enqueue,
+    /// cancel, and drain-to-empty, and refuses chunked admission once the
+    /// resident bytes reach the per-connection cap.
+    #[test]
+    fn outbound_queue_accounts_bytes_and_caps_chunked_admission() {
+        fn plan(id: &str, payload_len: usize) -> ChunkedFramePlan {
+            ChunkedFramePlan::response(
+                id.to_string(),
+                format!("{id}:0"),
+                "start".into(),
+                "end".into(),
+                vec![b'x'; payload_len],
+                CONTROL_RESPONSE_CHUNK_BYTES,
+            )
+        }
+
+        let mut queue = OutboundControlQueue::new();
+        assert!(queue.enqueue_chunked(plan("a", 1024)));
+        queue.enqueue_immediate("b".into(), "{\"t\":\"response\"}".into());
+        assert!(queue.queued_bytes > 1024);
+
+        // Cancel debits exactly what was credited.
+        assert!(queue.cancel("a"));
+        assert!(queue.cancel("b"));
+        assert_eq!(queue.queued_bytes, 0);
+        assert!(queue.frames.is_empty());
+
+        // Admission control refuses chunked frames at the cap (saturate
+        // the accounting directly rather than allocating 128 MiB).
+        queue.queued_bytes = CONTROL_OUTBOUND_QUEUE_MAX_BYTES;
+        assert!(!queue.enqueue_chunked(plan("c", 1024)));
+        assert!(queue.frames.is_empty());
+        queue.queued_bytes = 0;
+
+        // Draining to empty returns the accounting to zero.
+        assert!(queue.enqueue_chunked(plan("d", 4096)));
+        queue.enqueue_immediate("e".into(), "{}".into());
+        while queue.pop_front().is_some() {}
+        assert_eq!(queue.queued_bytes, 0);
+    }
+
+    /// A queued chunked frame renders each chunk lazily and exactly once,
+    /// byte-identical to the eager path (`render_all` is the eager
+    /// rendering the reassembly tests above already pin).
+    #[test]
+    fn chunked_plan_renders_lazily_with_stable_sequence() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let plan = ChunkedFramePlan::byte_stream(
+            "dl".into(),
+            "dl:file".into(),
+            "start".into(),
+            "end".into(),
+            payload.clone(),
+            16,
+        );
+        assert_eq!(plan.chunk_count(), 7);
+        assert!(plan.render_chunk(7).is_none());
+        let mut decoded = Vec::new();
+        for seq in 0..plan.chunk_count() {
+            let text = plan.render_chunk(seq).unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(frame["t"], "byte_stream_chunk");
+            assert_eq!(frame["seq"], seq);
+            decoded.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(frame["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(decoded, payload);
     }
 }

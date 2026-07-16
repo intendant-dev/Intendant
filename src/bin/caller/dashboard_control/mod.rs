@@ -65,6 +65,32 @@ const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
 const CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES: usize = 64 * 1024;
 const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_BYTE_STREAM_CHUNK_BYTES: usize = 16 * 1024;
+/// Capacity of the per-connection bounded PTY-output lane (the tunnel twin
+/// of `ws_session::TERMINAL_FORWARD_LANE_CAP`). Entries are one JSON frame
+/// around a base64 chunk (terminal.rs merges output up to 64 KiB per
+/// entry), so the lane holds ~1.4 MiB worst case — the same order as
+/// terminal.rs's own 1 MiB per-listener bound that takes over
+/// (drop-oldest) once this lane fills and the forwarders park.
+const TERMINAL_OUTPUT_LANE_CAP: usize = 16;
+/// Stop draining the terminal-output lane once the control channel's SCTP
+/// send buffer holds this much; resume at the low watermark. The response
+/// lane is client-credit-gated, but PTY output had no end-to-end
+/// backpressure — a stalled tab grew the unbounded SCTP pending queue at
+/// PTY rate.
+const TERMINAL_LANE_BUFFERED_HIGH_WATERMARK_BYTES: usize = 1024 * 1024;
+/// Low watermark paired with [`TERMINAL_LANE_BUFFERED_HIGH_WATERMARK_BYTES`].
+const TERMINAL_LANE_BUFFERED_LOW_WATERMARK_BYTES: usize = 256 * 1024;
+/// Per-connection cap on bytes resident in the credit-gated outbound
+/// queue. Sized above the single largest legitimate response (the 100 MB
+/// fs-read cap) so one full-size download always fits, while N stalled
+/// downloads to a quiet client can no longer pin N full payloads.
+const CONTROL_OUTBOUND_QUEUE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+/// Clamp a byte watermark into the `u32` the rtc data-channel threshold
+/// setters take.
+fn watermark_to_u32(bytes: usize) -> u32 {
+    u32::try_from(bytes).unwrap_or(u32::MAX)
+}
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
@@ -1977,6 +2003,13 @@ impl InboundUploadState {
 
 pub(crate) struct OutboundControlQueue {
     frames: VecDeque<QueuedControlFrame>,
+    /// Bytes resident in `frames` (immediate texts + chunked payloads with
+    /// their start/end envelopes), maintained on every enqueue/removal.
+    /// Chunked enqueues are refused above
+    /// [`CONTROL_OUTBOUND_QUEUE_MAX_BYTES`] — before this cap, N stalled
+    /// credit-gated downloads pinned N full payload materializations for
+    /// as long as the client stayed quiet.
+    queued_bytes: usize,
 }
 
 enum QueuedControlFrame {
@@ -1984,32 +2017,158 @@ enum QueuedControlFrame {
     Chunked(QueuedChunkedFrame),
 }
 
+impl QueuedControlFrame {
+    /// Byte accounting for [`OutboundControlQueue::queued_bytes`], captured
+    /// at enqueue and debited verbatim at removal (chunked frames memoize
+    /// theirs, so draining `start`/`end` out of the plan cannot skew it).
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Immediate { text, .. } => text.len(),
+            Self::Chunked(queued) => queued.accounted_bytes,
+        }
+    }
+}
+
 struct QueuedChunkedFrame {
-    request_id: String,
-    chunk_id: String,
-    start: String,
-    chunks: Vec<String>,
-    end: String,
+    plan: ChunkedFramePlan,
+    /// `plan` size at enqueue (see [`QueuedControlFrame::queued_bytes`]).
+    accounted_bytes: usize,
     next_chunk: usize,
     credit: usize,
     started: bool,
 }
 
-pub(crate) enum ControlFrameTexts {
-    Immediate(Vec<String>),
-    Chunked {
+/// A chunked wire frame with its payload held raw and every
+/// `*_chunk` frame rendered lazily at send time. The old shape
+/// materialized each base64+JSON chunk String up front — ~1.37× the
+/// payload held simultaneously with the payload itself — and the drain
+/// cloned each chunk String again at send: ~5 copies end to end and
+/// ~2.4× payload peak RSS per queued download.
+pub(crate) struct ChunkedFramePlan {
+    pub(crate) request_id: String,
+    pub(crate) chunk_id: String,
+    /// Small header/footer frames, rendered eagerly (they carry counts and
+    /// metadata, not payload).
+    pub(crate) start: String,
+    pub(crate) end: String,
+    envelope: ChunkEnvelope,
+    payload: Vec<u8>,
+    chunk_bytes: usize,
+}
+
+/// Which chunk-frame envelope [`ChunkedFramePlan::render_chunk`] emits.
+enum ChunkEnvelope {
+    /// `response_chunk` frames around chunked JSON response text.
+    Response,
+    /// `byte_stream_chunk` frames around raw byte payloads.
+    ByteStream,
+}
+
+impl ChunkedFramePlan {
+    /// Plan for chunked JSON response text (`response_chunk` envelopes).
+    pub(crate) fn response(
         request_id: String,
         chunk_id: String,
         start: String,
-        chunks: Vec<String>,
         end: String,
-    },
+        payload: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            chunk_id,
+            start,
+            end,
+            envelope: ChunkEnvelope::Response,
+            payload,
+            chunk_bytes,
+        }
+    }
+
+    /// Plan for a raw byte download (`byte_stream_chunk` envelopes).
+    pub(crate) fn byte_stream(
+        request_id: String,
+        chunk_id: String,
+        start: String,
+        end: String,
+        payload: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            chunk_id,
+            start,
+            end,
+            envelope: ChunkEnvelope::ByteStream,
+            payload,
+            chunk_bytes,
+        }
+    }
+
+    pub(crate) fn chunk_count(&self) -> usize {
+        self.payload.len().div_ceil(self.chunk_bytes.max(1))
+    }
+
+    /// Render the `seq`-th chunk frame (base64 slice + envelope), `None`
+    /// past the end. Byte-identical to the frames the eager path built.
+    pub(crate) fn render_chunk(&self, seq: usize) -> Option<String> {
+        let offset = seq.checked_mul(self.chunk_bytes)?;
+        if offset >= self.payload.len() || self.chunk_bytes == 0 {
+            return None;
+        }
+        let end = offset.saturating_add(self.chunk_bytes).min(self.payload.len());
+        let data = base64::engine::general_purpose::STANDARD.encode(&self.payload[offset..end]);
+        let frame = match self.envelope {
+            ChunkEnvelope::Response => serde_json::json!({
+                "t": "response_chunk",
+                "id": self.request_id,
+                "chunk_id": self.chunk_id,
+                "seq": seq,
+                "data": data,
+            }),
+            ChunkEnvelope::ByteStream => serde_json::json!({
+                "t": "byte_stream_chunk",
+                "id": self.request_id,
+                "stream_id": self.chunk_id,
+                "seq": seq,
+                "data": data,
+            }),
+        };
+        Some(frame.to_string())
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.payload
+            .len()
+            .saturating_add(self.start.len())
+            .saturating_add(self.end.len())
+    }
+
+    /// All frames in order (start, chunks, end) — test helpers and the
+    /// no-credit immediate send path.
+    pub(crate) fn render_all(&self) -> Vec<String> {
+        let mut frames = Vec::with_capacity(self.chunk_count() + 2);
+        frames.push(self.start.clone());
+        for seq in 0..self.chunk_count() {
+            if let Some(text) = self.render_chunk(seq) {
+                frames.push(text);
+            }
+        }
+        frames.push(self.end.clone());
+        frames
+    }
+}
+
+pub(crate) enum ControlFrameTexts {
+    Immediate(Vec<String>),
+    Chunked(ChunkedFramePlan),
 }
 
 impl OutboundControlQueue {
     fn new() -> Self {
         Self {
             frames: VecDeque::new(),
+            queued_bytes: 0,
         }
     }
 
@@ -2018,30 +2177,42 @@ impl OutboundControlQueue {
     }
 
     fn enqueue_immediate(&mut self, request_id: String, text: String) {
-        self.frames
-            .push_back(QueuedControlFrame::Immediate { request_id, text });
+        let frame = QueuedControlFrame::Immediate { request_id, text };
+        self.queued_bytes = self.queued_bytes.saturating_add(frame.queued_bytes());
+        self.frames.push_back(frame);
     }
 
-    fn enqueue_chunked(
-        &mut self,
-        request_id: String,
-        chunk_id: String,
-        start: String,
-        chunks: Vec<String>,
-        end: String,
-    ) {
-        self.cancel_chunk(&chunk_id);
+    /// Queue a chunked frame; `false` when the per-connection byte cap is
+    /// exhausted (the caller answers the request with an error instead —
+    /// admission control, never a silent drop).
+    #[must_use]
+    fn enqueue_chunked(&mut self, plan: ChunkedFramePlan) -> bool {
+        self.cancel_chunk(&plan.chunk_id.clone());
+        let accounted_bytes = plan.resident_bytes();
+        if self
+            .queued_bytes
+            .saturating_add(accounted_bytes)
+            > CONTROL_OUTBOUND_QUEUE_MAX_BYTES
+        {
+            return false;
+        }
+        self.queued_bytes = self.queued_bytes.saturating_add(accounted_bytes);
         self.frames
             .push_back(QueuedControlFrame::Chunked(QueuedChunkedFrame {
-                request_id,
-                chunk_id,
-                start,
-                chunks,
-                end,
+                plan,
+                accounted_bytes,
                 next_chunk: 0,
                 credit: CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT,
                 started: false,
             }));
+        true
+    }
+
+    /// Remove and return the front frame, keeping the byte accounting.
+    fn pop_front(&mut self) -> Option<QueuedControlFrame> {
+        let frame = self.frames.pop_front()?;
+        self.queued_bytes = self.queued_bytes.saturating_sub(frame.queued_bytes());
+        Some(frame)
     }
 
     fn grant_credit(&mut self, request_id: &str, chunk_id: Option<&str>, chunks: usize) {
@@ -2053,33 +2224,48 @@ impl OutboundControlQueue {
             let QueuedControlFrame::Chunked(queued) = frame else {
                 continue;
             };
-            let matches_chunk = chunk_id.map(|id| queued.chunk_id == id).unwrap_or(false);
-            if matches_chunk || (chunk_id.is_none() && queued.request_id == request_id) {
+            let matches_chunk = chunk_id
+                .map(|id| queued.plan.chunk_id == id)
+                .unwrap_or(false);
+            if matches_chunk || (chunk_id.is_none() && queued.plan.request_id == request_id) {
                 queued.credit = queued.credit.saturating_add(granted);
             }
         }
     }
 
     fn cancel(&mut self, request_id: &str) -> bool {
-        let before = self.frames.len();
-        self.frames.retain(|frame| match frame {
+        self.retain_accounted(|frame| match frame {
             QueuedControlFrame::Immediate {
                 request_id: queued_id,
                 ..
             } => queued_id != request_id,
             QueuedControlFrame::Chunked(queued) => {
-                queued.request_id != request_id && queued.chunk_id != request_id
+                queued.plan.request_id != request_id && queued.plan.chunk_id != request_id
             }
-        });
-        self.frames.len() != before
+        })
     }
 
     fn cancel_chunk(&mut self, chunk_id: &str) -> bool {
-        let before = self.frames.len();
-        self.frames.retain(|frame| match frame {
+        self.retain_accounted(|frame| match frame {
             QueuedControlFrame::Immediate { .. } => true,
-            QueuedControlFrame::Chunked(queued) => queued.chunk_id != chunk_id,
+            QueuedControlFrame::Chunked(queued) => queued.plan.chunk_id != chunk_id,
+        })
+    }
+
+    /// `retain` that debits removed frames from the byte accounting;
+    /// returns whether anything was removed.
+    fn retain_accounted(&mut self, keep: impl Fn(&QueuedControlFrame) -> bool) -> bool {
+        let before = self.frames.len();
+        let mut removed_bytes = 0usize;
+        self.frames.retain(|frame| {
+            if keep(frame) {
+                true
+            } else {
+                removed_bytes = removed_bytes.saturating_add(frame.queued_bytes());
+                false
+            }
         });
+        self.queued_bytes = self.queued_bytes.saturating_sub(removed_bytes);
         self.frames.len() != before
     }
 }
@@ -3523,6 +3709,8 @@ mod tests {
     ) -> Option<serde_json::Value> {
         let mut inbound_uploads = HashMap::new();
         let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let (terminal_output_tx, _terminal_output_rx) =
+            mpsc::channel(TERMINAL_OUTPUT_LANE_CAP);
         let mut terminal_forwarders = HashMap::new();
         let display_input_tx = DisplayInputForwarder::test_sink();
         control_frame_response(
@@ -3533,6 +3721,7 @@ mod tests {
             outbound_queue,
             &mut inbound_uploads,
             &terminal_tx,
+            &terminal_output_tx,
             &mut terminal_forwarders,
             &display_input_tx,
         )
@@ -5604,13 +5793,14 @@ mod tests {
         .unwrap();
         assert_eq!(status["result"]["response_credit_enabled"], true);
 
-        outbound.enqueue_chunked(
+        assert!(outbound.enqueue_chunked(ChunkedFramePlan::response(
             "large".into(),
             "large:0".into(),
             "start".into(),
-            vec!["chunk".into()],
             "end".into(),
-        );
+            b"chunk".to_vec(),
+            CONTROL_RESPONSE_CHUNK_BYTES,
+        )));
         if let Some(QueuedControlFrame::Chunked(queued)) = outbound.frames.front_mut() {
             queued.credit = 0;
         }
