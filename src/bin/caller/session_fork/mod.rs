@@ -23,8 +23,10 @@
 
 mod claude_tree;
 mod fork_points;
+mod native;
 pub(crate) use claude_tree::*;
 pub(crate) use fork_points::*;
+pub(crate) use native::*;
 
 use serde::Serialize;
 
@@ -42,20 +44,20 @@ pub(crate) struct ForkPoint {
     pub(crate) granularity: &'static str,
     /// 1-based user-turn / round ordinal this point relates to.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) turn: Option<u32>,
+    pub turn: Option<u32>,
     /// Native only: `seq` of the last message the fork keeps.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) seq: Option<u64>,
+    pub seq: Option<u64>,
     /// Codex only: the rollout item id of the anchor.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) item_id: Option<String>,
+    pub item_id: Option<String>,
     /// Codex only: cut position relative to the item (`before`/`after`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) position: Option<&'static str>,
     /// Claude Code only: the transcript message uuid the fork keeps
     /// history through (the chain-slice anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) message_uuid: Option<String>,
+    pub message_uuid: Option<String>,
     /// Claude Code only: the anchor sits on history replaced by the
     /// newest compact boundary. Informational — the chain-slice fork
     /// omits the boundary and keeps full pre-compaction history.
@@ -136,6 +138,48 @@ impl Default for ForkPointQuery {
             offset: 0,
             limit: FORK_POINT_DEFAULT_LIMIT,
         }
+    }
+}
+
+/// The wire form of a chosen fork point, carried by
+/// `ControlMsg::ForkSessionAtAnchor`. Field usage mirrors `ForkPoint`:
+/// codex anchors use `item_id`/`position` or `turn`, native uses `seq`,
+/// claude-code uses `message_uuid`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkAnchorSpec {
+    /// Fork-point kind from the catalog (`turn-boundary`, `item-anchor`,
+    /// `round`, `head`, `message`, `branch-tip`).
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_uuid: Option<String>,
+}
+
+impl ForkAnchorSpec {
+    /// One-line summary for result events and logs.
+    pub(crate) fn summary(&self) -> String {
+        let mut parts = vec![self.kind.clone()];
+        if let Some(turn) = self.turn {
+            parts.push(format!("turn {turn}"));
+        }
+        if let Some(seq) = self.seq {
+            parts.push(format!("seq {seq}"));
+        }
+        if let Some(item_id) = &self.item_id {
+            let position = self.position.as_deref().unwrap_or("after");
+            parts.push(format!("{position} {item_id}"));
+        }
+        if let Some(uuid) = &self.message_uuid {
+            parts.push(format!("through {uuid}"));
+        }
+        parts.join(", ")
     }
 }
 

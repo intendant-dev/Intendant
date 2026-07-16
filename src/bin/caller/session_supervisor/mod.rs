@@ -22,6 +22,7 @@ pub(crate) use routing::*;
 mod agent_config;
 pub(crate) use agent_config::*;
 mod dispatch;
+mod fork;
 mod registry;
 
 #[derive(Clone)]

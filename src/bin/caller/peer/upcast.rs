@@ -913,6 +913,25 @@ impl AppEventUpcaster {
                 s.ephemeral = *ephemeral;
             })),
 
+            AppEvent::SessionForkResult {
+                parent_session_id,
+                child_session_id,
+                error,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                match (child_session_id, error) {
+                    (Some(child), _) => {
+                        format!("session fork: {parent_session_id} -> {child}")
+                    }
+                    (_, Some(error)) => {
+                        format!("session fork of {parent_session_id} failed: {error}")
+                    }
+                    _ => format!("session fork of {parent_session_id} completed"),
+                },
+            )],
+
             AppEvent::SessionGoal { session_id, goal } => session_updated_events(
                 self.sessions.update(session_id, |s| s.goal = goal.clone()),
             ),
@@ -2327,6 +2346,25 @@ impl WireEventUpcaster {
                 s.relationship = relationship.clone();
                 s.ephemeral = *ephemeral;
             })),
+
+            OutboundEvent::SessionForkResult {
+                parent_session_id,
+                child_session_id,
+                error,
+                ..
+            } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                match (child_session_id, error) {
+                    (Some(child), _) => {
+                        format!("session fork: {parent_session_id} -> {child}")
+                    }
+                    (_, Some(error)) => {
+                        format!("session fork of {parent_session_id} failed: {error}")
+                    }
+                    _ => format!("session fork of {parent_session_id} completed"),
+                },
+            )],
 
             OutboundEvent::SessionGoal { session_id, goal } => session_updated_events(
                 self.sessions.update(session_id, |s| s.goal = goal.clone()),

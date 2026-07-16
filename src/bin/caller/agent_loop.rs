@@ -2656,6 +2656,15 @@ Proceed with explicit assumptions and continue without additional questions."
         }
     }
 
+    // Persist the conversation on every exit path: the in-loop auto-save
+    // runs at turn end, but done-signal exits `break` before reaching it —
+    // without this, a session whose final round ends in signal_done leaves
+    // no conversation.jsonl for cold resume or fork-from-anchor.
+    if let Err(e) = conversation.save_to_file(&log_dir.join("conversation.jsonl")) {
+        slog(&session_log, |l| {
+            l.debug(&format!("Failed to save conversation at loop exit: {}", e))
+        });
+    }
     slog(&session_log, |l| l.info("Agent loop finished"));
     Ok((loop_stats, exit_reason))
 }

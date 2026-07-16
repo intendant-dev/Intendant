@@ -907,6 +907,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::CreateSession { .. }
         | ControlMsg::SpawnSubAgent { .. }
         | ControlMsg::ResumeSession { .. }
+        | ControlMsg::ForkSessionAtAnchor { .. }
         | ControlMsg::EditUserMessage { .. } => PeerOperation::Task,
         ControlMsg::Approve { .. }
         | ControlMsg::Deny { .. }

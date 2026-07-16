@@ -338,6 +338,18 @@ pub enum AppEvent {
         relationship: String,
         ephemeral: bool,
     },
+    /// Outcome of a `ForkSessionAtAnchor` request: the child session id on
+    /// success, or the error. `request_id` echoes the request's
+    /// correlation id so frontends can pair the result to their action.
+    SessionForkResult {
+        request_id: Option<String>,
+        parent_session_id: String,
+        child_session_id: Option<String>,
+        source: String,
+        relationship: String,
+        anchor_summary: String,
+        error: Option<String>,
+    },
     /// Describes which frontend actions are supported for a visible session.
     /// Synthetic child sessions can use this to expose follow-ups while
     /// disabling controls the underlying backend cannot honor for that target.
@@ -1695,6 +1707,35 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
     },
+    /// Fork a session into a NEW session cut at a chosen fork point (from
+    /// `GET /api/session/{id}/fork-points`). The fork engines only ever
+    /// copy parent artifacts — the parent session/transcript is never
+    /// mutated — and fork lineage/config ride internal launch overrides
+    /// the wire cannot set. The child is spawned/attached immediately and
+    /// announced via a `session_fork_result` event carrying `request_id`.
+    ForkSessionAtAnchor {
+        /// Session source: "intendant", "codex", or "claude-code".
+        source: String,
+        /// Display id from the Sessions tab. For Intendant this is the
+        /// session log id; for external backends the native session id.
+        session_id: String,
+        /// Backend-specific resume token. Defaults to `session_id`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_id: Option<String>,
+        /// The chosen fork point.
+        anchor: crate::session_fork::ForkAnchorSpec,
+        /// Optional display name for the child session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Optional prompt sent as the child's first turn once attached.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        /// Client correlation id echoed on the result event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     FollowUp {
         /// Optional target session. Omitted means "current active session"
         /// for legacy single-session frontends.
@@ -2350,6 +2391,23 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             child_session_id: child_session_id.clone(),
             relationship: relationship.clone(),
             ephemeral: *ephemeral,
+        }),
+        AppEvent::SessionForkResult {
+            request_id,
+            parent_session_id,
+            child_session_id,
+            source,
+            relationship,
+            anchor_summary,
+            error,
+        } => Some(OutboundEvent::SessionForkResult {
+            request_id: request_id.clone(),
+            parent_session_id: parent_session_id.clone(),
+            child_session_id: child_session_id.clone(),
+            source: source.clone(),
+            relationship: relationship.clone(),
+            anchor_summary: anchor_summary.clone(),
+            error: error.clone(),
         }),
         AppEvent::SessionCapabilities {
             session_id,
