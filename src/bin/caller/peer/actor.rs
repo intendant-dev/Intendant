@@ -56,13 +56,20 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 struct Backoff {
     current: Duration,
     attempt: u32,
+    /// Per-actor jitter phase. Deriving jitter from the attempt counter
+    /// alone put every peer actor on an identical schedule — after a
+    /// network blip the whole fleet reconnected in lockstep (thundering
+    /// herd). Seeding by peer identity keeps jitter deterministic per
+    /// actor (tests stay reproducible) while decorrelating actors.
+    seed: u32,
 }
 
 impl Backoff {
-    fn new() -> Self {
+    fn new(seed: u32) -> Self {
         Self {
             current: INITIAL_BACKOFF,
             attempt: 0,
+            seed,
         }
     }
 
@@ -72,18 +79,29 @@ impl Backoff {
     }
 
     /// Return the next delay and advance internal state. Jitter is
-    /// deterministic (derived from the attempt counter) so tests are
-    /// reproducible; a real rng can be swapped in later without
-    /// changing the shape.
+    /// deterministic (derived from the attempt counter and the actor's
+    /// seed) so tests are reproducible; a real rng can be swapped in
+    /// later without changing the shape.
     fn next_delay(&mut self) -> Duration {
         let base_ms = self.current.as_millis() as i64;
-        // ±20% jitter, stepping through 40 positions based on attempt.
-        let jitter_bps = (self.attempt as i64 * 137) % 40 - 20;
+        // ±20% jitter, stepping through 40 positions based on attempt,
+        // phase-shifted per actor.
+        let jitter_bps = ((self.attempt as i64 * 137) + self.seed as i64) % 40 - 20;
         let jittered_ms = (base_ms * (100 + jitter_bps) / 100).max(0) as u64;
         self.current = (self.current * 2).min(MAX_BACKOFF);
         self.attempt = self.attempt.saturating_add(1);
         Duration::from_millis(jittered_ms)
     }
+}
+
+/// Stable per-actor jitter seed from the peer id (FNV-1a over the bytes).
+fn backoff_seed(peer_id: &PeerId) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in peer_id.0.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +193,7 @@ impl PeerActor {
 
 impl PeerActor {
     pub async fn run(mut self) {
-        let mut backoff = Backoff::new();
+        let mut backoff = Backoff::new(backoff_seed(&self.peer_id));
 
         loop {
             // ---- Attempt connect ----
@@ -458,16 +476,27 @@ impl PeerActor {
 
     /// Durable-first fan-out: await on the log sink (must not drop),
     /// then broadcast (lossy, slow subscribers skip).
+    ///
+    /// Streaming `Message { partial: true }` deltas stay off the durable
+    /// log: the final message carries the complete text, so logging every
+    /// delta stored the streamed output twice and made `peers.jsonl` grow
+    /// at model-streaming rate (≤25 Hz per busy peer session) instead of
+    /// the "few hundred events per minute" its writer was sized for. Live
+    /// consumers still get every partial via the broadcast. Elided
+    /// partials still advance `seq`, so a gap in the log's sequence marks
+    /// exactly where deltas were skipped.
     async fn emit_event(&mut self, event: PeerEvent) {
         self.seq = self.seq.saturating_add(1);
-        let tagged = TaggedPeerEvent {
-            peer: self.peer_id.clone(),
-            payload: event.clone(),
-            seq: self.seq,
-        };
-        // Durable sink: await. If closed, the log writer is gone
-        // (process shutdown) and we drop silently.
-        let _ = self.log_sink.send(tagged).await;
+        if !matches!(&event, PeerEvent::Message { partial: true, .. }) {
+            let tagged = TaggedPeerEvent {
+                peer: self.peer_id.clone(),
+                payload: event.clone(),
+                seq: self.seq,
+            };
+            // Durable sink: await. If closed, the log writer is gone
+            // (process shutdown) and we drop silently.
+            let _ = self.log_sink.send(tagged).await;
+        }
         // Broadcast: non-blocking. Err means no subscribers — that's
         // fine, we still wrote to the durable sink.
         let _ = self.events_out_tx.send(event);
@@ -485,7 +514,7 @@ mod tests {
 
     #[test]
     fn backoff_resets() {
-        let mut b = Backoff::new();
+        let mut b = Backoff::new(0);
         let _ = b.next_delay();
         let _ = b.next_delay();
         let _ = b.next_delay();
@@ -498,7 +527,7 @@ mod tests {
 
     #[test]
     fn backoff_caps_at_max() {
-        let mut b = Backoff::new();
+        let mut b = Backoff::new(7);
         // Burn a generous number of attempts to ensure we saturate.
         for _ in 0..20 {
             let _ = b.next_delay();
@@ -512,14 +541,33 @@ mod tests {
 
     #[test]
     fn backoff_initial_delay_is_jittered_but_bounded() {
-        let mut b = Backoff::new();
-        let d = b.next_delay();
-        // First delay should be within ±20% of INITIAL_BACKOFF.
-        let min = INITIAL_BACKOFF * 80 / 100;
-        let max = INITIAL_BACKOFF * 120 / 100;
+        for seed in [0, 1, 19, u32::MAX] {
+            let mut b = Backoff::new(seed);
+            let d = b.next_delay();
+            // First delay should be within ±20% of INITIAL_BACKOFF.
+            let min = INITIAL_BACKOFF * 80 / 100;
+            let max = INITIAL_BACKOFF * 120 / 100;
+            assert!(
+                d >= min && d <= max,
+                "seed {seed}: got {d:?}, expected between {min:?} and {max:?}"
+            );
+        }
+    }
+
+    /// Distinct peers must not share a reconnect phase (the thundering
+    /// herd this seed exists to break): different ids yield different
+    /// first-attempt delays for at least some pair.
+    #[test]
+    fn backoff_seed_decorrelates_actors() {
+        let delays: std::collections::HashSet<Duration> = (0..8)
+            .map(|i| {
+                let id = PeerId::new(crate::peer::id::PeerKind::Intendant, &format!("peer-{i}"));
+                Backoff::new(backoff_seed(&id)).next_delay()
+            })
+            .collect();
         assert!(
-            d >= min && d <= max,
-            "got {d:?}, expected between {min:?} and {max:?}"
+            delays.len() > 1,
+            "eight distinct peer ids produced one shared delay schedule"
         );
     }
 }
