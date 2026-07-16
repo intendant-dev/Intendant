@@ -438,7 +438,10 @@ mod tests {
     /// to lossy replacement (the pre-move behavior for both cases).
     #[test]
     fn output_buf_into_string_moves_utf8_and_lossy_falls_back() {
-        assert_eq!(output_buf_into_string(b"plain output".to_vec()), "plain output");
+        assert_eq!(
+            output_buf_into_string(b"plain output".to_vec()),
+            "plain output"
+        );
         let mut broken = b"tail: ".to_vec();
         broken.push(0xFF);
         assert_eq!(output_buf_into_string(broken), "tail: \u{FFFD}");

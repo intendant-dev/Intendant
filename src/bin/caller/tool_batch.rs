@@ -476,7 +476,10 @@ mod tests {
         );
 
         // Unparseable input falls back to the raw string (UI collapses it).
-        assert_eq!(BatchFacts::from_json("not json").commands_preview, "not json");
+        assert_eq!(
+            BatchFacts::from_json("not json").commands_preview,
+            "not json"
+        );
         // A batch whose every command previews to nothing falls back too.
         let empty_parts = r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#;
         assert_eq!(

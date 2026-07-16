@@ -6450,7 +6450,10 @@ mod tests {
             !agent_output_negative_memo_fresh(root_b.path(), &ids[0]),
             "a miss under one logs root must not veto sweeps under another"
         );
-        assert!(!agent_output_negative_memo_fresh(root_a.path(), "memo-probe-other"));
+        assert!(!agent_output_negative_memo_fresh(
+            root_a.path(),
+            "memo-probe-other"
+        ));
     }
 
     /// The bounded sweep still resolves ids from sibling dirs and reports

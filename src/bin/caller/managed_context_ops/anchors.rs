@@ -2112,7 +2112,11 @@ mod tests {
         }
     }
 
-    fn anchor_probe(first_line: usize, last_line: usize, last_item_is_model: bool) -> ContextRewindAnchorCatalogEntry {
+    fn anchor_probe(
+        first_line: usize,
+        last_line: usize,
+        last_item_is_model: bool,
+    ) -> ContextRewindAnchorCatalogEntry {
         ContextRewindAnchorCatalogEntry {
             ordinal: 0,
             item_id: "probe".to_string(),
@@ -2282,8 +2286,13 @@ mod tests {
         });
         std::fs::write(
             &path,
-            [report(100).to_string(), decoy.to_string(), report(250).to_string(), decoy.to_string()]
-                .join("\n"),
+            [
+                report(100).to_string(),
+                decoy.to_string(),
+                report(250).to_string(),
+                decoy.to_string(),
+            ]
+            .join("\n"),
         )
         .unwrap();
         let usage = latest_context_rewind_backend_usage_in_rollout(&path)

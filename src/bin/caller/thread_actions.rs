@@ -1337,12 +1337,11 @@ pub(crate) async fn spawn_single_fission_branch(
     let branch_worktree = if use_worktree {
         let blocking_root = config.project_root.to_path_buf();
         let branch = fission_branch_git_name(ctx.group_id, ordinal);
-        let wt = tokio::task::spawn_blocking(move || {
-            worktree::create(&blocking_root, &branch, "HEAD")
-        })
-        .await
-        .map_err(|e| format!("worktree creation task failed: {e}"))?
-        .map_err(|e| format!("worktree creation failed: {e}"))?;
+        let wt =
+            tokio::task::spawn_blocking(move || worktree::create(&blocking_root, &branch, "HEAD"))
+                .await
+                .map_err(|e| format!("worktree creation task failed: {e}"))?
+                .map_err(|e| format!("worktree creation failed: {e}"))?;
         Some(wt)
     } else {
         None

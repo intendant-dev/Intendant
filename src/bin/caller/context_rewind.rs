@@ -176,9 +176,9 @@ pub fn list_record_summaries(log_dir: &Path) -> io::Result<Vec<ContextRewindReco
 /// Shared listing walk: every `*.json` under `context_rewinds/`,
 /// deserialized as `T` (full record or skinny summary), unparseable files
 /// skipped, newest first.
-fn list_records_as<T: serde::de::DeserializeOwned>(log_dir: &Path) -> io::Result<Vec<T>>
+fn list_records_as<T>(log_dir: &Path) -> io::Result<Vec<T>>
 where
-    T: RecordCreatedAt,
+    T: serde::de::DeserializeOwned + RecordCreatedAt,
 {
     let dir = records_dir(log_dir);
     let entries = match fs::read_dir(dir) {
