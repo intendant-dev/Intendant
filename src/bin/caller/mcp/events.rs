@@ -1644,14 +1644,14 @@ pub(crate) fn hydrate_requested_session_status_from_logs(
         // noted on PR #343, not patchable here without one.
         //
         // Enter the replay scope (RAII — a panic mid-fold must not leave
-        // the state stuck in "hydrating" mode): replays never trigger the
-        // over-cap prune and never invalidate the controller-loop cache
-        // (see note_session_ended / note_live_session_lifecycle_change).
-        let mut replay = s.begin_hydration_replay(if base.bytes == 0 {
-            HydrationReplayKind::Full
-        } else {
-            HydrationReplayKind::Tail
-        });
+        // the state stuck in "hydrating" mode), carrying the hydration
+        // TARGET: replays never trigger the over-cap prune, never
+        // invalidate the controller-loop cache, and rows lacking a session
+        // id (round_complete predates stamping) attribute to the target —
+        // never to the daemon's active session (see
+        // note_session_ended / note_live_session_lifecycle_change /
+        // unattributed_event_session_id).
+        let mut replay = s.begin_hydration_replay(session_id);
         let advanced = walk_session_jsonl_tail(&tail, base, |_, line| {
             let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
                 return true;
@@ -1934,6 +1934,77 @@ mod tests {
             ));
             assert_eq!(
                 s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+        });
+    }
+
+    #[test]
+    fn hydration_attributes_unattributed_rows_to_the_target_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let home = tempdir().unwrap();
+            let session_id = "sess-old";
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+            log.write_meta(None, Some("old session task"));
+            log.agent_started_with_session_id(
+                Some(session_id),
+                1,
+                "round one",
+                None,
+                Some("Codex"),
+            );
+            // The REAL writer: round_complete rows persist NO session id
+            // (replay reconstructs session_id: None), and this one is the
+            // log's FINAL row — nothing after it re-attributes.
+            log.round_complete(2, 1);
+
+            // An unrelated session is live and active on the daemon.
+            let state = test_state();
+            let mut s = state.write().await;
+            s.session_id = "sess-live".to_string();
+            s.note_session_phase(Some("sess-live"), Some(3), Phase::RunningAgent, None);
+
+            // Hydrating `sess-old` must attribute the naked round_complete
+            // to the HYDRATION TARGET: the requested session reaches
+            // WaitingFollowUp and the live session is untouched. (The
+            // active-session fallback here both missed the target and
+            // corrupted the live session — with the cursor then committed
+            // past the row, so neither side ever healed.)
+            assert!(hydrate_requested_session_status_from_logs(
+                home.path(),
+                &mut s,
+                session_id
+            ));
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+            assert_eq!(
+                s.session_status_for_id(session_id).map(|st| st.round),
+                Some(2)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live")
+                    .map(|st| st.phase.clone()),
+                Some(Phase::RunningAgent)
+            );
+
+            // Stays consistent once the cursor sits at EOF.
+            hydrate_requested_session_status_from_logs(home.path(), &mut s, session_id);
+            assert_eq!(
+                s.session_status_for_id(session_id)
+                    .map(|st| st.phase.clone()),
+                Some(Phase::WaitingFollowUp)
+            );
+            assert_eq!(
+                s.session_status_for_id("sess-live")
                     .map(|st| st.phase.clone()),
                 Some(Phase::RunningAgent)
             );

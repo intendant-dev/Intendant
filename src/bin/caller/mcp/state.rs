@@ -76,16 +76,19 @@ pub struct McpAppState {
     pub(crate) session_log_hydration_cursors:
         std::collections::HashMap<std::path::PathBuf, SessionJsonlCursor>,
     /// Set while [`hydrate_requested_session_status_from_logs`] folds a log
-    /// into this state, naming the replay kind. It gates two hazards: a
-    /// replayed `session_ended` line must not re-run the over-cap prune
-    /// (the rebuild the query is performing would erase itself and record
-    /// an EOF cursor against absent state), and replayed lifecycle rows
+    /// into this state, carrying the hydration TARGET session id. Three
+    /// jobs: a replayed `session_ended` line must not re-run the over-cap
+    /// prune (the rebuild the query is performing would erase itself and
+    /// record an EOF cursor against absent state); replayed lifecycle rows
     /// must not invalidate the controller-loop raw cache (historic events
     /// do not change process reality — see
-    /// [`McpAppState::note_live_session_lifecycle_change`]). The replay
-    /// itself applies rows UNGATED: the ordering contract lives at the
-    /// hydrate fold site in `events.rs`.
-    pub(crate) hydration_replay: Option<HydrationReplayKind>,
+    /// [`McpAppState::note_live_session_lifecycle_change`]); and a replayed
+    /// row WITHOUT a session id attributes to this target, never to the
+    /// daemon's active session (see
+    /// [`McpAppState::unattributed_event_session_id`]). The replay itself
+    /// applies rows UNGATED: the ordering contract lives at the hydrate
+    /// fold site in `events.rs`.
+    pub(crate) hydration_replay: Option<String>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -209,18 +212,6 @@ pub(crate) struct DensityMaintenanceSatisfaction {
 /// once the status map outgrows this, ended sessions are pruned on
 /// [`McpAppState::note_session_ended`] instead of lingering.
 pub(crate) const ENDED_SESSION_PRUNE_THRESHOLD: usize = 1024;
-
-/// Which kind of log replay a hydration pass is performing. See
-/// [`McpAppState::hydration_replay`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HydrationReplayKind {
-    /// Replaying from byte 0 — re-applies history that live observation may
-    /// already have superseded.
-    Full,
-    /// Replaying only bytes appended past a validated cursor — new
-    /// information by construction.
-    Tail,
-}
 
 /// RAII scope for [`McpAppState::hydration_replay`]: constructed via
 /// [`McpAppState::begin_hydration_replay`], resets the flag on drop so a
@@ -382,15 +373,34 @@ impl McpAppState {
         }
     }
 
-    /// Enter a hydration-replay scope. The returned guard resets
-    /// [`Self::hydration_replay`] on drop (panic-safe); mutate the state
-    /// through [`HydrationReplayGuard::state`] for the replay's duration.
+    /// Enter a hydration-replay scope for `target_session_id`. The returned
+    /// guard resets [`Self::hydration_replay`] on drop (panic-safe); mutate
+    /// the state through [`HydrationReplayGuard::state`] for the replay's
+    /// duration.
     pub(crate) fn begin_hydration_replay(
         &mut self,
-        kind: HydrationReplayKind,
+        target_session_id: &str,
     ) -> HydrationReplayGuard<'_> {
-        self.hydration_replay = Some(kind);
+        self.hydration_replay = Some(target_session_id.trim().to_string());
         HydrationReplayGuard { state: self }
+    }
+
+    /// The session an event WITHOUT a session id belongs to. Live events
+    /// from the bus belong to the daemon's active session — the historical
+    /// fallback, unchanged. During a hydration replay the answer is the
+    /// HYDRATION TARGET instead: some persisted rows carry no session id
+    /// (`round_complete` predates stamping), and reconstructing them
+    /// against the active session would both miss the session being
+    /// hydrated and corrupt the live session's status — a divergence that
+    /// is neither sink-lag-bounded nor self-healing once the cursor
+    /// commits past the row.
+    fn unattributed_event_session_id(&self) -> Option<String> {
+        if let Some(target) = &self.hydration_replay {
+            let target = target.trim();
+            return (!target.is_empty()).then(|| target.to_string());
+        }
+        let id = self.session_id.trim();
+        (!id.is_empty()).then(|| id.to_string())
     }
 
     /// Invalidate the raw controller-loop cache for a LIVE-observed session
@@ -789,10 +799,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                (!id.is_empty()).then(|| id.to_string())
-            });
+            .or_else(|| self.unattributed_event_session_id());
         let Some(target_id) = target_id else {
             if let Some(turn) = turn {
                 self.turn = turn;
@@ -859,10 +866,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                (!id.is_empty()).then(|| id.to_string())
-            });
+            .or_else(|| self.unattributed_event_session_id());
         let Some(target_id) = target_id else {
             self.round = round;
             return;
@@ -954,14 +958,7 @@ impl McpAppState {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string)
-            .or_else(|| {
-                let id = self.session_id.trim();
-                if id.is_empty() {
-                    None
-                } else {
-                    Some(id.to_string())
-                }
-            })
+            .or_else(|| self.unattributed_event_session_id())
     }
 
     pub(crate) fn rewind_related_keys(&self, key: &str) -> Vec<String> {
