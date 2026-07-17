@@ -528,6 +528,10 @@ impl ChatProvider for OpenAIProvider {
         self.max_output_tokens
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning.as_ref().map(|r| r.effort.clone())
+    }
+
     fn use_tools(&self) -> bool {
         self.use_tools
     }

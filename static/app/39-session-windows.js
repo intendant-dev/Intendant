@@ -822,12 +822,14 @@ function vitalsLimitLabelShort(label) {
 // Live activity — the honest "is the model actually doing something right
 // now" signal. Raw state + epochs arrive on the wire (the vitals
 // `activity` section: state, sinceEpoch, lastStreamByteEpoch,
-// stalledAfterSeconds, effort, resetsAtEpoch); elapsed and quiet tick
+// stalledAfterSeconds, resetsAtEpoch); elapsed and quiet tick
 // client-side, and the `stalled` state is DERIVED here with the same rule
 // the daemon's state machine exposes: a state that promises a live byte
 // stream (stalledAfterSeconds present) quiet past its threshold. States
 // without that promise — tool runs, backends that don't stream reasoning
-// — never claim stalled: honest silence over a fake alarm.
+// — never claim stalled: honest silence over a fake alarm. (Reasoning
+// effort is a session-config fact — the vitals `config` section — not an
+// activity claim.)
 function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
   if (!activity || typeof activity !== 'object') return null;
   const state = String(activity.state || 'idle').trim();
@@ -843,7 +845,6 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
     elapsed: since ? Math.max(0, nowSec - since) : 0,
     quiet,
     hasHeartbeat: threshold > 0,
-    effort: String(activity.effort || '').trim(),
     resetsAtEpoch: Number(activity.resetsAtEpoch) || 0,
     // Short descriptions of wire-announced background tasks still running
     // (grounds the parked-on-tasks claim; may ride any state). No
@@ -861,6 +862,14 @@ function sessionWireActivity(sessionId) {
   const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
   const activity = meta.vitals && typeof meta.vitals === 'object' ? meta.vitals.activity : null;
   return activity && typeof activity === 'object' ? activity : null;
+}
+
+// Configured reasoning effort from the session-facts section (wire
+// `config.effort`) — decorates the status pill's "Thinking" label.
+function sessionConfigEffort(sessionId) {
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
+  const config = meta.vitals && typeof meta.vitals === 'object' ? meta.vitals.config : null;
+  return config && typeof config === 'object' ? String(config.effort || '').trim() : '';
 }
 
 const ACTIVITY_STATE_LABELS = {
@@ -887,6 +896,92 @@ function formatActivityElapsed(seconds) {
   if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
   if (s >= 60) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
   return `${s}s`;
+}
+
+// Plain-language copy for the backend-agnostic permission display kinds
+// (wire `config.permissionKind` — computed once daemon-side from each
+// backend's raw mode by the intendant-core vitals catalog; pinned both
+// ways by vitals_symbol_catalog_covers_wire_fields). The raw mode is
+// always one tap away in the explainer — never hidden, never replaced.
+// `tone: 'warn'` is a cosmetic tint (a chosen configuration, not a
+// failure): it never elevates the chip or colors the health dot.
+// Kinds: bypass, auto-edits, auto-safe, auto-sandboxed, ask, deny-asks,
+// read-only, plan, autonomy (native — label from UI2_AUTONOMY_TAGS).
+const PERMISSION_KIND_COPY = {
+  bypass: {
+    label: 'Acts without asking',
+    tone: 'warn',
+    lines: ['This agent can edit files and run commands without asking first.'],
+  },
+  'auto-edits': {
+    label: 'Auto-accepts edits',
+    lines: ['File edits apply without asking; commands still ask for approval.'],
+  },
+  'auto-safe': {
+    label: 'Auto-approves safe actions',
+    lines: ['Actions judged safe run without asking; riskier ones still ask.'],
+  },
+  'auto-sandboxed': {
+    label: 'Works alone in its sandbox',
+    lines: ['Edits files and runs commands inside its own workspace without asking; asks before reaching outside it.'],
+  },
+  ask: {
+    label: 'Asks before acting',
+    lines: ['Commands and file changes wait for your approval.'],
+  },
+  'deny-asks': {
+    label: 'Never asks — declines instead',
+    lines: ['Anything that would need an approval is declined automatically instead of asking you.'],
+  },
+  'read-only': {
+    label: 'Read-only',
+    lines: ['Reads the project but asks before changing anything.'],
+  },
+  plan: {
+    label: 'Plan mode',
+    lines: ['Researching and planning only — no edits or commands until a plan is approved.'],
+  },
+};
+
+// Resolve a permission kind + raw mode into display copy. `autonomy` is
+// the native backend: the label reuses the sidebar's autonomy vocabulary
+// ("Medium · gate writes"), and the ungated Full level gets the same
+// quiet warning tint as bypass. Unknown kinds show the raw mode verbatim
+// — honest passthrough, never a guessed plain-language claim.
+function permissionDisplay(kind, mode) {
+  if (kind === 'autonomy') {
+    const tag = UI2_AUTONOMY_TAGS[mode] || '';
+    return {
+      label: tag ? `${mode} · ${tag}` : mode,
+      tone: mode === 'Full' ? 'warn' : '',
+      lines: [
+        tag
+          ? `Intendant's autonomy level for this session is ${mode} — ${tag}.`
+          : `Intendant's autonomy level for this session is ${mode}.`,
+        mode === 'Full'
+          ? 'This agent can edit files and run commands without asking first.'
+          : 'The autonomy level decides which actions need your approval.',
+      ],
+    };
+  }
+  const copy = PERMISSION_KIND_COPY[kind];
+  if (copy) return { label: copy.label, tone: copy.tone || '', lines: copy.lines };
+  return {
+    label: mode,
+    tone: '',
+    lines: [`This agent reports permission mode “${mode}” — a mode this dashboard doesn't have plain words for yet.`],
+  };
+}
+
+// Display compression for model ids in chip grammar: drop a vendor
+// prefix and a trailing release date ("claude-sonnet-4-5-20250929" →
+// "sonnet-4-5"). Compression only, never truncation — the pane and the
+// explainer always carry the full id.
+function vitalsModelShortName(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return '';
+  let short = raw.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+  return short || raw;
 }
 
 const VITALS_SYMBOLS = {
@@ -976,6 +1071,43 @@ const VITALS_SYMBOLS = {
       if (v.state === 'rate-limited') return `Rate-limited${v.reset ? ` — resets in ~${v.reset}` : ''}`;
       if (v.state === 'stalled') return `Model stalled — nothing received for ${v.quietText}`;
       return '';
+    },
+  },
+  // ── Session facts (wire `config` section: model, effort,
+  // permissionMode + permissionKind + permissionEchoed). Wire-first: the
+  // backend's own echoes where the protocol has them, the launch config
+  // otherwise — and the explainer says which. Quiet chips: they live in
+  // the expanded header and the pane, never the collapsed one-liner.
+  model: {
+    label: 'Model',
+    priority: 28,
+    unavailable: 'Not reported yet — appears once the agent names its model (or its launch settings do).',
+    chip: (v) => (v.shortName
+      ? `⬡ ${v.shortName}${v.effort ? ` · ${v.effort}` : ''}`
+      : `⬡ ${v.effort} effort`),
+    explain: (v) => {
+      const lines = [v.model
+        ? `This session runs on ${v.model}.`
+        : "The agent hasn't named its model yet — it runs on its own default."];
+      if (v.effort) {
+        lines.push(`Reasoning effort is set to “${v.effort}” — how hard the model may think before answering. A setting, not a measurement.`);
+      }
+      return lines;
+    },
+    action: (v) => (v.model ? { label: 'Copy model id', run: () => vitalsCopyText(v.model) } : null),
+  },
+  permissions: {
+    label: 'Permissions',
+    priority: 55,
+    unavailable: 'Not reported yet — appears once the agent (or its launch settings) states a permission mode.',
+    chip: (v) => `🛡 ${v.label}`,
+    explain: (v) => {
+      const lines = [...v.lines];
+      lines.push(`In the agent's own vocabulary: “${v.mode}”.`);
+      if (!v.echoed) {
+        lines.push("This is the launch setting — the agent hasn't confirmed it yet.");
+      }
+      return lines;
     },
   },
   worktree: {
@@ -1119,9 +1251,12 @@ const VITALS_SYMBOLS = {
 
 // Fixed display order for chips and the glossary (semantic, not priority:
 // priority only governs which chips stay visible when space is scarce).
+// model + permissions form the session-facts group, right after the live
+// activity signal.
 const VITALS_SYMBOL_ORDER = [
-  'health', 'activity', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
-  'unpushed', 'primary-unpushed', 'cache-hit', 'cache-ttl', 'limit',
+  'health', 'activity', 'model', 'permissions', 'worktree', 'branch', 'dirty',
+  'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
+  'cache-ttl', 'limit',
 ];
 
 // Seconds until the prompt cache goes cold, from the server-stamped
@@ -1195,11 +1330,16 @@ function vitalsChipModels(vitals, meta, sessionId) {
     });
   };
 
+  // Session facts (the `config` section). The configured effort also
+  // decorates the live thinking chip — one wire carrier, two readouts.
+  const facts = vitals?.config && typeof vitals.config === 'object' ? vitals.config : null;
+  const factsEffort = String(facts?.effort || '').trim();
+
   const act = deriveSessionActivity(vitals?.activity);
   if (act) {
     push('activity', 'activity', {
       state: act.state,
-      effort: act.effort,
+      effort: factsEffort,
       hasHeartbeat: act.hasHeartbeat,
       elapsedText: formatActivityElapsed(act.elapsed),
       quietText: formatActivityElapsed(act.quiet),
@@ -1213,8 +1353,35 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // something other than the model's own work".
       severity: act.state === 'stalled' || act.state === 'rate-limited' ? 'warn' : '',
       ticking: true,
-      sig: `${act.state}|${act.effort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
+      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
     });
+  }
+
+  if (facts) {
+    const model = String(facts.model || '').trim();
+    if (model || factsEffort) {
+      push('model', 'model', {
+        model,
+        shortName: vitalsModelShortName(model),
+        effort: factsEffort,
+      });
+    }
+    const mode = String(facts.permissionMode || '').trim();
+    if (mode) {
+      const display = permissionDisplay(String(facts.permissionKind || '').trim(), mode);
+      push('permissions', 'permissions', {
+        label: display.label,
+        lines: display.lines,
+        mode,
+        echoed: facts.permissionEchoed === true,
+      }, {
+        // Cosmetic tint only: a chosen bypass/ungated configuration is
+        // worth noticing, but it is not a failure — no health-dot
+        // severity, no elevation into the collapsed header.
+        severity: '',
+        tone: display.tone || '',
+      });
+    }
   }
 
   const worktree = meta?.worktree && typeof meta.worktree === 'object' ? meta.worktree : null;
@@ -2332,8 +2499,9 @@ function normalizeSessionVitals(raw) {
   const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
   const limits = Array.isArray(src.limits) ? src.limits : [];
   const activity = src.activity && typeof src.activity === 'object' ? src.activity : null;
-  if (!git && !cache && !limits.length && !activity) return null;
-  return { git, cache, limits, activity };
+  const config = src.config && typeof src.config === 'object' ? src.config : null;
+  if (!git && !cache && !limits.length && !activity && !config) return null;
+  return { git, cache, limits, activity, config };
 }
 
 // Merge an arriving vitals snapshot over what a session already has. A
@@ -2351,6 +2519,7 @@ function mergeSessionVitals(incoming, existing) {
     cache: incoming.cache || existing.cache || null,
     limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
     activity: incoming.activity || existing.activity || null,
+    config: incoming.config || existing.config || null,
   };
 }
 
@@ -2380,7 +2549,7 @@ function applySessionVitals(raw = {}) {
 function maybeRefreshSessionWindowActivityPill(sid, win, vitals) {
   if (!win || !win.phase || typeof applySessionWindowPhase !== 'function') return;
   const act = deriveSessionActivity(vitals?.activity);
-  const key = act ? `${act.state}|${act.effort}|${act.backgroundTasks.length}` : '';
+  const key = act ? `${act.state}|${act.backgroundTasks.length}` : '';
   if (win.activityPillKey === key) return;
   win.activityPillKey = key;
   applySessionWindowPhase(win, sid, win.phase);
