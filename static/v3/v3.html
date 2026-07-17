@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="lamplight" data-density="standard">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Intendant</title>
+<meta name="description" content="The Intendant dashboard — the owner's box for the agentic house.">
+<link rel="icon" href="/icon-128.png">
+<link rel="stylesheet" href="/v3/v3-tokens.css">
+<link rel="stylesheet" href="/v3/v3-app.css">
+<link rel="stylesheet" href="/v3/v3-rooms.css">
+</head>
+<body>
+
+<!-- Curtain lift: first paint per tab, skipped under reduced motion -->
+<div id="curtain" aria-hidden="true">
+  <svg viewBox="70 80 372 372" width="72" height="72" aria-hidden="true">
+    <path d="M128 384 L128 240 Q128 128 256 128 Q384 128 384 240 L384 384"
+          fill="none" stroke="currentColor" stroke-width="14" stroke-linecap="round"/>
+    <line x1="256" y1="220" x2="256" y2="330" stroke="currentColor" stroke-width="14" stroke-linecap="round"/>
+    <line x1="236" y1="300" x2="330" y2="180" stroke="var(--brass)" stroke-width="10" stroke-linecap="round"/>
+  </svg>
+</div>
+
+<div id="app">
+  <nav id="rail" aria-label="Rooms">
+    <div id="rail-brand" title="Intendant">
+      <svg viewBox="70 80 372 372" width="30" height="30" aria-hidden="true">
+        <path d="M128 384 L128 240 Q128 128 256 128 Q384 128 384 240 L384 384"
+              fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+        <line x1="256" y1="220" x2="256" y2="330" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
+        <line x1="236" y1="300" x2="330" y2="180" stroke="var(--brass)" stroke-width="11" stroke-linecap="round"/>
+        <circle cx="196" cy="360" r="11" fill="var(--brass)"/>
+        <circle cx="316" cy="360" r="11" fill="var(--brass)" opacity=".55"/>
+      </svg>
+      <span class="rail-label wordmark">Intendant</span>
+    </div>
+    <div id="rail-rooms" role="list"></div>
+    <div class="grow"></div>
+    <div id="rail-vantages"></div>
+    <a class="rail-item" id="rail-v2" href="/" title="Back to the classic dashboard">
+      <span class="icon" data-icon="external"></span>
+      <span class="rail-label">Classic (V2)</span>
+    </a>
+    <div id="rail-foot">
+      <button id="rail-queue" class="rail-item" title="Needs you (queue)">
+        <span class="icon" data-icon="doorbell"></span>
+        <span class="rail-label">Needs you</span>
+        <span class="badge-count" id="rail-queue-count" hidden></span>
+      </button>
+      <div id="rail-identity" class="authline"></div>
+    </div>
+  </nav>
+
+  <div id="column">
+    <header id="topbar">
+      <div id="topbar-title" class="voice"></div>
+      <div class="grow"></div>
+      <div id="topbar-facts" class="mono dim"></div>
+      <button class="icon-btn" id="btn-density" title="Density: Cozy / Standard / Studio">
+        <span class="icon" data-icon="density"></span><span id="density-label" class="hide-cozy"></span>
+      </button>
+      <button class="icon-btn" id="btn-theme" title="Theme: Lamplight / Daylight">
+        <span class="icon" data-icon="theme"></span>
+      </button>
+      <button id="btn-palette" title="Search everything (⌘K)">
+        <span class="icon" data-icon="search"></span><span class="kbd-hint">⌘K</span>
+      </button>
+    </header>
+
+    <main id="main" role="main" tabindex="-1"></main>
+
+    <footer id="composer" aria-label="Talk to the house">
+      <div id="composer-target" class="chip chip-brass" hidden></div>
+      <div id="composer-box">
+        <button class="icon-btn" title="Attach" id="composer-attach"><span class="icon" data-icon="attach"></span></button>
+        <textarea id="composer-input" rows="1" placeholder="Ask the house anything…"></textarea>
+        <button class="icon-btn" title="Speak (live voice)" id="composer-mic"><span class="icon" data-icon="mic"></span></button>
+        <button class="icon-btn btn-send" title="Send (⌘↵)" id="composer-send"><span class="icon" data-icon="send"></span></button>
+      </div>
+      <div id="composer-hint" class="dim">@ aims at a session · / for power grammar · the house answers in the thread</div>
+    </footer>
+  </div>
+</div>
+
+<div id="palette" class="overlay" hidden>
+  <div id="palette-panel" role="dialog" aria-label="Search everything">
+    <div id="palette-input-row">
+      <span class="icon" data-icon="search"></span>
+      <input id="palette-input" type="text" placeholder="Search rooms, work, settings, actions…" autocomplete="off" spellcheck="false">
+      <span class="kbd-hint">esc</span>
+    </div>
+    <div id="palette-results" role="listbox"></div>
+    <div id="palette-foot" class="dim">↑↓ move · ↵ open · every setting, folded or not</div>
+  </div>
+</div>
+
+<div id="queue-drawer" class="overlay" hidden>
+  <div id="queue-panel" role="dialog" aria-label="Needs you"></div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script src="/v3/js/v3-icons.js"></script>
+<script src="/v3/js/v3-transport.js"></script>
+<script src="/v3/js/v3-data.js"></script>
+<script src="/v3/js/v3-ui.js"></script>
+<script src="/v3/js/v3-palette.js"></script>
+<script src="/v3/js/views/home.js"></script>
+<script src="/v3/js/views/work.js"></script>
+<script src="/v3/js/views/session.js"></script>
+<script src="/v3/js/views/screens.js"></script>
+<script src="/v3/js/views/files.js"></script>
+<script src="/v3/js/views/machines.js"></script>
+<script src="/v3/js/views/people.js"></script>
+<script src="/v3/js/views/books.js"></script>
+<script src="/v3/js/views/settings.js"></script>
+<script src="/v3/js/views/station.js"></script>
+<script src="/v3/js/views/studio.js"></script>
+<script src="/v3/js/v3-app.js"></script>
+</body>
+</html>
