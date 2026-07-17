@@ -5857,7 +5857,7 @@ mod tests {
         let cap = crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES;
         // 3-byte chars guarantee the cap lands mid-char.
         let ch = '\u{2713}';
-        let big: String = std::iter::repeat(ch).take(cap / 3 + 10).collect();
+        let big: String = ch.to_string().repeat(cap / 3 + 10);
         let event = AppEvent::AgentOutput {
             session_id: None,
             stdout: big.as_str().into(),

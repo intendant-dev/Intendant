@@ -2106,7 +2106,7 @@ mod tests {
         log.turn_start(1, 0.0, 100_000);
         // 2-byte chars, ~2x the cap: the bounded span read lands mid-char
         // and must trim back to a complete one.
-        let big_stdout: String = std::iter::repeat('\u{00e9}').take(cap).collect();
+        let big_stdout: String = "\u{00e9}".repeat(cap);
         log.agent_output_with_id(&big_stdout, "small stderr", Some("Codex"), Some("out-clip"));
         drop(log);
 
