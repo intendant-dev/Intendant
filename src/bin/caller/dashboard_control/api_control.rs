@@ -3260,8 +3260,7 @@ mod tests {
     //      tempdirs (hermeticity convention).
 
     fn empty_peer_registry() -> crate::peer::PeerRegistry {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         crate::peer::PeerRegistry::new(log_tx)
     }
 
@@ -4125,8 +4124,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_webrtc_signal_returns_http_error_metadata() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         let mut rt = runtime();
         rt.peer_registry = Some(crate::peer::PeerRegistry::new(log_tx));
 
