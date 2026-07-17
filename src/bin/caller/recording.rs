@@ -1270,7 +1270,10 @@ fn spawn_external_capture_pump(
     slot: ExternalFrameSlot,
     stream_name: String,
     bus: EventBus,
-) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         loop {
@@ -1656,8 +1659,8 @@ pub fn spawn_recording_listener(
 mod tests {
     use super::*;
 
-    fn test_frame() -> std::sync::Arc<crate::display::Frame> {
-        std::sync::Arc::new(crate::display::Frame {
+    fn raw_test_frame() -> crate::display::Frame {
+        crate::display::Frame {
             data: vec![0u8; 2 * 2 * 4],
             format: crate::display::FrameFormat::Bgra,
             width: 2,
@@ -1665,7 +1668,11 @@ mod tests {
             stride: 8,
             timestamp: std::time::Instant::now(),
             dirty_rects: None,
-        })
+        }
+    }
+
+    fn test_frame() -> std::sync::Arc<crate::display::Frame> {
+        std::sync::Arc::new(raw_test_frame())
     }
 
     #[tokio::test]
@@ -1755,6 +1762,271 @@ mod tests {
             jpeg.starts_with(&[0xFF, 0xD8]),
             "cached bytes must be a JPEG (SOI marker)"
         );
+    }
+
+    /// Injectable feed sink for bridge-level tests: counts feeds and
+    /// reports the configured verdict.
+    struct TestSink {
+        feeds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BridgeFeedSink for TestSink {
+        async fn feed(&mut self, _jpeg: &[u8]) -> bool {
+            self.feeds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ok
+        }
+    }
+
+    /// Poll `cond` until it holds or a generous deadline passes — the
+    /// bridge ticks on real time, so assertions are threshold-based rather
+    /// than tick-exact to stay robust on loaded CI boxes.
+    async fn wait_until(cond: impl Fn() -> bool, what: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn external_bridge_feeds_every_tick_and_reencodes_only_on_frame_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slot: ExternalFrameSlot =
+            std::sync::Arc::new(tokio::sync::RwLock::new(Some(test_frame())));
+        let feeds = std::sync::Arc::new(AtomicUsize::new(0));
+        let encodes = std::sync::Arc::new(AtomicUsize::new(0));
+        let encode = {
+            let encodes = std::sync::Arc::clone(&encodes);
+            move |_: &crate::display::Frame| {
+                encodes.fetch_add(1, Ordering::SeqCst);
+                Some(vec![9])
+            }
+        };
+        let bridge = tokio::spawn(run_frame_bridge(
+            BridgeSource::External {
+                slot: std::sync::Arc::clone(&slot),
+            },
+            TestSink {
+                feeds: std::sync::Arc::clone(&feeds),
+                ok: true,
+            },
+            encode,
+            "display_7".to_string(),
+            50,
+            EventBus::new(),
+        ));
+
+        // The unchanged slot frame keeps feeding every tick from the cache.
+        wait_until(
+            || feeds.load(Ordering::SeqCst) >= 3,
+            "several ticks to feed",
+        )
+        .await;
+        assert_eq!(
+            encodes.load(Ordering::SeqCst),
+            1,
+            "an unchanged slot frame must reuse the cached JPEG"
+        );
+
+        // A new frame in the slot re-encodes exactly once more.
+        *slot.write().await = Some(test_frame());
+        wait_until(
+            || encodes.load(Ordering::SeqCst) == 2,
+            "a new frame to re-encode",
+        )
+        .await;
+        let fed_after_swap = feeds.load(Ordering::SeqCst);
+        wait_until(
+            || feeds.load(Ordering::SeqCst) > fed_after_swap,
+            "feeding to continue after the re-encode",
+        )
+        .await;
+        assert_eq!(encodes.load(Ordering::SeqCst), 2);
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn external_bridge_idles_on_empty_slot_until_a_frame_arrives() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slot: ExternalFrameSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let feeds = std::sync::Arc::new(AtomicUsize::new(0));
+        let bridge = tokio::spawn(run_frame_bridge(
+            BridgeSource::External {
+                slot: std::sync::Arc::clone(&slot),
+            },
+            TestSink {
+                feeds: std::sync::Arc::clone(&feeds),
+                ok: true,
+            },
+            frame_to_jpeg,
+            "display_7".to_string(),
+            100,
+            EventBus::new(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            feeds.load(Ordering::SeqCst),
+            0,
+            "an empty slot must not feed anything"
+        );
+        *slot.write().await = Some(test_frame());
+        wait_until(|| feeds.load(Ordering::SeqCst) >= 1, "feeding to begin").await;
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn external_bridge_stops_recording_when_the_feed_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let feeds = std::sync::Arc::new(AtomicUsize::new(0));
+        let bridge = tokio::spawn(run_frame_bridge(
+            BridgeSource::External {
+                slot: std::sync::Arc::new(tokio::sync::RwLock::new(Some(test_frame()))),
+            },
+            TestSink {
+                feeds: std::sync::Arc::clone(&feeds),
+                ok: false,
+            },
+            frame_to_jpeg,
+            "display_7".to_string(),
+            50,
+            bus.clone(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), bridge)
+            .await
+            .expect("bridge must exit after a failed feed")
+            .unwrap();
+        assert_eq!(
+            feeds.load(Ordering::SeqCst),
+            1,
+            "the bridge must stop at the first failed feed"
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("a stop intent must be emitted")
+            .expect("event bus stays open");
+        match event {
+            AppEvent::ControlCommand(ControlMsg::StopRecording { stream_name }) => {
+                assert_eq!(stream_name, "display_7");
+            }
+            other => panic!("expected StopRecording, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_pump_fills_slot_and_quiesces_backend_on_stop() {
+        let backend: std::sync::Arc<dyn crate::display::DisplayBackend> =
+            std::sync::Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let frames = backend
+            .start_capture(30)
+            .await
+            .expect("synthetic capture starts");
+        let slot: ExternalFrameSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let (stop_tx, pump) = spawn_external_capture_pump(
+            std::sync::Arc::clone(&backend),
+            frames,
+            std::sync::Arc::clone(&slot),
+            "display_3".to_string(),
+            EventBus::new(),
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.read().await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the pump to fill the slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The finalize path: fire the stop sender, then the pump must
+        // quiesce the backend (joining its producer thread) and exit.
+        stop_tx.send(()).expect("pump is alive to receive the stop");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+            .await
+            .expect("pump must quiesce the backend and exit on stop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_pump_quiesces_when_the_stop_sender_is_dropped() {
+        let backend: std::sync::Arc<dyn crate::display::DisplayBackend> =
+            std::sync::Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let frames = backend
+            .start_capture(30)
+            .await
+            .expect("synthetic capture starts");
+        let (stop_tx, pump) = spawn_external_capture_pump(
+            std::sync::Arc::clone(&backend),
+            frames,
+            std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            "display_3".to_string(),
+            EventBus::new(),
+        );
+
+        // The Drop path: the guard never awaits — dropping the sender alone
+        // must wake the pump into teardown.
+        drop(stop_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+            .await
+            .expect("pump must quiesce the backend and exit when the sender drops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_pump_stops_recording_when_the_source_ends() {
+        // Backend never started: `stop_capture` without a start is a no-op
+        // per the teardown contract, so the pump's quiesce still completes.
+        let backend: std::sync::Arc<dyn crate::display::DisplayBackend> =
+            std::sync::Arc::new(crate::display::synthetic::SyntheticBackend::new());
+        let (frame_tx, frames) = tokio::sync::mpsc::channel::<crate::display::Frame>(4);
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let slot: ExternalFrameSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        // Keep the stop sender alive so the capture-loss branch (not the
+        // stop branch) is what ends the pump.
+        let (_keep_stop_alive, pump) = spawn_external_capture_pump(
+            backend,
+            frames,
+            std::sync::Arc::clone(&slot),
+            "display_9".to_string(),
+            bus.clone(),
+        );
+
+        frame_tx
+            .send(raw_test_frame())
+            .await
+            .expect("pump is receiving");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.read().await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the pump to fill the slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        drop(frame_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+            .await
+            .expect("pump must exit when the capture source ends")
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("capture loss must stop the recording")
+            .expect("event bus stays open");
+        match event {
+            AppEvent::ControlCommand(ControlMsg::StopRecording { stream_name }) => {
+                assert_eq!(stream_name, "display_9");
+            }
+            other => panic!("expected StopRecording, got {other:?}"),
+        }
     }
 
     #[test]
