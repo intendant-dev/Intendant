@@ -546,6 +546,7 @@ pub(crate) fn access_connect_status_response_value() -> serde_json::Value {
         "hosted_bundle_checked_unix_ms": hosted_bundle.checked_unix_ms,
         "hosted_bundle_last_error": hosted_bundle.last_error,
         "hosted_bundle_mismatches": hosted_bundle.mismatches,
+        "hosted_bundle_rendezvous_url": hosted_bundle.rendezvous_url,
     })
 }
 

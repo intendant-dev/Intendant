@@ -3205,6 +3205,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
+        crate::credential_leases::scrub_dns_credential_env(&mut command);
         let mut child = command.spawn().map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;

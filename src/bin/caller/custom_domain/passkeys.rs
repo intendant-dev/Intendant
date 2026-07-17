@@ -116,6 +116,7 @@ struct PasskeyStore {
 
 struct PendingRegistration {
     label: String,
+    user_id: Uuid,
     state: RegistrationState,
     expires_unix_ms: u64,
 }
@@ -126,6 +127,7 @@ struct PendingInvitation {
 }
 
 struct PendingAuthentication {
+    user_id: Uuid,
     state: AuthenticationState,
     input: HostedLeaseRequestInput,
     source_bucket: Option<String>,
@@ -180,20 +182,18 @@ impl PasskeyRuntime {
     }
 
     pub(crate) fn views(&self) -> Result<Vec<PasskeyView>, String> {
-        let store = self
-            .store
-            .lock()
-            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-        Ok(store
-            .passkeys
-            .iter()
-            .map(|passkey| PasskeyView {
-                credential_id: passkey.credential.id.to_b64url(),
-                label: passkey.label.clone(),
-                created_unix_ms: passkey.created_unix_ms,
-                last_used_unix_ms: passkey.last_used_unix_ms,
-            })
-            .collect())
+        self.with_fresh_store(|store| {
+            Ok(store
+                .passkeys
+                .iter()
+                .map(|passkey| PasskeyView {
+                    credential_id: passkey.credential.id.to_b64url(),
+                    label: passkey.label.clone(),
+                    created_unix_ms: passkey.created_unix_ms,
+                    last_used_unix_ms: passkey.last_used_unix_ms,
+                })
+                .collect())
+        })
     }
 
     pub(crate) fn registration_invite(
@@ -201,15 +201,12 @@ impl PasskeyRuntime {
         input: RegistrationInviteInput,
     ) -> Result<EnrollmentInvite, String> {
         let label = normalized_label(&input.label)?;
-        {
-            let store = self
-                .store
-                .lock()
-                .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
+        self.with_fresh_store(|store| {
             if store.passkeys.len() >= MAX_PASSKEYS {
                 return Err("custom-domain passkey limit reached".to_string());
             }
-        }
+            Ok(())
+        })?;
         let token = Uuid::new_v4().simple().to_string();
         let now = now_unix_ms();
         let expires_unix_ms = now.saturating_add(INVITE_TTL_MS);
@@ -254,23 +251,19 @@ impl PasskeyRuntime {
             return Err("passkey enrollment invitation expired".to_string());
         }
         let label = invitation.label;
-        let (user_id, exclude) = {
-            let store = self
-                .store
-                .lock()
-                .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
+        let (user_id, exclude) = self.with_fresh_store(|store| {
             if store.passkeys.len() >= MAX_PASSKEYS {
                 return Err("custom-domain passkey limit reached".to_string());
             }
-            (
+            Ok((
                 store.user_id,
                 store
                     .passkeys
                     .iter()
                     .map(|passkey| passkey.credential.id.clone())
                     .collect::<Vec<_>>(),
-            )
-        };
+            ))
+        })?;
         let (options, state) = self.webauthn.start_registration(
             user_id.as_bytes(),
             &self.domain.name,
@@ -291,6 +284,7 @@ impl PasskeyRuntime {
             flow_id.clone(),
             PendingRegistration {
                 label,
+                user_id,
                 state,
                 expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
             },
@@ -321,36 +315,34 @@ impl PasskeyRuntime {
             .finish_registration(&pending.state, &input.credential)
             .map_err(|error| format!("finish passkey registration: {error}"))?;
         let now = now_unix_ms();
-        let view = PasskeyView {
-            credential_id: credential.id.to_b64url(),
-            label: pending.label.clone(),
-            created_unix_ms: now,
-            last_used_unix_ms: None,
-        };
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-        if store
-            .passkeys
-            .iter()
-            .any(|stored| stored.credential.id == credential.id)
-        {
-            return Err("passkey is already registered".to_string());
-        }
-        if store.passkeys.len() >= MAX_PASSKEYS {
-            return Err("custom-domain passkey limit reached".to_string());
-        }
-        let mut next = store.clone();
-        next.passkeys.push(StoredPasskey {
-            credential,
-            label: pending.label,
-            created_unix_ms: now,
-            last_used_unix_ms: None,
-        });
-        persist_store(&self.cert_dir, &next)?;
-        *store = next;
-        Ok(view)
+        self.mutate_store(move |store| {
+            if store.user_id != pending.user_id {
+                return Err("passkey enrollment state changed; create a new invitation".to_string());
+            }
+            if store
+                .passkeys
+                .iter()
+                .any(|stored| stored.credential.id == credential.id)
+            {
+                return Err("passkey is already registered".to_string());
+            }
+            if store.passkeys.len() >= MAX_PASSKEYS {
+                return Err("custom-domain passkey limit reached".to_string());
+            }
+            let view = PasskeyView {
+                credential_id: credential.id.to_b64url(),
+                label: pending.label.clone(),
+                created_unix_ms: now,
+                last_used_unix_ms: None,
+            };
+            store.passkeys.push(StoredPasskey {
+                credential,
+                label: pending.label,
+                created_unix_ms: now,
+                last_used_unix_ms: None,
+            });
+            Ok((view, true))
+        })
     }
 
     pub(crate) fn authentication_start(
@@ -377,23 +369,19 @@ impl PasskeyRuntime {
             }
             starts.push_back(now);
         }
-        let (user_id, credentials) = {
-            let store = self
-                .store
-                .lock()
-                .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
+        let (user_id, credentials) = self.with_fresh_store(|store| {
             if store.passkeys.is_empty() {
                 return Err("no passkey is registered for this custom domain".to_string());
             }
-            (
+            Ok((
                 store.user_id,
                 store
                     .passkeys
                     .iter()
                     .map(|passkey| passkey.credential.clone())
                     .collect::<Vec<_>>(),
-            )
-        };
+            ))
+        })?;
         let (options, state) = self
             .webauthn
             .start_authentication_with_creds_for_user(user_id.as_bytes(), &credentials);
@@ -409,6 +397,7 @@ impl PasskeyRuntime {
         pending.insert(
             flow_id.clone(),
             PendingAuthentication {
+                user_id,
                 state,
                 input: input.request,
                 source_bucket: source_bucket.map(str::to_string),
@@ -444,13 +433,13 @@ impl PasskeyRuntime {
         validate_pending_request_shape(&pending.input)?;
         let credential_id = CredentialId::from_b64url(&input.credential.id)
             .map_err(|error| format!("passkey credential id: {error}"))?;
-        {
-            let mut store = self
-                .store
-                .lock()
-                .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-            let mut next = store.clone();
-            let stored = next
+        self.mutate_store(|store| {
+            if store.user_id != pending.user_id {
+                return Err(
+                    "passkey authentication state changed; start a new ceremony".to_string()
+                );
+            }
+            let stored = store
                 .passkeys
                 .iter_mut()
                 .find(|passkey| passkey.credential.id == credential_id)
@@ -461,9 +450,8 @@ impl PasskeyRuntime {
                 .map_err(|error| format!("finish passkey authentication: {error}"))?;
             stored.credential.counter = result.new_counter;
             stored.last_used_unix_ms = Some(now_unix_ms());
-            persist_store(&self.cert_dir, &next)?;
-            *store = next;
-        }
+            Ok(((), true))
+        })?;
 
         let request =
             self.hosted
@@ -487,20 +475,14 @@ impl PasskeyRuntime {
     pub(crate) fn revoke(&self, input: RevokeInput) -> Result<bool, String> {
         let credential_id = CredentialId::from_b64url(input.credential_id.trim())
             .map_err(|error| format!("passkey credential id: {error}"))?;
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-        let mut next = store.clone();
-        let before = next.passkeys.len();
-        next.passkeys
-            .retain(|passkey| passkey.credential.id != credential_id);
-        if next.passkeys.len() == before {
-            return Ok(false);
-        }
-        persist_store(&self.cert_dir, &next)?;
-        *store = next;
-        Ok(true)
+        self.mutate_store(move |store| {
+            let before = store.passkeys.len();
+            store
+                .passkeys
+                .retain(|passkey| passkey.credential.id != credential_id);
+            let revoked = store.passkeys.len() != before;
+            Ok((revoked, revoked))
+        })
     }
 
     fn require_origin(&self, origin: &str) -> Result<(), String> {
@@ -509,6 +491,32 @@ impl PasskeyRuntime {
         } else {
             Err("passkey ceremony origin does not match the custom domain".to_string())
         }
+    }
+
+    fn with_fresh_store<T>(
+        &self,
+        read: impl FnOnce(&PasskeyStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut cached = self
+            .store
+            .lock()
+            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
+        let fresh = current_store(&self.cert_dir, &self.domain, &cached)?;
+        *cached = fresh;
+        read(&cached)
+    }
+
+    fn mutate_store<T>(
+        &self,
+        update: impl FnOnce(&mut PasskeyStore) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let mut cached = self
+            .store
+            .lock()
+            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
+        let (fresh, value) = transact_store(&self.cert_dir, &self.domain, &cached, update)?;
+        *cached = fresh;
+        Ok(value)
     }
 }
 
@@ -592,14 +600,69 @@ fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<Passkey
     Ok(store)
 }
 
-fn persist_store(cert_dir: &Path, store: &PasskeyStore) -> Result<(), String> {
+fn current_store(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+    cached: &PasskeyStore,
+) -> Result<PasskeyStore, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        load_current_store_locked(cert_dir, domain, cached).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn load_current_store_locked(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+    cached: &PasskeyStore,
+) -> Result<PasskeyStore, String> {
+    match std::fs::metadata(store_path(cert_dir)) {
+        Ok(_) => load_store(cert_dir, domain),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(cached.clone()),
+        Err(error) => Err(format!(
+            "inspect {}: {error}",
+            store_path(cert_dir).display()
+        )),
+    }
+}
+
+fn transact_store<T>(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+    cached: &PasskeyStore,
+    update: impl FnOnce(&mut PasskeyStore) -> Result<(T, bool), String>,
+) -> Result<(PasskeyStore, T), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut fresh = load_current_store_locked(cert_dir, domain, cached)
+            .map_err(crate::access::AccessError)?;
+        let (value, changed) = update(&mut fresh).map_err(crate::access::AccessError)?;
+        if changed {
+            save_store_locked(cert_dir, &fresh)?;
+        }
+        Ok((fresh, value))
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn serialized_store(store: &PasskeyStore) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec_pretty(store)
         .map_err(|error| format!("serialize custom-domain passkeys: {error}"))?;
     bytes.push(b'\n');
-    crate::access::authority_store::with_lock(cert_dir, || {
-        crate::access::authority_store::atomic_write_private_locked(&store_path(cert_dir), &bytes)
-    })
-    .map_err(|error| error.to_string())
+    if bytes.len() as u64 > STORE_MAX_BYTES {
+        return Err("custom-domain passkey store exceeds the size cap".to_string());
+    }
+    Ok(bytes)
+}
+
+fn save_store_locked(cert_dir: &Path, store: &PasskeyStore) -> crate::access::AccessResult<()> {
+    let bytes = serialized_store(store).map_err(crate::access::AccessError)?;
+    crate::access::authority_store::atomic_write_private_locked(&store_path(cert_dir), &bytes)
+}
+
+#[cfg(test)]
+fn persist_store(cert_dir: &Path, store: &PasskeyStore) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || save_store_locked(cert_dir, store))
+        .map_err(|error| error.to_string())
 }
 
 fn passkey_actor(credential_id: &CredentialId) -> AccessPrincipal {
@@ -642,6 +705,21 @@ mod tests {
         }
     }
 
+    fn stored_passkey(id: u8, label: &str) -> StoredPasskey {
+        StoredPasskey {
+            credential: PasskeyCredential {
+                id: CredentialId(vec![id]),
+                public_key_cose: passkey_auth::CosePublicKey(vec![0xa0]),
+                counter: 0,
+                transports: Vec::new(),
+                aaguid: [0; 16],
+            },
+            label: label.to_string(),
+            created_unix_ms: 1,
+            last_used_unix_ms: None,
+        }
+    }
+
     #[test]
     fn a_store_cannot_be_reused_under_a_different_rp_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -656,6 +734,72 @@ mod tests {
         assert!(load_store(dir.path(), &domain())
             .unwrap_err()
             .contains("different custom-domain"));
+    }
+
+    #[test]
+    fn stale_daemon_cannot_restore_a_revoked_passkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name.clone(),
+                rp_id: domain.rp_id.clone(),
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, "one"), stored_passkey(2, "two")],
+            },
+        )
+        .unwrap();
+        let hosted = Arc::new(HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let first = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        let stale = PasskeyRuntime::new(domain.clone(), dir.path().to_path_buf(), hosted).unwrap();
+
+        assert!(first
+            .revoke(RevokeInput {
+                credential_id: CredentialId(vec![1]).to_b64url(),
+            })
+            .unwrap());
+        assert!(stale
+            .revoke(RevokeInput {
+                credential_id: CredentialId(vec![2]).to_b64url(),
+            })
+            .unwrap());
+        assert!(
+            load_store(dir.path(), &domain).unwrap().passkeys.is_empty(),
+            "the stale process must reload under the interprocess lock"
+        );
+    }
+
+    #[test]
+    fn passkey_store_cap_is_enforced_before_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let error = persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name,
+                rp_id: domain.rp_id,
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, &"x".repeat(STORE_MAX_BYTES as usize))],
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("size cap"), "{error}");
+        assert!(!store_path(dir.path()).exists());
     }
 
     #[test]

@@ -31,9 +31,9 @@ box.example.com. 300 IN CNAME relay.intendant.dev.
 
 The daemon registers that exact SNI name over its daemon-identity-signed relay
 control channel. The relay routes an exact name only when one active daemon
-claims it; conflicting live claims are refused. Fleet-label routing remains a
-separate compatibility path. Neither registration nor routing grants daemon
-authority.
+claims it. A conflicting live registration is rejected while the incumbent
+route remains active; fleet-label routing remains a separate compatibility
+path. Neither registration nor routing grants daemon authority.
 
 ## Pin certificate issuance
 

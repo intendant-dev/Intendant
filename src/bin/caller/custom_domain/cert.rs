@@ -103,10 +103,10 @@ async fn ensure_certificate(
     });
     if !issuance_enabled {
         update_status(status, |current| {
-            if current.not_after_unix_ms.is_none() {
+            if current.not_after_unix_ms.is_none() && current.state != "error" {
                 current.state = "waiting_for_caa".to_string();
+                current.last_error = None;
             }
-            current.last_error = None;
         });
         return Ok(());
     }

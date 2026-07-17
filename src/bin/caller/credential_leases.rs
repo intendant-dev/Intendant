@@ -128,6 +128,28 @@ pub(crate) fn is_dns_credential_env(name: &str) -> bool {
         || name.ends_with("_TSIG_SECRET")
 }
 
+/// Remove every supported DNS credential spelling from an untrusted child.
+/// Defaults are removed unconditionally; scanning the inherited environment
+/// also catches owner-selected suffix-constrained names and their original
+/// casing on case-sensitive hosts.
+pub(crate) fn scrub_dns_credential_env(command: &mut tokio::process::Command) {
+    scrub_dns_credential_env_names(command, std::env::vars_os().map(|(name, _)| name).collect());
+}
+
+fn scrub_dns_credential_env_names(
+    command: &mut tokio::process::Command,
+    inherited_names: Vec<std::ffi::OsString>,
+) {
+    for name in DNS_CREDENTIAL_ENV_VARS {
+        command.env_remove(name);
+    }
+    for name in inherited_names {
+        if name.to_str().is_some_and(is_dns_credential_env) {
+            command.env_remove(name);
+        }
+    }
+}
+
 pub(crate) fn dns_credential_env_name(
     configured: Option<&str>,
     default: &str,
@@ -287,8 +309,6 @@ fn kind_has_env_fallback(kind: &str) -> bool {
         "api_key:anthropic" => &["ANTHROPIC_API_KEY", "ANTHROPIC"],
         "api_key:openai" => &["OPENAI_API_KEY", "OPENAI"],
         "api_key:gemini" => &["GEMINI_API_KEY", "GEMINI"],
-        "dns:cloudflare" => &["CLOUDFLARE_API_TOKEN"],
-        "dns:rfc2136" => &["INTENDANT_RFC2136_TSIG_SECRET"],
         // The external agents have no env fallback — an expired oauth
         // lease always means dry.
         _ => &[],
@@ -301,6 +321,14 @@ fn kind_has_env_fallback(kind: &str) -> bool {
 }
 
 fn queue_dry_notice(kind: &str, label: &str) {
+    // DNS fallback names are project configuration, not lease metadata, and
+    // may use any validated *_API_TOKEN / *_TSIG_SECRET spelling. The
+    // certificate loop reports an actual provider lookup failure precisely;
+    // do not emit a false "dry" push merely because the canonical default
+    // environment name is absent.
+    if matches!(kind, "dns:cloudflare" | "dns:rfc2136") {
+        return;
+    }
     if kind_has_env_fallback(kind) {
         return;
     }
@@ -1113,6 +1141,47 @@ mod tests {
         store().write().unwrap().clear();
         tombstones().write().unwrap().clear();
         pending_materialization_cleanup().write().unwrap().clear();
+    }
+
+    #[test]
+    fn supervised_children_drop_default_and_configured_dns_credentials() {
+        let mut command = tokio::process::Command::new("never-spawned");
+        command
+            .env("CLOUDFLARE_API_TOKEN", "default")
+            .env("OWNER_DNS_API_TOKEN", "custom")
+            .env("ORDINARY_CHILD_SETTING", "kept");
+        scrub_dns_credential_env_names(
+            &mut command,
+            vec![
+                std::ffi::OsString::from("CLOUDFLARE_API_TOKEN"),
+                std::ffi::OsString::from("OWNER_DNS_API_TOKEN"),
+                std::ffi::OsString::from("ORDINARY_CHILD_SETTING"),
+            ],
+        );
+        let changes = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_os_string(),
+                    value.map(std::ffi::OsStr::to_os_string),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("CLOUDFLARE_API_TOKEN")),
+            Some(&None)
+        );
+        assert_eq!(
+            changes.get(std::ffi::OsStr::new("OWNER_DNS_API_TOKEN")),
+            Some(&None)
+        );
+        assert_eq!(
+            changes
+                .get(std::ffi::OsStr::new("ORDINARY_CHILD_SETTING"))
+                .and_then(Option::as_deref),
+            Some(std::ffi::OsStr::new("kept"))
+        );
     }
 
     /// Build a lease whose expiry anchor the test controls directly.

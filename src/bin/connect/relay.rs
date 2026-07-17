@@ -295,9 +295,22 @@ impl RelayState {
         self.listen
     }
 
-    /// Refresh a tunnel's control-channel presence on each poll.
-    fn touch_tunnel(&self, label: &str, now: u64, server_names: &[String]) {
+    /// Refresh a tunnel's control-channel presence on each poll. Exact names
+    /// have one live incumbent: a second daemon is rejected at admission so
+    /// the incumbent retains one unambiguous route. Resolution still retains
+    /// its ambiguity check as defense in depth for rolling state.
+    fn touch_tunnel(&self, label: &str, now: u64, server_names: &[String]) -> bool {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let conflicts = server_names.iter().any(|name| {
+            tunnels.iter().any(|(other_label, entry)| {
+                other_label != label
+                    && now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                    && entry.server_names.iter().any(|claimed| claimed == name)
+            })
+        });
+        if conflicts {
+            return false;
+        }
         let entry = tunnels
             .entry(label.to_string())
             .or_insert_with(|| TunnelEntry {
@@ -307,6 +320,7 @@ impl RelayState {
             });
         entry.last_seen_unix_ms = now;
         entry.server_names = server_names.to_vec();
+        true
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
@@ -649,7 +663,11 @@ pub(crate) async fn relay_next(
             "daemon id does not derive a fleet label",
         ));
     };
-    relay.touch_tunnel(&label, now_unix_ms(), &server_names);
+    if !relay.touch_tunnel(&label, now_unix_ms(), &server_names) {
+        return Err(ApiError::conflict(
+            "an active relay tunnel already owns one of the exact server names",
+        ));
+    }
 
     let timeout = Duration::from_millis(
         body.timeout_ms
@@ -671,7 +689,11 @@ pub(crate) async fn relay_next(
         }
         let remaining = deadline.saturating_duration_since(now);
         // Re-touch keeps the tunnel live across a full parked poll.
-        relay.touch_tunnel(&label, now_unix_ms(), &server_names);
+        if !relay.touch_tunnel(&label, now_unix_ms(), &server_names) {
+            return Err(ApiError::conflict(
+                "an active relay tunnel already owns one of the exact server names",
+            ));
+        }
         if tokio::time::timeout(remaining, relay.control_notify.notified())
             .await
             .is_err()
@@ -1238,7 +1260,7 @@ mod tests {
         let now = crate::now_unix_ms();
         // No tunnel yet: enqueue refuses.
         assert!(!relay.enqueue_dialback("d-none", "n0".to_string(), now));
-        relay.touch_tunnel("d-live", now, &[]);
+        assert!(relay.touch_tunnel("d-live", now, &[]));
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
             assert!(relay.enqueue_dialback("d-live", format!("n{i}"), now));
@@ -1256,17 +1278,20 @@ mod tests {
         let relay = relay_state();
         let now = crate::now_unix_ms();
         let name = "box.example.test".to_string();
-        relay.touch_tunnel("d-first", now, std::slice::from_ref(&name));
+        assert!(relay.touch_tunnel("d-first", now, std::slice::from_ref(&name)));
         assert_eq!(
             relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now).as_deref(),
             Some("d-first")
         );
 
-        relay.touch_tunnel("d-second", now, std::slice::from_ref(&name));
+        assert!(
+            !relay.touch_tunnel("d-second", now, std::slice::from_ref(&name)),
+            "a conflicting live claim must be rejected at admission"
+        );
         assert_eq!(
-            relay.resolve_tunnel("box.example.test", now),
-            None,
-            "two active exact-name claims must not be routed"
+            relay.resolve_tunnel("box.example.test", now).as_deref(),
+            Some("d-first"),
+            "the incumbent remains routable after a rejected collision"
         );
     }
 
@@ -1293,7 +1318,7 @@ mod tests {
     fn fleet_label_route_survives_v1_registration() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
-        relay.touch_tunnel("d-rolling", now, &[]);
+        assert!(relay.touch_tunnel("d-rolling", now, &[]));
         assert_eq!(
             relay
                 .resolve_tunnel("d-rolling.fleet.example.test", now)

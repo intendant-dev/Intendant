@@ -1309,6 +1309,7 @@ impl ExternalAgent for CodexAgent {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
         }
+        crate::credential_leases::scrub_dns_credential_env(&mut command);
         let mut child = command.spawn().map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;

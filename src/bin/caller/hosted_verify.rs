@@ -48,6 +48,9 @@ pub(crate) struct HostedBundleStatus {
     pub last_error: Option<String>,
     /// The per-artifact diff behind an `alert` (or a proof-level summary).
     pub mismatches: Vec<String>,
+    /// Normalized Connect URL this verdict belongs to. Never display a
+    /// completed verdict after live configuration points at another service.
+    pub rendezvous_url: Option<String>,
 }
 
 fn registry() -> &'static Mutex<HostedBundleStatus> {
@@ -58,6 +61,7 @@ fn registry() -> &'static Mutex<HostedBundleStatus> {
             checked_unix_ms: None,
             last_error: None,
             mismatches: Vec::new(),
+            rendezvous_url: None,
         })
     })
 }
@@ -69,9 +73,50 @@ pub(crate) fn status_snapshot() -> HostedBundleStatus {
         .clone()
 }
 
-fn with_status(update: impl FnOnce(&mut HostedBundleStatus)) {
+fn with_status<T>(update: impl FnOnce(&mut HostedBundleStatus) -> T) -> T {
     let mut status = registry().lock().expect("hosted bundle status poisoned");
-    update(&mut status);
+    update(&mut status)
+}
+
+fn verifier_url_key(value: Option<&str>) -> Option<String> {
+    let mut url = Url::parse(value?.trim()).ok()?;
+    url.set_fragment(None);
+    let normalized = url.as_str().trim_end_matches('/').to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn bind_status_to_url(status: &mut HostedBundleStatus, rendezvous_url: Option<String>) {
+    if status.rendezvous_url == rendezvous_url {
+        return;
+    }
+    status.state = "unchecked".to_string();
+    status.checked_unix_ms = None;
+    status.last_error = None;
+    status.mismatches.clear();
+    status.rendezvous_url = rendezvous_url;
+}
+
+fn update_status_for_url(
+    status: &mut HostedBundleStatus,
+    rendezvous_url: &str,
+    update: impl FnOnce(&mut HostedBundleStatus),
+) -> bool {
+    if status.rendezvous_url.as_deref() != Some(rendezvous_url) {
+        return false;
+    }
+    update(status);
+    true
+}
+
+/// Reset a completed verdict when the live Connect destination changes.
+pub(crate) fn note_connect_config(enabled: bool, rendezvous_url: Option<&str>) {
+    let key = enabled.then(|| verifier_url_key(rendezvous_url)).flatten();
+    with_status(|status| bind_status_to_url(status, key));
+}
+
+/// Runtime settings changes do not wait for the next daily tick.
+pub(crate) fn spawn_check_now() {
+    tokio::spawn(check_once());
 }
 
 fn now_unix_ms() -> u64 {
@@ -1211,49 +1256,64 @@ pub(crate) async fn verify_hosted_release(
 pub(crate) async fn check_once() {
     let status = crate::connect_rendezvous::status_snapshot();
     if !status.configured {
+        note_connect_config(false, None);
         return;
     }
-    let Some(base) = status
+    let Some(base_text) = status
         .rendezvous_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .and_then(|s| Url::parse(s).ok())
     else {
         return;
     };
+    let Some(key) = verifier_url_key(Some(base_text)) else {
+        return;
+    };
+    let Ok(base) = Url::parse(base_text) else {
+        return;
+    };
+    with_status(|status| bind_status_to_url(status, Some(key.clone())));
     let now = now_unix_ms();
     match verify_hosted_bundle(&base, &crate::platform::intendant_home()).await {
         Ok(_) => with_status(|s| {
-            s.state = "ok".to_string();
-            s.checked_unix_ms = Some(now);
-            s.last_error = None;
-            s.mismatches = Vec::new();
+            update_status_for_url(s, &key, |s| {
+                s.state = "ok".to_string();
+                s.checked_unix_ms = Some(now);
+                s.last_error = None;
+                s.mismatches = Vec::new();
+            });
         }),
         Err(VerifyFailure::Unavailable(error)) => with_status(|s| {
-            s.last_error = Some(error);
+            update_status_for_url(s, &key, |s| {
+                s.last_error = Some(error);
+            });
         }),
         Err(VerifyFailure::Verification {
             summary,
             mismatches,
         }) => {
-            with_status(|s| {
-                s.state = "alert".to_string();
-                s.checked_unix_ms = Some(now);
-                s.last_error = None;
-                s.mismatches = if mismatches.is_empty() {
-                    vec![summary.clone()]
-                } else {
-                    mismatches.clone()
-                };
+            let applied = with_status(|s| {
+                update_status_for_url(s, &key, |s| {
+                    s.state = "alert".to_string();
+                    s.checked_unix_ms = Some(now);
+                    s.last_error = None;
+                    s.mismatches = if mismatches.is_empty() {
+                        vec![summary.clone()]
+                    } else {
+                        mismatches.clone()
+                    };
+                })
             });
-            eprintln!(
-                "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
-                 not match its public transparency log ({summary}): {:?} — treat hosted tabs \
-                 against this rendezvous as compromised until the operator explains; direct \
-                 and fleet-name dashboards are unaffected",
-                base, mismatches,
-            );
+            if applied {
+                eprintln!(
+                    "[hosted-verify] HOSTED BUNDLE ALERT: {} is serving Connect code/assets that do \
+                     not match its public transparency log ({summary}): {:?} — treat hosted tabs \
+                     against this rendezvous as compromised until the operator explains; direct \
+                     and fleet-name dashboards are unaffected",
+                    base, mismatches,
+                );
+            }
         }
     }
 }
@@ -1566,6 +1626,34 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         rx.recv().await.expect("daily check");
         handle.abort();
+    }
+
+    #[test]
+    fn completed_verdict_is_bound_to_one_rendezvous_url() {
+        let mut status = HostedBundleStatus {
+            state: "unchecked".to_string(),
+            checked_unix_ms: None,
+            last_error: None,
+            mismatches: Vec::new(),
+            rendezvous_url: None,
+        };
+        let first = verifier_url_key(Some("https://first.example/")).unwrap();
+        bind_status_to_url(&mut status, Some(first.clone()));
+        assert!(update_status_for_url(&mut status, &first, |status| {
+            status.state = "ok".to_string();
+            status.checked_unix_ms = Some(7);
+        }));
+
+        let second = verifier_url_key(Some("https://second.example")).unwrap();
+        bind_status_to_url(&mut status, Some(second.clone()));
+        assert_eq!(status.state, "unchecked");
+        assert_eq!(status.checked_unix_ms, None);
+        assert!(!update_status_for_url(&mut status, &first, |status| {
+            status.state = "alert".to_string();
+        }));
+        assert!(update_status_for_url(&mut status, &second, |status| {
+            status.state = "ok".to_string();
+        }));
     }
 
     // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are

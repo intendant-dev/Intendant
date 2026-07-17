@@ -390,6 +390,11 @@ struct ClientState {
     handle: Option<JoinHandle<()>>,
     dashboard_control: Option<Arc<DashboardControlRegistry>>,
     hosted_control: Option<Arc<crate::access::hosted_control::HostedControlRuntime>>,
+    /// Last effective config supplied by boot or the live settings surface.
+    /// Kept private: daemon-signed side channels need the configured bearer
+    /// token and custom-domain registration, but neither belongs in the
+    /// dashboard status snapshot.
+    effective_config: Option<ConnectConfig>,
     /// The web gateway's TCP port — combined with the rendezvous-observed
     /// IP to advertise an ICE-TCP candidate on Connect offers.
     gateway_tcp_port: Option<u16>,
@@ -402,6 +407,7 @@ fn client_state() -> &'static Mutex<ClientState> {
             handle: None,
             dashboard_control: None,
             hosted_control: None,
+            effective_config: None,
             gateway_tcp_port: None,
         })
     })
@@ -451,6 +457,10 @@ pub(crate) fn stop_client() {
 pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
     stop_client();
     if !config.enabled {
+        client_state()
+            .lock()
+            .expect("connect client state poisoned")
+            .effective_config = Some(config.clone());
         with_status(|status| {
             status.configured = false;
             status.env_forced = ConnectConfig::env_forced();
@@ -459,6 +469,7 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
             status.claim_code_expires_unix_ms = None;
             status.last_error = None;
         });
+        crate::hosted_verify::note_connect_config(false, None);
         return Ok(false);
     }
     let (dashboard_control, gateway_tcp_port, hosted_control) = {
@@ -477,6 +488,7 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
         "connect client cannot start before hosted control is initialized".to_string()
     })?;
     start_client(config, dashboard_control, gateway_tcp_port, hosted_control);
+    crate::hosted_verify::spawn_check_now();
     Ok(client_state()
         .lock()
         .expect("connect client state poisoned")
@@ -492,6 +504,10 @@ fn start_client(
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
 ) {
+    client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .effective_config = Some(config.clone());
     with_status(|status| {
         status.configured = config.enabled;
         status.env_forced = ConnectConfig::env_forced();
@@ -499,6 +515,7 @@ fn start_client(
         status.daemon_id = config.daemon_id.clone();
         status.signed_claim = load_signed_claim_record();
     });
+    crate::hosted_verify::note_connect_config(config.enabled, config.rendezvous_url.as_deref());
     if !config.enabled {
         // One line per gateway spawn: a daemon that silently never
         // registers is indistinguishable from a broken rendezvous — say
@@ -1408,6 +1425,7 @@ const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 /// Persistent relay control-channel long-poll protocol (mirrors
 /// `bin/connect/relay.rs`).
+pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
@@ -1439,13 +1457,13 @@ fn dns_acme_signing_payload(
 /// URL, identity, and the effective daemon id.
 pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String>
 {
-    let mut config = crate::project::ConnectConfig::default().effective_with_env();
-    if config.rendezvous_url.is_none() {
-        config.rendezvous_url = status_snapshot().rendezvous_url;
-    }
-    if config.daemon_id.is_none() {
-        config.daemon_id = status_snapshot().daemon_id;
-    }
+    let stored = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .effective_config
+        .clone();
+    let status = status_snapshot();
+    let config = signed_daemon_config(stored, &status);
     let base_url = config
         .rendezvous_url
         .as_deref()
@@ -1462,6 +1480,21 @@ pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdent
         .map(str::to_string)
         .unwrap_or_else(|| identity.public_key_b64u());
     Ok((config, base_url, identity, daemon_id))
+}
+
+fn signed_daemon_config(stored: Option<ConnectConfig>, status: &ConnectStatus) -> ConnectConfig {
+    let mut config =
+        stored.unwrap_or_else(|| crate::project::ConnectConfig::default().effective_with_env());
+    // URL and daemon id are the two settings that can change live. Preserve
+    // every other startup field (notably auth_token and custom_domain) while
+    // following the running client's current destination and identity.
+    if status.rendezvous_url.is_some() {
+        config.rendezvous_url.clone_from(&status.rendezvous_url);
+    }
+    if status.daemon_id.is_some() {
+        config.daemon_id.clone_from(&status.daemon_id);
+    }
+    config
 }
 
 async fn dns_signed_post(
@@ -2076,6 +2109,36 @@ mod tests {
         assert!(hash
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+    }
+
+    #[test]
+    fn daemon_signed_side_channels_preserve_private_effective_config() {
+        let mut stored = ConnectConfig {
+            enabled: true,
+            rendezvous_url: Some("https://old.example".to_string()),
+            daemon_id: Some("old-daemon".to_string()),
+            auth_token: Some("configured-token".to_string()),
+            ..ConnectConfig::default()
+        };
+        stored.custom_domain.enabled = true;
+        stored.custom_domain.name = Some("box.example.test".to_string());
+        let status = ConnectStatus {
+            rendezvous_url: Some("https://current.example".to_string()),
+            daemon_id: Some("current-daemon".to_string()),
+            ..ConnectStatus::default()
+        };
+
+        let effective = signed_daemon_config(Some(stored), &status);
+        assert_eq!(
+            effective.rendezvous_url.as_deref(),
+            Some("https://current.example")
+        );
+        assert_eq!(effective.daemon_id.as_deref(), Some("current-daemon"));
+        assert_eq!(effective.auth_token.as_deref(), Some("configured-token"));
+        assert_eq!(
+            effective.custom_domain.name.as_deref(),
+            Some("box.example.test")
+        );
     }
 
     #[test]

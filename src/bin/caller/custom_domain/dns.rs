@@ -1,4 +1,5 @@
 use base64::Engine as _;
+use futures_util::StreamExt as _;
 use hickory_proto::op::{update_message, ResponseCode};
 use hickory_proto::rr::rdata::{tsig::TsigAlgorithm, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordSet, TSigner};
@@ -211,13 +212,7 @@ async fn cloudflare_create(
         .await
         .map_err(|error| format!("Cloudflare DNS create: {error}"))?;
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("read Cloudflare DNS response: {error}"))?;
-    if body.len() > CLOUDFLARE_RESPONSE_MAX_BYTES {
-        return Err("Cloudflare DNS response exceeds the size cap".to_string());
-    }
+    let body = cloudflare_response_body(response, "response").await?;
     let envelope: CloudflareEnvelope<CloudflareRecord> = serde_json::from_slice(&body)
         .map_err(|error| format!("parse Cloudflare DNS response ({status}): {error}"))?;
     if !status.is_success() || !envelope.success {
@@ -243,13 +238,7 @@ async fn cloudflare_delete(zone_id: &str, record_id: &str, token: &str) -> Resul
         .await
         .map_err(|error| format!("Cloudflare DNS cleanup: {error}"))?;
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| format!("read Cloudflare DNS cleanup response: {error}"))?;
-    if body.len() > CLOUDFLARE_RESPONSE_MAX_BYTES {
-        return Err("Cloudflare DNS cleanup response exceeds the size cap".to_string());
-    }
+    let body = cloudflare_response_body(response, "cleanup response").await?;
     let envelope: CloudflareEnvelope<serde_json::Value> = serde_json::from_slice(&body)
         .map_err(|error| format!("parse Cloudflare DNS cleanup response ({status}): {error}"))?;
     if !status.is_success() || !envelope.success {
@@ -267,6 +256,41 @@ fn cloudflare_client() -> Result<reqwest::Client, String> {
         .connect_timeout(Duration::from_secs(10))
         .build()
         .map_err(|error| format!("build Cloudflare DNS client: {error}"))
+}
+
+async fn cloudflare_response_body(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > CLOUDFLARE_RESPONSE_MAX_BYTES as u64)
+    {
+        return Err(format!("Cloudflare DNS {context} exceeds the size cap"));
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("read Cloudflare DNS {context}: {error}"))?;
+        append_cloudflare_response_chunk(&mut body, &chunk, context)?;
+    }
+    Ok(body)
+}
+
+fn append_cloudflare_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    context: &str,
+) -> Result<(), String> {
+    if body
+        .len()
+        .checked_add(chunk.len())
+        .is_none_or(|length| length > CLOUDFLARE_RESPONSE_MAX_BYTES)
+    {
+        return Err(format!("Cloudflare DNS {context} exceeds the size cap"));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn cloudflare_error_text(errors: &[CloudflareError]) -> String {
@@ -429,5 +453,15 @@ mod tests {
             "_TSIG_SECRET",
         )
         .is_err());
+    }
+
+    #[test]
+    fn cloudflare_response_cap_is_enforced_while_streaming() {
+        let mut body = vec![0; CLOUDFLARE_RESPONSE_MAX_BYTES - 2];
+        append_cloudflare_response_chunk(&mut body, &[1, 2], "response").unwrap();
+        let before = body.len();
+        let error = append_cloudflare_response_chunk(&mut body, &[3], "response").unwrap_err();
+        assert!(error.contains("size cap"), "{error}");
+        assert_eq!(body.len(), before, "the over-cap chunk is never retained");
     }
 }
