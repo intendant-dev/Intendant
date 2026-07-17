@@ -45,16 +45,17 @@ impl ClaudeTranscriptTree {
     pub(crate) fn ancestor_chain(&self, uuid: &str) -> Vec<&ClaudeTreeNode> {
         let mut chain = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mut cursor = Some(uuid.to_string());
-        while let Some(current) = cursor {
-            if !seen.insert(current.clone()) {
+        let mut cursor = self.by_uuid.get(uuid).copied();
+        while let Some(index) = cursor {
+            if !seen.insert(index) {
                 break;
             }
-            let Some(node) = self.node(&current) else {
-                break;
-            };
+            let node = &self.nodes[index];
             chain.push(node);
-            cursor = node.parent_uuid.clone();
+            cursor = node
+                .parent_uuid
+                .as_deref()
+                .and_then(|parent| self.by_uuid.get(parent).copied());
         }
         chain
     }

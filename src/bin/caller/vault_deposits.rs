@@ -248,7 +248,7 @@ pub fn list_deposits_in(dir: &Path) -> Result<Vec<DepositRecord>, String> {
             Err(e) => eprintln!("[vault-deposits] skipping {}: {e}", path.display()),
         }
     }
-    records.sort_by_key(|r| (r.created_unix_ms, r.id.clone()));
+    records.sort_by(|a, b| (a.created_unix_ms, &a.id).cmp(&(b.created_unix_ms, &b.id)));
     Ok(records)
 }
 
