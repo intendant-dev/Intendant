@@ -255,29 +255,23 @@ fn observe_event(
             record_on_item(handle, &spawn, "started", Some(session_id.clone()), None);
             state.running.insert(session_id.clone(), spawn);
         }
+        // The two normal-completion shapes: `signal_done` exits emit
+        // DoneSignal (the common case — proven live), while no-commands
+        // streaks and policy exits emit TaskComplete with a reason/summary.
+        AppEvent::DoneSignal {
+            session_id: Some(session_id),
+            message,
+        } => {
+            let note = message.clone().unwrap_or_else(|| "done".to_string());
+            complete_running(handle, journal, state, session_id, note);
+        }
         AppEvent::TaskComplete {
             session_id: Some(session_id),
             reason,
             summary,
         } => {
-            let Some(spawn) = state.running.remove(session_id) else {
-                return;
-            };
-            session_record(
-                journal,
-                &spawn,
-                now_ms(),
-                OccurrenceState::Completed,
-                Some(session_id.clone()),
-            );
             let note = summary.clone().unwrap_or_else(|| reason.clone());
-            record_on_item(
-                handle,
-                &spawn,
-                "completed",
-                Some(session_id.clone()),
-                Some(note),
-            );
+            complete_running(handle, journal, state, session_id, note);
         }
         AppEvent::SessionEnded {
             session_id, reason, ..
@@ -305,6 +299,34 @@ fn observe_event(
         }
         _ => {}
     }
+}
+
+/// A running scheduled session finished normally: journal `completed` and
+/// write the outcome back to the item.
+fn complete_running(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    session_id: &str,
+    note: String,
+) {
+    let Some(spawn) = state.running.remove(session_id) else {
+        return;
+    };
+    session_record(
+        journal,
+        &spawn,
+        now_ms(),
+        OccurrenceState::Completed,
+        Some(session_id.to_string()),
+    );
+    record_on_item(
+        handle,
+        &spawn,
+        "completed",
+        Some(session_id.to_string()),
+        Some(note),
+    );
 }
 
 /// Terminal resolution for occurrences that never spawned (missed window
@@ -831,15 +853,16 @@ mod tests {
         let item = items.iter().find(|i| i.id == item_id).unwrap();
         assert_eq!(item.effects[0].last_run.as_ref().unwrap().state, "started");
 
-        // Completion → terminal + result write-back.
+        // Completion → terminal + result write-back. `signal_done` exits
+        // emit DoneSignal, not TaskComplete — the shape the live daemon
+        // proved (a mock session stuck at `started` until this arm existed).
         observe_event(
             &handle,
             &mut journal,
             &mut state,
-            &AppEvent::TaskComplete {
+            &AppEvent::DoneSignal {
                 session_id: Some("sess-run".into()),
-                reason: "done".into(),
-                summary: Some("swept 4 certs".into()),
+                message: Some("swept 4 certs".into()),
             },
         );
         assert_eq!(
@@ -865,6 +888,77 @@ mod tests {
                 "spent occurrence must not re-dispatch"
             );
         }
+
+        // A revised manifest re-arms: new digest ⇒ new occurrence identity
+        // (same effect lineage), so after re-approval it fires again. This
+        // leg completes via TaskComplete — the no-commands/policy exit shape.
+        handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item_id.clone(),
+                    goal: "run the nightly sweep, rev 2".into(),
+                    fire_at_ms: now_ms() - 30_000,
+                    orchestrate: false,
+                },
+                None,
+            )
+            .unwrap();
+        let (items, _, _) = handle.snapshot();
+        let revised = items.iter().find(|i| i.id == item_id).unwrap().effects[0].clone();
+        assert!(
+            revised.last_run.is_none(),
+            "a fresh revision clears the stale outcome view"
+        );
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item_id.clone(),
+                    digest: revised.digest,
+                },
+                owner(),
+            )
+            .unwrap();
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut second = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                delegation_id: Some(delegation_id),
+                ..
+            }) = event
+            {
+                second = Some(delegation_id);
+            }
+        }
+        let second = second.expect("a revised + re-approved manifest dispatches again");
+        assert_ne!(second, dispatched[0].1, "revision mints a new occurrence");
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: second,
+                session_id: "sess-run-2".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskComplete {
+                session_id: Some("sess-run-2".into()),
+                reason: "Task complete".into(),
+                summary: Some("rev 2 done".into()),
+            },
+        );
+        let (items, _, _) = handle.snapshot();
+        let run = items.iter().find(|i| i.id == item_id).unwrap().effects[0]
+            .last_run
+            .clone()
+            .unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.note.as_deref(), Some("rev 2 done"));
+        assert_eq!(run.session_id.as_deref(), Some("sess-run-2"));
     }
 
     /// A session that stops or errors before finishing records `failed`;
