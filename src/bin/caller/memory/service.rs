@@ -565,7 +565,11 @@ mod tests {
         }
         let mut wrong = full[..12].to_string();
         wrong.pop();
-        wrong.push(if full.as_bytes()[11] == b'0' { '1' } else { '0' });
+        wrong.push(if full.as_bytes()[11] == b'0' {
+            '1'
+        } else {
+            '0'
+        });
         assert!(!hex_prefix_matches(&key, &wrong), "mismatched last nibble");
         let over = format!("{full}0");
         assert!(
