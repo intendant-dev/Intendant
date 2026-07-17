@@ -662,6 +662,27 @@ fn open_item_frame(payload: &[u8], r: &PlaneResume) -> Result<Vec<u8>, StoreErro
 mod tests {
     use super::*;
 
+    /// The battery is process-global by nature — child processes of the
+    /// TEST BINARY and env-var failpoints — so its tests serialize on
+    /// one lock. Under plain `cargo test` (threads in one process, the
+    /// CI legs) a concurrently spawned child briefly duplicates the
+    /// whole fd table in Linux's fork→exec window; a `plane.lock`
+    /// dropped by another test thread in that window survives in the
+    /// child until exec's CLOEXEC sweep, and that test's reopen sees a
+    /// spurious `lock-denied` (live: two different store tests ejected
+    /// PR #405's queue entry and flaked a Dell repro loop; macOS never
+    /// reproduces — its posix_spawn is a true syscall with no fork
+    /// window). Serializing removes the fd-inheritance overlap; nextest
+    /// (process-per-test) was never exposed.
+    static BATTERY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn battery_guard() -> std::sync::MutexGuard<'static, ()> {
+        match BATTERY.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     fn acks_path(dir: &Path) -> PathBuf {
         dir.join("acks.log")
     }
@@ -771,6 +792,7 @@ mod tests {
     /// ceremony's citations or the fold would reject them).
     #[test]
     fn durable_roundtrip_and_chain_resume() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         let mut acked = Vec::new();
@@ -808,6 +830,7 @@ mod tests {
     /// invariant is no acked loss, plus recovered-set admission.)
     #[test]
     fn crash_battery_kill_at_every_point() {
+        let _battery = battery_guard();
         for abort_at in 1..=4u64 {
             let tmp = tempfile::tempdir().unwrap();
             let dir = tmp.path().join("plane");
@@ -842,6 +865,7 @@ mod tests {
     /// must hold every journaled ack; a torn trailing frame truncates.
     #[test]
     fn crash_battery_sigkill_mid_run() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         let mut child = spawn_child(&dir, 200, None, None);
@@ -868,6 +892,7 @@ mod tests {
     /// `sync_all` call site turns this red.
     #[test]
     fn ack_is_coupled_to_flush() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         {
@@ -909,6 +934,7 @@ mod tests {
     /// stays writable.
     #[test]
     fn torn_tail_truncates_and_recovers() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         {
@@ -938,6 +964,7 @@ mod tests {
     /// refuses with the named `log-corrupt`, never silent truncation.
     #[test]
     fn corrupt_final_frame_quarantines() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         {
@@ -963,6 +990,7 @@ mod tests {
     /// quarantine, never a resync-and-skip.
     #[test]
     fn midlog_corruption_quarantines() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         {
@@ -986,6 +1014,7 @@ mod tests {
     /// the named `lock-denied` while the first handle lives.
     #[test]
     fn second_open_is_lock_denied() {
+        let _battery = battery_guard();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         let plane = DurablePlane::create(&dir).unwrap();
@@ -1004,6 +1033,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sidecar_is_owner_only() {
+        let _battery = battery_guard();
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
@@ -1019,6 +1049,7 @@ mod tests {
     /// byte-identically — the §6.2 encoding is the walker's, not ours.
     #[test]
     fn frames_walk_back_byte_identical() {
+        let _battery = battery_guard();
         let plane_id = [7u8; 32];
         let zone_id = [9u8; 16];
         let mut stream = file_header(0, &plane_id, &zone_id);
