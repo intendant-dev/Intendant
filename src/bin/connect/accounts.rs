@@ -146,7 +146,7 @@ pub(crate) async fn record_verified_attestation(
         None,
         json!({ "kind": kind, "subject": subject }),
     );
-    persist_locked(state, &store)?;
+    persist_locked(state, &store).await?;
     Ok(json!({ "ok": true, "kind": kind, "subject": subject }))
 }
 
@@ -383,7 +383,7 @@ pub(crate) async fn admin_invites_mint(
             None,
             json!({ "count": count, "label": label, "max_uses": max_uses }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(
         json!({ "ok": true, "codes": codes, "max_uses": max_uses }),
@@ -454,7 +454,7 @@ pub(crate) async fn admin_invites_revoke(
                 None,
                 json!({ "count": revoked }),
             );
-            persist_locked(&state, &store)?;
+            persist_locked(&state, &store).await?;
         }
     }
     Ok(Json(json!({ "ok": true, "revoked": revoked })))
@@ -980,7 +980,7 @@ pub(crate) async fn auth_register_finish(
             None,
             json!({ "account_name": pending.account_name }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
         store
             .users
             .iter()
@@ -1100,7 +1100,7 @@ pub(crate) async fn auth_login_finish(
             None,
             json!({ "account_name": user.account_name }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
         user
     };
     let (token, csrf_token) = create_session(&state, user.id).await;
