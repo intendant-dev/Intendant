@@ -1417,6 +1417,22 @@ fn make_damage_backend(
     Box::new(capture::damage::NullDamageBackend::new(width, height))
 }
 
+/// RIDs of the pool's always-on baseline bank
+/// ([`encode::pool::BASELINE_CODEC`]), in spec order (descending
+/// bitrate; last entry is the floor). This is the layer set the
+/// layer-policy coordinator manages: on-demand slots are excluded by
+/// `always_on_ids` (they're lease-refcounted, not policy-managed), and
+/// non-baseline always-on entries don't exist today but are filtered
+/// for robustness. Keyed to `BASELINE_CODEC` — not a codec literal —
+/// so the Windows H.264 bank is governed the same way as the VP8
+/// simulcast bank on macOS/Linux.
+fn baseline_always_on_rids(ids: Vec<encode::pool::EncoderId>) -> Vec<encode::pool::SimulcastRid> {
+    ids.into_iter()
+        .filter(|id| id.codec == encode::pool::BASELINE_CODEC)
+        .map(|id| id.rid)
+        .collect()
+}
+
 /// Encode a full-screen tile snapshot into wire frames **once**; the
 /// caller fans the refcounted frames out to any number of peers. The
 /// raw-copy + RLE + lossless-WebP encode of the whole screen is the
@@ -1900,17 +1916,27 @@ impl DisplaySession {
         // always-on layer handles, so snapshots taken at spawn time
         // would go stale.
         //
-        //   - `get_current_rids` returns the pool's full VP8
-        //     simulcast layer set in spec order (descending
-        //     bitrate; last entry is floor). Coordinator derives
-        //     the floor + upper-layer split internally.
+        // All three are keyed to `encode::pool::BASELINE_CODEC` — the
+        // always-on bank's codec (VP8 simulcast on macOS/Linux, the
+        // single full-resolution H.264 layer on Windows). A literal
+        // `CodecKind::Vp8` here left the coordinator inert on Windows
+        // (no VP8 layers → empty rid set → every tick skipped), so the
+        // zero-peer pause never fired and an unwatched Windows session
+        // converted + encoded at full rate forever.
+        //
+        //   - `get_current_rids` returns the pool's always-on baseline
+        //     layer set in spec order (descending bitrate; last entry
+        //     is floor). Coordinator derives the floor + upper-layer
+        //     split internally; with the single-layer Windows bank the
+        //     one layer IS the floor and the congestion cascade has no
+        //     upper layers to act on.
         //   - `is_layer_paused` queries actual pool state for one
         //     RID — diffing against actual (rather than against an
         //     internal `last_applied`) handles the resize-
         //     regenerates-active case correctly.
         //   - `on_action` routes `CapacityAction::PauseLayer` /
         //     `ResumeLayer` to `pool.pause_layer` /
-        //     `pool.resume_layer` with `CodecKind::Vp8`.
+        //     `pool.resume_layer` with `BASELINE_CODEC`.
         //
         // The 5 s zero-peer pause debounce, the 5 s drop /
         // 1 s restore debounces for both TWCC and RR, and the
@@ -1919,17 +1945,10 @@ impl DisplaySession {
         // configured via `CapacityPolicyConfig::default()`.
         let pool_for_rids = Arc::clone(&pool_arc);
         let get_current_rids: Box<dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync> =
-            Box::new(move || {
-                pool_for_rids
-                    .always_on_ids()
-                    .into_iter()
-                    .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
-                    .map(|id| id.rid)
-                    .collect()
-            });
+            Box::new(move || baseline_always_on_rids(pool_for_rids.always_on_ids()));
         let pool_for_query = Arc::clone(&pool_arc);
         let is_layer_paused: aggregator::LayerPauseProbe = Box::new(move |rid| {
-            pool_for_query.is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
+            pool_for_query.is_layer_paused(encode::pool::BASELINE_CODEC, rid.clone())
         });
         let pool_for_action = Arc::clone(&pool_arc);
         let on_action: Box<dyn Fn(aggregator::CapacityAction) + Send + Sync> =
@@ -1950,10 +1969,10 @@ impl DisplaySession {
                 }
                 match action {
                     aggregator::CapacityAction::PauseLayer(rid) => {
-                        pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+                        pool_for_action.pause_layer(encode::pool::BASELINE_CODEC, rid);
                     }
                     aggregator::CapacityAction::ResumeLayer(rid) => {
-                        pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+                        pool_for_action.resume_layer(encode::pool::BASELINE_CODEC, rid);
                     }
                 }
             });
@@ -4415,6 +4434,34 @@ mod tests {
         assert!(!should_try_xdamage_for_tile_stream("wayland"));
         assert!(!should_try_xdamage_for_tile_stream("macos"));
         assert!(!should_try_xdamage_for_tile_stream("stub"));
+    }
+
+    /// The layer-policy coordinator's rid feed must follow the
+    /// platform's `BASELINE_CODEC`, not a codec literal. A literal
+    /// `Vp8` filter left the coordinator inert on Windows (H.264
+    /// bank → empty rid set → every tick skipped → the zero-peer
+    /// pause and the conversion idle gate never engaged).
+    /// Platform-agnostic: the non-baseline codec is derived relative
+    /// to `BASELINE_CODEC`, so this pins the same property on all
+    /// three platforms.
+    #[test]
+    fn baseline_rid_filter_keys_on_platform_baseline_codec() {
+        use encode::pool::{CodecKind, EncoderId, SimulcastRid, BASELINE_CODEC};
+        let other = if BASELINE_CODEC == CodecKind::Vp8 {
+            CodecKind::H264
+        } else {
+            CodecKind::Vp8
+        };
+        let ids = vec![
+            EncoderId::new(BASELINE_CODEC, SimulcastRid::full()),
+            EncoderId::new(other, SimulcastRid::federated()),
+            EncoderId::new(BASELINE_CODEC, SimulcastRid::half()),
+        ];
+        assert_eq!(
+            baseline_always_on_rids(ids),
+            vec![SimulcastRid::full(), SimulcastRid::half()],
+            "coordinator rid feed must be keyed to BASELINE_CODEC, in pool order"
+        );
     }
 
     #[test]
