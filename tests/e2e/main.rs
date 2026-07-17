@@ -4477,3 +4477,124 @@ async fn native_session_forks_at_a_round_boundary() {
 
     daemon.child.kill().await.expect("stop the daemon");
 }
+
+/// Memory P1's zero-injection exit criterion (stewardship package §5.4 /
+/// umbrella §15.2): **a fresh session receives zero unrequested
+/// memory.** With the daemon's Memory plane demonstrably holding a
+/// claim, a session created under that daemon must see none of it —
+/// not in its system prompt, not in any message, nowhere in the
+/// provider-visible request (`turns/*_messages.json` records the full
+/// array the loop sent, system message included) and nowhere in its
+/// session log. Retrieval is pull-only by contract: the plane serves
+/// exactly what a caller searches for, and this test is the regression
+/// gate that keeps every future memory surface honest about that.
+#[tokio::test]
+async fn fresh_sessions_receive_zero_unrequested_memory() {
+    use futures_util::SinkExt;
+    // The nonce appears ONLY as a claim statement proposed onto the
+    // plane — never in the task text or the scripted content — so any
+    // occurrence inside the fresh session's record is an injection.
+    const NONCE: &str = "ZEROINJ_9f3a_the_deploy_runs_at_0600_utc";
+
+    let script = serde_json::json!({
+        "profiles": [{
+            "steps": [
+                { "content": "Checked my context: nothing arrived unrequested.",
+                  "tool_calls": [{ "name": "signal_done",
+                                   "arguments": { "message": "zero-injection mock run complete" } }] }
+            ]
+        }]
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let mut daemon = spawn_daemon(&client, &script).await;
+    let port = daemon.port;
+
+    // Seed the plane through the real ctl → MCP-gate lane, then prove
+    // the claim is retrievable ON REQUEST — the guarantee below is
+    // meaningless if the plane were empty.
+    let propose = ctl(
+        &daemon,
+        &["memory", "propose", NONCE, "--kind", "observation"],
+    )
+    .await;
+    assert!(propose.status.success(), "{}", text_of(&propose));
+    let search = ctl(&daemon, &["memory", "search", NONCE, "--candidates"]).await;
+    assert!(search.status.success(), "{}", text_of(&search));
+    assert!(
+        String::from_utf8_lossy(&search.stdout).contains(NONCE),
+        "the plane must hold the seeded claim before the guarantee means anything:\n{}",
+        text_of(&search)
+    );
+
+    // A fresh session in its own project root, through the real stack.
+    let session_project = tempfile::tempdir().expect("session project");
+    std::fs::write(session_project.path().join("intendant.toml"), "")
+        .expect("mark session project");
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws"))
+        .await
+        .expect("connect /ws");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        serde_json::json!({
+            "action": "create_session",
+            "task": "confirm your context is exactly the task you were given",
+            "project_root": session_project.path().to_string_lossy(),
+            "direct": true,
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send create_session");
+    let started = next_matching_ws_event(&mut ws, RUN_TIMEOUT, |json| {
+        json.get("event").and_then(|v| v.as_str()) == Some("session_started")
+            && json
+                .get("task")
+                .and_then(|v| v.as_str())
+                .is_some_and(|task| task.contains("exactly the task"))
+    })
+    .await
+    .unwrap_or_else(|| panic!("session never started; daemon log:\n{}", daemon.log_tail()));
+    let session_id = started
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("session_started carries a session id")
+        .to_string();
+    complete_and_stop_session(&mut ws, &session_id, || daemon.log_tail()).await;
+
+    // The fresh session's OWN full record: session.jsonl plus every
+    // per-turn artifact (including the request-message dumps). Scoped to
+    // this session's directory — the daemon head session legitimately
+    // saw the nonce ride through the ctl propose call above.
+    let session_dir = daemon
+        .rig
+        .home
+        .path()
+        .join(".intendant")
+        .join("logs")
+        .join(&session_id);
+    let mut record = std::fs::read_to_string(session_dir.join("session.jsonl"))
+        .unwrap_or_else(|e| panic!("fresh session log missing at {session_dir:?}: {e}"));
+    if let Ok(turns) = std::fs::read_dir(session_dir.join("turns")) {
+        for turn in turns.flatten() {
+            if let Ok(contents) = std::fs::read_to_string(turn.path()) {
+                record.push_str(&contents);
+                record.push('\n');
+            }
+        }
+    }
+    assert!(
+        record.contains("turn"),
+        "the fresh session must have actually run a turn:\n{}",
+        tail(&record, 2000)
+    );
+    assert!(
+        !record.contains(NONCE),
+        "ZERO-INJECTION VIOLATED: the plane's claim reached a fresh session's \
+         record without being requested (session {session_id})"
+    );
+
+    daemon.child.kill().await.expect("stop the daemon");
+}
