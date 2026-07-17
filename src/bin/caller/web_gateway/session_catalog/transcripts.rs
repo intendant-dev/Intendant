@@ -813,6 +813,16 @@ pub(crate) fn codex_session_canonical_lanes(path: &Path) -> (bool, bool) {
 /// transcript-sync dedupe (`sessionWindowTranscriptSignatures*`) collapses
 /// the two instead of duplicating rows.
 ///
+/// User prompt rows additionally carry `user_turn_index`/
+/// `user_turn_revision` counted per transcript line, exactly like the
+/// Codex parser (`push_codex_transcript_message`): the live
+/// `UserMessageLog` row logs the prompt with the wrapper's turn metadata
+/// and the DISPATCH-time timestamp, while this transcript records the
+/// backend's own (later) timestamp for the same text — without matching
+/// turn metadata the frontend has no signature bridging the two, and the
+/// initial prompt rendered twice in the Activity log (observed live: a
+/// 6s create→ready gap put the copies in different near-time buckets).
+///
 /// The flat predecessor extracted every block's text with
 /// `message_content_text` and stamped user-role envelopes as source
 /// `"user"` — which put tool_result payloads (command output!) in the log
@@ -825,6 +835,11 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
     // The live rows' source label (AgentBackend::Display) — dedupe
     // signatures include the source, so this must match byte-for-byte.
     let agent_source = crate::external_agent::AgentBackend::ClaudeCode.to_string();
+    // Fresh-state counters agree with the live lane's
+    // (`UserTurnRevisionState` starts every turn at revision 1), so the
+    // initial prompt hydrates as turn 1 rev 1 — the values the live
+    // `UserMessageLog` row carries.
+    let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -885,10 +900,13 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         if let Some(text) = content.and_then(|c| c.as_str()) {
             let text = user_prose(text);
             if typ == "user" && !text.is_empty() && !is_injected_external_user_text(&text) {
+                let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
                 push(serde_json::json!({
                     "level": "info",
                     "source": "User",
                     "content": text,
+                    "user_turn_index": user_turn_index,
+                    "user_turn_revision": user_turn_revision,
                 }));
             }
             continue;
@@ -896,6 +914,9 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         let Some(blocks) = content.and_then(|c| c.as_array()) else {
             continue;
         };
+        // One user turn per transcript line: a multi-block user message is
+        // one live prompt, so its prose blocks share the line's turn.
+        let mut line_user_turn: Option<(u32, u32)> = None;
         for block in blocks {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text" => {
@@ -919,10 +940,14 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
                         let text = user_prose(text);
                         if !text.is_empty() {
                             // Live shape: UserMessageLog → LogEntry.
+                            let (user_turn_index, user_turn_revision) = *line_user_turn
+                                .get_or_insert_with(|| user_turn_revisions.record_next_turn());
                             push(serde_json::json!({
                                 "level": "info",
                                 "source": "User",
                                 "content": text,
+                                "user_turn_index": user_turn_index,
+                                "user_turn_revision": user_turn_revision,
                             }));
                         }
                     }
@@ -2946,6 +2971,78 @@ mod tests {
         assert!(entries
             .iter()
             .all(|e| e["source"] != "User" || e["content"] == "real user prompt"));
+    }
+
+    /// User prompt rows carry sequential `user_turn_index`/
+    /// `user_turn_revision` — the dedupe bridge to the live `UserMessageLog`
+    /// rows. The live row logs the prompt at DISPATCH time with the
+    /// wrapper's turn metadata; the backend transcript re-serves the same
+    /// text under the backend's own (later) timestamp, so without matching
+    /// turn metadata no frontend signature collapses the two and the
+    /// initial prompt renders twice in the Activity log (a 6s create→ready
+    /// gap defeats even the near-time bucket). Tool results, meta records,
+    /// and harness-injected text must consume NO turn — they are not live
+    /// user turns, and burning indexes on them would shift every later
+    /// prompt out of alignment with the wrapper's round counter.
+    #[test]
+    fn claude_transcript_user_rows_carry_live_turn_metadata() {
+        let addendum_marker =
+            crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let initial_prompt =
+            format!("fix the flaky test\\n\\n{addendum_marker}\\nsupervisor plumbing");
+        let lines = [
+            // The wrapper appends the supervision addendum to the first
+            // prompt; hydration must serve the user's own prose (what the
+            // live row shows) with turn 1 rev 1 — the fresh-state values
+            // the live emission mints.
+            format!(
+                r#"{{"type":"user","timestamp":"2026-07-13T03:22:56.000Z","message":{{"role":"user","content":"{initial_prompt}"}}}}"#
+            ),
+            r#"{"type":"assistant","timestamp":"2026-07-13T03:23:13.000Z","message":{"role":"assistant","content":[{"type":"text","text":"On it."},{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"cargo test"}}]}}"#.to_string(),
+            // Interleaved non-turns: tool_result, isMeta, injected text.
+            r#"{"type":"user","timestamp":"2026-07-13T03:23:14.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"1 test passed"}]}}"#.to_string(),
+            r#"{"type":"user","isMeta":true,"timestamp":"2026-07-13T03:23:15.000Z","message":{"role":"user","content":"Caveat: harness-generated"}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-07-13T03:23:16.000Z","message":{"role":"user","content":[{"type":"text","text":"<local-command-stdout>noise</local-command-stdout>"}]}}"#.to_string(),
+            // Follow-up in block form (an image block rides along): ONE
+            // turn for the line, assigned to its prose block.
+            r#"{"type":"user","timestamp":"2026-07-13T03:24:00.000Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"now fix the docs"}]}}"#.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let entries = parse_claude_session_entries(&path).expect("parse");
+        let user_rows: Vec<(&str, u64, u64)> = entries
+            .iter()
+            .filter(|e| e["source"] == "User")
+            .map(|e| {
+                (
+                    e["content"].as_str().unwrap_or(""),
+                    e["user_turn_index"].as_u64().unwrap_or(0),
+                    e["user_turn_revision"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![("fix the flaky test", 1, 1), ("now fix the docs", 2, 1)],
+            "user prompts carry sequential turn metadata; non-turns consume no index"
+        );
+        // Non-user rows must not claim turn metadata (the frontend keys
+        // edit affordances and dedupe signatures off these fields).
+        assert!(entries
+            .iter()
+            .filter(|e| e["source"] != "User")
+            .all(|e| e.get("user_turn_index").is_none()
+                && e.get("user_turn_revision").is_none()));
+        // The cross-lane contract that makes the signatures collapse: the
+        // live lane's counter (UserTurnRevisionState, external_mode round
+        // bookkeeping) and the replay/hydration counter mint identical
+        // fresh-state sequences.
+        let mut live = crate::codex_history::UserTurnRevisionState::default();
+        let mut replay = ReplayUserTurnRevisionState::default();
+        assert_eq!(live.record_next_turn(), replay.record_next_turn());
+        assert_eq!(live.record_next_turn(), replay.record_next_turn());
     }
 
     /// Transcript entries carry the line's `message_uuid`, abandoned sibling
