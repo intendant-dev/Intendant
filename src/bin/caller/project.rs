@@ -825,6 +825,33 @@ impl CustomDomainConfig {
             rp_id,
         }))
     }
+
+    pub(crate) fn validated_dns_credential_fallback(
+        &self,
+    ) -> Result<Option<(&'static str, String)>, String> {
+        if self.validated()?.is_none() {
+            return Ok(None);
+        }
+        match &self.dns {
+            Some(CustomDomainDnsConfig::Cloudflare { token_env, .. }) => {
+                crate::credential_leases::dns_credential_env_name(
+                    token_env.as_deref(),
+                    "CLOUDFLARE_API_TOKEN",
+                    "_API_TOKEN",
+                )
+                .map(|name| Some(("dns:cloudflare", name)))
+            }
+            Some(CustomDomainDnsConfig::Rfc2136 { secret_env, .. }) => {
+                crate::credential_leases::dns_credential_env_name(
+                    secret_env.as_deref(),
+                    "INTENDANT_RFC2136_TSIG_SECRET",
+                    "_TSIG_SECRET",
+                )
+                .map(|name| Some(("dns:rfc2136", name)))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2621,6 +2648,10 @@ zone_id = "zone-id"
             &custom.dns,
             Some(CustomDomainDnsConfig::Cloudflare { zone_id, .. }) if zone_id == "zone-id"
         ));
+        assert_eq!(
+            custom.validated_dns_credential_fallback().unwrap(),
+            Some(("dns:cloudflare", "CLOUDFLARE_API_TOKEN".to_string()))
+        );
         let serialized = toml::to_string(&parsed.connect).unwrap();
         assert!(!serialized.to_ascii_lowercase().contains("secret ="));
         assert!(!serialized.to_ascii_lowercase().contains("token ="));
@@ -2632,6 +2663,7 @@ zone_id = "zone-id"
             propagation_delay_secs: 10,
         });
         assert!(invalid.validated().is_err());
+        assert!(invalid.validated_dns_credential_fallback().is_err());
     }
 
     #[test]

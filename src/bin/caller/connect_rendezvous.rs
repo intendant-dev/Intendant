@@ -1497,6 +1497,22 @@ fn signed_daemon_config(stored: Option<ConnectConfig>, status: &ConnectStatus) -
     config
 }
 
+/// Exact environment fallback belonging to the currently active, validated
+/// custom-domain configuration. The name is authority metadata, never the
+/// credential value.
+pub(crate) fn active_custom_domain_dns_fallback() -> Option<(&'static str, String)> {
+    let config = client_state()
+        .lock()
+        .expect("connect client state poisoned")
+        .effective_config
+        .clone()?;
+    config
+        .custom_domain
+        .validated_dns_credential_fallback()
+        .ok()
+        .flatten()
+}
+
 async fn dns_signed_post(
     path: &str,
     protocol: &str,

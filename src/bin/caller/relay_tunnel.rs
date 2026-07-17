@@ -186,7 +186,7 @@ async fn poll_relay_next(
         server_names,
     )
     .await?;
-    if protocol == RELAY_CONTROL_PROTOCOL && response.status() == reqwest::StatusCode::BAD_REQUEST {
+    if protocol == RELAY_CONTROL_PROTOCOL && exact_name_registration_rejected(response.status()) {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         eprintln!(
@@ -204,6 +204,13 @@ async fn poll_relay_next(
         .await?;
     }
     decode_relay_poll_response(response).await
+}
+
+fn exact_name_registration_rejected(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::CONFLICT
+    )
 }
 
 fn relay_control_protocol(server_names: &[String]) -> &'static str {
@@ -425,6 +432,19 @@ mod tests {
             relay_control_protocol(&["box.example.test".to_string()]),
             RELAY_CONTROL_PROTOCOL
         );
+    }
+
+    #[test]
+    fn exact_name_rejections_fall_back_without_disabling_fleet_routing() {
+        assert!(exact_name_registration_rejected(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(exact_name_registration_rejected(
+            reqwest::StatusCode::CONFLICT
+        ));
+        assert!(!exact_name_registration_rejected(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
     }
 
     /// The dial-back path splices the relay data connection to the dedicated
