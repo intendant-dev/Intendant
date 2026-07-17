@@ -1413,6 +1413,8 @@ mod tests {
             dns_zone: None,
             dns_ns_name: None,
             dns_listen: None,
+            relay_listen: None,
+            relay_addresses: Vec::new(),
         }
     }
 

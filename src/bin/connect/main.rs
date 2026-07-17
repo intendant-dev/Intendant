@@ -14,7 +14,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write as _;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,8 @@ mod rendezvous;
 pub(crate) use rendezvous::*;
 mod dns;
 pub(crate) use dns::*;
+mod relay;
+pub(crate) use relay::*;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
@@ -105,6 +107,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !had_keys || manifest_logged {
         save_store(&config.data_file, &store).map_err(|e| format!("persist service keys: {e}"))?;
     }
+    // Reachability relay: build its state before the DNS zone so relay-mode
+    // DNS records re-resolve to the CURRENT relay address at hydration rather
+    // than whatever was stored when they were last published.
+    let relay = match &config.relay_listen {
+        Some(listen) if !config.relay_addresses.is_empty() => Some(Arc::new(RelayState::new(
+            *listen,
+            config.relay_addresses.clone(),
+        ))),
+        _ => None,
+    };
+
     // Fleet DNS: build the zone, hydrate persisted records, and bind the
     // sockets BEFORE serving — a misconfigured DNS listener must fail the
     // whole startup loudly, not limp along HTTP-only.
@@ -112,11 +125,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Some(zone_name), Some(ns_name), Some(_listen)) => {
             let zone = Arc::new(FleetZone::new(zone_name, ns_name)?);
             for entry in &store.dns_records {
-                let addresses: Vec<std::net::IpAddr> = entry
-                    .addresses
-                    .iter()
-                    .filter_map(|value| value.parse().ok())
-                    .collect();
+                let addresses: Vec<std::net::IpAddr> = if entry.via_relay {
+                    match relay.as_ref() {
+                        Some(relay) => relay.advertise_addrs().to_vec(),
+                        None => {
+                            eprintln!(
+                                "[connect] skipping relay-mode dns record for {}: relay is disabled",
+                                entry.daemon_id
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    entry
+                        .addresses
+                        .iter()
+                        .filter_map(|value| value.parse().ok())
+                        .collect()
+                };
                 if let Err(error) = zone.set_daemon_addresses(&entry.daemon_id, &addresses) {
                     eprintln!(
                         "[connect] skipping persisted dns record for {}: {error}",
@@ -151,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_caches: std::sync::Mutex::new(LogCaches::default()),
         static_pages: StaticPages::render(&config),
         dns_zone,
+        relay,
     });
 
     tokio::spawn(presence_alert_monitor(state.clone()));
@@ -170,6 +197,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[connect] fleet dns server exited: {error}");
             }
         });
+    }
+
+    if let Some(relay) = state.relay.clone() {
+        // Reachability relay: bind the raw passthrough socket BEFORE serving so
+        // a misconfigured/occupied port fails startup loudly. The accept loop
+        // then runs until process exit like the other background tasks.
+        let listen = relay.listen();
+        let accept_loop = bind_relay(state.clone(), relay).await?;
+        eprintln!(
+            "[connect] reachability relay serving on {listen} (tcp; advertises {})",
+            state
+                .config
+                .relay_addresses
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        tokio::spawn(accept_loop);
     }
 
     let app = connect_router(state.clone());
@@ -380,6 +426,8 @@ fn connect_router(state: Arc<AppState>) -> Router {
         .route("/api/daemon/notify", post(daemon_notify))
         .route("/api/dns/publish", post(dns_publish))
         .route("/api/dns/acme-challenge", post(dns_acme_challenge))
+        .route("/api/dns/relay", post(dns_relay))
+        .route("/api/relay/next", post(relay_next))
         .route("/api/daemon/dry", post(daemon_dry))
         .route("/api/browser/offer", post(browser_offer))
         .route("/api/browser/ice", post(browser_ice))
@@ -450,6 +498,15 @@ struct ServiceConfig {
     /// UDP+TCP listen address for the DNS server (e.g. `0.0.0.0:53`;
     /// binding :53 unprivileged needs CAP_NET_BIND_SERVICE).
     dns_listen: Option<SocketAddr>,
+    /// Reachability relay (docs/src/self-hosted-rendezvous.md): the raw TCP
+    /// listen address for the SNI-passthrough relay (e.g. `0.0.0.0:443`).
+    /// Both `relay_*` values must be set for the relay to switch on; default
+    /// off, mirroring the `dns_*` group.
+    relay_listen: Option<SocketAddr>,
+    /// Public address(es) this relay is reachable at, published in fleet DNS
+    /// for relay-mode daemons so their names resolve to the relay. Empty when
+    /// the relay is disabled.
+    relay_addresses: Vec<IpAddr>,
 }
 
 impl ServiceConfig {
@@ -502,6 +559,20 @@ impl ServiceConfig {
                 }
                 _ => None,
             };
+        let mut relay_listen: Option<SocketAddr> =
+            match std::env::var("INTENDANT_CONNECT_RELAY_LISTEN") {
+                Ok(value) if !value.trim().is_empty() => {
+                    Some(value.trim().parse().map_err(|e| {
+                        format!("invalid INTENDANT_CONNECT_RELAY_LISTEN {value:?}: {e}")
+                    })?)
+                }
+                _ => None,
+            };
+        let mut relay_addresses: Vec<IpAddr> = match std::env::var("INTENDANT_CONNECT_RELAY_ADDRESS")
+        {
+            Ok(value) if !value.trim().is_empty() => parse_relay_addresses(&value)?,
+            _ => Vec::new(),
+        };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -550,6 +621,18 @@ impl ServiceConfig {
                             .map_err(|e| format!("invalid --dns-listen {value:?}: {e}"))?,
                     );
                 }
+                "--relay-listen" => {
+                    let value = args.next().ok_or("--relay-listen requires an address")?;
+                    relay_listen = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("invalid --relay-listen {value:?}: {e}"))?,
+                    );
+                }
+                "--relay-address" => {
+                    let value = args.next().ok_or("--relay-address requires an IP address")?;
+                    relay_addresses = parse_relay_addresses(&value)?;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -584,6 +667,15 @@ impl ServiceConfig {
                     .to_string(),
             );
         }
+        // The reachability relay is likewise all-or-nothing: a listener with
+        // no advertised address could not point DNS at itself, and an
+        // advertised address with no listener answers nothing.
+        if relay_listen.is_some() != !relay_addresses.is_empty() {
+            return Err(
+                "reachability relay needs both --relay-listen and --relay-address (or none)"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             listen,
             public_origin: trim_trailing_slash(&public_origin),
@@ -597,8 +689,28 @@ impl ServiceConfig {
             dns_zone,
             dns_ns_name,
             dns_listen,
+            relay_listen,
+            relay_addresses,
         })
     }
+}
+
+/// Parse a comma-separated list of relay public IP addresses.
+fn parse_relay_addresses(value: &str) -> Result<Vec<IpAddr>, String> {
+    let mut addresses = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let ip: IpAddr = part
+            .parse()
+            .map_err(|e| format!("invalid relay address {part:?}: {e}"))?;
+        if !addresses.contains(&ip) {
+            addresses.push(ip);
+        }
+    }
+    Ok(addresses)
 }
 
 fn print_help() {
@@ -614,7 +726,11 @@ fn print_help() {
               INTENDANT_CONNECT_INVITE_REQUIRED, INTENDANT_CONNECT_OPEN_REGISTRATION,\n\
               INTENDANT_CONNECT_DNS_ZONE, INTENDANT_CONNECT_DNS_NS_NAME, INTENDANT_CONNECT_DNS_LISTEN\n\
               (--dns-zone fleet.example.com --dns-ns-name ns-fleet.example.com --dns-listen 0.0.0.0:53\n\
-               enable the embedded fleet DNS server; all three or none)"
+               enable the embedded fleet DNS server; all three or none),\n\
+              INTENDANT_CONNECT_RELAY_LISTEN, INTENDANT_CONNECT_RELAY_ADDRESS\n\
+              (--relay-listen 0.0.0.0:443 --relay-address 203.0.113.10 enable the SNI-passthrough\n\
+               reachability relay; both or none. The relay must receive raw TLS — do not place it\n\
+               behind a TLS-terminating proxy)"
     );
 }
 
@@ -675,13 +791,33 @@ struct AppState {
     /// live record table the embedded server answers from (hydrated
     /// from `Store::dns_records` at startup).
     dns_zone: Option<Arc<FleetZone>>,
+    /// The reachability relay when the `relay_*` config group is set —
+    /// shared between the raw passthrough listener and the daemon control
+    /// long-poll / DNS relay-mode handlers. None when the relay is disabled.
+    relay: Option<Arc<RelayState>>,
 }
 
 /// Minimal production-shaped state for route-boundary tests. Tests seed the
 /// durable store they need, while sharing the same WebAuthn, signing-key, and
 /// in-memory state construction as the service.
 #[cfg(test)]
-fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> {
+fn production_router_test_state(root: &Path, store: Store) -> Arc<AppState> {
+    build_test_state(root, store, TestStateOverrides::default())
+}
+
+/// Overrides a test can apply to the base production-shaped state.
+#[cfg(test)]
+#[derive(Default)]
+struct TestStateOverrides {
+    /// Enable signed-request daemon endpoints without an operator bearer, as
+    /// the hosted instance runs (`open_daemon_registration = true`).
+    open_daemon_registration: bool,
+    dns_zone: Option<Arc<FleetZone>>,
+    relay: Option<Arc<RelayState>>,
+}
+
+#[cfg(test)]
+fn build_test_state(root: &Path, mut store: Store, overrides: TestStateOverrides) -> Arc<AppState> {
     let config = ServiceConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         public_origin: "https://connect.example.test".to_string(),
@@ -691,10 +827,16 @@ fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> 
         release_token: None,
         cookie_secure: true,
         invite_required: false,
-        open_daemon_registration: false,
+        open_daemon_registration: overrides.open_daemon_registration,
         dns_zone: None,
         dns_ns_name: None,
         dns_listen: None,
+        relay_listen: overrides.relay.as_ref().map(|relay| relay.listen()),
+        relay_addresses: overrides
+            .relay
+            .as_ref()
+            .map(|relay| relay.advertise_addrs().to_vec())
+            .unwrap_or_default(),
     };
     let webauthn = Webauthn::new(&config.rp_id, "Intendant Connect", &config.public_origin)
         .require_user_verification(true)
@@ -722,7 +864,8 @@ fn production_router_test_state(root: &Path, mut store: Store) -> Arc<AppState> 
         vapid,
         log_key,
         push_http: reqwest::Client::new(),
-        dns_zone: None,
+        dns_zone: overrides.dns_zone,
+        relay: overrides.relay,
     })
 }
 
@@ -741,6 +884,12 @@ struct DnsRecordEntry {
     addresses: Vec<String>,
     #[serde(default)]
     updated_unix_ms: u64,
+    /// Relay-mode record: the stored addresses are the reachability relay's
+    /// public address, published so the fleet name resolves to the relay
+    /// instead of the (NAT'd, unreachable) daemon. On restart these re-resolve
+    /// to the current relay address rather than the addresses stored here.
+    #[serde(default)]
+    via_relay: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
