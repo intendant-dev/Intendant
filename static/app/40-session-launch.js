@@ -2569,6 +2569,23 @@ function sessionWindowExternalActionAvailability(sessionId) {
 
 function sessionWindowStopAvailability(sessionId) {
   const sid = String(sessionId || '').trim();
+  // A window in a terminal phase has nothing left to stop — retire the
+  // Stop affordance (Close/Hide stays available) instead of dispatching
+  // a stop the daemon can only drop (live incident 2026-07-17: repeated
+  // Stop clicks on an ended session read as "can't stop this session").
+  const win = sessionWindows.get(sid);
+  const meta = sessionMetadataById.get(sid) || {};
+  const phase = normalizeSessionPhase(win?.phase || meta.phase || '');
+  const terminal = !!win?.ended || meta.ended === true
+    || phase === 'done' || phase === 'interrupted'
+    || promptTargetTerminalStatus(meta);
+  if (terminal) {
+    return {
+      ok: false,
+      reason: 'Session already ended — nothing to stop. Hide the card to dismiss it.',
+      toast: 'Session already ended — nothing to stop',
+    };
+  }
   const availability = sessionWindowExternalActionAvailability(sid);
   if (!availability.ok) return availability;
   if (sessionWindowIsDetached(sid)) {

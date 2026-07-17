@@ -1272,6 +1272,18 @@ pub(crate) async fn run_with_presence(
                     } else {
                         apply_fission_import_action(agent, &action_params, &drain_config).await
                     }
+                } else if let Some(deferral) = compact_deferred_by_limit_park(
+                    &op,
+                    &persistent_limit_park,
+                    tokio::time::Instant::now(),
+                    crate::session_activity::epoch_seconds(),
+                ) {
+                    // An out-of-band /compact while a rate-limit park is
+                    // armed would fire into the very limit the park waits
+                    // out — defer it with the calm reset line instead (twin
+                    // arm in external_mode's idle thread-action handler).
+                    // The shared tail below logs and busses the result.
+                    Err(deferral)
                 } else if let Some(ref mut agent) = persistent_agent {
                     // Backends without an in-process fork (Claude Code) fork
                     // by respawning — mirror the drain-level

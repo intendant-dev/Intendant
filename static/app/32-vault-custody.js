@@ -1561,8 +1561,8 @@ const AGENT_SIGNIN_PROVIDERS = {
     unsupportedNote:
       'This daemon predates the Claude sign-in ceremony — upgrade it to sign in from here.',
     backendMatch: backend => backend.includes('claude'),
-    sessionsTitle: 'Running Claude Code sessions',
-    noSessionsNote: 'No running Claude Code sessions — new sessions start on the new account.',
+    sessionsTitle: 'Live Claude Code sessions',
+    noSessionsNote: 'No live Claude Code sessions — new sessions start on the new account.',
     sessionKind: 'claude-code',
     lines: {
       idle: 'Sign this daemon into a Claude account (claude.ai subscription sign-in).',
@@ -1589,8 +1589,8 @@ const AGENT_SIGNIN_PROVIDERS = {
     unsupportedNote:
       'This daemon predates the Codex sign-in ceremony — upgrade it to sign in from here.',
     backendMatch: backend => backend.includes('codex'),
-    sessionsTitle: 'Running Codex sessions',
-    noSessionsNote: 'No running Codex sessions — new sessions start on the new account.',
+    sessionsTitle: 'Live Codex sessions',
+    noSessionsNote: 'No live Codex sessions — new sessions start on the new account.',
     sessionKind: 'codex',
     /* OpenAI's own device-flow warning, kept near-verbatim. */
     deviceWarning:
@@ -1613,8 +1613,9 @@ function agentSigninProviderState() {
     busy: false,
     lastError: '',
     pollTimer: null,
-    sessions: [], // running sessions of this provider's backend for the reload panel
+    sessions: [], // live sessions of this provider's backend for the reload panel
     sessionsFetchedAt: 0,
+    lastPhase: '', // transition detector: entering success forces a fresh fetch
     reloadRequested: new Set(),
   };
 }
@@ -1658,8 +1659,14 @@ async function agentSigninRefresh(provider, { force = false } = {}) {
   }
   agentSigninEnsurePoll(provider);
   renderAgentSigninSection();
-  if (agentSigninPhase(provider) === 'success') {
-    agentSigninRefreshSessions(provider).catch(() => {});
+  const phaseNow = agentSigninPhase(provider);
+  const phaseChanged = phaseNow !== state.lastPhase;
+  state.lastPhase = phaseNow;
+  // Entering success forces the fetch past the freshness window: the
+  // reload chips must reflect live sessions at the exact moment the user
+  // needs them (a cached pre-success list here hid a parked session).
+  if (phaseNow === 'success') {
+    agentSigninRefreshSessions(provider, { force: phaseChanged }).catch(() => {});
   }
 }
 
@@ -1774,22 +1781,88 @@ async function agentSigninCancel(provider) {
   renderAgentSigninSection();
 }
 
+/* Catalog statuses that mean a session row has ENDED — a mirror of the
+   daemon's session-catalog terminal vocabulary (SESSION_ENDED_STATUSES
+   plus the bare-dir "abandoned" classification). A daemon-side parity
+   test pins this set to the source
+   (agent_signin_terminal_status_mirror_matches_catalog_vocabulary), so
+   keep the one-status-per-quote shape scrapable. */
+const AGENT_SIGNIN_TERMINAL_STATUSES = new Set([
+  'completed', 'failed', 'interrupted', 'abandoned',
+]);
+
+/* Reload candidates are ALIVE supervised sessions of the provider's
+   backend: wrapper evidence (a supervised session always has an
+   Intendant wrapper row — merged rows carry intendant_status /
+   intendant_session_id, unmerged wrapper rows have source "intendant")
+   and a non-terminal status. The old `status === 'running'` filter
+   excluded exactly the sessions whose reload matters most — limit-parked
+   and between-turn sessions read idle/external on the row, never running
+   (live incident 2026-07-17). Raw transcript rows with no wrapper are
+   history, not reload targets. */
+function agentSigninSessionIsReloadCandidate(spec, row) {
+  const backend = String(row?.backend_source || row?.source || '').toLowerCase();
+  if (!spec.backendMatch(backend)) return false;
+  const wrapperStatus = String(row?.intendant_status || '').trim();
+  const supervised =
+    String(row?.source || '') === 'intendant' ||
+    !!wrapperStatus ||
+    !!String(row?.intendant_session_id || '').trim();
+  if (!supervised) return false;
+  const effective = (wrapperStatus || String(row?.status || '').trim()).toLowerCase();
+  return !AGENT_SIGNIN_TERMINAL_STATUSES.has(effective);
+}
+
+/* Chip copy for a reload candidate: live phase (open session windows,
+   recent status events) beats the catalog row's disk-derived status — a
+   limit-parked session reads idle on disk but waiting_rate_limit live.
+   Lookups are guarded: the live maps are declared in later fragments. */
+function agentSigninSessionStateChip(row) {
+  const ids = [row?.session_id, row?.backend_session_id, row?.intendant_session_id]
+    .map(v => String(v || '').trim())
+    .filter(Boolean);
+  let phase = '';
+  try {
+    for (const id of ids) {
+      if (typeof sessionWindows !== 'undefined' && sessionWindows.get(id)?.phase) {
+        phase = String(sessionWindows.get(id).phase);
+      }
+      if (!phase && typeof recentSessionStatusPhase === 'function') {
+        phase = String(recentSessionStatusPhase(id) || '');
+      }
+      if (phase) break;
+    }
+  } catch (_) {
+    /* live maps unavailable: fall back to the row's status below */
+  }
+  const key = phase.toLowerCase().replace(/-/g, '_');
+  if (key === 'waiting_rate_limit') return { label: 'rate-limited', cls: 'warn' };
+  if (key === 'interrupting' || key.startsWith('waiting')) return { label: 'waiting', cls: 'warn' };
+  if (key.startsWith('running') || key === 'thinking' || key === 'orchestrating') {
+    return { label: 'running', cls: 'ok' };
+  }
+  if (key === 'idle') return { label: 'parked', cls: '' };
+  const status = String(row?.intendant_status || row?.status || '').trim().toLowerCase();
+  if (status === 'running' || status === 'in_progress') return { label: 'running', cls: 'ok' };
+  if (status === 'idle' || status === 'external') return { label: 'parked', cls: '' };
+  return { label: status || 'live', cls: '' };
+}
+
 /* The reload panel's corpus: this provider's live sessions on this
    daemon. The daemon is the authority on reloadability — this list only
    decides which chips to offer. */
 async function agentSigninRefreshSessions(provider, { force = false } = {}) {
   const spec = AGENT_SIGNIN_PROVIDERS[provider];
   const state = agentSigninState[provider];
-  if (!force && Date.now() - state.sessionsFetchedAt < 10000) return;
+  /* 2.5s freshness (was 10s): right after sign-in success a stale empty
+     list is the worst answer; the ceremony/render cadence bounds the
+     request rate while the pane is watched. */
+  if (!force && Date.now() - state.sessionsFetchedAt < 2500) return;
   state.sessionsFetchedAt = Date.now();
   try {
     const resp = await daemonApi.request('api_sessions', { limit: 100 });
     if (!resp.ok || !Array.isArray(resp.body)) return;
-    state.sessions = resp.body.filter(row => {
-      if (String(row?.status || '') !== 'running') return false;
-      const backend = String(row?.backend_source || row?.source || '').toLowerCase();
-      return spec.backendMatch(backend);
-    });
+    state.sessions = resp.body.filter(row => agentSigninSessionIsReloadCandidate(spec, row));
     renderAgentSigninSection();
   } catch (_) {
     /* the next poll or manual refresh recovers */
@@ -2097,9 +2170,11 @@ function agentSigninProviderCard(provider) {
       note('Signed in (the CLI did not report account details).');
     }
 
-    // The value half: running sessions keep the OLD account until their
-    // backend process restarts — offer the per-session reload (graceful
-    // in-place respawn, resume-attached).
+    // The value half: LIVE sessions — running, parked between turns, or
+    // rate-limit-parked — keep the OLD account until their backend
+    // process restarts. Offer the per-session reload (graceful in-place
+    // respawn, resume-attached); parked sessions are the ones pinned to
+    // the old account longest, so they matter most here.
     agentSigninRefreshSessions(provider).catch(() => {});
     const reloadHead = document.createElement('div');
     reloadHead.className = 'vault-status-line';
@@ -2112,7 +2187,7 @@ function agentSigninProviderCard(provider) {
     if (!state.sessions.length) {
       note(spec.noSessionsNote);
     } else {
-      note('Running sessions keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
+      note('Live sessions — including parked and rate-limited ones — keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
       const list = document.createElement('div');
       list.className = 'vault-entry-list';
       for (const session of state.sessions) {
@@ -2125,6 +2200,14 @@ function agentSigninProviderCard(provider) {
         const kindChip = document.createElement('span');
         kindChip.className = 'vault-chip';
         kindChip.textContent = spec.sessionKind;
+        const sessionState = agentSigninSessionStateChip(session);
+        const stateChip = document.createElement('span');
+        stateChip.className = 'vault-chip' + (sessionState.cls ? ` ${sessionState.cls}` : '');
+        stateChip.textContent = sessionState.label;
+        stateChip.title =
+          sessionState.label === 'rate-limited'
+            ? 'Rate-limit park — the backend is alive and stays on the old account until reloaded'
+            : 'Session state — alive sessions stay on the old account until reloaded';
         const actions = document.createElement('span');
         actions.className = 'vault-entry-actions';
         if (state.reloadRequested.has(sessionId)) {
@@ -2137,7 +2220,7 @@ function agentSigninProviderCard(provider) {
             vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
           );
         }
-        row.append(lbl, kindChip, actions);
+        row.append(lbl, kindChip, stateChip, actions);
         list.appendChild(row);
       }
       card.appendChild(list);
