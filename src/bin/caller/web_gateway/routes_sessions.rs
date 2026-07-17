@@ -3014,15 +3014,21 @@ pub(crate) fn sessions_list_api_response(
     // it (keyed by its generation): re-parsing + re-serializing the full
     // multi-megabyte list per request was measurably hot. The ids path
     // keeps direct computation — its bodies are small and id-dependent.
+    // The body stays a shared Arc from the cache through the projection
+    // to the response (`JsonBody::Shared`), so serving a cache hit never
+    // copies the multi-hundred-KB list text.
     let (body, generation) = match ids_filter {
-        Some(ids) => (cached_list_sessions_for_ids(home, &ids), None),
+        Some(ids) => (
+            Arc::<str>::from(cached_list_sessions_for_ids(home, &ids)),
+            None,
+        ),
         None => match limit {
             Some(limit) => cached_list_sessions_with_limit_and_generation(limit),
             None => cached_list_sessions_with_generation(),
         },
     };
-    let body = projected_session_list_body(generation, &body, limit, usage_view);
-    session_json_response(200, body)
+    let body = projected_session_list_body(generation, body, limit, usage_view);
+    ApiResponse::json(200, JsonBody::Shared(body))
 }
 
 pub(crate) async fn handle_sessions_list(
