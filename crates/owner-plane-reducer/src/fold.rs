@@ -5430,8 +5430,7 @@ pub fn fold_set(
     let mut group_of: BTreeMap<&String, &String> = BTreeMap::new();
     {
         let mut by_bytes: BTreeMap<&[u8], &String> = BTreeMap::new();
-        let mut names: Vec<&String> = items.keys().collect();
-        names.sort();
+        let names: Vec<&String> = items.keys().collect();
         for name in names {
             let canon = by_bytes.entry(items[name].as_slice()).or_insert(name);
             group_of.insert(name, canon);
