@@ -79,6 +79,7 @@ pub(crate) async fn serve_http_request(
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_connection_identity: Option<PeerConnectionIdentity>,
+    gateway_ingress: GatewayIngress,
 ) {
     let HttpRequestCtx {
         access_cert_dir,
@@ -300,8 +301,10 @@ pub(crate) async fn serve_http_request(
     // IAM, loopback, browser-mTLS, process-token `/mcp`, or signaling context
     // is resolved. SNI provenance comes from rustls certificate selection,
     // never this request's mutable Host header.
-    let fleet_origin = tls_fleet_origin || request_names_known_fleet_origin(header_text);
-    if fleet_origin && !authority_free_request {
+    let discovery_only_ingress = gateway_ingress.is_reachability_relay()
+        || tls_fleet_origin
+        || request_names_known_fleet_origin(header_text);
+    if discovery_only_ingress && !authority_free_request {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
             "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
@@ -372,6 +375,7 @@ pub(crate) async fn serve_http_request(
     }
 
     let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+        gateway_ingress,
         peer_addr,
         header_text,
         tls_client_cert_fingerprint.as_deref(),
@@ -1492,6 +1496,7 @@ pub(crate) async fn serve_http_request(
     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
         use tokio::io::AsyncWriteExt;
         if remote_dashboard_client_auth_missing(
+            gateway_ingress,
             peer_addr,
             header_text,
             tls_client_cert_fingerprint.as_deref(),
@@ -1551,6 +1556,7 @@ pub(crate) async fn serve_http_request(
     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
         use tokio::io::AsyncWriteExt;
         if remote_dashboard_client_auth_missing(
+            gateway_ingress,
             peer_addr,
             header_text,
             tls_client_cert_fingerprint.as_deref(),
@@ -1610,6 +1616,7 @@ pub(crate) async fn serve_http_request(
     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
         use tokio::io::AsyncWriteExt;
         if remote_dashboard_client_auth_missing(
+            gateway_ingress,
             peer_addr,
             header_text,
             tls_client_cert_fingerprint.as_deref(),

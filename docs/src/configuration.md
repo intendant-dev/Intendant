@@ -365,6 +365,13 @@ current service also returns `403` for browser offer/ICE/close before mutation.
 | `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
+| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only, discovery-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
+| `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
+
+`INTENDANT_CONNECT_RELAY_ENDPOINT` force-enables the relay tunnel and sets
+`relay_endpoint`. The relay is availability-only: it never terminates TLS,
+holds no certificate, and grants no authority — a relayed browser connection
+reaches this daemon bearing the fleet SNI and stays discovery-only.
 
 No file editing is required for the common case: the dashboard's
 **Access → Intendant Connect** card toggles `enabled` (persisting it
@@ -407,6 +414,17 @@ but ignored. The default Connect binary serves only explicit, compile-time
 embedded routes and assets; it never mounts a filesystem fallback. In
 particular, a supplied directory cannot expose `app.html`, WASM, or
 `vault-kernel.js` from the hosted origin.
+
+The service-side reachability relay is off by default and gated on an
+all-or-nothing flag group (mirroring the `--dns-*` fleet-DNS group):
+
+| Flag / env | Description |
+|-----|-----|
+| `--relay-listen` / `INTENDANT_CONNECT_RELAY_LISTEN` | Raw TCP listen address for the SNI-passthrough relay (e.g. `0.0.0.0:443`). Must receive raw TLS — do not front it with a TLS-terminating proxy |
+| `--relay-address` / `INTENDANT_CONNECT_RELAY_ADDRESS` | Comma-separated public address(es) the relay is reachable at, published in fleet DNS for relay-mode daemons |
+
+Both are required together or neither. See
+docs/src/self-hosted-rendezvous.md for the full deployment description.
 
 `intendant-connect` is intended to sit behind public TLS for the configured
 origin. It handles passkey-only account sessions, single-use account/route linking,

@@ -49,6 +49,25 @@ decrypted vault state made available to it. Item 1 is account authentication
 and route metadata only; a Connect account assertion does not authenticate to
 a daemon, and the default service exposes no browser-control signaling.
 
+The optional **reachability relay** (docs/src/self-hosted-rendezvous.md) sits
+squarely in the transport class (item 3) and does not enlarge Connect's trust.
+It routes a fleet name to a NAT'd daemon by peeking the TLS SNI and splicing
+ciphertext both ways — it terminates no TLS, holds no certificate, and sees no
+plaintext, so the browser's handshake completes end-to-end against the daemon's
+own fleet certificate. The daemon tunnel splices that ciphertext into a
+dedicated loopback-only gateway ingress, separate from the public listener.
+Which listener accepted the connection is immutable transport provenance: the
+gateway marks every such connection `ReachabilityRelay` before TLS or HTTP
+parsing, serves only authority-free discovery bytes under anonymous
+`role:none`, and refuses every protected HTTP, MCP, signaling, and WebSocket
+route. Thus neither the loopback address of the tunnel's last hop nor a
+browser-controlled `Host: localhost` can enter the trusted-local lane. Fleet
+SNI classification remains a second, independent discovery-only gate. The
+relay ingress also rejects non-TLS bytes before the gateway's raw ICE-TCP and
+cleartext-MCP demux. The relay is availability-only: at worst a compromised or
+coerced relay withholds, delays, or sends arbitrary TLS traffic to that
+authority-free ingress, which cannot mint a daemon principal or grant.
+
 Item 5 is the one the web platform will not let us escape. The browser binds
 code identity to *origin*, origin trust to TLS+DNS, and the server behind an
 origin can change what it serves at any time, per user, silently:

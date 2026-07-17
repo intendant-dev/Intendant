@@ -10,6 +10,67 @@ use super::*;
 
 pub(crate) const TLS_FAILURE_LOG_INTERVAL_SECS: u64 = 30;
 
+/// Transport edge that accepted a gateway connection.
+///
+/// A loopback socket address is only proof of local presence on the public
+/// gateway listener. Reachability-relay dial-backs arrive on a separate
+/// loopback-only listener and are explicitly marked here so their last local
+/// hop can never synthesize the trusted-local dashboard principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GatewayIngress {
+    Direct,
+    ReachabilityRelay,
+}
+
+impl GatewayIngress {
+    pub(crate) fn is_reachability_relay(self) -> bool {
+        matches!(self, Self::ReachabilityRelay)
+    }
+}
+
+async fn accept_gateway_connection(
+    listener: &TcpListener,
+    relay_ingress_listener: Option<&TcpListener>,
+) -> (
+    GatewayIngress,
+    std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>,
+) {
+    if let Some(relay_ingress_listener) = relay_ingress_listener {
+        tokio::select! {
+            accepted = listener.accept() => (GatewayIngress::Direct, accepted),
+            accepted = relay_ingress_listener.accept() => {
+                (GatewayIngress::ReachabilityRelay, accepted)
+            }
+        }
+    } else {
+        (GatewayIngress::Direct, listener.accept().await)
+    }
+}
+
+fn bind_relay_gateway_ingress(config: &crate::project::ConnectConfig) -> Option<TcpListener> {
+    if !(config.enabled && config.relay_enabled) {
+        return None;
+    }
+    let socket = match tokio::net::TcpSocket::new_v4() {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("[relay] failed to create dedicated gateway ingress: {error}");
+            return None;
+        }
+    };
+    if let Err(error) = socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))) {
+        eprintln!("[relay] failed to bind dedicated loopback gateway ingress: {error}");
+        return None;
+    }
+    match socket.listen(128) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            eprintln!("[relay] failed to listen on dedicated gateway ingress: {error}");
+            None
+        }
+    }
+}
+
 /// Size cap for the rate-limiter map: entries are keyed by
 /// `kind|peer|detail`, so an internet-exposed port collects one entry per
 /// distinct scanner address for the daemon's lifetime. At the cap, entries
@@ -415,6 +476,48 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
     // STUN length-prefix and HTTP method bytes.
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     access_cert_dir: std::path::PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    let relay_ingress_listener = bind_relay_gateway_ingress(&config.connect);
+    spawn_web_gateway_from_cert_dir_with_relay_listener(
+        listener,
+        bus,
+        broadcast_tx,
+        config,
+        shared_session,
+        transcriber,
+        task_tx,
+        project_root,
+        mcp_server,
+        peer_registry,
+        advertise_urls,
+        inbound_bearer_token,
+        local_card_auth,
+        tls_client_cert_required,
+        tls_acceptor,
+        access_cert_dir,
+        relay_ingress_listener,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_web_gateway_from_cert_dir_with_relay_listener(
+    listener: TcpListener,
+    bus: EventBus,
+    broadcast_tx: broadcast::Sender<String>,
+    config: WebGatewayConfig,
+    shared_session: SharedActiveSession,
+    transcriber: Option<Arc<dyn crate::transcription::Transcriber>>,
+    task_tx: Option<tokio::sync::mpsc::Sender<presence_core::TaskEnvelope>>,
+    project_root: Option<std::path::PathBuf>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
+    peer_registry: Option<crate::peer::PeerRegistry>,
+    advertise_urls: Vec<String>,
+    inbound_bearer_token: Option<String>,
+    local_card_auth: crate::peer::AuthRequirements,
+    tls_client_cert_required: bool,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    access_cert_dir: std::path::PathBuf,
+    relay_ingress_listener: Option<TcpListener>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
@@ -869,6 +972,16 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
         dashboard_control.clone(),
         tcp_advertised_port,
     );
+    // Reachability relay tunnel: hold a control channel to Connect and splice
+    // relayed browser connections into the dedicated loopback-only ingress
+    // (the fleet cert still serves the end-to-end handshake). Accepting that
+    // last hop on its own listener gives the gateway immutable relay
+    // provenance before TLS or HTTP parsing; its loopback peer address can
+    // therefore never synthesize trusted-local authority.
+    let relay_ingress_addr = relay_ingress_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok());
+    crate::relay_tunnel::spawn_relay_tunnel_client(config.connect.clone(), relay_ingress_addr);
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.
     crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
@@ -1079,6 +1192,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
         }
 
         let mut listener = listener;
+        let mut relay_ingress_listener = relay_ingress_listener;
         let bind_addr = listener.local_addr().ok();
         let port = bind_addr.map(|a| a.port()).unwrap_or(0);
 
@@ -1087,13 +1201,45 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
         }
 
         let mut fatal_accept_streak: u32 = 0;
+        let mut relay_fatal_accept_streak: u32 = 0;
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(conn) => {
+            let (gateway_ingress, accepted) =
+                accept_gateway_connection(&listener, relay_ingress_listener.as_ref()).await;
+            let (stream, peer_addr) = match (gateway_ingress, accepted) {
+                (GatewayIngress::Direct, Ok(conn)) => {
                     fatal_accept_streak = 0;
                     conn
                 }
-                Err(e) => {
+                (GatewayIngress::ReachabilityRelay, Ok(conn)) => {
+                    relay_fatal_accept_streak = 0;
+                    conn
+                }
+                (GatewayIngress::ReachabilityRelay, Err(error)) => {
+                    if should_continue_after_accept_error(&error) {
+                        eprintln!(
+                            "[relay] dedicated gateway ingress accept failed: {error} (continuing)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    relay_fatal_accept_streak += 1;
+                    if relay_fatal_accept_streak < FATAL_ACCEPT_REBIND_THRESHOLD {
+                        eprintln!(
+                            "[relay] dedicated gateway ingress accept failed: {error} \
+                             (retry {relay_fatal_accept_streak}/{FATAL_ACCEPT_REBIND_THRESHOLD} before disabling)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    eprintln!(
+                        "[relay] dedicated gateway ingress failed persistently: {error}; \
+                         disabling reachability relay ingress"
+                    );
+                    relay_ingress_listener = None;
+                    relay_fatal_accept_streak = 0;
+                    continue;
+                }
+                (GatewayIngress::Direct, Err(e)) => {
                     if should_continue_after_accept_error(&e) {
                         eprintln!("[web_gateway] accept failed on port {port}: {e} (continuing)");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -1261,6 +1407,26 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                     _ => return,
                 };
 
+                // The hosted reachability relay is a TLS-SNI passthrough, not
+                // another entrance to this port's raw ICE-TCP or cleartext MCP
+                // demux lanes. Enforce that at the listener provenance edge,
+                // before interpreting any attacker-controlled bytes. Direct
+                // gateway connections retain the established multiplexing.
+                if gateway_ingress.is_reachability_relay()
+                    && !(tls_acceptor.is_some()
+                        && crate::web_tls::looks_like_tls_client_hello(&buf[..peeked]))
+                {
+                    use tokio::io::AsyncWriteExt;
+                    log_tls_failure_rate_limited(
+                        &tls_failure_log_state,
+                        &source_hint,
+                        "non-TLS reachability-relay ingress reject",
+                        "the relay ingress accepts TLS ClientHello bytes only",
+                    );
+                    let _ = raw_stream.shutdown().await;
+                    return;
+                }
+
                 // ICE-TCP detection: look for a STUN binding request
                 // wrapped in an RFC 4571 2-byte BE length prefix. STUN
                 // binding request type is 0x0001 (first payload byte < 2),
@@ -1354,8 +1520,8 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                 } else {
                     String::from_utf8_lossy(&buf[..peeked]).to_string()
                 };
-                let allow_loopback_cleartext_mcp =
-                    is_loopback_cleartext_mcp_request(peer_addr, is_tls, &cleartext_header_text);
+                let allow_loopback_cleartext_mcp = gateway_ingress == GatewayIngress::Direct
+                    && is_loopback_cleartext_mcp_request(peer_addr, is_tls, &cleartext_header_text);
 
                 // Strict TLS: when a TLS acceptor is configured the dashboard
                 // is HTTPS/WSS-only. A connection that reaches this point is
@@ -1369,7 +1535,8 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                 // loopback `/mcp` endpoint used by managed child CLIs: those
                 // clients cannot present the dashboard mTLS certificate, and
                 // their transport never leaves the host. Browser-originated
-                // requests do not qualify for that exception.
+                // requests and reachability-relay ingress do not qualify for
+                // that exception.
                 if tls_acceptor.is_some() && !is_tls && !allow_loopback_cleartext_mcp {
                     use tokio::io::AsyncWriteExt;
                     log_tls_failure_rate_limited(
@@ -1599,6 +1766,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                         tls_client_cert_present,
                         tls_client_cert_fingerprint.clone(),
                         peer_connection_identity,
+                        gateway_ingress,
                     )
                     .await;
 
@@ -1633,7 +1801,10 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
-                    if tls_fleet_origin || request_names_known_fleet_origin(&header_text) {
+                    if gateway_ingress.is_reachability_relay()
+                        || tls_fleet_origin
+                        || request_names_known_fleet_origin(&header_text)
+                    {
                         use tokio::io::AsyncWriteExt;
                         let response = json_error(
                             "403 Forbidden",
@@ -1674,6 +1845,7 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
                         return;
                     }
                     let remote_client_auth_missing = remote_dashboard_client_auth_missing(
+                        gateway_ingress,
                         peer_addr,
                         &header_text,
                         tls_client_cert_fingerprint.as_deref(),
@@ -2721,7 +2893,95 @@ mod tests {
     use crate::test_support::TEST_ENV_LOCK;
     use crate::types::OutboundEvent;
     use crate::web_gateway::tests::{next_ws_json_matching, EnvVarGuard};
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RelayIngressTestGateway {
+        task: tokio::task::JoinHandle<()>,
+        direct_addr: std::net::SocketAddr,
+        relay_addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+        _access_dir: tempfile::TempDir,
+    }
+
+    impl Drop for RelayIngressTestGateway {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_relay_ingress_test_gateway() -> RelayIngressTestGateway {
+        let access_dir = tempfile::tempdir().expect("relay gateway test access store");
+        let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = access_dir.path().join("server.crt");
+        let key_path = access_dir.path().join("server.key");
+        std::fs::write(&cert_path, identity.cert.pem()).unwrap();
+        std::fs::write(&key_path, identity.signing_key.serialize_pem()).unwrap();
+        let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::Files {
+            cert_path,
+            key_path,
+        })
+        .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = listener.local_addr().unwrap();
+        let relay_ingress_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_ingress_listener.local_addr().unwrap();
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let task = spawn_web_gateway_from_cert_dir_with_relay_listener(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+            false,
+            Some(acceptor),
+            access_dir.path().to_path_buf(),
+            Some(relay_ingress_listener),
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        RelayIngressTestGateway {
+            task,
+            direct_addr,
+            relay_addr,
+            server_cert: identity.cert.der().clone(),
+            _access_dir: access_dir,
+        }
+    }
+
+    async fn tls_request(
+        addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+        request: &str,
+    ) -> String {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_cert).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(10),
+            tls.read_to_end(&mut response),
+        )
+        .await
+        .expect("relay ingress response timed out")
+        .unwrap();
+        String::from_utf8_lossy(&response).into_owned()
+    }
 
     async fn next_ws_json_type<S>(ws_rx: &mut S, ty: &str) -> serde_json::Value
     where
@@ -2759,6 +3019,92 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_config_binds_a_dedicated_loopback_only_ingress() {
+        let config = crate::project::ConnectConfig {
+            enabled: true,
+            relay_enabled: true,
+            ..Default::default()
+        };
+        let listener =
+            bind_relay_gateway_ingress(&config).expect("relay config should bind its ingress");
+        let addr = listener.local_addr().unwrap();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0);
+    }
+
+    #[tokio::test]
+    async fn reachability_relay_ingress_is_discovery_only_not_trusted_local() {
+        let gateway = spawn_relay_ingress_test_gateway().await;
+        let direct = tls_request(
+            gateway.direct_addr,
+            gateway.server_cert.clone(),
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            direct.starts_with("HTTP/1.1 200"),
+            "genuine direct loopback must retain the trusted-local lane: {direct}"
+        );
+
+        for request in [
+            "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        ] {
+            let response = tls_request(
+                gateway.relay_addr,
+                gateway.server_cert.clone(),
+                request,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 403") && response.contains("discovery-only"),
+                "relay ingress must refuse protected traffic independently of localhost SNI/Host and optional client-auth configuration: {response}"
+            );
+        }
+
+        let public = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            "GET /connect/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(
+            public.starts_with("HTTP/1.1 200"),
+            "authority-free discovery bytes must remain reachable through the relay: {public}"
+        );
+
+        let mut cleartext = tokio::net::TcpStream::connect(gateway.relay_addr)
+            .await
+            .unwrap();
+        let token = loopback_mcp_auth_token();
+        cleartext
+            .write_all(
+                format!(
+                    "POST /mcp?mcp_token={token} HTTP/1.1\r\n\
+                     Host: localhost\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut cleartext_response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            cleartext.read_to_end(&mut cleartext_response),
+        )
+        .await
+        .expect("non-TLS relay ingress must close promptly");
+        assert!(
+            cleartext_response.is_empty(),
+            "relay ingress must not enter the cleartext loopback MCP lane: {}",
+            String::from_utf8_lossy(&cleartext_response)
+        );
     }
 
     #[tokio::test]

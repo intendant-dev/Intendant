@@ -694,6 +694,18 @@ pub struct ConnectConfig {
     /// Delay after transient rendezvous errors.
     #[serde(default = "default_connect_retry_delay_ms")]
     pub retry_delay_ms: u64,
+    /// Reachability relay: hold a persistent control channel to Connect so the
+    /// daemon's NAT'd fleet name is reachable through the relay's SNI
+    /// passthrough. Opt-in and requires `relay_endpoint`; the relay never
+    /// terminates TLS or gains authority (docs/src/self-hosted-rendezvous.md).
+    #[serde(default)]
+    pub relay_enabled: bool,
+    /// `host:port` of the relay's raw passthrough port, where this daemon dials
+    /// back browser connections (e.g. `relay.example.com:443`). Learned from
+    /// the register response when the rendezvous advertises one; this override
+    /// pins it explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
 }
 
 /// Rendezvous applied when `[connect] enabled = true` names no
@@ -720,6 +732,13 @@ impl ConnectConfig {
             let token = token.trim().to_string();
             if !token.is_empty() {
                 self.auth_token = Some(token);
+            }
+        }
+        if let Ok(endpoint) = std::env::var("INTENDANT_CONNECT_RELAY_ENDPOINT") {
+            let endpoint = endpoint.trim().to_string();
+            if !endpoint.is_empty() {
+                self.relay_enabled = true;
+                self.relay_endpoint = Some(endpoint);
             }
         }
         if self.enabled
@@ -754,6 +773,8 @@ impl Default for ConnectConfig {
             auth_token: None,
             poll_timeout_ms: default_connect_poll_timeout_ms(),
             retry_delay_ms: default_connect_retry_delay_ms(),
+            relay_enabled: false,
+            relay_endpoint: None,
         }
     }
 }

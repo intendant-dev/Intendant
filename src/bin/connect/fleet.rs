@@ -1241,6 +1241,8 @@ mod tests {
             dns_zone: None,
             dns_ns_name: None,
             dns_listen: None,
+            relay_listen: None,
+            relay_addresses: Vec::new(),
         };
 
         let targets = fleet_targets_for_user(&config, &store, user_id);

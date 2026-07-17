@@ -1993,6 +1993,7 @@ pub(crate) async fn dns_publish(
                 daemon_id: daemon_id.clone(),
                 addresses: addresses.iter().map(|ip| ip.to_string()).collect(),
                 updated_unix_ms: now,
+                via_relay: false,
             });
         }
         audit(
@@ -2147,6 +2148,8 @@ mod tests {
             dns_zone: None,
             dns_ns_name: None,
             dns_listen: None,
+            relay_listen: None,
+            relay_addresses: Vec::new(),
         };
         let webauthn = Webauthn::new(&config.rp_id, "Intendant Connect", &config.public_origin)
             .require_user_verification(true)
@@ -2177,6 +2180,7 @@ mod tests {
             log_key,
             push_http: reqwest::Client::new(),
             dns_zone: None,
+            relay: None,
         })
     }
 

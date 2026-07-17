@@ -276,6 +276,76 @@ block, `header_up -X-Forwarded-For` deletions are applied **after**
 idiom deletes the value it just set. Use the set alone — a set already
 replaces anything the client supplied.
 
+### Reachability relay (ciphertext SNI passthrough)
+
+`observed_ip` only helps a client that can open a direct connection. A
+daemon behind NAT with no port forward is unreachable at its fleet name
+except on the LAN. The **reachability relay** closes that gap without
+Connect ever terminating TLS or seeing plaintext:
+
+- A raw TCP listener (`--relay-listen`) peeks each connection's TLS
+  **ClientHello to read the SNI without terminating the handshake**
+  (fragmented ClientHellos are handled; non-TLS bytes are refused). When
+  the SNI names a registered fleet label whose daemon holds an active
+  tunnel, the relay splices the raw bytes to that daemon. Everything else
+  is refused.
+- Each daemon holds a persistent **control channel** to the service
+  (`POST /api/relay/next`, a long-poll authenticated by the daemon
+  identity key with the same signed/freshness discipline as
+  `/api/dns/publish`). When a browser connects, the relay mints a
+  single-use nonce, hands it to the daemon over the control channel, and
+  the daemon **dials back** a data connection carrying that nonce. The
+  relay correlates the two and splices them 1:1. On the daemon side the
+  tunnel opens a second connection to a dedicated, ephemeral,
+  loopback-only gateway ingress instead of the public gateway listener.
+- The browser's TLS handshake therefore completes end-to-end against the
+  **daemon's own fleet certificate**. Connect moves only ciphertext.
+
+The relay is **availability-only**: it terminates no TLS, holds no
+certificate, mints no authority, and logs no plaintext. The gateway
+records which listener accepted each connection before it parses TLS or
+HTTP. Connections from the relay-only ingress are always
+discovery-only: authority-free routes remain available as anonymous
+`role:none`, while protected HTTP/MCP/signaling routes and every
+WebSocket are refused. The tunnel's loopback last hop therefore cannot
+qualify for trusted-local authority even when the encrypted request
+contains `Host: localhost`; the existing fleet-SNI classification is an
+independent second gate. Non-TLS bytes are dropped before the gateway's
+raw ICE-TCP and cleartext-MCP demultiplexer, so the relay-only listener
+cannot reach either local lane.
+
+Enable it with the all-or-nothing `--relay-*` group (both flags or
+neither; default off, mirroring `--dns-*`):
+
+```bash
+intendant-connect \
+  --relay-listen 0.0.0.0:443 \      # raw passthrough port (browsers + dial-backs)
+  --relay-address 203.0.113.10      # public address published in fleet DNS
+```
+
+Equivalently `INTENDANT_CONNECT_RELAY_LISTEN` / `INTENDANT_CONNECT_RELAY_ADDRESS`.
+
+Deployment notes:
+
+- **The relay must receive raw TLS.** Do not place `--relay-listen`
+  behind a TLS-terminating reverse proxy — that would break the
+  passthrough. Expose the port directly, or front it with a TCP
+  (layer-4) passthrough only.
+- The relay and fleet DNS are usually co-deployed: a relay-mode daemon
+  publishes `POST /api/dns/relay` (daemon-signed) so the zone answers its
+  fleet label with `--relay-address` instead of the daemon's own (NAT'd)
+  addresses. The store/serve split is unchanged — `dns.rs` serves the
+  substituted address verbatim.
+- Abuse is bounded by per-source-IP and per-tunnel connection caps, a
+  per-connection byte cap, idle teardown, and a bounded dial-back wait.
+
+A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
+(see the configuration reference). It then holds the control channel,
+dials back browser connections into the gateway's private relay ingress,
+and publishes relay-mode fleet DNS while the tunnel is up. That ingress
+binds only to an ephemeral `127.0.0.1` port, is never advertised, and
+does not share the public listener's trusted-local classification.
+
 ## End-to-end transport validation
 
 `scripts/connect-transport-e2e.cjs` asserts the outcome this whole
