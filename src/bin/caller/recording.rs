@@ -1,7 +1,9 @@
 //! Continuous video recording for display and camera streams.
 //!
-//! Uses ffmpeg to record displays (x11grab on Linux, screencapture feeding
-//! image2pipe on macOS) and browser camera frames (image2pipe) into segmented
+//! ffmpeg is strictly the encoder: Linux display recordings let ffmpeg
+//! capture directly via x11grab, while macOS display recordings capture
+//! ScreenCaptureKit frames in-process and bridge them into ffmpeg as JPEGs
+//! (image2pipe), exactly like browser camera frames. Output is segmented
 //! MP4 files stored in the session directory. Stop paths extract the
 //! [`RecordingGuard`] from the registry and await its async `finalize`;
 //! plain `Drop` is only the kill-on-drop last resort.
@@ -23,7 +25,8 @@ use tokio::process::Child;
 /// so dropping is safe on a tokio worker.
 pub struct RecordingGuard {
     child: Child,
-    /// Stdin handle for piping frames (None for x11grab mode).
+    /// Stdin handle for piping frames (None for x11grab mode, and for the
+    /// macOS display bridge, whose task owns the pipe directly).
     stdin: Option<tokio::process::ChildStdin>,
     stream_name: String,
     segments_dir: PathBuf,
@@ -31,6 +34,13 @@ pub struct RecordingGuard {
     started_at: chrono::DateTime<chrono::Utc>,
     /// Background bridge task (frame-fed path only). Aborted on drop.
     bridge_task: Option<tokio::task::JoinHandle<()>>,
+    /// In-process capture teardown (macOS display recordings): firing or
+    /// dropping the sender wakes the capture pump, which quiesces the
+    /// capture backend (`stop_capture`) on its own task.
+    capture_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The capture pump itself, so [`RecordingGuard::finalize`] can await
+    /// the backend quiesce with a bound.
+    capture_pump: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +85,13 @@ impl RecordingGuard {
 
     /// Gracefully finalize the recording without blocking a worker thread.
     ///
-    /// Stops the feed bridge, closes stdin (image2pipe inputs finish cleanly
-    /// on EOF), sends SIGINT (no-op on non-unix, where the EOF is the
-    /// graceful path), and waits up to five seconds for ffmpeg to exit and
-    /// flush its segment list. If ffmpeg is still alive after the timeout,
-    /// dropping the guard lets `kill_on_drop(true)` reap it; the
+    /// Stops the feed bridge, quiesces any in-process capture (bounded —
+    /// the pump owns the backend's `stop_capture`), closes stdin (image2pipe
+    /// inputs finish cleanly on EOF; a bridge-owned pipe drops with the
+    /// aborted bridge task), sends SIGINT (no-op on non-unix, where the EOF
+    /// is the graceful path), and waits up to five seconds for ffmpeg to
+    /// exit and flush its segment list. If ffmpeg is still alive after the
+    /// timeout, dropping the guard lets `kill_on_drop(true)` reap it; the
     /// fragmented-MP4 segments stay playable without the final flush.
     ///
     /// Callers must not hold the recording-registry lock across this await —
@@ -87,6 +99,14 @@ impl RecordingGuard {
     pub async fn finalize(mut self) {
         if let Some(handle) = self.bridge_task.take() {
             handle.abort();
+        }
+        // Quiesce in-process capture before asking ffmpeg to exit, so no
+        // late frame races the encoder shutdown.
+        if let Some(stop) = self.capture_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(pump) = self.capture_pump.take() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pump).await;
         }
         // Drop stdin first so ffmpeg sees EOF and can finalize.
         self.stdin.take();
@@ -110,6 +130,10 @@ impl Drop for RecordingGuard {
         if let Some(handle) = self.bridge_task.take() {
             handle.abort();
         }
+        // Dropping the stop sender wakes the capture pump, which quiesces
+        // the capture backend on its own task — Drop must not await.
+        self.capture_stop.take();
+        self.capture_pump.take();
         self.stdin.take();
     }
 }
@@ -234,8 +258,141 @@ async fn verify_ffmpeg_started(
 }
 
 /// Start recording a display via ffmpeg.
-/// Uses x11grab on Linux and a screencapture/image2pipe feeder on macOS.
+///
+/// ffmpeg is strictly the encoder: Linux lets it capture directly via
+/// `x11grab`; macOS captures the requested display in-process via
+/// ScreenCaptureKit and bridges the frames into ffmpeg as JPEGs
+/// (`image2pipe`), so the capture permission and the display targeting both
+/// belong to this process rather than to a spawned helper binary.
 pub async fn start_display_recording(
+    display_id: u32,
+    width: u32,
+    height: u32,
+    config: &RecordingConfig,
+    session_dir: &Path,
+    bus: &EventBus,
+) -> Result<RecordingGuard, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // The recorded resolution comes from the live capture, not the
+        // caller's probe (which has no X server to ask on macOS).
+        let _ = (width, height);
+        start_display_recording_macos(display_id, config, session_dir, bus).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bus;
+        start_display_recording_x11grab(display_id, width, height, config, session_dir).await
+    }
+}
+
+/// macOS display recording: in-process ScreenCaptureKit capture of the
+/// requested display, bridged into the existing image2pipe encoder guard.
+///
+/// Replaces the March-era per-frame `screencapture` feeder, which predated
+/// in-process SCK capture and carried two latent bugs by construction: it
+/// never passed a display selector (recording the main display whatever id
+/// was requested) and funneled every instance through one fixed temp file
+/// (concurrent recordings corrupted each other's frames).
+#[cfg(target_os = "macos")]
+async fn start_display_recording_macos(
+    display_id: u32,
+    config: &RecordingConfig,
+    session_dir: &Path,
+    bus: &EventBus,
+) -> Result<RecordingGuard, String> {
+    let (backend, frames) = start_macos_display_capture(display_id, config.framerate).await?;
+    let (width, height) = backend.resolution();
+
+    let recordings_dir = session_dir.join("recordings");
+    let stream_name = pick_next_display_stream_name(&recordings_dir, display_id);
+    let mut guard = match start_frame_recording(&stream_name, config, session_dir).await {
+        Ok(guard) => guard,
+        Err(e) => {
+            // A failed encoder start must quiesce the capture it rode in on.
+            backend.stop_capture().await;
+            return Err(e);
+        }
+    };
+
+    // Upgrade the camera-shaped manifest with the display facts. Best
+    // effort: the recording itself does not depend on manifest contents.
+    let manifest = serde_json::json!({
+        "stream_name": stream_name,
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "framerate": config.framerate,
+        "resolution": format!("{}x{}", width, height),
+        "codec": "h264",
+        "source": "screencapturekit_image2pipe",
+    });
+    let _ = std::fs::write(
+        guard.segments_dir().join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    );
+
+    // The bridge owns ffmpeg's stdin: aborting it (finalize/Drop) is what
+    // hands ffmpeg its EOF.
+    let Some(stdin) = guard.stdin.take() else {
+        backend.stop_capture().await;
+        return Err("frame recording pipeline has no stdin pipe".to_string());
+    };
+    let slot: ExternalFrameSlot = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+    let (capture_stop, capture_pump) = spawn_external_capture_pump(
+        backend,
+        frames,
+        std::sync::Arc::clone(&slot),
+        stream_name.clone(),
+        bus.clone(),
+    );
+    let bridge = tokio::spawn(run_frame_bridge(
+        BridgeSource::External { slot },
+        StdinFeedSink { stdin },
+        frame_to_jpeg,
+        stream_name,
+        config.framerate,
+        bus.clone(),
+    ));
+    guard.bridge_task = Some(bridge);
+    guard.capture_stop = Some(capture_stop);
+    guard.capture_pump = Some(capture_pump);
+    Ok(guard)
+}
+
+/// Start in-process ScreenCaptureKit capture of one display for recording.
+///
+/// `display_id` is a CGDisplayID; `0` (`kCGNullDirectDisplay`) selects the
+/// main display — the debug-screen path records "the screen the browser
+/// opened on" that way. Failure is actionable at the start boundary: the
+/// display backend's error already carries the Screen Recording (TCC)
+/// recovery guidance, because the capture now lives in this process —
+/// previously Apple's `screencapture` binary held the grant instead.
+#[cfg(target_os = "macos")]
+async fn start_macos_display_capture(
+    display_id: u32,
+    fps: u32,
+) -> Result<
+    (
+        std::sync::Arc<dyn crate::display::DisplayBackend>,
+        tokio::sync::mpsc::Receiver<crate::display::Frame>,
+    ),
+    String,
+> {
+    let backend: std::sync::Arc<dyn crate::display::DisplayBackend> = if display_id == 0 {
+        std::sync::Arc::new(crate::display::macos::MacOSBackend::new())
+    } else {
+        std::sync::Arc::new(crate::display::macos::MacOSBackend::with_display_id(
+            display_id,
+        ))
+    };
+    let frames = backend.start_capture(fps).await.map_err(|e| {
+        format!("in-process screen capture failed to start for display {display_id}: {e}")
+    })?;
+    Ok((backend, frames))
+}
+
+/// Non-macOS display recording: ffmpeg captures directly via `x11grab`.
+#[cfg(not(target_os = "macos"))]
+async fn start_display_recording_x11grab(
     display_id: u32,
     width: u32,
     height: u32,
@@ -254,12 +411,6 @@ pub async fn start_display_recording(
     let output_pattern = segments_dir.join("seg_%05d.mp4");
     let segment_list = segments_dir.join("segments.csv");
 
-    let source = if cfg!(target_os = "macos") {
-        "screencapture_image2pipe"
-    } else {
-        "x11grab"
-    };
-
     // Write manifest
     let manifest = serde_json::json!({
         "stream_name": stream_name,
@@ -267,7 +418,7 @@ pub async fn start_display_recording(
         "framerate": config.framerate,
         "resolution": format!("{}x{}", width, height),
         "codec": "h264",
-        "source": source,
+        "source": "x11grab",
     });
     let manifest_path = segments_dir.join("manifest.json");
     std::fs::write(
@@ -276,36 +427,18 @@ pub async fn start_display_recording(
     )
     .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // Build platform-specific input args.
-    // macOS: screencapture (Apple system binary) feeds JPEG frames to ffmpeg
-    // via image2pipe. This avoids TCC issues (ffmpeg can't get Screen Recording
-    // permission as a third-party binary) and avfoundation timestamp bugs in VMs.
-    // Linux: x11grab captures directly.
-    let mut input_args: Vec<String> = Vec::new();
-    let use_screencapture_feeder = cfg!(target_os = "macos");
-    if use_screencapture_feeder {
-        input_args.extend([
-            "-f".into(),
-            "image2pipe".into(),
-            "-use_wallclock_as_timestamps".into(),
-            "1".into(),
-            "-i".into(),
-            "pipe:0".into(),
-        ]);
-    } else {
-        let display_arg = format!(":{}", display_id);
-        let size_arg = format!("{}x{}", width, height);
-        input_args.extend([
-            "-f".into(),
-            "x11grab".into(),
-            "-framerate".into(),
-            fps_arg.clone(),
-            "-video_size".into(),
-            size_arg,
-            "-i".into(),
-            display_arg,
-        ]);
-    }
+    let display_arg = format!(":{}", display_id);
+    let size_arg = format!("{}x{}", width, height);
+    let input_args: Vec<String> = vec![
+        "-f".into(),
+        "x11grab".into(),
+        "-framerate".into(),
+        fps_arg,
+        "-video_size".into(),
+        size_arg,
+        "-i".into(),
+        display_arg,
+    ];
 
     // Force keyframes at segment boundaries so segments split reliably.
     let keyframe_expr = format!("expr:gte(t,n_forced*{})", config.segment_duration_secs);
@@ -340,11 +473,7 @@ pub async fn start_display_recording(
             "1",
         ])
         .arg(output_pattern.to_str().unwrap_or("seg_%05d.mp4"))
-        .stdin(if use_screencapture_feeder {
-            std::process::Stdio::piped()
-        } else {
-            std::process::Stdio::null()
-        })
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr({
             let log_path = segments_dir.join("ffmpeg.log");
@@ -359,59 +488,13 @@ pub async fn start_display_recording(
         format!("Failed to spawn ffmpeg for display recording: {}", e)
     })?;
 
-    // Guard against fail-fast errors: x11grab on a Wayland-only session, or
-    // the screencapture feeder without Screen Recording permission, exits
-    // within ~50ms.
-    verify_ffmpeg_started(
-        &mut child,
-        &segments_dir.join("ffmpeg.log"),
-        if cfg!(target_os = "macos") {
-            "screencapture feeder"
-        } else {
-            "x11grab"
-        },
-    )
-    .await
-    .inspect_err(|_| {
-        let _ = std::fs::remove_dir_all(&segments_dir);
-    })?;
-
-    if use_screencapture_feeder {
-        if let Some(stdin) = child.stdin.take() {
-            let frame_interval =
-                std::time::Duration::from_millis(1000 / config.framerate.max(1) as u64);
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                let mut stdin = stdin;
-                let tmp = std::env::temp_dir().join("intendant_rec_frame.jpg");
-                loop {
-                    let start = tokio::time::Instant::now();
-                    let ok = tokio::process::Command::new("screencapture")
-                        .args(["-x", "-t", "jpg", &tmp.to_string_lossy()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if ok {
-                        if let Ok(data) = tokio::fs::read(&tmp).await {
-                            if stdin.write_all(&data).await.is_err() {
-                                break;
-                            }
-                        }
-                    } else {
-                        // screencapture failed — likely no TCC permission, stop trying
-                        break;
-                    }
-                    let elapsed = start.elapsed();
-                    if elapsed < frame_interval {
-                        tokio::time::sleep(frame_interval - elapsed).await;
-                    }
-                }
-            });
-        }
-    }
+    // Guard against fail-fast errors: x11grab on a Wayland-only session
+    // exits within ~50ms.
+    verify_ffmpeg_started(&mut child, &segments_dir.join("ffmpeg.log"), "x11grab")
+        .await
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&segments_dir);
+        })?;
 
     Ok(RecordingGuard {
         child,
@@ -420,6 +503,8 @@ pub async fn start_display_recording(
         segments_dir,
         started_at: chrono::Utc::now(),
         bridge_task: None,
+        capture_stop: None,
+        capture_pump: None,
     })
 }
 
@@ -526,6 +611,8 @@ pub async fn start_frame_recording(
         segments_dir,
         started_at: chrono::Utc::now(),
         bridge_task: None,
+        capture_stop: None,
+        capture_pump: None,
     })
 }
 
@@ -580,10 +667,17 @@ impl RecordingRegistry {
         display_id: u32,
         width: u32,
         height: u32,
+        bus: &EventBus,
     ) -> Result<String, String> {
-        let guard =
-            start_display_recording(display_id, width, height, &self.config, &self.session_dir)
-                .await?;
+        let guard = start_display_recording(
+            display_id,
+            width,
+            height,
+            &self.config,
+            &self.session_dir,
+            bus,
+        )
+        .await?;
         let stream_name = guard.stream_name().to_string();
         self.recordings.insert(stream_name.clone(), guard);
         Ok(stream_name)
@@ -596,8 +690,9 @@ impl RecordingRegistry {
         display_id: u32,
         width: u32,
         height: u32,
+        bus: &EventBus,
     ) -> Result<String, String> {
-        let stream_name = self.start_display(display_id, width, height).await?;
+        let stream_name = self.start_display(display_id, width, height, bus).await?;
         self.external_streams.insert(stream_name.clone());
         Ok(stream_name)
     }
@@ -980,16 +1075,227 @@ where
     }
 }
 
-/// Spawn the bridge task that feeds frames into a frame-fed recording.
+/// Latest-frame slot an in-process capture pump fills and the external
+/// bridge arm polls. Latest-wins, mirroring `DisplaySession::latest_frame`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+type ExternalFrameSlot =
+    std::sync::Arc<tokio::sync::RwLock<Option<std::sync::Arc<crate::display::Frame>>>>;
+
+/// Where a frame-fed recording bridge reads its latest frame, and what
+/// authorization each tick must uphold.
+enum BridgeSource {
+    /// An agent-visible `DisplaySession`: every tick and every feed is
+    /// bound to the exact current registry session, so revoke, replacement,
+    /// or private reopen stops the artifact.
+    Session {
+        session_registry: crate::display::SharedSessionRegistry,
+        session: std::sync::Arc<crate::display::DisplaySession>,
+        display_id: u32,
+    },
+    /// Trusted-local in-process capture with no display session to
+    /// authorize against (`--record-display`, the macOS debug screen): a
+    /// capture pump fills the slot. Only the macOS pipeline constructs this
+    /// in production; the seam itself is cross-platform and test-covered
+    /// everywhere.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    External { slot: ExternalFrameSlot },
+}
+
+impl BridgeSource {
+    async fn latest_frame(&self) -> Option<std::sync::Arc<crate::display::Frame>> {
+        match self {
+            BridgeSource::Session { session, .. } => session.latest_frame().await,
+            BridgeSource::External { slot } => slot.read().await.clone(),
+        }
+    }
+}
+
+/// Ceiling on one bridge tick's feed, so a wedged ffmpeg can never park the
+/// bridge (nor, on the session-bound arm, park it while the session-registry
+/// read guard is held).
+const BRIDGE_FEED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Sink for one bridge tick's JPEG bytes. Production sinks bound every feed
+/// by [`BRIDGE_FEED_TIMEOUT`]; tests inject counting or failing sinks.
+/// Returns `false` when the feed failed and the bridge must stop the
+/// recording.
+#[async_trait::async_trait]
+trait BridgeFeedSink: Send + 'static {
+    async fn feed(&mut self, jpeg: &[u8]) -> bool;
+}
+
+/// Feeds through the recording registry into the guard's stdin — the
+/// session-bound arm, where the registry lookup keeps the feed linearized
+/// with stop/delete guard extraction.
+struct RegistryFeedSink {
+    registry: std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
+    stream_name: String,
+}
+
+#[async_trait::async_trait]
+impl BridgeFeedSink for RegistryFeedSink {
+    async fn feed(&mut self, jpeg: &[u8]) -> bool {
+        matches!(
+            tokio::time::timeout(BRIDGE_FEED_TIMEOUT, async {
+                let mut r = self.registry.write().await;
+                r.feed_frame(&self.stream_name, jpeg).await
+            })
+            .await,
+            Ok(Ok(()))
+        )
+    }
+}
+
+/// Owns ffmpeg's stdin directly — the external arm, whose guard may live
+/// outside the recording registry entirely (the debug screen holds its
+/// guard locally). Dropping the sink with its aborted bridge task is what
+/// hands ffmpeg its EOF.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct StdinFeedSink {
+    stdin: tokio::process::ChildStdin,
+}
+
+#[async_trait::async_trait]
+impl BridgeFeedSink for StdinFeedSink {
+    async fn feed(&mut self, jpeg: &[u8]) -> bool {
+        matches!(
+            tokio::time::timeout(BRIDGE_FEED_TIMEOUT, self.stdin.write_all(jpeg)).await,
+            Ok(Ok(()))
+        )
+    }
+}
+
+/// Drive a frame-fed recording bridge until the recording stops.
 ///
-/// Ticks at the configured recording framerate and polls the session's
-/// `latest_frame` on each tick, mirroring how the WebRTC encoder bridge
-/// keeps a steady cadence even when the Wayland capture backend delivers
-/// new frames slowly (0.1 fps on idle desktops). Without this, the
-/// recording would contain only the handful of frames that happened to
-/// arrive during the recording window via the broadcast channel.
-/// Every feed is also bound to the exact current agent-visible registry
-/// session, so revoke, replacement, or private reopen stops the artifact.
+/// Ticks at the configured recording framerate and polls the source's
+/// latest frame on each tick, mirroring how the WebRTC encoder bridge keeps
+/// a steady cadence even when the capture backend delivers new frames
+/// slowly (event-driven backends emit nothing while the desktop is idle).
+/// Without this, the recording would contain only the handful of frames
+/// that happened to arrive during the recording window. Unchanged frames
+/// reuse the identity-keyed JPEG cache instead of re-encoding, but every
+/// tick still feeds — ffmpeg's image2pipe wallclock timing assumes a steady
+/// cadence. A failed feed stops the recording via the lossless control
+/// lane; on the session-bound arm, every feed is additionally bound to the
+/// exact current agent-visible registry session.
+async fn run_frame_bridge<S, E>(
+    source: BridgeSource,
+    mut sink: S,
+    encode: E,
+    stream_name: String,
+    fps: u32,
+    bus: EventBus,
+) where
+    S: BridgeFeedSink,
+    E: Fn(&crate::display::Frame) -> Option<Vec<u8>> + Clone + Send + 'static,
+{
+    let interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 67 });
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The frame the cached JPEG was encoded from, so an unchanged
+    // `latest_frame` reuses the encoded bytes instead of burning an RGB
+    // conversion + JPEG encode per tick on an idle display.
+    let mut last_jpeg: Option<(std::sync::Arc<crate::display::Frame>, Vec<u8>)> = None;
+    loop {
+        tick.tick().await;
+        if let BridgeSource::Session {
+            session_registry,
+            session,
+            display_id,
+        } = &source
+        {
+            match recording_session_state(session_registry, *display_id, session).await {
+                RecordingSessionState::Authorized => {}
+                state => {
+                    stop_recording_for_session_change(&bus, &stream_name, *display_id, state);
+                    break;
+                }
+            }
+        }
+        let Some(frame) = source.latest_frame().await else {
+            continue;
+        };
+        if !reuse_or_encode_jpeg(&mut last_jpeg, frame, encode.clone()).await {
+            continue;
+        }
+        let Some((_, jpeg)) = last_jpeg.as_ref() else {
+            continue;
+        };
+        let fed = match &source {
+            BridgeSource::Session {
+                session_registry,
+                session,
+                display_id,
+            } => {
+                // JPEG encoding runs on the blocking pool. Re-check after
+                // it, then retain the registry read guard through the final
+                // feed. A revoke/replacement needs the write guard, so the
+                // artifact write is linearized wholly before or wholly
+                // after that lifecycle boundary.
+                let session_guard = session_registry.read().await;
+                let state = recording_session_state_in(&session_guard, *display_id, session);
+                if state != RecordingSessionState::Authorized {
+                    drop(session_guard);
+                    stop_recording_for_session_change(&bus, &stream_name, *display_id, state);
+                    break;
+                }
+                let fed = sink.feed(jpeg).await;
+                drop(session_guard);
+                fed
+            }
+            BridgeSource::External { .. } => sink.feed(jpeg).await,
+        };
+        if !fed {
+            bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
+                stream_name: stream_name.clone(),
+            }));
+            break;
+        }
+    }
+}
+
+/// Drain an in-process capture backend's frames into the external bridge
+/// slot until stopped, then quiesce the backend.
+///
+/// Teardown routes through the returned stop sender: `finalize` fires it
+/// and awaits the pump with a bound; `Drop` merely drops it, which wakes
+/// the pump the same way without awaiting. If the capture source ends on
+/// its own (display disconnected, capture stream failure), the pump stops
+/// the recording via the lossless control lane instead of letting the
+/// bridge freeze on the last frame forever.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn spawn_external_capture_pump(
+    backend: std::sync::Arc<dyn crate::display::DisplayBackend>,
+    mut frames: tokio::sync::mpsc::Receiver<crate::display::Frame>,
+    slot: ExternalFrameSlot,
+    stream_name: String,
+    bus: EventBus,
+) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                frame = frames.recv() => match frame {
+                    Some(frame) => {
+                        *slot.write().await = Some(std::sync::Arc::new(frame));
+                    }
+                    None => {
+                        bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
+                            stream_name: stream_name.clone(),
+                        }));
+                        break;
+                    }
+                },
+            }
+        }
+        backend.stop_capture().await;
+    });
+    (stop_tx, task)
+}
+
+/// Spawn the bridge task that feeds an agent-visible session's frames into
+/// a frame-fed recording, bound to that exact session's authorization.
 ///
 /// Returns the `JoinHandle` so the caller can store it in the
 /// `RecordingGuard` for abort-on-drop.
@@ -1002,58 +1308,23 @@ fn spawn_frame_bridge(
     fps: u32,
     bus: EventBus,
 ) -> tokio::task::JoinHandle<()> {
-    let interval = std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 67 });
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The frame the cached JPEG was encoded from, so an unchanged
-        // `latest_frame` reuses the encoded bytes instead of burning an RGB
-        // conversion + JPEG encode per tick on an idle display.
-        let mut last_jpeg: Option<(std::sync::Arc<crate::display::Frame>, Vec<u8>)> = None;
-        loop {
-            tick.tick().await;
-            match recording_session_state(&session_registry, display_id, &session).await {
-                RecordingSessionState::Authorized => {}
-                state => {
-                    stop_recording_for_session_change(&bus, &stream_name, display_id, state);
-                    break;
-                }
-            }
-            let Some(frame) = session.latest_frame().await else {
-                continue;
-            };
-            if !reuse_or_encode_jpeg(&mut last_jpeg, frame, frame_to_jpeg).await {
-                continue;
-            }
-            let Some((_, jpeg)) = last_jpeg.as_ref() else {
-                continue;
-            };
-            // JPEG encoding runs on the blocking pool. Re-check after it,
-            // then retain the registry read guard through the final feed.
-            // A revoke/replacement needs the write guard, so the artifact
-            // write is linearized wholly before or wholly after that
-            // lifecycle boundary.
-            let session_guard = session_registry.read().await;
-            let state = recording_session_state_in(&session_guard, display_id, &session);
-            if state != RecordingSessionState::Authorized {
-                drop(session_guard);
-                stop_recording_for_session_change(&bus, &stream_name, display_id, state);
-                break;
-            }
-            let feed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                let mut r = registry.write().await;
-                r.feed_frame(&stream_name, jpeg).await
-            })
-            .await;
-            drop(session_guard);
-            if !matches!(feed, Ok(Ok(()))) {
-                bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
-                    stream_name: stream_name.clone(),
-                }));
-                break;
-            }
-        }
-    })
+    let sink = RegistryFeedSink {
+        registry,
+        stream_name: stream_name.clone(),
+    };
+    let source = BridgeSource::Session {
+        session_registry,
+        session,
+        display_id,
+    };
+    tokio::spawn(run_frame_bridge(
+        source,
+        sink,
+        frame_to_jpeg,
+        stream_name,
+        fps,
+        bus,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1125,7 +1396,7 @@ async fn recording_session_remains_authorized(
 /// ordinary session artifact tree, so allowing a private view to reach disk
 /// would bypass its owner-only media boundary through filesystem and transfer
 /// APIs. The trusted-local `--record-display` CLI remains a separate explicit
-/// legacy capture path.
+/// capture path (in-process ScreenCaptureKit on macOS, x11grab on Linux).
 async fn start_display_auto(
     registry: &std::sync::Arc<tokio::sync::RwLock<RecordingRegistry>>,
     session_registry: Option<&crate::display::SharedSessionRegistry>,

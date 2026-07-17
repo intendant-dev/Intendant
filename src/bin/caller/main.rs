@@ -1220,7 +1220,8 @@ pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
 
 /// Start recording external displays (--record-display) directly on the registry.
 /// Does NOT emit DisplayReady — external displays have no DisplaySession, so the
-/// web dashboard can't connect. Recording uses x11grab independently.
+/// web dashboard can't connect. Recording captures independently: x11grab on
+/// Linux, in-process ScreenCaptureKit on macOS.
 async fn start_external_display_recordings(
     displays: &[u32],
     registry: &std::sync::Arc<tokio::sync::RwLock<recording::RecordingRegistry>>,
@@ -1238,11 +1239,17 @@ async fn start_external_display_recordings(
             eprintln!("ffmpeg not available — skipping :{}", id);
             continue;
         }
-        match reg.start_external_display(id, width, height).await {
+        match reg.start_external_display(id, width, height, bus).await {
             Ok(stream_name) => {
                 bus.send(AppEvent::RecordingStarted { stream_name });
             }
-            Err(e) => eprintln!("Failed to start recording for :{}: {}", id, e),
+            Err(e) => {
+                eprintln!("Failed to start recording for :{}: {}", id, e);
+                bus.send(AppEvent::RecordingError {
+                    stream_name: format!("display_{id}"),
+                    message: e,
+                });
+            }
         }
     }
 }
