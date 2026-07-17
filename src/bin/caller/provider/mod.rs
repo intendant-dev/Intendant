@@ -87,6 +87,49 @@ fn parse_sse_line(line: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Byte-accurate line framing for SSE streams. Network chunks accumulate as
+/// raw bytes and are converted to text only once a complete line is
+/// available: converting each chunk independently (the old per-chunk
+/// `from_utf8_lossy`) corrupted any multibyte UTF-8 codepoint that a chunk
+/// boundary happened to split — common with CJK/emoji streaming — into
+/// U+FFFD replacement characters.
+pub(crate) struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    pub(crate) fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append a raw network chunk.
+    pub(crate) fn push_chunk(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// Pop the next complete line: everything up to the first `'\n'` (which
+    /// is consumed and excluded), with trailing `'\r'`s stripped — the
+    /// byte-level equivalent of the providers' old `trim_end_matches('\r')`.
+    /// Lossy UTF-8 conversion happens only here, on the complete line, so a
+    /// genuinely invalid byte still degrades to U+FFFD but a chunk boundary
+    /// never manufactures one. Returns `None` when no full line is buffered;
+    /// the partial tail stays buffered for the next chunk. Scanning for
+    /// `b'\n'`/`b'\r'` byte-wise is UTF-8-safe: ASCII bytes never occur
+    /// inside a multibyte sequence.
+    pub(crate) fn next_line(&mut self) -> Option<String> {
+        let newline_pos = self.buf.iter().position(|&b| b == b'\n')?;
+        let mut line_end = newline_pos;
+        while line_end > 0 && self.buf[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let line = String::from_utf8_lossy(&self.buf[..line_end]).into_owned();
+        // Drain the consumed prefix in place instead of reallocating the
+        // remainder into a fresh buffer per line.
+        self.buf.drain(..=newline_pos);
+        Some(line)
+    }
+}
+
 /// Streaming timeout for SSE connections (10 minutes).
 const STREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -1183,6 +1226,77 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drain every currently complete line.
+    fn drain_lines(buf: &mut SseLineBuffer) -> Vec<String> {
+        let mut lines = Vec::new();
+        while let Some(line) = buf.next_line() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    #[test]
+    fn sse_line_buffer_multibyte_split_across_two_chunks() {
+        // "…" is E2 80 A6; split it mid-sequence the way a network chunk
+        // boundary can. The old per-chunk from_utf8_lossy turned each half
+        // into U+FFFD.
+        let payload = "data: a…b\n".as_bytes();
+        let mut buf = SseLineBuffer::new();
+        buf.push_chunk(&payload[..9]); // "data: a" + E2 80 (mid-codepoint)
+        assert_eq!(buf.next_line(), None);
+        buf.push_chunk(&payload[9..]); // A6 + "b\n"
+        assert_eq!(buf.next_line().as_deref(), Some("data: a…b"));
+        assert_eq!(buf.next_line(), None);
+    }
+
+    #[test]
+    fn sse_line_buffer_emoji_split_across_three_chunks() {
+        // "🦀" is F0 9F A6 80 — four bytes, split across three pushes.
+        let payload = "data: 🦀!\n".as_bytes();
+        let mut buf = SseLineBuffer::new();
+        buf.push_chunk(&payload[..7]); // "data: " + F0
+        assert_eq!(buf.next_line(), None);
+        buf.push_chunk(&payload[7..9]); // 9F A6
+        assert_eq!(buf.next_line(), None);
+        buf.push_chunk(&payload[9..]); // 80 "!\n"
+        let line = buf.next_line().unwrap();
+        assert_eq!(line, "data: 🦀!");
+        assert!(!line.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn sse_line_buffer_crlf_and_heartbeat_lines() {
+        let mut buf = SseLineBuffer::new();
+        buf.push_chunk(b"data: hi\r\n\r\n\ndata: x\r\r\n");
+        assert_eq!(
+            drain_lines(&mut buf),
+            // Trailing '\r's are stripped (all of them — trim_end_matches
+            // parity), and heartbeat blank lines come through as empty
+            // strings for the callers' existing is_empty() skip.
+            vec!["data: hi", "", "", "data: x"]
+        );
+    }
+
+    #[test]
+    fn sse_line_buffer_split_mid_data_prefix() {
+        let mut buf = SseLineBuffer::new();
+        buf.push_chunk(b"da");
+        assert_eq!(buf.next_line(), None);
+        buf.push_chunk(b"ta: {\"k\":1}\n");
+        assert_eq!(buf.next_line().as_deref(), Some("data: {\"k\":1}"));
+    }
+
+    #[test]
+    fn sse_line_buffer_multiple_lines_one_chunk_and_partial_tail() {
+        let mut buf = SseLineBuffer::new();
+        buf.push_chunk(b"event: delta\ndata: one\ndata: tw");
+        assert_eq!(drain_lines(&mut buf), vec!["event: delta", "data: one"]);
+        // The partial tail stays buffered until its newline arrives.
+        buf.push_chunk(b"o\n");
+        assert_eq!(buf.next_line().as_deref(), Some("data: two"));
+        assert_eq!(buf.next_line(), None);
+    }
 
     #[test]
     fn project_env_keys_whitelists_provider_keys_only() {
