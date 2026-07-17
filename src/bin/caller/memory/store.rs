@@ -395,18 +395,23 @@ impl DurableStore {
     }
 }
 
-/// The composed durable plane: the writable in-memory plane (stamped
-/// mint + fold) over the durable store. This is the shape P1.8 wires
-/// under `MemoryService` once the ratified sequence completes; until
-/// then only this module's battery drives it.
-pub(crate) struct DurablePlane {
-    pub plane: EphemeralPlane,
-    store: DurableStore,
+/// What [`DurableStore::open`] recovers: the store handle plus the
+/// custody/identity record and the decrypted op set, ready for
+/// [`EphemeralPlane::resume`].
+pub(crate) struct RecoveredStore {
+    pub store: DurableStore,
+    pub resume: PlaneResume,
+    pub items: BTreeMap<String, Vec<u8>>,
 }
 
-impl DurablePlane {
-    pub(crate) fn create(dir: &Path) -> Result<DurablePlane, StoreError> {
-        let (plane, custody) = EphemeralPlane::bootstrap_with_custody()?;
+impl DurableStore {
+    /// Create a fresh durable store from a just-minted ceremony
+    /// (P1.8: called by `MemoryService::new_durable`).
+    pub(crate) fn create_from_ceremony(
+        dir: &Path,
+        plane: &EphemeralPlane,
+        custody: PlaneCustody,
+    ) -> Result<DurableStore, StoreError> {
         let genesis_bytes = plane
             .held_items()
             .values()
@@ -429,14 +434,13 @@ impl DurablePlane {
             grant_id: plane.grant.grant_id,
             genesis_hash,
         };
-        let store = DurableStore::create(dir, resume, &genesis_bytes)?;
-        Ok(DurablePlane { plane, store })
+        DurableStore::create(dir, resume, &genesis_bytes)
     }
 
     /// Reopen after a restart or crash: sidecar → recover both logs
-    /// (stamped walker) → open every item (§5.1/§5.3 inverses) →
-    /// stamped-fold admission + chain resumption.
-    pub(crate) fn open(dir: &Path) -> Result<DurablePlane, StoreError> {
+    /// (stamped walker) → open every item (§5.1/§5.3 inverses). The
+    /// caller folds the recovered set via [`EphemeralPlane::resume`].
+    pub(crate) fn open(dir: &Path) -> Result<RecoveredStore, StoreError> {
         let lock = DurableStore::lock_store(dir)?;
         let sidecar_bytes = std::fs::read(dir.join("custody.v1.json"))
             .map_err(|e| StoreError::Custody(format!("sidecar: {e}")))?;
@@ -488,13 +492,11 @@ impl DurablePlane {
             push(&mut items, op_bytes);
         }
 
-        let plane = EphemeralPlane::resume(&resume, items)?;
         let tenant = OpenOptions::new()
             .append(true)
             .open(dir.join("tenant.iplog"))
             .map_err(|e| StoreError::StorageIo(e.to_string()))?;
-        Ok(DurablePlane {
-            plane,
+        Ok(RecoveredStore {
             store: DurableStore {
                 dir: dir.to_path_buf(),
                 _lock: lock,
@@ -502,6 +504,53 @@ impl DurablePlane {
                 resume,
                 frozen: false,
             },
+            resume: DurableStore::reread_resume(dir)?,
+            items,
+        })
+    }
+
+    fn reread_resume(dir: &Path) -> Result<PlaneResume, StoreError> {
+        let sidecar_bytes = std::fs::read(dir.join("custody.v1.json"))
+            .map_err(|e| StoreError::Custody(format!("sidecar: {e}")))?;
+        let sidecar: SidecarV1 = serde_json::from_slice(&sidecar_bytes)
+            .map_err(|e| StoreError::Custody(format!("sidecar: {e}")))?;
+        sidecar.into_parts()
+    }
+
+    /// Seal + append one admitted op (§6.2 L1: the caller acks only
+    /// on Ok). P1.8's service path.
+    pub(crate) fn append_sealed_op(&mut self, op_bytes: &[u8]) -> Result<(), StoreError> {
+        let resume = &self.resume;
+        let payload = seal_item_frame(op_bytes, resume)?;
+        self.append_frame(FRAME_ITEM_COMMIT, &payload)
+    }
+
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+}
+
+/// The composed durable plane — the crash battery's harness shape
+/// (production wiring composes the same pieces inside
+/// `MemoryService`).
+pub(crate) struct DurablePlane {
+    pub plane: EphemeralPlane,
+    store: DurableStore,
+}
+
+impl DurablePlane {
+    pub(crate) fn create(dir: &Path) -> Result<DurablePlane, StoreError> {
+        let (plane, custody) = EphemeralPlane::bootstrap_with_custody()?;
+        let store = DurableStore::create_from_ceremony(dir, &plane, custody)?;
+        Ok(DurablePlane { plane, store })
+    }
+
+    pub(crate) fn open(dir: &Path) -> Result<DurablePlane, StoreError> {
+        let recovered = DurableStore::open(dir)?;
+        let plane = EphemeralPlane::resume(&recovered.resume, recovered.items)?;
+        Ok(DurablePlane {
+            plane,
+            store: recovered.store,
         })
     }
 
@@ -513,16 +562,15 @@ impl DurablePlane {
         }
     }
 
-    /// Mint + admit a Memory claim in the plane, then persist it as a
-    /// sealed item; the claim is ACKED (returned) only after the frame
-    /// is flushed (§6.2 L1). A persistence failure surfaces the named
-    /// outcome and freezes the writer — the in-memory admission is NOT
-    /// exposed as durable.
+    /// Mint + admit a Memory claim, then persist it as a sealed item;
+    /// ACKED only after the frame is flushed (§6.2 L1). On a
+    /// persistence failure the in-memory admission is retracted so
+    /// nothing unpersisted is ever exposed, and the writer freezes.
     pub(crate) fn append_claim_op(&mut self, statement: &str) -> Result<[u8; 32], StoreError> {
         use owner_plane_core::shapes::envelope::ActorKind;
         use owner_plane_core::shapes::memory::Mclaim;
         use owner_plane_core::shapes::{Class, Kind};
-        if self.store.frozen {
+        if self.store.is_frozen() {
             return Err(StoreError::StorageIo(
                 "writer frozen by an earlier flush failure".into(),
             ));
@@ -552,14 +600,10 @@ impl DurablePlane {
             .last()
             .expect("the op just admitted is held")
             .clone();
-        debug_assert_eq!(
-            parse_op(&op_bytes).map(|op| op.op_hash()).ok(),
-            Some(op_hash),
-            "held tail must be the op just admitted"
-        );
-
-        let payload = seal_item_frame(&op_bytes, &self.store.resume)?;
-        self.store.append_frame(FRAME_ITEM_COMMIT, &payload)?;
+        if let Err(e) = self.store.append_sealed_op(&op_bytes) {
+            self.plane.retract_unpersisted(&op_hash)?;
+            return Err(e);
+        }
         Ok(op_hash)
     }
 
@@ -869,7 +913,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("plane");
         let mut child = spawn_child(&dir, 200, None, None);
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        // Kill only once the child demonstrably runs (store created and
+        // at least one ack journaled) — a fixed sleep raced slow starts
+        // under full-suite load and killed before creation.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if acks_path(&dir).exists() && !acked_hashes(&dir).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
         child.kill().expect("SIGKILL the child");
         let _ = child.wait();
 

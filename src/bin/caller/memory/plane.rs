@@ -634,6 +634,61 @@ impl EphemeralPlane {
         Ok(op_hash)
     }
 
+    /// Retract the most recent op when its durable persistence FAILED
+    /// (P1.8 lockstep: §6.2 L1 says nothing unflushed is ever exposed
+    /// as committed, and the in-memory view must agree). Only valid
+    /// for the op at the chain tail; the fold and chain position are
+    /// re-derived from the remaining set.
+    pub(crate) fn retract_unpersisted(&mut self, op_hash: &[u8; 32]) -> Result<(), MemoryError> {
+        let Some((name, _)) = self
+            .items
+            .iter()
+            .last()
+            .filter(|(_, bytes)| {
+                owner_plane_reducer::envelope::parse_op(bytes)
+                    .is_ok_and(|op| op.op_hash() == *op_hash)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+        else {
+            return Err(MemoryError::InvalidArg(
+                "retract_unpersisted targets only the chain tail".into(),
+            ));
+        };
+        self.items.remove(&name);
+        let (verdicts, state) = fold_set(&self.items, &BTreeMap::new())
+            .map_err(|Unimplemented(why)| MemoryError::Unimplemented(why))?;
+        self.verdicts = verdicts;
+        self.state = state;
+        let (writer_seq, prev_writer_hash) =
+            match self
+                .state
+                .tenant_chain_head(&self.zone_id, &self.dev.lineage, 1)
+            {
+                Some((next_seq, head)) => (next_seq - 1, head),
+                None => (0, gen_start(&self.dev.lineage, 1)),
+            };
+        self.writer_seq = writer_seq;
+        self.prev_writer_hash = prev_writer_hash;
+        Ok(())
+    }
+
+    /// Test seam: seal a tenant op into an ARBITRARY space (the
+    /// space-denial exit test aims at the audit space the writer grant
+    /// does not cover; production sealing always targets home).
+    #[cfg(test)]
+    pub(crate) fn tenant_op_in_space_for_test(
+        &mut self,
+        space_id: [u8; 16],
+        op_type: &str,
+        body: cbor::Value,
+    ) -> Result<[u8; 32], MemoryError> {
+        let home = self.home_space;
+        self.home_space = space_id;
+        let out = self.tenant_op(ActorKind::Daemon, None, op_type, body);
+        self.home_space = home;
+        out
+    }
+
     /// Derived claim status via the reducer's §11.2 fold — never a
     /// service-side reimplementation.
     pub(crate) fn claim_status(&self, op_hash: &[u8; 32]) -> Option<&'static str> {

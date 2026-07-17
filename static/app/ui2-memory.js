@@ -20,6 +20,7 @@ let memoryRefetchQueued = false;
 let memoryLoadError = '';
 let memoryQuery = '';
 let memoryExpandedId = '';
+let memoryDurability = 'ephemeral';
 
 async function memoryRefresh() {
   if (memoryFetchInFlight) {
@@ -38,6 +39,7 @@ async function memoryRefresh() {
       });
       if (resp.ok && resp.body && Array.isArray(resp.body.results)) {
         memoryClaims = resp.body.results;
+        memoryDurability = resp.body.durability || 'ephemeral';
         memoryLoadError = '';
       } else {
         memoryLoadError = (resp.body && resp.body.error) || `memory unavailable (${resp.status})`;
@@ -135,10 +137,16 @@ function memoryDetailBlock(claim) {
 function memoryRenderTab() {
   const list = document.getElementById('memory-tab-list');
   if (!list) return;
+  const note = document.getElementById('memory-durability-note');
+  if (note) {
+    note.textContent = memoryDurability === 'durable'
+      ? 'Durable plane — claims survive daemon restarts on this machine. Sync across machines arrives in a later phase.'
+      : 'Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage runs on the primary-OS daemon.';
+  }
   const counts = document.getElementById('memory-tab-counts');
   if (counts) {
     const n = memoryClaims ? memoryClaims.length : 0;
-    counts.textContent = memoryClaims === null ? '' : `${n} claim${n === 1 ? '' : 's'} shown · ephemeral`;
+    counts.textContent = memoryClaims === null ? '' : `${n} claim${n === 1 ? '' : 's'} shown · ${memoryDurability}`;
   }
   if (memoryLoadError) {
     list.innerHTML = `<div class="ui-empty">${escapeHtml(memoryLoadError)}</div>`;

@@ -25,7 +25,7 @@ pub(crate) async fn memory_search_api_response(
         200,
         JsonBody::Value(serde_json::json!({
             "results": results,
-            "durability": "ephemeral",
+            "durability": memory.durability_label(),
         })),
     )
 }
