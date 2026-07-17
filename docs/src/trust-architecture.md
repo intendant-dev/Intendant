@@ -49,6 +49,17 @@ decrypted vault state made available to it. Item 1 is account authentication
 and route metadata only; a Connect account assertion does not authenticate to
 a daemon, and the default service exposes no browser-control signaling.
 
+The optional **reachability relay** (docs/src/self-hosted-rendezvous.md) sits
+squarely in the transport class (item 3) and does not enlarge Connect's trust.
+It routes a fleet name to a NAT'd daemon by peeking the TLS SNI and splicing
+ciphertext both ways — it terminates no TLS, holds no certificate, and sees no
+plaintext, so the browser's handshake completes end-to-end against the daemon's
+own fleet certificate. Because a relayed connection reaches the daemon bearing
+the same fleet SNI as a direct one, the gateway classifies it as discovery-only
+and refuses every protected route exactly as it does today. The relay is
+availability-only: at worst a compromised or coerced relay withholds or delays
+reachability, which is the denial-of-service Connect can already inflict.
+
 Item 5 is the one the web platform will not let us escape. The browser binds
 code identity to *origin*, origin trust to TLS+DNS, and the server behind an
 origin can change what it serves at any time, per user, silently:

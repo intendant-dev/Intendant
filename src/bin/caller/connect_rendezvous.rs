@@ -1326,6 +1326,13 @@ same resolution + signing discipline as request_unclaim. */
 
 const DNS_PUBLISH_PROTOCOL: &str = "intendant-connect-dns-publish-v1";
 const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
+/// Relay-mode DNS publish: "answer my fleet label with the relay's address"
+/// (mirrors `bin/connect/relay.rs`; same signing discipline as the fleet-DNS
+/// publishes).
+pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
+/// Persistent relay control-channel long-poll protocol (mirrors
+/// `bin/connect/relay.rs`).
+pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v1";
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(
@@ -1352,9 +1359,10 @@ fn dns_acme_signing_payload(
 }
 
 /// The signing context every daemon-signed rendezvous call needs (fleet
-/// DNS, attention nudges): effective config, rendezvous URL, identity, and
-/// the effective daemon id.
-fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String> {
+/// DNS, reachability relay, attention nudges): effective config, rendezvous
+/// URL, identity, and the effective daemon id.
+pub(crate) fn signed_daemon_context() -> Result<(ConnectConfig, Url, DaemonIdentity, String), String>
+{
     let mut config = crate::project::ConnectConfig::default().effective_with_env();
     if config.rendezvous_url.is_none() {
         config.rendezvous_url = status_snapshot().rendezvous_url;
@@ -1462,6 +1470,22 @@ pub(crate) async fn dns_acme_clear() -> Result<(), String> {
         DNS_ACME_PROTOCOL,
         "",
         serde_json::json!({ "clear": true }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Relay-mode DNS publish: ask the rendezvous to answer this daemon's fleet
+/// label with the reachability relay's address (`enable = true`) so the name
+/// resolves to the relay, or revert to direct address publishing
+/// (`enable = false`). Best-effort: only meaningful when the rendezvous runs
+/// both fleet DNS and the relay.
+pub(crate) async fn dns_publish_via_relay(enable: bool) -> Result<(), String> {
+    dns_signed_post(
+        "api/dns/relay",
+        DNS_RELAY_PROTOCOL,
+        if enable { "1" } else { "0" },
+        serde_json::json!({ "enable": enable }),
     )
     .await
     .map(|_| ())
@@ -1596,7 +1620,7 @@ async fn post_error_inner(
         .map_err(|e| e.to_string())
 }
 
-fn authenticated(config: &ConnectConfig, builder: RequestBuilder) -> RequestBuilder {
+pub(crate) fn authenticated(config: &ConnectConfig, builder: RequestBuilder) -> RequestBuilder {
     match config
         .auth_token
         .as_deref()

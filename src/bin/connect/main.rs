@@ -568,11 +568,11 @@ impl ServiceConfig {
                 }
                 _ => None,
             };
-        let mut relay_addresses: Vec<IpAddr> = match std::env::var("INTENDANT_CONNECT_RELAY_ADDRESS")
-        {
-            Ok(value) if !value.trim().is_empty() => parse_relay_addresses(&value)?,
-            _ => Vec::new(),
-        };
+        let mut relay_addresses: Vec<IpAddr> =
+            match std::env::var("INTENDANT_CONNECT_RELAY_ADDRESS") {
+                Ok(value) if !value.trim().is_empty() => parse_relay_addresses(&value)?,
+                _ => Vec::new(),
+            };
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -630,7 +630,9 @@ impl ServiceConfig {
                     );
                 }
                 "--relay-address" => {
-                    let value = args.next().ok_or("--relay-address requires an IP address")?;
+                    let value = args
+                        .next()
+                        .ok_or("--relay-address requires an IP address")?;
                     relay_addresses = parse_relay_addresses(&value)?;
                 }
                 "--help" | "-h" => {
@@ -670,7 +672,7 @@ impl ServiceConfig {
         // The reachability relay is likewise all-or-nothing: a listener with
         // no advertised address could not point DNS at itself, and an
         // advertised address with no listener answers nothing.
-        if relay_listen.is_some() != !relay_addresses.is_empty() {
+        if relay_listen.is_some() == relay_addresses.is_empty() {
             return Err(
                 "reachability relay needs both --relay-listen and --relay-address (or none)"
                     .to_string(),

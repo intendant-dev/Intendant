@@ -148,7 +148,7 @@ fn parse_sni_inner(buf: &[u8]) -> Result<Option<String>, Take> {
     }
     let _record_minor = read_u8(buf, &mut pos)?;
     let _record_len = read_u16(buf, &mut pos)?; // bound by the buffer, not this
-    // Handshake header: msg_type(1) length(3).
+                                                // Handshake header: msg_type(1) length(3).
     if read_u8(buf, &mut pos)? != 0x01 {
         return Err(Take::NotTls); // not a ClientHello
     }
@@ -311,9 +311,9 @@ impl RelayState {
     /// Whether a tunnel has an active (recently polled) control channel.
     fn tunnel_active(&self, label: &str, now: u64) -> bool {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels
-            .get(label)
-            .is_some_and(|entry| now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS)
+        tunnels.get(label).is_some_and(|entry| {
+            now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+        })
     }
 
     /// Queue a dial-back nonce for a tunnel's control poll. Fails closed if the
@@ -341,7 +341,9 @@ impl RelayState {
         self.tunnels
             .lock()
             .expect("relay tunnels poisoned")
-            .retain(|_, entry| now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS);
+            .retain(|_, entry| {
+                now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+            });
     }
 
     fn acquire_ip_conn(self: &Arc<Self>, ip: IpAddr) -> Option<IpConnGuard> {
@@ -436,12 +438,12 @@ fn relay_control_signing_payload(
 
 /// Require the relay to be enabled, then run the shared daemon-signed
 /// verification (bearer gate, rate limit, protocol + freshness, key pin).
+/// `protocol` is `(got, expected)`, mirroring `verified_daemon_request`.
 async fn relay_request_daemon(
     state: &Arc<AppState>,
     headers: &HeaderMap,
-    protocol: &str,
-    expected_protocol: &str,
     rate_key: &str,
+    protocol: (&str, &str),
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
@@ -455,7 +457,7 @@ async fn relay_request_daemon(
         state,
         headers,
         (rate_key, 120, 60_000),
-        (protocol, expected_protocol),
+        protocol,
         daemon_id,
         daemon_public_key,
         issued_at_unix_ms,
@@ -476,9 +478,8 @@ pub(crate) async fn relay_next(
     let daemon = relay_request_daemon(
         &state,
         &headers,
-        &body.protocol,
-        RELAY_CONTROL_PROTOCOL,
         "relay_next",
+        (&body.protocol, RELAY_CONTROL_PROTOCOL),
         &daemon_id,
         &body.daemon_public_key,
         body.issued_at_unix_ms,
@@ -502,7 +503,9 @@ pub(crate) async fn relay_next(
         .expect("relay presence checked in relay_request_daemon")
         .clone();
     let Some(label) = daemon_label(&daemon_id) else {
-        return Err(ApiError::bad_request("daemon id does not derive a fleet label"));
+        return Err(ApiError::bad_request(
+            "daemon id does not derive a fleet label",
+        ));
     };
     relay.touch_tunnel(&label, now_unix_ms());
 
@@ -558,7 +561,9 @@ fn dns_relay_signing_payload(
     enable: bool,
 ) -> String {
     let enable = if enable { "1" } else { "0" };
-    format!("{DNS_RELAY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{enable}\n")
+    format!(
+        "{DNS_RELAY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{enable}\n"
+    )
 }
 
 /// Daemon-signed relay-mode DNS publish: point the daemon's fleet label at the
@@ -580,9 +585,8 @@ pub(crate) async fn dns_relay(
     let daemon = relay_request_daemon(
         &state,
         &headers,
-        &body.protocol,
-        DNS_RELAY_PROTOCOL,
         "dns_relay",
+        (&body.protocol, DNS_RELAY_PROTOCOL),
         &daemon_id,
         &body.daemon_public_key,
         body.issued_at_unix_ms,
@@ -612,15 +616,15 @@ pub(crate) async fn dns_relay(
             "this relay advertises no public address (set --relay-address)",
         ));
     }
-    let zone = state
-        .dns_zone
-        .as_ref()
-        .expect("checked above")
-        .clone();
+    let zone = state.dns_zone.as_ref().expect("checked above").clone();
     let name = zone
         .daemon_fqdn(&daemon_id)
         .ok_or_else(|| ApiError::bad_request("daemon id does not derive a DNS label"))?;
-    let addresses = if body.enable { advertise.clone() } else { Vec::new() };
+    let addresses = if body.enable {
+        advertise.clone()
+    } else {
+        Vec::new()
+    };
     zone.set_daemon_addresses(&daemon_id, &addresses)
         .map_err(ApiError::bad_request)?;
     let now = now_unix_ms();
@@ -668,7 +672,11 @@ pub(crate) async fn bind_relay(
     Ok(run_relay_accept_loop(state, relay, listener))
 }
 
-async fn run_relay_accept_loop(_state: Arc<AppState>, relay: Arc<RelayState>, listener: TcpListener) {
+async fn run_relay_accept_loop(
+    _state: Arc<AppState>,
+    relay: Arc<RelayState>,
+    listener: TcpListener,
+) {
     // Periodic sweep of quiet tunnels alongside accepting.
     let sweep_relay = relay.clone();
     tokio::spawn(async move {
@@ -768,7 +776,13 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
     // Pure ciphertext splice: the browser's TLS records flow to the daemon,
     // whose fleet certificate completes the handshake. This service never sees
     // plaintext.
-    splice(stream, data_stream, RELAY_SPLICE_MAX_BYTES, RELAY_SPLICE_IDLE).await;
+    splice(
+        stream,
+        data_stream,
+        RELAY_SPLICE_MAX_BYTES,
+        RELAY_SPLICE_IDLE,
+    )
+    .await;
 }
 
 /// A daemon dial-back data connection: read `ITRLY1 <nonce>\n`, hand this
@@ -982,7 +996,10 @@ mod tests {
 
     #[test]
     fn sni_parser_refuses_non_tls_garbage() {
-        assert_eq!(parse_client_hello_sni(b"GET / HTTP/1.1\r\n"), SniPeek::NotTls);
+        assert_eq!(
+            parse_client_hello_sni(b"GET / HTTP/1.1\r\n"),
+            SniPeek::NotTls
+        );
         assert_eq!(parse_client_hello_sni(b"\x00\x14\x00\x01"), SniPeek::NotTls); // STUN-ish
         assert_eq!(parse_client_hello_sni(&[0x16, 0x99, 0x01]), SniPeek::NotTls); // bad version
         assert_eq!(parse_client_hello_sni(&[0x16]), SniPeek::NeedMore); // could be TLS
@@ -1070,7 +1087,10 @@ mod tests {
         for _ in 0..RELAY_MAX_CONNS_PER_TUNNEL {
             guards.push(relay.acquire_tunnel_splice(label).expect("under cap"));
         }
-        assert!(relay.acquire_tunnel_splice(label).is_none(), "at cap, refuse");
+        assert!(
+            relay.acquire_tunnel_splice(label).is_none(),
+            "at cap, refuse"
+        );
         drop(guards.pop());
         assert!(relay.acquire_tunnel_splice(label).is_some());
     }
@@ -1177,10 +1197,14 @@ mod tests {
             signature: crate::b64u(key.sign(payload.as_bytes()).as_ref()),
             timeout_ms: Some(10),
         };
-        let err = relay_next(axum::extract::State(state), HeaderMap::new(), axum::Json(body))
-            .await
-            .err()
-            .expect("relay disabled must reject");
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .err()
+        .expect("relay disabled must reject");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
@@ -1208,10 +1232,14 @@ mod tests {
             signature: crate::b64u(&[0u8; 64]),
             timeout_ms: Some(10),
         };
-        let err = relay_next(axum::extract::State(state), HeaderMap::new(), axum::Json(body))
-            .await
-            .err()
-            .expect("a bad signature must reject");
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .err()
+        .expect("a bad signature must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
@@ -1222,7 +1250,8 @@ mod tests {
         let daemon_id = "relay-dns-daemon";
         let relay = relay_state();
         let advertise = relay.advertise_addrs()[0];
-        let zone = Arc::new(crate::FleetZone::new("fleet.example.test", "ns.example.test").unwrap());
+        let zone =
+            Arc::new(crate::FleetZone::new("fleet.example.test", "ns.example.test").unwrap());
         let state = crate::build_test_state(
             dir.path(),
             registered_store(daemon_id, &public),
@@ -1593,11 +1622,8 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let server_name = rustls::pki_types::ServerName::try_from(stray_name).unwrap();
         let tcp = TcpStream::connect(relay_addr).await.unwrap();
-        let handshake = tokio::time::timeout(
-            Duration::from_secs(3),
-            connector.connect(server_name, tcp),
-        )
-        .await;
+        let handshake =
+            tokio::time::timeout(Duration::from_secs(3), connector.connect(server_name, tcp)).await;
         assert!(
             matches!(handshake, Ok(Err(_)) | Err(_)),
             "an unknown fleet name never completes a TLS handshake"

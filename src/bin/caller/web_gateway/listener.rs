@@ -869,6 +869,14 @@ pub(crate) fn spawn_web_gateway_from_cert_dir(
         dashboard_control.clone(),
         tcp_advertised_port,
     );
+    // Reachability relay tunnel: hold a control channel to Connect and splice
+    // relayed browser connections into this gateway (fleet cert serves the
+    // handshake). Opt-in; a no-op unless `[connect] relay_enabled`. The
+    // dial-back target is this gateway's own HTTP port on loopback.
+    crate::relay_tunnel::spawn_relay_tunnel_client(
+        config.connect.clone(),
+        (http_port != 0).then_some(http_port),
+    );
     // Pending-request attention nudges: watch approvals/questions on the bus
     // and ping the Connect rendezvous when they age with no dashboard around.
     crate::attention_nudge::spawn_attention_nudge_monitor(bus.clone());
