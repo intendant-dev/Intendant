@@ -2797,6 +2797,9 @@ button.wt-session-chip:focus-visible {
 .control-toast.error { border-left-color: var(--red); }
 .control-toast.success { border-left-color: var(--green); }
 .control-toast.info { border-left-color: var(--blue); }
+/* Rate-limit escalation alerts: amber, matching the vitals chips'
+   data-severity="warn" role. */
+.control-toast.warn { border-left-color: var(--yellow); }
 /* The base gradient is a literal dark glass; under the ui-v2 light theme
    --text flips to dark ink, which rendered toasts dark-on-dark ("Load
    failed" unreadable). Light mode gets a light raised surface instead. */
@@ -3385,6 +3388,87 @@ html.ui-v2[data-theme="light"] .control-toast {
 .session-detail-title .sd-fork-note {
   color: var(--overlay1);
   font-size: 10px;
+}
+
+/* Session detail: inline per-row fork affordances — the transcript is the
+   lineage explorer; the panel above stays as the complete-catalog fallback
+   (native sessions, codex item anchors, paged-out history). */
+.log-entry .log-fork-entry {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  margin-left: 2px;
+  padding: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--mauve);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.log-entry:hover .log-fork-entry,
+.log-fork-entry:focus,
+.log-entry.has-fork-form .log-fork-entry {
+  opacity: 1;
+  pointer-events: auto;
+}
+.log-fork-entry:hover {
+  border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 14%, transparent);
+}
+@media (pointer: coarse) {
+  .log-entry .log-fork-entry { opacity: 1; pointer-events: auto; }
+}
+.log-entry.has-fork-form { flex-wrap: wrap; }
+.log-fork-form-host {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 4px 0 2px;
+  font-size: 11px;
+}
+.log-fork-form-host input {
+  width: 150px;
+  font-size: 11px;
+}
+.log-fork-form-host .log-fork-hint {
+  flex: 1 1 100%;
+  color: var(--overlay1);
+  font-size: 10px;
+}
+.log-fork-form-host .sd-fork-status {
+  min-height: 14px;
+  color: var(--overlay1);
+}
+.log-fork-form-host .sd-fork-status[data-tone='error'] { color: var(--red); }
+.log-fork-form-host .sd-fork-status[data-tone='ok'] { color: var(--green); }
+
+/* Abandoned claude-code branch rows: parked history, resumable via the
+   branch tip's fork affordance. */
+.log-entry.off-chain-branch {
+  opacity: 0.62;
+  border-left-style: dashed;
+  border-left-color: color-mix(in srgb, var(--mauve) 45%, transparent);
+}
+.log-entry.off-chain-branch:hover { opacity: 0.9; }
+.log-entry .log-branch-chip {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-left: 4px;
+  color: var(--mauve);
+  border: 1px solid color-mix(in srgb, var(--mauve) 45%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 10%, transparent);
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 /* Recent list: lineage family tree (indent rail + collapse toggle). */
