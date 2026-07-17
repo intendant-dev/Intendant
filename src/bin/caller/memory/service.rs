@@ -23,7 +23,6 @@ const SEARCH_LIMIT_CEILING: usize = 50;
 /// signed body) keyed by the accepted op hash. Status is NEVER stored
 /// here — it is derived from the fold at read time.
 struct ClaimRecord {
-    op_hash: [u8; 32],
     kind: Kind,
     statement: String,
     sensitivity: Class,
@@ -53,6 +52,23 @@ fn parse_vocab<T: Copy>(
                 .collect::<Vec<_>>()
                 .join(", "),
         })
+}
+
+/// Does `p` — validated lowercase hex — prefix-match `key`'s 64-char
+/// lowercase hex form? Compared nibble-wise, so the hex string is
+/// never materialized per candidate.
+fn hex_prefix_matches(key: &[u8; 32], p: &str) -> bool {
+    if p.len() > 64 {
+        return false;
+    }
+    p.bytes().enumerate().all(|(i, c)| {
+        let nibble = if i % 2 == 0 {
+            key[i / 2] >> 4
+        } else {
+            key[i / 2] & 0x0f
+        };
+        c == b"0123456789abcdef"[nibble as usize]
+    })
 }
 
 pub(crate) struct MemoryService {
@@ -190,7 +206,6 @@ impl MemoryService {
             claims.insert(
                 op.op_hash(),
                 ClaimRecord {
-                    op_hash: op.op_hash(),
                     kind,
                     statement: text("statement").unwrap_or_default(),
                     sensitivity,
@@ -346,7 +361,6 @@ impl MemoryService {
         self.claims.insert(
             op_hash,
             ClaimRecord {
-                op_hash,
                 kind,
                 statement: args.statement,
                 sensitivity,
@@ -358,7 +372,7 @@ impl MemoryService {
                 proposed_by,
             },
         );
-        Ok(self.view(&self.claims[&op_hash]))
+        Ok(self.view(&op_hash, &self.claims[&op_hash]))
     }
 
     /// Bounded lexical search. Candidates are excluded unless opted
@@ -367,7 +381,7 @@ impl MemoryService {
         let limit = args.limit.clamp(1, SEARCH_LIMIT_CEILING);
         let needle = args.query.to_lowercase();
         let mut out = Vec::new();
-        for rec in self.claims.values() {
+        for (op_hash, rec) in &self.claims {
             if !needle.is_empty() {
                 let hay = format!(
                     "{} {} {}",
@@ -379,11 +393,13 @@ impl MemoryService {
                     continue;
                 }
             }
-            let view = self.view(rec);
-            if view.status == "candidate" && !args.include_candidates {
+            // Derive the status BEFORE building the view: excluded
+            // candidates never pay for the view's clones.
+            let status = self.claim_status_of(op_hash);
+            if status == "candidate" && !args.include_candidates {
                 continue;
             }
-            out.push(view);
+            out.push(self.view_with_status(op_hash, rec, status));
             if out.len() >= limit {
                 break;
             }
@@ -399,29 +415,40 @@ impl MemoryService {
                 "id prefix must be at least 8 hex characters".into(),
             ));
         }
-        let matches: Vec<&ClaimRecord> = self
+        let matches: Vec<(&[u8; 32], &ClaimRecord)> = self
             .claims
-            .values()
-            .filter(|r| hex32(&r.op_hash).starts_with(&p))
+            .iter()
+            .filter(|(hash, _)| hex_prefix_matches(hash, &p))
             .collect();
         match matches.len() {
             0 => Err(MemoryError::NotFound(id_prefix.into())),
-            1 => Ok(self.view(matches[0])),
+            1 => Ok(self.view(matches[0].0, matches[0].1)),
             n => Err(MemoryError::Ambiguous(id_prefix.into(), n)),
         }
     }
 
-    fn view(&self, rec: &ClaimRecord) -> ClaimView {
+    /// The reducer-derived status a view carries ("pending" until the
+    /// fold speaks) — derived at read time, never stored.
+    fn claim_status_of(&self, op_hash: &[u8; 32]) -> &'static str {
+        self.plane.claim_status(op_hash).unwrap_or("pending")
+    }
+
+    fn view(&self, op_hash: &[u8; 32], rec: &ClaimRecord) -> ClaimView {
+        self.view_with_status(op_hash, rec, self.claim_status_of(op_hash))
+    }
+
+    fn view_with_status(
+        &self,
+        op_hash: &[u8; 32],
+        rec: &ClaimRecord,
+        status: &'static str,
+    ) -> ClaimView {
         ClaimView {
-            id: hex32(&rec.op_hash),
+            id: hex32(op_hash),
             kind: rec.kind.as_str().into(),
             statement: rec.statement.clone(),
             sensitivity: rec.sensitivity.as_str().into(),
-            status: self
-                .plane
-                .claim_status(&rec.op_hash)
-                .unwrap_or("pending")
-                .into(),
+            status: status.into(),
             session: rec.session.clone(),
             project: rec.project.clone(),
             model: rec.model.clone(),
@@ -516,6 +543,35 @@ mod tests {
     fn bootstrap_genesis_admits() {
         let svc = MemoryService::new().expect("bootstrap admits");
         assert_eq!(svc.plane.held_ops(), 1, "genesis is held");
+    }
+
+    /// The no-alloc prefix comparator must agree with the hex-string
+    /// formulation it replaced (`hex32(key).starts_with(p)`),
+    /// including odd-length prefixes and the over-length edge.
+    #[test]
+    fn hex_prefix_matches_agrees_with_hex_expansion() {
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let full = hex32(&key);
+        for len in [8, 9, 12, 63, 64] {
+            assert_eq!(
+                hex_prefix_matches(&key, &full[..len]),
+                full.starts_with(&full[..len]),
+                "len {len}"
+            );
+            assert!(hex_prefix_matches(&key, &full[..len]), "len {len}");
+        }
+        let mut wrong = full[..12].to_string();
+        wrong.pop();
+        wrong.push(if full.as_bytes()[11] == b'0' { '1' } else { '0' });
+        assert!(!hex_prefix_matches(&key, &wrong), "mismatched last nibble");
+        let over = format!("{full}0");
+        assert!(
+            !hex_prefix_matches(&key, &over),
+            "a 65-char prefix can never match a 64-char id"
+        );
     }
 
     /// propose → candidate → read round-trip, with the reducer-derived
