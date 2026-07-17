@@ -9,7 +9,6 @@ pub mod autonomy;
 pub mod conversation;
 pub mod error;
 pub mod frames;
-pub mod knowledge;
 pub mod net;
 pub mod peer_id;
 pub mod skills;

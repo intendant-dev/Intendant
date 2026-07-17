@@ -19,6 +19,8 @@ mod connect_rendezvous;
 mod context_rewind;
 mod control;
 mod control_plane;
+mod coordination;
+mod cutover_absence;
 pub(crate) use intendant_core::conversation;
 mod credential_audit;
 mod credential_egress;
@@ -47,7 +49,6 @@ mod frontend;
 mod gateway_routes;
 mod global_store;
 mod hosted_verify;
-pub(crate) use intendant_core::knowledge;
 mod lease_transcript_staging;
 mod lineage_ledger;
 mod linux_display_env;
@@ -957,34 +958,24 @@ fn apply_context_directives(json_str: &str, conversation: &mut Conversation) -> 
 }
 
 /// Finalize a command batch before dispatch: inject project context
-/// (`memory_file` on memory commands) and normalize command aliases
+/// normalize command aliases
 /// (`writeFile` → `editFile`) in ONE parse + serialize. These were two
 /// separate helpers (`inject_project_context`, `normalize_command_batch`)
 /// chained on every batch, each paying its own full parse and re-serialize
 /// of a payload that can embed megabytes of editFile content.
-pub(crate) fn finalize_command_batch(json_str: &str, project: &Project) -> String {
+pub(crate) fn finalize_command_batch(json_str: &str) -> String {
     let mut value: serde_json::Value = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return json_str.to_string(),
     };
 
     if let Some(commands) = value.get_mut("commands").and_then(|c| c.as_array_mut()) {
-        let memory_file = project.memory_path().to_string_lossy().to_string();
-
         for cmd in commands.iter_mut() {
-            match cmd.get("function").and_then(|f| f.as_str()) {
-                Some("storeMemory" | "recallMemory") => {
-                    if cmd.get("memory_file").is_none() {
-                        cmd["memory_file"] = serde_json::Value::String(memory_file.clone());
-                    }
+            if let Some("writeFile") = cmd.get("function").and_then(|f| f.as_str()) {
+                cmd["function"] = serde_json::Value::String("editFile".to_string());
+                if cmd.get("operation").is_none() {
+                    cmd["operation"] = serde_json::Value::String("write".to_string());
                 }
-                Some("writeFile") => {
-                    cmd["function"] = serde_json::Value::String("editFile".to_string());
-                    if cmd.get("operation").is_none() {
-                        cmd["operation"] = serde_json::Value::String("write".to_string());
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -1650,54 +1641,10 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn finalize_command_batch_adds_memory_file() {
-        let root = std::path::PathBuf::from("/tmp/proj");
-        let project = Project {
-            root: root.clone(),
-            config: project::ProjectConfig::default(),
-        };
-        let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"test","memory_summary":"hello"}]}"#;
-        let result = finalize_command_batch(input, &project);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        // Build the expected path the same platform-aware way production does
-        // (via `PathBuf::join`) instead of hardcoding '/'-joined POSIX text,
-        // so the assertion holds on Windows (separator '\\') too.
-        let expected = root
-            .join(".intendant")
-            .join("memory.json")
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(
-            parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            expected
-        );
-    }
-
-    #[test]
-    fn finalize_command_batch_preserves_existing_memory_file() {
-        let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
-            config: project::ProjectConfig::default(),
-        };
-        let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_file":"/custom/path.json"}]}"#;
-        let result = finalize_command_batch(input, &project);
-        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            "/custom/path.json"
-        );
-    }
-
-    #[test]
     fn finalize_command_batch_ignores_unrelated() {
-        let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
-            config: project::ProjectConfig::default(),
-        };
         let input = r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#;
-        let result = finalize_command_batch(input, &project);
+        let result = finalize_command_batch(input);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["commands"][0].get("memory_file").is_none());
         assert!(parsed["commands"][0].get("project_dir").is_none());
     }
 
@@ -1705,12 +1652,8 @@ Also: {"source": "bare"}"#;
     /// `normalize_command_batch` pass) rides the same single parse.
     #[test]
     fn finalize_command_batch_normalizes_write_file_alias() {
-        let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
-            config: project::ProjectConfig::default(),
-        };
         let input = r#"{"commands":[{"function":"writeFile","nonce":1,"file_path":"a.txt","content":"hi"},{"function":"writeFile","nonce":2,"file_path":"b.txt","operation":"append","content":"x"}]}"#;
-        let result = finalize_command_batch(input, &project);
+        let result = finalize_command_batch(input);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["commands"][0]["function"], "editFile");
         assert_eq!(parsed["commands"][0]["operation"], "write");
@@ -1718,7 +1661,7 @@ Also: {"source": "bare"}"#;
         // An explicit operation is preserved, not clobbered.
         assert_eq!(parsed["commands"][1]["operation"], "append");
         // Unparseable input passes through untouched.
-        assert_eq!(finalize_command_batch("not json", &project), "not json");
+        assert_eq!(finalize_command_batch("not json"), "not json");
     }
 
     #[test]
@@ -2483,15 +2426,13 @@ Also: {"source": "bare"}"#;
             ("browse_url", "browse"),
             ("ask_human", "askHuman"),
             ("exec_pty", "execPty"),
-            ("store_memory", "storeMemory"),
-            ("recall_memory", "recallMemory"),
         ];
         for (tool_name, expected_func) in tool_pairs {
             let calls = vec![provider::ToolCall {
                 id: "call_1".to_string(),
                 call_id: "call_1".to_string(),
                 name: tool_name.to_string(),
-                arguments: r#"{"nonce":1,"command":"test","status_type":"stdout","path":"/tmp","file_path":"/tmp/f","operation":"write","url":"http://x","question":"?","memory_key":"k","memory_summary":"s","memory_query":"q"}"#.to_string(),
+                arguments: r#"{"nonce":1,"command":"test","status_type":"stdout","path":"/tmp","file_path":"/tmp/f","operation":"write","url":"http://x","question":"?"}"#.to_string(),
             }];
             let result = assemble_batch_from_tool_calls(&calls);
             let input: serde_json::Value =
@@ -2667,20 +2608,6 @@ All relative paths and commands execute from this directory.",
     if let Some(instructions) = prompts::load_project_instructions(Some(&project.root)) {
         conv.add_user(MessageProvenance::SystemInjection, instructions);
         conv.add_assistant("Acknowledged. I will follow the project instructions.".to_string());
-    }
-
-    // Inject knowledge
-    if project.config.memory.enabled {
-        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
-            let refs: Vec<&_> = kstore.entries.iter().collect();
-            let msg = knowledge::format_for_injection(&refs);
-            if !msg.is_empty() {
-                conv.add_user(MessageProvenance::SystemInjection, msg);
-                conv.add_assistant(
-                    "Acknowledged. I have loaded the project knowledge.".to_string(),
-                );
-            }
-        }
     }
 
     // Inject skill catalog

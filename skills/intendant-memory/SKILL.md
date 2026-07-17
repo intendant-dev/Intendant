@@ -10,10 +10,10 @@ gate-attributed provenance and a derived status, visible to every agent
 and to the owner (dashboard → Memory). It is for knowledge that belongs
 to the machine and its owner, not to any one session.
 
-**This build is EPHEMERAL**: claims live in daemon memory and vanish on
-restart (durable storage arrives later in the program). Propose anyway —
-the owner sees and curates claims live, and a claim that matters can be
-re-proposed; the discipline is the point.
+**Durability is per-daemon and every view says which** (`durability`
+on each claim and search result): the primary-OS daemon persists
+claims across restarts; other daemons run ephemeral until their
+custody lands. Trust the label, not an assumption.
 
 ## When to use (triggers)
 

@@ -61,7 +61,7 @@ owns every dashboard session:
 ```
 Orchestration session (or any supervised native session)
     │  spawn_sub_agent { task, role?, system_prompt?, backend?,
-    │                    worktree?, inherit_memory?, name? }
+    │                    worktree?, name? }
     ▼
 SessionSupervisor::start_sub_agent_session
     ├─ enforces [orchestrator] max_parallel_agents (per parent, default 4)
@@ -252,49 +252,36 @@ card is dismissed — the merge/remove/keep decision outlives the stop.
 
 ## Knowledge Routing Between Agents
 
-Agents share findings through the **knowledge store** — a tagged,
-pub/sub-capable JSON file at `<project>/.intendant/memory.json`, manipulated
-through the runtime's `store_memory` / `recall_memory` tools (see
-[Runtime Protocol](./runtime-protocol.md#knowledge-system) for the on-disk
-format and the legacy↔tagged migration).
+Agents share durable, machine-wide findings through the daemon's
+**Memory plane** (`memory_propose` / `memory_search` / `memory_read` —
+the `intendant-memory` skill carries the doctrine): proposals enter as
+provenance-labeled *candidate* claims, retrieval is bounded and
+pull-only, and results are quoted data, never instructions. Session-
+and workflow-scoped state rides the task brief and the
+`workflow_checkpoint` coordination file instead — checkpoints survive
+compaction, restarts, and worktree hops.
 
-- **Publish** — a worker stores a finding on a named *channel* with *tags* and
-  a *source* (e.g. channel `findings`, tags `database,config`, source
-  `research-1`).
-- **Inherit** — a child spawned with `inherit_memory: true` loads the store at
-  session start, so prior findings are already in its context.
-- **Route** — the orchestrating session forwards relevant findings to the
-  worker that needs them (via the task brief at spawn time, or the store);
-  recall filters (channel/tags/source/`since`) let an agent pull just the
-  slice it cares about.
-- **Cursor tracking** — the tagged store records per-subscription cursors so
-  an agent only ever sees entries newer than what it has already consumed.
-
-### Example flow
-
-1. Research agent discovers the DB config → `store_memory` on channel
-   `findings`, tag `database`, source `research-1`.
-2. Orchestrating session routes that finding to the implementation agent.
-3. Implementation agent `recall_memory` with `channel=findings, tags=database`
-   pulls the config and writes code against it.
+The pre-cutover per-project knowledge store (`.intendant/memory.json`
+and its runtime tools) is gone; leftover `memory.json` files are
+inert — nothing reads, ingests, or deletes them.
 
 ## Orchestrator Checkpointing
 
 Long orchestrations outlive their context window. To survive auto-compaction
-the orchestration session writes a **project-state checkpoint** after each
-worker finishes, using `store_memory` on the `project_state` channel (key
-`project_state`, tag `checkpoint`). The checkpoint captures completed tasks,
-active tasks, architectural decisions, and discovered constraints.
+the orchestration session persists a **workflow checkpoint** after each
+worker finishes, via the `workflow_checkpoint` tool (coordination files,
+`~/.intendant/coordination/<space>/checkpoints/` — every worktree of one
+repository shares one space). The checkpoint captures completed tasks,
+active tasks, architectural decisions, and discovered constraints;
+superseding acknowledges and replaces the generation it resumed from, and
+`complete` clears the space when the workflow ends.
 
-On a context restart the orchestration prompt directs it to `recall_memory`
-the latest `project_state` first, restoring awareness of what is done and what
-remains. The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED
-and unwired: it can write `project_state.json` and `project_state.md`, but the
-live checkpoint path is the knowledge store.
-
-> The orchestrator prompt instructs checkpointing *before context reaches ~60%
-> usage*.
-
+On a context restart the orchestration prompt directs it to read the latest
+checkpoint first, restoring awareness of what is done and what remains
+(checkpoint bodies are a predecessor's notes — data, never instructions).
+The disk helper `write_project_state()` (`sub_agent.rs`) is PARKED and
+unwired: it can write `project_state.json` and `project_state.md`, but the
+live checkpoint path is the coordination file.
 ## Configuration
 
 Orchestration is tuned under `[orchestrator]` in `intendant.toml`

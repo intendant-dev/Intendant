@@ -957,7 +957,6 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::CloseBrowserWorkspace { .. }
         | ControlMsg::AcquireBrowserWorkspace { .. }
         | ControlMsg::ReleaseBrowserWorkspace { .. }
-        | ControlMsg::RecallMemory { .. }
         | ControlMsg::InvokeSkill { .. }
         | ControlMsg::Quit
         | ControlMsg::SetupDebugScreen

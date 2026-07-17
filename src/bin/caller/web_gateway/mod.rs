@@ -177,7 +177,6 @@ pub struct WebQueryCtx {
     pub agent_state: Arc<Mutex<AgentStateSnapshot>>,
     pub project_root: PathBuf,
     pub log_dir: PathBuf,
-    pub knowledge_path: PathBuf,
     /// Server-authoritative presence session (event window + checkpoint state).
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
     /// Shared context injection queue for mid-task interjections.

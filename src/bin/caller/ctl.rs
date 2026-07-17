@@ -2461,7 +2461,15 @@ async fn run_memory_search(
     for claim in &results {
         println!("{}", memory_render_row(claim));
     }
-    println!("(ephemeral plane — nothing persists across daemon restarts)");
+    let durability = value
+        .get("durability")
+        .and_then(Value::as_str)
+        .unwrap_or("ephemeral");
+    if durability == "durable" {
+        println!("(durable plane)");
+    } else {
+        println!("(ephemeral plane — nothing persists across daemon restarts)");
+    }
     Ok(())
 }
 

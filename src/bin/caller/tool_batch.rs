@@ -152,6 +152,9 @@ pub struct ToolBatchResult {
     /// Live audio spawn requests extracted from spawn_live_audio tool calls.
     /// Vec of (call_id, session_id, full_args_json).
     pub live_audio_spawns: Vec<(String, String, serde_json::Value)>,
+    /// Workflow-checkpoint calls (coordination files, §9 v0).
+    /// Vec of (call_id, args).
+    pub workflow_checkpoints: Vec<(String, serde_json::Value)>,
     /// Sub-agent spawn requests extracted from spawn_sub_agent tool calls.
     /// Vec of (call_id, args).
     pub sub_agent_spawns: Vec<(String, serde_json::Value)>,
@@ -178,6 +181,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut shared_view_calls = Vec::new();
     let mut peer_calls = Vec::new();
     let mut live_audio_spawns = Vec::new();
+    let mut workflow_checkpoints = Vec::new();
     let mut sub_agent_spawns = Vec::new();
     let mut sub_agent_waits = Vec::new();
     let mut sub_agent_results = Vec::new();
@@ -225,6 +229,11 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                         .to_string();
                     live_audio_spawns.push((tc.call_id.clone(), session_id, args));
                 }
+            }
+            "workflow_checkpoint" => {
+                let args =
+                    serde_json::from_str::<serde_json::Value>(&tc.arguments).unwrap_or_default();
+                workflow_checkpoints.push((tc.call_id.clone(), args));
             }
             "spawn_sub_agent" => {
                 let args =
@@ -306,6 +315,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         shared_view_calls,
         peer_calls,
         live_audio_spawns,
+        workflow_checkpoints,
         sub_agent_spawns,
         sub_agent_waits,
         sub_agent_results,

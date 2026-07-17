@@ -836,7 +836,7 @@ mod tests {
             transports: vec![TransportSpec::IntendantWs {
                 url: ws_url.to_string(),
             }],
-            capabilities: vec![Capability::ComputerUse, Capability::Knowledge],
+            capabilities: vec![Capability::ComputerUse],
             auth: AuthRequirements::none(),
         }
     }

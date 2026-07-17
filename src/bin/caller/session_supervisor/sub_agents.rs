@@ -94,7 +94,6 @@ impl SessionSupervisor {
             system_prompt: None,
             backend,
             worktree: worktree.unwrap_or(false),
-            inherit_memory: false,
             name,
         };
         let started = match self
@@ -317,7 +316,6 @@ impl SessionSupervisor {
             child_name: child_name.clone(),
             role: params.role,
             system_prompt: params.system_prompt,
-            inherit_memory: params.inherit_memory,
             depth: child_depth,
         };
         let source = params
@@ -438,7 +436,6 @@ mod tests {
                     system_prompt: None,
                     backend: None,
                     worktree: false,
-                    inherit_memory: false,
                     name: None,
                 },
             )

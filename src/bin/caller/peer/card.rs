@@ -287,7 +287,6 @@ pub enum Capability {
     /// Has computer-use (screen + keyboard + mouse) on its own host.
     ComputerUse,
     /// Has a tagged knowledge store the peer can be queried against.
-    Knowledge,
     /// Has display / session recording.
     Recording,
     /// Accepts task delegation from peers (implements `PeerDelegator`).
@@ -331,7 +330,6 @@ impl Capability {
             "voice" => Some(Self::Voice),
             "phone" => Some(Self::Phone),
             "computer-use" => Some(Self::ComputerUse),
-            "knowledge" => Some(Self::Knowledge),
             "recording" => Some(Self::Recording),
             "task-delegation" => Some(Self::TaskDelegation),
             "message-relay" => Some(Self::MessageRelay),
@@ -814,10 +812,6 @@ mod tests {
         assert_eq!(
             Capability::from_query_string("computer-use"),
             Some(Capability::ComputerUse)
-        );
-        assert_eq!(
-            Capability::from_query_string("knowledge"),
-            Some(Capability::Knowledge)
         );
         assert_eq!(
             Capability::from_query_string("recording"),

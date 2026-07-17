@@ -61,7 +61,10 @@ async function loadSessionForkPoints(session, sessionId, body) {
   body.appendChild(list);
   const points = Array.isArray(catalog.fork_points) ? catalog.fork_points : [];
   if (points.length === 0) {
-    list.textContent = 'No fork points yet (native sessions expose them from the last persisted state).';
+    list.textContent =
+      catalog.source === 'intendant'
+        ? 'No fork points yet: native sessions expose them from the last persisted conversation (stop or complete a round first).'
+        : 'No fork points yet: this session has no completed turns in its transcript.';
     return;
   }
   const source = catalog.source || sessionForkSourceForCatalog(session);
