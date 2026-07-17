@@ -1142,7 +1142,7 @@ const VITALS_SYMBOLS = {
       `${v.count} file${v.count === 1 ? ' has' : 's have'} changes that aren't committed to git yet.`,
       'Normal while the agent works — they become permanent history once committed.',
     ],
-    action: () => ({ label: 'View the changes', run: () => vitalsOpenChangesTab() }),
+    action: (v, sessionId) => ({ label: 'View the changes', run: () => vitalsOpenChangesTab(sessionId) }),
   },
   divergence: {
     label: 'Ahead / behind',
@@ -2514,7 +2514,14 @@ function vitalsCopyText(text) {
   scratch.remove();
 }
 
-function vitalsOpenChangesTab() {
+function vitalsOpenChangesTab(sessionId) {
+  // The Changes tab targets the CURRENT session — focus the chip's
+  // session first so the tab shows the checkout the chip counted, not
+  // whichever session happened to be current.
+  const sid = String(sessionId || '').trim();
+  if (sid && sid !== currentSessionFullId && typeof focusSessionWindow === 'function') {
+    focusSessionWindow(sid);
+  }
   const btn = document.querySelector('#activity-subtabs [data-activity-tab="changes"]');
   if (btn) btn.click();
 }
