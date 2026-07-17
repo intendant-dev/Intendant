@@ -1,6 +1,9 @@
 // ── Keyboard Shortcuts ──
 document.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+  // Chapter navigation: Alt+Arrow (user messages) / Alt+Shift+Arrow
+  // (agent replies) on the visible log surface — 57c-chapter-nav.js.
+  if (typeof chapterNavHandleShortcut === 'function' && chapterNavHandleShortcut(e)) return;
   if (e.key === 'Escape' && closeSessionWindowMenus()) {
     e.preventDefault();
     return;

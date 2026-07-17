@@ -59,6 +59,12 @@ pub(crate) fn is_injected_external_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("# AGENTS.md instructions for ")
         || trimmed.starts_with("<turn_aborted>")
+        // Claude Code's synthetic abort markers ("[Request interrupted by
+        // user]", "…for tool use]") ride user messages; the live adapter
+        // deliberately drops them (`claude_code.rs::handle_user` — the
+        // `result` message carries the outcome), so no transcript surface
+        // may render them as user speech or count them as user turns.
+        || trimmed.starts_with("[Request interrupted by user")
         || trimmed.starts_with("<subagent_notification>")
         || trimmed.starts_with("<environment_context>")
         || trimmed.starts_with("<task-notification>")

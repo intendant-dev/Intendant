@@ -114,6 +114,7 @@ ui2-settings.js
 57b-session-fork.js
 57-sessions-replay.js
 57-sessions-message-search.js
+57c-chapter-nav.js
 57-attention-notifications.js
 58-shortcuts-boot.js
 58-display-request.js

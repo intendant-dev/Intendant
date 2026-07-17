@@ -3,6 +3,12 @@ use std::fmt;
 #[derive(Debug)]
 pub enum CallerError {
     Provider(String),
+    /// A provider SSE stream failed mid-body, after a successful open.
+    /// Displays with the same "Provider error: Stream error:" shape the
+    /// retry string-match and session logs already carry; the typed
+    /// variant lets the agent loop classify mid-stream failures
+    /// structurally instead of parsing prose.
+    StreamChunk(String),
     Agent(String),
     SubAgent(String),
     Io(std::io::Error),
@@ -25,6 +31,7 @@ impl fmt::Display for CallerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CallerError::Provider(msg) => write!(f, "Provider error: {}", msg),
+            CallerError::StreamChunk(msg) => write!(f, "Provider error: Stream error: {}", msg),
             CallerError::Agent(msg) => write!(f, "Agent error: {}", msg),
             CallerError::SubAgent(msg) => write!(f, "Sub-agent error: {}", msg),
             CallerError::Io(e) => write!(f, "IO error: {}", e),
@@ -80,6 +87,18 @@ mod tests {
     fn provider_error_display() {
         let err = CallerError::Provider("rate limited".to_string());
         assert_eq!(format!("{}", err), "Provider error: rate limited");
+    }
+
+    #[test]
+    fn stream_chunk_error_displays_as_legacy_stream_error() {
+        // Session logs and the agent loop's fallback string match carry
+        // the "Provider error: Stream error:" shape from the pre-typed
+        // era; the typed variant must not change the rendered string.
+        let err = CallerError::StreamChunk("connection reset".to_string());
+        assert_eq!(
+            format!("{}", err),
+            "Provider error: Stream error: connection reset"
+        );
     }
 
     #[test]
