@@ -125,14 +125,59 @@ fn env_kind(env_name: &str) -> Option<&'static str> {
     }
 }
 
-fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
-    let staging = crate::lease_transcript_staging::default_paths();
+/// One deferred filesystem cleanup: `kind`'s materialized home, already
+/// renamed out of the live namespace (`reaped`; `None` = nothing was on
+/// disk and only the active-registry entry may need clearing). Built
+/// under the store lock; executed by [`run_cleanup_item`] with no lock
+/// held.
+struct MaterializationCleanup {
+    kind: String,
+    reaped: Option<PathBuf>,
+}
+
+/// The in-memory half of a sweep, run under the store write lock: expire
+/// leases (tombstones, dry notices, audit trail) and rename each expired
+/// kind's materialized home out of the live namespace — one syscall per
+/// kind. The returned batch carries the staging scans and directory
+/// deletions; the caller runs it via [`run_deferred_cleanup`] AFTER
+/// releasing the lock. Filesystem work must not stall every other lease
+/// operation (`leased_secret` sits on the provider hot path), and
+/// because a reaped home is outside the live namespace, a lease
+/// re-granted while its cleanup is still in flight materializes a fresh
+/// canonical home the deferred deletion can never touch.
+fn sweep_locked(
+    leases: &mut HashMap<String, CredentialLease>,
+    now: u64,
+    root: &Path,
+) -> Vec<MaterializationCleanup> {
+    let mut cleanup: Vec<MaterializationCleanup> = Vec::new();
     let active_oauth: HashSet<String> = leases
         .iter()
         .filter(|(_, lease)| lease.expires_at_unix_ms() > now)
         .map(|(kind, _)| kind.clone())
         .collect();
-    retry_pending_materialization_cleanup(&materialization_root(), &staging, &active_oauth);
+    // Canonical-path cleanups whose reap failed earlier: retry the
+    // rename under the lock, deferring the rest like everything else.
+    let pending: Vec<String> = pending_materialization_cleanup()
+        .read()
+        .expect("pending materialization cleanup poisoned")
+        .iter()
+        .cloned()
+        .collect();
+    for kind in pending {
+        if active_oauth.contains(&kind) {
+            continue;
+        }
+        match reap_materialization(root, &kind) {
+            Ok(reaped) => {
+                clear_materialization_cleanup(&kind);
+                cleanup.push(MaterializationCleanup { kind, reaped });
+            }
+            Err(err) => {
+                eprintln!("[credential-leases] pending cleanup for {kind} failed: {err}");
+            }
+        }
+    }
 
     let expired: Vec<String> = leases
         .iter()
@@ -140,7 +185,7 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
         .map(|(kind, _)| kind.clone())
         .collect();
     if expired.is_empty() {
-        return;
+        return cleanup;
     }
     let mut graves = tombstones().write().expect("lease tombstones poisoned");
     for kind in expired {
@@ -160,11 +205,18 @@ fn sweep_locked(leases: &mut HashMap<String, CredentialLease>, now: u64) {
                 ),
             );
         }
-        if let Err(err) = drop_materialization(&materialization_root(), &staging, &kind) {
-            eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
-            queue_materialization_cleanup(&kind);
+        if materialization_plan(&kind).is_none() {
+            continue;
+        }
+        match reap_materialization(root, &kind) {
+            Ok(reaped) => cleanup.push(MaterializationCleanup { kind, reaped }),
+            Err(err) => {
+                eprintln!("[credential-leases] expired lease cleanup for {kind} failed: {err}");
+                queue_materialization_cleanup(&kind);
+            }
         }
     }
+    cleanup
 }
 
 /* ── Dry-daemon notices ──
@@ -385,21 +437,135 @@ fn materialize_kind(
     Ok(())
 }
 
-fn drop_materialization(
-    root: &Path,
+/// Rename `kind`'s materialized home out of the live namespace (same
+/// parent, one syscall) so its staging scan and deletion can run with no
+/// store lock held. A lease re-granted mid-cleanup materializes a FRESH
+/// canonical home, so the deferred deletion of the reaped path can never
+/// destroy an active lease's auth file. Returns `None` when nothing is
+/// materialized (kind has no plan, or no home on disk).
+fn reap_materialization(root: &Path, kind: &str) -> Result<Option<PathBuf>, String> {
+    let Some(plan) = materialization_plan(kind) else {
+        return Ok(None);
+    };
+    let live = root.join(plan.dir_name);
+    let reaped = root.join(format!(
+        ".reap-{}-{}",
+        plan.dir_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::rename(&live, &reaped) {
+        Ok(()) => Ok(Some(reaped)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!(
+            "rename {} -> {}: {err}",
+            live.display(),
+            reaped.display()
+        )),
+    }
+}
+
+/// Reaped homes whose deletion failed — retried off-lock by later
+/// sweeps. Reaped paths are outside the live namespace, so retrying
+/// needs no store lock and no active-kind gating. Lost on restart, when
+/// the startup sweep deletes the whole materialization root anyway.
+fn pending_reaped_paths() -> &'static RwLock<HashSet<PathBuf>> {
+    static PENDING: OnceLock<RwLock<HashSet<PathBuf>>> = OnceLock::new();
+    PENDING.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// Execute one deferred cleanup with NO store lock held: stage the
+/// reaped home's transcripts, clear the active-registry entry (unless
+/// the kind was re-granted while the cleanup was in flight — the fresh
+/// lease re-recorded the registration and owns it now), and delete the
+/// reaped directory. What gets deleted is exactly what the under-lock
+/// cleanup deleted; only the lock discipline changed.
+fn run_cleanup_item(
     staging: &crate::lease_transcript_staging::StagingPaths,
-    kind: &str,
-) -> Result<(), String> {
-    if let Some(plan) = materialization_plan(kind) {
-        let path = root.join(plan.dir_name);
-        stage_before_removal(&plan, &path, staging);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(format!("remove {}: {err}", path.display())),
+    item: &MaterializationCleanup,
+) {
+    let Some(plan) = materialization_plan(&item.kind) else {
+        return;
+    };
+    if let Some(path) = &item.reaped {
+        if path.is_dir() {
+            crate::lease_transcript_staging::stage_transcripts(
+                path,
+                plan.dir_name,
+                plan.source,
+                plan.transcript_dirs,
+                &staging.staging,
+            );
         }
     }
-    Ok(())
+    // The active-registry entry names the canonical home. Check-and-clear
+    // runs under the store read lock: `grant` registers under the write
+    // lock, so a concurrent re-grant cannot interleave — and this is one
+    // unlink of a small marker file, not a scan.
+    {
+        let leases = store().read().expect("lease store poisoned");
+        let regranted = leases
+            .get(&item.kind)
+            .map(|lease| lease.expires_at_unix_ms() > now_unix_ms())
+            .unwrap_or(false);
+        if !regranted {
+            crate::lease_transcript_staging::clear_active(&staging.active, plan.dir_name);
+        }
+    }
+    if let Some(path) = &item.reaped {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!(
+                    "[credential-leases] cleanup of {} for {} failed: {err}",
+                    path.display(),
+                    item.kind
+                );
+                pending_reaped_paths()
+                    .write()
+                    .expect("pending reaped paths poisoned")
+                    .insert(path.clone());
+            }
+        }
+    }
+}
+
+/// The deferred (off-lock) half of a sweep: run the batch built under
+/// the lock and retry any previously parked reaped paths. Must be called
+/// with no store lock held (the re-grant gate takes a read lock).
+fn run_deferred_cleanup(cleanup: Vec<MaterializationCleanup>) {
+    let parked: Vec<PathBuf> = {
+        let pending = pending_reaped_paths()
+            .read()
+            .expect("pending reaped paths poisoned");
+        pending.iter().cloned().collect()
+    };
+    if cleanup.is_empty() && parked.is_empty() {
+        return;
+    }
+    let staging = crate::lease_transcript_staging::default_paths();
+    for item in &cleanup {
+        run_cleanup_item(&staging, item);
+    }
+    for path in parked {
+        let removed = match std::fs::remove_dir_all(&path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                eprintln!(
+                    "[credential-leases] retry cleanup of {} failed: {err}",
+                    path.display()
+                );
+                false
+            }
+        };
+        if removed {
+            pending_reaped_paths()
+                .write()
+                .expect("pending reaped paths poisoned")
+                .remove(&path);
+        }
+    }
 }
 
 fn queue_materialization_cleanup(kind: &str) {
@@ -416,32 +582,6 @@ fn clear_materialization_cleanup(kind: &str) {
         .write()
         .expect("pending materialization cleanup poisoned")
         .remove(kind);
-}
-
-fn retry_pending_materialization_cleanup(
-    root: &Path,
-    staging: &crate::lease_transcript_staging::StagingPaths,
-    active_kinds: &HashSet<String>,
-) {
-    let pending: Vec<String> = pending_materialization_cleanup()
-        .read()
-        .expect("pending materialization cleanup poisoned")
-        .iter()
-        .cloned()
-        .collect();
-    for kind in pending {
-        if active_kinds.contains(&kind) {
-            continue;
-        }
-        match drop_materialization(root, staging, &kind) {
-            Ok(()) => {
-                clear_materialization_cleanup(&kind);
-            }
-            Err(err) => {
-                eprintln!("[credential-leases] pending cleanup for {kind} failed: {err}");
-            }
-        }
-    }
 }
 
 /// Whether an unexpired lease of `kind` is held right now. Public for
@@ -477,11 +617,15 @@ pub fn materialized_claude_config_dir() -> Option<PathBuf> {
 
 /// Expiry is otherwise enforced lazily on lease-API calls; the daemon
 /// runs this on a timer so an expired oauth materialization is deleted
-/// promptly even when nothing touches the lease store.
+/// promptly even when nothing touches the lease store. The filesystem
+/// half runs after the store lock is released.
 pub fn sweep_now() {
     let now = now_unix_ms();
-    let mut leases = store().write().expect("lease store poisoned");
-    sweep_locked(&mut leases, now);
+    let cleanup = {
+        let mut leases = store().write().expect("lease store poisoned");
+        sweep_locked(&mut leases, now, &materialization_root())
+    };
+    run_deferred_cleanup(cleanup);
 }
 
 /// Crash recovery: no lease survives a restart, so no materialization
@@ -496,6 +640,27 @@ pub fn startup_materialization_sweep() {
         for kind in ["oauth:codex", "oauth:claude-code"] {
             if let Some(plan) = materialization_plan(kind) {
                 stage_before_removal(&plan, &root.join(plan.dir_name), &staging);
+            }
+        }
+        // Homes reaped for deletion (`.reap-<dir>-<nonce>`) by a process
+        // that died before deleting them may hold transcripts too.
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                for kind in ["oauth:codex", "oauth:claude-code"] {
+                    let Some(plan) = materialization_plan(kind) else {
+                        continue;
+                    };
+                    if name.starts_with(&format!(".reap-{}-", plan.dir_name)) {
+                        crate::lease_transcript_staging::stage_transcripts(
+                            &entry.path(),
+                            plan.dir_name,
+                            plan.source,
+                            plan.transcript_dirs,
+                            &staging.staging,
+                        );
+                    }
+                }
             }
         }
         if let Err(err) = std::fs::remove_dir_all(&root) {
@@ -624,64 +789,77 @@ pub fn grant(
         expires_at_unix_ms: lease.expires_at_unix_ms(),
         replaced: false,
     };
+    let root = materialization_root();
+    let staging = crate::lease_transcript_staging::default_paths();
     let mut leases = store().write().expect("lease store poisoned");
-    sweep_locked(&mut leases, now);
+    let cleanup = sweep_locked(&mut leases, now, &root);
     // An oauth lease without its materialized auth file is useless to the
     // child process — refuse the grant rather than hold a dead lease.
-    let staging = crate::lease_transcript_staging::default_paths();
-    if let Err(error) = materialize_kind(&materialization_root(), &staging, kind, material) {
-        return Err(format!("credential materialization failed: {error}"));
-    }
-    clear_materialization_cleanup(kind);
-    // Register the live home so the message-search indexer can watch it
-    // during the lease (not only recover it at cleanup).
-    if let Some(plan) = materialization_plan(kind) {
-        crate::lease_transcript_staging::record_active(
-            &staging.active,
-            plan.dir_name,
-            plan.source,
-            &materialization_root().join(plan.dir_name),
+    let result = if let Err(error) = materialize_kind(&root, &staging, kind, material) {
+        Err(format!("credential materialization failed: {error}"))
+    } else {
+        clear_materialization_cleanup(kind);
+        // Register the live home so the message-search indexer can watch it
+        // during the lease (not only recover it at cleanup).
+        if let Some(plan) = materialization_plan(kind) {
+            crate::lease_transcript_staging::record_active(
+                &staging.active,
+                plan.dir_name,
+                plan.source,
+                &root.join(plan.dir_name),
+            );
+        }
+        let replaced = leases.insert(kind.to_string(), lease).is_some();
+        tombstones()
+            .write()
+            .expect("lease tombstones poisoned")
+            .remove(kind);
+        crate::credential_audit::record_with_origin(
+            crate::credential_audit::EVENT_LEASE_GRANTED,
+            kind,
+            label.trim(),
+            granted_by.trim(),
+            granted_via,
+            format!(
+                "ttl {}m · offline {}h · mode {}{}",
+                ttl_ms / 60_000,
+                offline_ms / 3_600_000,
+                mode.as_str(),
+                if replaced {
+                    " · replaced previous"
+                } else {
+                    ""
+                },
+            ),
         );
-    }
-    let replaced = leases.insert(kind.to_string(), lease).is_some();
-    tombstones()
-        .write()
-        .expect("lease tombstones poisoned")
-        .remove(kind);
-    crate::credential_audit::record_with_origin(
-        crate::credential_audit::EVENT_LEASE_GRANTED,
-        kind,
-        label.trim(),
-        granted_by.trim(),
-        granted_via,
-        format!(
-            "ttl {}m · offline {}h · mode {}{}",
-            ttl_ms / 60_000,
-            offline_ms / 3_600_000,
-            mode.as_str(),
-            if replaced {
-                " · replaced previous"
-            } else {
-                ""
-            },
-        ),
-    );
-    Ok(GrantOutcome {
-        replaced,
-        ..outcome
-    })
+        Ok(GrantOutcome {
+            replaced,
+            ..outcome
+        })
+    };
+    drop(leases);
+    // The sweep's filesystem half (staging + deletion of whatever this
+    // grant's own sweep expired) runs only after the store lock is gone.
+    run_deferred_cleanup(cleanup);
+    result
 }
 
 pub fn renew(lease_id: &str) -> Result<u64, String> {
     let now = now_unix_ms();
-    let mut leases = store().write().expect("lease store poisoned");
-    sweep_locked(&mut leases, now);
-    let lease = leases
-        .values_mut()
-        .find(|lease| lease.lease_id == lease_id)
-        .ok_or_else(|| "no active lease with that id (expired or revoked)".to_string())?;
-    lease.renewed_at_unix_ms = now;
-    Ok(lease.expires_at_unix_ms())
+    let (result, cleanup) = {
+        let mut leases = store().write().expect("lease store poisoned");
+        let cleanup = sweep_locked(&mut leases, now, &materialization_root());
+        let result = match leases.values_mut().find(|lease| lease.lease_id == lease_id) {
+            Some(lease) => {
+                lease.renewed_at_unix_ms = now;
+                Ok(lease.expires_at_unix_ms())
+            }
+            None => Err("no active lease with that id (expired or revoked)".to_string()),
+        };
+        (result, cleanup)
+    };
+    run_deferred_cleanup(cleanup);
+    result
 }
 
 /// Guard that revokes every lease when the process winds down. Held by
@@ -715,34 +893,58 @@ impl Drop for LeaseShutdownGuard {
 /// who asked (a principal label, or "daemon shutdown"), recorded in the
 /// custody trail.
 pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
-    let mut leases = store().write().expect("lease store poisoned");
-    let before = leases.len();
     let mut dropped: Vec<(String, String)> = Vec::new();
-    match selector {
-        None => {
-            dropped.extend(
-                leases
-                    .iter()
-                    .map(|(kind, lease)| (kind.clone(), lease.label.clone())),
-            );
-            leases.clear();
+    let (revoked, cleanup) = {
+        let mut leases = store().write().expect("lease store poisoned");
+        let before = leases.len();
+        match selector {
+            None => {
+                dropped.extend(
+                    leases
+                        .iter()
+                        .map(|(kind, lease)| (kind.clone(), lease.label.clone())),
+                );
+                leases.clear();
+            }
+            Some(selector) => {
+                leases.retain(|kind, lease| {
+                    let keep = kind != selector && lease.lease_id != selector;
+                    if !keep {
+                        dropped.push((kind.clone(), lease.label.clone()));
+                    }
+                    keep
+                });
+            }
         }
-        Some(selector) => {
-            leases.retain(|kind, lease| {
-                let keep = kind != selector && lease.lease_id != selector;
-                if !keep {
-                    dropped.push((kind.clone(), lease.label.clone()));
+        // Reap each dropped kind's home while still under the lock (one
+        // rename per kind); staging and deletion follow after release.
+        let root = materialization_root();
+        let mut cleanup: Vec<MaterializationCleanup> = Vec::new();
+        for (kind, _) in &dropped {
+            if materialization_plan(kind).is_none() {
+                continue;
+            }
+            match reap_materialization(&root, kind) {
+                Ok(reaped) => cleanup.push(MaterializationCleanup {
+                    kind: kind.clone(),
+                    reaped,
+                }),
+                Err(err) => {
+                    eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
+                    queue_materialization_cleanup(kind);
                 }
-                keep
-            });
+            }
         }
-    }
+        (before - leases.len(), cleanup)
+    };
+    // Delete synchronously but with no lock held: shutdown revocation
+    // (the LeaseShutdownGuard, the signal handler) must finish deleting
+    // before the process exits.
     let staging = crate::lease_transcript_staging::default_paths();
+    for item in &cleanup {
+        run_cleanup_item(&staging, item);
+    }
     for (kind, label) in dropped {
-        if let Err(err) = drop_materialization(&materialization_root(), &staging, &kind) {
-            eprintln!("[credential-leases] revoked lease cleanup for {kind} failed: {err}");
-            queue_materialization_cleanup(&kind);
-        }
         crate::credential_audit::record_with_origin(
             crate::credential_audit::EVENT_LEASE_REVOKED,
             &kind,
@@ -752,7 +954,7 @@ pub fn revoke(selector: Option<&str>, actor: &str, via: &str) -> usize {
             "material dropped and zeroized".to_string(),
         );
     }
-    before - leases.len()
+    revoked
 }
 
 pub struct LeaseStatusEntry {
@@ -771,24 +973,28 @@ pub struct LeaseStatusEntry {
 
 pub fn status_entries() -> Vec<LeaseStatusEntry> {
     let now = now_unix_ms();
-    let mut leases = store().write().expect("lease store poisoned");
-    sweep_locked(&mut leases, now);
-    let mut entries: Vec<LeaseStatusEntry> = leases
-        .values()
-        .map(|lease| LeaseStatusEntry {
-            lease_id: lease.lease_id.clone(),
-            kind: lease.kind.clone(),
-            label: lease.label.clone(),
-            mode: lease.mode,
-            granted_by: lease.granted_by.clone(),
-            granted_at_unix_ms: lease.granted_at_unix_ms,
-            renewed_at_unix_ms: lease.renewed_at_unix_ms,
-            expires_at_unix_ms: lease.expires_at_unix_ms(),
-            ttl_ms: lease.ttl_ms,
-            offline_ms: lease.offline_ms,
-            use_count: lease.use_count,
-        })
-        .collect();
+    let (mut entries, cleanup) = {
+        let mut leases = store().write().expect("lease store poisoned");
+        let cleanup = sweep_locked(&mut leases, now, &materialization_root());
+        let entries: Vec<LeaseStatusEntry> = leases
+            .values()
+            .map(|lease| LeaseStatusEntry {
+                lease_id: lease.lease_id.clone(),
+                kind: lease.kind.clone(),
+                label: lease.label.clone(),
+                mode: lease.mode,
+                granted_by: lease.granted_by.clone(),
+                granted_at_unix_ms: lease.granted_at_unix_ms,
+                renewed_at_unix_ms: lease.renewed_at_unix_ms,
+                expires_at_unix_ms: lease.expires_at_unix_ms(),
+                ttl_ms: lease.ttl_ms,
+                offline_ms: lease.offline_ms,
+                use_count: lease.use_count,
+            })
+            .collect();
+        (entries, cleanup)
+    };
+    run_deferred_cleanup(cleanup);
     entries.sort_by(|a, b| a.kind.cmp(&b.kind));
     entries
 }
@@ -797,11 +1003,17 @@ pub fn status_entries() -> Vec<LeaseStatusEntry> {
 /// counter (surfaced in lease status for the audit trail).
 pub fn leased_secret(kind: &str) -> Option<String> {
     let now = now_unix_ms();
-    let mut leases = store().write().expect("lease store poisoned");
-    sweep_locked(&mut leases, now);
-    let lease = leases.get_mut(kind)?;
-    lease.use_count += 1;
-    Some(lease.secret_string())
+    let (secret, cleanup) = {
+        let mut leases = store().write().expect("lease store poisoned");
+        let cleanup = sweep_locked(&mut leases, now, &materialization_root());
+        let secret = leases.get_mut(kind).map(|lease| {
+            lease.use_count += 1;
+            lease.secret_string()
+        });
+        (secret, cleanup)
+    };
+    run_deferred_cleanup(cleanup);
+    secret
 }
 
 /// Lease-first key lookup for the native providers: an active leased
@@ -859,12 +1071,32 @@ mod tests {
         pending_materialization_cleanup().write().unwrap().clear();
     }
 
+    /// Build a lease whose expiry anchor the test controls directly.
+    fn test_lease(kind: &str, renewed_at_unix_ms: u64, ttl_ms: u64) -> CredentialLease {
+        CredentialLease {
+            lease_id: format!("lease_test_{kind}"),
+            kind: kind.to_string(),
+            label: "Test".to_string(),
+            material: b"{}".to_vec().into_boxed_slice(),
+            mode: LeaseMode::OauthFullCredential,
+            granted_by: "test".to_string(),
+            granted_at_unix_ms: renewed_at_unix_ms,
+            renewed_at_unix_ms,
+            ttl_ms,
+            offline_ms: 0,
+            use_count: 0,
+        }
+    }
+
     #[test]
-    fn drop_materialization_stages_transcripts_before_deleting() {
-        // Fully injected roots: no env, no globals — the first version of
-        // this test reached the LIVE intendant home through default_paths()
-        // (intendant-core's cfg(test) scratch does not cross the crate
-        // boundary) and flaked under CI's threaded `cargo test`.
+    fn cleanup_stages_transcripts_before_deleting() {
+        // Fully injected roots: no env, no globals beyond the (reset)
+        // lease store — the first version of this test reached the LIVE
+        // intendant home through default_paths() (intendant-core's
+        // cfg(test) scratch does not cross the crate boundary) and flaked
+        // under CI's threaded `cargo test`.
+        let _guard = lock();
+        reset();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("codex-home");
         let sessions = home.join("sessions");
@@ -878,10 +1110,25 @@ mod tests {
         std::fs::create_dir_all(&staging.active).unwrap();
         std::fs::write(staging.active.join("codex-home.json"), "{}").unwrap();
 
-        drop_materialization(tmp.path(), &staging, "oauth:codex").unwrap();
+        // The reap (the only filesystem work still done under the store
+        // lock) frees the canonical path with the content intact…
+        let reaped = reap_materialization(tmp.path(), "oauth:codex")
+            .unwrap()
+            .expect("home reaped");
+        assert!(!home.exists(), "canonical path freed by the rename");
+        assert!(reaped.join("auth.json").exists(), "content moved, not lost");
 
-        // The home (and the secret) are gone…
-        assert!(!home.exists(), "materialized home deleted");
+        // …and the deferred half stages + deletes it off-lock.
+        run_cleanup_item(
+            &staging,
+            &MaterializationCleanup {
+                kind: "oauth:codex".to_string(),
+                reaped: Some(reaped.clone()),
+            },
+        );
+
+        // The reaped home (and the secret) are gone…
+        assert!(!reaped.exists(), "reaped home deleted");
         // …the active-registry entry was cleared…
         assert!(!staging.active.join("codex-home.json").exists());
         // …and the transcript survived into staging.
@@ -895,6 +1142,166 @@ mod tests {
         assert!(!entry.join("auth.json").exists(), "secret never staged");
         let raw = std::fs::read_to_string(entry.join("manifest.json")).unwrap();
         assert!(raw.contains("\"codex\""));
+        reset();
+    }
+
+    /// The sweep's lock phase only renames and mutates memory: the
+    /// expired home leaves the canonical path immediately (so a re-grant
+    /// can materialize fresh), while the staging scan and deletion ride
+    /// the returned batch into the off-lock half.
+    #[test]
+    fn expiry_sweep_reaps_under_lock_and_deletes_deferred() {
+        let _guard = lock();
+        reset();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(home.join("auth.json"), "SECRET").unwrap();
+        std::fs::write(home.join("sessions").join("rollout-x.jsonl"), "{}\n").unwrap();
+
+        let now = now_unix_ms();
+        let mut leases: HashMap<String, CredentialLease> = HashMap::new();
+        leases.insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now.saturating_sub(10_000), 1),
+        );
+
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert!(leases.is_empty(), "expired lease removed under the lock");
+        assert!(
+            tombstones().read().unwrap().contains_key("oauth:codex"),
+            "expiry tombstoned"
+        );
+        assert_eq!(cleanup.len(), 1);
+        let item = &cleanup[0];
+        assert_eq!(item.kind, "oauth:codex");
+        let reaped = item.reaped.clone().expect("home was on disk");
+        assert!(!home.exists(), "canonical path freed under the lock");
+        assert!(
+            reaped.join("auth.json").exists(),
+            "deletion deferred to the off-lock half"
+        );
+
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: tmp.path().join("staging"),
+            active: tmp.path().join("active"),
+        };
+        run_cleanup_item(&staging, item);
+        assert!(!reaped.exists(), "deferred half deletes the reaped home");
+        let entries: Vec<_> = std::fs::read_dir(&staging.staging)
+            .expect("staging dir created")
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "transcripts staged");
+        // The oauth expiry queued a dry notice; drain it so later tests
+        // start clean.
+        let _ = take_dry_notices();
+        reset();
+    }
+
+    /// A lease re-granted while its predecessor's cleanup is still in
+    /// flight must not lose the fresh materialization: the deferred
+    /// deletion targets only the reaped path, and the active-registry
+    /// entry is left to the new lease.
+    #[test]
+    fn regrant_mid_cleanup_keeps_fresh_home_and_registration() {
+        let _guard = lock();
+        reset();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "OLD").unwrap();
+        let staging = crate::lease_transcript_staging::StagingPaths {
+            staging: tmp.path().join("staging"),
+            active: tmp.path().join("active"),
+        };
+
+        let reaped = reap_materialization(tmp.path(), "oauth:codex")
+            .unwrap()
+            .expect("old home reaped");
+
+        // A re-grant lands between the reap and the deferred deletion:
+        // fresh home at the canonical path, fresh registration, live
+        // lease in the store.
+        materialize_kind(tmp.path(), &staging, "oauth:codex", r#"{"tokens":{}}"#).unwrap();
+        crate::lease_transcript_staging::record_active(
+            &staging.active,
+            "codex-home",
+            "codex",
+            &home,
+        );
+        let now = now_unix_ms();
+        store().write().unwrap().insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now, MAX_TTL_MS),
+        );
+
+        run_cleanup_item(
+            &staging,
+            &MaterializationCleanup {
+                kind: "oauth:codex".to_string(),
+                reaped: Some(reaped.clone()),
+            },
+        );
+
+        assert!(!reaped.exists(), "old reaped home still deleted");
+        assert_eq!(
+            std::fs::read_to_string(home.join("auth.json")).unwrap(),
+            r#"{"tokens":{}}"#,
+            "fresh materialization untouched"
+        );
+        assert!(
+            staging.active.join("codex-home.json").exists(),
+            "fresh lease keeps its active registration"
+        );
+        reset();
+    }
+
+    /// Pending canonical-path cleanups retry as renames under the lock —
+    /// and stay parked while the kind holds an active lease again (the
+    /// leftover IS the live home then).
+    #[test]
+    fn pending_cleanup_retries_reap_and_skips_active_kinds() {
+        let _guard = lock();
+        reset();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "LEFTOVER").unwrap();
+        queue_materialization_cleanup("oauth:codex");
+
+        let now = now_unix_ms();
+        let mut leases: HashMap<String, CredentialLease> = HashMap::new();
+        leases.insert(
+            "oauth:codex".to_string(),
+            test_lease("oauth:codex", now, MAX_TTL_MS),
+        );
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert!(cleanup.is_empty(), "active kind skipped");
+        assert!(home.exists(), "live home untouched");
+        assert!(pending_materialization_cleanup()
+            .read()
+            .unwrap()
+            .contains("oauth:codex"));
+
+        // Once the lease is gone the retry reaps and hands off.
+        leases.clear();
+        let cleanup = sweep_locked(&mut leases, now, tmp.path());
+        assert_eq!(cleanup.len(), 1);
+        assert!(!home.exists(), "leftover reaped");
+        assert!(cleanup[0].reaped.is_some());
+        assert!(
+            pending_materialization_cleanup().read().unwrap().is_empty(),
+            "pending cleared once the rename succeeded"
+        );
+        run_cleanup_item(
+            &crate::lease_transcript_staging::StagingPaths {
+                staging: tmp.path().join("staging"),
+                active: tmp.path().join("active"),
+            },
+            &cleanup[0],
+        );
+        reset();
     }
 
     #[test]
@@ -1064,16 +1471,26 @@ mod tests {
             .collect();
         assert_eq!(dirs.len(), 2, "only the two oauth kinds may materialize");
 
-        drop_materialization(root.path(), &staging, "oauth:codex").unwrap();
+        let cleanup_kind = |kind: &str| {
+            let reaped = reap_materialization(root.path(), kind).unwrap();
+            run_cleanup_item(
+                &staging,
+                &MaterializationCleanup {
+                    kind: kind.to_string(),
+                    reaped,
+                },
+            );
+        };
+        cleanup_kind("oauth:codex");
         assert!(!root.path().join("codex-home").exists());
         assert!(
             creds.is_file(),
-            "dropping one kind must not touch the other"
+            "cleaning one kind must not touch the other"
         );
-        drop_materialization(root.path(), &staging, "oauth:claude-code").unwrap();
+        cleanup_kind("oauth:claude-code");
         assert!(!root.path().join("claude-home").exists());
-        // Dropping an already-gone kind is a quiet no-op.
-        drop_materialization(root.path(), &staging, "oauth:claude-code").unwrap();
+        // Cleaning an already-gone kind is a quiet no-op.
+        cleanup_kind("oauth:claude-code");
     }
 
     #[test]
