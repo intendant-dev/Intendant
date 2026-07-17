@@ -1217,10 +1217,13 @@ pub(crate) async fn run_agent_loop(
                 let stream_session_id = local_session_id.clone();
                 let stream_activity = activity.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
-                    if let crate::provider::StreamEvent::Delta(ref text) = event {
+                    // The closure owns the event: destructure by value and
+                    // move the delta text into the shared payload instead of
+                    // cloning it.
+                    if let crate::provider::StreamEvent::Delta(text) = event {
                         stream_bus.send(AppEvent::ModelResponseDelta {
                             session_id: stream_session_id.clone(),
-                            text: text.clone(),
+                            text: text.into(),
                         });
                         if let Some(activity) = &stream_activity {
                             // Live response bytes — the machine's own

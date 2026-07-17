@@ -1527,7 +1527,7 @@ mod tests {
 
         let event = AppEvent::ModelResponseDelta {
             session_id: None,
-            text: "hi".to_string(),
+            text: "hi".into(),
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
     }
