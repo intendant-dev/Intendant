@@ -6562,6 +6562,12 @@ mod tests {
     /// before this one must not surface as a phantom "deleted" row — the
     /// stale `baseline/` copy is reconciled away at watcher construction,
     /// keeping the full scan and the watcher-index fast path in agreement.
+    ///
+    /// The resumed instance opens a CLONE of the store (same bytes,
+    /// fresh path — `clone_store_for_resume`): reopening the same path
+    /// in-process races concurrently forked subprocesses pinning the
+    /// dropped store flock, which degraded this test's resumed watcher
+    /// to read-only on the CI Mac and ejected the merge queue.
     #[test]
     fn resume_after_delete_reconciles_stale_baselines() {
         let project = tempfile::TempDir::new().unwrap();
@@ -6580,15 +6586,17 @@ mod tests {
         // The file disappears between runs.
         std::fs::remove_file(root.join("stale.rs")).unwrap();
 
+        let resumed_store =
+            crate::file_watcher::FileWatcher::clone_store_for_resume(snapshot.path());
         let mut resumed = crate::file_watcher::FileWatcher::new(
             root.to_path_buf(),
-            snapshot.path().to_path_buf(),
+            resumed_store.path().to_path_buf(),
             crate::event::EventBus::new(),
         )
         .expect("resumed watcher");
         resumed.mark_live_index_healthy_for_tests();
 
-        let baseline_dir = snapshot.path().join("baseline");
+        let baseline_dir = resumed_store.path().join("baseline");
         let full = changes_list_summaries_full_scan(&baseline_dir, root);
         let index = resumed.changes_index_snapshot().expect("healthy index");
         let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);
