@@ -720,6 +720,12 @@ pub struct ConnectConfig {
     /// pins it explicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_endpoint: Option<String>,
+    /// Optional daemon-local hosted-control lane. This switch is deliberately
+    /// independent from Connect discovery and the reachability relay: when
+    /// false, fleet/relay ingress retains the discovery-only `role:none`
+    /// behavior. There is intentionally no environment-variable override.
+    #[serde(default)]
+    pub hosted_control_enabled: bool,
 }
 
 /// Rendezvous applied when `[connect] enabled = true` names no
@@ -789,6 +795,7 @@ impl Default for ConnectConfig {
             retry_delay_ms: default_connect_retry_delay_ms(),
             relay_enabled: false,
             relay_endpoint: None,
+            hosted_control_enabled: false,
         }
     }
 }

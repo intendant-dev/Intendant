@@ -4,25 +4,28 @@
 — is an open, first-class deployable, not a chokepoint. It introduces
 browsers to daemon route and presence records, carries account/route metadata,
 delivers optional encrypted Web Push notifications, serves the discovery
-client and installers, and stores client-signed fleet metadata. It does not
-serve the daemon dashboard SPA or its WASM/static assets, and it does not relay
-daemon control traffic in the default build. A claim creates no daemon
-IAM principal or grant. The default
-daemon stamps this route as hosted and applies immutable `role:none`, so
-Connect-served code cannot open a daemon-control session. Org grant documents
-are verified by the target daemon against its own trusted keys, and authority
-on trusted local or independently reached direct-mTLS routes still comes from
-the target daemon's local IAM.
+client and installers, stores client-signed fleet metadata, and can carry
+daemon-terminated TLS through its optional reachability relay. It does not
+serve the daemon dashboard SPA or its WASM/static assets. A claim creates no
+daemon IAM principal or grant. The daemon stamps ambient hosted provenance
+`role:none`, so Connect-served code cannot reuse a claim, account assertion, or
+browser-key grant as authority. A separately enabled
+[hosted-control lane](./hosted-control.md) can admit only a short-lived lease
+minted by the target daemon after trusted confirmation. Org grant documents
+are verified by the target daemon against its own trusted keys, and root
+authority remains on trusted local or independently reached direct-mTLS
+surfaces.
 
 That is a precise boundary, not an absolute "zero-authority" claim. Connect
 is trusted for availability, its account and route metadata, push delivery,
-and the code it serves. Push payloads are encrypted to the browser
+relay delivery, and the code it serves. Push payloads are encrypted to the browser
 subscription, but a malicious Connect-served page can lie about or exfiltrate
 anything exposed in the Connect UI, and a malicious installer can compromise
 what it installs.
-What it cannot do in the default build is turn any claim, account assertion,
-browser-key grant, or configuration edit into daemon authority. See [Trust
-Architecture](./trust-architecture.md).
+What it cannot do is turn any claim, account assertion, browser-key grant, or
+generic configuration edit into daemon authority. Its signed navigation hint
+also grants nothing: lease approval and enforcement terminate at the daemon.
+See [Trust Architecture](./trust-architecture.md).
 
 ## Build and run
 
@@ -48,6 +51,8 @@ cargo build --release --bin intendant-connect
 | `--dns-zone` | `INTENDANT_CONNECT_DNS_ZONE` | Fleet DNS: the delegated subzone this service answers for authoritatively (see below). All three `--dns-*` values or none |
 | `--dns-ns-name` | `INTENDANT_CONNECT_DNS_NS_NAME` | The NS host the parent zone delegates to (served in the apex SOA/NS) |
 | `--dns-listen` | `INTENDANT_CONNECT_DNS_LISTEN` | UDP+TCP bind for the DNS server, e.g. `0.0.0.0:53` |
+| `--relay-listen` | `INTENDANT_CONNECT_RELAY_LISTEN` | Raw TLS/SNI passthrough listener. Requires at least one relay address |
+| `--relay-address` | `INTENDANT_CONNECT_RELAY_ADDRESS` | Repeatable public IP published for relay-mode fleet DNS |
 
 The service speaks plain HTTP; terminate TLS in front of it (nginx,
 Caddy, a cloud load balancer). WebAuthn requires the public origin to be
@@ -87,9 +92,12 @@ no port forwarding), answers the ACME DNS-01 challenge through the
 service with daemon-signed requests, and keeps its private keys local.
 The service's DNS authority covers exactly the delegated subzone and nothing
 else. That still makes it an authority over code at every name in the subzone,
-so the daemon classifies fleet SNI before IAM and serves only public
-shell/discovery bytes there. Protected HTTP/MCP routes, direct signaling, and
-WebSockets require an independently reached direct-mTLS or loopback origin.
+so the daemon classifies fleet SNI before IAM. With hosted control off, it
+serves only public shell/discovery bytes there. With hosted control on,
+unproved traffic remains anonymous `role:none`; protected HTTP/WSS admission
+requires a fresh proof by an approved lease and the compiled hosted
+route/method/frame/action wall. Direct signaling, MCP, and trusted-local
+fallback never become available merely because the request used a fleet name.
 
 Setup, one time:
 
@@ -116,8 +124,8 @@ Encrypt rate-limits new certificates per registered domain (~50/week —
 request a limit raise before any large fleet), and a hostile zone
 operator could redirect fleet names and mint certificates for them. CT logs
 make issuance public evidence, but that evidence does not protect an enrolled
-browser credential from same-origin code. The discovery-only SNI gate is the
-authority boundary.
+browser credential from same-origin code. The fleet-SNI gate plus the exact
+lease/preset evaluator is the authority boundary.
 
 ## Pointing daemons at it
 
@@ -129,6 +137,7 @@ enabled = true
 rendezvous_url = "https://connect.example.com"
 daemon_id = "my-daemon"          # optional; defaults to the daemon public key
 auth_token = "<the --daemon-token value>"
+hosted_control_enabled = false   # daemon-local, restart-only, no env override
 ```
 
 or via `INTENDANT_CONNECT_RENDEZVOUS_URL`, `INTENDANT_CONNECT_DAEMON_ID`,
@@ -136,7 +145,9 @@ and `INTENDANT_CONNECT_TOKEN`. `enabled = true` with no `rendezvous_url`
 defaults to the hosted instance. The dashboard's **Access → Intendant
 Connect** card drives all of this without touching the file: it toggles
 `enabled`, shows registration/link state, and reveals the one-time claim
-code to manage-grade sessions.
+code to manage-grade sessions. The separate **Hosted control** card manages the
+lease ceiling and pending/active leases; ordinary Connect configuration does
+not enable it.
 
 ## Claiming, co-signed route links, and release
 
@@ -196,10 +207,12 @@ protocol sealed each claim.
 Claiming grants **no authority**, including on a fresh box with empty IAM.
 It creates no principal or grant; it only associates discovery and routing
 metadata with the account. A hosted Connect account assertion never
-authenticates to the daemon. The default build fixes hosted provenance at
-`role:none`; a separately enrolled browser key, stored grant, hand-edited
-ceiling, or disclosure cannot enable hosted control. Use a trusted local or
-independently reached daemon-served direct/mTLS surface for daemon access. The
+authenticates to the daemon. Ambient hosted provenance remains `role:none`; a
+separately enrolled browser key, stored generic grant, hand-edited compatibility
+ceiling, or disclosure cannot enable hosted control. The optional lane begins
+with a separate fleet-origin request and trusted confirmation, then mints an
+exact expiring `hosted_lease`. Use a trusted local or independently reached
+daemon-served direct/mTLS surface for root access and lease confirmation. The
 packaged macOS app is not an alternative distribution anchor in this alpha:
 no Developer ID-signed/notarized release has been published.
 
@@ -210,11 +223,11 @@ retired in this alpha because a fingerprint alone is not a complete certless
 remote authentication protocol. Never treat a Connect claim code as a password,
 owner secret, or proof of root authority.
 
-> **Alpha migration (IAM schema v2).** Earlier alpha builds could create an
+> **Alpha migration.** Earlier alpha builds could create an
 > uncapped `role:root` client-key grant with origin `connect-bootstrap` on
 > first claim. Loading that state now revokes every active grant on those
 > legacy principals, records a `revoke_legacy_connect_bootstrap` audit event,
-> and restores both hosted ceilings to `role:none`. The account/route link
+> and restores both compatibility ceilings to `role:none`. The account/route link
 > survives as discovery metadata, but trusted re-enrollment is required.
 
 > **Mixed-version rollout.** The current Connect service returns `403` for
@@ -224,7 +237,7 @@ owner secret, or proof of root authority.
 > state, which protects them against older/self-hosted services. Restarting only
 > the service cannot revoke a legacy peer-to-peer DataChannel that is already
 > established: upgrade and restart the daemon, close every old Connect tab, and
-> let IAM schema v2 revoke legacy `connect-bootstrap` grants.
+> let the IAM migration revoke legacy `connect-bootstrap` grants.
 
 Bindings are releasable from both sides, and both paths append
 `daemon_unclaimed` transparency-log entries: the linked account releases
@@ -304,15 +317,17 @@ Connect ever terminating TLS or seeing plaintext:
 The relay is **availability-only**: it terminates no TLS, holds no
 certificate, mints no authority, and logs no plaintext. The gateway
 records which listener accepted each connection before it parses TLS or
-HTTP. Connections from the relay-only ingress are always
-discovery-only: authority-free routes remain available as anonymous
-`role:none`, while protected HTTP/MCP/signaling routes and every
-WebSocket are refused. The tunnel's loopback last hop therefore cannot
-qualify for trusted-local authority even when the encrypted request
-contains `Host: localhost`; the existing fleet-SNI classification is an
-independent second gate. Non-TLS bytes are dropped before the gateway's
-raw ICE-TCP and cleartext-MCP demultiplexer, so the relay-only listener
-cannot reach either local lane.
+HTTP. Connections from the relay-only ingress remain anonymous `role:none`
+unless the optional hosted-control lane validates a fresh lease proof. That
+carve admits only explicitly classified HTTPS routes, while `/mcp`, direct
+signaling, trusted-local fallback, unknown routes, and every unproved request
+remain refused. WebSocket upgrade additionally consumes a seconds-lived
+one-use ticket minted by a proof-bound HTTPS request. The tunnel's loopback
+last hop therefore cannot qualify for trusted-local authority even when the
+encrypted request contains `Host: localhost`; fleet-SNI classification is an
+independent second gate. Non-TLS bytes are dropped before the gateway's raw
+ICE-TCP and cleartext-MCP demultiplexer, so the relay-only listener cannot
+reach either local lane.
 
 Enable it with the all-or-nothing `--relay-*` group (both flags or
 neither; default off, mirroring `--dns-*`):
@@ -344,12 +359,16 @@ A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
 dials back browser connections into the gateway's private relay ingress,
 and publishes relay-mode fleet DNS while the tunnel is up. That ingress
 binds only to an ephemeral `127.0.0.1` port, is never advertised, and
-does not share the public listener's trusted-local classification.
+does not share the public listener's trusted-local classification. Connect
+shows its **Request control** navigation only when registration carries the
+daemon-signed hosted-capability hint and that daemon has a relay-mode DNS
+record; older daemons and direct-mode DNS remain discovery-only in the
+directory.
 
 ## End-to-end transport validation
 
-`scripts/connect-transport-e2e.cjs` asserts the outcome this whole
-chapter exists for — a browser registers at the rendezvous, links a
+`scripts/connect-transport-e2e.cjs` asserts the flag-off baseline — a browser
+registers at the rendezvous, links a
 **fresh** daemon with its locally minted one-time code, receives no authority
 from that claim, and remains refused at immutable `role:none` even when a
 trusted fixture creates a local grant for its browser key — entirely locally:
@@ -371,6 +390,13 @@ three event kinds as if they came from an older/self-hosted service and verifies
 that dashboard-control, IAM, and enrollment state stay unchanged. Direct/local
 dashboard-control validators cover successful DataChannel and ICE transport;
 the Connect validator expects zero hosted control sessions.
+
+The Rust gateway E2E
+`web_gateway::listener::tests::hosted_lease_is_the_only_relay_control_authority`
+then covers the opt-in carve end to end: signed doorbell creation through the
+real relay ingress, trusted-local approval, proof-bound HTTP, proof replay
+refusal, `/mcp` refusal, one-use ticketed WebSocket admission, preset action
+denial, ticket-reuse refusal, and live socket closure after revocation.
 
 ```bash
 cargo build --bin intendant --bin intendant-runtime --bin intendant-connect
@@ -422,6 +448,10 @@ Notifications). Two alert kinds exist, flagged per subscription
   grace period, only when no dashboard has connected since the request
   appeared, one nudge per session per 10 minutes, silent degrade when
   unlinked or offline (`attention_nudge.rs`).
+- **Hosted lease requests** (also under `notify_requests`): the daemon may
+  report only that a hosted-control doorbell is waiting. The nudge carries no
+  request id, browser key, preset, lifetime, or requester label; it tells the
+  owner to open a trusted daemon client for the actual review.
 
 Payloads are encrypted to each browser subscription (RFC 8291 — the
 push relay carries ciphertext), and the VAPID signing key is generated
@@ -575,8 +605,12 @@ A daemon with Connect enabled advertises its rendezvous in its agent card
 (`/.well-known/agent-card.json` → `rendezvous_base`, `connect_daemon_id`),
 and the dashboard records it in the signed fleet records
 (`connect_signaling_base`, fleet-record payload v2). Those fields are retained
-as route/protocol compatibility metadata; the default hosted directory does
-not turn them into `/app?connect=1` daemon-control links. A claimed Connect
-route can show discovery and presence only. An independently recorded direct
-daemon URL opens the daemon's own HTTPS/mTLS origin, where the daemon—not the
-rendezvous—serves the dashboard and authenticates the client.
+as route/protocol compatibility metadata; the hosted directory never turns
+them into the retired `/app?connect=1` signaling path. A claimed daemon may
+separately sign a hosted-control capability on registration. Connect displays
+**Request control** only when that signature verifies and the daemon has a
+relay-mode fleet-DNS route, then performs a plain navigation to
+`https://d-<hash>.<zone>/`. The public doorbell at that origin grants nothing;
+the target daemon—not the rendezvous—serves the page, verifies the tab's proof,
+and mints any approved lease. An independently recorded direct daemon URL still
+opens the daemon's own HTTPS/mTLS root-capable origin.

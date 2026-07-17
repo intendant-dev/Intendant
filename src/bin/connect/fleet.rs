@@ -15,7 +15,10 @@ pub(crate) async fn api_daemons(
         .daemons
         .iter()
         .filter(|d| d.owner_user_id == Some(user.id))
-        .map(daemon_view)
+        .map(|daemon| {
+            let url = daemon_hosted_control_url(&state, &store, daemon);
+            daemon_view(daemon, url.as_deref())
+        })
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "ok": true,
@@ -613,18 +616,22 @@ pub(crate) async fn api_daemon_label(
     if store.daemons[daemon_index].owner_user_id != Some(user.id) {
         return Err(ApiError::forbidden("daemon belongs to a different account"));
     }
-    let daemon = &mut store.daemons[daemon_index];
-    daemon.label = if label.is_empty() {
-        None
-    } else {
-        Some(label.to_string())
-    };
-    daemon.updated_unix_ms = now_unix_ms();
-    let view = daemon_view(daemon);
+    {
+        let daemon = &mut store.daemons[daemon_index];
+        daemon.label = if label.is_empty() {
+            None
+        } else {
+            Some(label.to_string())
+        };
+        daemon.updated_unix_ms = now_unix_ms();
+    }
+    let daemon = &store.daemons[daemon_index];
+    let hosted_control_url = daemon_hosted_control_url(&state, &store, daemon);
+    let view = daemon_view(daemon, hosted_control_url.as_deref());
     let target_label = if label.is_empty() {
-        daemon_id.as_str()
+        daemon_id.clone()
     } else {
-        label
+        label.to_string()
     };
     let now = now_unix_ms();
     for target in store.fleet_targets.iter_mut().filter(|target| {
@@ -633,7 +640,7 @@ pub(crate) async fn api_daemon_label(
                 || target.id == daemon_id
                 || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str()))
     }) {
-        target.label = target_label.to_string();
+        target.label = target_label.clone();
         target.updated_unix_ms = now;
     }
     audit(
@@ -896,6 +903,7 @@ mod tests {
             daemon_id: "owned-daemon".to_string(),
             label: None,
             daemon_public_key: "key".to_string(),
+            hosted_control_enabled: false,
             owner_user_id: Some(user_id),
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -1107,6 +1115,7 @@ mod tests {
                 daemon_id: "daemon-1".to_string(),
                 label: Some("Live daemon".to_string()),
                 daemon_public_key: "daemon-key".to_string(),
+                hosted_control_enabled: false,
                 owner_user_id: Some(user_id),
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,

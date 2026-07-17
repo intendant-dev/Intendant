@@ -94,7 +94,7 @@ pub(crate) async fn api_state_snapshot_response(
             session.session_log.clone(),
         )
     };
-    let state = query_ctx
+    let mut state = query_ctx
         .as_ref()
         .map(|ctx| {
             ctx.agent_state
@@ -103,6 +103,7 @@ pub(crate) async fn api_state_snapshot_response(
                 .clone()
         })
         .unwrap_or_default();
+    runtime.grant.sanitize_state_snapshot(&mut state);
     let bootstrap_session_id = daemon_session_id
         .or_else(|| {
             query_ctx
@@ -120,7 +121,7 @@ pub(crate) async fn api_state_snapshot_response(
             "t": "state_snapshot",
             "state": state,
             "connection_id": runtime.session_id.clone(),
-            "config": &*runtime.config,
+            "config": runtime.grant.project_runtime_config(&runtime.config),
             "session_id": bootstrap_session_id,
         },
     })
@@ -205,10 +206,12 @@ pub(crate) async fn api_dashboard_bootstrap_response(
             }));
         }
     }
-    if let Some(frame) =
-        response_result(api_browser_workspace_snapshot_response("bootstrap-browser".into()).await)
-    {
-        frames.push(frame);
+    if !runtime.grant.is_hosted_lease() {
+        if let Some(frame) = response_result(
+            api_browser_workspace_snapshot_response("bootstrap-browser".into()).await,
+        ) {
+            frames.push(frame);
+        }
     }
     frames.extend(display_ready_bootstrap_frames(runtime).await);
     let mut replayed_external_session_ids = HashSet::new();
@@ -744,7 +747,7 @@ pub(crate) async fn external_session_activity_replay_frames(
     // Each conversion reads and converts a backend-native session file —
     // blocking disk work, off the runtime workers (see
     // api_session_log_replay_response).
-    tokio::task::spawn_blocking(move || {
+    let mut frames = tokio::task::spawn_blocking(move || {
         to_convert
             .into_iter()
             .filter_map(|(session_id, source)| {
@@ -760,7 +763,13 @@ pub(crate) async fn external_session_activity_replay_frames(
     .unwrap_or_else(|e| {
         eprintln!("[dashboard-control] external session replay task failed: {e}");
         Vec::new()
-    })
+    });
+    if !runtime.grant.has_owner_dashboard_authority() {
+        for frame in &mut frames {
+            runtime.grant.filter_dashboard_replay_payload(frame);
+        }
+    }
+    frames
 }
 
 pub(crate) fn response_result(response: serde_json::Value) -> Option<serde_json::Value> {
@@ -1255,7 +1264,7 @@ pub(crate) async fn api_control_msg_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
+    let mut ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
         Ok(ctrl) => ctrl,
         Err(response) => return response,
     };
@@ -1277,6 +1286,14 @@ pub(crate) async fn api_control_msg_response(
     let decision = runtime.grant.control_msg_access_decision(&ctrl);
     if !decision.allowed {
         return control_msg_denied_response(id, decision, "control message");
+    }
+    if let Err(error) = runtime.grant.stamp_hosted_session_provenance(&mut ctrl) {
+        return http_body_response(
+            id,
+            403,
+            serde_json::json!({"ok": false, "error": error}).to_string(),
+            "control message",
+        );
     }
     let action = dashboard_control_msg_action(&ctrl);
     runtime.bus.send(AppEvent::PresenceLog {
@@ -1301,7 +1318,7 @@ pub(crate) async fn api_session_control_msg_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
+    let mut ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
         Ok(ctrl) => ctrl,
         Err(response) => return response,
     };
@@ -1324,6 +1341,14 @@ pub(crate) async fn api_session_control_msg_response(
     if !decision.allowed {
         return control_msg_denied_response(id, decision, "session control message");
     }
+    if let Err(error) = runtime.grant.stamp_hosted_session_provenance(&mut ctrl) {
+        return http_body_response(
+            id,
+            403,
+            serde_json::json!({"ok": false, "error": error}).to_string(),
+            "session control message",
+        );
+    }
     let action = dashboard_control_msg_action(&ctrl);
     dispatch_dashboard_control_msg(&runtime.bus, ctrl, "session-control");
     serde_json::json!({
@@ -1342,7 +1367,7 @@ pub(crate) async fn api_dashboard_action_msg_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
+    let mut ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
         Ok(ctrl) => ctrl,
         Err(response) => return response,
     };
@@ -1364,6 +1389,14 @@ pub(crate) async fn api_dashboard_action_msg_response(
     let decision = runtime.grant.control_msg_access_decision(&ctrl);
     if !decision.allowed {
         return control_msg_denied_response(id, decision, "dashboard action message");
+    }
+    if let Err(error) = runtime.grant.stamp_hosted_session_provenance(&mut ctrl) {
+        return http_body_response(
+            id,
+            403,
+            serde_json::json!({"ok": false, "error": error}).to_string(),
+            "dashboard action message",
+        );
     }
     let action = dashboard_control_msg_action(&ctrl);
     let marker_apply = match &ctrl {

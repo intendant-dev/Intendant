@@ -1582,6 +1582,12 @@ pub enum ControlMsg {
         /// `session-<short-id>`; collisions get a numeric suffix.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_branch: Option<String>,
+        /// Internal provenance set only by an authenticated hosted-control
+        /// transport. This is never accepted from or emitted onto the wire;
+        /// the session supervisor revalidates the named lease before marking
+        /// the newly allocated session hosted-eligible.
+        #[serde(skip)]
+        hosted_lease_id: Option<String>,
     },
     /// Delegate a task to a new supervised sub-agent under an existing
     /// internal session (the dashboard "delegate" action). The child is
@@ -4429,6 +4435,7 @@ mod tests {
                 attachments: vec!["upload:u1".to_string()],
                 worktree: Some(true),
                 worktree_branch: Some("feature-branch".to_string()),
+                hosted_lease_id: None,
             },
             ControlMsg::StartTask {
                 session_id: None,
@@ -4706,6 +4713,7 @@ mod tests {
                 attachments,
                 worktree,
                 worktree_branch,
+                hosted_lease_id,
             } => {
                 assert_eq!(task, "fix bug");
                 assert!(claude_model.is_none());
@@ -4730,6 +4738,7 @@ mod tests {
                 // Legacy payloads without the worktree fields parse as "off".
                 assert!(worktree.is_none());
                 assert!(worktree_branch.is_none());
+                assert!(hosted_lease_id.is_none());
             }
             _ => panic!("expected CreateSession"),
         }

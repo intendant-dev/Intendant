@@ -348,14 +348,20 @@ ICE servers for the WebRTC display transport (see
 Each `ice_servers` entry: `urls` (array, required), optional `username`,
 optional `credential`.
 
+The Connect SNI relay carries daemon-terminated HTTPS/WSS control, not raw
+WebRTC media. A hosted lease may view or drive only agent-visible displays, and
+remote media requires either successful direct ICE or a configured TURN entry.
+Production TURN credentials should be short-lived.
+
 ### `[connect]`
 
 Intendant Connect client for public-origin account/route discovery. This is
 disabled by default and does **not** replace local/offline dashboard mTLS.
 When enabled, the daemon registers signed presence and route-code metadata and
-polls the rendezvous mailbox. The default binary refuses every hosted-origin
-control event before touching dashboard-control, IAM, or enrollment state. The
-current service also returns `403` for browser offer/ICE/close before mutation.
+polls the rendezvous mailbox. The retired Connect browser offer/ICE/close path
+remains refused before dashboard-control, IAM, or enrollment mutation. A
+separate, restart-only flag can enable the bounded fleet-origin lease lane
+without changing that refusal or the Connect account's `role:none` posture.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -365,13 +371,17 @@ current service also returns `403` for browser offer/ICE/close before mutation.
 | `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
-| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only, discovery-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
+| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
 | `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
+| `hosted_control_enabled` | bool | `false` | Enable the daemon-local hosted lease doorbell and exact lease-proof/ticket carve on fleet/relay ingress. Restart-only; deliberately has no environment-variable override |
 
 `INTENDANT_CONNECT_RELAY_ENDPOINT` force-enables the relay tunnel and sets
 `relay_endpoint`. The relay is availability-only: it never terminates TLS,
 holds no certificate, and grants no authority — a relayed browser connection
-reaches this daemon bearing the fleet SNI and stays discovery-only.
+reaches this daemon bearing immutable relay/fleet provenance. It stays
+discovery-only unless `hosted_control_enabled` is true and the request proves
+an active hosted lease; `/mcp`, direct signaling, and trusted-local fallback
+remain unavailable.
 
 No file editing is required for the common case: the dashboard's
 **Access → Intendant Connect** card toggles `enabled` (persisting it
@@ -379,7 +389,10 @@ here), shows registration/link state, reveals the single-use twelve-word
 locally minted claim code to trusted manage-grade sessions, and can release the
 account/route link. The
 `INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable still force-enables
-the client and overrides the file (the card reports when it does).
+the client and overrides the file (the card reports when it does). Hosted
+control uses its own **Access → Hosted control** card: an owner can set the
+ceiling, review pending requests, revoke active leases, and mark sessions
+eligible. That ceremony is not part of the Connect toggle.
 
 **Projectless daemons** (the bundled macOS app's normal shape — no
 `.git`/`intendant.toml` at the launch directory) keep general defaults in the
@@ -395,6 +408,7 @@ enabled = true
 rendezvous_url = "https://connect.intendant.dev"
 daemon_id = "vortex-deb-x11-intendant"
 auth_token = "same daemon token configured on intendant-connect"
+hosted_control_enabled = false
 ```
 
 The service is a separate binary:
@@ -429,12 +443,16 @@ docs/src/self-hosted-rendezvous.md for the full deployment description.
 `intendant-connect` is intended to sit behind public TLS for the configured
 origin. It handles passkey-only account sessions, single-use account/route linking,
 daemon list/release/label UI, account-backed fleet target metadata, and a capped
-audit log. A live claim-linked daemon exposes no control URL or Open action;
-`/app` always redirects to `/connect`. A separately remembered, client-signed
+audit log. `/app` always redirects to `/connect`. When a daemon's signed
+registration says hosted control is enabled and it has a relay-mode fleet-DNS
+route, its card may show **Request control**; that action only navigates to the
+daemon's public fleet-origin doorbell. A separately remembered, client-signed
 and passkey-decrypted direct route may show **Open direct route**, which merely
 navigates away from Connect to that daemon's mTLS origin and grants nothing by
-itself. A Connect account assertion never authenticates to the
-daemon, and no grant or configuration edit can enable hosted control. The state file durably stores users/passkeys, daemon account
+itself. A Connect account assertion never authenticates to the daemon, and no
+claim, generic grant, or compatibility-ceiling edit can enable hosted control.
+The explicit daemon flag plus trusted approval of an individual request mints
+the only usable hosted principal. The state file durably stores users/passkeys, daemon account
 links, labels, hashed claim codes, account-scoped fleet navigation records, and
 audit events. The daemon locally generates each single-use 12-word BIP39 code
 and signs a fresh registration containing only its SHA-256 hash. Its printed
@@ -584,7 +602,12 @@ with no enqueue, release, and audit.
 The transport validator drives the fresh-box ceremony end to end — passkey
 signup, fragment-only one-time discovery link, retired `/app` redirect, and
 service/daemon refusal — and asserts that even a local browser-key grant cannot
-create a hosted control session. Lower-level direct/local harnesses cover the ICE/DataChannel paths
+create a legacy hosted control session while the new feature flag is off.
+The gateway unit/E2E
+`hosted_lease_is_the_only_relay_control_authority` covers the enabled lane's
+signed doorbell, trusted approval, proof replay refusal, one-use WebSocket
+ticket, action wall, and revocation closure through the real relay ingress.
+Lower-level direct/local harnesses cover the ICE/DataChannel paths
 (see
 [Self-Hosted Rendezvous → End-to-end transport validation](./self-hosted-rendezvous.md#end-to-end-transport-validation)):
 
@@ -725,11 +748,11 @@ normally `~/.intendant/access-certs/iam.json` on Unix-like platforms. It is not
 part of `intendant.toml` because it belongs to the local daemon identity and may
 later contain per-device/user audit metadata rather than project configuration.
 
-Schema version 2 contains:
+Schema version 3 contains:
 
 | Field | Meaning |
 |---|---|
-| `schema_version` | State schema version; currently `2` |
+| `schema_version` | State schema version; currently `3` |
 | `principals` | Local managed human/device principal records |
 | `roles` | Built-in or local role templates |
 | `grants` | Local IAM grant records targeting daemon IDs (optional `expires_at_unix_ms` stops enforcement after that instant; shown as `expired`) |
@@ -737,6 +760,7 @@ Schema version 2 contains:
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
 | `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (implemented; see [Trust Architecture](./trust-architecture.md)) |
+| `hosted_control` | Daemon-local hosted policy, pending doorbells, active/recent lease records, and qualifying signed-app anchors. Defaults to a Tasks ceiling and empty request/lease/anchor sets |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
@@ -750,12 +774,17 @@ dashboard-control offers, and the reserved future native-bridge code do not
 authenticate them. A
 combined `human_user` principal may carry those records plus optional
 account/provider and organization metadata. `connect_account` records are
-also inert compatibility/audit metadata and never authenticate.
+also inert compatibility/audit metadata and never authenticate. A hosted tab
+key appears only inside an exact `hosted_lease` principal minted by the
+dedicated runtime after trusted confirmation; it is not a general
+`client_key` login.
 Loopback sessions and the verified owner browser mTLS certificate keep the
 root-compatible fallback so direct/self-hosted access remains first-class.
-Certless remote TLS/plaintext requests do not. Connect has no dashboard-session
-path at all: the service rejects browser signaling and the daemon drops legacy
-events before key/grant resolution. A key record in `draft` or `revoked`
+Certless remote TLS/plaintext requests do not. Connect's origin has no
+dashboard-session path: the service rejects browser signaling and the daemon
+drops legacy events before key/grant resolution. The optional fleet-origin
+lease lane instead uses proof-bound daemon HTTP and one-use WebSocket tickets.
+A key record in `draft` or `revoked`
 status denies instead of falling back to anything else. Root users can create
 these records through the Access UI,
 `POST /api/access/iam/user-client-grants`, or dashboard-control
@@ -770,6 +799,8 @@ alpha only its mTLS binding is an active browser authenticator; a browser-key
 binding is record-only. `connect_account` remains readable in the IAM vocabulary
 for compatibility and audit, but grant upsert rejects it without mutating IAM
 state: Connect account links are metadata only and cannot receive a role.
+Generic grant APIs also reject the reserved hosted principal kind, grant
+source, and role ids; only hosted-control transactions may write them.
 `client_key` grant records take `client_key_fingerprint` (base64url, case-sensitive),
 an optional `client_key` public key for audit, and an optional
 `client_key_origin` recorded by the trusted session that creates the grant. The
@@ -784,8 +815,8 @@ historical binding categories and serializes as
 { "connect_account": "role:none", "client_key": "role:none" }
 ```
 
-A hosted-origin key may have a grant record, but Connect cannot present or
-exercise it in the default build. Legacy events are rejected before grant
+A hosted-origin key may have a legacy grant record, but Connect cannot present
+or exercise it. Legacy events are rejected before grant
 resolution, and the compatibility map remains fail-closed. Client
 keys whose recorded enrollment origin is in `hosted_origins` (default
 `["https://connect.intendant.dev"]`) are also hosted, as is the retired
@@ -799,21 +830,27 @@ two](./trust-tiers.md#first-contact-three-rungs)). Adding an exact origin to
 `hosted_origins` now refuses it at `role:none`; it is not a lower-authority
 control mode.
 
-The former hosted-control cap UI and mutation route are retired. `role:none` is
-a zero-permission, ceiling-only builtin — it can never be granted to a
-principal — and compiled policy is the authority for hosted provenance rather
-than the persisted map.
+The former compatibility-role cap UI and mutation route are retired.
+`role:none` is a zero-permission, ceiling-only builtin — it can never be
+granted to a principal — and compiled policy is the authority for ambient
+hosted provenance rather than the persisted map. The separate **Hosted
+control** card writes `hosted_control.policy`: `View < Tasks < Operate`,
+default **Tasks**, with a maximum lease lifetime up to the compiled 24-hour
+limit. Raising the ceiling is a dedicated owner ceremony; integrated daemons
+must acknowledge the hardening nudge before **Operate**. Lowering it revokes
+leases above the new ceiling; raising it never upgrades an existing lease.
 
-IAM schema v2 migrates earlier alpha state fail-closed. It revokes every
+The schema-v2 migration revokes earlier alpha state fail-closed. It revokes every
 active grant on a principal whose client-key origin is `connect-bootstrap`,
 records a `revoke_legacy_connect_bootstrap` audit event, and restores both
 hosted ceilings to `role:none`. Direct root grants survive, and the Connect
 account/route link remains discovery metadata, but the legacy browser key
 requires trusted re-enrollment.
 
+Schema v3 adds default `hosted_control` state without changing direct grants.
 During an alpha upgrade, restarting only the service cannot tear down an
 already-established legacy P2P DataChannel. Upgrade/restart the daemon, close
-old Connect tabs, and let the schema-v2 migration revoke legacy bootstrap
+old Connect tabs, and let the IAM migration revoke legacy bootstrap
 grants. New mixed-version attempts are blocked at both service and daemon.
 
 The enforced built-in user/client roles are `role:scoped-human`,
@@ -822,6 +859,14 @@ The enforced built-in user/client roles are `role:scoped-human`,
 visible in the same Access overview so daemon peer grants and human grants can
 be compared, but it is daemon-to-daemon only and cannot be assigned to a
 browser certificate or Connect account.
+
+Hosted leases use three reserved compiled role ids:
+`role:hosted-view`, `role:hosted-tasks`, and `role:hosted-operate`. Their
+persisted role rows are descriptive only; authorization intersects the active
+lease, current ceiling, exact compiled operation set, route/method/frame
+classification, and concrete action/target wall. No preset contains
+`access.manage`, `credentials.manage`, organization-root operations,
+`approval.resolve`, or the ability to raise its own ceiling.
 
 Terminal capability is three separate permissions: `terminal.view` (attach to
 a visible session, scrollback + live output), `terminal.write` (type into,

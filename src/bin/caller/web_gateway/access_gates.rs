@@ -354,8 +354,35 @@ pub(crate) fn deny_ws_frame_if_unauthorized(
     logged_denials: &mut std::collections::HashSet<String>,
 ) -> bool {
     let Some(frame_type) = json.get("t").and_then(|v| v.as_str()) else {
-        return false;
+        if !grant.is_hosted_lease() || grant.hosted_ws_frame_allowed(json) {
+            return false;
+        }
+        let denied = serde_json::json!({
+            "t": "ws_denied",
+            "frame": "untyped",
+            "permission": "hosted.frame",
+            "reason": "control action is outside the hosted lease projection",
+        });
+        let _ = direct_tx.send(denied.to_string());
+        return true;
     };
+    if grant.is_hosted_lease() && !grant.hosted_ws_frame_allowed(json) {
+        let denied = serde_json::json!({
+            "t": "ws_denied",
+            "frame": frame_type,
+            "permission": "hosted.frame",
+            "reason": "frame or concrete action is outside the hosted lease projection",
+        });
+        let _ = direct_tx.send(denied.to_string());
+        if logged_denials.insert(frame_type.to_string()) {
+            bus.send(AppEvent::PresenceLog {
+                message: format!("[ws] denied unclassified hosted frame {frame_type}"),
+                level: Some(LogLevel::Warn),
+                turn: None,
+            });
+        }
+        return true;
+    }
     let Some(op) = ws_frame_operation(frame_type) else {
         return false;
     };

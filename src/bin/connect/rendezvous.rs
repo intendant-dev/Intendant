@@ -260,6 +260,13 @@ pub(crate) struct DaemonRegisterRequest {
     issued_at_unix_ms: u64,
     #[serde(default)]
     signature: String,
+    /// Optional, separately signed directory capability. Kept outside the
+    /// registration proof so upgraded daemons remain compatible with older
+    /// Connect services that verify the v1 identity payload.
+    #[serde(default)]
+    hosted_control_enabled: Option<bool>,
+    #[serde(default)]
+    hosted_control_signature: Option<String>,
 }
 
 const MAX_DAEMON_ID_BYTES: usize = 128;
@@ -328,6 +335,24 @@ fn validate_daemon_register_shape(
             "signature must be canonical unpadded base64url for exactly 64 Ed25519 signature bytes",
         ));
     }
+    match (
+        body.hosted_control_enabled,
+        body.hosted_control_signature.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(_), Some(signature))
+            if !operator_probe && is_canonical_b64u_len(signature, 86, 64) => {}
+        (Some(_), Some(_)) if operator_probe => {
+            return Err(ApiError::bad_request(
+                "operator registration probes must omit hosted-control capability fields",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "hosted-control capability and signature must be supplied together",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -339,6 +364,18 @@ fn registration_signing_payload(
 ) -> String {
     format!(
         "{REGISTER_PROOF_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{claim_code_hash}\n{issued_at_unix_ms}\n"
+    )
+}
+
+fn hosted_control_capability_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    claim_code_hash: &str,
+    issued_at_unix_ms: u64,
+    enabled: bool,
+) -> String {
+    format!(
+        "{HOSTED_CONTROL_CAPABILITY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{claim_code_hash}\n{issued_at_unix_ms}\n{enabled}\n"
     )
 }
 
@@ -434,6 +471,27 @@ fn verify_registration_proof(body: &DaemonRegisterRequest, now: u64) -> ApiResul
         return Err(ApiError::bad_request(
             "registration identity signature is invalid",
         ));
+    }
+    if let (Some(enabled), Some(signature)) = (
+        body.hosted_control_enabled,
+        body.hosted_control_signature.as_deref(),
+    ) {
+        let payload = hosted_control_capability_signing_payload(
+            body.daemon_id.trim(),
+            body.daemon_public_key.trim(),
+            body.claim_code_hash.trim(),
+            body.issued_at_unix_ms,
+            enabled,
+        );
+        if !verify_ed25519_b64u(
+            body.daemon_public_key.trim(),
+            payload.as_bytes(),
+            signature.trim(),
+        ) {
+            return Err(ApiError::bad_request(
+                "hosted-control capability signature is invalid",
+            ));
+        }
     }
     Ok(())
 }
@@ -546,6 +604,7 @@ fn apply_daemon_registration(
             daemon_id: daemon_id.to_string(),
             label: None,
             daemon_public_key: daemon_public_key.to_string(),
+            hosted_control_enabled: false,
             owner_user_id: None,
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -655,7 +714,7 @@ pub(crate) async fn daemon_register(
         let registration = update_store_transaction(
             &mut store,
             |next| {
-                let outcome = apply_daemon_registration(
+                let mut outcome = apply_daemon_registration(
                     next,
                     &daemon_id,
                     &daemon_public_key,
@@ -663,6 +722,19 @@ pub(crate) async fn daemon_register(
                     proof_verified.then_some(body.issued_at_unix_ms),
                     now,
                 )?;
+                if proof_verified {
+                    let hosted_control_enabled = body.hosted_control_enabled.unwrap_or(false);
+                    if let Some(record) = next
+                        .daemons
+                        .iter_mut()
+                        .find(|record| record.daemon_id == daemon_id)
+                    {
+                        if record.hosted_control_enabled != hosted_control_enabled {
+                            record.hosted_control_enabled = hosted_control_enabled;
+                            outcome.durable_change = true;
+                        }
+                    }
+                }
                 durable_change.set(outcome.durable_change);
                 Ok(outcome)
             },
@@ -2112,6 +2184,7 @@ mod tests {
             daemon_id: daemon_id.to_string(),
             label: None,
             daemon_public_key: format!("{daemon_id}-key"),
+            hosted_control_enabled: false,
             owner_user_id,
             claim_code_hash: claim_code.map(claim_code_hash),
             claim_code_created_unix_ms,
@@ -2460,6 +2533,8 @@ mod tests {
             claim_code_hash,
             issued_at_unix_ms: now,
             signature,
+            hosted_control_enabled: None,
+            hosted_control_signature: None,
         };
         validate_daemon_register_shape(&valid, false).unwrap();
 
@@ -2708,6 +2783,16 @@ mod tests {
             "intendant-connect-register-proof-v1\ndaemon-1\nPubKey\nClaimHash\n1700000000000\n"
         );
         assert_eq!(
+            hosted_control_capability_signing_payload(
+                "daemon-1",
+                "PubKey",
+                "ClaimHash",
+                1_700_000_000_000,
+                true,
+            ),
+            "intendant-connect-hosted-control-capability-v1\ndaemon-1\nPubKey\nClaimHash\n1700000000000\ntrue\n"
+        );
+        assert_eq!(
             claim_signing_payload("claim-1", "daemon-1", "PubKey", "challenge-1"),
             "intendant-connect-claim-v1\nclaim-1\ndaemon-1\nPubKey\nchallenge-1\n"
         );
@@ -2755,6 +2840,13 @@ mod tests {
         let payload =
             registration_signing_payload("daemon-1", &daemon_public_key, &claim_code_hash, now);
         let signature = b64u(key.sign(payload.as_bytes()).as_ref());
+        let capability_payload = hosted_control_capability_signing_payload(
+            "daemon-1",
+            &daemon_public_key,
+            &claim_code_hash,
+            now,
+            true,
+        );
         let valid = DaemonRegisterRequest {
             protocol: PROTOCOL.to_string(),
             daemon_id: "daemon-1".to_string(),
@@ -2762,8 +2854,14 @@ mod tests {
             claim_code_hash: claim_code_hash.clone(),
             issued_at_unix_ms: now,
             signature,
+            hosted_control_enabled: Some(true),
+            hosted_control_signature: Some(b64u(key.sign(capability_payload.as_bytes()).as_ref())),
         };
         verify_registration_proof(&valid, now).unwrap();
+        let mut altered_capability = valid.clone();
+        altered_capability.hosted_control_enabled = Some(false);
+        let error = verify_registration_proof(&altered_capability, now).unwrap_err();
+        assert!(error.message.contains("capability signature"));
 
         let copied_public_key = DaemonRegisterRequest {
             signature: b64u(&[0u8; 64]),
@@ -2785,6 +2883,8 @@ mod tests {
             claim_code_hash,
             issued_at_unix_ms: now - REGISTER_PROOF_MAX_SKEW_MS - 1,
             signature: b64u(key.sign(stale_payload.as_bytes()).as_ref()),
+            hosted_control_enabled: None,
+            hosted_control_signature: None,
         };
         let error = verify_registration_proof(&stale, now).unwrap_err();
         assert!(error.message.contains("stale"));

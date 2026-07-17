@@ -1,0 +1,150 @@
+/* Hosted-control lease ceremony and preset-shaped client projection.
+   Server policy remains authoritative; these selectors keep the borrowed
+   browser honest about the surface its current lease can exercise. */
+.hosted-control-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--base, #11111b) 92%, transparent);
+  backdrop-filter: blur(16px);
+}
+.hosted-control-gate[hidden] { display: none; }
+.hosted-control-card {
+  width: min(560px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--surface1, #45475a);
+  border-radius: 18px;
+  background: var(--mantle, #181825);
+  color: var(--text, #cdd6f4);
+  box-shadow: 0 24px 80px rgb(0 0 0 / .5);
+}
+.hosted-control-card h1 { margin: 0 0 8px; font-size: 24px; }
+.hosted-control-card p { color: var(--subtext0, #a6adc8); line-height: 1.5; }
+.hosted-control-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 18px 0;
+}
+.hosted-control-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--subtext1, #bac2de);
+  font-size: 12px;
+}
+.hosted-control-grid input,
+.hosted-control-grid select {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--surface1, #45475a);
+  border-radius: 9px;
+  background: var(--base, #11111b);
+  color: var(--text, #cdd6f4);
+}
+.hosted-control-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hosted-control-actions button,
+.hosted-control-mgmt button {
+  padding: 9px 14px;
+  border: 1px solid var(--surface1, #45475a);
+  border-radius: 9px;
+  background: var(--surface0, #313244);
+  color: var(--text, #cdd6f4);
+  cursor: pointer;
+}
+.hosted-control-actions button.primary,
+.hosted-control-mgmt button.primary {
+  border-color: var(--blue, #89b4fa);
+  background: var(--blue, #89b4fa);
+  color: var(--crust, #11111b);
+  font-weight: 700;
+}
+.hosted-control-status { min-height: 20px; margin-top: 14px; color: var(--yellow, #f9e2af); }
+.hosted-control-status.error { color: var(--red, #f38ba8); }
+.hosted-control-fingerprint {
+  overflow-wrap: anywhere;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: var(--base, #11111b);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.hosted-control-badge {
+  position: fixed;
+  right: 14px;
+  bottom: 14px;
+  z-index: 5000;
+  padding: 7px 10px;
+  border: 1px solid var(--blue, #89b4fa);
+  border-radius: 999px;
+  background: var(--mantle, #181825);
+  color: var(--blue, #89b4fa);
+  font: 700 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.hosted-control-mgmt { display: grid; gap: 14px; }
+.hosted-control-mgmt-section {
+  padding: 14px;
+  border: 1px solid var(--surface0, #313244);
+  border-radius: 12px;
+}
+.hosted-control-mgmt-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.hosted-control-mgmt input,
+.hosted-control-mgmt select {
+  min-width: 100px;
+  padding: 7px 9px;
+  border: 1px solid var(--surface1, #45475a);
+  border-radius: 7px;
+  background: var(--base, #11111b);
+  color: var(--text, #cdd6f4);
+}
+
+/* Immutable hosted floor: these destinations never appear on a lease. */
+html[data-hosted-preset] [data-tab="access"],
+html[data-hosted-preset] [data-tab="vault"],
+html[data-hosted-preset] [data-tab="settings"],
+html[data-hosted-preset] [data-tab="debug"],
+html[data-hosted-preset] [data-tab="agenda"],
+html[data-hosted-preset] #ui2-autonomy-btn,
+html[data-hosted-preset] #upload-attach-btn,
+html[data-hosted-preset] #upload-file-input,
+html[data-hosted-preset] #direct-mode-toggle,
+html[data-hosted-preset] .global-direct-toggle,
+html[data-hosted-preset] [data-activity-tab="managed"],
+html[data-hosted-preset] [data-activity-tab="changes"],
+html[data-hosted-preset] [data-activity-tab="control"],
+html[data-hosted-preset] [data-sessions-tab="worktrees"],
+html[data-hosted-preset] .sessions-new-session-project,
+html[data-hosted-preset] #new-session-worktree-wrap,
+html[data-hosted-preset] #new-session-worktree-branch-row,
+html[data-hosted-preset] #new-session-agent,
+html[data-hosted-preset] #new-session-execution-wrap,
+html[data-hosted-preset] #new-session-external-fold,
+html[data-hosted-preset] #new-session-attach-btn,
+html[data-hosted-preset] #new-session-attachments-bar,
+html[data-hosted-preset] #micBtn,
+html[data-hosted-preset] #videoBtn,
+html[data-hosted-preset] #makeActiveBtn,
+html[data-hosted-preset="view"] .global-task-bar,
+html[data-hosted-preset="view"] [data-sessions-tab="new"],
+html[data-hosted-preset="view"] #ui2-stop-btn,
+html[data-hosted-preset="tasks"] #ui2-stop-btn,
+html[data-hosted-preset="view"] [data-tab="terminal"],
+html[data-hosted-preset="view"] [data-tab="files"],
+html[data-hosted-preset="tasks"] [data-tab="terminal"],
+html[data-hosted-preset="tasks"] [data-tab="files"] {
+  display: none !important;
+}
+
+@media (max-width: 620px) {
+  .hosted-control-grid { grid-template-columns: 1fr; }
+  .hosted-control-card { padding: 18px; }
+}

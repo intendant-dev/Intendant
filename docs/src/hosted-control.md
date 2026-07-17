@@ -28,8 +28,10 @@ authority recheck without changing direct/mTLS sessions.
 
 1. The fleet-name page creates a non-extractable P-256 key in the current tab.
    The private key is not persisted in origin storage.
-2. The page submits a bounded lease request containing the public key,
-   requested preset, requested lifetime, and a display label.
+2. The page signs and submits a bounded lease request containing the public
+   key, requested preset, requested lifetime, and a display label. The
+   signature also binds the daemon, fleet origin, nonce, and timestamp, so a
+   copied public key cannot be used to create a prompt.
 3. The daemon stores and signs the canonical request. Connect may send a
    content-free notification that a request is waiting, but does not carry the
    request fields or an approval.
@@ -86,7 +88,7 @@ Preset ordering is `View < Tasks < Operate`:
 | Operation family | View | Tasks | Operate |
 |---|---:|---:|---:|
 | Presence and bounded status | yes | yes | yes |
-| Session inspection and eligible logs | yes | yes | yes |
+| Session inspection and logs | yes | yes | yes |
 | Agent-visible display view | yes | yes | yes |
 | Task submit and message/steer | no | constrained | constrained |
 | Session lifecycle | no | no | yes |
@@ -125,7 +127,8 @@ session eligible without changing its autonomy.
 
 Hosted task creation cannot override the project root, sandbox or approval
 policy, execution shape, backend command, worktree behavior, display target, or
-other launch policy. Implicit "current session" targeting is unavailable.
+other launch policy. Leading slash-command forms are refused before supervisor
+translation, and implicit "current session" targeting is unavailable.
 Resume/fork/rewind/edit, sub-agent delegation, cancellation, agent
 reconfiguration, autonomy changes, and approval answers are outside Tasks.
 
@@ -136,7 +139,7 @@ message actions still require an explicit hosted-eligible target.
 
 ## Route, frame, and event projection
 
-The WP1 ingress marker remains authoritative. Fleet-SNI or reachability-relay
+The immutable relay-ingress marker remains authoritative. Fleet-SNI or reachability-relay
 traffic enters a protected route only after a valid hosted request proof; an
 unticketed `/ws`, `/mcp`, cleartext demux, trusted-local resolution, and every
 unproved protected request retain their discovery-only refusal.
@@ -148,7 +151,7 @@ methods and frames are denied until deliberately classified, and parity tests
 cover the complete route/method/frame catalogs.
 
 Hosted sockets also use an explicit outbound projection. They receive only the
-session catalog/state, bounded usage/status, hosted-eligible session logs,
+session catalog/state, bounded usage/status, session logs,
 agent-visible display readiness and authority state, and events needed to keep
 those views current. Access/IAM state, peer state, settings, autonomy controls,
 approval payloads, browser-workspace state, private displays, app anchors, and

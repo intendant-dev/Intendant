@@ -2000,6 +2000,11 @@ function renderDaemons() {{
     const hasLabel = Boolean(String(daemon.label || '').trim());
     const label = hasLabel ? String(daemon.label) : shortId(daemonId);
     const lastSeen = formatRelative(daemon.last_seen_unix_ms);
+    const hostedUrl = String(daemon.hosted_control_url || '');
+    const routeAction = hostedUrl
+      ? `<button class="primary" data-hosted-open="${{escapeAttr(hostedUrl)}}">Request control</button>
+         <span class="route-only">Opens the daemon's bounded lease doorbell.</span>`
+      : '<span class="route-only">Discovery only &mdash; open this daemon from a trusted local or independently verified direct-mTLS client.</span>';
     const card = document.createElement('div');
     card.className = 'computer-card';
     card.innerHTML = `
@@ -2011,7 +2016,7 @@ function renderDaemons() {{
         </div>
       </div>
       <div class="computer-actions">
-        <span class="route-only">Discovery only &mdash; open this daemon from a trusted local or independently verified direct-mTLS client.</span>
+        ${{routeAction}}
         <button class="secondary" data-rename="${{escapeAttr(daemonId)}}">Rename</button>
       </div>
       ${{presenceSparkline(daemon)}}
@@ -2025,6 +2030,12 @@ function renderDaemons() {{
       </details>`;
     grid.appendChild(card);
   }}
+  grid.querySelectorAll('[data-hosted-open]').forEach(button => {{
+    button.addEventListener('click', () => {{
+      const url = button.getAttribute('data-hosted-open');
+      if (url) window.location.assign(url);
+    }});
+  }});
   grid.querySelectorAll('[data-revoke]').forEach(button => {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-revoke');
@@ -2674,6 +2685,10 @@ mod tests {
         assert!(html.contains("Connect neither fetches nor presents organization documents"));
         assert!(!html.contains("presented automatically on every connection"));
         assert!(html.contains("Discovery only &mdash; open this daemon from a trusted local"));
+        assert!(html.contains("daemon.hosted_control_url"));
+        assert!(html.contains("data-hosted-open="));
+        assert!(html.contains("Opens the daemon's bounded lease doorbell."));
+        assert!(html.contains("window.location.assign(url)"));
         assert!(!html.contains("data-open="));
         assert!(html.contains("target.claimed_daemon === true ? ''"));
         assert!(html.contains("Open direct route"));
