@@ -1591,40 +1591,68 @@ mod tests {
     }
 
     /// Opens on DIFFERENT keys must not serialize behind each other's
-    /// spawns: two deliberately slow spawners complete in ~one spawn
-    /// duration, not two. Pure sleeps (no real PTY) so the measurement
-    /// reflects lock discipline, not shell startup noise.
+    /// spawns. Key A's spawner parks while holding its reservation and
+    /// the test completes a WHOLE open on key B in the meantime —
+    /// impossible when the map lock is held across the spawn. Gate-based
+    /// rather than timed: two blocking sleeps can land in one tokio
+    /// worker's LIFO slot and serialize for scheduling reasons, which a
+    /// wall-clock assertion would misread as lock contention.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_different_keys_do_not_serialize() {
-        const SLOW_SPAWN: Duration = Duration::from_millis(600);
         let registry = Arc::new(TerminalRegistry::new(std::env::temp_dir()));
-        let started = tokio::time::Instant::now();
-        let mut tasks = Vec::new();
-        for name in ["parallel-a", "parallel-b"] {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let slow = {
             let registry = registry.clone();
-            tasks.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 registry
                     .open_or_attach_with(
-                        TerminalKey::local(name),
+                        TerminalKey::local("parallel-slow"),
                         &TerminalActor::Root,
                         true,
                         move || {
-                            std::thread::sleep(SLOW_SPAWN);
+                            let _ = entered_tx.send(());
+                            // Hold the reservation until the test has
+                            // finished its key-B open (30s failsafe).
+                            let _ = release_rx.recv_timeout(Duration::from_secs(30));
                             Err("slow spawn failed (test)".to_string())
                         },
                     )
                     .await
-            }));
+            })
+        };
+
+        // Wait until key A's spawner is provably in flight…
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while entered_rx.try_recv().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "slow spawner never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        for task in tasks {
-            let result = task.await.unwrap();
-            assert!(matches!(result, Err(TerminalOpenError::Spawn(_))));
-        }
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < SLOW_SPAWN * 2,
-            "different-key opens serialized: {elapsed:?} for two {SLOW_SPAWN:?} spawns"
-        );
+
+        // …then run a complete open on key B. The timeout is the
+        // serialization detector: under spawn-under-the-write-lock this
+        // open would park behind key A's spawn (still held open by the
+        // gate) and trip it.
+        let fast = tokio::time::timeout(
+            Duration::from_secs(10),
+            registry.open_or_attach_with(
+                TerminalKey::local("parallel-fast"),
+                &TerminalActor::Root,
+                true,
+                || Err("fast spawn failed (test)".to_string()),
+            ),
+        )
+        .await
+        .expect("key-B open must not wait behind key-A's in-flight spawn");
+        assert!(matches!(fast, Err(TerminalOpenError::Spawn(_))));
+
+        let _ = release_tx.send(());
+        let slow_result = slow.await.unwrap();
+        assert!(matches!(slow_result, Err(TerminalOpenError::Spawn(_))));
         assert_eq!(
             registry.len().await,
             0,
