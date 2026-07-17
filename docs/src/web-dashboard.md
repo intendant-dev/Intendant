@@ -18,6 +18,61 @@ the gateway re-read a disk copy of app.html on every request instead of
 serving the embedded one (see [Configuration](./configuration.md)) — edit a
 fragment, run the assembler, refresh.
 
+## V3 — Proscenium (in development; opt-in)
+
+A **second, standalone dashboard** ships alongside the classic SPA at
+**`/v3`** — the implementation of the *Proscenium* design concept (full
+design docs and the clickable concept prototype live in
+`docs/design/proscenium/`). V3 is a clean-room front-end codebase
+(`static/v3/`, plain HTML/CSS/JS, no build step, embedded like every other
+static asset) that talks to the daemon over the same public rails the
+classic SPA uses — the `/ws` event stream + ControlMsg intents + the
+declared HTTP routes. It is a renderer over the one control plane, never a
+second brain, and it changes nothing about IAM, mTLS, or the classic
+dashboard: **`/` stays the default**, and V3 is one click away via the
+"Try V3 ✦" link in the classic nav (a "Classic (V2)" link rides the V3
+rail for the way back). When V3 proves itself, replacing app.html becomes
+a one-line flip; until then both are shipped.
+
+Where the classic dashboard is an operator's cockpit organized by
+subsystem, V3 is organized around the **owner–house relationship**:
+
+- **Home is a conversation, not a log.** Presence speaks first-person
+  (briefing, milestones, "show work" unfolding to the raw lines), the
+  composer takes tasks (with `@`-aiming and `/` grammar), and finished
+  work lands as artifacts in the thread.
+- **The Queue** unifies every decision the daemon can't make alone —
+  command approvals, agent questions, display doorbells, enrollment
+  requests, peer pairing knocks, federated peer approvals, hosted-control
+  asks, fuel — as plain-language cards with the safe default stated, all
+  resolvable inline or by keyboard (`y`/`s`/`a`/`n`).
+- **Eight intent-named rooms** (Home, Work, Screens, Files, Machines,
+  People & Keys, Books, Settings) plus two vantages (Station, Studio),
+  each calm on top with the machinery one unfold away.
+- **Two registers and a density dial** (Cozy / Standard / Studio): plain
+  sentences first, instrument truth (IDs, JSON, routes) always one gesture
+  away. Nothing is renamed per level; everything unfolds.
+- **One universal ⌘K index** — rooms, sessions, machines, people,
+  displays, agenda items, every settings row (derived from the same
+  catalog the Settings room renders), and every action — with
+  jump-and-flash onto the exact folded control.
+
+Beyond parity, V3 surfaces things the daemon already does but no frontend
+had ever shown: the **agenda scheduler** (propose/approve/revoke scheduled
+sessions, in Books → The List and Home's Today ribbon) and the **unified
+doorbells** (pairing requests, hosted-control asks, federated peer
+approvals) collected into the Queue.
+
+Honest gaps in this draft — V3 links to the classic dashboard rather than
+rebuilding these yet: the WebRTC live display stream and input authority,
+the PTY terminal, the tunnel-only vault/egress/custody surfaces, the
+managed-context rewind/fission composer, and the WebGPU Station canvas
+(V3 renders its own small constellation and links the real one).
+
+For iteration, `INTENDANT_V3_HTML_PATH=<dir>` mirrors
+`INTENDANT_APP_HTML_PATH`: the gateway re-reads `static/v3/` from disk on
+every request, so front-end edits need only a browser refresh.
+
 ## On by default
 
 There is no opt-in: the gateway starts automatically unless you pass `--no-web`,

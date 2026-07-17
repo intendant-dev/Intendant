@@ -114,6 +114,18 @@ needs a normal build. A read failure serves a loud 500 naming the override
 rather than silently falling back to the embedded copy, and the gateway
 logs the active override at startup.
 
+### V3 dashboard dev override
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INTENDANT_V3_HTML_PATH` | unset | Serve the V3 dashboard (`/v3` and `/v3/*`) from this directory, re-read on every request, instead of the embedded copy |
+
+Development-only, same contract as the app.html override: point it at a
+checkout's `static/v3/` and every browser refresh picks up front-end edits
+with no daemon rebuild. A read failure serves a loud 500 naming the
+override (without echoing the configured path), and the gateway logs the
+active override at startup.
+
 ### Session-log retention variables
 
 | Variable | Default | Description |
