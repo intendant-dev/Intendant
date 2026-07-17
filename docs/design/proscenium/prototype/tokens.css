@@ -1,0 +1,143 @@
+/* ============================================================
+   Proscenium — design tokens ("House lights")
+   Lamplight (dark, default) · Daylight (light)
+   Density: cozy · standard · studio
+   Doctrine: warm is yours (brass/attn/brick) — cool is the
+   machinery's (sage/slate/violet). Chips always carry words.
+   ============================================================ */
+
+@font-face {
+  font-family: 'Hanken Grotesk';
+  src: url('../../../../static/fonts/hanken-grotesk-latin.woff2') format('woff2');
+  font-weight: 100 900; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('../../../../static/fonts/jetbrains-mono-latin.woff2') format('woff2');
+  font-weight: 100 800; font-style: normal; font-display: swap;
+}
+
+:root {
+  /* --- Lamplight (dark) ------------------------------------ */
+  --bg:        #14120F;
+  --bg-1:      #191612;
+  --surface:   #1E1A15;
+  --surface-2: #26211A;
+  --surface-3: #2F2920;
+  --line:      rgba(242,232,213,.09);
+  --line-2:    rgba(242,232,213,.16);
+  --text:      #F1EADC;
+  --text-2:    #C6BAA4;
+  --text-3:    #91866F;
+
+  --brass:     #D2A24C;  --brass-rgb: 210,162,76;
+  --brass-2:   #E4BC72;
+  --on-brass:  #241A08;
+  --attn:      #E8A33D;  --attn-rgb: 232,163,61;
+  --brick:     #D97B66;  --brick-rgb: 217,123,102;
+  --sage:      #8AB894;  --sage-rgb: 138,184,148;
+  --slate:     #7FA6C9;  --slate-rgb: 127,166,201;
+  --violet:    #A58BD4;  --violet-rgb: 165,139,212;
+
+  --shadow-card:    0 1px 0 rgba(255,240,214,.03) inset, 0 2px 10px rgba(0,0,0,.25);
+  --shadow-overlay: 0 12px 40px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.4);
+  --glow-brass: 0 0 0 1px rgba(var(--brass-rgb),.35), 0 0 24px rgba(var(--brass-rgb),.12);
+
+  /* --- Type ------------------------------------------------- */
+  --voice: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, 'Times New Roman', serif;
+  --sans:  'Hanken Grotesk', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --mono:  'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --fs-base: 14px;
+  --fs-voice: 16.5px;
+  --fs-display: 30px;
+  --fs-title: 19px;
+  --fs-eyebrow: 11px;
+  --lh: 1.5;
+
+  /* --- Shape & spacing -------------------------------------- */
+  --r-inset: 8px; --r-ctl: 10px; --r-card: 14px; --r-panel: 20px; --r-pill: 999px;
+  --pad-card: 16px 18px;
+  --gap: 14px;
+  --rail-w: 216px;
+  --content-max: 1060px;
+
+  /* --- Motion ------------------------------------------------ */
+  --t-fast: .13s; --t-med: .18s; --t-slow: .24s;
+  --ease: cubic-bezier(.2,.7,.3,1);
+}
+
+html[data-theme="daylight"] {
+  --bg:        #F4EFE4;
+  --bg-1:      #EDE7D8;
+  --surface:   #FFFCF4;
+  --surface-2: #F7F1E3;
+  --surface-3: #EFE7D4;
+  --line:      rgba(58,46,28,.13);
+  --line-2:    rgba(58,46,28,.22);
+  --text:      #262018;
+  --text-2:    #5F574A;
+  --text-3:    #8B8170;
+
+  --brass:     #A67C1F;  --brass-rgb: 166,124,31;
+  --brass-2:   #8F6A15;
+  --on-brass:  #FFF8E6;
+  --attn:      #B97F0F;  --attn-rgb: 185,127,15;
+  --brick:     #B84B39;  --brick-rgb: 184,75,57;
+  --sage:      #3F7D4E;  --sage-rgb: 63,125,78;
+  --slate:     #33608F;  --slate-rgb: 51,96,143;
+  --violet:    #6D52A8;  --violet-rgb: 109,82,168;
+
+  --shadow-card:    0 1px 0 rgba(255,255,255,.6) inset, 0 2px 8px rgba(84,64,30,.10);
+  --shadow-overlay: 0 14px 44px rgba(84,64,30,.22), 0 2px 8px rgba(84,64,30,.14);
+  --glow-brass: 0 0 0 1px rgba(var(--brass-rgb),.4), 0 0 20px rgba(var(--brass-rgb),.14);
+}
+
+/* --- Density ------------------------------------------------- */
+html[data-density="cozy"] {
+  --fs-base: 15px; --fs-voice: 17.5px; --fs-display: 33px; --fs-title: 21px;
+  --gap: 18px; --pad-card: 20px 22px; --content-max: 880px;
+}
+html[data-density="studio"] {
+  --fs-base: 13px; --fs-voice: 15px; --fs-display: 24px; --fs-title: 16px;
+  --gap: 10px; --pad-card: 12px 14px; --content-max: 1280px;
+  --rail-w: 232px;
+}
+
+/* --- Base ---------------------------------------------------- */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font: 400 var(--fs-base)/var(--lh) var(--sans);
+  background:
+    radial-gradient(1200px 500px at 85% -10%, rgba(var(--brass-rgb),.06), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+::selection { background: rgba(var(--brass-rgb),.32); }
+.voice { font-family: var(--voice); }
+.mono  { font-family: var(--mono); font-size: .92em; }
+.dim   { color: var(--text-3); }
+.grow  { flex: 1 1 auto; }
+[hidden] { display: none !important; }
+
+:focus-visible {
+  outline: 2px solid var(--brass);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+a { color: var(--slate); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a.chip:hover, a.stage-card:hover { text-decoration: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+}
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 8px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }

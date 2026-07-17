@@ -1,0 +1,170 @@
+/* ============================================================
+   Proscenium — room styles: Screens · Files · Machines
+   (views-a.css). Everything here is prefixed (.scr-*, .file-*,
+   .mach-*) — tokens and shared components stay in app.css.
+   The fake "screens" are pictures of remote displays, so they
+   stay dark under both house themes, like a video would.
+   ============================================================ */
+
+/* ============ Screens room ============ */
+.scr-stagegrid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--gap); align-items: start; }
+@media (max-width: 1120px) { .scr-stagegrid { grid-template-columns: 1fr; } }
+
+.scr-screen {
+  position: relative; overflow: hidden;
+  border: 1px solid var(--line-2); border-radius: var(--r-ctl);
+  aspect-ratio: 16 / 10; background: #100E0C; color: #E9E2D2;
+}
+.scr-cool { background: #0E1218; color: #D7E1EC; }
+
+/* --- fake staging browser (disp-1) --- */
+.scr-browser {
+  position: absolute; inset: 9% 9% 0; display: flex; flex-direction: column;
+  border-radius: 10px 10px 0 0; overflow: hidden;
+  background: #1A1712; border: 1px solid rgba(242,232,213,.10); border-bottom: 0;
+  box-shadow: 0 10px 34px rgba(0,0,0,.5);
+}
+.scr-browser-bar {
+  display: flex; align-items: center; gap: 7px; padding: 7px 10px; flex: none;
+  background: #221E18; border-bottom: 1px solid rgba(242,232,213,.08);
+}
+.scr-stoplight { width: 9px; height: 9px; border-radius: 50%; background: #4A4234; flex: none; }
+.scr-url {
+  flex: 1; min-width: 0; font: 400 11px var(--mono); color: #B9AE95;
+  background: rgba(0,0,0,.30); border: 1px solid rgba(242,232,213,.08);
+  border-radius: var(--r-pill); padding: 3px 10px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.scr-banner {
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px; flex: none;
+  background: rgba(217,123,102,.16); color: #E5A191;
+  border-bottom: 1px solid rgba(217,123,102,.28); font-size: 12px;
+}
+.scr-banner .icon { width: 14px; height: 14px; }
+.scr-page { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+.scr-page-title { font: 500 15px var(--voice); color: #EDE5D3; }
+.scr-field { height: 26px; border-radius: 7px; background: #26211A; border: 1px solid rgba(242,232,213,.09); }
+.scr-field.scr-ghost { height: 8px; width: 55%; opacity: .55; }
+.scr-btn { height: 26px; width: 34%; border-radius: 7px; background: linear-gradient(180deg, rgba(210,162,76,.9), rgba(178,132,52,.9)); }
+
+/* --- the agent cursor + click ripple --- */
+.scr-cursor {
+  position: absolute; left: 58%; top: 56%; z-index: 3; pointer-events: none;
+  display: flex; align-items: center; gap: 5px;
+  transition: left 1.15s var(--ease), top 1.15s var(--ease);
+}
+.scr-cursor-dot {
+  width: 11px; height: 11px; border-radius: 50%; background: var(--attn); flex: none;
+  box-shadow: 0 0 0 3px rgba(232,163,61,.25), 0 0 12px rgba(232,163,61,.55);
+}
+.scr-cursor-tag {
+  font: 500 10.5px var(--mono); color: #F4EBD8; background: rgba(20,17,12,.88);
+  border: 1px solid rgba(232,163,61,.45); border-radius: var(--r-pill);
+  padding: 2px 8px; white-space: nowrap;
+}
+.scr-ripple {
+  position: absolute; z-index: 2; width: 8px; height: 8px; border-radius: 50%;
+  border: 2px solid var(--attn); transform: translate(-50%, -50%);
+  pointer-events: none; animation: scrRipple .7s ease-out forwards;
+}
+@keyframes scrRipple {
+  from { opacity: .9; width: 8px; height: 8px; }
+  to   { opacity: 0;  width: 46px; height: 46px; }
+}
+
+/* --- peer terminal-ish screen (disp-2) --- */
+.scr-term-screen { position: absolute; inset: 0; padding: 14px 16px; overflow: hidden; }
+.scr-screen .log { color: #C6CFDB; font-size: 11.5px; }
+.scr-screen .log .lt   { color: #6E7B8C; }
+.scr-screen .log .tool { color: #9DC0E8; }
+.scr-screen .log .ok   { color: #9CD0A6; }
+.scr-screen .log .err  { color: #E5A191; }
+
+/* --- xterm panel --- */
+.scr-xterm {
+  background: #131110; border: 1px solid var(--line-2); border-radius: var(--r-ctl);
+  padding: 12px 14px; font: 400 12.5px/1.7 var(--mono); color: #CFC6B0;
+  overflow-x: auto; white-space: nowrap;
+}
+.scr-xterm .p { color: #8AB894; }  /* prompt */
+.scr-xterm .c { color: #EFE7D4; }  /* command */
+.scr-xterm .o { color: #8D8270; }  /* output */
+.scr-caret {
+  display: inline-block; width: 8px; height: 14px; margin-left: 2px;
+  background: #8AB894; vertical-align: -2px;
+  animation: scrCaret 1.1s steps(1) infinite;
+}
+@keyframes scrCaret { 50% { opacity: 0; } }
+
+/* --- recordings: the fake player --- */
+.scr-poster {
+  position: relative; display: flex; align-items: center; justify-content: center;
+  aspect-ratio: 16 / 8.2; overflow: hidden;
+  border: 1px solid var(--line); border-radius: var(--r-ctl);
+  background:
+    radial-gradient(120% 130% at 20% 0%, rgba(210,162,76,.10), transparent 55%),
+    linear-gradient(150deg, #241E16, #16120F 65%);
+  transition: border-color var(--t-med);
+}
+.scr-player.playing .scr-poster { border-color: rgba(210,162,76,.45); }
+.scr-play {
+  width: 52px; height: 52px; border-radius: 50%; cursor: pointer;
+  border: 1px solid rgba(242,232,213,.25); background: rgba(0,0,0,.42); color: #F1EADC;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: transform var(--t-fast), box-shadow var(--t-fast);
+}
+.scr-play:hover { transform: scale(1.06); box-shadow: 0 0 18px rgba(210,162,76,.28); }
+.scr-play svg { display: block; }
+.scr-timeline { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(242,232,213,.12); }
+.scr-timeline i { display: block; height: 100%; width: 0; background: var(--brass); }
+.scr-player.playing .scr-timeline i { animation: scrPlay var(--playdur, 14s) linear infinite; }
+@keyframes scrPlay { from { width: 0; } to { width: 100%; } }
+
+/* ============ Files room ============ */
+.file-deskgrid { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: var(--gap); align-items: start; }
+@media (max-width: 900px) { .file-deskgrid { grid-template-columns: 1fr; } }
+
+/* whose-disk accent — the colored top edge on the viewer panel */
+.file-accent-slate  { border-top: 2px solid var(--slate); }
+.file-accent-violet { border-top: 2px solid var(--violet); }
+
+.file-chev { transition: transform var(--t-med) var(--ease); color: var(--text-3); }
+.file-folder.open > .file-chev { transform: rotate(90deg); }
+
+/* fake PDF page (cream paper under both themes) */
+.file-page {
+  background: #F3EDDD; border-radius: var(--r-ctl); padding: 20px 22px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.28);
+}
+.file-page-line { height: 8px; border-radius: 4px; background: rgba(74,65,50,.16); margin: 9px 0; }
+.file-page-line.w80 { width: 80%; }
+.file-page-line.w60 { width: 60%; }
+.file-page-line.w40 { width: 40%; }
+.file-page-line.file-page-head { height: 14px; width: 46%; background: rgba(74,65,50,.32); }
+
+/* the cover — a warm book jacket, drawn in CSS */
+.file-cover {
+  position: relative; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; gap: 12px; text-align: center;
+  aspect-ratio: 4 / 5; max-width: 320px; margin: 0 auto; padding: 22px;
+  border-radius: 10px; overflow: hidden; color: #F1E7D0;
+  background:
+    radial-gradient(140% 90% at 50% 0%, rgba(210,162,76,.30), transparent 55%),
+    linear-gradient(165deg, #31463A 0%, #24352B 48%, #1A2620 100%);
+  box-shadow: 0 10px 34px rgba(0,0,0,.4), inset 0 0 0 1px rgba(241,231,208,.14);
+}
+.file-cover::before {
+  content: ""; position: absolute; inset: 12px; pointer-events: none;
+  border: 1px solid rgba(210,162,76,.5); border-radius: 7px;
+}
+.file-cover .t { font: 500 30px/1.18 var(--voice); letter-spacing: .02em; text-shadow: 0 2px 10px rgba(0,0,0,.4); }
+.file-cover .s { font: 400 11.5px var(--sans); letter-spacing: .18em; text-transform: uppercase; color: rgba(241,231,208,.78); }
+.file-cover .rule { width: 54px; border-top: 1px solid rgba(210,162,76,.7); }
+
+/* ============ Machines room ============ */
+.mach-petname { font: 500 21px var(--voice); letter-spacing: .01em; }
+.mach-pressure {
+  display: grid; grid-template-columns: 34px 1fr 36px; gap: 5px 8px; align-items: center;
+}
+.mach-pressure .k { font: 400 11px var(--mono); color: var(--text-3); }
+.mach-pressure .p { font: 400 11px var(--mono); color: var(--text-3); text-align: right; }
