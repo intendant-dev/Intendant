@@ -100,9 +100,14 @@ pub struct HostedControlRuntime {
     daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
+    /// Replay window for authority-free doorbell creation and polling.
     replay: Arc<Mutex<ReplayState>>,
+    /// Independent replay window for active lease proofs. Public polling must
+    /// never consume the capacity that protects authenticated control.
+    lease_replay: Arc<Mutex<ReplayState>>,
     tickets: Arc<Mutex<HashMap<String, WsTicketRecord>>>,
     doorbell_rate: Arc<Mutex<DoorbellRateState>>,
+    poll_rate: Arc<Mutex<PollRateState>>,
 }
 
 impl std::fmt::Debug for HostedControlRuntime {
@@ -140,6 +145,12 @@ struct DoorbellRateState {
     global: VecDeque<i64>,
     by_key: HashMap<String, VecDeque<i64>>,
     by_source: HashMap<String, VecDeque<i64>>,
+}
+
+#[derive(Default)]
+struct PollRateState {
+    global: VecDeque<i64>,
+    by_request: HashMap<String, VecDeque<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,8 +201,10 @@ impl HostedControlRuntime {
             daemon_label,
             display_media_relay_configured,
             replay: Arc::new(Mutex::new(ReplayState::default())),
+            lease_replay: Arc::new(Mutex::new(ReplayState::default())),
             tickets: Arc::new(Mutex::new(HashMap::new())),
             doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
+            poll_rate: Arc::new(Mutex::new(PollRateState::default())),
         }
     }
 
@@ -253,6 +266,11 @@ impl HostedControlRuntime {
         }
         input.browser_public_key = public_key.clone();
         input.requester_label = label.clone();
+        let now = now_ms();
+        // Account every well-shaped attempt before the comparatively
+        // expensive curve verification. Invalid signatures must consume the
+        // same bounded attempt budget as valid ones.
+        self.check_doorbell_rate(&fingerprint, source_bucket, now)?;
         verify_p256_signature(
             &public_key,
             input
@@ -260,8 +278,6 @@ impl HostedControlRuntime {
                 .as_bytes(),
             &input.signature,
         )?;
-        let now = now_ms();
-        self.check_doorbell_rate(&fingerprint, source_bucket, now)?;
         self.record_nonce(
             &format!("doorbell:{fingerprint}"),
             &input.nonce,
@@ -288,6 +304,46 @@ impl HostedControlRuntime {
         };
         request.doorbell_signature = identity.sign_b64u(request.signing_payload().as_bytes());
         iam::transact_state(&self.cert_dir, |state, _| {
+            let now = now as u64;
+            let expired_request_ids = state
+                .hosted_control
+                .requests
+                .iter_mut()
+                .filter_map(|stored| {
+                    if stored.status == HostedLeaseRequestStatus::Pending
+                        && stored.expires_unix_ms <= now
+                    {
+                        stored.status = HostedLeaseRequestStatus::Expired;
+                        Some(stored.request_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            for request_id in expired_request_ids {
+                push_audit(
+                    state,
+                    "principal:anonymous:hosted-doorbell",
+                    "hosted_lease_request_expire",
+                    &request_id,
+                    "Observed expired hosted lease request".to_string(),
+                );
+            }
+            let active_pending = state
+                .hosted_control
+                .requests
+                .iter()
+                .filter(|stored| {
+                    stored.status == HostedLeaseRequestStatus::Pending
+                        && stored.expires_unix_ms > now
+                })
+                .count();
+            if active_pending >= HOSTED_REQUESTS_CAP {
+                return Err(AccessError(
+                    "hosted lease request queue is full; retry after a pending request is decided or expires"
+                        .to_string(),
+                ));
+            }
             if request.requested_preset > state.hosted_control.policy.ceiling {
                 return Err(AccessError(
                     "requested preset exceeds the daemon ceiling".to_string(),
@@ -339,6 +395,7 @@ impl HostedControlRuntime {
         if !valid_id_component(&proof.nonce) {
             return Err("poll proof nonce is invalid".to_string());
         }
+        self.check_poll_rate(&request.request_id, now_ms())?;
         let payload = format!(
             "{POLL_PROOF_PROTOCOL}\n{}\n{}\n{}\n{}",
             request.request_id,
@@ -563,7 +620,7 @@ impl HostedControlRuntime {
             payload.as_bytes(),
             &proof.signature,
         )?;
-        self.record_nonce(
+        self.record_lease_nonce(
             &format!("lease:{}", proof.lease_id),
             &proof.nonce,
             proof.timestamp_unix_ms,
@@ -700,7 +757,6 @@ impl HostedControlRuntime {
         ceiling: HostedPreset,
         max_ttl_secs: u64,
         actor: &AccessPrincipal,
-        integrated_tier: bool,
         operate_acknowledged: bool,
     ) -> AccessResult<HostedControlPolicy> {
         self.ensure_enabled().map_err(AccessError)?;
@@ -711,7 +767,7 @@ impl HostedControlRuntime {
         }
         iam::transact_state(&self.cert_dir, |state, _| {
             let old = state.hosted_control.policy.clone();
-            if integrated_tier
+            if state.tier.as_deref() == Some("integrated")
                 && ceiling == HostedPreset::Operate
                 && old.ceiling < HostedPreset::Operate
                 && !operate_acknowledged
@@ -724,7 +780,7 @@ impl HostedControlRuntime {
             state.hosted_control.policy.ceiling = ceiling;
             state.hosted_control.policy.max_ttl_secs = max_ttl_secs;
             let now = now_ms() as u64;
-            let mut revoked_grants = Vec::new();
+            let mut revoked_documents = Vec::new();
             for lease in &mut state.hosted_control.leases {
                 if lease.status == HostedLeaseStatus::Active
                     && (lease.document.preset > ceiling
@@ -734,14 +790,33 @@ impl HostedControlRuntime {
                     lease.status = HostedLeaseStatus::Revoked;
                     lease.revoked_at_unix_ms = Some(now);
                     lease.revoked_by = Some(actor.id.clone());
-                    revoked_grants.push(lease.document.grant_id.clone());
+                    revoked_documents.push(lease.document.clone());
                 }
             }
             for grant in &mut state.grants {
-                if revoked_grants.iter().any(|grant_id| grant_id == &grant.id) {
+                if revoked_documents
+                    .iter()
+                    .any(|document| document.grant_id == grant.id)
+                {
                     grant.status = "revoked".to_string();
                     grant.revoked_at_unix_ms = Some(now);
                 }
+            }
+            for document in &revoked_documents {
+                push_audit(
+                    state,
+                    &actor.id,
+                    "hosted_lease_revoke",
+                    &document.lease_id,
+                    format!(
+                        "Revoked {} lease during policy update ({} second lifetime)",
+                        document.preset.as_str(),
+                        document
+                            .expires_unix_ms
+                            .saturating_sub(document.issued_unix_ms)
+                            / 1000
+                    ),
+                );
             }
             push_audit(
                 state,
@@ -756,7 +831,7 @@ impl HostedControlRuntime {
             );
             Ok((
                 state.hosted_control.policy.clone(),
-                old != state.hosted_control.policy,
+                old != state.hosted_control.policy || !revoked_documents.is_empty(),
             ))
         })
     }
@@ -983,32 +1058,16 @@ impl HostedControlRuntime {
         nonce: &str,
         timestamp_unix_ms: i64,
     ) -> Result<(), String> {
-        let now = now_ms();
-        let cutoff = now.saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
-        let mut replay = self
-            .replay
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        replay.by_authority.retain(|_, entries| {
-            entries.retain(|(_, timestamp)| *timestamp >= cutoff);
-            !entries.is_empty()
-        });
-        let total: usize = replay.by_authority.values().map(VecDeque::len).sum();
-        if total >= PROOF_NONCES_GLOBAL_CAP {
-            return Err("hosted proof replay window is full".to_string());
-        }
-        let entries = replay
-            .by_authority
-            .entry(authority.to_string())
-            .or_default();
-        if entries.iter().any(|(candidate, _)| candidate == nonce) {
-            return Err("hosted proof nonce was already used".to_string());
-        }
-        if entries.len() >= PROOF_NONCES_PER_LEASE_CAP {
-            return Err("hosted proof nonce window is full for this authority".to_string());
-        }
-        entries.push_back((nonce.to_string(), timestamp_unix_ms));
-        Ok(())
+        record_nonce_in(&self.replay, authority, nonce, timestamp_unix_ms)
+    }
+
+    fn record_lease_nonce(
+        &self,
+        authority: &str,
+        nonce: &str,
+        timestamp_unix_ms: i64,
+    ) -> Result<(), String> {
+        record_nonce_in(&self.lease_replay, authority, nonce, timestamp_unix_ms)
     }
 
     fn check_doorbell_rate(
@@ -1052,6 +1111,59 @@ impl HostedControlRuntime {
             .push_back(now);
         Ok(())
     }
+
+    fn check_poll_rate(&self, request_id: &str, now: i64) -> Result<(), String> {
+        let cutoff = now.saturating_sub(60_000);
+        let mut rate = self
+            .poll_rate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        retain_recent(&mut rate.global, cutoff);
+        rate.by_request.retain(|_, entries| {
+            retain_recent(entries, cutoff);
+            !entries.is_empty()
+        });
+        if rate.global.len() >= POLL_GLOBAL_PER_MINUTE {
+            return Err("hosted lease poll global rate limit reached".to_string());
+        }
+        let request_entries = rate.by_request.entry(request_id.to_string()).or_default();
+        if request_entries.len() >= POLL_PER_REQUEST_PER_MINUTE {
+            return Err("hosted lease poll request rate limit reached".to_string());
+        }
+        request_entries.push_back(now);
+        rate.global.push_back(now);
+        Ok(())
+    }
+}
+
+fn record_nonce_in(
+    replay: &Arc<Mutex<ReplayState>>,
+    authority: &str,
+    nonce: &str,
+    timestamp_unix_ms: i64,
+) -> Result<(), String> {
+    let cutoff = now_ms().saturating_sub(REQUEST_PROOF_MAX_SKEW_MS);
+    let mut replay = replay.lock().unwrap_or_else(|error| error.into_inner());
+    replay.by_authority.retain(|_, entries| {
+        entries.retain(|(_, timestamp)| *timestamp >= cutoff);
+        !entries.is_empty()
+    });
+    let total: usize = replay.by_authority.values().map(VecDeque::len).sum();
+    if total >= PROOF_NONCES_GLOBAL_CAP {
+        return Err("hosted proof replay window is full".to_string());
+    }
+    let entries = replay
+        .by_authority
+        .entry(authority.to_string())
+        .or_default();
+    if entries.iter().any(|(candidate, _)| candidate == nonce) {
+        return Err("hosted proof nonce was already used".to_string());
+    }
+    if entries.len() >= PROOF_NONCES_PER_LEASE_CAP {
+        return Err("hosted proof nonce window is full for this authority".to_string());
+    }
+    entries.push_back((nonce.to_string(), timestamp_unix_ms));
+    Ok(())
 }
 
 fn project_request_status(mut request: HostedLeaseRequest, now_unix_ms: u64) -> HostedLeaseRequest {
@@ -1281,7 +1393,7 @@ mod tests {
         assert!(!runtime.enabled());
         assert!(!path.exists());
         assert!(runtime
-            .set_policy(HostedPreset::Operate, 3600, &owner(), false, true)
+            .set_policy(HostedPreset::Operate, 3600, &owner(), true)
             .unwrap_err()
             .to_string()
             .contains("disabled"));
@@ -1442,6 +1554,192 @@ mod tests {
             runtime.replay.lock().unwrap().by_authority.is_empty(),
             "rate-limited doorbells must not consume the shared proof nonce window"
         );
+    }
+
+    #[test]
+    fn invalid_doorbell_signatures_consume_the_preverification_rate_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        for _ in 0..DOORBELL_PER_KEY_PER_MINUTE {
+            let mut input = doorbell_input(&key, HostedPreset::Tasks, 3600);
+            input.signature = b64u(&[0; 64]);
+            assert!(runtime
+                .create_request(input, "https://laptop.example.test", None)
+                .unwrap_err()
+                .contains("signature verification"));
+        }
+        let mut limited = doorbell_input(&key, HostedPreset::Tasks, 3600);
+        limited.signature = b64u(&[0; 64]);
+        assert!(runtime
+            .create_request(limited, "https://laptop.example.test", None)
+            .unwrap_err()
+            .contains("key rate limit"));
+        assert!(
+            runtime.replay.lock().unwrap().by_authority.is_empty(),
+            "invalid signatures must not enter the replay cache"
+        );
+    }
+
+    #[test]
+    fn public_replay_capacity_cannot_starve_an_active_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let (_, document) = issue_lease(&runtime, &key, HostedPreset::Tasks, 3600);
+        let now = now_ms();
+        let mut public_replay = runtime.replay.lock().unwrap();
+        public_replay.by_authority.clear();
+        public_replay.by_authority.insert(
+            "poll:public-capacity".to_string(),
+            (0..PROOF_NONCES_GLOBAL_CAP)
+                .map(|index| (format!("public-{index}"), now))
+                .collect(),
+        );
+        drop(public_replay);
+
+        let proof = request_proof(
+            &key,
+            &document,
+            "GET",
+            "/api/sessions",
+            "lease-independent",
+            now,
+        );
+        assert!(runtime
+            .verify_request_proof(
+                "GET",
+                "/api/sessions",
+                "https://laptop.example.test",
+                &proof,
+                "relay",
+            )
+            .is_ok());
+        assert_eq!(
+            runtime
+                .lease_replay
+                .lock()
+                .unwrap()
+                .by_authority
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_polling_is_globally_rate_limited_before_signature_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let request = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        let now = now_ms();
+        runtime
+            .poll_rate
+            .lock()
+            .unwrap()
+            .global
+            .extend(std::iter::repeat_n(now, POLL_GLOBAL_PER_MINUTE));
+        let proof = HostedLeasePollProof {
+            request_id: request.request_id,
+            nonce: "poll-rate-limit".to_string(),
+            timestamp_unix_ms: now,
+            signature: b64u(&[0; 64]),
+        };
+        assert!(runtime
+            .poll_request(&proof)
+            .unwrap_err()
+            .contains("global rate limit"));
+        assert_eq!(
+            runtime
+                .replay
+                .lock()
+                .unwrap()
+                .by_authority
+                .values()
+                .map(VecDeque::len)
+                .sum::<usize>(),
+            1,
+            "the rejected poll must not consume replay capacity"
+        );
+    }
+
+    #[test]
+    fn request_retention_preserves_pending_owner_decisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let pending = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            for index in 0..HOSTED_REQUESTS_CAP {
+                let mut completed = pending.clone();
+                completed.request_id = format!("request:completed-{index}");
+                completed.status = HostedLeaseRequestStatus::Denied;
+                state.hosted_control.requests.push(completed);
+            }
+            state.hosted_control.normalize();
+            Ok(((), true))
+        })
+        .unwrap();
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.requests.len(), HOSTED_REQUESTS_CAP);
+        assert!(state
+            .hosted_control
+            .requests
+            .iter()
+            .any(|request| request.request_id == pending.request_id
+                && request.status == HostedLeaseRequestStatus::Pending));
+    }
+
+    #[test]
+    fn a_full_pending_queue_refuses_new_requests_without_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let key = browser_key();
+        let first = runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            for index in 1..HOSTED_REQUESTS_CAP {
+                let mut pending = first.clone();
+                pending.request_id = format!("request:pending-{index}");
+                state.hosted_control.requests.push(pending);
+            }
+            Ok(((), true))
+        })
+        .unwrap();
+        assert!(runtime
+            .create_request(
+                doorbell_input(&key, HostedPreset::Tasks, 3600),
+                "https://laptop.example.test",
+                None,
+            )
+            .unwrap_err()
+            .contains("queue is full"));
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.requests.len(), HOSTED_REQUESTS_CAP);
+        assert!(state
+            .hosted_control
+            .requests
+            .iter()
+            .any(|request| request.request_id == first.request_id));
     }
 
     #[test]
@@ -1786,14 +2084,19 @@ mod tests {
         assert_eq!(reduced.preset, HostedPreset::View);
         assert!(reduced.expires_unix_ms - reduced.issued_unix_ms <= 600_000);
 
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            iam::set_daemon_tier(state, Some("integrated"), &owner())?;
+            Ok(((), true))
+        })
+        .unwrap();
         assert!(runtime
-            .set_policy(HostedPreset::Operate, 3600, &owner(), true, false)
+            .set_policy(HostedPreset::Operate, 3600, &owner(), false)
             .unwrap_err()
             .to_string()
             .contains("hardening acknowledgement"));
         assert_eq!(
             runtime
-                .set_policy(HostedPreset::Operate, 3600, &owner(), true, true)
+                .set_policy(HostedPreset::Operate, 3600, &owner(), true)
                 .unwrap()
                 .ceiling,
             HostedPreset::Operate
@@ -1863,12 +2166,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(&temp);
         runtime
-            .set_policy(HostedPreset::View, 3600, &owner(), false, true)
+            .set_policy(HostedPreset::View, 3600, &owner(), true)
             .unwrap();
         let key = browser_key();
         let (_, document) = issue_lease(&runtime, &key, HostedPreset::View, 3600);
         runtime
-            .set_policy(HostedPreset::Operate, 3600, &owner(), false, true)
+            .set_policy(HostedPreset::Operate, 3600, &owner(), true)
             .unwrap();
         let verified = runtime
             .load_verified_lease(&document.lease_id, "https://laptop.example.test", "relay")
@@ -2004,7 +2307,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime = runtime(&temp);
         runtime
-            .set_policy(HostedPreset::Operate, 7200, &owner(), false, true)
+            .set_policy(HostedPreset::Operate, 7200, &owner(), true)
             .unwrap();
         let key = browser_key();
         let request = runtime
@@ -2027,10 +2330,20 @@ mod tests {
             .unwrap()
             .unwrap();
         runtime
-            .set_policy(HostedPreset::Tasks, 7200, &owner(), false, true)
+            .set_policy(HostedPreset::Tasks, 7200, &owner(), true)
             .unwrap();
         assert!(runtime
             .load_verified_lease(&document.lease_id, "https://laptop.example.test", "relay")
             .is_err());
+        let state = iam::load_state_cached_arc(&runtime.cert_dir).unwrap();
+        let audit = state
+            .audit_events
+            .iter()
+            .find(|event| {
+                event.action == "hosted_lease_revoke" && event.target_id == document.lease_id
+            })
+            .expect("policy revocation must emit a per-lease audit record");
+        assert!(audit.summary.contains("operate"));
+        assert!(audit.summary.contains("3600 second lifetime"));
     }
 }

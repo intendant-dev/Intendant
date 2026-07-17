@@ -48,9 +48,15 @@ authority recheck without changing direct/mTLS sessions.
    upgrade and rechecks the opening authority throughout the connection.
 
 Requests expire after ten minutes. Leases default to four hours and have a
-compiled maximum of 24 hours. Request creation, proof nonces, and outstanding
-tickets all have per-key and global bounds. The relay's loopback last hop is
-not treated as a distinct remote-client address.
+compiled maximum of 24 hours. Request creation, anonymous polling, proof
+nonces, and outstanding tickets all have per-key or per-request and global
+bounds. Anonymous doorbell and poll proofs use replay capacity separate from
+active lease proofs, so public traffic cannot consume the authenticated
+request window. Pending requests are not displaced by newer requests; a full
+pending queue refuses another doorbell until an owner decides one or one
+expires. The relay's loopback last hop is not treated as a distinct
+remote-client address, so public availability is globally bounded rather than
+promised fairly among anonymous callers.
 
 ## Trust anchors
 
@@ -79,9 +85,12 @@ disposable client borrowing only the approved lease.
 
 Each daemon has an owner-selected ceiling. The initial ceiling is **Tasks**.
 Raising it is a dedicated owner ceremony; an integrated-tier daemon also
-requires the hardening acknowledgement before accepting **Operate**. Lowering
-the ceiling revokes leases above it in the same IAM transaction. Raising it
-does not upgrade an existing lease.
+requires the hardening acknowledgement before accepting **Operate**. A daemon
+cannot change its tier to integrated while the hosted ceiling is Operate: the
+owner first lowers the ceiling, changes the tier, and then deliberately
+re-enables Operate with the acknowledgement. The tier check and ceiling update
+occur in the same IAM transaction. Lowering the ceiling revokes leases above
+it in that transaction. Raising it does not upgrade an existing lease.
 
 Preset ordering is `View < Tasks < Operate`:
 
@@ -113,9 +122,9 @@ exact active lease principal and grant
 ∩ concrete action and target constraints
 ```
 
-Persisted hosted-role permission lists are display metadata, not an
-authorization input. Generic IAM APIs cannot create or assign the reserved
-hosted principal kind, grant source, or role ids.
+Reserved hosted role ids and labels are display metadata, not persisted role
+rows or an authorization input. Generic IAM APIs cannot create or assign the
+reserved hosted principal kind, grant source, or role ids.
 
 ### Tasks action wall
 
@@ -151,12 +160,14 @@ methods and frames are denied until deliberately classified, and parity tests
 cover the complete route/method/frame catalogs.
 
 Hosted sockets also use an explicit outbound projection. They receive only the
-session catalog/state, bounded usage/status, session logs,
-agent-visible display readiness and authority state, and events needed to keep
-those views current. Access/IAM state, peer state, settings, autonomy controls,
-approval payloads, browser-workspace state, private displays, app anchors, and
-lease-management records are omitted. The same classifier filters bootstrap,
-replay, and live events; a new event kind is absent until classified.
+session catalog/state, bounded usage/status, session conversation and
+lifecycle events, agent-visible display readiness and authority state, and
+events needed to keep those views current. Generic daemon log and audit
+events, diagnostic report archives, Access/IAM state, peer state, settings,
+autonomy controls, approval payloads, browser-workspace state, private
+displays, app anchors, and lease-management records are omitted. The same
+classifier filters bootstrap, replay, and live events; a new event kind is
+absent until classified.
 
 ## Control and media reachability
 
@@ -180,8 +191,10 @@ experience.
 | Connect account or passkey assertion | No daemon principal or grant is resolved. |
 | Raw hosted browser key without an approved lease | No protected-route admission. |
 | Pending request | No IAM principal, grant, or control admission. |
+| Pending request queue is full | A new request is refused; existing pending decisions remain present. |
 | Copied lease document | No authority without a fresh proof by its bound tab key. |
 | Reused proof nonce or WebSocket ticket | Refused by replay/one-use state. |
+| Anonymous replay window or poll budget is exhausted | Public proof is refused without consuming active-lease replay capacity. |
 | Wrong daemon, origin, method, path, key, or time window | Proof is refused. |
 | Expired or revoked lease | New requests fail and live authority rechecks close the socket. |
 | Ceiling lowered below a lease | The lease is revoked in the policy transaction. |
@@ -190,6 +203,7 @@ experience.
 | Generic IAM mutation names a hosted principal/grant/role | The generic mutation is refused. |
 | Multiplexer reaches an unclassified action or target | The hosted action wall refuses dispatch. |
 | New route, method, frame, or event lacks hosted classification | It remains unavailable. |
+| Diagnostic session report is requested | The archive remains outside hosted View and is refused. |
 | Tasks reaches an approval wall | The hosted lane cannot answer it. |
 | Private user display is requested | The agent-visible-display boundary refuses it. |
 | No direct ICE route or TURN | Media is reported unavailable; no broader transport is substituted. |
@@ -197,5 +211,6 @@ experience.
 
 Every request creation, decision, lease issue/revoke/expiry observation,
 ceiling change, and eligibility change produces a bounded IAM audit record.
-Audit records contain ids, actor, preset, and lifetime—not task text, file
-content, signaling payloads, or private key material.
+A policy update that revokes several leases also emits one record for each
+revoked lease. Audit records contain ids, actor, preset, and lifetime—not task
+text, file content, signaling payloads, or private key material.

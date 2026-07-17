@@ -193,7 +193,6 @@ pub(crate) async fn handle_hosted_control_management(
     path: &str,
     body: String,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
-    cert_dir: PathBuf,
     authority: HttpAccessContext,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
@@ -258,17 +257,11 @@ pub(crate) async fn handle_hosted_control_management(
             match serde_json::from_str::<HostedPolicyInput>(&body)
                 .map_err(|error| format!("invalid hosted policy: {error}"))
                 .and_then(|input| {
-                    let integrated = crate::access::iam::load_state_cached_arc(&cert_dir)
-                        .map_err(|error| error.to_string())?
-                        .tier
-                        .as_deref()
-                        == Some("integrated");
                     runtime
                         .set_policy(
                             input.ceiling,
                             input.max_ttl_secs,
                             actor,
-                            integrated,
                             input.operate_acknowledged,
                         )
                         .map_err(|error| error.to_string())

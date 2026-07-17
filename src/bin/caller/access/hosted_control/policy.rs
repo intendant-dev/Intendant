@@ -204,13 +204,13 @@ pub fn hosted_http_route_allowed(preset: HostedPreset, method: &str, path: &str)
     {
         return true;
     }
-    let session_segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if let ["api", "session", session_id, rest @ ..] = session_segments.as_slice() {
+    let segments: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
+    if let ["api", "session", session_id, rest @ ..] = segments.as_slice() {
         let valid_session = *session_id != "current" && super::valid_id_component(session_id);
         let read_leaf = matches!(
             (method, rest),
             ("GET", [])
-                | ("GET", ["context-snapshot" | "report" | "fork-points"])
+                | ("GET", ["context-snapshot" | "fork-points"])
                 | ("POST", ["agent-output"])
         );
         if valid_session && read_leaf {
@@ -220,12 +220,16 @@ pub fn hosted_http_route_allowed(preset: HostedPreset, method: &str, path: &str)
     if path == "/api/hosted-control/ws-ticket" {
         return method == "POST";
     }
-    if preset == HostedPreset::Operate
-        && (path.starts_with("/api/fs/")
-            || path == "/api/transfers"
-            || path.starts_with("/api/transfers/"))
-    {
-        return matches!(method, "GET" | "POST" | "DELETE");
+    if preset == HostedPreset::Operate {
+        return match (method, segments.as_slice()) {
+            ("GET", ["api", "fs", "stat" | "list" | "read"])
+            | ("POST", ["api", "fs", "mkdir" | "write" | "rename" | "delete"])
+            | ("GET" | "POST", ["api", "transfers"]) => true,
+            ("POST", ["api", "transfers", id, "chunk" | "commit" | "delete"])
+            | ("GET", ["api", "transfers", id, "download"])
+            | ("DELETE", ["api", "transfers", id]) => super::valid_id_component(id),
+            _ => false,
+        };
     }
     false
 }
@@ -250,7 +254,6 @@ pub fn hosted_dashboard_method_allowed(preset: HostedPreset, method: &str) -> bo
             | "api_session_detail"
             | "api_session_agent_output"
             | "api_session_context_snapshot"
-            | "api_session_report"
             | "api_session_fork_points"
             | "api_displays"
             | "api_display_bootstrap"
@@ -561,9 +564,10 @@ pub fn hosted_ws_frame_allowed(
     match value.get("t").and_then(serde_json::Value::as_str) {
         Some("ping") => true,
         Some("display_offer" | "display_ice") => preset >= HostedPreset::View,
-        Some("terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close") => {
-            preset == HostedPreset::Operate
-        }
+        Some(
+            "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close"
+            | "terminal_share",
+        ) => preset == HostedPreset::Operate,
         Some("display_input") => preset == HostedPreset::Operate,
         Some(_) => false,
         None => serde_json::from_value::<crate::event::ControlMsg>(value.clone())
@@ -598,7 +602,7 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
             | "display_ice"
             | "display_input_authority_state"
             | "event_gap" => true,
-            "terminal_opened" | "terminal_output" | "terminal_closed" | "terminal_error"
+            "terminal_opened" | "terminal_output" | "terminal_exited" | "terminal_error"
             | "terminal_shared" => preset == HostedPreset::Operate,
             _ => false,
         };
@@ -618,9 +622,6 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
                 | "conversation_message"
                 | "messages_input"
                 | "reasoning"
-                | "info"
-                | "debug"
-                | "presence_log"
                 | "replay_start"
                 | "session_start"
                 | "task_complete"
@@ -644,7 +645,6 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
                 | "agent_started"
                 | "done_signal"
                 | "model_response"
-                | "log_entry"
                 | "session_note"
                 | "interrupted"
                 | "steer_requested"
@@ -652,6 +652,7 @@ fn hosted_outbound_value_allowed(preset: HostedPreset, value: &serde_json::Value
                 | "steer_queued"
                 | "steer_delivered"
                 | "follow_up_status"
+                | "event_gap"
         )
     )
 }
@@ -809,7 +810,6 @@ mod tests {
                 ("GET", "/api/sessions/message-search"),
                 ("GET", "/api/session/session-1"),
                 ("GET", "/api/session/session-1/context-snapshot"),
-                ("GET", "/api/session/session-1/report"),
                 ("GET", "/api/session/session-1/fork-points"),
                 ("POST", "/api/session/session-1/agent-output"),
                 ("POST", "/api/hosted-control/ws-ticket"),
@@ -827,6 +827,7 @@ mod tests {
                 ("DELETE", "/api/session/session-1"),
                 ("GET", "/api/session/current"),
                 ("GET", "/api/session/session-1/recordings"),
+                ("GET", "/api/session/session-1/report"),
                 ("GET", "/api/session/session-1/report/extra"),
                 ("GET", "/api/sessions-extra"),
                 ("POST", "/api/diagnostics/visual-freshness"),
@@ -848,6 +849,41 @@ mod tests {
             "GET",
             "/api/fs/read"
         ));
+        for (method, path) in [
+            ("GET", "/api/fs/stat"),
+            ("GET", "/api/fs/list"),
+            ("GET", "/api/fs/read"),
+            ("POST", "/api/fs/mkdir"),
+            ("POST", "/api/fs/write"),
+            ("POST", "/api/fs/rename"),
+            ("POST", "/api/fs/delete"),
+            ("GET", "/api/transfers"),
+            ("POST", "/api/transfers"),
+            ("POST", "/api/transfers/job-1/chunk"),
+            ("POST", "/api/transfers/job-1/commit"),
+            ("POST", "/api/transfers/job-1/delete"),
+            ("DELETE", "/api/transfers/job-1"),
+            ("GET", "/api/transfers/job-1/download"),
+        ] {
+            assert!(
+                hosted_http_route_allowed(HostedPreset::Operate, method, path),
+                "Operate should admit {method} {path}",
+            );
+        }
+        for (method, path) in [
+            ("POST", "/api/fs/read"),
+            ("GET", "/api/fs/future"),
+            ("PUT", "/api/transfers"),
+            ("GET", "/api/transfers/job-1/chunk"),
+            ("POST", "/api/transfers/job-1/future"),
+            ("DELETE", "/api/transfers/job-1/download"),
+            ("GET", "/api/transfers/bad%2fid/download"),
+        ] {
+            assert!(
+                !hosted_http_route_allowed(HostedPreset::Operate, method, path),
+                "Operate unexpectedly admitted {method} {path}",
+            );
+        }
     }
 
     #[test]
@@ -1064,6 +1100,35 @@ mod tests {
             HostedPreset::Operate,
             r#"{"event":"future_event"}"#
         ));
+        for event in ["info", "debug", "presence_log", "log_entry"] {
+            assert!(
+                !hosted_outbound_line_allowed(
+                    HostedPreset::View,
+                    &serde_json::json!({
+                        "event": event,
+                        "message": "peer=private fingerprint=private path=/workspace/private"
+                    })
+                    .to_string(),
+                ),
+                "generic daemon log event {event} crossed the hosted projection",
+            );
+        }
+        assert!(hosted_outbound_line_allowed(
+            HostedPreset::View,
+            r#"{"event":"event_gap","skipped":3}"#
+        ));
+        assert!(hosted_outbound_line_allowed(
+            HostedPreset::View,
+            r#"{"t":"event_gap","skipped":3}"#
+        ));
+        assert!(hosted_outbound_line_allowed(
+            HostedPreset::Operate,
+            r#"{"t":"terminal_exited","host_id":"local","terminal_id":"shell-0","status":0}"#
+        ));
+        assert!(!hosted_outbound_line_allowed(
+            HostedPreset::Tasks,
+            r#"{"t":"terminal_exited","host_id":"local","terminal_id":"shell-0","status":0}"#
+        ));
         assert!(!hosted_outbound_line_allowed(
             HostedPreset::Operate,
             r#"{"event":"display_ready","display_id":2,"agent_visible":false}"#
@@ -1105,6 +1170,26 @@ mod tests {
                 "task": "must stay denied"
             })
         ));
+        assert!(hosted_ws_frame_allowed(
+            &LocalIamState::default(),
+            HostedPreset::Operate,
+            &serde_json::json!({
+                "t": "terminal_share",
+                "host_id": "local",
+                "terminal_id": "shell-0",
+                "shared": true
+            })
+        ));
+        assert!(!hosted_ws_frame_allowed(
+            &LocalIamState::default(),
+            HostedPreset::Tasks,
+            &serde_json::json!({
+                "t": "terminal_share",
+                "host_id": "local",
+                "terminal_id": "shell-0",
+                "shared": true
+            })
+        ));
     }
 
     #[test]
@@ -1143,6 +1228,8 @@ mod tests {
         }
         assert!(source.contains("const presets = ['view', 'tasks', 'operate'];"));
         assert!(source.contains("false,\n    ['sign', 'verify']"));
+        assert!(source.contains("function hostedControlEnsureTtlOption(select, seconds)"));
+        assert!(source.contains("ttlSelect.value = String(preferredTtl);"));
         for persistent_store in ["localStorage", "sessionStorage", "indexedDB"] {
             assert!(
                 !source.contains(persistent_store),

@@ -24,6 +24,8 @@ pub const PROOF_NONCES_PER_LEASE_CAP: usize = 128;
 pub const WS_TICKETS_GLOBAL_CAP: usize = 512;
 pub const DOORBELL_GLOBAL_PER_MINUTE: usize = 120;
 pub const DOORBELL_PER_KEY_PER_MINUTE: usize = 6;
+pub const POLL_GLOBAL_PER_MINUTE: usize = 1200;
+pub const POLL_PER_REQUEST_PER_MINUTE: usize = 60;
 
 pub const HOSTED_PRINCIPAL_KIND: &str = "hosted_lease";
 pub const HOSTED_AUTHN_KIND: &str = "hosted_lease_key";
@@ -376,13 +378,36 @@ impl HostedControlState {
 
         self.requests
             .retain(|request| valid_id_component(&request.request_id));
-        retain_tail(&mut self.requests, HOSTED_REQUESTS_CAP);
+        retain_request_tail(&mut self.requests, HOSTED_REQUESTS_CAP);
         self.leases
             .retain(|lease| valid_id_component(&lease.document.lease_id));
         retain_tail(&mut self.leases, HOSTED_LEASES_CAP);
         self.signed_app_anchors
             .retain(|anchor| valid_id_component(&anchor.device_id));
         retain_tail(&mut self.signed_app_anchors, HOSTED_ANCHORS_CAP);
+    }
+}
+
+fn retain_request_tail(values: &mut Vec<HostedLeaseRequest>, cap: usize) {
+    if values.len() <= cap {
+        return;
+    }
+    // Completed records are retention history; pending records are live
+    // owner decisions. Prefer pruning the oldest completed records so a burst
+    // of new doorbells cannot silently evict an existing pending request.
+    let mut remaining = values.len() - cap;
+    values.retain(|request| {
+        if remaining > 0 && request.status != HostedLeaseRequestStatus::Pending {
+            remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    // Corrupt/legacy state may already exceed the cap with only pending
+    // records. Keep the newest bounded tail in that exceptional case.
+    if remaining > 0 {
+        values.drain(..remaining);
     }
 }
 

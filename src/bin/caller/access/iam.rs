@@ -1690,6 +1690,14 @@ pub fn set_daemon_tier(
     if state.tier == normalized {
         return Ok(normalized);
     }
+    if normalized.as_deref() == Some("integrated")
+        && state.hosted_control.policy.ceiling == super::hosted_control::HostedPreset::Operate
+    {
+        return Err(AccessError(
+            "lower the hosted-control ceiling before setting the daemon tier to integrated; Operate can then be re-enabled with the integrated hardening acknowledgement"
+                .to_string(),
+        ));
+    }
     let now = now_unix_ms();
     state.audit_events.push(IamAuditEvent {
         id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
@@ -5803,6 +5811,27 @@ mod tests {
         assert_eq!(cleared, None);
         assert_eq!(state.tier, None);
         assert_eq!(state.audit_events.len(), 2);
+    }
+
+    #[test]
+    fn integrated_tier_transition_requires_operate_to_be_reenabled() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        state.hosted_control.policy.ceiling = crate::access::hosted_control::HostedPreset::Operate;
+        let before = state.clone();
+        let error = set_daemon_tier(&mut state, Some("integrated"), &actor).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lower the hosted-control ceiling"));
+        assert_eq!(state, before);
+
+        state.hosted_control.policy.ceiling = crate::access::hosted_control::HostedPreset::Tasks;
+        assert_eq!(
+            set_daemon_tier(&mut state, Some("integrated"), &actor)
+                .unwrap()
+                .as_deref(),
+            Some("integrated")
+        );
     }
 
     #[test]

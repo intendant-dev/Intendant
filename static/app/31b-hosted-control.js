@@ -128,6 +128,31 @@ function hostedControlSetGateStatus(message, error = false) {
   status.classList.toggle('error', error);
 }
 
+function hostedControlTtlLabel(seconds) {
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return `${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+  }
+  if (seconds % 60 === 0) {
+    const minutes = seconds / 60;
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
+  }
+  return `${seconds} seconds`;
+}
+
+function hostedControlEnsureTtlOption(select, seconds) {
+  const existing = Array.from(select.options)
+    .find(option => Number(option.value) === seconds);
+  if (existing) return existing;
+  const option = document.createElement('option');
+  option.value = String(seconds);
+  option.textContent = hostedControlTtlLabel(seconds);
+  const next = Array.from(select.options)
+    .find(candidate => Number(candidate.value) > seconds);
+  select.insertBefore(option, next || null);
+  return option;
+}
+
 function hostedControlValidateLease(lease, publicKey) {
   if (!lease || lease.protocol !== 'intendant-hosted-control-lease-v1'
       || lease.daemon_id !== hostedControlBootstrap.daemon_id
@@ -292,16 +317,14 @@ async function hostedControlPrepare() {
     return option;
   }));
   const ttlSelect = document.getElementById('hosted-control-ttl');
+  const maxTtl = Number(body.max_ttl_secs);
+  const preferredTtl = Math.min(Number(body.default_ttl_secs), maxTtl);
+  hostedControlEnsureTtlOption(ttlSelect, preferredTtl);
   for (const option of Array.from(ttlSelect.options)) {
-    option.hidden = Number(option.value) > Number(body.max_ttl_secs);
+    option.hidden = Number(option.value) > maxTtl;
     option.disabled = option.hidden;
   }
-  const preferredTtl = Math.min(Number(body.default_ttl_secs), Number(body.max_ttl_secs));
-  const ttlOption = Array.from(ttlSelect.options)
-    .filter(option => !option.disabled)
-    .reverse()
-    .find(option => Number(option.value) <= preferredTtl);
-  if (ttlOption) ttlSelect.value = ttlOption.value;
+  ttlSelect.value = String(preferredTtl);
 
   await new Promise(resolve => {
     document.getElementById('hosted-control-request').onclick = async event => {

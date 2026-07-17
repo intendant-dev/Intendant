@@ -5418,7 +5418,6 @@ mod tests {
             "api_session_detail",
             "api_session_agent_output",
             "api_session_context_snapshot",
-            "api_session_report",
             "api_session_fork_points",
             "api_displays",
             "api_display_bootstrap",
