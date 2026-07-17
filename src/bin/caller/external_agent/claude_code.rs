@@ -181,6 +181,16 @@ fn lock_pending(
     }
 }
 
+/// One observed limit rejection (`rate_limit_event` with a non-allowed
+/// status), pending correlation with the turn's terminal result.
+#[derive(Debug, Clone)]
+struct CcLimitRejection {
+    /// The `rateLimitType` window that rejected (`five_hour`, `seven_day`).
+    window_kind: String,
+    /// Unix seconds when that window resets, when the event carried one.
+    resets_at_epoch: Option<u64>,
+}
+
 /// State shared between the adapter and its stdout reader task.
 struct CcShared {
     /// Backend-native session id, captured from the first stdout message
@@ -190,6 +200,13 @@ struct CcShared {
     /// of subtype `error_during_execution`; this flag keeps that expected
     /// outcome from being reported as a backend error.
     interrupt_pending: AtomicBool,
+    /// Set by the rate-limit arm when the CLI reports a non-allowed
+    /// status (`rejected`); consumed by `handle_result` so the turn's
+    /// terminal result reads as ONE structured limit rejection instead of
+    /// a mislabeled `backend error (success)` triple. Cleared by an
+    /// explicit allowed/allowed_warning status. Same expected-outcome
+    /// pattern as `interrupt_pending` above.
+    limit_rejected: StdMutex<Option<CcLimitRejection>>,
     /// Set by `thread_action("compact")`. An out-of-band `/compact` ends
     /// with a FREE result (`num_turns: 0`, all-zero usage) that is not a
     /// conversation turn; this flag lets the reader absorb it so it cannot
@@ -228,6 +245,7 @@ impl CcShared {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
+            limit_rejected: StdMutex::new(None),
             compact_pending: AtomicBool::new(false),
             goal: StdMutex::new(GoalEngine::default()),
             cumulative_fresh_tokens: AtomicU64::new(0),
@@ -266,6 +284,39 @@ impl CcShared {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    fn lock_limit_rejected(&self) -> StdMutexGuard<'_, Option<CcLimitRejection>> {
+        match self.limit_rejected.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn set_limit_rejected(&self, rejection: CcLimitRejection) {
+        *self.lock_limit_rejected() = Some(rejection);
+    }
+
+    fn take_limit_rejected(&self) -> Option<CcLimitRejection> {
+        self.lock_limit_rejected().take()
+    }
+
+    fn clear_limit_rejected(&self) {
+        *self.lock_limit_rejected() = None;
+    }
+
+    /// Flip an active operator goal to `usageLimited` because the
+    /// provider rejected a turn at a rate limit; `None` when nothing
+    /// changed (no goal, or not active).
+    fn park_goal_for_usage_limit(&self) -> Option<crate::types::SessionGoal> {
+        let fresh = self.fresh_tokens();
+        self.lock_goal().park_for_usage_limit(fresh)
+    }
+
+    /// Resume a goal the limit itself parked; `None` when nothing changed.
+    fn resume_goal_from_usage_limit(&self) -> Option<crate::types::SessionGoal> {
+        let fresh = self.fresh_tokens();
+        self.lock_goal().resume_from_usage_limit(fresh)
     }
 
     fn fresh_tokens(&self) -> u64 {
@@ -1972,6 +2023,55 @@ impl CcReader {
             .and_then(|r| r.as_str())
             .map(str::to_string);
 
+        // Correlate a pending limit rejection (rate_limit_event status
+        // `rejected`) with this result. Only an abnormal result claims it
+        // — the live wire ends the rejected turn with subtype `success`
+        // but `is_error: true`. An interrupt outcome wins when both
+        // raced, and a clean success proves the flag stale.
+        let limit_rejection = if was_interrupt {
+            self.shared.clear_limit_rejected();
+            None
+        } else if is_error || subtype != "success" {
+            self.shared.take_limit_rejected()
+        } else {
+            // The turn actually ran: the provider is serving again, so a
+            // goal parked by an earlier rejection resumes even if no
+            // explicit `allowed` event was observed.
+            self.shared.clear_limit_rejected();
+            if let Some(goal) = self.shared.resume_goal_from_usage_limit() {
+                out.log("info", "Goal resumed — the provider rate limit cleared");
+                out.events.push(AgentEvent::GoalUpdated { goal });
+            }
+            None
+        };
+        if let Some(rejection) = limit_rejection {
+            // ONE structured event instead of the model_response /
+            // backend-error / done triple: a log row plus the terminal
+            // TurnLimitRejected the host lanes park on. Never a
+            // BackendError — the rejection is an expected outcome, not a
+            // backend failure (and `(success)` as an error code was a lie).
+            let phrase = super::limit_reset_phrase(
+                rejection.resets_at_epoch,
+                crate::session_activity::epoch_seconds(),
+            );
+            out.log(
+                "warn",
+                format!("Rate-limited ({} window) — {phrase}", rejection.window_kind),
+            );
+            if let Some(goal) = self.shared.park_goal_for_usage_limit() {
+                out.log(
+                    "info",
+                    "Goal paused — rate limited; will auto-resume when the limit clears",
+                );
+                out.events.push(AgentEvent::GoalUpdated { goal });
+            }
+            out.events.push(AgentEvent::TurnLimitRejected {
+                resets_at_epoch: rejection.resets_at_epoch,
+                message,
+            });
+            return;
+        }
+
         if is_error || subtype != "success" {
             if was_interrupt {
                 out.log("info", "Claude Code turn interrupted");
@@ -2159,9 +2259,25 @@ impl CcReader {
         match status {
             "" => {}
             "allowed" | "allowed_warning" => {
+                // Never park on an allowed status: retire any pending
+                // rejection flag and resume a goal the limit itself parked.
+                self.shared.clear_limit_rejected();
+                if let Some(goal) = self.shared.resume_goal_from_usage_limit() {
+                    out.log("info", "Goal resumed — the provider rate limit cleared");
+                    out.events.push(AgentEvent::GoalUpdated { goal });
+                }
                 self.observe_activity(ActivityObs::RateLimitCleared, out);
             }
             _ => {
+                // Expected-outcome flag for this turn's result: the CLI
+                // ends a limit-rejected turn with a `result` whose subtype
+                // is still `success`; `handle_result` consumes this to
+                // report the rejection first-hand instead of a backend
+                // error.
+                self.shared.set_limit_rejected(CcLimitRejection {
+                    window_kind: kind.to_string(),
+                    resets_at_epoch,
+                });
                 self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
             }
         }
@@ -5015,6 +5131,220 @@ mod tests {
         assert!(out.events.iter().any(|e| matches!(
             e,
             AgentEvent::Log { level, message } if level == "warn" && message.contains("rejected")
+        )));
+    }
+
+    /// The captured incident shape: a `rate_limit_event` with status
+    /// `rejected` followed by the turn's result — subtype still `success`,
+    /// `is_error: true`, the limit notice as the text. The reader must
+    /// emit ONE structured `TurnLimitRejected` (flag consumed) instead of
+    /// the mislabeled `backend error (success)` + TurnCompleted pair.
+    #[test]
+    fn limit_rejected_result_emits_one_structured_event_not_backend_error() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit · resets 3pm (America/New_York)","session_id":"s1","num_turns":1}"#,
+        );
+        let limit_events: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnLimitRejected {
+                    resets_at_epoch,
+                    message,
+                } => Some((*resets_at_epoch, message.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(limit_events.len(), 1, "exactly one structured limit event");
+        assert_eq!(limit_events[0].0, Some(1_783_990_800));
+        assert!(limit_events[0]
+            .1
+            .as_deref()
+            .is_some_and(|m| m.contains("session limit")));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::BackendError { .. })),
+            "a limit rejection is an expected outcome, never a backend error"
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "TurnLimitRejected replaces TurnCompleted for the rejected turn"
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Log { level, message }
+                    if level == "warn" && message.starts_with("Rate-limited")
+            )),
+            "one log row announces the rejection with the reset time"
+        );
+
+        // Flag consumed: the same abnormal result WITHOUT a preceding
+        // rejected event reports through the normal error path again.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit · resets 3pm (America/New_York)","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })),
+            "the rejection flag must be one-shot"
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackendError { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    /// `allowed_warning` still allows requests — it must never arm the
+    /// rejection flag, so the following result completes normally.
+    #[test]
+    fn allowed_warning_never_parks_the_turn() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    /// A clean success consumes a stale rejection flag silently (the turn
+    /// ran, so the provider is serving) — no limit event, no error.
+    #[test]
+    fn clean_success_consumes_stale_rejection_flag() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        // Consumed: a later abnormal result is a plain error again.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+    }
+
+    /// An interrupt racing the rejection wins: the expected interrupt
+    /// outcome reports, and the limit flag is consumed silently.
+    #[test]
+    fn interrupt_outcome_wins_over_limit_rejection() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        reader
+            .shared
+            .interrupt_pending
+            .store(true, Ordering::SeqCst);
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"aborted","session_id":"s1","num_turns":0}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.contains("interrupted")
+        )));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        // The flag did not survive the interrupt.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+    }
+
+    /// An active operator goal parks to usageLimited on the rejection and
+    /// resumes when the wire reports the window allowed again.
+    #[test]
+    fn limit_rejection_parks_goal_and_allowed_resumes_it() {
+        let mut reader = test_reader();
+        reader
+            .shared
+            .lock_goal()
+            .dispatch("goal-set", &serde_json::json!({"objective": "ship"}), 0)
+            .unwrap();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit","session_id":"s1","num_turns":1}"#,
+        );
+        let parked: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::GoalUpdated { goal } => goal.status.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            parked.iter().any(|status| status == "usageLimited"),
+            "goal statuses seen: {parked:?}"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.starts_with("Goal paused")
+        )));
+
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let resumed: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::GoalUpdated { goal } => goal.status.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            resumed.iter().any(|status| status == "active"),
+            "goal statuses seen: {resumed:?}"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.starts_with("Goal resumed")
         )));
     }
 

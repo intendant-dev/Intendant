@@ -311,6 +311,13 @@ pub(crate) struct GoalState {
     /// Fresh-token counter snapshot when the goal was set; spend against
     /// the budget is measured from here.
     pub(crate) tokens_at_set: u64,
+    /// True when `park_for_usage_limit` flipped this goal to
+    /// `usageLimited` because the provider rejected a turn at a rate
+    /// limit. Only such auto-parked goals are resumed by
+    /// `resume_from_usage_limit` — an operator's own status choices are
+    /// never overridden. Any explicit status set through `dispatch`
+    /// clears the mark.
+    pub(crate) limit_parked: bool,
 }
 
 /// What a dispatched goal op did, for the host loop to act on: emit the
@@ -377,6 +384,45 @@ impl GoalEngine {
             if goal.status == "active" && goal.token_budget.is_some_and(|budget| used >= budget) {
                 goal.status = "budgetLimited".to_string();
             }
+        }
+        self.snapshot(fresh_tokens_now)
+    }
+
+    /// The provider rejected a turn at a usage limit: flip an `active`
+    /// goal to `usageLimited` (marked as auto-parked so only the limit
+    /// path resumes it) and return the updated snapshot for a
+    /// goal-updated emission. `None` when there is no goal or it was not
+    /// active (an operator pause/complete is never overridden).
+    pub(crate) fn park_for_usage_limit(
+        &mut self,
+        fresh_tokens_now: u64,
+    ) -> Option<crate::types::SessionGoal> {
+        {
+            let goal = self.goal.as_mut()?;
+            if goal.status != "active" {
+                return None;
+            }
+            goal.status = "usageLimited".to_string();
+            goal.limit_parked = true;
+        }
+        self.snapshot(fresh_tokens_now)
+    }
+
+    /// The provider limit cleared (an explicit allowed status, or a turn
+    /// that ran to completion): resume a goal that `park_for_usage_limit`
+    /// itself parked. Goals the operator set to `usageLimited` (or any
+    /// other status) by hand stay untouched. `None` when nothing changed.
+    pub(crate) fn resume_from_usage_limit(
+        &mut self,
+        fresh_tokens_now: u64,
+    ) -> Option<crate::types::SessionGoal> {
+        {
+            let goal = self.goal.as_mut()?;
+            if !goal.limit_parked || goal.status != "usageLimited" {
+                return None;
+            }
+            goal.status = "active".to_string();
+            goal.limit_parked = false;
         }
         self.snapshot(fresh_tokens_now)
     }
@@ -458,6 +504,9 @@ impl GoalEngine {
                 }
                 if let Some(status) = status {
                     goal.status = status;
+                    // An explicit operator status overrides the limit
+                    // park; the auto-resume must not fight it later.
+                    goal.limit_parked = false;
                 }
                 if let Some(budget) = token_budget {
                     goal.token_budget = budget;
@@ -475,6 +524,7 @@ impl GoalEngine {
                     token_budget: token_budget.flatten(),
                     set_at: std::time::Instant::now(),
                     tokens_at_set: fresh_tokens_now,
+                    limit_parked: false,
                 });
             }
         }
@@ -501,6 +551,42 @@ impl GoalEngine {
             goal,
             notice,
         })
+    }
+}
+
+/// Human phrase for a provider limit reset: absolute local time plus a
+/// relative countdown ("resumes 4:00 PM (in ~2h 5m)"), or an honest
+/// "reset time unknown" when the wire carried none. Pure — the clock is
+/// injected so tests drive it; only the local-timezone rendering reads
+/// the environment.
+pub(crate) fn limit_reset_phrase(resets_at_epoch: Option<u64>, now_epoch: u64) -> String {
+    let Some(resets_at) = resets_at_epoch else {
+        return "reset time unknown".to_string();
+    };
+    let secs = resets_at.saturating_sub(now_epoch);
+    let relative = if secs == 0 {
+        "now".to_string()
+    } else if secs < 60 {
+        format!("in ~{secs}s")
+    } else if secs < 3600 {
+        format!("in ~{}m", secs.div_ceil(60))
+    } else {
+        format!("in ~{}h {}m", secs / 3600, (secs % 3600) / 60)
+    };
+    use chrono::TimeZone;
+    let absolute = chrono::Local
+        .timestamp_opt(resets_at as i64, 0)
+        .single()
+        .map(|dt| {
+            if secs >= 24 * 3600 {
+                dt.format("%b %-d, %-I:%M %p").to_string()
+            } else {
+                dt.format("%-I:%M %p").to_string()
+            }
+        });
+    match absolute {
+        Some(absolute) => format!("resumes {absolute} ({relative})"),
+        None => format!("resumes {relative}"),
     }
 }
 
@@ -975,6 +1061,20 @@ pub enum AgentEvent {
     UserQuestionRequest {
         request_id: String,
         questions: Vec<crate::types::UserQuestion>,
+    },
+    /// The agent's turn ended rejected at a provider usage limit (Claude
+    /// Code `rate_limit_event` status `rejected`, correlated by the
+    /// adapter with the turn's terminal result). Terminal for the turn
+    /// like [`AgentEvent::TurnCompleted`], but the round did no work:
+    /// hosts park the pending follow-up until `resets_at_epoch` instead
+    /// of counting a round and re-firing.
+    TurnLimitRejected {
+        /// Unix seconds when the provider window resets, when the wire
+        /// carried one.
+        resets_at_epoch: Option<u64>,
+        /// The backend's own limit text (e.g. "You've hit your session
+        /// limit · resets 3pm"), kept for reference.
+        message: Option<String>,
     },
     /// The agent's turn is complete.
     TurnCompleted { message: Option<String> },
@@ -1667,6 +1767,67 @@ mod tests {
             }
             other => panic!("expected calm report, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn goal_engine_limit_park_flips_active_and_resumes_only_auto_parked() {
+        let mut engine = GoalEngine::default();
+        // No goal: both directions are calm no-ops.
+        assert!(engine.park_for_usage_limit(0).is_none());
+        assert!(engine.resume_from_usage_limit(0).is_none());
+
+        let params = serde_json::json!({ "objective": "ship it" });
+        engine.dispatch("goal-set", &params, 0).unwrap();
+
+        // Active goal parks to usageLimited and resumes back to active.
+        let parked = engine.park_for_usage_limit(10).expect("parks");
+        assert_eq!(parked.status.as_deref(), Some("usageLimited"));
+        // Idempotent: an already-parked goal does not re-park.
+        assert!(engine.park_for_usage_limit(10).is_none());
+        let resumed = engine.resume_from_usage_limit(20).expect("resumes");
+        assert_eq!(resumed.status.as_deref(), Some("active"));
+        assert!(engine.resume_from_usage_limit(20).is_none());
+
+        // An operator pause is never parked or resumed by the limit path.
+        engine
+            .dispatch("goal-pause", &serde_json::Value::Null, 20)
+            .unwrap();
+        assert!(engine.park_for_usage_limit(20).is_none());
+        assert!(engine.resume_from_usage_limit(20).is_none());
+
+        // An explicit operator status set while limit-parked clears the
+        // auto mark: the limit path must not resurrect it afterwards.
+        engine
+            .dispatch("goal-resume", &serde_json::Value::Null, 20)
+            .unwrap();
+        engine.park_for_usage_limit(30).expect("parks again");
+        engine
+            .dispatch(
+                "goal-set",
+                &serde_json::json!({ "status": "usageLimited" }),
+                30,
+            )
+            .unwrap();
+        assert!(
+            engine.resume_from_usage_limit(30).is_none(),
+            "operator-confirmed usageLimited must not auto-resume"
+        );
+    }
+
+    #[test]
+    fn limit_reset_phrase_renders_relative_and_absolute() {
+        // No wire reset time: honest unknown.
+        assert_eq!(limit_reset_phrase(None, 1_000), "reset time unknown");
+        // The absolute local-time rendering is timezone-dependent, so only
+        // the structure and the injected-clock relative part are pinned.
+        let phrase = limit_reset_phrase(Some(1_000 + 2 * 3600 + 5 * 60), 1_000);
+        assert!(phrase.starts_with("resumes "), "phrase: {phrase}");
+        assert!(phrase.contains("in ~2h 5m"), "phrase: {phrase}");
+        let phrase = limit_reset_phrase(Some(1_000 + 90), 1_000);
+        assert!(phrase.contains("in ~2m"), "phrase: {phrase}");
+        // A reset already in the past reads as now.
+        let phrase = limit_reset_phrase(Some(500), 1_000);
+        assert!(phrase.contains("now"), "phrase: {phrase}");
     }
 
     #[test]

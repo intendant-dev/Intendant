@@ -2894,6 +2894,30 @@ pub(crate) async fn drain_external_child_turn(
         DrainOutcome::TurnCompleted { message, .. } => {
             emit_child_turn_complete(&child_config, conversation_kind, message);
         }
+        DrainOutcome::LimitRejected {
+            resets_at_epoch,
+            message,
+            ..
+        } => {
+            // The child turn ended rejected at a provider limit. Child
+            // conversations have no park machinery — report honestly and
+            // end the child turn like a completion.
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "warn".to_string(),
+                source: external_agent_log_source(child_config.agent_source.as_deref()),
+                content: format!(
+                    "Rate-limited — the {} conversation turn was rejected; {}",
+                    conversation_kind,
+                    external_agent::limit_reset_phrase(
+                        resets_at_epoch,
+                        crate::session_activity::epoch_seconds()
+                    )
+                ),
+                turn: None,
+            });
+            emit_child_turn_complete(&child_config, conversation_kind, message);
+        }
         DrainOutcome::ContextRewindRequested { request, .. } => {
             emit_context_rewind_failure(
                 &request,
@@ -3331,6 +3355,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
             stats
                 .codex_subagent_tool_failure_limiters
                 .remove(&child_thread_id);
+            emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
+        }
+        external_agent::AgentEvent::TurnLimitRejected { message, .. } => {
+            // A limit-rejected child turn ends like a completion; the
+            // park machinery is a primary-conversation concern.
             emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
         }
         external_agent::AgentEvent::SubAgentToolCall {
