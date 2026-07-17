@@ -39,7 +39,16 @@ async function loadSessionForkPoints(session, sessionId, body) {
   body.textContent = 'Loading fork points…';
   let catalog = null;
   try {
-    catalog = await daemonApi.request('api_session_fork_points', { session_id: sessionId });
+    // Facade contract: request() resolves {ok, status, body} on both
+    // lanes — the catalog is the BODY (reading fields off the envelope
+    // rendered every session as an empty catalog; found live 2026-07-17).
+    const resp = await daemonApi.request('api_session_fork_points', { session_id: sessionId });
+    if (!resp || resp.ok === false) {
+      const detail = resp && resp.body && resp.body.error;
+      body.textContent = `Fork points unavailable: ${detail || `HTTP ${(resp && resp.status) || '?'}`}`;
+      return;
+    }
+    catalog = resp.body;
   } catch (e) {
     body.textContent = `Fork points unavailable: ${e && e.message ? e.message : e}`;
     return;
