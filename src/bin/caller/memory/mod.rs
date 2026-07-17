@@ -26,6 +26,12 @@
 pub(crate) mod handle;
 pub(crate) mod plane;
 pub(crate) mod service;
+/// The P1.5 Gate-B-lite custody adapter — a de-risking ARTIFACT, not
+/// a live path: nothing here is reachable from the service until the
+/// ratified sequence completes (P0.5 + tombed cutover → P1.8), so
+/// outside its own battery the module is deliberately dead code.
+#[allow(dead_code)]
+pub(crate) mod store;
 pub(crate) mod types;
 
 pub(crate) use handle::MemoryHandle;
