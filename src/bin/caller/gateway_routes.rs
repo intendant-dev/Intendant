@@ -304,7 +304,7 @@ pub(crate) enum RouteHandlerId {
     DashboardTabs,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
-    /// Apply one agenda command (add/patch/complete/reopen/retire).
+    /// Apply one agenda command (add/answer/patch/transitions/effects).
     AgendaOp,
     /// Merge-patch the owner's reminder delivery policy.
     AgendaReminderPolicy,
@@ -827,7 +827,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaWrite,
         BodyPolicy::Default,
         RouteHandlerId::AgendaOp,
-        "Apply one agenda command (add, patch, complete, reopen, or retire)",
+        "Apply one agenda command (add, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
     // Reminder delivery policy is owner policy, not agenda authorship:

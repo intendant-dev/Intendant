@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Command intake errors. The gateway maps `NotFound` to 404 and the two
-/// rejection variants to 400; `Io` is a daemon-side 500.
+/// Command intake errors. The gateway maps `NotFound` to 404, the two
+/// rejection variants to 400, `NotPermitted` to 403; `Io` is a
+/// daemon-side 500.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AgendaError {
     #[error("agenda item not found: {0}")]
@@ -22,6 +23,13 @@ pub(crate) enum AgendaError {
     Invalid(String),
     #[error("{0}")]
     Transition(String),
+    /// The rider's named denial: manifest approval/revocation is an
+    /// owner-surface act (mirrors Memory P1.2's `authorize_write`).
+    #[error(
+        "{verb} is an owner-surface act: {actor} actors may propose scheduled sessions \
+         but never approve them — ask the owner to review on the dashboard"
+    )]
+    NotPermitted { verb: &'static str, actor: String },
     #[error("agenda log I/O: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -30,7 +38,18 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 6] = ["add", "patch", "complete", "reopen", "retire", "answer"];
+const KNOWN_OPS: [&str; 10] = [
+    "add",
+    "patch",
+    "complete",
+    "reopen",
+    "retire",
+    "answer",
+    "propose_effect",
+    "approve_effect",
+    "revoke_effect",
+    "record_occurrence",
+];
 
 const LOG_FILE: &str = "agenda.jsonl";
 
@@ -58,6 +77,19 @@ pub(crate) struct AgendaStore {
     /// [`Self::refresh_if_stale`] refolds. Appends are `O_APPEND`, so
     /// interleaved single-line writes stay whole.
     folded_len: u64,
+}
+
+/// Facts of one scheduled-session occurrence outcome, written back by the
+/// scheduler. Bundled because they always travel together through the
+/// handle into the store's daemon-only `record_occurrence`.
+pub(crate) struct OccurrenceWriteBack<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) effect_id: &'a str,
+    pub(crate) occurrence_id: &'a str,
+    /// `started` | `completed` | `failed` | `missed` | `unknown`.
+    pub(crate) state: &'a str,
+    pub(crate) session_id: Option<String>,
+    pub(crate) note: Option<String>,
 }
 
 /// Fold raw log bytes into derived state: `(items, ops folded, lines skipped)`.
@@ -161,7 +193,8 @@ impl AgendaStore {
 
     /// Validate a frontend intent against current state, append the durable
     /// op, fold it, and return the item as it now stands. This is the only
-    /// write path — strictness lives here, not in the tolerant fold.
+    /// external write path — strictness lives here, not in the tolerant
+    /// fold. (`record_occurrence` is the one daemon-internal sibling.)
     pub(crate) fn apply_command(
         &mut self,
         cmd: AgendaCommand,
@@ -171,6 +204,15 @@ impl AgendaStore {
         // Validate against the freshest state another instance may have left.
         self.refresh_if_stale()?;
         let op = self.command_to_op(cmd)?;
+        self.append_op(op, actor, now_ms)
+    }
+
+    fn append_op(
+        &mut self,
+        op: AgendaOp,
+        actor: Option<AgendaActor>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
         let item_id = op.item_id().to_string();
         let record = AgendaOpRecord {
             v: AGENDA_LOG_VERSION,
@@ -184,14 +226,14 @@ impl AgendaStore {
         // One write_all per record: a crash tears at most the final line,
         // which `open` terminates and skips. Durability is append + flush
         // by ratified scope (no fsync in v1 — the delivery-critical
-        // occurrence journal in a later slice adds it where it matters).
+        // occurrence journal adds it where it matters).
         self.log.write_all(line.as_bytes())?;
         self.log.flush()?;
         self.folded_len += line.len() as u64;
         if let Some(reason) = apply_op(&mut self.items, &record) {
-            // Unreachable by construction: the command was validated
-            // against the exact state the fold sees.
-            eprintln!("[agenda] fold rejected a validated command: {reason}");
+            // Unreachable by construction: the op was validated against
+            // the exact state the fold sees.
+            eprintln!("[agenda] fold rejected a validated op: {reason}");
         }
         self.ops += 1;
         self.items
@@ -272,7 +314,124 @@ impl AgendaStore {
                     ))),
                 }
             }
+            AgendaCommand::ProposeEffect {
+                id,
+                goal,
+                fire_at_ms,
+                orchestrate,
+            } => {
+                let item = self.require(&id)?;
+                if item.status != AgendaStatus::Open {
+                    return Err(AgendaError::Transition(format!(
+                        "{id} is not open — reopen it before scheduling work on it"
+                    )));
+                }
+                if fire_at_ms == 0 {
+                    return Err(AgendaError::Invalid("fire_at_ms must be set".into()));
+                }
+                let goal = {
+                    let goal = goal.trim();
+                    if goal.is_empty() {
+                        return Err(AgendaError::Invalid("goal must not be empty".into()));
+                    }
+                    if goal.len() > MAX_BODY_BYTES {
+                        return Err(AgendaError::Invalid(format!(
+                            "goal exceeds {MAX_BODY_BYTES} bytes"
+                        )));
+                    }
+                    goal.to_string()
+                };
+                // v1: one session effect per item — a re-propose revises it
+                // (stable effect_id lineage, fresh digest, approval void).
+                let effect_id = item
+                    .effects
+                    .first()
+                    .map(|effect| effect.effect_id.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "ef-{}",
+                            &super::reminders::occurrence_id(&id, fire_at_ms)[..12]
+                        )
+                    });
+                Ok(AgendaOp::ProposeEffect {
+                    id,
+                    effect_id,
+                    manifest: super::types::SessionManifest {
+                        goal,
+                        fire_at_ms,
+                        orchestrate,
+                    },
+                })
+            }
+            AgendaCommand::ApproveEffect { id, digest } => {
+                let item = self.require(&id)?;
+                if item.status != AgendaStatus::Open {
+                    return Err(AgendaError::Transition(format!("{id} is not open")));
+                }
+                let Some(effect) = item.effects.first() else {
+                    return Err(AgendaError::NotFound(format!(
+                        "{id} has no proposed scheduled session"
+                    )));
+                };
+                if effect.approval.is_some() {
+                    return Err(AgendaError::Transition(format!(
+                        "{id}'s scheduled session is already approved — revoke first to re-review"
+                    )));
+                }
+                // The rider's binding rule: approval names exact bytes. A
+                // stale digest means the manifest changed since review.
+                if effect.digest != digest.trim() {
+                    return Err(AgendaError::Invalid(format!(
+                        "digest mismatch: the manifest was revised since it was reviewed \
+                         (current digest {})",
+                        effect.digest
+                    )));
+                }
+                Ok(AgendaOp::ApproveEffect {
+                    id,
+                    effect_id: effect.effect_id.clone(),
+                    digest: effect.digest.clone(),
+                })
+            }
+            AgendaCommand::RevokeEffect { id } => {
+                let item = self.require(&id)?;
+                let Some(effect) = item.effects.first() else {
+                    return Err(AgendaError::NotFound(format!(
+                        "{id} has no scheduled session"
+                    )));
+                };
+                if effect.approval.is_none() {
+                    return Err(AgendaError::Transition(format!(
+                        "{id}'s scheduled session is not approved"
+                    )));
+                }
+                Ok(AgendaOp::RevokeEffect {
+                    id,
+                    effect_id: effect.effect_id.clone(),
+                })
+            }
         }
+    }
+
+    /// Daemon-internal occurrence write-back (scheduler only — no command
+    /// twin exists, so no external surface reaches this). Appends the op
+    /// with no actor and folds it.
+    pub(crate) fn record_occurrence(
+        &mut self,
+        write: OccurrenceWriteBack<'_>,
+        now_ms: u64,
+    ) -> Result<AgendaItem, AgendaError> {
+        self.refresh_if_stale()?;
+        self.require(write.item_id)?;
+        let op = AgendaOp::RecordOccurrence {
+            id: write.item_id.to_string(),
+            effect_id: write.effect_id.to_string(),
+            occurrence_id: write.occurrence_id.to_string(),
+            state: write.state.to_string(),
+            session_id: write.session_id,
+            note: write.note.map(|n| n.chars().take(500).collect()),
+        };
+        self.append_op(op, None, now_ms)
     }
 
     fn require(&self, id: &str) -> Result<&AgendaItem, AgendaError> {

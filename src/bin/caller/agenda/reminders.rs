@@ -287,30 +287,47 @@ pub(crate) struct OccurrenceRecord {
     pub(crate) state: OccurrenceState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) urgency: Option<ReminderUrgency>,
+    /// The spawned session, on `started` records (A5 scheduled sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum OccurrenceState {
-    /// Fsync'd intent to deliver — precedes every delivery attempt.
+    /// Fsync'd intent to act — precedes every delivery/spawn attempt.
     Prepared,
-    /// Delivered through the ladder (terminal).
+    /// Delivered through the ladder (terminal; reminders).
     Delivered,
     /// Spent without delivery: muted item or reminders disabled (terminal).
     Suppressed,
-    /// Degraded into a missed-reminders digest entry (terminal).
+    /// Missed its window: digest entry (reminders) or never-spawned
+    /// scheduled session (terminal).
     Missed,
+    /// Scheduled session dispatched; the session id is on the record.
+    /// Non-terminal: a completion record follows.
+    Started,
+    /// The spawned session finished (terminal; RFC §7.5).
+    Completed,
+    /// The spawn or session failed (terminal).
+    Failed,
+    /// The executor lost sight of the occurrence — crashed pre-launch
+    /// confirmation or restarted mid-run. Fail-closed terminal per RFC
+    /// §7.5: never auto-retried; the owner re-approves to reschedule.
+    Unknown,
 }
 
 impl OccurrenceState {
     fn is_terminal(self) -> bool {
-        !matches!(self, OccurrenceState::Prepared)
+        !matches!(self, OccurrenceState::Prepared | OccurrenceState::Started)
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct OccurrenceProgress {
     pub(crate) prepared: bool,
+    /// Session id from a `started` record, while no terminal followed.
+    pub(crate) started: Option<String>,
     pub(crate) terminal: Option<OccurrenceState>,
 }
 
@@ -351,7 +368,7 @@ impl OccurrenceJournal {
     }
 
     pub(crate) fn progress(&self, occurrence_id: &str) -> OccurrenceProgress {
-        self.state.get(occurrence_id).copied().unwrap_or_default()
+        self.state.get(occurrence_id).cloned().unwrap_or_default()
     }
 
     /// Occurrences with a `prepared` record but no terminal one — a crash
@@ -363,6 +380,17 @@ impl OccurrenceJournal {
             .iter()
             .filter(|(_, progress)| progress.prepared && progress.terminal.is_none())
             .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// `started` occurrences with no terminal record — sessions this
+    /// executor launched and (after a restart) lost sight of. The boot
+    /// pass resolves them to `Unknown`, fail-closed per RFC §7.5.
+    pub(crate) fn started_unresolved(&self) -> Vec<(String, Option<String>)> {
+        self.state
+            .iter()
+            .filter(|(_, progress)| progress.started.is_some() && progress.terminal.is_none())
+            .map(|(id, progress)| (id.clone(), progress.started.clone()))
             .collect()
     }
 
@@ -380,12 +408,10 @@ impl OccurrenceJournal {
             self.file.sync_data()?;
         }
         self.folded_len += line.len() as u64;
-        let entry = self.state.entry(record.occurrence_id.clone()).or_default();
-        if record.state.is_terminal() {
-            entry.terminal = Some(record.state);
-        } else {
-            entry.prepared = true;
-        }
+        fold_record_into(
+            self.state.entry(record.occurrence_id.clone()).or_default(),
+            record,
+        );
         Ok(())
     }
 
@@ -412,6 +438,17 @@ impl OccurrenceJournal {
     }
 }
 
+fn fold_record_into(entry: &mut OccurrenceProgress, record: &OccurrenceRecord) {
+    match record.state {
+        OccurrenceState::Prepared => entry.prepared = true,
+        OccurrenceState::Started => {
+            entry.prepared = true;
+            entry.started = record.session_id.clone();
+        }
+        state => entry.terminal = Some(state),
+    }
+}
+
 fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
     let text = String::from_utf8_lossy(bytes);
     let mut state: BTreeMap<String, OccurrenceProgress> = BTreeMap::new();
@@ -422,12 +459,10 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
         }
         match serde_json::from_str::<OccurrenceRecord>(line) {
             Ok(record) => {
-                let entry = state.entry(record.occurrence_id.clone()).or_default();
-                if record.state.is_terminal() {
-                    entry.terminal = Some(record.state);
-                } else {
-                    entry.prepared = true;
-                }
+                fold_record_into(
+                    state.entry(record.occurrence_id.clone()).or_default(),
+                    &record,
+                );
             }
             Err(err) => {
                 // Torn tail or foreign vocabulary: skip, never brick.
@@ -448,6 +483,46 @@ pub(crate) struct DueOccurrence {
     pub(crate) urgency: ReminderUrgency,
 }
 
+/// One approved, due scheduled-session occurrence (A5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnOccurrence {
+    pub(crate) occurrence_id: String,
+    pub(crate) item_id: String,
+    pub(crate) effect_id: String,
+    pub(crate) goal: String,
+    pub(crate) orchestrate: bool,
+    pub(crate) fire_at_ms: u64,
+}
+
+/// Occurrence identity for a scheduled session: entry + effect + the
+/// approved revision digest + due instance — the RFC §7.5 shape. A
+/// re-approved new revision is a new occurrence; a spent one never
+/// refires.
+pub(crate) fn session_occurrence_id(
+    item_id: &str,
+    effect_id: &str,
+    digest: &str,
+    fire_at_ms: u64,
+) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"session\0");
+    hasher.update(item_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(effect_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(fire_at_ms.to_string().as_bytes());
+    let out = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in out.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// What the scheduler should do right now, plus when to wake next.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -456,6 +531,16 @@ pub(crate) struct Plan {
     pub(crate) deliver: Vec<DueOccurrence>,
     /// Degrade into one digest notification (past the staleness window).
     pub(crate) digest: Vec<DueOccurrence>,
+    /// Approved scheduled sessions whose instant arrived (A5). Quiet
+    /// hours deliberately do NOT defer these — they are notification
+    /// policy, and a 03:00 job was approved to run at 03:00.
+    pub(crate) spawn: Vec<SpawnOccurrence>,
+    /// Approved sessions whose window passed while the daemon was down:
+    /// never spawned, fail-closed (`missed` + a notification).
+    pub(crate) missed_sessions: Vec<SpawnOccurrence>,
+    /// `prepared`-but-never-`started` session occurrences (crash before
+    /// launch confirmation): resolved to `Unknown`, never auto-retried.
+    pub(crate) crashed: Vec<SpawnOccurrence>,
     /// Next instant (epoch ms) the scheduler must re-plan, if any.
     pub(crate) next_wake_ms: Option<u64>,
 }
@@ -463,21 +548,74 @@ pub(crate) struct Plan {
 /// The pure planner. `quiet_until_ms` is the precomputed end of the
 /// currently active quiet window (`None` when outside quiet hours) — the
 /// driver owns the local-timezone math so this stays clock-free.
+/// `in_flight` names session occurrences this process has dispatched but
+/// not yet seen acknowledged (they must not be re-planned or declared
+/// crashed while the receipt is in transit).
 pub(crate) fn plan(
     items: &[AgendaItem],
     journal: &OccurrenceJournal,
     policy: &ReminderPolicy,
     now_ms: u64,
     quiet_until_ms: Option<u64>,
+    in_flight: &std::collections::HashSet<String>,
 ) -> Plan {
     let mut plan = Plan::default();
-    if !policy.enabled {
-        return plan;
-    }
     let staleness_ms = policy.staleness_ms();
     let consider_wake = |instant: u64, plan: &mut Plan| {
         plan.next_wake_ms = Some(plan.next_wake_ms.map_or(instant, |cur| cur.min(instant)));
     };
+
+    // Scheduled sessions (A5): independent of the reminder switch and of
+    // quiet hours — an approved manifest is its own owner decision.
+    for item in items {
+        if item.status != AgendaStatus::Open {
+            continue;
+        }
+        for effect in &item.effects {
+            let Some(approval) = &effect.approval else {
+                continue;
+            };
+            let occurrence_id = session_occurrence_id(
+                &item.id,
+                &effect.effect_id,
+                &approval.digest,
+                effect.manifest.fire_at_ms,
+            );
+            if in_flight.contains(&occurrence_id) {
+                continue;
+            }
+            let progress = journal.progress(&occurrence_id);
+            if progress.terminal.is_some() || progress.started.is_some() {
+                continue;
+            }
+            let spawn = SpawnOccurrence {
+                occurrence_id,
+                item_id: item.id.clone(),
+                effect_id: effect.effect_id.clone(),
+                goal: effect.manifest.goal.clone(),
+                orchestrate: effect.manifest.orchestrate,
+                fire_at_ms: effect.manifest.fire_at_ms,
+            };
+            if progress.prepared {
+                // Crash between prepare and launch confirmation: fail
+                // closed — a session is high-impact work (RFC §7.5).
+                plan.crashed.push(spawn);
+                continue;
+            }
+            let fire_at = effect.manifest.fire_at_ms;
+            if fire_at > now_ms {
+                consider_wake(fire_at, &mut plan);
+            } else if now_ms.saturating_sub(fire_at) > staleness_ms {
+                plan.missed_sessions.push(spawn);
+            } else {
+                plan.spawn.push(spawn);
+            }
+        }
+    }
+
+    if !policy.enabled {
+        return plan;
+    }
     // Quiet hours defer every due delivery to the window's end.
     let effective_now_gate = quiet_until_ms.filter(|q| *q > now_ms);
 
@@ -541,6 +679,7 @@ mod tests {
             updated_ms: 1,
             completed_ms: None,
             answer: None,
+            effects: Vec::new(),
         }
     }
 
@@ -588,7 +727,7 @@ mod tests {
             item("no-due", AgendaStatus::Open, None),
         ];
 
-        let plan_now = plan(&items, &journal, &policy, 2_000, None);
+        let plan_now = plan(&items, &journal, &policy, 2_000, None, &Default::default());
         assert_eq!(plan_now.deliver.len(), 1);
         assert_eq!(plan_now.deliver[0].item_id, "a");
         assert!(plan_now.digest.is_empty());
@@ -606,6 +745,7 @@ mod tests {
                 due_ms: occ.due_ms,
                 state: OccurrenceState::Prepared,
                 urgency: None,
+                session_id: None,
             })
             .unwrap();
         journal
@@ -617,9 +757,10 @@ mod tests {
                 due_ms: occ.due_ms,
                 state: OccurrenceState::Delivered,
                 urgency: Some(ReminderUrgency::Attention),
+                session_id: None,
             })
             .unwrap();
-        let again = plan(&items, &journal, &policy, 2_500, None);
+        let again = plan(&items, &journal, &policy, 2_500, None, &Default::default());
         assert!(again.deliver.is_empty());
         assert_eq!(again.next_wake_ms, Some(5_000));
     }
@@ -647,6 +788,7 @@ mod tests {
                         due_ms: 1_000,
                         state: OccurrenceState::Prepared,
                         urgency: None,
+                        session_id: None,
                     })
                     .unwrap();
                 if terminal {
@@ -659,6 +801,7 @@ mod tests {
                             due_ms: 1_000,
                             state: OccurrenceState::Delivered,
                             urgency: None,
+                            session_id: None,
                         })
                         .unwrap();
                 }
@@ -666,7 +809,7 @@ mod tests {
         }
         let journal = journal(dir.path());
         assert_eq!(journal.unresolved(), vec![occurrence_id("torn-one", 1_000)]);
-        let replanned = plan(&items, &journal, &policy, 2_000, None);
+        let replanned = plan(&items, &journal, &policy, 2_000, None, &Default::default());
         assert_eq!(replanned.deliver.len(), 1);
         assert_eq!(replanned.deliver[0].item_id, "torn-one");
     }
@@ -677,11 +820,18 @@ mod tests {
         let journal = journal(dir.path());
         let policy = ReminderPolicy::default();
         let items = vec![item("a", AgendaStatus::Open, Some(1_000))];
-        let deferred = plan(&items, &journal, &policy, 2_000, Some(9_000));
+        let deferred = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            Some(9_000),
+            &Default::default(),
+        );
         assert!(deferred.deliver.is_empty());
         assert_eq!(deferred.next_wake_ms, Some(9_000));
         // At the window's end the delivery proceeds.
-        let fired = plan(&items, &journal, &policy, 9_000, None);
+        let fired = plan(&items, &journal, &policy, 9_000, None, &Default::default());
         assert_eq!(fired.deliver.len(), 1);
     }
 
@@ -698,7 +848,7 @@ mod tests {
             // Over the 12h window: degrades to the digest.
             item("stale", AgendaStatus::Open, Some(now - twelve_h - 60_000)),
         ];
-        let planned = plan(&items, &journal, &policy, now, None);
+        let planned = plan(&items, &journal, &policy, now, None, &Default::default());
         assert_eq!(planned.deliver.len(), 1);
         assert_eq!(planned.deliver[0].item_id, "fresh");
         assert_eq!(planned.digest.len(), 1);
@@ -721,7 +871,7 @@ mod tests {
             item("quiet", AgendaStatus::Open, Some(1_000)),
             item("plain", AgendaStatus::Open, Some(1_000)),
         ];
-        let planned = plan(&items, &journal, &policy, 2_000, None);
+        let planned = plan(&items, &journal, &policy, 2_000, None, &Default::default());
         let urgency_of = |id: &str| {
             planned
                 .deliver
@@ -734,7 +884,7 @@ mod tests {
         assert_eq!(urgency_of("plain"), Some(ReminderUrgency::Attention));
 
         policy.enabled = false;
-        let disabled = plan(&items, &journal, &policy, 2_000, None);
+        let disabled = plan(&items, &journal, &policy, 2_000, None, &Default::default());
         assert_eq!(disabled, Plan::default());
     }
 
@@ -757,17 +907,32 @@ mod tests {
                     due_ms: 1_000,
                     state,
                     urgency: None,
+                    session_id: None,
                 })
                 .unwrap();
         }
         // Same item, same due, reopened: spent occurrence stays spent.
         let reopened = vec![item("a", AgendaStatus::Open, Some(1_000))];
-        assert!(plan(&reopened, &journal, &policy, 2_000, None)
-            .deliver
-            .is_empty());
+        assert!(plan(
+            &reopened,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default()
+        )
+        .deliver
+        .is_empty());
         // Patched due: a new occurrence plans fresh.
         let rescheduled = vec![item("a", AgendaStatus::Open, Some(3_000))];
-        let planned = plan(&rescheduled, &journal, &policy, 4_000, None);
+        let planned = plan(
+            &rescheduled,
+            &journal,
+            &policy,
+            4_000,
+            None,
+            &Default::default(),
+        );
         assert_eq!(planned.deliver.len(), 1);
         assert_ne!(planned.deliver[0].occurrence_id, old_occ);
     }
