@@ -166,8 +166,15 @@ pub enum AppEvent {
     },
     AgentOutput {
         session_id: Option<String>,
-        stdout: String,
-        stderr: String,
+        /// Full stream content as `Arc<str>` (same rationale as
+        /// `ModelResponseDelta.text`): a tool batch's stdout/stderr can run
+        /// to tens of MiB, and the broadcast ring clones the whole event
+        /// once per subscriber — a shared payload makes each of those
+        /// clones a refcount bump instead of a heap copy. Internal
+        /// consumers see the full content; the outbound wire edge
+        /// (`app_event_to_outbound`) forwards a bounded preview.
+        stdout: Arc<str>,
+        stderr: Arc<str>,
         source: Option<String>,
         output_id: Option<String>,
         /// The originating tool call (`AgentStarted.item_id`) when the
@@ -2359,14 +2366,24 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             source,
             output_id,
             item_id,
-        } => Some(OutboundEvent::AgentOutput {
-            session_id: session_id.clone(),
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            source: source.clone(),
-            output_id: output_id.clone(),
-            item_id: item_id.clone(),
-        }),
+        } => {
+            // Wire edge: every WS connection JSON-escapes and sends this
+            // payload, so it carries a bounded per-stream preview. The full
+            // output is already persisted inline by the session log at the
+            // emit site; frontends fetch it by `output_id` on demand.
+            let (stdout, stdout_truncated) = crate::types::agent_output_wire_preview(stdout);
+            let (stderr, stderr_truncated) = crate::types::agent_output_wire_preview(stderr);
+            Some(OutboundEvent::AgentOutput {
+                session_id: session_id.clone(),
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                source: source.clone(),
+                output_id: output_id.clone(),
+                item_id: item_id.clone(),
+            })
+        }
         AppEvent::DoneSignal {
             session_id,
             message,
@@ -5784,8 +5801,8 @@ mod tests {
     fn outbound_agent_output() {
         let event = AppEvent::AgentOutput {
             session_id: None,
-            stdout: "hello".to_string(),
-            stderr: "".to_string(),
+            stdout: "hello".into(),
+            stderr: "".into(),
             source: None,
             output_id: None,
             item_id: None,
@@ -5794,6 +5811,108 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
         assert!(json.contains("\"hello\""));
+    }
+
+    /// Under-cap agent output serializes byte-identically to the pre-flag
+    /// wire format: the additive `*_truncated` fields are skipped while
+    /// false, so existing consumers observe an unchanged wire.
+    #[test]
+    fn outbound_agent_output_under_cap_wire_json_is_pinned() {
+        let event = AppEvent::AgentOutput {
+            session_id: Some("sess-1".to_string()),
+            stdout: "hello".into(),
+            stderr: "oops".into(),
+            source: Some("Codex".to_string()),
+            output_id: Some("out-1".to_string()),
+            item_id: Some("call-1".to_string()),
+        };
+        let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            "{\"event\":\"agent_output\",\"session_id\":\"sess-1\",\"stdout\":\"hello\",\
+             \"stderr\":\"oops\",\"source\":\"Codex\",\"output_id\":\"out-1\",\
+             \"item_id\":\"call-1\"}"
+        );
+
+        let event = AppEvent::AgentOutput {
+            session_id: None,
+            stdout: "ok".into(),
+            stderr: "".into(),
+            source: None,
+            output_id: None,
+            item_id: None,
+        };
+        let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            "{\"event\":\"agent_output\",\"stdout\":\"ok\",\"stderr\":\"\"}"
+        );
+    }
+
+    /// Over-cap streams are clipped to the wire preview cap on a char
+    /// boundary, per stream, with the matching flag set; `output_id` (the
+    /// full-output fetch key) rides through untouched.
+    #[test]
+    fn outbound_agent_output_over_cap_is_bounded_flagged_char_safe() {
+        let cap = crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES;
+        // 3-byte chars guarantee the cap lands mid-char.
+        let ch = '\u{2713}';
+        let big: String = ch.to_string().repeat(cap / 3 + 10);
+        let event = AppEvent::AgentOutput {
+            session_id: None,
+            stdout: big.as_str().into(),
+            stderr: "small".into(),
+            source: None,
+            output_id: Some("out-9".to_string()),
+            item_id: None,
+        };
+        match app_event_to_outbound(&event).unwrap() {
+            crate::types::OutboundEvent::AgentOutput {
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+                output_id,
+                ..
+            } => {
+                assert!(stdout.len() <= cap);
+                assert!(
+                    stdout.len() > cap - 4,
+                    "clip must stop at the boundary char"
+                );
+                assert!(stdout.chars().all(|c| c == ch));
+                assert!(big.starts_with(&*stdout));
+                assert!(stdout_truncated);
+                assert_eq!(&*stderr, "small");
+                assert!(!stderr_truncated);
+                assert_eq!(output_id.as_deref(), Some("out-9"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
+        }
+        let json = serde_json::to_string(&app_event_to_outbound(&event).unwrap()).unwrap();
+        assert!(json.contains("\"stdout_truncated\":true"));
+        assert!(!json.contains("stderr_truncated"));
+    }
+
+    /// The pre-flag wire shape (an older peer's stream) deserializes with
+    /// both flags defaulting to false.
+    #[test]
+    fn outbound_agent_output_legacy_wire_without_flags_deserializes() {
+        let legacy =
+            "{\"event\":\"agent_output\",\"stdout\":\"hi\",\"stderr\":\"\",\"output_id\":\"o\"}";
+        match serde_json::from_str::<crate::types::OutboundEvent>(legacy).unwrap() {
+            crate::types::OutboundEvent::AgentOutput {
+                stdout,
+                stdout_truncated,
+                stderr_truncated,
+                ..
+            } => {
+                assert_eq!(&*stdout, "hi");
+                assert!(!stdout_truncated);
+                assert!(!stderr_truncated);
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
+        }
     }
 
     #[test]
@@ -5962,8 +6081,8 @@ mod tests {
             &shared,
             &AppEvent::AgentOutput {
                 session_id: None,
-                stdout: "already logged inline".to_string(),
-                stderr: String::new(),
+                stdout: "already logged inline".into(),
+                stderr: "".into(),
                 source: Some("Codex".to_string()),
                 output_id: Some("out-1".to_string()),
                 item_id: None,

@@ -226,6 +226,37 @@ fn default_true() -> bool {
     true
 }
 
+/// Serde skip helper for additive `bool` flags: a `false` flag is omitted
+/// from the wire so payloads that don't exercise the flag serialize
+/// byte-identically to the pre-flag format.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Per-stream byte cap for `agent_output` payloads on the outbound wire
+/// (WebSocket broadcast, control socket, bootstrap replay). Tool output up
+/// to the runtime's 64 MiB stream cap is persisted in full by the session
+/// log — the wire carries at most this much per stream plus a
+/// `*_truncated` flag, and frontends fetch the full text on demand via the
+/// agent-output endpoint (`output_id` is the fetch key). The session-log
+/// replay clip and the peer-upcast bound derive from this constant.
+pub const AGENT_OUTPUT_WIRE_PREVIEW_BYTES: usize = 64 * 1024;
+
+/// Bound one `agent_output` stream for the wire: under the cap the shared
+/// payload is forwarded as-is (a refcount bump, byte-identical wire JSON);
+/// over the cap a char-boundary-safe prefix is copied out and the
+/// truncation flag is set.
+pub fn agent_output_wire_preview(full: &std::sync::Arc<str>) -> (std::sync::Arc<str>, bool) {
+    if full.len() <= AGENT_OUTPUT_WIRE_PREVIEW_BYTES {
+        (std::sync::Arc::clone(full), false)
+    } else {
+        (
+            std::sync::Arc::from(truncate_str(full, AGENT_OUTPUT_WIRE_PREVIEW_BYTES)),
+            true,
+        )
+    }
+}
+
 /// One image attached to a display-only session note. A *reference* to a
 /// blob committed into the session's upload store — never inline bytes:
 /// the WebSocket broadcast and the session log both stay small, and the
@@ -268,8 +299,24 @@ pub enum OutboundEvent {
     AgentOutput {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        stdout: String,
-        stderr: String,
+        /// Bounded preview of the stream (`AGENT_OUTPUT_WIRE_PREVIEW_BYTES`
+        /// per stream at the `app_event_to_outbound` edge). `Arc<str>`,
+        /// like `ModelResponseDelta.text`: shared with
+        /// `AppEvent::AgentOutput` so an under-cap conversion is a refcount
+        /// bump, and serde (`rc` feature) serializes it exactly like
+        /// `String` — the wire format is unchanged.
+        stdout: std::sync::Arc<str>,
+        stderr: std::sync::Arc<str>,
+        /// True when `stdout` was clipped to the wire preview cap. The full
+        /// stream stays persisted in the session log; fetch it by
+        /// `output_id` via the agent-output endpoint / tunnel method.
+        /// Additive: absent (false) on under-cap events, so those serialize
+        /// byte-identically to the pre-flag wire format.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stdout_truncated: bool,
+        /// `stdout_truncated`'s twin for the stderr stream.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stderr_truncated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

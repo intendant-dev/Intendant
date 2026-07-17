@@ -20,6 +20,24 @@ pub(crate) fn read_event_file_span(
     offset_key: Option<&str>,
     len_key: Option<&str>,
 ) -> Option<String> {
+    read_event_file_span_bounded(entry, log_dir, file_key, offset_key, len_key, None)
+}
+
+/// [`read_event_file_span`] with an optional byte bound: at most
+/// `max_bytes` are read (span path) or kept (whole-file fallback), so
+/// replaying a row whose sidecar holds tens of MiB never materializes the
+/// full stream. A bounded read that lands mid-UTF-8-char is trimmed back
+/// to the last complete char; invalid UTF-8 that is *not* a clip artifact
+/// (an error more than one char short of the clipped end) keeps the
+/// unbounded path's `None` so legacy fallbacks behave identically.
+fn read_event_file_span_bounded(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    file_key: &str,
+    offset_key: Option<&str>,
+    len_key: Option<&str>,
+    max_bytes: Option<usize>,
+) -> Option<String> {
     let rel = entry.get(file_key)?.as_str()?;
     let path = log_dir.join(rel);
     let data = entry.get("data");
@@ -28,13 +46,38 @@ pub(crate) fn read_event_file_span(
 
     match (offset, len) {
         (Some(offset), Some(len)) => {
+            let read_len = match max_bytes {
+                Some(max) => (len as usize).min(max),
+                None => len as usize,
+            };
             let mut file = File::open(path).ok()?;
             file.seek(SeekFrom::Start(offset)).ok()?;
-            let mut buf = vec![0_u8; len as usize];
+            let mut buf = vec![0_u8; read_len];
             file.read_exact(&mut buf).ok()?;
-            String::from_utf8(buf).ok()
+            let clipped = read_len < len as usize;
+            match String::from_utf8(buf) {
+                Ok(s) => Some(s),
+                // Only a clipped read may trim: the recorded span is valid
+                // UTF-8 as written, so an error within the final char of
+                // the clipped buffer is the clip boundary, not corruption.
+                Err(e) if clipped && e.utf8_error().valid_up_to() + 4 > read_len => {
+                    let valid = e.utf8_error().valid_up_to();
+                    let mut bytes = e.into_bytes();
+                    bytes.truncate(valid);
+                    String::from_utf8(bytes).ok()
+                }
+                Err(_) => None,
+            }
         }
-        _ => fs::read_to_string(path).ok(),
+        _ => {
+            let content = fs::read_to_string(path).ok()?;
+            Some(match max_bytes {
+                Some(max) if content.len() > max => {
+                    crate::types::truncate_str(&content, max).to_string()
+                }
+                _ => content,
+            })
+        }
     }
 }
 
@@ -528,20 +571,32 @@ pub fn session_log_entry_to_app_event(
             })
         }
         "agent_output" => {
-            let stdout = read_event_file_span(
+            // Replay is a wire path (bootstrap → `app_event_to_outbound` →
+            // every reconnecting tab), so the streams are clipped to just
+            // over the wire preview cap: enough that the outbound edge
+            // still detects the overflow and sets the `*_truncated` flags,
+            // without materializing a multi-MB sidecar per reconnect. The
+            // legacy fallbacks are unchanged: rows without spans read the
+            // whole sidecar (now clipped the same way), and rows without a
+            // readable sidecar fall back to the 200-char `message`
+            // preview for stdout / empty stderr, exactly as before.
+            const REPLAY_CLIP: usize = crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES + 16;
+            let stdout = read_event_file_span_bounded(
                 entry,
                 log_dir,
                 "file",
                 Some("stdout_offset"),
                 Some("stdout_bytes"),
+                Some(REPLAY_CLIP),
             )
             .unwrap_or_else(|| message.to_string());
-            let stderr = read_event_file_span(
+            let stderr = read_event_file_span_bounded(
                 entry,
                 log_dir,
                 "file2",
                 Some("stderr_offset"),
                 Some("stderr_bytes"),
+                Some(REPLAY_CLIP),
             )
             .unwrap_or_default();
             let source = data
@@ -562,8 +617,8 @@ pub fn session_log_entry_to_app_event(
                 .map(String::from);
             Some(AppEvent::AgentOutput {
                 session_id,
-                stdout,
-                stderr,
+                stdout: stdout.into(),
+                stderr: stderr.into(),
                 source,
                 output_id,
                 item_id,
@@ -1727,7 +1782,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(session_id.as_deref(), Some("child-thread"));
-                assert_eq!(stdout, "child stdout");
+                assert_eq!(&*stdout, "child stdout");
                 assert_eq!(source.as_deref(), Some("Codex"));
                 assert_eq!(output_id.as_deref(), Some("out-1"));
                 assert_eq!(item_id.as_deref(), Some("call-9"));
@@ -2030,9 +2085,92 @@ mod tests {
             } => {
                 // Full content read from turn file, not truncated preview.
                 assert_eq!(stdout.len(), 600);
-                assert_eq!(stdout, big_stdout);
-                assert_eq!(stderr, "small stderr");
+                assert_eq!(&*stdout, big_stdout);
+                assert_eq!(&*stderr, "small stderr");
                 assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
+        }
+    }
+
+    /// Replaying a row whose sidecar stream exceeds the wire preview cap
+    /// clips just above the cap (multibyte-safe, never the full stream)
+    /// and still trips the outbound edge's truncation flag, with the
+    /// full-output fetch key intact.
+    #[test]
+    fn rt_agent_output_replay_clips_above_wire_cap() {
+        let cap = crate::types::AGENT_OUTPUT_WIRE_PREVIEW_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        // 2-byte chars, ~2x the cap: the bounded span read lands mid-char
+        // and must trim back to a complete one.
+        let big_stdout: String = "\u{00e9}".repeat(cap);
+        log.agent_output_with_id(&big_stdout, "small stderr", Some("Codex"), Some("out-clip"));
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "agent_output");
+        let event = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        match &event {
+            AppEvent::AgentOutput {
+                stdout,
+                stderr,
+                output_id,
+                ..
+            } => {
+                assert!(
+                    stdout.len() > cap,
+                    "replay clip must stay above the wire cap so the flag fires"
+                );
+                assert!(stdout.len() <= cap + 16);
+                assert!(big_stdout.starts_with(&**stdout));
+                assert_eq!(&**stderr, "small stderr");
+                assert_eq!(output_id.as_deref(), Some("out-clip"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
+        }
+        match crate::event::app_event_to_outbound(&event).unwrap() {
+            crate::types::OutboundEvent::AgentOutput {
+                stdout,
+                stdout_truncated,
+                stderr_truncated,
+                output_id,
+                ..
+            } => {
+                assert!(stdout.len() <= cap);
+                assert!(stdout_truncated);
+                assert!(!stderr_truncated);
+                assert_eq!(output_id.as_deref(), Some("out-clip"));
+            }
+            other => panic!("expected outbound AgentOutput, got {:?}", other),
+        }
+    }
+
+    /// A row whose sidecar is gone falls back to the 200-char `message`
+    /// preview for stdout and empty stderr — the legacy path, unchanged
+    /// by the replay clip (and under-cap, so no flag fires downstream).
+    #[test]
+    fn rt_agent_output_missing_sidecar_falls_back_to_message_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(&log_dir).unwrap();
+        let entry = serde_json::json!({
+            "event": "agent_output",
+            "message": "preview text",
+            "file": "turns/does-not-exist.txt",
+            "data": {"output_id": "out-legacy"}
+        });
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AgentOutput {
+                stdout,
+                stderr,
+                output_id,
+                ..
+            } => {
+                assert_eq!(&*stdout, "preview text");
+                assert_eq!(&*stderr, "");
+                assert_eq!(output_id.as_deref(), Some("out-legacy"));
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }

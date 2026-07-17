@@ -249,8 +249,10 @@ mod tests {
     fn outbound_event_agent_output_serialize() {
         let event = OutboundEvent::AgentOutput {
             session_id: None,
-            stdout: "hello".to_string(),
-            stderr: "".to_string(),
+            stdout: "hello".into(),
+            stderr: "".into(),
+            stdout_truncated: false,
+            stderr_truncated: false,
             source: None,
             output_id: None,
             item_id: None,
