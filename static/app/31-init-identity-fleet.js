@@ -783,6 +783,13 @@ const filesStagedUploads = new Map();
 const peerFileTransferConnections = new Map();
 const peerDashboardControlConnections = new Map(); // hostId|sessionId -> PeerDashboardControlConnection
 const peerDashboardControlConnectionsByHost = new Map(); // hostId -> PeerDashboardControlConnection
+// Same deep-link TDZ rule for #stats: fragment 48's initial route apply
+// runs switchTab('stats') → renderStatsForActiveHost() →
+// loadAllSessionsUsage() during script evaluation, before fragment 53's
+// top-level declarations initialize. The usage-corpus TTL state
+// therefore lives here with the rest of the early state.
+const STATS_USAGE_FORCE_TTL_MS = 45_000;
+const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
