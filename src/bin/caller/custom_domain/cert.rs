@@ -10,6 +10,7 @@ const CERT_FILE: &str = "custom-domain-cert.pem";
 const KEY_FILE: &str = "custom-domain-key.pem";
 const CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 const RENEW_BEFORE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const DNS_CHALLENGE_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 pub(super) fn restore(
     domain: &ValidatedCustomDomain,
@@ -91,6 +92,11 @@ pub(super) fn relay_certificate_material(
         return Err("custom-domain certificate is expired".to_string());
     }
     crate::web_tls::validate_custom_domain_certificate_key_pair(&cert_pem, &key_pem)?;
+    // Certificate files are shared across daemon processes, while the TLS
+    // resolver is process-local. Install the exact generation this poll is
+    // about to prove before advertising that this process can receive its
+    // relay dialbacks.
+    crate::web_tls::install_custom_domain_certificate(&domain.name, &cert_pem, &key_pem)?;
     Ok((cert_pem, key_pem))
 }
 
@@ -133,7 +139,11 @@ async fn ensure_certificate(
     // A prior crash/cancellation may have left the exact DNS-01 value live.
     // Clear its durable journal before account work or a new order so retries
     // never stack stale authority records.
-    super::dns::retry_pending_challenge(cert_dir).await?;
+    if !super::dns::retry_pending_challenge(cert_dir).await? {
+        return Err(
+            "a custom-domain DNS challenge is active in another daemon process".to_string(),
+        );
+    }
     if crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name)? {
         return Err(
             "custom-domain name overlaps a service-controlled fleet name or zone".to_string(),
@@ -182,6 +192,7 @@ async fn request_certificate(
         .await
         .map_err(|error| format!("custom-domain ACME new order: {error}"))?;
 
+    let mut dns_challenge_lease = None;
     let authorization_result: Result<(), String> = async {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
@@ -200,10 +211,21 @@ async fn request_certificate(
                 .challenge(instant_acme::ChallengeType::Dns01)
                 .ok_or_else(|| "custom-domain ACME order offers no dns-01 challenge".to_string())?;
             let value = challenge.key_authorization().dns_value();
-            super::dns::set_challenge_in(dns_config, &domain.name, &value, cert_dir).await?;
-            let delay = super::dns::propagation_delay_secs(dns_config);
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+            let lease =
+                super::dns::set_challenge_in(dns_config, &domain.name, &value, cert_dir).await?;
+            dns_challenge_lease = Some(lease);
+            let mut propagation_wait =
+                Duration::from_secs(super::dns::propagation_delay_secs(dns_config));
+            while !propagation_wait.is_zero() {
+                let wait = propagation_wait.min(DNS_CHALLENGE_LEASE_RENEW_INTERVAL);
+                tokio::time::sleep(wait).await;
+                propagation_wait = propagation_wait.saturating_sub(wait);
+                super::dns::renew_pending_challenge(
+                    cert_dir,
+                    dns_challenge_lease
+                        .as_ref()
+                        .expect("DNS challenge lease was just stored"),
+                )?;
             }
             challenge
                 .set_ready()
@@ -223,7 +245,19 @@ async fn request_certificate(
     }
     .await;
 
-    if let Err(cleanup_error) = super::dns::retry_pending_challenge(cert_dir).await {
+    let cleanup_result = if let Some(lease) = dns_challenge_lease.as_ref() {
+        match super::dns::mark_pending_challenge_cleanup(cert_dir, lease) {
+            Ok(()) => match super::dns::retry_pending_challenge(cert_dir).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err("custom-domain DNS-01 cleanup is still leased".to_string()),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(())
+    };
+    if let Err(cleanup_error) = cleanup_result {
         return Err(match authorization_result {
             Ok(()) => format!("custom-domain DNS-01 cleanup remains pending: {cleanup_error}"),
             Err(authorization_error) => format!(

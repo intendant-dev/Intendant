@@ -312,9 +312,11 @@ Connect ever terminating TLS or seeing plaintext:
   tunnel opens a second connection to a dedicated, ephemeral,
   loopback-only gateway ingress instead of the public gateway listener.
 - Control protocol v2 also binds a normalized, sorted list of exact custom
-  names into that daemon signature. An exact SNI claim routes only when one
-  active tunnel owns it; competing live claims fail closed. The derived
-  fleet-label route remains available for rolling v1 compatibility.
+  names and a process-stable poller id into that daemon signature. Exact-name
+  liveness and dialbacks remain attached to the v2 poller that supplied the
+  certificate proof; a rolling v1 sibling can refresh and consume only the
+  derived fleet-label fallback. An exact SNI claim routes only when one daemon
+  identity owns it; competing live claims fail closed.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 

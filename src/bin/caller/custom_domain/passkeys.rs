@@ -177,23 +177,37 @@ impl PasskeyRuntime {
         cert_dir: PathBuf,
         hosted: Arc<HostedControlRuntime>,
     ) -> Result<Self, String> {
-        let store = load_store(&cert_dir, &domain)?;
         crate::access::authority_store::with_lock(&cert_dir, || {
-            load_ceremony_store_locked(&cert_dir, &domain)
-                .map(|_| ())
-                .map_err(crate::access::AccessError)
+            let store_missing = match std::fs::metadata(store_path(&cert_dir)) {
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    return Err(crate::access::AccessError(format!(
+                        "inspect {}: {error}",
+                        store_path(&cert_dir).display()
+                    )));
+                }
+            };
+            let store = load_store(&cert_dir, &domain).map_err(crate::access::AccessError)?;
+            if store_missing {
+                save_store_locked(&cert_dir, &store)?;
+            }
+            load_ceremony_store_locked(&cert_dir, &domain).map_err(crate::access::AccessError)?;
+            Ok(store)
         })
-        .map_err(|error| error.to_string())?;
-        let webauthn = Webauthn::new(&domain.rp_id, "Intendant", &domain.origin)
-            .require_user_verification(true)
-            .authenticator_attachment(Attachment::Any)
-            .strict_base64(true);
-        Ok(Self {
-            domain,
-            cert_dir,
-            webauthn,
-            store: Mutex::new(store),
-            hosted,
+        .map_err(|error| error.to_string())
+        .map(|store| {
+            let webauthn = Webauthn::new(&domain.rp_id, "Intendant", &domain.origin)
+                .require_user_verification(true)
+                .authenticator_attachment(Attachment::Any)
+                .strict_base64(true);
+            Self {
+                domain,
+                cert_dir,
+                webauthn,
+                store: Mutex::new(store),
+                hosted,
+            }
         })
     }
 
@@ -508,7 +522,7 @@ impl PasskeyRuntime {
             let mut cached = self.store.lock().map_err(|_| {
                 crate::access::AccessError("custom-domain passkey store is unavailable".to_string())
             })?;
-            let fresh = load_current_store_locked(&self.cert_dir, &self.domain, &cached)
+            let fresh = load_current_store_locked(&self.cert_dir, &self.domain)
                 .map_err(crate::access::AccessError)?;
             *cached = fresh;
             read(&cached).map_err(crate::access::AccessError)
@@ -524,7 +538,7 @@ impl PasskeyRuntime {
             let mut cached = self.store.lock().map_err(|_| {
                 crate::access::AccessError("custom-domain passkey store is unavailable".to_string())
             })?;
-            let mut fresh = load_current_store_locked(&self.cert_dir, &self.domain, &cached)
+            let mut fresh = load_current_store_locked(&self.cert_dir, &self.domain)
                 .map_err(crate::access::AccessError)?;
             let (value, changed) = update(&mut fresh).map_err(crate::access::AccessError)?;
             if changed {
@@ -758,11 +772,13 @@ fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<Passkey
 fn load_current_store_locked(
     cert_dir: &Path,
     domain: &ValidatedCustomDomain,
-    cached: &PasskeyStore,
 ) -> Result<PasskeyStore, String> {
     match std::fs::metadata(store_path(cert_dir)) {
         Ok(_) => load_store(cert_dir, domain),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(cached.clone()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{} disappeared after passkey initialization",
+            store_path(cert_dir).display()
+        )),
         Err(error) => Err(format!(
             "inspect {}: {error}",
             store_path(cert_dir).display()
@@ -855,6 +871,24 @@ mod tests {
             String::new(),
             false,
         ))
+    }
+
+    #[test]
+    fn empty_store_identity_is_persisted_before_ceremonies_are_exposed() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let hosted = hosted_runtime(dir.path());
+        let first = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        let first_user_id = first.store.lock().unwrap().user_id;
+        assert!(store_path(dir.path()).is_file());
+
+        let second = PasskeyRuntime::new(domain, dir.path().to_path_buf(), hosted).unwrap();
+        assert_eq!(second.store.lock().unwrap().user_id, first_user_id);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub(crate) const RELAY_MAX_CONNS_PER_IP: u32 = 64;
 pub(crate) const RELAY_MAX_CONNS_PER_TUNNEL: u32 = 128;
 /// Max unclaimed dial-back nonces queued for one tunnel's control poll.
 pub(crate) const RELAY_MAX_PENDING_PER_TUNNEL: usize = 64;
+/// Max independently proved v2 pollers retained for one daemon label. Poller
+/// state is process-scoped, so bound it separately from the daemon registry.
+const RELAY_MAX_EXACT_POLLERS_PER_TUNNEL: usize = 16;
 /// Idle teardown: a spliced connection with no bytes in either direction for
 /// this long is closed.
 pub(crate) const RELAY_SPLICE_IDLE: Duration = Duration::from_secs(120);
@@ -250,14 +253,31 @@ fn sni_route_label(sni: &str) -> Option<String> {
 
 // ── Relay state ─────────────────────────────────────────────────────────────
 
-/// A daemon's live control-channel presence plus its queue of unclaimed
-/// dial-back nonces.
-struct TunnelEntry {
+struct ExactTunnelSession {
     last_seen_unix_ms: u64,
     pending: VecDeque<String>,
-    /// Exact SNI names bound into the daemon-signed v2 control registration.
-    /// The derived fleet label remains the rolling-compatibility route.
     server_names: Vec<String>,
+}
+
+/// A daemon label's fallback presence plus independently proved v2 pollers.
+struct TunnelEntry {
+    fallback_last_seen_unix_ms: u64,
+    fallback_pending: VecDeque<String>,
+    exact_sessions: HashMap<String, ExactTunnelSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TunnelRoute {
+    Fallback { label: String },
+    Exact { label: String, poller_id: String },
+}
+
+impl TunnelRoute {
+    fn label(&self) -> &str {
+        match self {
+            Self::Fallback { label } | Self::Exact { label, .. } => label,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -324,13 +344,22 @@ impl RelayState {
     /// have one live incumbent: a second daemon is rejected at admission so
     /// the incumbent retains one unambiguous route. Resolution still retains
     /// its ambiguity check as defense in depth for rolling state.
-    fn touch_tunnel(&self, label: &str, now: u64, server_names: Option<&[String]>) -> bool {
+    fn touch_tunnel(
+        &self,
+        label: &str,
+        now: u64,
+        poller_id: Option<&str>,
+        server_names: Option<&[String]>,
+    ) -> bool {
+        debug_assert_eq!(poller_id.is_some(), server_names.is_some());
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let conflicts = server_names.into_iter().flatten().any(|name| {
             tunnels.iter().any(|(other_label, entry)| {
                 other_label != label
-                    && now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-                    && entry.server_names.iter().any(|claimed| claimed == name)
+                    && entry.exact_sessions.values().any(|session| {
+                        now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                            && session.server_names.iter().any(|claimed| claimed == name)
+                    })
             })
         });
         if conflicts {
@@ -339,25 +368,53 @@ impl RelayState {
         let entry = tunnels
             .entry(label.to_string())
             .or_insert_with(|| TunnelEntry {
-                last_seen_unix_ms: now,
-                pending: VecDeque::new(),
-                server_names: Vec::new(),
+                fallback_last_seen_unix_ms: now,
+                fallback_pending: VecDeque::new(),
+                exact_sessions: HashMap::new(),
             });
-        entry.last_seen_unix_ms = now;
-        // v1 has no exact-name vocabulary, so a rolling old process may only
-        // refresh liveness; it must not erase a v2 route registered by a new
-        // sibling. A v2 poll always supplies Some, including an explicit empty
-        // list when the new daemon wants to clear its exact-name claims.
-        if let Some(server_names) = server_names {
-            entry.server_names = server_names.to_vec();
+        entry.exact_sessions.retain(|_, session| {
+            now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+        });
+        if let Some(poller_id) = poller_id {
+            if !entry.exact_sessions.contains_key(poller_id)
+                && entry.exact_sessions.len() >= RELAY_MAX_EXACT_POLLERS_PER_TUNNEL
+            {
+                return false;
+            }
+        }
+        entry.fallback_last_seen_unix_ms = now;
+        // Exact-name ownership and its nonce queue belong to the v2 poller
+        // that supplied the certificate proof. A v1 sibling may refresh only
+        // the fleet-label fallback and can never keep or consume this state.
+        if let (Some(poller_id), Some(server_names)) = (poller_id, server_names) {
+            let session = entry
+                .exact_sessions
+                .entry(poller_id.to_string())
+                .or_insert_with(|| ExactTunnelSession {
+                    last_seen_unix_ms: now,
+                    pending: VecDeque::new(),
+                    server_names: Vec::new(),
+                });
+            session.last_seen_unix_ms = now;
+            session.server_names = server_names.to_vec();
         }
         true
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
-    fn pop_pending(&self, label: &str) -> Option<String> {
+    fn pop_pending(&self, label: &str, poller_id: Option<&str>) -> Option<String> {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels.get_mut(label)?.pending.pop_front()
+        let entry = tunnels.get_mut(label)?;
+        if let Some(poller_id) = poller_id {
+            if let Some(nonce) = entry
+                .exact_sessions
+                .get_mut(poller_id)
+                .and_then(|session| session.pending.pop_front())
+            {
+                return Some(nonce);
+            }
+        }
+        entry.fallback_pending.pop_front()
     }
 
     /// Whether a tunnel has an active (recently polled) control channel.
@@ -365,7 +422,10 @@ impl RelayState {
     fn tunnel_active(&self, label: &str, now: u64) -> bool {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         tunnels.get(label).is_some_and(|entry| {
-            now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+            now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                || entry.exact_sessions.values().any(|session| {
+                    now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                })
         })
     }
 
@@ -373,43 +433,92 @@ impl RelayState {
     /// precedence. If more than one live daemon claims the same exact name,
     /// refuse rather than choosing one. With no exact registration, retain the
     /// v1 fleet-label route for rolling upgrades.
-    fn resolve_tunnel(&self, sni: &str, now: u64) -> Option<String> {
+    fn resolve_tunnel(&self, sni: &str, now: u64) -> Option<TunnelRoute> {
         let normalized = normalize_server_name(sni)?;
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         let mut exact = tunnels
             .iter()
-            .filter(|(_, entry)| {
-                now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
-                    && entry.server_names.iter().any(|name| name == &normalized)
+            .flat_map(|(label, entry)| {
+                entry
+                    .exact_sessions
+                    .iter()
+                    .filter(|(_, session)| {
+                        now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                            && session.server_names.iter().any(|name| name == &normalized)
+                    })
+                    .map(move |(poller_id, session)| {
+                        (
+                            label.as_str(),
+                            poller_id.as_str(),
+                            session.last_seen_unix_ms,
+                        )
+                    })
             })
-            .map(|(label, _)| label.as_str());
-        let first = exact.next();
-        if exact.next().is_some() {
+            .collect::<Vec<_>>();
+        exact.sort_by(|left, right| {
+            right
+                .2
+                .cmp(&left.2)
+                .then_with(|| left.0.cmp(right.0))
+                .then_with(|| left.1.cmp(right.1))
+        });
+        let first = exact.first().copied();
+        if first.is_some_and(|(label, _, _)| {
+            exact
+                .iter()
+                .skip(1)
+                .any(|(other_label, _, _)| *other_label != label)
+        }) {
             return None;
         }
-        if let Some(label) = first {
-            return Some(label.to_string());
+        if let Some((label, poller_id, _)) = first {
+            return Some(TunnelRoute::Exact {
+                label: label.to_string(),
+                poller_id: poller_id.to_string(),
+            });
         }
         let label = sni_route_label(&normalized)?;
         tunnels.get(&label).and_then(|entry| {
-            (now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS)
-                .then_some(label)
+            (now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS)
+                .then_some(TunnelRoute::Fallback { label })
         })
     }
 
     /// Queue a dial-back nonce for a tunnel's control poll. Fails closed if the
     /// tunnel is not active or its queue is at capacity.
-    fn enqueue_dialback(&self, label: &str, nonce: String, now: u64) -> bool {
+    fn enqueue_dialback(&self, route: &TunnelRoute, nonce: String, now: u64) -> bool {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        let Some(entry) = tunnels.get_mut(label) else {
+        let Some(entry) = tunnels.get_mut(route.label()) else {
             return false;
         };
-        if now.saturating_sub(entry.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
-            || entry.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
-        {
+        let queued = match route {
+            TunnelRoute::Fallback { .. } => {
+                if now.saturating_sub(entry.fallback_last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+                    || entry.fallback_pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
+                {
+                    false
+                } else {
+                    entry.fallback_pending.push_back(nonce);
+                    true
+                }
+            }
+            TunnelRoute::Exact { poller_id, .. } => {
+                let Some(session) = entry.exact_sessions.get_mut(poller_id) else {
+                    return false;
+                };
+                if now.saturating_sub(session.last_seen_unix_ms) > RELAY_TUNNEL_LIVENESS_MS
+                    || session.pending.len() >= RELAY_MAX_PENDING_PER_TUNNEL
+                {
+                    false
+                } else {
+                    session.pending.push_back(nonce);
+                    true
+                }
+            }
+        };
+        if !queued {
             return false;
         }
-        entry.pending.push_back(nonce);
         drop(tunnels);
         self.control_notify.notify_waiters();
         true
@@ -423,7 +532,11 @@ impl RelayState {
             .lock()
             .expect("relay tunnels poisoned")
             .retain(|_, entry| {
-                now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                entry.exact_sessions.retain(|_, session| {
+                    now.saturating_sub(session.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                });
+                now.saturating_sub(entry.fallback_last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                    || !entry.exact_sessions.is_empty()
             });
     }
 
@@ -515,6 +628,8 @@ pub(crate) struct RelayNextRequest {
     issued_at_unix_ms: u64,
     signature: String,
     #[serde(default)]
+    poller_id: Option<String>,
+    #[serde(default)]
     server_names: Vec<String>,
     #[serde(default)]
     server_name_proofs: Vec<RelayServerNameProof>,
@@ -534,10 +649,18 @@ fn relay_control_signing_payload(
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
+    poller_id: Option<&str>,
     server_names: &[String],
 ) -> Vec<u8> {
     let mut payload =
         format!("{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n").into_bytes();
+    if protocol == RELAY_CONTROL_PROTOCOL {
+        let poller_id = poller_id.unwrap_or_default();
+        payload.extend_from_slice(poller_id.len().to_string().as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(poller_id.as_bytes());
+        payload.push(b'\n');
+    }
     for name in server_names {
         payload.extend_from_slice(name.len().to_string().as_bytes());
         payload.push(b'\n');
@@ -545,6 +668,16 @@ fn relay_control_signing_payload(
         payload.push(b'\n');
     }
     payload
+}
+
+fn canonical_poller_id(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value.unwrap_or_default().trim();
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(
+            "relay control v2 requires a 32-character poller id",
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 fn relay_name_proof_signing_payload(
@@ -769,16 +902,21 @@ pub(crate) async fn relay_next(
     Json(body): Json<RelayNextRequest>,
 ) -> ApiResult<Response> {
     let daemon_id = body.daemon_id.trim().to_string();
-    let server_names = match body.protocol.as_str() {
-        RELAY_CONTROL_PROTOCOL => Some(canonical_server_names(&body.server_names)?),
+    let (poller_id, server_names) = match body.protocol.as_str() {
+        RELAY_CONTROL_PROTOCOL => (
+            Some(canonical_poller_id(body.poller_id.as_deref())?),
+            Some(canonical_server_names(&body.server_names)?),
+        ),
         RELAY_CONTROL_PROTOCOL_V1
-            if body.server_names.is_empty() && body.server_name_proofs.is_empty() =>
+            if body.poller_id.is_none()
+                && body.server_names.is_empty()
+                && body.server_name_proofs.is_empty() =>
         {
-            None
+            (None, None)
         }
         RELAY_CONTROL_PROTOCOL_V1 => {
             return Err(ApiError::bad_request(
-                "relay control v1 cannot register server names or proofs",
+                "relay control v1 cannot register a poller id, server names, or proofs",
             ));
         }
         _ => {
@@ -811,6 +949,7 @@ pub(crate) async fn relay_next(
         &daemon_id,
         &daemon.daemon_public_key,
         body.issued_at_unix_ms,
+        poller_id.as_deref(),
         server_names.as_deref().unwrap_or_default(),
     );
     if !verify_ed25519_b64u(&daemon.daemon_public_key, &payload, body.signature.trim()) {
@@ -836,9 +975,14 @@ pub(crate) async fn relay_next(
             "daemon id does not derive a fleet label",
         ));
     };
-    if !relay.touch_tunnel(&label, now_unix_ms(), server_names.as_deref()) {
+    if !relay.touch_tunnel(
+        &label,
+        now_unix_ms(),
+        poller_id.as_deref(),
+        server_names.as_deref(),
+    ) {
         return Err(ApiError::conflict(
-            "an active relay tunnel already owns one of the exact server names",
+            "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
         ));
     }
 
@@ -849,7 +993,7 @@ pub(crate) async fn relay_next(
     );
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(nonce) = relay.pop_pending(&label) {
+        if let Some(nonce) = relay.pop_pending(&label, poller_id.as_deref()) {
             return Ok(Json(json!({
                 "ok": true,
                 "dialback": { "nonce": nonce },
@@ -862,9 +1006,14 @@ pub(crate) async fn relay_next(
         }
         let remaining = deadline.saturating_duration_since(now);
         // Re-touch keeps the tunnel live across a full parked poll.
-        if !relay.touch_tunnel(&label, now_unix_ms(), server_names.as_deref()) {
+        if !relay.touch_tunnel(
+            &label,
+            now_unix_ms(),
+            poller_id.as_deref(),
+            server_names.as_deref(),
+        ) {
             return Err(ApiError::conflict(
-                "an active relay tunnel already owns one of the exact server names",
+                "relay exact-name registration conflicts with live ownership or exceeds its poller bound",
             ));
         }
         if tokio::time::timeout(remaining, relay.control_notify.notified())
@@ -1085,10 +1234,10 @@ async fn handle_browser_connection(
         None => return, // fragmented-forever, oversized, non-TLS, or no-SNI: refuse
     };
     let now = now_unix_ms();
-    let Some(label) = relay.resolve_tunnel(&sni, now) else {
+    let Some(route) = relay.resolve_tunnel(&sni, now) else {
         return; // no unique active tunnel for this exact or fleet-label name
     };
-    let Some(_splice_guard) = relay.acquire_tunnel_splice(&label) else {
+    let Some(_splice_guard) = relay.acquire_tunnel_splice(route.label()) else {
         return; // per-tunnel cap
     };
 
@@ -1103,7 +1252,7 @@ async fn handle_browser_connection(
             .expect("relay dialbacks poisoned");
         pending.insert(nonce.clone(), tx);
     }
-    if !relay.enqueue_dialback(&label, nonce.clone(), now) {
+    if !relay.enqueue_dialback(&route, nonce.clone(), now) {
         relay
             .pending_dialbacks
             .lock()
@@ -1275,6 +1424,12 @@ mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     use tokio::net::{TcpListener, TcpStream};
+
+    const TEST_POLLER_ID: &str = "11111111111111111111111111111111";
+
+    fn resolved_label(route: Option<TunnelRoute>) -> Option<String> {
+        route.map(|route| route.label().to_string())
+    }
 
     // ── ClientHello builder + SNI parser units ──────────────────────────────
 
@@ -1531,15 +1686,18 @@ mod tests {
     fn dialback_queue_only_grows_for_an_active_tunnel_and_is_bounded() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
+        let route = TunnelRoute::Fallback {
+            label: "d-live".to_string(),
+        };
         // No tunnel yet: enqueue refuses.
-        assert!(!relay.enqueue_dialback("d-none", "n0".to_string(), now));
-        assert!(relay.touch_tunnel("d-live", now, None));
+        assert!(!relay.enqueue_dialback(&route, "n0".to_string(), now));
+        assert!(relay.touch_tunnel("d-live", now, None, None));
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
-            assert!(relay.enqueue_dialback("d-live", format!("n{i}"), now));
+            assert!(relay.enqueue_dialback(&route, format!("n{i}"), now));
         }
         assert!(
-            !relay.enqueue_dialback("d-live", "overflow".to_string(), now),
+            !relay.enqueue_dialback(&route, "overflow".to_string(), now),
             "the pending queue is capped"
         );
         // A stale tunnel is inactive and unroutable.
@@ -1551,18 +1709,28 @@ mod tests {
         let relay = relay_state();
         let now = crate::now_unix_ms();
         let name = "box.example.test".to_string();
-        assert!(relay.touch_tunnel("d-first", now, Some(std::slice::from_ref(&name))));
+        assert!(relay.touch_tunnel(
+            "d-first",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
         assert_eq!(
-            relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now).as_deref(),
-            Some("d-first")
+            resolved_label(relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now)).as_deref(),
+            Some("d-first"),
         );
 
         assert!(
-            !relay.touch_tunnel("d-second", now, Some(std::slice::from_ref(&name))),
+            !relay.touch_tunnel(
+                "d-second",
+                now,
+                Some("22222222222222222222222222222222"),
+                Some(std::slice::from_ref(&name))
+            ),
             "a conflicting live claim must be rejected at admission"
         );
         assert_eq!(
-            relay.resolve_tunnel("box.example.test", now).as_deref(),
+            resolved_label(relay.resolve_tunnel("box.example.test", now)).as_deref(),
             Some("d-first"),
             "the incumbent remains routable after a rejected collision"
         );
@@ -1591,33 +1759,89 @@ mod tests {
     fn fleet_label_route_survives_v1_registration() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
-        assert!(relay.touch_tunnel("d-rolling", now, None));
+        assert!(relay.touch_tunnel("d-rolling", now, None, None));
         assert_eq!(
-            relay
-                .resolve_tunnel("d-rolling.fleet.example.test", now)
-                .as_deref(),
+            resolved_label(relay.resolve_tunnel("d-rolling.fleet.example.test", now)).as_deref(),
             Some("d-rolling")
         );
     }
 
     #[test]
-    fn v1_refresh_preserves_v2_names_and_v2_empty_clears_them() {
+    fn v1_refresh_cannot_extend_or_consume_a_v2_exact_registration() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
         let name = "box.example.test".to_string();
-        assert!(relay.touch_tunnel("d-rolling", now, Some(std::slice::from_ref(&name))));
-        assert!(relay.touch_tunnel("d-rolling", now + 1, None));
+        assert!(relay.touch_tunnel(
+            "d-rolling",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        let exact = relay.resolve_tunnel(&name, now).unwrap();
+        assert!(relay.enqueue_dialback(&exact, "exact-nonce".to_string(), now));
+        assert!(relay.touch_tunnel("d-rolling", now + RELAY_TUNNEL_LIVENESS_MS, None, None));
+        assert_eq!(relay.pop_pending("d-rolling", None), None);
         assert_eq!(
-            relay.resolve_tunnel(&name, now + 1).as_deref(),
-            Some("d-rolling"),
-            "a v1 sibling may refresh liveness but cannot erase a v2 route"
-        );
-        assert!(relay.touch_tunnel("d-rolling", now + 2, Some(&[])));
-        assert_eq!(
-            relay.resolve_tunnel(&name, now + 2),
+            relay.pop_pending("d-rolling", Some("22222222222222222222222222222222")),
             None,
-            "an explicit v2 empty set clears exact-name routing"
+            "a different v2 poller cannot consume the proved route"
         );
+        assert_eq!(
+            relay.pop_pending("d-rolling", Some(TEST_POLLER_ID)),
+            Some("exact-nonce".to_string())
+        );
+        assert_eq!(
+            relay.resolve_tunnel(&name, now + RELAY_TUNNEL_LIVENESS_MS + 1),
+            None,
+            "v1 liveness must not extend the exact registration"
+        );
+        assert_eq!(
+            resolved_label(relay.resolve_tunnel(
+                "d-rolling.fleet.example.test",
+                now + RELAY_TUNNEL_LIVENESS_MS + 1
+            ))
+            .as_deref(),
+            Some("d-rolling"),
+            "the v1 fleet-label fallback remains live"
+        );
+    }
+
+    #[test]
+    fn a_v2_empty_set_clears_only_its_own_exact_names() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel(
+            "d-rolling",
+            now,
+            Some(TEST_POLLER_ID),
+            Some(std::slice::from_ref(&name))
+        ));
+        assert!(relay.touch_tunnel("d-rolling", now + 1, Some(TEST_POLLER_ID), Some(&[])));
+        assert_eq!(relay.resolve_tunnel(&name, now + 1), None);
+    }
+
+    #[test]
+    fn exact_poller_sessions_are_bounded_and_stale_slots_are_reclaimed() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        for index in 0..RELAY_MAX_EXACT_POLLERS_PER_TUNNEL {
+            let poller_id = format!("{index:032x}");
+            assert!(relay.touch_tunnel("d-bounded", now, Some(&poller_id), Some(&[])));
+        }
+        let overflow = format!("{:032x}", RELAY_MAX_EXACT_POLLERS_PER_TUNNEL);
+        assert!(!relay.touch_tunnel("d-bounded", now, Some(&overflow), Some(&[])));
+        let existing = format!("{:032x}", 0);
+        assert!(
+            relay.touch_tunnel("d-bounded", now, Some(&existing), Some(&[])),
+            "an existing poller can refresh while the set is full"
+        );
+        assert!(relay.touch_tunnel(
+            "d-bounded",
+            now + RELAY_TUNNEL_LIVENESS_MS + 1,
+            Some(&overflow),
+            Some(&[])
+        ));
     }
 
     // ── Dial-back framing ───────────────────────────────────────────────────
@@ -1752,6 +1976,7 @@ mod tests {
             daemon_id,
             &public,
             issued,
+            Some(TEST_POLLER_ID),
             &server_names,
         );
         let body = RelayNextRequest {
@@ -1760,6 +1985,7 @@ mod tests {
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
             signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
             server_names,
             server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
@@ -1796,6 +2022,7 @@ mod tests {
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
             signature: crate::b64u(&[0u8; 64]),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
             server_names: Vec::new(),
             server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
@@ -1832,6 +2059,7 @@ mod tests {
             daemon_id,
             &public,
             issued,
+            Some(TEST_POLLER_ID),
             &signed_names,
         );
         let body = RelayNextRequest {
@@ -1840,6 +2068,7 @@ mod tests {
             daemon_public_key: public,
             issued_at_unix_ms: issued,
             signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
             server_names: vec!["other.example.test".to_string()],
             server_name_proofs: Vec::new(),
             timeout_ms: Some(1),
@@ -1876,6 +2105,7 @@ mod tests {
             daemon_id,
             &public,
             issued,
+            Some(TEST_POLLER_ID),
             &server_names,
         );
         let body = RelayNextRequest {
@@ -1884,6 +2114,7 @@ mod tests {
             daemon_public_key: public,
             issued_at_unix_ms: issued,
             signature: crate::b64u(key.sign(&payload).as_ref()),
+            poller_id: Some(TEST_POLLER_ID.to_string()),
             server_names,
             server_name_proofs: Vec::new(),
             timeout_ms: Some(1),
@@ -1924,14 +2155,22 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let payload =
-                relay_control_signing_payload(protocol, &daemon_id, &public, issued, &server_names);
+            let poller_id = (protocol == RELAY_CONTROL_PROTOCOL).then_some(TEST_POLLER_ID);
+            let payload = relay_control_signing_payload(
+                protocol,
+                &daemon_id,
+                &public,
+                issued,
+                poller_id,
+                &server_names,
+            );
             let body = RelayNextRequest {
                 protocol: protocol.to_string(),
                 daemon_id: daemon_id.clone(),
                 daemon_public_key: public,
                 issued_at_unix_ms: issued,
                 signature: crate::b64u(key.sign(&payload).as_ref()),
+                poller_id: poller_id.map(str::to_string),
                 server_names: server_names.clone(),
                 server_name_proofs,
                 timeout_ms: Some(1),
@@ -1950,7 +2189,7 @@ mod tests {
             } else {
                 relay.resolve_tunnel(&format!("{label}.fleet.example.test"), issued)
             };
-            assert_eq!(routed.as_deref(), Some(label.as_str()));
+            assert_eq!(resolved_label(routed).as_deref(), Some(label.as_str()));
         }
     }
 
@@ -2140,6 +2379,7 @@ mod tests {
     ) {
         tokio::spawn(async move {
             let client = reqwest::Client::new();
+            let poller_id = uuid::Uuid::new_v4().simple().to_string();
             loop {
                 let issued = crate::now_unix_ms();
                 let server_names = Vec::<String>::new();
@@ -2148,6 +2388,7 @@ mod tests {
                     &daemon_id,
                     &public,
                     issued,
+                    Some(&poller_id),
                     &server_names,
                 );
                 let signature = crate::b64u(key.sign(&payload).as_ref());
@@ -2159,6 +2400,7 @@ mod tests {
                         "daemon_public_key": public,
                         "issued_at_unix_ms": issued,
                         "signature": signature,
+                        "poller_id": poller_id,
                         "server_names": server_names,
                         "timeout_ms": 1000,
                     }))

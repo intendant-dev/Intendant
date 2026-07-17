@@ -35,10 +35,13 @@ singleton-SAN certificate key. The relay verifies the chain, exact name, and
 key signature before accepting the route; a daemon identity alone cannot claim
 another tenant's name. The relay routes an exact name only when one active
 daemon proves it. A conflicting live registration is rejected while the
-incumbent route remains active. During a rolling upgrade, a v1 poll may refresh
-fleet-label liveness but cannot erase a v2 exact-name route; an explicit empty
-v2 registration clears it. Neither registration nor routing grants daemon
-authority.
+incumbent route remains active. Each v2 process has a signed poller id, its own
+proof liveness, and its own exact-name dialback queue. During a rolling upgrade,
+a v1 poll may refresh and consume only fleet-label fallback work; it cannot
+extend or consume a v2 exact-name route. An explicit empty v2 registration
+clears that poller's names. Before every registration, the process reloads
+shared certificate generations into its process-local TLS resolver. Neither
+registration nor routing grants daemon authority.
 
 The custom name must also remain outside every current or previously recorded
 service fleet zone. The daemon re-evaluates that separation whenever the route
@@ -73,11 +76,14 @@ client. The DNS credential can add and remove only the exact `_acme-challenge`
 TXT value for the order. Before changing DNS, the daemon durably journals the
 provider, exact name, and exact value without storing the provider secret.
 Cleanup removes that journal only after the provider confirms the exact record
-is gone. Startup and every later certificate pass retry a surviving journal
-before creating another challenge, covering crashes, cancellation, and
-transient provider failures. Store the credential as a daemon credential lease
-where possible; configuration names an environment-variable fallback but
-never embeds the secret.
+is gone. The journal carries creation, active-validation, and cleanup phases
+with bounded owner leases. A sibling process therefore leaves a live challenge
+alone; only an explicit handoff to cleanup or an expired lease plus grace
+period makes it reclaimable. Startup and every later certificate pass retry a
+reclaimable journal before creating another challenge, covering crashes,
+cancellation, and transient provider failures. Store the credential as a
+daemon credential lease where possible; configuration names an
+environment-variable fallback but never embeds the secret.
 
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:
@@ -111,8 +117,9 @@ rp_id check intact. Invitations expire after ten minutes and are consumed at
 ceremony start. Invitations, registration/authentication challenges, and the
 ceremony rate window are stored under the daemon's cross-process authority
 lock, so a relay request may move between service processes without duplicating
-or losing the flow. Passkey records and counters stay in the same owner-only
-authority store.
+or losing the flow. The empty passkey store, including its stable WebAuthn user
+id, is created atomically under that lock before any ceremony is exposed.
+Passkey records and counters stay in the same owner-only authority store.
 
 Opening `https://box.example.com/` creates a non-extractable tab key. A
 successful user-verifying passkey assertion approves only the signed request

@@ -154,19 +154,24 @@ discovery* button publishes the daemon's addresses (LAN included — no
 port forwarding needed) and mints a Let's Encrypt certificate via DNS-01,
 renewed automatically, private keys never leaving the machine. Issuance intent
 is recorded durably before ACME begins, so a crash before the first
-certificate pair is committed remains retryable. Pair and own-certificate
-ledger reads and replacements share the daemon authority-store lock; restored
-and newly issued certificates must name the current exact fleet origin. With
+certificate pair is committed remains retryable. The active order URL, CSR,
+and certificate private key are journaled before finalization; an ambiguous
+finalize or certificate-poll result resumes the same order and keeps CT
+classification deferred until the resulting serial is recorded locally. Pair
+and own-certificate ledger reads and replacements share the daemon
+authority-store lock; restored and newly issued certificates must name the
+current exact fleet origin. With
 hosted control off, that gives a warning-free public shell/discovery endpoint.
 With it on, unproved fleet traffic remains anonymous `role:none`; protected
 traffic must prove an approved short-lived lease and pass the exact
 route/method/frame/action projection. The rendezvous controls the name and can
 serve code at the same origin, so the lease ceiling and immutable floor—not the
-name—bound that code. CT monitoring is the current slower detection fallback;
-the peer and signed-app outside-vantage witnesses remain planned work. None
-of those signals grants authority. Certless root exists only on verified
-loopback; `--allow-public-plaintext` and fleet WebPKI grant no authority by
-themselves.
+name—bound that code. Peer certificate witnesses are shipped; an eligible
+signed application may also report when a qualifying signed distribution
+exists, while the current unsigned development bundle is never accepted as a
+witness. CT monitoring remains the slower fallback. None of those signals
+grants authority. Certless root exists only on verified loopback;
+`--allow-public-plaintext` and fleet WebPKI grant no authority by themselves.
 
 A worked example, one fleet:
 
@@ -210,10 +215,11 @@ Three rungs, ordered by what betrayal costs the attacker:
    fleet SNI like the hosted tab for authority: public shell and discovery
    bytes only. The optional hosted lane does not promote the origin; it admits
    only a confirmed, short-lived lease under a compiled preset, while all
-   unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused. CT
-   is the current fallback detection signal; peer and enrolled signed-app
-   witnesses remain planned. Detection is not authority. Assigned fleet
-   names are remembered
+   unproved protected HTTP/MCP/signaling/WebSocket traffic remains refused.
+   Peer witnessing is shipped, eligible signed-application witnesses are
+   accepted only when a qualifying distribution anchor exists, and CT remains
+   the fallback when neither outside vantage is available. Detection is not
+   authority. Assigned fleet names are remembered
    durably even when Connect is later disabled or reports no current zone; a
    previously service-controlled name never decays into a direct anchor.
    Pre-provenance installs recover exact names from `fleet-cert.pem` on
@@ -361,9 +367,10 @@ the owner's memory. All four are **shipped**:
    crash cannot make an own certificate look foreign), polls crt.sh for the
    daemon's exact fleet name on each renewal tick, and flips the Connect card
    to **CT ALERT** on any serial the daemon never requested. The exact-name
-   verdict and active-issuance marker are durable under the cross-process
-   authority lock; processes merge foreign serials instead of overwriting
-   newer evidence, and only a locally recorded own serial removes one.
+   verdict and resumable active-order journal are durable under the
+   cross-process authority lock; processes merge foreign serials instead of
+   overwriting newer evidence, and only a locally recorded own serial removes
+   one.
    A foreign serial or unreadable durable verdict suspends hosted-lease
    admission. A crt.sh fetch failure creates no new evidence, preserves the
    last durable verdict, and does not block certificate renewal.

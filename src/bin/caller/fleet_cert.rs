@@ -24,13 +24,14 @@
 //! and rejects protected HTTP, MCP, signaling, and WebSocket access before it
 //! resolves browser mTLS or daemon IAM authority.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 const FLEET_ORIGIN_PROVENANCE_FILE: &str = "fleet-origin-provenance.json";
-const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 2;
 const FLEET_CERT_REQUESTED_FILE: &str = "fleet-cert-requested";
 const FLEET_CERT_REQUESTED_MARKER: &[u8] = b"intendant-fleet-certificate-requested-v1\n";
 const FLEET_CERT_SERIALS_MAX_BYTES: u64 = 1024 * 1024;
@@ -39,9 +40,10 @@ const FLEET_CT_STATUS_MAX_BYTES: u64 = 1024 * 1024;
 const FLEET_CT_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const FLEET_CT_FOREIGN_SERIALS_MAX: usize = 256;
 const FLEET_CERT_ISSUANCE_FILE: &str = "fleet-cert-issuance.json";
-const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 1;
+const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 2;
 const FLEET_CERT_ISSUANCE_MAX_BYTES: u64 = 64 * 1024;
 const FLEET_CERT_ISSUANCE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
+const FLEET_CERT_ISSUANCE_OWNER_LEASE_MS: u64 = 10 * 60 * 1000;
 const FLEET_CERT_ISSUANCE_MAX_ACTIVE: usize = 16;
 
 /// Durable service-controlled-name provenance. Certificates and Connect
@@ -89,6 +91,14 @@ fn normalized_dns_name(value: &str) -> Option<String> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
+fn fleet_zone_from_exact_name(name: &str) -> Option<String> {
+    let name = normalized_dns_name(name)?;
+    let (label, zone) = name.split_once('.')?;
+    let digest = label.strip_prefix("d-")?;
+    (digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) && !zone.is_empty())
+        .then(|| zone.to_string())
+}
+
 fn fleet_origin_provenance_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join(FLEET_ORIGIN_PROVENANCE_FILE)
 }
@@ -107,6 +117,16 @@ fn write_fleet_origin_provenance_locked(
     )
 }
 
+fn fleet_origin_provenance_needs_rewrite_in(cert_dir: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(fleet_origin_provenance_path_in(cert_dir)) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| value.get("schema_version")?.as_u64())
+        != Some(FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION as u64)
+}
+
 fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvenance, String> {
     let path = fleet_origin_provenance_path_in(cert_dir);
     let bytes = match std::fs::read(&path) {
@@ -118,7 +138,8 @@ fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvena
     };
     let mut provenance: FleetOriginProvenance = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
-    if provenance.schema_version > FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION {
+    let loaded_schema_version = provenance.schema_version;
+    if loaded_schema_version > FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION {
         return Err(format!(
             "{} uses unsupported schema version {}",
             path.display(),
@@ -148,6 +169,21 @@ fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvena
     }
     provenance.known_names.sort();
     provenance.known_names.dedup();
+    if loaded_schema_version < 2 {
+        let mut recovered_all_zones = true;
+        for name in &provenance.known_names {
+            if let Some(zone) = fleet_zone_from_exact_name(name) {
+                provenance.known_zones.push(zone);
+            } else {
+                recovered_all_zones = false;
+            }
+        }
+        provenance.known_zones.sort();
+        provenance.known_zones.dedup();
+        if !recovered_all_zones {
+            provenance.provenance_incomplete = true;
+        }
+    }
     Ok(provenance)
 }
 
@@ -183,6 +219,7 @@ fn remember_fleet_origin_in(
     let name = normalized_dns_name(name)
         .ok_or_else(|| "rendezvous returned an empty fleet name".to_string())?;
     crate::access::authority_store::with_lock(cert_dir, || {
+        let needs_rewrite = fleet_origin_provenance_needs_rewrite_in(cert_dir);
         let mut provenance =
             load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
         let before = provenance.clone();
@@ -196,7 +233,7 @@ fn remember_fleet_origin_in(
         provenance.known_names.push(name);
         provenance.known_names.sort();
         provenance.known_names.dedup();
-        if provenance == before {
+        if provenance == before && !needs_rewrite {
             return Ok(provenance);
         }
         write_fleet_origin_provenance_locked(cert_dir, &provenance)?;
@@ -595,6 +632,7 @@ fn restore_fleet_origin_provenance_in(cert_dir: &Path) -> RestoredFleetOriginPro
         };
 
         let before = provenance.clone();
+        let needs_rewrite = fleet_origin_provenance_needs_rewrite_in(cert_dir);
         let mut warning = None;
         match fleet_certificate_dns_names_in(cert_dir) {
             Ok(Some(names)) => merge_recovered_fleet_names(&mut provenance, names),
@@ -606,7 +644,7 @@ fn restore_fleet_origin_provenance_in(cert_dir: &Path) -> RestoredFleetOriginPro
                 ));
             }
         }
-        if provenance != before {
+        if provenance != before || needs_rewrite {
             write_fleet_origin_provenance_locked(cert_dir, &provenance)?;
         }
         Ok(RestoredFleetOriginProvenance {
@@ -950,6 +988,18 @@ struct InFlightIssuance {
     token: String,
     name: String,
     started_unix_ms: u64,
+    #[serde(default)]
+    updated_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_token: Option<String>,
+    #[serde(default)]
+    owner_lease_expires_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    private_key_pem: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    csr_der_b64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -989,12 +1039,37 @@ fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStor
     }
     let mut store: InFlightIssuanceStore = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let legacy_schema = store.schema_version == 1;
+    if legacy_schema {
+        store.schema_version = FLEET_CERT_ISSUANCE_SCHEMA_VERSION;
+        for order in &mut store.orders {
+            order.updated_unix_ms = order.started_unix_ms;
+            order.owner_token = None;
+            order.owner_lease_expires_unix_ms = 0;
+        }
+    }
     if store.schema_version != FLEET_CERT_ISSUANCE_SCHEMA_VERSION
         || store.orders.len() > FLEET_CERT_ISSUANCE_MAX_ACTIVE
         || store.orders.iter().any(|order| {
             order.token.is_empty()
                 || order.token.len() > 64
                 || normalized_dns_name(&order.name).as_deref() != Some(order.name.as_str())
+                || order.owner_token.as_ref().is_some_and(|token| {
+                    token.len() != 32 || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                || order
+                    .order_url
+                    .as_ref()
+                    .is_some_and(|url| url.is_empty() || url.len() > 4096)
+                || order
+                    .private_key_pem
+                    .as_ref()
+                    .is_some_and(|key| key.is_empty() || key.len() > 32 * 1024)
+                || order
+                    .csr_der_b64
+                    .as_ref()
+                    .is_some_and(|csr| csr.is_empty() || csr.len() > 32 * 1024)
+                || order.private_key_pem.is_some() != order.csr_der_b64.is_some()
         })
     {
         return Err(format!(
@@ -1003,9 +1078,10 @@ fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStor
         ));
     }
     let now = now_unix_ms();
-    store
-        .orders
-        .retain(|order| now.saturating_sub(order.started_unix_ms) < FLEET_CERT_ISSUANCE_TTL_MS);
+    store.orders.retain(|order| {
+        now.saturating_sub(order.updated_unix_ms.max(order.started_unix_ms))
+            < FLEET_CERT_ISSUANCE_TTL_MS
+    });
     Ok(store)
 }
 
@@ -1028,7 +1104,7 @@ fn write_issuance_store_locked_in(
     )
 }
 
-fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
+fn claim_issuance_in(cert_dir: &Path, name: &str) -> Result<(InFlightIssuance, String), String> {
     let name = normalized_dns_name(name)
         .ok_or_else(|| "cannot start issuance for an empty fleet name".to_string())?;
     crate::access::authority_store::with_lock(cert_dir, || {
@@ -1041,31 +1117,141 @@ fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
         }
         let mut store =
             load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
-        if store.orders.iter().any(|order| order.name == name) {
-            return Err(crate::access::AccessError(
-                "a certificate request is already running in another daemon process".to_string(),
-            ));
-        }
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        store.orders.push(InFlightIssuance {
-            token: token.clone(),
-            name,
-            started_unix_ms: now_unix_ms(),
-        });
+        let now = now_unix_ms();
+        let owner_token = uuid::Uuid::new_v4().simple().to_string();
+        let order = if let Some(order) = store.orders.iter_mut().find(|order| order.name == name) {
+            if order.owner_token.is_some() && now <= order.owner_lease_expires_unix_ms {
+                return Err(crate::access::AccessError(
+                    "a certificate request is already running in another daemon process"
+                        .to_string(),
+                ));
+            }
+            order.owner_token = Some(owner_token.clone());
+            order.owner_lease_expires_unix_ms =
+                now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS);
+            order.updated_unix_ms = now;
+            order.clone()
+        } else {
+            let order = InFlightIssuance {
+                token: uuid::Uuid::new_v4().simple().to_string(),
+                name,
+                started_unix_ms: now,
+                updated_unix_ms: now,
+                owner_token: Some(owner_token.clone()),
+                owner_lease_expires_unix_ms: now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS),
+                order_url: None,
+                private_key_pem: None,
+                csr_der_b64: None,
+            };
+            store.orders.push(order.clone());
+            order
+        };
         write_issuance_store_locked_in(cert_dir, &store)?;
-        Ok(token)
+        Ok((order, owner_token))
     })
     .map_err(|error| error.to_string())
 }
 
-fn finish_issuance_in(cert_dir: &Path, token: &str) -> Result<(), String> {
+fn update_claimed_issuance_in(
+    cert_dir: &Path,
+    token: &str,
+    owner_token: &str,
+    update: impl FnOnce(&mut InFlightIssuance) -> crate::access::AccessResult<()>,
+) -> Result<InFlightIssuance, String> {
     crate::access::authority_store::with_lock(cert_dir, || {
         let mut store =
             load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        let order = store
+            .orders
+            .iter_mut()
+            .find(|order| order.token == token)
+            .ok_or_else(|| {
+                crate::access::AccessError(
+                    "durable certificate issuance state disappeared".to_string(),
+                )
+            })?;
+        if order.owner_token.as_deref() != Some(owner_token) {
+            return Err(crate::access::AccessError(
+                "durable certificate issuance ownership changed".to_string(),
+            ));
+        }
+        update(order)?;
+        let now = now_unix_ms();
+        order.updated_unix_ms = now;
+        order.owner_lease_expires_unix_ms = now.saturating_add(FLEET_CERT_ISSUANCE_OWNER_LEASE_MS);
+        let updated = order.clone();
+        write_issuance_store_locked_in(cert_dir, &store)?;
+        Ok(updated)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn release_issuance_in(cert_dir: &Path, token: &str, owner_token: &str) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        let order = store
+            .orders
+            .iter_mut()
+            .find(|order| order.token == token)
+            .ok_or_else(|| {
+                crate::access::AccessError(
+                    "durable certificate issuance state disappeared".to_string(),
+                )
+            })?;
+        if order.owner_token.as_deref() != Some(owner_token) {
+            return Err(crate::access::AccessError(
+                "durable certificate issuance ownership changed".to_string(),
+            ));
+        }
+        order.owner_token = None;
+        order.owner_lease_expires_unix_ms = 0;
+        order.updated_unix_ms = now_unix_ms();
+        write_issuance_store_locked_in(cert_dir, &store)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn finish_issuance_claim_in(
+    cert_dir: &Path,
+    token: &str,
+    owner_token: Option<&str>,
+) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        if let Some(required_owner) = owner_token {
+            let order = store
+                .orders
+                .iter()
+                .find(|order| order.token == token)
+                .ok_or_else(|| {
+                    crate::access::AccessError(
+                        "durable certificate issuance state disappeared".to_string(),
+                    )
+                })?;
+            if order.owner_token.as_deref() != Some(required_owner) {
+                return Err(crate::access::AccessError(
+                    "durable certificate issuance ownership changed".to_string(),
+                ));
+            }
+        }
         store.orders.retain(|order| order.token != token);
         write_issuance_store_locked_in(cert_dir, &store)
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
+    let (order, owner_token) = claim_issuance_in(cert_dir, name)?;
+    release_issuance_in(cert_dir, &order.token, &owner_token)?;
+    Ok(order.token)
+}
+
+#[cfg(test)]
+fn finish_issuance_in(cert_dir: &Path, token: &str) -> Result<(), String> {
+    finish_issuance_claim_in(cert_dir, token, None)
 }
 
 fn issuance_active_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
@@ -1073,44 +1259,134 @@ fn issuance_active_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String
     Ok(store.orders.iter().any(|order| order.name == name))
 }
 
+fn issuance_active_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        issuance_active_locked_in(cert_dir, name).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
 struct IssuanceGuard {
     cert_dir: PathBuf,
-    token: Option<String>,
+    order: InFlightIssuance,
+    owner_token: String,
+    claimed: bool,
 }
 
 impl IssuanceGuard {
     fn begin(cert_dir: &Path, name: &str) -> Result<Self, String> {
+        let (order, owner_token) = claim_issuance_in(cert_dir, name)?;
         Ok(Self {
             cert_dir: cert_dir.to_path_buf(),
-            token: Some(begin_issuance_in(cert_dir, name)?),
+            order,
+            owner_token,
+            claimed: true,
+        })
+    }
+
+    fn order_url(&self) -> Option<&str> {
+        self.order.order_url.as_deref()
+    }
+
+    fn record_order_url(&mut self, order_url: &str) -> Result<(), String> {
+        if order_url.is_empty() || order_url.len() > 4096 {
+            return Err("ACME returned an invalid order URL".to_string());
+        }
+        let order_url = order_url.to_string();
+        self.order = update_claimed_issuance_in(
+            &self.cert_dir,
+            &self.order.token,
+            &self.owner_token,
+            |order| {
+                if let Some(existing) = order.order_url.as_deref() {
+                    if existing != order_url {
+                        return Err(crate::access::AccessError(
+                            "ACME order identity changed during recovery".to_string(),
+                        ));
+                    }
+                } else {
+                    order.order_url = Some(order_url);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    fn finalization_material(&mut self, name: &str) -> Result<(String, Vec<u8>), String> {
+        if let (Some(private_key_pem), Some(csr_der_b64)) = (
+            self.order.private_key_pem.as_ref(),
+            self.order.csr_der_b64.as_ref(),
+        ) {
+            let csr = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(csr_der_b64)
+                .map_err(|error| format!("decode durable fleet certificate CSR: {error}"))?;
+            return Ok((private_key_pem.clone(), csr));
+        }
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()])
+            .map_err(|error| format!("build fleet certificate CSR: {error}"))?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        let key = rcgen::KeyPair::generate()
+            .map_err(|error| format!("generate fleet certificate key: {error}"))?;
+        let csr = params
+            .serialize_request(&key)
+            .map_err(|error| format!("serialize fleet certificate CSR: {error}"))?;
+        let private_key_pem = key.serialize_pem();
+        let csr_der = csr.der().as_ref().to_vec();
+        let csr_der_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&csr_der);
+        self.order = update_claimed_issuance_in(
+            &self.cert_dir,
+            &self.order.token,
+            &self.owner_token,
+            |order| {
+                order.private_key_pem = Some(private_key_pem.clone());
+                order.csr_der_b64 = Some(csr_der_b64);
+                Ok(())
+            },
+        )?;
+        Ok((private_key_pem, csr_der))
+    }
+
+    fn persisted_private_key(&self) -> Result<String, String> {
+        self.order.private_key_pem.clone().ok_or_else(|| {
+            "ACME order reached processing without durable certificate key material".to_string()
         })
     }
 
     fn finish(mut self) -> Result<(), String> {
-        let token = self.token.take().expect("issuance guard already finished");
-        let result = finish_issuance_in(&self.cert_dir, &token);
+        let result =
+            finish_issuance_claim_in(&self.cert_dir, &self.order.token, Some(&self.owner_token));
         if let Err(error) = &result {
             with_status(|status| {
                 status.ct_state = "unreadable".to_string();
                 status.ct_last_error =
                     Some(format!("clear durable certificate issuance state: {error}"));
             });
+        } else {
+            self.claimed = false;
         }
         result
+    }
+
+    fn abandon(self) -> Result<(), String> {
+        self.finish()
     }
 }
 
 impl Drop for IssuanceGuard {
     fn drop(&mut self) {
-        let Some(token) = self.token.take() else {
+        if !self.claimed {
             return;
-        };
-        if let Err(error) = finish_issuance_in(&self.cert_dir, &token) {
-            eprintln!("[fleet-cert] clear durable issuance state: {error}");
+        }
+        if let Err(error) =
+            release_issuance_in(&self.cert_dir, &self.order.token, &self.owner_token)
+        {
+            eprintln!("[fleet-cert] release durable issuance ownership: {error}");
             with_status(|status| {
                 status.ct_state = "unreadable".to_string();
-                status.ct_last_error =
-                    Some(format!("clear durable certificate issuance state: {error}"));
+                status.ct_last_error = Some(format!(
+                    "release durable certificate issuance ownership: {error}"
+                ));
             });
         }
     }
@@ -1153,7 +1429,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // missing first pair look indistinguishable from a never-enabled daemon.
     let certificate_dir = cert_dir();
     mark_issuance_requested_in(&certificate_dir)?;
-    let issuance = IssuanceGuard::begin(&certificate_dir, &name)?;
+    let mut issuance = IssuanceGuard::begin(&certificate_dir, &name)?;
     with_status(|status| {
         status.state = "requesting".to_string();
         status.last_error = None;
@@ -1165,43 +1441,71 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
 
     // 2. The ACME order.
     let account = acme_account().await?;
-    let identifiers = [instant_acme::Identifier::Dns(name.clone())];
-    let mut order = account
-        .new_order(&instant_acme::NewOrder::new(&identifiers))
-        .await
-        .map_err(|e| format!("acme new order: {e}"))?;
-
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result.map_err(|e| format!("acme authorization: {e}"))?;
-        match authz.status {
-            instant_acme::AuthorizationStatus::Pending => {}
-            instant_acme::AuthorizationStatus::Valid => continue,
-            other => return Err(format!("acme authorization in unexpected state {other:?}")),
-        }
-        let mut challenge = authz
-            .challenge(instant_acme::ChallengeType::Dns01)
-            .ok_or_else(|| "acme order offers no dns-01 challenge".to_string())?;
-        let txt_value = challenge.key_authorization().dns_value();
-        crate::connect_rendezvous::dns_acme_set(&txt_value).await?;
-        challenge
-            .set_ready()
+    let mut order = if let Some(order_url) = issuance.order_url() {
+        account
+            .order(order_url.to_string())
             .await
-            .map_err(|e| format!("acme challenge ready: {e}"))?;
-    }
+            .map_err(|error| format!("resume ACME order: {error}"))?
+    } else {
+        let identifiers = [instant_acme::Identifier::Dns(name.clone())];
+        let order = account
+            .new_order(&instant_acme::NewOrder::new(&identifiers))
+            .await
+            .map_err(|error| format!("acme new order: {error}"))?;
+        issuance.record_order_url(order.url())?;
+        order
+    };
 
-    let status = order
-        .poll_ready(&instant_acme::RetryPolicy::default())
-        .await
-        .map_err(|e| format!("acme validation: {e}"))?;
-    if status != instant_acme::OrderStatus::Ready {
-        let _ = crate::connect_rendezvous::dns_acme_clear().await;
-        return Err(format!("acme order did not become ready: {status:?}"));
+    let mut order_status = order.state().status;
+    if order_status == instant_acme::OrderStatus::Pending {
+        {
+            let mut authorizations = order.authorizations();
+            while let Some(result) = authorizations.next().await {
+                let mut authz = result.map_err(|e| format!("acme authorization: {e}"))?;
+                match authz.status {
+                    instant_acme::AuthorizationStatus::Pending => {}
+                    instant_acme::AuthorizationStatus::Valid => continue,
+                    other => {
+                        return Err(format!("acme authorization in unexpected state {other:?}"));
+                    }
+                }
+                let mut challenge = authz
+                    .challenge(instant_acme::ChallengeType::Dns01)
+                    .ok_or_else(|| "acme order offers no dns-01 challenge".to_string())?;
+                let txt_value = challenge.key_authorization().dns_value();
+                crate::connect_rendezvous::dns_acme_set(&txt_value).await?;
+                challenge
+                    .set_ready()
+                    .await
+                    .map_err(|e| format!("acme challenge ready: {e}"))?;
+            }
+        }
+        order_status = order
+            .poll_ready(&instant_acme::RetryPolicy::default())
+            .await
+            .map_err(|e| format!("acme validation: {e}"))?;
     }
-    let private_key_pem = order
-        .finalize()
-        .await
-        .map_err(|e| format!("acme finalize: {e}"))?;
+    if order_status == instant_acme::OrderStatus::Invalid {
+        let _ = crate::connect_rendezvous::dns_acme_clear().await;
+        issuance.abandon()?;
+        return Err("acme order became invalid".to_string());
+    }
+    let private_key_pem = match order_status {
+        instant_acme::OrderStatus::Ready => {
+            let (private_key_pem, csr_der) = issuance.finalization_material(&name)?;
+            order
+                .finalize_csr(&csr_der)
+                .await
+                .map_err(|error| format!("acme finalize: {error}"))?;
+            private_key_pem
+        }
+        instant_acme::OrderStatus::Processing | instant_acme::OrderStatus::Valid => {
+            issuance.persisted_private_key()?
+        }
+        other => {
+            return Err(format!("acme order cannot be resumed from state {other:?}"));
+        }
+    };
     let cert_chain_pem = order
         .poll_certificate(&instant_acme::RetryPolicy::default())
         .await
@@ -1958,9 +2262,16 @@ pub async fn ct_check_once() {
 /// run 90), and an error restoring or issuing a certificate is retried even
 /// when no usable expiry could be recovered. The CT tripwire runs every tick.
 /// Spawned once at gateway startup.
-fn should_request_certificate(status: &FleetCertStatus, now_unix_ms: u64) -> bool {
+fn should_request_certificate(
+    status: &FleetCertStatus,
+    now_unix_ms: u64,
+    recovering_issuance: bool,
+) -> bool {
     if status.name.is_none() || status.state == "requesting" {
         return false;
+    }
+    if recovering_issuance {
+        return true;
     }
     if status.state == "error" {
         return true;
@@ -1975,12 +2286,26 @@ pub fn spawn_renewal_loop() {
     tokio::spawn(async move {
         let mut first = true;
         loop {
-            let delay = if first { 10 * 60 } else { 12 * 60 * 60 };
+            let status_before_sleep = status_snapshot();
+            let certificate_dir = cert_dir();
+            let recovering = status_before_sleep
+                .name
+                .as_deref()
+                .is_some_and(|name| issuance_active_in(&certificate_dir, name).unwrap_or(true));
+            let delay = if first || status_before_sleep.state == "error" || recovering {
+                10 * 60
+            } else {
+                12 * 60 * 60
+            };
             first = false;
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             ct_check_once().await;
             let status = status_snapshot();
-            if !should_request_certificate(&status, now_unix_ms()) {
+            let recovering = status
+                .name
+                .as_deref()
+                .is_some_and(|name| issuance_active_in(&certificate_dir, name).unwrap_or(true));
+            if !should_request_certificate(&status, now_unix_ms(), recovering) {
                 continue;
             }
             let addresses = if status.addresses.is_empty() {
@@ -2074,6 +2399,58 @@ mod tests {
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
         let _ = metadata;
+    }
+
+    #[test]
+    fn schema_one_provenance_recovers_every_historical_fleet_zone() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fleet_origin_provenance_path_in(temp.path()),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "zone": "new.fleet.example.test",
+                "name": "d-11111111111111111111.new.fleet.example.test",
+                "known_names": [
+                    "d-aaaaaaaaaaaaaaaaaaaa.old.fleet.example.test",
+                    "d-11111111111111111111.new.fleet.example.test"
+                ],
+                "provenance_incomplete": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert_eq!(
+            restored.known_zones,
+            vec![
+                "new.fleet.example.test".to_string(),
+                "old.fleet.example.test".to_string()
+            ]
+        );
+        assert!(!restored.provenance_incomplete);
+        assert!(
+            is_service_controlled_name_in(temp.path(), "other.old.fleet.example.test").unwrap()
+        );
+    }
+
+    #[test]
+    fn schema_one_provenance_fails_closed_when_a_historical_zone_is_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fleet_origin_provenance_path_in(temp.path()),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "known_names": ["legacy-name.example.test"],
+                "provenance_incomplete": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
+        assert!(restored.provenance_incomplete);
+        assert!(is_service_controlled_name_in(temp.path(), "owner.example.test").is_err());
     }
 
     #[test]
@@ -2224,15 +2601,31 @@ mod tests {
             not_after_unix_ms: None,
             ..Default::default()
         };
-        assert!(should_request_certificate(&repair, now_unix_ms()));
+        assert!(should_request_certificate(&repair, now_unix_ms(), false));
 
         let mut unrequested = repair.clone();
         unrequested.state = "none".to_string();
-        assert!(!should_request_certificate(&unrequested, now_unix_ms()));
+        assert!(!should_request_certificate(
+            &unrequested,
+            now_unix_ms(),
+            false
+        ));
 
         let mut requesting = repair;
         requesting.state = "requesting".to_string();
-        assert!(!should_request_certificate(&requesting, now_unix_ms()));
+        assert!(!should_request_certificate(
+            &requesting,
+            now_unix_ms(),
+            true
+        ));
+
+        let installed = FleetCertStatus {
+            name: Some(name.to_string()),
+            state: "valid".to_string(),
+            not_after_unix_ms: Some(now_unix_ms().saturating_add(60 * 24 * 60 * 60 * 1000)),
+            ..Default::default()
+        };
+        assert!(should_request_certificate(&installed, now_unix_ms(), true));
     }
 
     #[test]
@@ -2570,6 +2963,42 @@ mod tests {
             commit_ct_entries_in(temp.path(), name, Vec::new(), 2).unwrap(),
             CtCommit::Applied(_)
         ));
+    }
+
+    #[test]
+    fn ambiguous_issuance_resumes_with_the_same_order_and_private_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "d-11111111111111111111.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+
+        let mut first = IssuanceGuard::begin(temp.path(), name).unwrap();
+        first
+            .record_order_url("https://acme.example.test/order/one")
+            .unwrap();
+        let (first_key, first_csr) = first.finalization_material(name).unwrap();
+        let issuance_token = first.order.token.clone();
+        drop(first);
+
+        assert!(issuance_active_in(temp.path(), name).unwrap());
+        let mut resumed = IssuanceGuard::begin(temp.path(), name).unwrap();
+        assert_eq!(resumed.order.token, issuance_token);
+        assert_eq!(
+            resumed.order_url(),
+            Some("https://acme.example.test/order/one")
+        );
+        let (resumed_key, resumed_csr) = resumed.finalization_material(name).unwrap();
+        assert_eq!(resumed_key, first_key);
+        assert_eq!(resumed_csr, first_csr);
+        let sibling_error = match IssuanceGuard::begin(temp.path(), name) {
+            Ok(_) => panic!("a sibling must not acquire a live issuance lease"),
+            Err(error) => error,
+        };
+        assert!(
+            sibling_error.contains("another daemon process"),
+            "a live owner lease prevents a sibling from running the order"
+        );
+        resumed.finish().unwrap();
+        assert!(!issuance_active_in(temp.path(), name).unwrap());
     }
 
     #[test]
