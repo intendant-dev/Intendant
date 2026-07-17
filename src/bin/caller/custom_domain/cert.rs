@@ -23,22 +23,12 @@ pub(super) fn restore(
         }
         Err(error) => Some(error),
     };
-    let cert_path = cert_dir.join(CERT_FILE);
-    let key_path = cert_dir.join(KEY_FILE);
-    let (cert_pem, key_pem) = match (
-        std::fs::read_to_string(&cert_path),
-        std::fs::read_to_string(&key_path),
-    ) {
-        (Ok(cert), Ok(key)) => (cert, key),
-        (Err(cert_error), Err(key_error))
-            if cert_error.kind() == std::io::ErrorKind::NotFound
-                && key_error.kind() == std::io::ErrorKind::NotFound =>
-        {
+    let (cert_pem, key_pem) = match read_stored_certificate_pair(cert_dir)? {
+        Some(pair) => pair,
+        None => {
             update_status(status, |current| current.last_error = account_error);
             return Ok(());
         }
-        (Err(error), _) => return Err(format!("read {}: {error}", cert_path.display())),
-        (_, Err(error)) => return Err(format!("read {}: {error}", key_path.display())),
     };
     require_exact_dns_name(&cert_pem, &domain.name)?;
     let not_after = crate::fleet_cert::cert_not_after_unix_ms(&cert_pem)
@@ -58,6 +48,34 @@ pub(super) fn restore(
         current.last_error = account_error;
     });
     Ok(())
+}
+
+fn read_stored_certificate_pair(cert_dir: &Path) -> Result<Option<(String, String)>, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let cert_path = cert_dir.join(CERT_FILE);
+        let key_path = cert_dir.join(KEY_FILE);
+        match (
+            std::fs::read_to_string(&cert_path),
+            std::fs::read_to_string(&key_path),
+        ) {
+            (Ok(cert), Ok(key)) => Ok(Some((cert, key))),
+            (Err(cert_error), Err(key_error))
+                if cert_error.kind() == std::io::ErrorKind::NotFound
+                    && key_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            (Err(error), _) => Err(crate::access::AccessError(format!(
+                "read {}: {error}",
+                cert_path.display()
+            ))),
+            (_, Err(error)) => Err(crate::access::AccessError(format!(
+                "read {}: {error}",
+                key_path.display()
+            ))),
+        }
+    })
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn spawn(
@@ -332,6 +350,56 @@ mod tests {
             "valid",
             "a partial certificate/key update must not be restored as usable"
         );
+    }
+
+    #[test]
+    fn stored_pair_read_waits_for_the_atomic_writer_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(CERT_FILE), b"old certificate").unwrap();
+        std::fs::write(dir.path().join(KEY_FILE), b"old key").unwrap();
+
+        let (key_written_tx, key_written_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let writer_dir = dir.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            crate::access::authority_store::with_lock(&writer_dir, || {
+                crate::access::authority_store::atomic_write_private_locked(
+                    &writer_dir.join(KEY_FILE),
+                    b"new key",
+                )?;
+                key_written_tx.send(()).unwrap();
+                finish_rx.recv().unwrap();
+                crate::access::authority_store::atomic_write_private_locked(
+                    &writer_dir.join(CERT_FILE),
+                    b"new certificate",
+                )
+            })
+        });
+        key_written_rx.recv().unwrap();
+
+        let (reader_started_tx, reader_started_rx) = std::sync::mpsc::channel();
+        let (pair_tx, pair_rx) = std::sync::mpsc::channel();
+        let reader_dir = dir.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            reader_started_tx.send(()).unwrap();
+            pair_tx
+                .send(read_stored_certificate_pair(&reader_dir))
+                .unwrap();
+        });
+        reader_started_rx.recv().unwrap();
+        assert!(
+            pair_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "reader observed a partially replaced certificate pair"
+        );
+        finish_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            pair_rx.recv().unwrap().unwrap(),
+            Some(("new certificate".to_string(), "new key".to_string()))
+        );
+        reader.join().unwrap();
     }
 
     #[test]

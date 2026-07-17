@@ -31,6 +31,9 @@ use std::sync::{Mutex, OnceLock};
 
 const FLEET_ORIGIN_PROVENANCE_FILE: &str = "fleet-origin-provenance.json";
 const FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION: u32 = 1;
+const FLEET_CERT_REQUESTED_FILE: &str = "fleet-cert-requested";
+const FLEET_CERT_REQUESTED_MARKER: &[u8] = b"intendant-fleet-certificate-requested-v1\n";
+const FLEET_CERT_SERIALS_MAX_BYTES: u64 = 1024 * 1024;
 const FLEET_CT_STATUS_FILE: &str = "fleet-cert-ct-status.json";
 const FLEET_CT_STATUS_MAX_BYTES: u64 = 1024 * 1024;
 
@@ -340,6 +343,43 @@ fn key_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join("fleet-key.pem")
 }
 
+fn issuance_requested_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(FLEET_CERT_REQUESTED_FILE)
+}
+
+fn issuance_requested_locked_in(cert_dir: &Path) -> Result<bool, String> {
+    let path = issuance_requested_path_in(cert_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) if bytes == FLEET_CERT_REQUESTED_MARKER => Ok(true),
+        Ok(_) => Err(format!(
+            "{} contains an invalid fleet-certificate request marker",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("read {}: {error}", path.display())),
+    }
+}
+
+fn issuance_requested_in(cert_dir: &Path) -> Result<bool, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        issuance_requested_locked_in(cert_dir).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn mark_issuance_requested_in(cert_dir: &Path) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        if issuance_requested_locked_in(cert_dir).map_err(crate::access::AccessError)? {
+            return Ok(());
+        }
+        crate::access::authority_store::atomic_write_private_locked(
+            &issuance_requested_path_in(cert_dir),
+            FLEET_CERT_REQUESTED_MARKER,
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
 /// Certificate expiry (`not_after`, unix ms) from a PEM chain's leaf.
 pub(crate) fn cert_not_after_unix_ms(cert_pem: &str) -> Option<u64> {
     let leaf = pem_certificates(cert_pem).into_iter().next()?;
@@ -390,6 +430,19 @@ fn fleet_certificate_dns_names(cert_pem: &str) -> Result<Vec<String>, String> {
         return Err("fleet certificate has no exact DNS SAN names".to_string());
     }
     Ok(names)
+}
+
+fn require_fleet_certificate_dns_name(cert_pem: &str, expected: &str) -> Result<(), String> {
+    let expected = normalized_dns_name(expected)
+        .ok_or_else(|| "current fleet certificate name is empty".to_string())?;
+    let names = fleet_certificate_dns_names(cert_pem)?;
+    if names.iter().any(|name| name == &expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "fleet certificate SANs do not include the current exact name {expected}"
+        ))
+    }
 }
 
 fn fleet_certificate_dns_names_in(cert_dir: &Path) -> Result<Option<Vec<String>>, String> {
@@ -544,33 +597,108 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
             status.name = restored.provenance.name;
         });
     }
+    if let Err(error) = own_serial_records_in(cert_dir) {
+        with_status(|status| {
+            status.ct_state = "unreadable".to_string();
+            status.ct_foreign_serials.clear();
+            status.ct_unknown.clear();
+            status.ct_last_error = Some(error.clone());
+        });
+        eprintln!(
+            "[fleet-cert] own-certificate ledger is unreadable; hosted lane suspended: {error}"
+        );
+    }
     let (cert_pem, key_pem) = match read_stored_certificate_pair_in(cert_dir) {
         Ok(Some(pair)) => pair,
-        Ok(None) => return,
+        Ok(None) => {
+            match missing_pair_retry_error_in(cert_dir) {
+                Ok(Some(error)) => with_status(|status| {
+                    status.state = "error".to_string();
+                    status.not_after_unix_ms = None;
+                    status.last_error = Some(error);
+                }),
+                Ok(None) => {}
+                Err(error) => with_status(|status| {
+                    status.state = "error".to_string();
+                    status.not_after_unix_ms = None;
+                    status.last_error =
+                        Some(format!("read fleet-certificate request marker: {error}"));
+                }),
+            }
+            return;
+        }
         Err(error) => {
             with_status(|status| {
                 status.state = "error".to_string();
+                status.not_after_unix_ms = None;
                 status.last_error = Some(error);
             });
             return;
         }
     };
+    // Existing installs predate the explicit request marker. The stored pair
+    // proves that renewal was enabled, so migrate that intent before serving
+    // the certificate. A later crash that loses both pair files must remain
+    // retryable rather than looking like a never-enabled daemon.
+    if let Err(error) = mark_issuance_requested_in(cert_dir) {
+        with_status(|status| {
+            status.state = "error".to_string();
+            status.not_after_unix_ms = None;
+            status.last_error = Some(format!("persist fleet-certificate renewal intent: {error}"));
+        });
+        return;
+    }
     let Some(name) = status_snapshot().name else {
         // Cert on disk but no name learned yet: install once the
         // register response names us (note_fleet_dns re-runs this).
         return;
     };
     let not_after = cert_not_after_unix_ms(&cert_pem);
-    match crate::web_tls::install_fleet_certificate(&name, &cert_pem, &key_pem) {
+    let install_result = require_fleet_certificate_dns_name(&cert_pem, &name)
+        .and_then(|()| crate::web_tls::install_fleet_certificate(&name, &cert_pem, &key_pem));
+    match install_result {
         Ok(()) => with_status(|status| {
-            status.state = "valid".to_string();
-            status.not_after_unix_ms = not_after;
-            status.last_error = None;
+            if fleet_name_matches(status.name.as_deref(), &name) {
+                status.state = "valid".to_string();
+                status.not_after_unix_ms = not_after;
+                status.last_error = None;
+            } else {
+                status.state = "error".to_string();
+                status.not_after_unix_ms = None;
+                status.last_error = Some(
+                    "fleet name changed while the stored certificate was being restored; renewal will retry"
+                        .to_string(),
+                );
+            }
         }),
         Err(error) => with_status(|status| {
             status.state = "error".to_string();
-            status.last_error = Some(format!("install stored certificate: {error}"));
+            status.not_after_unix_ms = None;
+            status.last_error = Some(format!("validate/install stored certificate: {error}"));
         }),
+    }
+}
+
+fn missing_pair_retry_error_in(cert_dir: &Path) -> Result<Option<String>, String> {
+    issuance_requested_in(cert_dir).map(|requested| {
+        requested.then(|| {
+            "fleet certificate issuance was requested, but no stored certificate pair exists; renewal will retry"
+                .to_string()
+        })
+    })
+}
+
+fn fleet_name_matches(current: Option<&str>, expected: &str) -> bool {
+    current.and_then(normalized_dns_name).as_deref() == normalized_dns_name(expected).as_deref()
+}
+
+fn ensure_current_fleet_name(expected: &str) -> Result<(), String> {
+    if fleet_name_matches(status_snapshot().name.as_deref(), expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "fleet name changed while certificate issuance was running for {expected}; retry against the current name"
+        ))
     }
 }
 
@@ -725,23 +853,6 @@ pub(crate) fn acme_account_uri_in(cert_dir: &Path) -> Result<Option<String>, Str
     Ok(Some(account_uri.to_string()))
 }
 
-pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    Ok(())
-}
-
 /// The default addresses to publish: every routable local address (LAN
 /// included — that is the point), loopback excluded, capped at 8.
 pub fn default_publish_addresses() -> Vec<String> {
@@ -786,6 +897,11 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         "this daemon has no fleet name — enable Connect against a rendezvous with fleet DNS"
             .to_string()
     })?;
+    // This is the durable opt-in to issuance and renewal. It lands before
+    // any network side effect so a crash after ACME starts cannot make a
+    // missing first pair look indistinguishable from a never-enabled daemon.
+    let certificate_dir = cert_dir();
+    mark_issuance_requested_in(&certificate_dir)?;
     with_status(|status| {
         status.state = "requesting".to_string();
         status.last_error = None;
@@ -838,32 +954,57 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         .poll_certificate(&instant_acme::RetryPolicy::default())
         .await
         .map_err(|e| format!("acme certificate: {e}"))?;
-    // The CT tripwire's own-serial ledger — recorded before install so a
-    // crash here can't make this certificate look foreign later.
-    record_own_certificate(&cert_chain_pem, &name, &acme_directory());
     // Best-effort challenge cleanup; the TXT self-expires regardless.
     let _ = crate::connect_rendezvous::dns_acme_clear().await;
+    require_fleet_certificate_dns_name(&cert_chain_pem, &name)?;
+    ensure_current_fleet_name(&name)?;
+    // The CT tripwire's own-serial ledger — recorded before install so a
+    // crash here can't make this certificate look foreign later. Failure is
+    // loud and retryable: installing an unrecorded certificate would create
+    // a false CT alert.
+    record_own_certificate_in(&certificate_dir, &cert_chain_pem, &name, &acme_directory())?;
 
     // 3. Persist + install live. The per-file replacements are atomic and
     // the shared authority lock prevents two daemon processes from
     // interleaving different pairs. A crash between the two replacements is
     // detected at restore and retried by the renewal loop.
-    persist_certificate_pair_in(&cert_dir(), &cert_chain_pem, &private_key_pem)?;
+    persist_certificate_pair_in(&certificate_dir, &name, &cert_chain_pem, &private_key_pem)?;
+    ensure_current_fleet_name(&name)?;
     crate::web_tls::install_fleet_certificate(&name, &cert_chain_pem, &private_key_pem)?;
+    let mut name_changed = false;
     with_status(|status| {
-        status.state = "valid".to_string();
-        status.not_after_unix_ms = cert_not_after_unix_ms(&cert_chain_pem);
-        status.last_error = None;
+        if fleet_name_matches(status.name.as_deref(), &name) {
+            status.state = "valid".to_string();
+            status.not_after_unix_ms = cert_not_after_unix_ms(&cert_chain_pem);
+            status.last_error = None;
+        } else {
+            name_changed = true;
+        }
     });
+    if name_changed {
+        return Err(format!(
+            "fleet name changed after certificate issuance completed for {name}; retry against the current name"
+        ));
+    }
     Ok(())
 }
 
 fn persist_certificate_pair_in(
     cert_dir: &Path,
+    expected_name: &str,
     cert_chain_pem: &str,
     private_key_pem: &str,
 ) -> Result<(), String> {
+    let expected_name = normalized_dns_name(expected_name)
+        .ok_or_else(|| "cannot persist a certificate for an empty fleet name".to_string())?;
     crate::access::authority_store::with_lock(cert_dir, || {
+        let provenance =
+            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+        if provenance.name.as_deref() != Some(expected_name.as_str()) {
+            return Err(crate::access::AccessError(format!(
+                "fleet name changed before certificate commit for {expected_name}; no certificate pair was written"
+            )));
+        }
         crate::access::authority_store::atomic_write_private_locked(
             &key_path_in(cert_dir),
             private_key_pem.as_bytes(),
@@ -898,10 +1039,6 @@ fn serials_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join("fleet-cert-serials.json")
 }
 
-fn serials_path() -> PathBuf {
-    serials_path_in(&cert_dir())
-}
-
 /// Lowercase hex with leading zeros trimmed — both our parsed serials
 /// and crt.sh's strings normalize to this before comparison.
 pub(crate) fn normalize_serial_hex(serial: &str) -> String {
@@ -926,22 +1063,40 @@ fn cert_serial_hex(cert_pem: &str) -> Option<String> {
     Some(normalize_serial_hex(&hex))
 }
 
-fn own_serial_records_in(cert_dir: &Path) -> Vec<OwnCertRecord> {
-    std::fs::read_to_string(serials_path_in(cert_dir))
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
-}
+fn own_serial_records_locked_in(cert_dir: &Path) -> Result<Vec<OwnCertRecord>, String> {
+    use std::io::Read as _;
 
-fn own_serial_records() -> Vec<OwnCertRecord> {
-    own_serial_records_in(&cert_dir())
-}
-
-fn own_serials_for_exact_name_in(cert_dir: &Path, name: &str) -> Vec<String> {
-    let Some(name) = normalized_dns_name(name) else {
-        return Vec::new();
+    let path = serials_path_in(cert_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
     };
-    let mut serials: Vec<String> = own_serial_records_in(cert_dir)
+    let mut bytes = Vec::new();
+    file.take(FLEET_CERT_SERIALS_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > FLEET_CERT_SERIALS_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the own-certificate ledger size limit",
+            path.display()
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("parse {}: {error}", path.display()))
+}
+
+fn own_serial_records_in(cert_dir: &Path) -> Result<Vec<OwnCertRecord>, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        own_serial_records_locked_in(cert_dir).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn own_serials_for_exact_name_in(cert_dir: &Path, name: &str) -> Result<Vec<String>, String> {
+    let Some(name) = normalized_dns_name(name) else {
+        return Ok(Vec::new());
+    };
+    let mut serials: Vec<String> = own_serial_records_in(cert_dir)?
         .into_iter()
         .filter(|record| normalized_dns_name(&record.name).as_deref() == Some(name.as_str()))
         .filter_map(|record| {
@@ -954,12 +1109,14 @@ fn own_serials_for_exact_name_in(cert_dir: &Path, name: &str) -> Vec<String> {
         .collect();
     serials.sort();
     serials.dedup();
-    serials
+    Ok(serials)
 }
 
 #[cfg(test)]
 pub(crate) fn own_serials_for_name_in(cert_dir: &Path, name: &str) -> Vec<String> {
     own_serial_ledger_for_name_in(cert_dir, name)
+        .ok()
+        .flatten()
         .map(|(serials, _)| serials)
         .unwrap_or_default()
 }
@@ -967,9 +1124,11 @@ pub(crate) fn own_serials_for_name_in(cert_dir: &Path, name: &str) -> Vec<String
 pub(crate) fn own_serial_ledger_for_name_in(
     cert_dir: &Path,
     name: &str,
-) -> Option<(Vec<String>, u64)> {
-    let name = normalized_dns_name(name)?;
-    let mut records: Vec<(String, u64)> = own_serial_records_in(cert_dir)
+) -> Result<Option<(Vec<String>, u64)>, String> {
+    let Some(name) = normalized_dns_name(name) else {
+        return Ok(None);
+    };
+    let mut records: Vec<(String, u64)> = own_serial_records_in(cert_dir)?
         .into_iter()
         .filter(|record| normalized_dns_name(&record.name).as_deref() == Some(name.as_str()))
         .filter_map(|record| {
@@ -987,36 +1146,58 @@ pub(crate) fn own_serial_ledger_for_name_in(
     let mut seen = std::collections::BTreeSet::new();
     records.retain(|(serial, _)| seen.insert(serial.clone()));
     records.truncate(crate::access::hosted_control::HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP);
-    let issued_unix_ms = records.iter().map(|(_, issued)| *issued).max()?;
+    let Some(issued_unix_ms) = records.iter().map(|(_, issued)| *issued).max() else {
+        return Ok(None);
+    };
     let mut serials: Vec<String> = records.into_iter().map(|(serial, _)| serial).collect();
     serials.sort();
-    Some((serials, issued_unix_ms))
+    Ok(Some((serials, issued_unix_ms)))
 }
 
 /// Record a certificate this daemon obtained — BEFORE install, so a
 /// crash between issuance and install can't leave an own-cert looking
 /// foreign at the next check.
-fn record_own_certificate(cert_pem: &str, name: &str, directory: &str) {
-    let Some(serial) = cert_serial_hex(cert_pem) else {
-        return;
-    };
-    let mut records = own_serial_records();
-    let normalized_name = normalized_dns_name(name);
-    if records.iter().any(|record| {
-        record.serial_hex == serial
-            && normalized_dns_name(&record.name).as_ref() == normalized_name.as_ref()
-    }) {
-        return;
-    }
-    records.push(OwnCertRecord {
-        serial_hex: serial,
-        name: name.to_string(),
-        directory: directory.to_string(),
-        issued_unix_ms: now_unix_ms(),
-    });
-    if let Ok(serialized) = serde_json::to_string_pretty(&records) {
-        let _ = write_private(&serials_path(), serialized.as_bytes());
-    }
+fn record_own_certificate_in(
+    cert_dir: &Path,
+    cert_pem: &str,
+    name: &str,
+    directory: &str,
+) -> Result<(), String> {
+    let serial = cert_serial_hex(cert_pem)
+        .ok_or_else(|| "issued fleet certificate has no usable serial".to_string())?;
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "issued fleet certificate has no usable exact name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut records =
+            own_serial_records_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        if records.iter().any(|record| {
+            normalize_serial_hex(&record.serial_hex) == serial
+                && normalized_dns_name(&record.name).as_deref() == Some(name.as_str())
+        }) {
+            return Ok(());
+        }
+        records.push(OwnCertRecord {
+            serial_hex: serial,
+            name,
+            directory: directory.to_string(),
+            issued_unix_ms: now_unix_ms(),
+        });
+        let mut serialized = serde_json::to_vec_pretty(&records).map_err(|error| {
+            crate::access::AccessError(format!("serialize own-certificate ledger: {error}"))
+        })?;
+        serialized.push(b'\n');
+        if serialized.len() as u64 > FLEET_CERT_SERIALS_MAX_BYTES {
+            return Err(crate::access::AccessError(
+                "own-certificate ledger would exceed its size limit; no record was changed"
+                    .to_string(),
+            ));
+        }
+        crate::access::authority_store::atomic_write_private_locked(
+            &serials_path_in(cert_dir),
+            &serialized,
+        )
+    })
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, PartialEq)]
@@ -1191,7 +1372,7 @@ pub async fn ct_check_once() {
     let Some(name) = status_snapshot().name else {
         return;
     };
-    let own = own_serials_for_exact_name_in(&cert_dir(), &name);
+    let certificate_dir = cert_dir();
     let result = async {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -1213,8 +1394,32 @@ pub async fn ct_check_once() {
     let now = now_unix_ms();
     match result {
         Ok(logged) => {
+            // Issuance can complete while the public-index request is in
+            // flight. Snapshot the locked own-certificate ledger only after
+            // the fetch so a newly recorded serial cannot become a false
+            // foreign-certificate alert.
+            let own = match own_serials_for_exact_name_in(&certificate_dir, &name) {
+                Ok(own) => own,
+                Err(error) => {
+                    with_status(|status| {
+                        if fleet_name_matches(status.name.as_deref(), &name) {
+                            status.ct_state = "unreadable".to_string();
+                            status.ct_foreign_serials.clear();
+                            status.ct_unknown.clear();
+                            status.ct_last_error =
+                                Some(format!("read own-certificate ledger: {error}"));
+                        }
+                    });
+                    return;
+                }
+            };
             let foreign = foreign_entries(logged, &own);
+            let mut applied = false;
             with_status(|status| {
+                if !fleet_name_matches(status.name.as_deref(), &name) {
+                    return;
+                }
+                applied = true;
                 status.ct_checked_unix_ms = Some(now);
                 status.ct_last_error = None;
                 if foreign.is_empty() {
@@ -1238,8 +1443,11 @@ pub async fn ct_check_once() {
                         .collect();
                 }
             });
+            if !applied {
+                return;
+            }
             let status = status_snapshot();
-            if let Err(error) = persist_ct_status_in(&cert_dir(), &status) {
+            if let Err(error) = persist_ct_status_in(&certificate_dir, &status) {
                 eprintln!("[fleet-cert] persist durable CT status: {error}");
             }
             if status.ct_state == "alert" {
@@ -1255,7 +1463,9 @@ pub async fn ct_check_once() {
         }
         Err(error) => {
             with_status(|status| {
-                status.ct_last_error = Some(error);
+                if fleet_name_matches(status.name.as_deref(), &name) {
+                    status.ct_last_error = Some(error);
+                }
             });
         }
     }
@@ -1508,10 +1718,12 @@ mod tests {
     #[test]
     fn renewal_retries_an_unusable_restored_pair_without_an_expiry() {
         let temp = tempfile::tempdir().unwrap();
+        let name = "d-test.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
         assert!(read_stored_certificate_pair_in(temp.path())
             .unwrap()
             .is_none());
-        persist_certificate_pair_in(temp.path(), "certificate", "private key").unwrap();
+        persist_certificate_pair_in(temp.path(), name, "certificate", "private key").unwrap();
         assert_eq!(
             read_stored_certificate_pair_in(temp.path()).unwrap(),
             Some(("certificate".to_string(), "private key".to_string()))
@@ -1522,7 +1734,7 @@ mod tests {
             .contains("pair is incomplete"));
 
         let repair = FleetCertStatus {
-            name: Some("d-test.fleet.example.test".to_string()),
+            name: Some(name.to_string()),
             state: "error".to_string(),
             not_after_unix_ms: None,
             ..Default::default()
@@ -1536,6 +1748,63 @@ mod tests {
         let mut requesting = repair;
         requesting.state = "requesting".to_string();
         assert!(!should_request_certificate(&requesting, now_unix_ms()));
+    }
+
+    #[test]
+    fn issuance_intent_is_durable_before_the_first_certificate_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!issuance_requested_in(temp.path()).unwrap());
+        mark_issuance_requested_in(temp.path()).unwrap();
+        assert!(issuance_requested_in(temp.path()).unwrap());
+        assert!(read_stored_certificate_pair_in(temp.path())
+            .unwrap()
+            .is_none());
+        assert!(missing_pair_retry_error_in(temp.path())
+            .unwrap()
+            .is_some_and(|error| error.contains("renewal will retry")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(issuance_requested_path_in(temp.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_commit_is_bound_to_the_current_durable_fleet_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_name = "old.fleet.example.test";
+        let new_name = "new.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), old_name).unwrap();
+        persist_certificate_pair_in(temp.path(), old_name, "old certificate", "old key").unwrap();
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), new_name).unwrap();
+
+        let error =
+            persist_certificate_pair_in(temp.path(), old_name, "stale certificate", "stale key")
+                .unwrap_err();
+        assert!(error.contains("fleet name changed"), "{error}");
+        assert_eq!(
+            read_stored_certificate_pair_in(temp.path()).unwrap(),
+            Some(("old certificate".to_string(), "old key".to_string()))
+        );
+    }
+
+    #[test]
+    fn fleet_certificate_must_name_the_current_exact_fleet_origin() {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["old.fleet.example.test".to_string()]).unwrap();
+        assert!(
+            require_fleet_certificate_dns_name(&cert.cert.pem(), "old.fleet.example.test").is_ok()
+        );
+        let error = require_fleet_certificate_dns_name(&cert.cert.pem(), "new.fleet.example.test")
+            .unwrap_err();
+        assert!(error.contains("current exact name"), "{error}");
     }
 
     #[test]
@@ -1595,11 +1864,11 @@ mod tests {
         );
         assert_eq!(
             own_serial_ledger_for_name_in(temp.path(), "ONE.fleet.example.test"),
-            Some((vec!["a".to_string(), "b".to_string()], 3))
+            Ok(Some((vec!["a".to_string(), "b".to_string()], 3)))
         );
         assert_eq!(
             own_serials_for_exact_name_in(temp.path(), "two.fleet.example.test"),
-            vec!["ff".to_string()]
+            Ok(vec!["ff".to_string()])
         );
     }
 
@@ -1622,7 +1891,9 @@ mod tests {
         .unwrap();
 
         let (serials, issued_unix_ms) =
-            own_serial_ledger_for_name_in(temp.path(), "one.fleet.example.test").unwrap();
+            own_serial_ledger_for_name_in(temp.path(), "one.fleet.example.test")
+                .unwrap()
+                .unwrap();
         assert_eq!(
             serials.len(),
             crate::access::hosted_control::HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP
@@ -1631,6 +1902,57 @@ mod tests {
         assert!(!serials.contains(&"1".to_string()));
         assert!(!serials.contains(&"2".to_string()));
         assert!(!serials.contains(&"3".to_string()));
+    }
+
+    #[test]
+    fn concurrent_own_certificate_records_do_not_overwrite_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "one.fleet.example.test";
+        let certificate = |serial: u8| {
+            let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+            params.serial_number = Some(rcgen::SerialNumber::from(vec![serial]));
+            let key = rcgen::KeyPair::generate().unwrap();
+            params.self_signed(&key).unwrap().pem()
+        };
+        let first = certificate(1);
+        let second = certificate(2);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|certificate| {
+                let cert_dir = temp.path().to_path_buf();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_own_certificate_in(&cert_dir, &certificate, name, "test")
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(
+            own_serials_for_exact_name_in(temp.path(), name).unwrap(),
+            vec!["1".to_string(), "2".to_string()]
+        );
+    }
+
+    #[test]
+    fn malformed_own_certificate_ledger_is_not_treated_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(serials_path_in(temp.path()), b"{").unwrap();
+        assert!(
+            own_serials_for_exact_name_in(temp.path(), "one.fleet.example.test")
+                .unwrap_err()
+                .contains("parse")
+        );
+        assert!(
+            own_serial_ledger_for_name_in(temp.path(), "one.fleet.example.test")
+                .unwrap_err()
+                .contains("parse")
+        );
     }
 
     #[test]

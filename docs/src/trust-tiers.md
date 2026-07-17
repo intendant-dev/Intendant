@@ -152,10 +152,14 @@ tab self-sufficient.
 gives each daemon a real name, and the Connect card's *Enable HTTPS
 discovery* button publishes the daemon's addresses (LAN included — no
 port forwarding needed) and mints a Let's Encrypt certificate via DNS-01,
-renewed automatically, private keys never leaving the machine. With hosted
-control off, that gives a warning-free public shell/discovery endpoint. With it
-on, unproved fleet traffic remains anonymous `role:none`; protected traffic
-must prove an approved short-lived lease and pass the exact
+renewed automatically, private keys never leaving the machine. Issuance intent
+is recorded durably before ACME begins, so a crash before the first
+certificate pair is committed remains retryable. Pair and own-certificate
+ledger reads and replacements share the daemon authority-store lock; restored
+and newly issued certificates must name the current exact fleet origin. With
+hosted control off, that gives a warning-free public shell/discovery endpoint.
+With it on, unproved fleet traffic remains anonymous `role:none`; protected
+traffic must prove an approved short-lived lease and pass the exact
 route/method/frame/action projection. The rendezvous controls the name and can
 serve code at the same origin, so the lease ceiling and immutable floor—not the
 name—bound that code. CT monitoring is the current slower detection fallback;

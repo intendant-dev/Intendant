@@ -24,6 +24,7 @@ impl HostedControlRuntime {
         let fleet_origin = validate_fleet_origin(&format!("https://{name}"))?;
         let (serials, issued_unix_ms) =
             crate::fleet_cert::own_serial_ledger_for_name_in(&self.cert_dir, &name)
+                .map_err(|error| format!("read fleet certificate ledger: {error}"))?
                 .ok_or_else(|| "fleet certificate ledger has no issued certificate".to_string())?;
         let mut ledger = HostedCertificateLedger {
             protocol: CERTIFICATE_LEDGER_PROTOCOL.to_string(),
