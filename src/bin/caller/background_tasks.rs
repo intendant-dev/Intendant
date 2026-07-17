@@ -317,7 +317,13 @@ pub(crate) fn record_started(
     description: &str,
     started_at_epoch: u64,
 ) {
-    global().record_started(session_id, task_id, tool_use_id, description, started_at_epoch);
+    global().record_started(
+        session_id,
+        task_id,
+        tool_use_id,
+        description,
+        started_at_epoch,
+    );
 }
 
 pub(crate) fn record_output_file(session_id: &str, tool_use_id: &str, output_file: PathBuf) {
@@ -475,19 +481,35 @@ mod tests {
 
     #[test]
     fn ack_path_parses_probed_shape_and_refuses_relative() {
-        let ack = "Command running in background with ID: b9lkjn0bv. \
-                   Output is being written to: /tmp/claude/tasks dir/b9lkjn0bv.output. \
-                   You will be notified when it completes. To check interim output, \
-                   use Read on that file path.";
+        // The CLI emits host-native absolute paths, and `is_absolute` is
+        // a host judgment ("/tmp/x" is NOT absolute on Windows) — so the
+        // fixtures are host-shaped too.
+        let abs_spaced = if cfg!(windows) {
+            "C:\\claude\\tasks dir\\b9lkjn0bv.output"
+        } else {
+            "/tmp/claude/tasks dir/b9lkjn0bv.output"
+        };
+        let abs_plain = if cfg!(windows) {
+            "C:\\t\\x.output"
+        } else {
+            "/tmp/t/x.output"
+        };
+        let ack = format!(
+            "Command running in background with ID: b9lkjn0bv. \
+             Output is being written to: {abs_spaced}. \
+             You will be notified when it completes. To check interim output, \
+             use Read on that file path."
+        );
         assert_eq!(
-            parse_output_path_from_ack(ack).as_deref(),
-            Some(std::path::Path::new("/tmp/claude/tasks dir/b9lkjn0bv.output")),
+            parse_output_path_from_ack(&ack).as_deref(),
+            Some(std::path::Path::new(abs_spaced)),
             "embedded spaces survive the sentence cut"
         );
         // Ack ending at the path: the lone trailing period trims.
         assert_eq!(
-            parse_output_path_from_ack("Output is being written to: /tmp/t/x.output.").as_deref(),
-            Some(std::path::Path::new("/tmp/t/x.output"))
+            parse_output_path_from_ack(&format!("Output is being written to: {abs_plain}."))
+                .as_deref(),
+            Some(std::path::Path::new(abs_plain))
         );
         // No marker, relative path, or empty remainder: no path, no guess.
         assert!(parse_output_path_from_ack("Command running in background with ID: x.").is_none());
@@ -496,7 +518,8 @@ mod tests {
         );
         assert!(parse_output_path_from_ack("Output is being written to: ").is_none());
         assert!(
-            parse_output_path_from_ack("Output is being written to: \n/tmp/t/x.output").is_none(),
+            parse_output_path_from_ack(&format!("Output is being written to: \n{abs_plain}"))
+                .is_none(),
             "a newline before any path text means no path on the marker line"
         );
     }

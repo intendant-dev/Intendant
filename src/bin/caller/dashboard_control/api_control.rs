@@ -1078,9 +1078,8 @@ pub(crate) async fn api_session_background_task_output_response(
         };
         query = format!("?tail_kb={tail_kb}");
     }
-    let request_line = format!(
-        "GET /api/session/{session_id}/background-tasks/{task_id}/output{query} HTTP/1.1"
-    );
+    let request_line =
+        format!("GET /api/session/{session_id}/background-tasks/{task_id}/output{query} HTTP/1.1");
     let home = crate::platform::home_dir();
     let response = tokio::task::spawn_blocking(move || {
         crate::web_gateway::session_background_task_output_response(&request_line, &home)

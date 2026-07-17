@@ -1654,7 +1654,9 @@ impl CcReader {
             .iter()
             .position(|task| task.tool_use_id == tool_use_id)
         {
-            let BgArmedTask { description: desc, .. } = self.bg_armed.remove(pos);
+            let BgArmedTask {
+                description: desc, ..
+            } = self.bg_armed.remove(pos);
             // Finish the inspector record: the notification's
             // `output_file` is the authoritative path statement (probed:
             // present on completed/failed/stopped alike, sometimes "").
@@ -2031,9 +2033,8 @@ impl CcReader {
             let structured = tool_use_result
                 .and_then(|r| r.get("outputFile").or_else(|| r.get("output_file")))
                 .and_then(|v| v.as_str());
-            let announced = bg_wire_output_path(structured).or_else(|| {
-                crate::background_tasks::parse_output_path_from_ack(&content_text)
-            });
+            let announced = bg_wire_output_path(structured)
+                .or_else(|| crate::background_tasks::parse_output_path_from_ack(&content_text));
             if let Some(path) = announced {
                 if let Some(session) = self.announced_session_id.as_deref() {
                     crate::background_tasks::record_output_file(session, &tool_id, path.clone());
@@ -3853,6 +3854,23 @@ mod tests {
     fn background_task_registry_mirrors_lifecycle_and_output_paths() {
         use crate::background_tasks::{self, BackgroundTaskStatus};
         let sid = "cc-bg-inspector-e2e-0001";
+        // Host-shaped absolute paths: the CLI emits native paths and the
+        // absoluteness gate is a host judgment ("/tmp/x" is not absolute
+        // on Windows). `json` escapes the Windows backslashes for the
+        // wire fixtures.
+        let abs = |name: &str| {
+            if cfg!(windows) {
+                format!("C:\\cc-tasks\\{name}")
+            } else {
+                format!("/tmp/cc-tasks/{name}")
+            }
+        };
+        let json = |path: &str| path.replace('\\', "\\\\");
+        let (ack_path, final_path, structured_path) = (
+            abs("breg1.output"),
+            abs("breg1-final.output"),
+            abs("breg2.output"),
+        );
         let mut reader = test_reader();
         reader.shared.observe_activity(ActivityObs::TurnDispatched);
         reader.process_line(&format!(
@@ -3869,13 +3887,14 @@ mod tests {
 
         // Launch ack (probed shape): the text names the output file.
         reader.process_line(&format!(
-            r#"{{"type":"user","tool_use_result":{{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"breg1"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg1","content":"Command running in background with ID: breg1. Output is being written to: /tmp/cc-tasks/breg1.output. You will be notified when it completes. To check interim output, use Read on that file path."}}]}},"session_id":"{sid}"}}"#,
+            r#"{{"type":"user","tool_use_result":{{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"breg1"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg1","content":"Command running in background with ID: breg1. Output is being written to: {}. You will be notified when it completes. To check interim output, use Read on that file path."}}]}},"session_id":"{sid}"}}"#,
+            json(&ack_path),
         ));
         let task = background_tasks::find_task(sid, "breg1").expect("registered");
         assert_eq!(task.status, BackgroundTaskStatus::Running);
         assert_eq!(
             task.output_file.as_deref(),
-            Some(std::path::Path::new("/tmp/cc-tasks/breg1.output"))
+            Some(std::path::Path::new(&ack_path))
         );
 
         // Park, then the completion notification: finished record
@@ -3884,14 +3903,15 @@ mod tests {
             r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":2,"session_id":"{sid}"}}"#,
         ));
         reader.process_line(&format!(
-            r#"{{"type":"system","subtype":"task_notification","task_id":"breg1","tool_use_id":"toolu_bgreg1","status":"completed","output_file":"/tmp/cc-tasks/breg1-final.output","summary":"done","session_id":"{sid}"}}"#,
+            r#"{{"type":"system","subtype":"task_notification","task_id":"breg1","tool_use_id":"toolu_bgreg1","status":"completed","output_file":"{}","summary":"done","session_id":"{sid}"}}"#,
+            json(&final_path),
         ));
         let task = background_tasks::find_task(sid, "breg1").expect("retained after finish");
         assert_eq!(task.status, BackgroundTaskStatus::Completed);
         assert!(task.ended_at_epoch.is_some());
         assert_eq!(
             task.output_file.as_deref(),
-            Some(std::path::Path::new("/tmp/cc-tasks/breg1-final.output"))
+            Some(std::path::Path::new(&final_path))
         );
 
         // Second command: a (future-CLI) structured outputFile beats the
@@ -3903,12 +3923,13 @@ mod tests {
             r#"{{"type":"system","subtype":"task_started","task_id":"breg2","tool_use_id":"toolu_bgreg2","description":"sleep 300","task_type":"local_bash","session_id":"{sid}"}}"#,
         ));
         reader.process_line(&format!(
-            r#"{{"type":"user","tool_use_result":{{"backgroundTaskId":"breg2","outputFile":"/tmp/cc-tasks/breg2.output"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg2","content":"Command running in background with ID: breg2."}}]}},"session_id":"{sid}"}}"#,
+            r#"{{"type":"user","tool_use_result":{{"backgroundTaskId":"breg2","outputFile":"{}"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg2","content":"Command running in background with ID: breg2."}}]}},"session_id":"{sid}"}}"#,
+            json(&structured_path),
         ));
         let task = background_tasks::find_task(sid, "breg2").expect("second command registered");
         assert_eq!(
             task.output_file.as_deref(),
-            Some(std::path::Path::new("/tmp/cc-tasks/breg2.output"))
+            Some(std::path::Path::new(&structured_path))
         );
 
         // A fresh reader adopting the same backend id clears the records.

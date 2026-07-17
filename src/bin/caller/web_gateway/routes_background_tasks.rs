@@ -24,7 +24,7 @@
 use super::*;
 use crate::background_tasks::{BackgroundTaskRecord, BackgroundTaskStatus};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Default tail size served when `tail_kb` is absent.
 pub(crate) const DEFAULT_TAIL_KB: u64 = 64;
@@ -55,11 +55,11 @@ pub(crate) async fn handle_session_background_task_output(
 /// How `{id}` resolved: the registry key to serve, or an honest
 /// unsupported/unknown verdict.
 enum SessionResolution {
-    /// Serve the registry under this backend session id. The bool says
-    /// whether the id resolved through a persisted wrapper identity
-    /// (which vouches the session exists even when the registry has no
-    /// records for it yet).
-    ClaudeCode { key: String, vouched: bool },
+    /// Serve the registry under this backend session id — resolved
+    /// through a persisted wrapper identity (which vouches the session
+    /// exists even when the registry has no records for it yet), or the
+    /// id itself when the registry already knows it.
+    ClaudeCode { key: String },
     /// A wrapper session of a backend without a background-task wire.
     Unsupported { source: String },
     /// Nothing known under this id anywhere.
@@ -73,10 +73,7 @@ fn resolve_session(session_id: &str, home: &Path) -> SessionResolution {
         crate::session_supervisor::persisted_external_identity_for_session_in_home(home, session_id)
     {
         return if source == "claude-code" {
-            SessionResolution::ClaudeCode {
-                key: backend_id,
-                vouched: true,
-            }
+            SessionResolution::ClaudeCode { key: backend_id }
         } else {
             SessionResolution::Unsupported { source }
         };
@@ -84,7 +81,6 @@ fn resolve_session(session_id: &str, home: &Path) -> SessionResolution {
     if crate::background_tasks::session_known(session_id) {
         return SessionResolution::ClaudeCode {
             key: session_id.to_string(),
-            vouched: false,
         };
     }
     SessionResolution::Unknown
@@ -115,7 +111,7 @@ pub(crate) fn session_background_tasks_response(request_line: &str, home: &Path)
         return ApiResponse::json_error(400, "session id missing in background-tasks path");
     };
     match resolve_session(&session_id, home) {
-        SessionResolution::ClaudeCode { key, .. } => {
+        SessionResolution::ClaudeCode { key } => {
             let tasks: Vec<serde_json::Value> = crate::background_tasks::tasks_for_session(&key)
                 .iter()
                 .map(task_json)
@@ -170,7 +166,7 @@ pub(crate) fn session_background_task_output_response(
         return ApiResponse::json_error(400, "session or task id missing in output path");
     };
     let key = match resolve_session(&session_id, home) {
-        SessionResolution::ClaudeCode { key, .. } => key,
+        SessionResolution::ClaudeCode { key } => key,
         SessionResolution::Unsupported { source } => {
             return ApiResponse::json_error(
                 404,
@@ -214,10 +210,9 @@ pub(crate) fn session_background_task_output_response(
             404,
             format!("output file for background task {task_id} is gone"),
         ),
-        Err(TailError::NotRegular) => ApiResponse::json_error(
-            403,
-            "refusing to read a non-regular output file".to_string(),
-        ),
+        Err(TailError::NotRegular) => {
+            ApiResponse::json_error(403, "refusing to read a non-regular output file")
+        }
         Err(TailError::Io(err)) => {
             ApiResponse::json_error(500, format!("failed to read output tail: {err}"))
         }
@@ -399,8 +394,12 @@ mod tests {
         assert_eq!(tasks[1]["endedAtEpoch"], 95);
         // The invariant in the wire shape itself: no path ever leaves.
         assert!(
-            !serde_json::to_string(&body).expect("body").contains("output_file")
-                && !serde_json::to_string(&body).expect("body").contains("outputFile"),
+            !serde_json::to_string(&body)
+                .expect("body")
+                .contains("output_file")
+                && !serde_json::to_string(&body)
+                    .expect("body")
+                    .contains("outputFile"),
             "paths never serialize"
         );
         crate::background_tasks::clear_session(sid);
@@ -566,7 +565,9 @@ mod tests {
                 .as_deref(),
             Some("abc")
         );
-        assert!(background_tasks_session_id("GET /api/session//background-tasks HTTP/1.1").is_none());
+        assert!(
+            background_tasks_session_id("GET /api/session//background-tasks HTTP/1.1").is_none()
+        );
         assert!(background_tasks_session_id("GET /api/session/abc/frames HTTP/1.1").is_none());
         assert!(background_tasks_session_id(
             "GET /api/session/abc/background-tasks/extra HTTP/1.1"
@@ -578,10 +579,10 @@ mod tests {
             ),
             Some(("abc".to_string(), "t9".to_string()))
         );
-        assert!(
-            background_task_output_ids("GET /api/session/abc/background-tasks//output HTTP/1.1")
-                .is_none()
-        );
+        assert!(background_task_output_ids(
+            "GET /api/session/abc/background-tasks//output HTTP/1.1"
+        )
+        .is_none());
         assert!(
             background_task_output_ids("GET /api/session/abc/background-tasks/t9 HTTP/1.1")
                 .is_none()
