@@ -522,6 +522,7 @@ pub(crate) async fn run_headless_mode(
                     logs_home_override: None,
                     git_vitals_targets: vitals_git_targets.clone(),
                     hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
+                    launch_gate_for_tests: None,
                 },
             )
             .spawn_resume_listener(),

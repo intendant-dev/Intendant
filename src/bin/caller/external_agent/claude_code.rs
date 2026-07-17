@@ -2568,6 +2568,12 @@ impl CcReader {
                 label: cc_rate_limit_label(kind),
                 ..Default::default()
             });
+        // The CLI re-announces the window's CURRENT status on roughly
+        // every model call while it persists (live: one allowed_warning
+        // per call through the whole warned span). The gauge takes every
+        // event; the log arm at the bottom fires on genuine status
+        // transitions only, so capture what this event overwrites.
+        let prev_status = window.status.clone();
         if used_pct.is_some() {
             window.used_pct = used_pct;
         }
@@ -2607,13 +2613,53 @@ impl CcReader {
                 self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
             }
         }
-        if status.is_empty() || status == "allowed" {
+        // Log rows fire on status TRANSITIONS only. Same-status
+        // re-announcements are vitals traffic, not news — logging each one
+        // put a warn row in the Activity log (and the persisted session
+        // JSONL) once per model call for as long as a warning persisted;
+        // the limits vitals chip is the continuous surface for the state.
+        if status.is_empty() || prev_status.as_deref() == Some(status) {
             return;
         }
-        out.log(
-            "warn",
-            format!("Claude Code rate limit: status {status} ({kind} window)"),
-        );
+        match status {
+            "allowed" => {
+                // Recovery is only news after a non-allowed status; the
+                // session's first plain allowed stays silent.
+                if prev_status.is_some() {
+                    out.log(
+                        "info",
+                        format!("Claude Code rate limit cleared ({kind} window)"),
+                    );
+                }
+            }
+            "allowed_warning" => {
+                let reset = resets_at_epoch
+                    .map(|at| {
+                        let phrase = super::limit_reset_phrase_verb(
+                            "resets",
+                            Some(at),
+                            crate::session_activity::epoch_seconds(),
+                        );
+                        format!(" — {phrase}")
+                    })
+                    .unwrap_or_default();
+                out.log(
+                    "warn",
+                    format!(
+                        "Claude Code rate limit warning: the {kind} window is approaching its limit{reset}"
+                    ),
+                );
+            }
+            _ => {
+                // Hard statuses (rejected, …): the turn-level report with
+                // the resume time rides handle_result's structured
+                // TurnLimitRejected; this row records the wire status flip.
+                out.log(
+                    "warn",
+                    format!("Claude Code rate limit: status {status} ({kind} window)"),
+                );
+            }
+        }
     }
 
     /// Current rate-limit windows for attaching to usage snapshots.
@@ -5946,6 +5992,102 @@ mod tests {
             e,
             AgentEvent::Log { level, message } if level == "warn" && message.contains("rejected")
         )));
+    }
+
+    /// The live spam incident: the CLI re-announces `allowed_warning` on
+    /// every model call for as long as the warning persists, and each
+    /// re-announcement logged a warn row (Activity log + persisted JSONL).
+    /// Log rows must fire on status TRANSITIONS only, while the vitals
+    /// gauge keeps taking every event.
+    #[test]
+    fn rate_limit_status_logs_only_on_transitions() {
+        fn log_events(out: &CcLineOutcome) -> Vec<(String, String)> {
+            out.events
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Log { level, message } => Some((level.clone(), message.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut reader = test_reader();
+        // Entering the warning logs once, with the reset time.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":9999999999},"session_id":"s1"}"#,
+        );
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "one warn row on the transition: {logs:?}");
+        assert_eq!(logs[0].0, "warn");
+        assert!(
+            logs[0].1.contains("warning") && logs[0].1.contains("five_hour"),
+            "row names the state and window: {}",
+            logs[0].1
+        );
+        assert!(
+            logs[0].1.contains("resets"),
+            "row carries the reset time when the wire has one: {}",
+            logs[0].1
+        );
+
+        // Re-announcements of the SAME status stay silent — even when the
+        // reset time moves — but the vitals gauge still takes the update.
+        for resets_at in [9999999999u64, 9999999998] {
+            let line = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":{resets_at}}},"session_id":"s1"}}"#
+            );
+            let out = reader.process_line(&line);
+            assert!(
+                log_events(&out).is_empty(),
+                "re-announced status must not log: {:?}",
+                log_events(&out)
+            );
+        }
+        let windows = reader.current_limit_windows();
+        let five_hour = windows.iter().find(|w| w.label == "5h").expect("5h window");
+        assert_eq!(
+            five_hour.resets_at_epoch,
+            Some(9_999_999_998),
+            "silent re-announcements still update the gauge"
+        );
+        assert_eq!(five_hour.status.as_deref(), Some("allowed_warning"));
+
+        // Escalation to a hard status logs again; repeating it is silent.
+        let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#;
+        let out = reader.process_line(rejected);
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "escalation logs once: {logs:?}");
+        assert!(logs[0].1.contains("rejected"));
+        let out = reader.process_line(rejected);
+        assert!(log_events(&out).is_empty(), "repeated rejected is silent");
+
+        // Recovery back to allowed logs an info row once; a fresh warning
+        // afterwards is a new transition and logs again.
+        let allowed = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#;
+        let out = reader.process_line(allowed);
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "recovery logs once: {logs:?}");
+        assert_eq!(logs[0].0, "info");
+        assert!(logs[0].1.contains("cleared"));
+        let out = reader.process_line(allowed);
+        assert!(log_events(&out).is_empty(), "repeated allowed is silent");
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        assert_eq!(
+            log_events(&out).len(),
+            1,
+            "a fresh warning after recovery re-arms the row"
+        );
+
+        // Independent windows transition independently: a seven_day
+        // warning logs even while five_hour sits in the same state.
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day"},"session_id":"s1"}"#,
+        );
+        let logs = log_events(&out);
+        assert_eq!(logs.len(), 1, "per-window transition: {logs:?}");
+        assert!(logs[0].1.contains("seven_day"));
     }
 
     /// The captured incident shape: a `rate_limit_event` with status
