@@ -1,6 +1,6 @@
 ---
 name: intendant-agenda
-description: When you defer work, promise a follow-up ("I'll also…", "later we should…", "worth revisiting"), hit something out of scope, or want the owner to see a note that must survive your context window — park it on the daemon's agenda instead of losing it. Also use to check what's already parked before planning, and to complete or retire items you resolve.
+description: When you defer work, promise a follow-up ("I'll also…", "later we should…", "worth revisiting"), hit something out of scope, have a question only the owner can answer but don't need to block on it, or want the owner to see a note that must survive your context window — park it on the daemon's agenda instead of losing it. Also use at session start to check what's parked and whether earlier questions got answered.
 ---
 
 # The Agenda: park intent that must outlive your context
@@ -26,12 +26,22 @@ dashboard, attributed to your session.
 ```bash
 "${INTENDANT:-intendant}" ctl agenda add "Renew the TLS cert" --task --body "Expires Aug 1; renew by Jul 20." --tag infra --due 2026-07-20
 "${INTENDANT:-intendant}" ctl agenda add "Idea: unify the two transfer pumps" --note --tag arch
+"${INTENDANT:-intendant}" ctl agenda ask "OK to drop the v1 shim next week?" --body "qa.transportShimHits()==0 for 2 days now."
 "${INTENDANT:-intendant}" ctl agenda list            # open items (--all / --done / --retired)
+"${INTENDANT:-intendant}" ctl agenda answer 01KX "yes — after the soak window"   # owner replies
 "${INTENDANT:-intendant}" ctl agenda complete 01KX   # any unique id prefix
 "${INTENDANT:-intendant}" ctl agenda reopen 01KX     # resurrects done or retired
 "${INTENDANT:-intendant}" ctl agenda retire 01KX     # hides without destroying history
 "${INTENDANT:-intendant}" ctl agenda patch 01KX --due +3d   # presentation edits (title/body/tags/due)
 ```
+
+- **Questions**: `ask` parks a durable, non-blocking question — it badges
+  the owner's attention rail, nothing waits, and the reply lands on the
+  item (`answer` field in `list --json`). Ask when you need the owner's
+  call but can proceed on other work; use `ctl ask` (the blocking rail)
+  only when you cannot proceed without the answer. **Check for answers at
+  session start** — an answered question is how yesterday's you hears
+  back.
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.

@@ -715,6 +715,42 @@ pub(crate) async fn create_external_agent(
                 .is_some_and(|parent| parent.trim() == resume)
         });
 
+    // Anchor-fork staging (codex): one-shot spawn parameters the fork
+    // orchestrator persisted into the wrapper's launch config. Lifted only
+    // while the wrapper still resumes the parent id (the same window as
+    // `fork_resume`), so a later plain resume of the child can never
+    // re-fork; the announce-time overlay persist strips them durably.
+    let (codex_fork_rollout_path, codex_fork_cut) = if fork_resume {
+        session_log
+            .lock()
+            .ok()
+            .map(|log| log.dir().to_path_buf())
+            .and_then(|dir| crate::session_config::read_log_dir_config(&dir))
+            .map(|cfg| {
+                let cut = if let Some(item_id) = cfg
+                    .codex_fork_rollback_item_id
+                    .filter(|item| !item.trim().is_empty())
+                {
+                    Some(crate::session_fork::CodexForkCut::ItemAnchor {
+                        item_id,
+                        position: cfg
+                            .codex_fork_rollback_position
+                            .unwrap_or_else(|| "after".to_string()),
+                    })
+                } else {
+                    cfg.codex_fork_rollback_turns
+                        .map(crate::session_fork::CodexForkCut::Turns)
+                };
+                (
+                    cfg.codex_fork_rollout_path.map(std::path::PathBuf::from),
+                    cut,
+                )
+            })
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
@@ -780,6 +816,8 @@ pub(crate) async fn create_external_agent(
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
+                fork_from_rollout_path: codex_fork_rollout_path.clone(),
+                fork_cut: codex_fork_cut.clone(),
                 codex_home,
                 protocol_watch,
             };
@@ -823,6 +861,8 @@ pub(crate) async fn create_external_agent(
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
+                fork_from_rollout_path: None,
+                fork_cut: None,
                 codex_home: None,
                 protocol_watch,
             };
@@ -929,6 +969,119 @@ pub(crate) enum DrainOutcome {
         turns_in_round: usize,
         turn_stop_status: ManagedContextRewindTurnStopStatus,
     },
+    /// The turn ended rejected at a provider usage limit
+    /// ([`external_agent::AgentEvent::TurnLimitRejected`]). The backend
+    /// process stays usable, but the round did no work: the caller must
+    /// consume no round budget and must NOT immediately re-fire —
+    /// instead it parks the pending follow-up until `resets_at_epoch`
+    /// (plus jitter; exponential backoff when absent) and queues user
+    /// input arriving meanwhile.
+    LimitRejected {
+        resets_at_epoch: Option<u64>,
+        message: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit park policy (park-until-reset for limit-rejected turns)
+// ---------------------------------------------------------------------------
+
+/// Jitter added on top of the provider's reset time so a fleet of parked
+/// sessions doesn't stampede the API the second a window opens.
+pub(crate) const LIMIT_PARK_JITTER_MIN_SECS: u64 = 30;
+pub(crate) const LIMIT_PARK_JITTER_MAX_SECS: u64 = 90;
+/// Backoff bounds when the rejection carried no reset time.
+const LIMIT_PARK_BACKOFF_MIN_SECS: u64 = 5 * 60;
+const LIMIT_PARK_BACKOFF_MAX_SECS: u64 = 30 * 60;
+/// Cap on a single park cycle. A `seven_day` window can honestly reset
+/// days out; instead of one multi-day timer, the park re-checks at this
+/// cadence (one cheap rejected request per cycle re-parks with a fresh
+/// reset time).
+const LIMIT_PARK_MAX_SECS: u64 = 6 * 3600;
+
+/// Random park jitter in the fleet-safe band. Tests inject their own
+/// value into [`limit_park_delay`] instead of calling this.
+pub(crate) fn limit_park_jitter_secs() -> u64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS)
+}
+
+/// How long a limit-rejected follow-up parks before it is re-sent. Pure —
+/// clock and jitter injected. With a wire reset time: until the reset
+/// plus jitter, capped at [`LIMIT_PARK_MAX_SECS`]. Without one:
+/// exponential backoff by consecutive-park `streak` (1-based), 5 → 30
+/// minutes, so an untimed limit is retried patiently instead of hammered.
+pub(crate) fn limit_park_delay(
+    resets_at_epoch: Option<u64>,
+    now_epoch: u64,
+    streak: u32,
+    jitter_secs: u64,
+) -> Duration {
+    let secs = match resets_at_epoch {
+        Some(resets_at) => resets_at
+            .saturating_sub(now_epoch)
+            .min(LIMIT_PARK_MAX_SECS)
+            .saturating_add(jitter_secs),
+        None => {
+            let shift = streak.saturating_sub(1).min(3);
+            (LIMIT_PARK_BACKOFF_MIN_SECS << shift).min(LIMIT_PARK_BACKOFF_MAX_SECS)
+        }
+    };
+    Duration::from_secs(secs)
+}
+
+/// One armed rate-limit park in an external-session lane: the lane sleeps
+/// until `resume_at`, then re-sends `pending` (if still uncancelled).
+/// User messages arriving while parked queue behind it instead of burning
+/// against the rejected backend.
+pub(crate) struct LimitParkState {
+    pub(crate) resume_at: tokio::time::Instant,
+    pub(crate) pending: Option<FollowUpMessage>,
+}
+
+/// The session-log/activity row announcing a park. One place so the two
+/// lanes (persistent daemon lane and the supervised external-mode lane)
+/// cannot drift. `has_pending` says whether a rejected message will be
+/// re-sent when the park elapses.
+pub(crate) fn limit_park_log_line(
+    resets_at_epoch: Option<u64>,
+    now_epoch: u64,
+    has_pending: bool,
+) -> String {
+    let tail = if has_pending {
+        "will auto-resume and re-send the pending message (messages arriving meanwhile queue)"
+    } else {
+        "messages arriving meanwhile queue until the limit resets"
+    };
+    format!(
+        "Rate-limited — parked; {}; {tail}",
+        external_agent::limit_reset_phrase(resets_at_epoch, now_epoch)
+    )
+}
+
+/// The queued-while-parked row for a user follow-up held during a park.
+pub(crate) const LIMIT_PARK_QUEUED_MESSAGE_LOG: &str =
+    "Message queued — delivers when the limit resets";
+
+/// Pop the next still-deliverable message off a rate-limit park queue,
+/// dropping entries cancelled while they waited. FIFO — the pending
+/// re-send sits at the front, user messages queued during the park
+/// behind it. Returns the message plus how many cancelled entries were
+/// skipped (for the caller's log row). Shared by both lanes so the
+/// resume-flush semantics cannot drift.
+pub(crate) fn next_parked_follow_up(
+    parked: &mut std::collections::VecDeque<FollowUpMessage>,
+    cancelled_follow_ups: &mut HashSet<String>,
+) -> (Option<FollowUpMessage>, usize) {
+    let mut skipped = 0usize;
+    while let Some(queued) = parked.pop_front() {
+        if follow_up_message_was_cancelled(cancelled_follow_ups, &queued) {
+            skipped += 1;
+            continue;
+        }
+        return (Some(queued), skipped);
+    }
+    (None, skipped)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1430,5 +1583,73 @@ new file mode 100644
 
         assert!(overrides.is_none(), "fresh startups must stay untouched");
         assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+    }
+
+    #[test]
+    fn limit_park_delay_targets_reset_plus_jitter() {
+        // Reset 2h out, 60s jitter: park exactly until reset + jitter.
+        let delay = limit_park_delay(Some(10_000 + 7_200), 10_000, 1, 60);
+        assert_eq!(delay, Duration::from_secs(7_260));
+        // A reset already in the past parks for just the jitter.
+        let delay = limit_park_delay(Some(9_000), 10_000, 1, 45);
+        assert_eq!(delay, Duration::from_secs(45));
+        // A seven_day-style reset far out is capped to one re-check cycle.
+        let delay = limit_park_delay(Some(10_000 + 3 * 24 * 3600), 10_000, 1, 30);
+        assert_eq!(delay, Duration::from_secs(LIMIT_PARK_MAX_SECS + 30));
+    }
+
+    #[test]
+    fn limit_park_delay_backs_off_exponentially_without_reset_time() {
+        // 5 → 10 → 20 → 30 (capped) minutes; streak is 1-based and a
+        // runaway streak must not overflow the shift.
+        let d = |streak| limit_park_delay(None, 10_000, streak, 60).as_secs();
+        assert_eq!(d(1), 5 * 60);
+        assert_eq!(d(2), 10 * 60);
+        assert_eq!(d(3), 20 * 60);
+        assert_eq!(d(4), 30 * 60);
+        assert_eq!(d(50), 30 * 60);
+        // Streak 0 (defensive) behaves like the first park.
+        assert_eq!(d(0), 5 * 60);
+    }
+
+    #[test]
+    fn limit_park_jitter_stays_in_band() {
+        for _ in 0..32 {
+            let jitter = limit_park_jitter_secs();
+            assert!((LIMIT_PARK_JITTER_MIN_SECS..=LIMIT_PARK_JITTER_MAX_SECS).contains(&jitter));
+        }
+    }
+
+    #[test]
+    fn parked_follow_ups_flush_fifo_and_honor_cancels() {
+        let mut parked: std::collections::VecDeque<FollowUpMessage> =
+            std::collections::VecDeque::new();
+        let mut first = FollowUpMessage::text("re-send".to_string());
+        first.follow_up_id = Some("fu-1".to_string());
+        let mut cancelled_mid_park = FollowUpMessage::text("cancelled".to_string());
+        cancelled_mid_park.follow_up_id = Some("fu-2".to_string());
+        let mut last = FollowUpMessage::text("queued during park".to_string());
+        last.follow_up_id = Some("fu-3".to_string());
+        parked.push_back(first);
+        parked.push_back(cancelled_mid_park);
+        parked.push_back(last);
+
+        // A cancel recorded while the message waited in the park queue.
+        let mut cancelled: HashSet<String> = HashSet::new();
+        cancelled.insert("fu-2".to_string());
+
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert_eq!(popped.unwrap().text, "re-send");
+        assert_eq!(skipped, 0);
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert_eq!(
+            popped.unwrap().text,
+            "queued during park",
+            "cancelled entries are dropped, later ones still deliver in order"
+        );
+        assert_eq!(skipped, 1);
+        let (popped, skipped) = next_parked_follow_up(&mut parked, &mut cancelled);
+        assert!(popped.is_none());
+        assert_eq!(skipped, 0);
     }
 }

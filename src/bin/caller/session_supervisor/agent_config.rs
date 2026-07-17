@@ -545,6 +545,21 @@ pub(crate) struct LaunchOverrides {
     pub(crate) claude_permission_mode: Option<String>,
     pub(crate) claude_allowed_tools: Option<String>,
     pub(crate) claude_effort: Option<String>,
+    /// Internal-only anchor-fork parameters (set by the supervisor's fork
+    /// orchestrator, never parsed from any wire message — deliberately
+    /// absent from `as_wire_fields`, so `ResumeSession` senders cannot
+    /// inject them; applied onto the merged config by
+    /// `apply_fork_lineage`). `fork_relationship` here overrides the
+    /// wire-vetted kind (`anchor-fork` is minted internally only), and
+    /// `forked_from` covers engines whose child resumes its OWN id (the
+    /// claude-code chain-slice: resume token = child uuid ≠ parent).
+    pub(crate) forked_from: Option<String>,
+    pub(crate) fork_relationship: Option<String>,
+    pub(crate) fork_anchor: Option<String>,
+    pub(crate) codex_fork_rollout_path: Option<String>,
+    pub(crate) codex_fork_rollback_turns: Option<u32>,
+    pub(crate) codex_fork_rollback_item_id: Option<String>,
+    pub(crate) codex_fork_rollback_position: Option<String>,
 }
 
 impl LaunchOverrides {
@@ -572,6 +587,39 @@ impl LaunchOverrides {
             claude_permission_mode: self.claude_permission_mode.as_deref(),
             claude_allowed_tools: self.claude_allowed_tools.as_deref(),
             claude_effort: self.claude_effort.as_deref(),
+        }
+    }
+
+    /// Apply the internal-only anchor-fork parameters onto the merged
+    /// session config, after `from_wire_fields` + persisted-overlay merge
+    /// (which cannot carry them). No-ops when the overrides carry none.
+    pub(crate) fn apply_fork_lineage(
+        &self,
+        config: Option<&mut crate::session_config::SessionAgentConfig>,
+    ) {
+        let Some(config) = config else {
+            return;
+        };
+        if self.forked_from.is_some() {
+            config.forked_from = self.forked_from.clone();
+        }
+        if self.fork_relationship.is_some() {
+            config.fork_relationship = self.fork_relationship.clone();
+        }
+        if self.fork_anchor.is_some() {
+            config.fork_anchor = self.fork_anchor.clone();
+        }
+        if self.codex_fork_rollout_path.is_some() {
+            config.codex_fork_rollout_path = self.codex_fork_rollout_path.clone();
+        }
+        if self.codex_fork_rollback_turns.is_some() {
+            config.codex_fork_rollback_turns = self.codex_fork_rollback_turns;
+        }
+        if self.codex_fork_rollback_item_id.is_some() {
+            config.codex_fork_rollback_item_id = self.codex_fork_rollback_item_id.clone();
+        }
+        if self.codex_fork_rollback_position.is_some() {
+            config.codex_fork_rollback_position = self.codex_fork_rollback_position.clone();
         }
     }
 }
@@ -805,6 +853,21 @@ pub(crate) fn effective_session_agent_config_from_project(
         if overrides.fork_relationship.is_some() {
             config.fork_relationship = overrides.fork_relationship.clone();
         }
+        if overrides.fork_anchor.is_some() {
+            config.fork_anchor = overrides.fork_anchor.clone();
+        }
+        if overrides.codex_fork_rollout_path.is_some() {
+            config.codex_fork_rollout_path = overrides.codex_fork_rollout_path.clone();
+        }
+        if overrides.codex_fork_rollback_turns.is_some() {
+            config.codex_fork_rollback_turns = overrides.codex_fork_rollback_turns;
+        }
+        if overrides.codex_fork_rollback_item_id.is_some() {
+            config.codex_fork_rollback_item_id = overrides.codex_fork_rollback_item_id.clone();
+        }
+        if overrides.codex_fork_rollback_position.is_some() {
+            config.codex_fork_rollback_position = overrides.codex_fork_rollback_position.clone();
+        }
     }
     config
 }
@@ -858,6 +921,50 @@ mod tests {
         );
         assert_eq!(config.forked_from.as_deref(), Some("parent-native"));
         assert_eq!(config.fork_relationship.as_deref(), Some("side"));
+    }
+
+    #[test]
+    fn effective_config_preserves_anchor_fork_one_shots() {
+        // Same pin policy as fork lineage: the anchor-fork staging fields
+        // are per-session facts a project can never supply — dropping any
+        // of them in the rebuild breaks the child's spawn-time fork.
+        let project = Project {
+            root: PathBuf::from("/tmp/project"),
+            config: Default::default(),
+        };
+        let overrides = crate::session_config::SessionAgentConfig {
+            forked_from: Some("parent-backend".to_string()),
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: Some("{\"kind\":\"turn-boundary\",\"turn\":2}".to_string()),
+            codex_fork_rollout_path: Some("/tmp/staged.jsonl".to_string()),
+            codex_fork_rollback_turns: Some(3),
+            codex_fork_rollback_item_id: Some("item_9".to_string()),
+            codex_fork_rollback_position: Some("after".to_string()),
+            ..Default::default()
+        };
+        let config = effective_session_agent_config_from_project(
+            &external_agent::AgentBackend::Codex,
+            &project,
+            Some(&overrides),
+        );
+        assert_eq!(config.fork_relationship.as_deref(), Some("anchor-fork"));
+        assert!(config
+            .fork_anchor
+            .as_deref()
+            .is_some_and(|anchor| anchor.contains("turn-boundary")));
+        assert_eq!(
+            config.codex_fork_rollout_path.as_deref(),
+            Some("/tmp/staged.jsonl")
+        );
+        assert_eq!(config.codex_fork_rollback_turns, Some(3));
+        assert_eq!(
+            config.codex_fork_rollback_item_id.as_deref(),
+            Some("item_9")
+        );
+        assert_eq!(
+            config.codex_fork_rollback_position.as_deref(),
+            Some("after")
+        );
     }
 
     #[tokio::test]

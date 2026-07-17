@@ -181,6 +181,16 @@ fn lock_pending(
     }
 }
 
+/// One observed limit rejection (`rate_limit_event` with a non-allowed
+/// status), pending correlation with the turn's terminal result.
+#[derive(Debug, Clone)]
+struct CcLimitRejection {
+    /// The `rateLimitType` window that rejected (`five_hour`, `seven_day`).
+    window_kind: String,
+    /// Unix seconds when that window resets, when the event carried one.
+    resets_at_epoch: Option<u64>,
+}
+
 /// State shared between the adapter and its stdout reader task.
 struct CcShared {
     /// Backend-native session id, captured from the first stdout message
@@ -190,6 +200,13 @@ struct CcShared {
     /// of subtype `error_during_execution`; this flag keeps that expected
     /// outcome from being reported as a backend error.
     interrupt_pending: AtomicBool,
+    /// Set by the rate-limit arm when the CLI reports a non-allowed
+    /// status (`rejected`); consumed by `handle_result` so the turn's
+    /// terminal result reads as ONE structured limit rejection instead of
+    /// a mislabeled `backend error (success)` triple. Cleared by an
+    /// explicit allowed/allowed_warning status. Same expected-outcome
+    /// pattern as `interrupt_pending` above.
+    limit_rejected: StdMutex<Option<CcLimitRejection>>,
     /// Set by `thread_action("compact")`. An out-of-band `/compact` ends
     /// with a FREE result (`num_turns: 0`, all-zero usage) that is not a
     /// conversation turn; this flag lets the reader absorb it so it cannot
@@ -228,6 +245,7 @@ impl CcShared {
         Self {
             session_id: StdMutex::new(resume_session),
             interrupt_pending: AtomicBool::new(false),
+            limit_rejected: StdMutex::new(None),
             compact_pending: AtomicBool::new(false),
             goal: StdMutex::new(GoalEngine::default()),
             cumulative_fresh_tokens: AtomicU64::new(0),
@@ -251,6 +269,20 @@ impl CcShared {
         machine.observe(obs, crate::session_activity::epoch_seconds())
     }
 
+    /// Whether the activity machine currently has a turn open (dispatch or
+    /// task-wake seen, no settle yet). The reader's wake discriminator: a
+    /// background-task notification with no open turn wakes the agent, a
+    /// mid-turn one is plain bookkeeping. Deliberately the machine's view,
+    /// not `turn_active` (the dispatch-side bool stays false through
+    /// task-woken rounds Intendant never dispatched).
+    fn activity_turn_active(&self) -> bool {
+        let machine = match self.activity.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        machine.turn_active()
+    }
+
     /// Adopt a first-hand effort value (launch config, or the CLI's own
     /// echo when a future protocol states one).
     fn set_activity_effort(&self, effort: Option<String>) {
@@ -266,6 +298,39 @@ impl CcShared {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    fn lock_limit_rejected(&self) -> StdMutexGuard<'_, Option<CcLimitRejection>> {
+        match self.limit_rejected.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn set_limit_rejected(&self, rejection: CcLimitRejection) {
+        *self.lock_limit_rejected() = Some(rejection);
+    }
+
+    fn take_limit_rejected(&self) -> Option<CcLimitRejection> {
+        self.lock_limit_rejected().take()
+    }
+
+    fn clear_limit_rejected(&self) {
+        *self.lock_limit_rejected() = None;
+    }
+
+    /// Flip an active operator goal to `usageLimited` because the
+    /// provider rejected a turn at a rate limit; `None` when nothing
+    /// changed (no goal, or not active).
+    fn park_goal_for_usage_limit(&self) -> Option<crate::types::SessionGoal> {
+        let fresh = self.fresh_tokens();
+        self.lock_goal().park_for_usage_limit(fresh)
+    }
+
+    /// Resume a goal the limit itself parked; `None` when nothing changed.
+    fn resume_goal_from_usage_limit(&self) -> Option<crate::types::SessionGoal> {
+        let fresh = self.fresh_tokens();
+        self.lock_goal().resume_from_usage_limit(fresh)
     }
 
     fn fresh_tokens(&self) -> u64 {
@@ -710,6 +775,36 @@ fn is_task_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
+/// One short line (~60 chars) describing a background task, for the
+/// armed-set vitals and the wake-attribution log row.
+fn bg_desc_snippet(text: &str) -> Option<String> {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > 60 {
+        Some(format!("{}…", trimmed.chars().take(60).collect::<String>()))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Description for a `run_in_background` Bash tool_use: the model's own
+/// `description` input when it gave one, else the command's head.
+fn bg_desc_from_bash_input(input: &serde_json::Value) -> Option<String> {
+    for key in ["description", "command"] {
+        if let Some(desc) = input
+            .get(key)
+            .and_then(|v| v.as_str())
+            .and_then(bg_desc_snippet)
+        {
+            return Some(desc);
+        }
+    }
+    None
+}
+
 /// Plan entries from a `TodoWrite` tool_use input, in `PlanUpdate` shape:
 /// `(content, priority, status)` — todos carry no priority, and statuses
 /// normalize to the shared plan vocabulary ("in_progress" → "inprogress").
@@ -896,6 +991,19 @@ struct CcReader {
     /// provisional row parked as pending, mirroring the CLI's own
     /// uncertainty about whether the create took.
     pending_task_creates: HashMap<String, Option<String>>,
+    /// Main-thread `Bash` tool_use ids launched with `run_in_background`,
+    /// mapped to a short description — candidates only: arming waits for
+    /// the CLI's own launch evidence (`system:task_started` with
+    /// `task_type:"local_bash"`), whose notification lifecycle guarantees
+    /// a disarm exists. Ids whose launch never materialized (denied,
+    /// failed) idle here inertly, like `plan_tools` orphans.
+    bg_task_candidates: HashMap<String, String>,
+    /// The armed background-command set: `(tool_use_id, description)` in
+    /// launch order. Non-empty at turn end means the session parks
+    /// waiting on background work instead of going idle; entries disarm
+    /// on their `system:task_notification` (completion, failure, or
+    /// kill), which — arriving between turns — is the wake signal.
+    bg_armed: Vec<(String, String)>,
     /// Latest rate-limit window per `rateLimitType` (`five_hour`,
     /// `seven_day`) from `rate_limit_event` — attached to outgoing usage
     /// snapshots for the vitals limit gauges. BTreeMap for stable order.
@@ -943,6 +1051,8 @@ impl CcReader {
             plan_tools: HashMap::new(),
             task_list_folds: HashMap::new(),
             pending_task_creates: HashMap::new(),
+            bg_task_candidates: HashMap::new(),
+            bg_armed: Vec::new(),
             limit_windows: std::collections::BTreeMap::new(),
             model: "claude".to_string(),
             context_window: DEFAULT_CONTEXT_WINDOW,
@@ -961,6 +1071,13 @@ impl CcReader {
         if let Some(activity) = self.shared.observe_activity(obs) {
             out.events.push(AgentEvent::ActivityUpdate { activity });
         }
+    }
+
+    /// Sync the armed background-command set into the activity machine
+    /// (call after every arm/disarm).
+    fn observe_bg_tasks(&self, out: &mut CcLineOutcome) {
+        let tasks: Vec<String> = self.bg_armed.iter().map(|(_, desc)| desc.clone()).collect();
+        self.observe_activity(ActivityObs::BackgroundTasksChanged { tasks }, out);
     }
 
     fn process_line(&mut self, line: &str) -> CcLineOutcome {
@@ -1247,7 +1364,10 @@ impl CcReader {
             // already show live; task_updated's terminal patch is followed
             // by the authoritative task_notification;
             // background_tasks_changed (2.1.206) mirrors the background-task
-            // tray, which the per-task signals already cover.
+            // tray, which the per-task signals already cover — including
+            // the armed set (task_started arms, task_notification disarms);
+            // reconciling from the tray instead would eat wake attribution,
+            // since the emptied tray precedes the notification (probed).
             Some("task_progress") | Some("task_updated") | Some("background_tasks_changed") => {
                 return
             }
@@ -1374,6 +1494,31 @@ impl CcReader {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
         }
+        // Background command announced (`run_in_background` Bash and
+        // auto-backgrounded commands alike, live-probed on 2.1.211): arm
+        // it. Main-thread only — a sub-agent's background work belongs to
+        // the child's window, not the parent's parked claim — established
+        // by the run_in_background candidate or the open tool's owner.
+        // The same task system delivers `task_notification`, so every arm
+        // has its disarm.
+        if msg.get("task_type").and_then(|v| v.as_str()) == Some("local_bash") {
+            let main_thread = self.bg_task_candidates.contains_key(tool_use_id)
+                || matches!(self.open_tools.get(tool_use_id), Some(None));
+            if main_thread && !self.bg_armed.iter().any(|(id, _)| id == tool_use_id) {
+                let desc = self
+                    .bg_task_candidates
+                    .remove(tool_use_id)
+                    .or_else(|| {
+                        msg.get("description")
+                            .and_then(|v| v.as_str())
+                            .and_then(bg_desc_snippet)
+                    })
+                    .unwrap_or_else(|| "background command".to_string());
+                self.bg_armed.push((tool_use_id.to_string(), desc));
+                self.observe_bg_tasks(out);
+            }
+            return;
+        }
         // `subagent_type` only ever rides agent spawns (live-probed: Bash
         // payloads carry neither it nor `prompt`), so its presence is
         // affirmative regardless of task_type — a future CLI renaming the
@@ -1430,6 +1575,30 @@ impl CcReader {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("completed");
+        // An armed background command ended. Between turns a completion or
+        // failure wakes the agent (live-probed: the CLI immediately opens a
+        // self-initiated round) — attribute the wake in the log BEFORE the
+        // round's activity. Mid-turn (a task finishing while the agent
+        // works, or its own TaskStop) it is calm bookkeeping.
+        if let Some(pos) = self.bg_armed.iter().position(|(id, _)| id == &tool_use_id) {
+            let (_, desc) = self.bg_armed.remove(pos);
+            let woke =
+                !self.shared.activity_turn_active() && matches!(status, "completed" | "failed");
+            if woke {
+                out.log("info", format!("⏰ Woken by background task: {desc}"));
+                self.observe_activity(ActivityObs::WokenByTask, out);
+            } else {
+                let verb = match status {
+                    "completed" | "success" => "completed",
+                    "failed" | "error" | "errored" => "failed",
+                    "stopped" | "killed" | "cancelled" | "interrupted" => "stopped",
+                    other => other,
+                };
+                out.log("info", format!("Background task {verb}: {desc}"));
+            }
+            self.observe_bg_tasks(out);
+            return;
+        }
         let (outer_status, state_status) = match status {
             "completed" | "success" => ("completed", "completed"),
             "failed" | "error" | "errored" => ("failed", "errored"),
@@ -1593,6 +1762,22 @@ impl CcReader {
                     if !tool_id.is_empty() {
                         self.open_tools
                             .insert(tool_id.clone(), child_scope.map(str::to_string));
+                        // A main-thread Bash launched with run_in_background
+                        // is a background-task candidate (live-probed shape,
+                        // 2.1.211). Candidate only: the armed set flips on
+                        // the CLI's own launch evidence (task_started), so a
+                        // denied or failed launch never claims "parked".
+                        // Sub-agent tasks stay off the parent's armed set —
+                        // children carry their own visibility.
+                        if child_scope.is_none()
+                            && tool_name == "Bash"
+                            && input.get("run_in_background").and_then(|v| v.as_bool())
+                                == Some(true)
+                        {
+                            if let Some(desc) = bg_desc_from_bash_input(&input) {
+                                self.bg_task_candidates.insert(tool_id.clone(), desc);
+                            }
+                        }
                     }
                     let write_paths = cc_write_tool_paths(&tool_name, &input);
                     out.events.push(AgentEvent::ToolStarted {
@@ -1972,6 +2157,55 @@ impl CcReader {
             .and_then(|r| r.as_str())
             .map(str::to_string);
 
+        // Correlate a pending limit rejection (rate_limit_event status
+        // `rejected`) with this result. Only an abnormal result claims it
+        // — the live wire ends the rejected turn with subtype `success`
+        // but `is_error: true`. An interrupt outcome wins when both
+        // raced, and a clean success proves the flag stale.
+        let limit_rejection = if was_interrupt {
+            self.shared.clear_limit_rejected();
+            None
+        } else if is_error || subtype != "success" {
+            self.shared.take_limit_rejected()
+        } else {
+            // The turn actually ran: the provider is serving again, so a
+            // goal parked by an earlier rejection resumes even if no
+            // explicit `allowed` event was observed.
+            self.shared.clear_limit_rejected();
+            if let Some(goal) = self.shared.resume_goal_from_usage_limit() {
+                out.log("info", "Goal resumed — the provider rate limit cleared");
+                out.events.push(AgentEvent::GoalUpdated { goal });
+            }
+            None
+        };
+        if let Some(rejection) = limit_rejection {
+            // ONE structured event instead of the model_response /
+            // backend-error / done triple: a log row plus the terminal
+            // TurnLimitRejected the host lanes park on. Never a
+            // BackendError — the rejection is an expected outcome, not a
+            // backend failure (and `(success)` as an error code was a lie).
+            let phrase = super::limit_reset_phrase(
+                rejection.resets_at_epoch,
+                crate::session_activity::epoch_seconds(),
+            );
+            out.log(
+                "warn",
+                format!("Rate-limited ({} window) — {phrase}", rejection.window_kind),
+            );
+            if let Some(goal) = self.shared.park_goal_for_usage_limit() {
+                out.log(
+                    "info",
+                    "Goal paused — rate limited; will auto-resume when the limit clears",
+                );
+                out.events.push(AgentEvent::GoalUpdated { goal });
+            }
+            out.events.push(AgentEvent::TurnLimitRejected {
+                resets_at_epoch: rejection.resets_at_epoch,
+                message,
+            });
+            return;
+        }
+
         if is_error || subtype != "success" {
             if was_interrupt {
                 out.log("info", "Claude Code turn interrupted");
@@ -1998,6 +2232,22 @@ impl CcReader {
                     recovery_hint,
                 });
             }
+        }
+        // Armed background tasks outlive the turn: the session parks to
+        // wait on them (the activity machine flipped to parked-on-tasks at
+        // the TurnSettled above) — say so next to the round bookkeeping,
+        // so "round complete" never reads as done/stuck while work runs.
+        if !self.bg_armed.is_empty() {
+            let descs: Vec<&str> = self.bg_armed.iter().map(|(_, d)| d.as_str()).collect();
+            out.log(
+                "info",
+                format!(
+                    "Parked — waiting on {} background task{}: {}",
+                    descs.len(),
+                    if descs.len() == 1 { "" } else { "s" },
+                    descs.join("; "),
+                ),
+            );
         }
         out.events.push(AgentEvent::TurnCompleted { message });
     }
@@ -2159,9 +2409,25 @@ impl CcReader {
         match status {
             "" => {}
             "allowed" | "allowed_warning" => {
+                // Never park on an allowed status: retire any pending
+                // rejection flag and resume a goal the limit itself parked.
+                self.shared.clear_limit_rejected();
+                if let Some(goal) = self.shared.resume_goal_from_usage_limit() {
+                    out.log("info", "Goal resumed — the provider rate limit cleared");
+                    out.events.push(AgentEvent::GoalUpdated { goal });
+                }
                 self.observe_activity(ActivityObs::RateLimitCleared, out);
             }
             _ => {
+                // Expected-outcome flag for this turn's result: the CLI
+                // ends a limit-rejected turn with a `result` whose subtype
+                // is still `success`; `handle_result` consumes this to
+                // report the rejection first-hand instead of a backend
+                // error.
+                self.shared.set_limit_rejected(CcLimitRejection {
+                    window_kind: kind.to_string(),
+                    resets_at_epoch,
+                });
                 self.observe_activity(ActivityObs::RateLimited { resets_at_epoch }, out);
             }
         }
@@ -3178,6 +3444,263 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
         );
         assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+    }
+
+    fn log_rows(out: &CcLineOutcome) -> Vec<String> {
+        out.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Log { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The background-task round trip, with the wire shapes captured live
+    /// on Claude Code 2.1.211: a `run_in_background` Bash arms on the
+    /// CLI's `task_started` (`task_type:"local_bash"`), the turn's result
+    /// parks the session instead of idling it, the completion
+    /// `task_notification` between turns attributes the wake and re-opens
+    /// the turn, and the drained set settles the next result to idle.
+    #[test]
+    fn background_task_arms_parks_wakes_and_drains() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+
+        // Launch (probe round 1): tool_use → tray event (ignored) →
+        // task_started (arms) → launch-ack tool_result.
+        let out = reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","name":"Bash","input":{"command":"sleep 8 && echo BG_DONE_MARKER","run_in_background":true}}]},"session_id":"ad153098"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::ToolRunning]);
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"b9lkjn0bv","task_type":"local_bash","description":"sleep 8 && echo BG_DONE_MARKER"}],"session_id":"ad153098"}"#,
+        );
+        assert!(out.events.is_empty(), "the tray mirror stays ignored");
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b9lkjn0bv","tool_use_id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","description":"sleep 8 && echo BG_DONE_MARKER","task_type":"local_bash","session_id":"ad153098"}"#,
+        );
+        let armed = last_activity(&out).expect("arming publishes the set");
+        assert_eq!(
+            armed.background_tasks,
+            vec!["sleep 8 && echo BG_DONE_MARKER"]
+        );
+        assert_eq!(armed.state, S::ToolRunning, "mid-turn arming keeps state");
+        let out = reader.process_line(
+            r#"{"type":"user","tool_use_result":{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"b9lkjn0bv"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","content":"Command running in background with ID: b9lkjn0bv. You will be notified when it completes."}]},"session_id":"ad153098"}"#,
+        );
+        assert_eq!(activity_states(&out), vec![S::AwaitingApi]);
+
+        // The turn ends with the task armed: parked, not idle — and the
+        // round bookkeeping says so.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"LAUNCHED","num_turns":2,"session_id":"ad153098"}"#,
+        );
+        let parked = last_activity(&out).expect("parking publishes");
+        assert_eq!(parked.state, S::ParkedOnTasks);
+        assert_eq!(
+            parked.background_tasks,
+            vec!["sleep 8 && echo BG_DONE_MARKER"]
+        );
+        assert_eq!(parked.stalled_after_seconds, None, "parked never stalls");
+        assert!(
+            log_rows(&out)
+                .iter()
+                .any(|m| m
+                    == "Parked — waiting on 1 background task: sleep 8 && echo BG_DONE_MARKER"),
+            "{:?}",
+            log_rows(&out)
+        );
+
+        // Completion between turns (probe: tray-empty + task_updated
+        // precede the notification; both stay ignored).
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[],"session_id":"ad153098"}"#,
+        );
+        assert!(out.events.is_empty());
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_updated","task_id":"b9lkjn0bv","patch":{"status":"completed","end_time":1784233184569},"session_id":"ad153098"}"#,
+        );
+        assert!(out.events.is_empty());
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"b9lkjn0bv","tool_use_id":"toolu_01PR8dT8jJe7S9ffb6mGgr6N","status":"completed","output_file":"/tmp/tasks/b9lkjn0bv.output","summary":"Background command \"sleep 8 && echo BG_DONE_MARKER\" completed (exit code 0)","session_id":"ad153098"}"#,
+        );
+        assert_eq!(
+            log_rows(&out),
+            vec!["⏰ Woken by background task: sleep 8 && echo BG_DONE_MARKER"]
+        );
+        // The wake row precedes the woken turn's activity claim.
+        let first_activity_idx = out
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ActivityUpdate { .. }))
+            .expect("wake publishes activity");
+        let log_idx = out
+            .events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Log { .. }))
+            .expect("wake logs attribution");
+        assert!(log_idx < first_activity_idx);
+        assert_eq!(
+            activity_states(&out),
+            vec![S::AwaitingApi, S::AwaitingApi],
+            "woken turn opens awaiting-api, then the set drains"
+        );
+        let drained = last_activity(&out).unwrap();
+        assert!(drained.background_tasks.is_empty());
+
+        // The self-initiated wake round ends with nothing armed: idle.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Background task completed with exit code 0.","num_turns":1,"session_id":"ad153098"}"#,
+        );
+        let settled = last_activity(&out).expect("settling publishes");
+        assert_eq!(settled.state, S::Idle);
+        assert!(settled.background_tasks.is_empty());
+        assert!(
+            !log_rows(&out).iter().any(|m| m.starts_with("Parked")),
+            "an empty set parks nothing"
+        );
+    }
+
+    /// A task finishing while the agent is mid-turn wakes nothing: calm
+    /// bookkeeping row, no ⏰ attribution, state untouched.
+    #[test]
+    fn background_task_mid_turn_completion_is_calm() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg1","name":"Bash","input":{"command":"sleep 2 && echo hi","run_in_background":true}}]},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"task9","tool_use_id":"toolu_bg1","description":"sleep 2 && echo hi","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        // Still mid-turn (no result yet): the completion is bookkeeping.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"task9","tool_use_id":"toolu_bg1","status":"completed","summary":"Background command \"sleep 2 && echo hi\" completed (exit code 0)","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            log_rows(&out),
+            vec!["Background task completed: sleep 2 && echo hi"]
+        );
+        let updated = last_activity(&out).expect("the set change publishes");
+        assert_eq!(updated.state, S::ToolRunning, "no wake mid-turn");
+        assert!(updated.background_tasks.is_empty());
+
+        // With the set drained the result settles to plain idle.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","num_turns":1,"session_id":"s1"}"#,
+        );
+        assert_eq!(last_activity(&out).unwrap().state, S::Idle);
+    }
+
+    /// A TaskStop kill (probe: `task_notification` status "stopped",
+    /// summary = the bare command) disarms without ever claiming a wake.
+    #[test]
+    fn background_task_kill_disarms_without_wake() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01CDWowtTUUWNgh4x1T6Siey","name":"Bash","input":{"command":"sleep 300 && echo NEVER_SEEN","run_in_background":true}}]},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"bxj0d36jc","tool_use_id":"toolu_01CDWowtTUUWNgh4x1T6Siey","description":"sleep 300 && echo NEVER_SEEN","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"LAUNCHED2","num_turns":2,"session_id":"s1"}"#,
+        );
+        // Kill notification while parked: no wake claim (only completed/
+        // failed were ever observed to open a round), set drains to idle.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_notification","task_id":"bxj0d36jc","tool_use_id":"toolu_01CDWowtTUUWNgh4x1T6Siey","status":"stopped","output_file":"/tmp/tasks/bxj0d36jc.output","summary":"sleep 300 && echo NEVER_SEEN","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            log_rows(&out),
+            vec!["Background task stopped: sleep 300 && echo NEVER_SEEN"]
+        );
+        assert_eq!(activity_states(&out), vec![S::Idle]);
+        assert!(last_activity(&out).unwrap().background_tasks.is_empty());
+    }
+
+    /// Honesty gate: without the CLI's task events (pre-2.1.206 CLIs)
+    /// nothing arms — a run_in_background launch alone must degrade to
+    /// exactly the old behavior (idle at turn end, no parked claim).
+    #[test]
+    fn background_task_without_task_events_never_claims_parked() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_old1","name":"Bash","input":{"command":"sleep 8 && echo done","run_in_background":true}}]},"session_id":"s1"}"#,
+        );
+        reader.process_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_old1","content":"Command running in background with ID: abc123."}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"LAUNCHED","num_turns":2,"session_id":"s1"}"#,
+        );
+        let settled = last_activity(&out).expect("settling publishes");
+        assert_eq!(settled.state, S::Idle, "no wire evidence, no parked claim");
+        assert!(settled.background_tasks.is_empty());
+        assert!(!log_rows(&out).iter().any(|m| m.starts_with("Parked")));
+    }
+
+    /// Auto-backgrounded commands (a foreground Bash the CLI moved to the
+    /// background) arm from `task_started` alone — the open main-thread
+    /// tool identifies the scope, the event's description names it. The
+    /// model's own `description` input wins when the launch was explicit.
+    #[test]
+    fn background_task_arms_for_auto_backgrounded_and_prefers_description() {
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        // Auto-backgrounded: no run_in_background on the input.
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_slow1","name":"Bash","input":{"command":"cargo build --release"}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"auto1","tool_use_id":"toolu_slow1","description":"cargo build --release","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            last_activity(&out).unwrap().background_tasks,
+            vec!["cargo build --release"]
+        );
+        // Explicit launch with a description input: the description wins
+        // over the raw command.
+        reader.process_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bg2","name":"Bash","input":{"command":"bash run_battery.sh --full 2>&1 | tee /tmp/out.log","run_in_background":true,"description":"Run the validation battery"}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"bg2","tool_use_id":"toolu_bg2","description":"bash run_battery.sh --full 2>&1 | tee /tmp/out.log","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        assert_eq!(
+            last_activity(&out).unwrap().background_tasks,
+            vec!["cargo build --release", "Run the validation battery"]
+        );
+    }
+
+    /// A sub-agent's background command belongs to the child's window,
+    /// never the parent's armed set.
+    #[test]
+    fn background_task_of_child_scope_never_arms_parent() {
+        use crate::types::SessionActivityState as S;
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        reader.process_line(
+            r#"{"type":"assistant","parent_tool_use_id":"spawn-1","message":{"content":[{"type":"tool_use","id":"toolu_child_bg","name":"Bash","input":{"command":"sleep 60","run_in_background":true}}]},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"cbg1","tool_use_id":"toolu_child_bg","description":"sleep 60","task_type":"local_bash","session_id":"s1"}"#,
+        );
+        assert!(
+            out.events.is_empty(),
+            "child-scoped background work says nothing about the parent"
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"session_id":"s1"}"#,
+        );
+        assert_eq!(last_activity(&out).unwrap().state, S::Idle);
     }
 
     /// Write-ish tool_use blocks emit their structured paths alongside
@@ -5015,6 +5538,220 @@ mod tests {
         assert!(out.events.iter().any(|e| matches!(
             e,
             AgentEvent::Log { level, message } if level == "warn" && message.contains("rejected")
+        )));
+    }
+
+    /// The captured incident shape: a `rate_limit_event` with status
+    /// `rejected` followed by the turn's result — subtype still `success`,
+    /// `is_error: true`, the limit notice as the text. The reader must
+    /// emit ONE structured `TurnLimitRejected` (flag consumed) instead of
+    /// the mislabeled `backend error (success)` + TurnCompleted pair.
+    #[test]
+    fn limit_rejected_result_emits_one_structured_event_not_backend_error() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit · resets 3pm (America/New_York)","session_id":"s1","num_turns":1}"#,
+        );
+        let limit_events: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnLimitRejected {
+                    resets_at_epoch,
+                    message,
+                } => Some((*resets_at_epoch, message.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(limit_events.len(), 1, "exactly one structured limit event");
+        assert_eq!(limit_events[0].0, Some(1_783_990_800));
+        assert!(limit_events[0]
+            .1
+            .as_deref()
+            .is_some_and(|m| m.contains("session limit")));
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::BackendError { .. })),
+            "a limit rejection is an expected outcome, never a backend error"
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })),
+            "TurnLimitRejected replaces TurnCompleted for the rejected turn"
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Log { level, message }
+                    if level == "warn" && message.starts_with("Rate-limited")
+            )),
+            "one log row announces the rejection with the reset time"
+        );
+
+        // Flag consumed: the same abnormal result WITHOUT a preceding
+        // rejected event reports through the normal error path again.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit · resets 3pm (America/New_York)","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })),
+            "the rejection flag must be one-shot"
+        );
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::BackendError { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    /// `allowed_warning` still allows requests — it must never arm the
+    /// rejection flag, so the following result completes normally.
+    #[test]
+    fn allowed_warning_never_parks_the_turn() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+    }
+
+    /// A clean success consumes a stale rejection flag silently (the turn
+    /// ran, so the provider is serving) — no limit event, no error.
+    #[test]
+    fn clean_success_consumes_stale_rejection_flag() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        // Consumed: a later abnormal result is a plain error again.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"boom","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+    }
+
+    /// An interrupt racing the rejection wins: the expected interrupt
+    /// outcome reports, and the limit flag is consumed silently.
+    #[test]
+    fn interrupt_outcome_wins_over_limit_rejection() {
+        let mut reader = test_reader();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        reader
+            .shared
+            .interrupt_pending
+            .store(true, Ordering::SeqCst);
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"aborted","session_id":"s1","num_turns":0}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.contains("interrupted")
+        )));
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. })));
+        // The flag did not survive the interrupt.
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit","session_id":"s1","num_turns":1}"#,
+        );
+        assert!(!out
+            .events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnLimitRejected { .. })));
+    }
+
+    /// An active operator goal parks to usageLimited on the rejection and
+    /// resumes when the wire reports the window allowed again.
+    #[test]
+    fn limit_rejection_parks_goal_and_allowed_resumes_it() {
+        let mut reader = test_reader();
+        reader
+            .shared
+            .lock_goal()
+            .dispatch("goal-set", &serde_json::json!({"objective": "ship"}), 0)
+            .unwrap();
+        reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1783990800},"session_id":"s1"}"#,
+        );
+        let out = reader.process_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"result":"You've hit your session limit","session_id":"s1","num_turns":1}"#,
+        );
+        let parked: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::GoalUpdated { goal } => goal.status.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            parked.iter().any(|status| status == "usageLimited"),
+            "goal statuses seen: {parked:?}"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.starts_with("Goal paused")
+        )));
+
+        let out = reader.process_line(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour"},"session_id":"s1"}"#,
+        );
+        let resumed: Vec<_> = out
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::GoalUpdated { goal } => goal.status.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            resumed.iter().any(|status| status == "active"),
+            "goal statuses seen: {resumed:?}"
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Log { message, .. } if message.starts_with("Goal resumed")
         )));
     }
 

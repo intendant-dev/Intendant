@@ -64,6 +64,29 @@ pub struct SessionAgentConfig {
     /// fork.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_relationship: Option<String>,
+    /// Serialized `ForkAnchorSpec` of the anchor an `anchor-fork` cut at
+    /// (lineage documentation; the dashboard's divergence chips read it).
+    /// Internal-only: never enters via the wire (`from_wire_fields` has no
+    /// column for it), only via the supervisor's fork overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_anchor: Option<String>,
+    /// One-shot codex fork staging (anchor forks only): the staged rollout
+    /// copy `thread/fork{path}` seeds the child from. Consumed by the
+    /// spawner while `resume == forked_from`, stripped when the child's
+    /// own overlay persists. Internal-only, like `fork_anchor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fork_rollout_path: Option<String>,
+    /// One-shot vanilla-binary trim: whole turns to roll the fresh child
+    /// back before its first turn. Internal-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fork_rollback_turns: Option<u32>,
+    /// One-shot managed-binary trim: exact item-anchor rollback on the
+    /// fresh child. Internal-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fork_rollback_item_id: Option<String>,
+    /// Position for `codex_fork_rollback_item_id` (`before`/`after`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fork_rollback_position: Option<String>,
 }
 
 impl SessionAgentConfig {
@@ -85,6 +108,11 @@ impl SessionAgentConfig {
             && self.claude_effort.is_none()
             && self.forked_from.is_none()
             && self.fork_relationship.is_none()
+            && self.fork_anchor.is_none()
+            && self.codex_fork_rollout_path.is_none()
+            && self.codex_fork_rollback_turns.is_none()
+            && self.codex_fork_rollback_item_id.is_none()
+            && self.codex_fork_rollback_position.is_none()
     }
 
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
@@ -138,6 +166,21 @@ impl SessionAgentConfig {
         }
         if self.fork_relationship.is_none() {
             self.fork_relationship = fallback.fork_relationship;
+        }
+        if self.fork_anchor.is_none() {
+            self.fork_anchor = fallback.fork_anchor;
+        }
+        if self.codex_fork_rollout_path.is_none() {
+            self.codex_fork_rollout_path = fallback.codex_fork_rollout_path;
+        }
+        if self.codex_fork_rollback_turns.is_none() {
+            self.codex_fork_rollback_turns = fallback.codex_fork_rollback_turns;
+        }
+        if self.codex_fork_rollback_item_id.is_none() {
+            self.codex_fork_rollback_item_id = fallback.codex_fork_rollback_item_id;
+        }
+        if self.codex_fork_rollback_position.is_none() {
+            self.codex_fork_rollback_position = fallback.codex_fork_rollback_position;
         }
     }
 }
@@ -415,6 +458,13 @@ pub fn from_wire_fields(fields: WireSessionAgentFields) -> SessionAgentConfig {
             .then(|| normalize_codex_service_tier(fields.codex_service_tier))
             .flatten(),
         codex_home: None,
+        // The anchor-fork fields are internal-only: no wire column exists,
+        // so every wire parse yields None here by construction.
+        fork_anchor: None,
+        codex_fork_rollout_path: None,
+        codex_fork_rollback_turns: None,
+        codex_fork_rollback_item_id: None,
+        codex_fork_rollback_position: None,
         claude_model: is_claude
             .then(|| normalize_claude_model(fields.claude_model))
             .flatten(),
@@ -464,6 +514,11 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
             claude_effort: None,
             forked_from: None,
             fork_relationship: None,
+            fork_anchor: None,
+            codex_fork_rollout_path: None,
+            codex_fork_rollback_turns: None,
+            codex_fork_rollback_item_id: None,
+            codex_fork_rollback_position: None,
         },
         AgentBackend::ClaudeCode => {
             let claude = &project.config.agent.claude_code;
@@ -490,6 +545,11 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
                 claude_effort: crate::project::normalize_claude_effort(claude.effort.as_deref()),
                 forked_from: None,
                 fork_relationship: None,
+                fork_anchor: None,
+                codex_fork_rollout_path: None,
+                codex_fork_rollback_turns: None,
+                codex_fork_rollback_item_id: None,
+                codex_fork_rollback_position: None,
             }
         }
     }

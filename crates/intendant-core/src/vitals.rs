@@ -89,6 +89,13 @@ pub enum SessionActivityState {
     /// A turn is dispatched (or the model must be called again after
     /// tools settled) and no response bytes have arrived yet.
     AwaitingApi,
+    /// No turn is running, but backend-announced background tasks the
+    /// session started are — it parked to wait and wakes itself when one
+    /// finishes. `background_tasks` carries their short descriptions.
+    /// Claimed only from wire evidence (the backend's own task events),
+    /// never guessed; quiet is normal here, so it never degrades to
+    /// stalled.
+    ParkedOnTasks,
     /// The provider reported a non-allowed rate-limit status while a turn
     /// is active; `resets_at_epoch` carries the countdown when known.
     RateLimited,
@@ -132,6 +139,14 @@ pub struct SessionActivityVitals {
     /// wire carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_epoch: Option<u64>,
+    /// Short descriptions of the backend-announced background tasks this
+    /// session has running (count = length). Non-empty while any are
+    /// armed, in any state; the `parked-on-tasks` claim additionally
+    /// requires no turn to be running. Only ever filled from the
+    /// backend's own task events — absent means "none announced", which
+    /// on backends without background primitives is simply always.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_tasks: Vec<String>,
 }
 
 /// Per-session vitals (git / prompt-cache / rate limits / live activity)
