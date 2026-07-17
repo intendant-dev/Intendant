@@ -893,6 +893,21 @@ pub(crate) async fn run_agent_loop(
                         text,
                         id,
                     }) if event_targets_session(&session_id, &watcher_session_id) => {
+                        // The round exit cancels this token BEFORE aborting
+                        // the watcher (see InterruptGuard::drop): abort only
+                        // lands at the next yield, so a watcher mid-poll
+                        // outlives it and keeps draining broadcast backlog.
+                        // Such a corpse must not ack a steer it can no longer
+                        // deliver — the parked drain / supervisor fallback
+                        // own steers once the round is over. TOCTOU caveat:
+                        // the corpse can pass this check, get descheduled,
+                        // and still push after cancellation — this gate only
+                        // narrows the window; the round loop's delivered-id
+                        // dedup at the orphan sweep is the serialized layer
+                        // that closes it.
+                        if watcher_token.is_cancelled() {
+                            break;
+                        }
                         // Queue the steer for the next turn's drain. The
                         // native loop has no separate "mid-turn inject"
                         // hook — model calls are atomic — so acceptance and
@@ -951,9 +966,17 @@ pub(crate) async fn run_agent_loop(
     // approvals with Deny if the exit path was interrupt-driven.
     struct InterruptGuard {
         watcher: Option<tokio::task::JoinHandle<()>>,
+        token: tokio_util::sync::CancellationToken,
     }
     impl Drop for InterruptGuard {
         fn drop(&mut self) {
+            // Cancel BEFORE aborting: abort() only takes effect at the
+            // task's next yield, so a watcher mid-poll survives it and
+            // keeps consuming broadcast backlog. The cancelled token is
+            // what tells that corpse to stop acking/queueing steers the
+            // finished round can no longer deliver (the SteerRequested
+            // arm gates on it).
+            self.token.cancel();
             if let Some(h) = self.watcher.take() {
                 h.abort();
             }
@@ -961,6 +984,7 @@ pub(crate) async fn run_agent_loop(
     }
     let _guard = InterruptGuard {
         watcher: Some(cancel_watcher_handle),
+        token: cancel_token.clone(),
     };
 
     for turn in 1..=SAFETY_CAP {
@@ -2764,6 +2788,31 @@ fn claim_steer_injections(
     claimed
 }
 
+/// Split claimed steer injections into deliverable ones and duplicates of
+/// steers this round loop already consumed as a round/follow-up (returned
+/// as `(kept, dropped)`).
+///
+/// A dying round's watcher can outlive its abort mid-poll and push + ack a
+/// steer AFTER every same-id claim has fired; the orphan sweep would then
+/// resurrect that push as a spurious extra round — the same user steer
+/// executing twice. The sweep runs on the round loop's own task, serialized
+/// with actual delivery, so the delivered-id check here is race-free where
+/// the claims are not. Dedup is strictly by id, never by text — the same
+/// text sent twice is two steers with two ids and must deliver twice; ids
+/// that are empty/whitespace can't be correlated and are always kept.
+fn split_already_delivered_steer_injections(
+    delivered_steer_ids: &HashSet<String>,
+    injections: Vec<event::ContextInjection>,
+) -> (Vec<event::ContextInjection>, Vec<event::ContextInjection>) {
+    injections.into_iter().partition(|injection| {
+        !injection
+            .steer_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .is_some_and(|id| delivered_steer_ids.contains(id))
+    })
+}
+
 /// The parked drain's exit when a steer reaches a between-rounds session:
 /// the synthesized next-round follow-up plus the acceptance the steer
 /// protocol expects (empty ids skip the ack — nothing correlates on "").
@@ -2818,6 +2867,11 @@ pub(crate) async fn run_round_loop(
     // History lookup; round numbers are the ones RoundComplete broadcast).
     let mut round_ledger: Vec<(usize, u32)> = Vec::new();
     let mut cancelled_follow_ups: HashSet<String> = HashSet::new();
+    // Ids of steers this loop already consumed as a round/follow-up. The
+    // orphan sweep consults it (split_already_delivered_steer_injections)
+    // so a dying watcher's late push cannot resurrect a delivered steer as
+    // an extra round. Grows one small id per steer, like round_ledger.
+    let mut delivered_steer_ids: HashSet<String> = HashSet::new();
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -2892,8 +2946,25 @@ pub(crate) async fn run_round_loop(
                 // mid-round SteerRequested events the live watcher already
                 // handled.
                 let mut parked_steer_rx = bus.subscribe();
-                let mut orphaned =
-                    claim_steer_injections(context_injection, &local_session_id, None);
+                let claimed = claim_steer_injections(context_injection, &local_session_id, None);
+                // Corpse dedup, the serialized layer: the dying watcher can
+                // outlive its abort and push + ack a steer after every
+                // same-id claim below has already fired. This sweep shares
+                // the delivery task, so dropping already-delivered ids here
+                // is race-free where the claims are not. The log row is the
+                // forensic tell that the corpse race fired.
+                let (mut orphaned, corpse_duplicates) =
+                    split_already_delivered_steer_injections(&delivered_steer_ids, claimed);
+                for duplicate in corpse_duplicates {
+                    let dropped_id = duplicate.steer_id.unwrap_or_default();
+                    slog(&session_log, |l| {
+                        l.warn(&format!(
+                            "Dropped steer injection {} at the orphan sweep: id already \
+                             delivered (dying watcher's late duplicate)",
+                            dropped_id
+                        ))
+                    });
+                }
                 // One steer round per drain pass: deliver the first, put
                 // the rest back for the next pass (each delivery loops
                 // back through this drain).
@@ -3099,13 +3170,19 @@ pub(crate) async fn run_round_loop(
                 // Acceptance-race dedup: if the dying watcher's corpse
                 // pushed this steer's injection AFTER the drain arm looked,
                 // claim it now — the text is about to enter the
-                // conversation through this follow-up.
+                // conversation through this follow-up. Every between-rounds
+                // steer consumption flows through here (the sweep arm, the
+                // parked select arm, and the supervisor's queue-as-follow-up
+                // fallback), so also record the id: a corpse push landing
+                // even later than this claim is dropped by the next orphan
+                // sweep instead of resurrecting as an extra round.
                 if let Some(id) = message
                     .steer_id
                     .as_deref()
                     .filter(|id| !id.trim().is_empty())
                 {
                     let _ = claim_steer_injections(context_injection, &local_session_id, Some(id));
+                    delivered_steer_ids.insert(id.to_string());
                 }
                 // A between-rounds steer is delivered through this path
                 // (steer_id set); classify it as such rather than follow_up.
@@ -3223,6 +3300,52 @@ mod budget_tail {
             .into_iter()
             .collect();
         assert_eq!(budget_tail_index(&batch, &handled), None);
+    }
+}
+
+#[cfg(test)]
+mod steer_dedup {
+    use super::split_already_delivered_steer_injections;
+    use crate::event::ContextInjection;
+    use std::collections::HashSet;
+
+    fn steer(id: &str, text: &str) -> ContextInjection {
+        ContextInjection::text_with_steer_id(text.to_string(), id.to_string())
+    }
+
+    #[test]
+    fn sweep_drops_only_already_delivered_ids() {
+        let delivered: HashSet<String> = ["steer-1".to_string()].into_iter().collect();
+        let (kept, dropped) = split_already_delivered_steer_injections(
+            &delivered,
+            vec![
+                steer("steer-1", "late corpse push"),
+                steer("steer-2", "fresh"),
+            ],
+        );
+        assert_eq!(kept.len(), 1, "undelivered id must survive the sweep");
+        assert_eq!(kept[0].steer_id.as_deref(), Some("steer-2"));
+        assert_eq!(dropped.len(), 1, "already-delivered id must be dropped");
+        assert_eq!(dropped[0].steer_id.as_deref(), Some("steer-1"));
+    }
+
+    #[test]
+    fn dedup_is_by_id_never_by_text_and_skips_empty_ids() {
+        // "steer-1" already delivered this exact text; a NEW steer with the
+        // same text but its own id must still deliver. Id-less steers can't
+        // be correlated and are kept even if "" somehow enters the set.
+        let delivered: HashSet<String> =
+            ["steer-1".to_string(), String::new()].into_iter().collect();
+        let (kept, dropped) = split_already_delivered_steer_injections(
+            &delivered,
+            vec![
+                steer("steer-2", "same text sent twice"),
+                steer("", "id-less"),
+                steer("  ", "whitespace id"),
+            ],
+        );
+        assert_eq!(kept.len(), 3, "same-text/new-id and id-less steers stay");
+        assert!(dropped.is_empty());
     }
 }
 
