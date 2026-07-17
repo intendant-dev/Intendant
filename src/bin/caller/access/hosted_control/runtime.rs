@@ -26,9 +26,7 @@ pub fn mark_session_created_by_hosted_lease(
         ));
     }
     iam::transact_state(cert_dir, |state, _| {
-        if compute_lane_guard(state, crate::fleet_cert::ct_foreign_serials()).status
-            == HostedLaneGuardStatus::Suspended
-        {
+        if compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended {
             return Err(AccessError(
                 "hosted control is suspended by the certificate guard".to_string(),
             ));
@@ -104,6 +102,7 @@ pub struct HostedControlRuntime {
     pub(super) init_error: Option<String>,
     pub(super) cert_dir: PathBuf,
     pub(super) identity: Option<Arc<DaemonIdentity>>,
+    pub(super) identity_path: Option<PathBuf>,
     pub(super) daemon_id: String,
     daemon_label: String,
     display_media_relay_configured: bool,
@@ -115,6 +114,7 @@ pub struct HostedControlRuntime {
     tickets: Arc<Mutex<HashMap<String, WsTicketRecord>>>,
     doorbell_rate: Arc<Mutex<DoorbellRateState>>,
     poll_rate: Arc<Mutex<PollRateState>>,
+    pub(super) witness_rate: Arc<Mutex<WitnessRateState>>,
 }
 
 impl std::fmt::Debug for HostedControlRuntime {
@@ -158,6 +158,12 @@ struct DoorbellRateState {
 struct PollRateState {
     global: VecDeque<i64>,
     by_request: HashMap<String, VecDeque<i64>>,
+}
+
+#[derive(Default)]
+pub(super) struct WitnessRateState {
+    pub(super) global: VecDeque<i64>,
+    pub(super) by_binding: HashMap<String, VecDeque<i64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -204,6 +210,7 @@ impl HostedControlRuntime {
             init_error,
             cert_dir,
             identity,
+            identity_path: identity_path.map(Path::to_path_buf),
             daemon_id,
             daemon_label,
             display_media_relay_configured,
@@ -212,6 +219,7 @@ impl HostedControlRuntime {
             tickets: Arc::new(Mutex::new(HashMap::new())),
             doorbell_rate: Arc::new(Mutex::new(DoorbellRateState::default())),
             poll_rate: Arc::new(Mutex::new(PollRateState::default())),
+            witness_rate: Arc::new(Mutex::new(WitnessRateState::default())),
         }
     }
 
@@ -234,7 +242,7 @@ impl HostedControlRuntime {
             .map_err(|error| format!("load hosted-control policy: {error}"))?;
         let identity = self.identity()?;
         let lane_guard = HostedPublicLaneGuard {
-            status: compute_lane_guard(&state, crate::fleet_cert::ct_foreign_serials()).status,
+            status: compute_current_lane_guard(&state).status,
         };
         Ok(HostedControlBootstrap {
             enabled: true,
@@ -456,10 +464,9 @@ impl HostedControlRuntime {
     ) -> Result<Option<HostedLeaseDocument>, String> {
         self.ensure_enabled()?;
         let identity = self.identity()?;
-        let ct_serials = crate::fleet_cert::ct_foreign_serials();
         iam::transact_state(&self.cert_dir, |state, _| {
-            if compute_lane_guard(state, ct_serials.clone()).status
-                == HostedLaneGuardStatus::Suspended
+            if input.approve
+                && compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended
             {
                 return Err(AccessError(
                     "hosted control is suspended by the certificate guard".to_string(),
@@ -708,7 +715,7 @@ impl HostedControlRuntime {
         self.materialize_expirations("principal:local:hosted-control-observer")?;
         let state = iam::load_state_cached_arc(&self.cert_dir)?;
         let now = now_ms() as u64;
-        let lane_guard = compute_lane_guard(&state, crate::fleet_cert::ct_foreign_serials());
+        let lane_guard = compute_current_lane_guard(&state);
         Ok(HostedControlManagementSnapshot {
             configured: self.configured(),
             enabled: self.enabled(),
@@ -1014,9 +1021,7 @@ impl HostedControlRuntime {
     ) -> Result<VerifiedHostedLease, String> {
         let state = iam::load_state_cached_arc(&self.cert_dir)
             .map_err(|error| format!("load hosted lease state: {error}"))?;
-        if compute_lane_guard(&state, crate::fleet_cert::ct_foreign_serials()).status
-            == HostedLaneGuardStatus::Suspended
-        {
+        if compute_current_lane_guard(&state).status == HostedLaneGuardStatus::Suspended {
             return Err("hosted control is suspended by the certificate guard".to_string());
         }
         let lease = state
@@ -1283,7 +1288,7 @@ pub(super) fn now_ms() -> i64 {
     crate::access::client_key::now_unix_ms()
 }
 
-fn retain_recent(entries: &mut VecDeque<i64>, cutoff: i64) {
+pub(super) fn retain_recent(entries: &mut VecDeque<i64>, cutoff: i64) {
     while entries.front().is_some_and(|timestamp| *timestamp < cutoff) {
         entries.pop_front();
     }
@@ -1546,7 +1551,7 @@ mod tests {
         assert!(runtime
             .decide_request(
                 HostedLeaseDecisionInput {
-                    request_id: pending.request_id,
+                    request_id: pending.request_id.clone(),
                     approve: true,
                     approved_preset: None,
                     approved_ttl_secs: None,
@@ -1555,6 +1560,18 @@ mod tests {
             )
             .unwrap_err()
             .contains("suspended"));
+        assert!(runtime
+            .decide_request(
+                HostedLeaseDecisionInput {
+                    request_id: pending.request_id,
+                    approve: false,
+                    approved_preset: None,
+                    approved_ttl_secs: None,
+                },
+                &owner(),
+            )
+            .unwrap()
+            .is_none());
         assert!(runtime
             .verify_request_proof(
                 "GET",

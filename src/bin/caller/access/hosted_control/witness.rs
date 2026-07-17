@@ -1,16 +1,19 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::access::iam::{self, AccessPrincipal, LocalIamState};
 use crate::access::{AccessError, AccessResult};
 use crate::daemon_identity::{b64u, verify_b64u};
 
 use super::runtime::{
-    now_ms, push_audit, validate_fleet_origin, verify_p256_signature,
+    now_ms, push_audit, retain_recent, validate_fleet_origin, verify_p256_signature,
     ELIGIBLE_SIGNED_APP_DISTRIBUTIONS,
 };
 use super::*;
 
 const WITNESS_MAX_SKEW_MS: u64 = 10 * 60 * 1000;
+pub const WITNESS_EVIDENCE_CHANGED_ERROR: &str =
+    "certificate evidence changed; refresh before overriding";
 
 impl HostedControlRuntime {
     pub fn certificate_ledger(&self) -> Result<HostedCertificateLedger, String> {
@@ -37,10 +40,7 @@ impl HostedControlRuntime {
 
     pub fn lane_guard_snapshot(&self) -> AccessResult<HostedLaneGuardSnapshot> {
         let state = iam::load_state_cached_arc(&self.cert_dir)?;
-        Ok(compute_lane_guard(
-            &state,
-            crate::fleet_cert::ct_foreign_serials(),
-        ))
+        Ok(compute_current_lane_guard(&state))
     }
 
     pub fn ensure_lane_available(&self) -> Result<HostedLaneGuardSnapshot, String> {
@@ -87,14 +87,18 @@ impl HostedControlRuntime {
         observed_serial_hex: &str,
         vantage: HostedWitnessVantage,
     ) -> Result<HostedCertificateWitnessReport, String> {
-        self.ensure_enabled()?;
         verify_certificate_ledger(ledger)?;
-        let identity = self.identity()?;
+        let identity = self.observer_identity()?;
+        let observer_id = if self.daemon_id.trim().is_empty() {
+            identity.public_key_b64u()
+        } else {
+            self.daemon_id.clone()
+        };
         let mut report = HostedCertificateWitnessReport {
             protocol: CERTIFICATE_WITNESS_PROTOCOL.to_string(),
             report_id: uuid::Uuid::new_v4().to_string(),
             observer_kind: HostedWitnessKind::Peer,
-            observer_id: self.daemon_id.clone(),
+            observer_id,
             observer_public_key: identity.public_key_b64u(),
             target_daemon_id: ledger.daemon_id.clone(),
             fleet_origin: ledger.fleet_origin.clone(),
@@ -106,6 +110,17 @@ impl HostedControlRuntime {
         };
         report.signature = identity.sign_b64u(report.unsigned_payload().as_bytes());
         Ok(report)
+    }
+
+    fn observer_identity(&self) -> Result<Arc<crate::daemon_identity::DaemonIdentity>, String> {
+        if let Some(identity) = &self.identity {
+            return Ok(Arc::clone(identity));
+        }
+        self.identity_path
+            .as_deref()
+            .map(crate::daemon_identity::DaemonIdentity::load_or_create)
+            .unwrap_or_else(crate::daemon_identity::DaemonIdentity::load_or_create_default)
+            .map(Arc::new)
     }
 
     pub fn receive_signed_app_witness(
@@ -149,30 +164,26 @@ impl HostedControlRuntime {
                 .lane_guard_snapshot()
                 .map_err(|error| format!("load hosted certificate guard: {error}"));
         }
-        let ct_serials = crate::fleet_cert::ct_foreign_serials();
+        let ct_evidence = crate::fleet_cert::ct_guard_evidence();
+        let current = iam::load_state_cached_arc(&self.cert_dir)
+            .map_err(|error| format!("load hosted certificate guard: {error}"))?;
+        if let Some(device_id) = signed_app_device_id.as_deref() {
+            verify_signed_app_witness_anchor(&current, device_id, &report)
+                .map_err(|error| error.to_string())?;
+        }
+        if current
+            .hosted_control
+            .witnesses
+            .reports
+            .iter()
+            .any(|record| witness_update_is_noop(record, &observer_binding, &report))
+        {
+            return Ok(compute_lane_guard_with_ct(&current, ct_evidence));
+        }
+        self.record_witness_rate(&observer_binding)?;
         iam::transact_state(&self.cert_dir, |state, _| {
             if let Some(device_id) = signed_app_device_id.as_deref() {
-                let anchor = state
-                    .hosted_control
-                    .signed_app_anchors
-                    .iter()
-                    .find(|anchor| {
-                        anchor.device_id == device_id
-                            && anchor.active
-                            && anchor.revoked_unix_ms.is_none()
-                    })
-                    .ok_or_else(|| {
-                        AccessError("signed application witness is not accepted".to_string())
-                    })?;
-                if anchor.public_key != report.observer_public_key
-                    || !ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
-                        .iter()
-                        .any(|distribution| *distribution == anchor.distribution_id)
-                {
-                    return Err(AccessError(
-                        "signed application witness is not accepted".to_string(),
-                    ));
-                }
+                verify_signed_app_witness_anchor(state, device_id, &report)?;
             }
             if state
                 .hosted_control
@@ -181,7 +192,22 @@ impl HostedControlRuntime {
                 .iter()
                 .any(|record| record.report.report_id == report.report_id)
             {
-                return Ok((compute_lane_guard(state, ct_serials), false));
+                return Ok((
+                    compute_lane_guard_with_ct(state, ct_evidence.clone()),
+                    false,
+                ));
+            }
+            if state
+                .hosted_control
+                .witnesses
+                .reports
+                .iter()
+                .any(|record| witness_update_is_noop(record, &observer_binding, &report))
+            {
+                return Ok((
+                    compute_lane_guard_with_ct(state, ct_evidence.clone()),
+                    false,
+                ));
             }
             let received_unix_ms = now_ms().max(0) as u64;
             if let Some(existing) =
@@ -195,9 +221,7 @@ impl HostedControlRuntime {
                             && record.report.observed_serial_hex == report.observed_serial_hex
                     })
             {
-                if report.vantage.is_strong() || !existing.report.vantage.is_strong() {
-                    existing.report = report.clone();
-                }
+                existing.report = report.clone();
                 existing.observer_label = observer_label.clone();
                 existing.received_unix_ms = received_unix_ms;
             } else {
@@ -225,9 +249,41 @@ impl HostedControlRuntime {
                     report.vantage.as_str()
                 ),
             );
-            Ok((compute_lane_guard(state, ct_serials), true))
+            Ok((compute_lane_guard_with_ct(state, ct_evidence.clone()), true))
         })
         .map_err(|error| error.to_string())
+    }
+
+    fn record_witness_rate(&self, observer_binding: &str) -> Result<(), String> {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(HOSTED_WITNESS_RATE_WINDOW_MS);
+        let mut rate = self
+            .witness_rate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        retain_recent(&mut rate.global, cutoff);
+        for entries in rate.by_binding.values_mut() {
+            retain_recent(entries, cutoff);
+        }
+        rate.by_binding.retain(|_, entries| !entries.is_empty());
+        if rate.global.len() >= HOSTED_WITNESS_GLOBAL_PER_WINDOW {
+            return Err("certificate witness update rate limit exceeded".to_string());
+        }
+        if !rate.by_binding.contains_key(observer_binding)
+            && rate.by_binding.len() >= HOSTED_WITNESS_RATE_BINDINGS_CAP
+        {
+            return Err("certificate witness update rate limit exceeded".to_string());
+        }
+        let entries = rate
+            .by_binding
+            .entry(observer_binding.to_string())
+            .or_default();
+        if entries.len() >= HOSTED_WITNESS_PER_BINDING_PER_WINDOW {
+            return Err("certificate witness update rate limit exceeded".to_string());
+        }
+        entries.push_back(now);
+        rate.global.push_back(now);
+        Ok(())
     }
 
     pub fn confirm_witness_serial(
@@ -237,9 +293,9 @@ impl HostedControlRuntime {
     ) -> AccessResult<HostedLaneGuardSnapshot> {
         self.ensure_enabled().map_err(AccessError)?;
         let serial = normalized_serial(serial).map_err(AccessError)?;
-        let ct_serials = crate::fleet_cert::ct_foreign_serials();
+        let ct_evidence = crate::fleet_cert::ct_guard_evidence();
         iam::transact_state(&self.cert_dir, |state, _| {
-            let before = compute_lane_guard(state, ct_serials.clone());
+            let before = compute_lane_guard_with_ct(state, ct_evidence.clone());
             if !before.unexpected_serials.contains(&serial) {
                 return Err(AccessError(
                     "certificate serial is not present in current witness evidence".to_string(),
@@ -278,22 +334,38 @@ impl HostedControlRuntime {
                     "Confirmed hosted certificate observation and suspended the lane".to_string(),
                 );
             }
-            Ok((compute_lane_guard(state, ct_serials), changed))
+            Ok((
+                compute_lane_guard_with_ct(state, ct_evidence.clone()),
+                changed,
+            ))
         })
     }
 
     pub fn override_witness_guard(
         &self,
+        expected_evidence_sha256: &str,
         actor: &AccessPrincipal,
     ) -> AccessResult<HostedLaneGuardSnapshot> {
         self.ensure_enabled().map_err(AccessError)?;
-        let ct_serials = crate::fleet_cert::ct_foreign_serials();
+        if expected_evidence_sha256.len() != 43
+            || !expected_evidence_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(AccessError(
+                "certificate evidence digest is invalid".to_string(),
+            ));
+        }
+        let ct_evidence = crate::fleet_cert::ct_guard_evidence();
         iam::transact_state(&self.cert_dir, |state, _| {
-            let guard = compute_lane_guard(state, ct_serials.clone());
-            if guard.unexpected_serials.is_empty() {
+            let guard = compute_lane_guard_with_ct(state, ct_evidence.clone());
+            if guard.status == HostedLaneGuardStatus::Clear {
                 return Err(AccessError(
                     "certificate guard has no evidence to override".to_string(),
                 ));
+            }
+            if guard.evidence_sha256 != expected_evidence_sha256 {
+                return Err(AccessError(WITNESS_EVIDENCE_CHANGED_ERROR.to_string()));
             }
             let changed = state
                 .hosted_control
@@ -314,9 +386,47 @@ impl HostedControlRuntime {
                     "Overrode the current hosted certificate evidence set".to_string(),
                 );
             }
-            Ok((compute_lane_guard(state, ct_serials), changed))
+            Ok((
+                compute_lane_guard_with_ct(state, ct_evidence.clone()),
+                changed,
+            ))
         })
     }
+}
+
+fn verify_signed_app_witness_anchor(
+    state: &LocalIamState,
+    device_id: &str,
+    report: &HostedCertificateWitnessReport,
+) -> AccessResult<()> {
+    let anchor = state
+        .hosted_control
+        .signed_app_anchors
+        .iter()
+        .find(|anchor| {
+            anchor.device_id == device_id && anchor.active && anchor.revoked_unix_ms.is_none()
+        })
+        .ok_or_else(|| AccessError("signed application witness is not accepted".to_string()))?;
+    if anchor.public_key != report.observer_public_key
+        || !ELIGIBLE_SIGNED_APP_DISTRIBUTIONS
+            .iter()
+            .any(|distribution| *distribution == anchor.distribution_id)
+    {
+        return Err(AccessError(
+            "signed application witness is not accepted".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn witness_update_is_noop(
+    record: &HostedWitnessRecord,
+    observer_binding: &str,
+    report: &HostedCertificateWitnessReport,
+) -> bool {
+    record.observer_binding == observer_binding
+        && record.report.observed_serial_hex == report.observed_serial_hex
+        && (!report.vantage.is_strong() || record.report.vantage.is_strong())
 }
 
 pub fn verify_certificate_ledger(ledger: &HostedCertificateLedger) -> Result<(), String> {
@@ -354,10 +464,29 @@ pub fn verify_certificate_ledger(ledger: &HostedCertificateLedger) -> Result<(),
     Ok(())
 }
 
+#[cfg(test)]
 pub fn compute_lane_guard(
     state: &LocalIamState,
     ct_serials: Vec<String>,
 ) -> HostedLaneGuardSnapshot {
+    compute_lane_guard_with_ct(
+        state,
+        crate::fleet_cert::CtGuardEvidence {
+            foreign_serials: ct_serials,
+            state_unavailable: false,
+        },
+    )
+}
+
+pub fn compute_current_lane_guard(state: &LocalIamState) -> HostedLaneGuardSnapshot {
+    compute_lane_guard_with_ct(state, crate::fleet_cert::ct_guard_evidence())
+}
+
+pub(crate) fn compute_lane_guard_with_ct(
+    state: &LocalIamState,
+    ct_evidence: crate::fleet_cert::CtGuardEvidence,
+) -> HostedLaneGuardSnapshot {
+    let ct_state_unavailable = ct_evidence.state_unavailable;
     let report_serials: BTreeSet<String> = state
         .hosted_control
         .witnesses
@@ -372,7 +501,8 @@ pub fn compute_lane_guard(
     corroborated_serials.sort();
     corroborated_serials.dedup();
 
-    let mut ct_serials: Vec<String> = ct_serials
+    let mut ct_serials: Vec<String> = ct_evidence
+        .foreign_serials
         .into_iter()
         .filter_map(|serial| normalized_serial(&serial).ok())
         .collect();
@@ -392,25 +522,27 @@ pub fn compute_lane_guard(
     unexpected.extend(ct_serials.iter().cloned());
     unexpected.extend(owner_confirmed_serials.iter().cloned());
     let unexpected_serials: Vec<String> = unexpected.into_iter().collect();
-    let evidence_sha256 = evidence_digest(&unexpected_serials);
+    let evidence_sha256 = evidence_digest(&unexpected_serials, ct_state_unavailable);
+    let has_evidence = !unexpected_serials.is_empty() || ct_state_unavailable;
     let confirmed = !corroborated_serials.is_empty()
         || !ct_serials.is_empty()
-        || !owner_confirmed_serials.is_empty();
-    let overridden = !unexpected_serials.is_empty()
+        || !owner_confirmed_serials.is_empty()
+        || ct_state_unavailable;
+    let overridden = has_evidence
         && state
             .hosted_control
             .witnesses
             .override_evidence_sha256
             .as_deref()
             == Some(evidence_sha256.as_str());
-    let stale_override = !unexpected_serials.is_empty()
+    let stale_override = has_evidence
         && state
             .hosted_control
             .witnesses
             .override_evidence_sha256
             .as_deref()
             .is_some_and(|digest| digest != evidence_sha256);
-    let status = if unexpected_serials.is_empty() {
+    let status = if !has_evidence {
         HostedLaneGuardStatus::Clear
     } else if overridden {
         HostedLaneGuardStatus::Overridden
@@ -425,6 +557,7 @@ pub fn compute_lane_guard(
         unexpected_serials,
         corroborated_serials,
         ct_serials,
+        ct_state_unavailable,
         owner_confirmed_serials,
         reports: state.hosted_control.witnesses.reports.clone(),
         override_actor: state.hosted_control.witnesses.override_actor.clone(),
@@ -483,8 +616,12 @@ fn normalized_serial(serial: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn evidence_digest(serials: &[String]) -> String {
-    b64u(ring::digest::digest(&ring::digest::SHA256, serials.join("\n").as_bytes()).as_ref())
+fn evidence_digest(serials: &[String], ct_state_unavailable: bool) -> String {
+    let mut evidence = serials.join("\n");
+    if ct_state_unavailable {
+        evidence.push_str("\n!ct-state-unavailable");
+    }
+    b64u(ring::digest::digest(&ring::digest::SHA256, evidence.as_bytes()).as_ref())
 }
 
 fn bounded_witness_label(value: &str, fallback: &str) -> String {
@@ -545,6 +682,102 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_binding_serial_evidence_is_idempotent_and_updates_are_bounded() {
+        let existing = report("r1", "abc", "peer:a", HostedWitnessVantage::SameLan);
+        let mut repeated = existing.report.clone();
+        repeated.report_id = "r2".to_string();
+        assert!(witness_update_is_noop(&existing, "peer:a", &repeated));
+        repeated.vantage = HostedWitnessVantage::Remote;
+        assert!(!witness_update_is_noop(&existing, "peer:a", &repeated));
+
+        let temp = tempfile::tempdir().unwrap();
+        let cert_dir = temp.path().join("access");
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        std::fs::write(
+            cert_dir.join("fleet-origin-provenance.json"),
+            r#"{
+                "schema_version": 1,
+                "zone": "example.test",
+                "name": "target.example.test",
+                "known_names": ["target.example.test"],
+                "provenance_incomplete": false
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cert_dir.join("fleet-cert-serials.json"),
+            r#"[{
+                "serial_hex": "abc",
+                "name": "target.example.test",
+                "directory": "test",
+                "issued_unix_ms": 1
+            }]"#,
+        )
+        .unwrap();
+        let runtime = HostedControlRuntime::new(
+            true,
+            cert_dir,
+            Some(&temp.path().join("identity.pk8")),
+            Some("target"),
+            "Target".to_string(),
+            false,
+        );
+        let ledger = runtime.certificate_ledger().unwrap();
+        let first = runtime
+            .build_peer_witness_report(&ledger, "def", HostedWitnessVantage::SameLan)
+            .unwrap();
+        let first_id = first.report_id.clone();
+        runtime
+            .receive_peer_witness(first, &"11".repeat(32), "Peer A")
+            .unwrap();
+        let repeated = runtime
+            .build_peer_witness_report(&ledger, "def", HostedWitnessVantage::SameLan)
+            .unwrap();
+        runtime
+            .receive_peer_witness(repeated, &"11".repeat(32), "Peer A")
+            .unwrap();
+        let state = iam::load_state(&runtime.cert_dir).unwrap();
+        assert_eq!(state.hosted_control.witnesses.reports.len(), 1);
+        assert_eq!(
+            state.hosted_control.witnesses.reports[0].report.report_id,
+            first_id
+        );
+        assert_eq!(
+            state
+                .audit_events
+                .iter()
+                .filter(|event| event.action == "hosted_certificate_witness")
+                .count(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .witness_rate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .global
+                .len(),
+            1
+        );
+
+        let bounded = HostedControlRuntime::new(
+            false,
+            temp.path().join("bounded-access"),
+            Some(&temp.path().join("bounded-identity.pk8")),
+            Some("observer"),
+            String::new(),
+            false,
+        );
+        for _ in 0..HOSTED_WITNESS_PER_BINDING_PER_WINDOW {
+            bounded.record_witness_rate("peer:a").unwrap();
+        }
+        assert!(bounded
+            .record_witness_rate("peer:a")
+            .unwrap_err()
+            .contains("rate limit"));
+    }
+
+    #[test]
     fn two_weak_bindings_alert_but_one_strong_vantage_corroborates() {
         let mut state = LocalIamState::default();
         state.hosted_control.witnesses.reports = vec![
@@ -576,6 +809,25 @@ mod tests {
         let guard = compute_lane_guard(&state, Vec::new());
         assert_eq!(guard.status, HostedLaneGuardStatus::Suspended);
         assert_eq!(guard.owner_confirmed_serials, vec!["def"]);
+    }
+
+    #[test]
+    fn unreadable_durable_ct_state_suspends_and_can_be_exactly_overridden() {
+        let mut state = LocalIamState::default();
+        let evidence = crate::fleet_cert::CtGuardEvidence {
+            foreign_serials: Vec::new(),
+            state_unavailable: true,
+        };
+        let guard = compute_lane_guard_with_ct(&state, evidence.clone());
+        assert_eq!(guard.status, HostedLaneGuardStatus::Suspended);
+        assert!(guard.ct_state_unavailable);
+        assert!(guard.unexpected_serials.is_empty());
+
+        state.hosted_control.witnesses.override_evidence_sha256 = Some(guard.evidence_sha256);
+        assert_eq!(
+            compute_lane_guard_with_ct(&state, evidence).status,
+            HostedLaneGuardStatus::Overridden
+        );
     }
 
     #[test]
@@ -667,6 +919,90 @@ mod tests {
             .receive_signed_app_witness(witness)
             .unwrap_err()
             .contains("no qualifying signed application distribution"));
+    }
+
+    #[test]
+    fn dark_observer_can_sign_a_peer_report_without_enabling_its_own_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let observer = HostedControlRuntime::new(
+            false,
+            temp.path().join("access"),
+            Some(&temp.path().join("observer.pk8")),
+            Some("observer"),
+            String::new(),
+            false,
+        );
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let target = crate::daemon_identity::DaemonIdentity::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let mut ledger = HostedCertificateLedger {
+            protocol: CERTIFICATE_LEDGER_PROTOCOL.to_string(),
+            daemon_id: "target".to_string(),
+            daemon_public_key: target.public_key_b64u(),
+            fleet_origin: "https://target.example.test".to_string(),
+            serials: vec!["abc".to_string()],
+            issued_unix_ms: 1,
+            signature: String::new(),
+        };
+        ledger.signature = target.sign_b64u(ledger.unsigned_payload().as_bytes());
+
+        let report = observer
+            .build_peer_witness_report(&ledger, "def", HostedWitnessVantage::Unknown)
+            .unwrap();
+        assert_eq!(report.observer_id, "observer");
+        assert!(verify_b64u(
+            &report.observer_public_key,
+            report.unsigned_payload().as_bytes(),
+            &report.signature,
+        ));
+        assert!(temp.path().join("observer.pk8").exists());
+        assert!(!observer.enabled());
+    }
+
+    #[test]
+    fn override_rejects_evidence_that_changed_after_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = HostedControlRuntime::new(
+            true,
+            temp.path().join("access"),
+            Some(&temp.path().join("identity.pk8")),
+            Some("target"),
+            "Target".to_string(),
+            false,
+        );
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state.hosted_control.witnesses.reports.push(report(
+                "r1",
+                "abc",
+                "peer:a",
+                HostedWitnessVantage::Remote,
+            ));
+            Ok(((), true))
+        })
+        .unwrap();
+        let rendered = runtime.lane_guard_snapshot().unwrap();
+        iam::transact_state(&runtime.cert_dir, |state, _| {
+            state.hosted_control.witnesses.reports.push(report(
+                "r2",
+                "def",
+                "peer:b",
+                HostedWitnessVantage::SameLan,
+            ));
+            Ok(((), true))
+        })
+        .unwrap();
+
+        let error = runtime
+            .override_witness_guard(
+                &rendered.evidence_sha256,
+                &AccessPrincipal::root_dashboard_session("owner", "Owner"),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), WITNESS_EVIDENCE_CHANGED_ERROR);
+        assert_ne!(
+            runtime.lane_guard_snapshot().unwrap().status,
+            HostedLaneGuardStatus::Overridden
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ use crate::peer::handle::PeerHandle;
 use crate::peer::registry::PeerRegistry;
 use crate::peer::transport::intendant::{PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE};
 use crate::peer::transport::ws_url_to_http_base;
+use crate::peer::PeerWitnessVantage;
 
 const LEDGER_PATH: &str = "/api/hosted-control/certificate-ledger";
 const LEDGER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -35,26 +36,32 @@ pub struct FleetCertificateObservation {
     pub vantage: HostedWitnessVantage,
 }
 
-pub fn certificate_ledger_endpoint(card: &AgentCard) -> Option<String> {
-    card.transports
+pub fn certificate_ledger_endpoints(card: &AgentCard) -> Vec<String> {
+    let mut endpoints: Vec<String> = card
+        .transports
         .iter()
-        .find_map(|transport| match transport {
+        .filter_map(|transport| match transport {
             TransportSpec::IntendantWs { url } => {
                 Some(format!("{}{LEDGER_PATH}", ws_url_to_http_base(url)))
             }
             _ => None,
         })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    endpoints.retain(|endpoint| seen.insert(endpoint.clone()));
+    endpoints
 }
 
 pub async fn fetch_certificate_ledger(
     handle: &PeerHandle,
 ) -> Result<HostedCertificateLedger, String> {
-    let endpoint = certificate_ledger_endpoint(&handle.card_snapshot()).ok_or_else(|| {
-        format!(
+    let endpoints = certificate_ledger_endpoints(&handle.card_snapshot());
+    if endpoints.is_empty() {
+        return Err(format!(
             "peer {} advertises no direct route for a certificate ledger",
             handle.id()
-        )
-    })?;
+        ));
+    }
     let credentials = handle.transport_credentials();
     let tls_config = credentials
         .tls
@@ -70,11 +77,39 @@ pub async fn fetch_certificate_ledger(
     let client = client
         .build()
         .map_err(|error| format!("build peer ledger client: {error}"))?;
+    fetch_certificate_ledger_from_candidates(
+        &client,
+        &endpoints,
+        credentials.bearer_token.as_deref(),
+    )
+    .await
+}
+
+async fn fetch_certificate_ledger_from_candidates(
+    client: &reqwest::Client,
+    endpoints: &[String],
+    bearer_token: Option<&str>,
+) -> Result<HostedCertificateLedger, String> {
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match fetch_certificate_ledger_from_endpoint(client, endpoint, bearer_token).await {
+            Ok(ledger) => return Ok(ledger),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "no peer certificate ledger route was attempted".to_string()))
+}
+
+async fn fetch_certificate_ledger_from_endpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    bearer_token: Option<&str>,
+) -> Result<HostedCertificateLedger, String> {
     let mut request = client
-        .get(&endpoint)
+        .get(endpoint)
         .timeout(LEDGER_FETCH_TIMEOUT)
         .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE);
-    if let Some(token) = &credentials.bearer_token {
+    if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
     }
     let response = request
@@ -105,7 +140,22 @@ pub async fn fetch_certificate_ledger(
     let ledger: HostedCertificateLedger = serde_json::from_slice(&bytes)
         .map_err(|error| format!("decode peer certificate ledger: {error}"))?;
     verify_certificate_ledger(&ledger)?;
+    ensure_independent_ledger_source(endpoint, &ledger.fleet_origin)?;
     Ok(ledger)
+}
+
+fn ensure_independent_ledger_source(endpoint: &str, fleet_origin: &str) -> Result<(), String> {
+    let source = url::Url::parse(endpoint)
+        .map_err(|error| format!("parse peer certificate ledger route: {error}"))?;
+    let fleet = url::Url::parse(fleet_origin)
+        .map_err(|error| format!("parse fleet certificate origin: {error}"))?;
+    if source.origin() == fleet.origin() {
+        return Err(
+            "peer certificate ledger route must be independent of the observed fleet origin"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub async fn observe_fleet_certificate(
@@ -173,11 +223,11 @@ async fn observe_fleet_certificate_on_stream(
         .collect::<String>();
     Ok(FleetCertificateObservation {
         serial_hex: crate::fleet_cert::normalize_serial_hex(&serial_hex),
-        vantage: classify_vantage(peer_addr),
+        vantage: classify_destination_vantage(peer_addr),
     })
 }
 
-fn classify_vantage(peer_addr: SocketAddr) -> HostedWitnessVantage {
+fn classify_destination_vantage(peer_addr: SocketAddr) -> HostedWitnessVantage {
     match peer_addr.ip() {
         IpAddr::V4(ip) if ip.is_private() || ip.is_loopback() || ip.is_link_local() => {
             HostedWitnessVantage::SameLan
@@ -189,7 +239,24 @@ fn classify_vantage(peer_addr: SocketAddr) -> HostedWitnessVantage {
         }
         IpAddr::V4(ip) if ip.is_unspecified() || ip.is_multicast() => HostedWitnessVantage::Unknown,
         IpAddr::V6(ip) if ip.is_unspecified() || ip.is_multicast() => HostedWitnessVantage::Unknown,
-        _ => HostedWitnessVantage::Remote,
+        // A public destination can still be a hairpinned route from a
+        // co-located observer. It becomes strong only through explicit local
+        // operator configuration for this peer relationship.
+        _ => HostedWitnessVantage::Unknown,
+    }
+}
+
+fn effective_peer_vantage(
+    destination: HostedWitnessVantage,
+    configured: PeerWitnessVantage,
+) -> HostedWitnessVantage {
+    if destination == HostedWitnessVantage::SameLan {
+        return HostedWitnessVantage::SameLan;
+    }
+    match configured {
+        PeerWitnessVantage::SameLan => HostedWitnessVantage::SameLan,
+        PeerWitnessVantage::Remote => HostedWitnessVantage::Remote,
+        PeerWitnessVantage::Unknown => HostedWitnessVantage::Unknown,
     }
 }
 
@@ -205,8 +272,8 @@ async fn observe_peer_once(
     if ledger.serials.contains(&observation.serial_hex) {
         return Ok(());
     }
-    let report =
-        runtime.build_peer_witness_report(&ledger, &observation.serial_hex, observation.vantage)?;
+    let vantage = effective_peer_vantage(observation.vantage, handle.certificate_witness_vantage());
+    let report = runtime.build_peer_witness_report(&ledger, &observation.serial_hex, vantage)?;
     handle
         .submit_certificate_witness(report)
         .await
@@ -238,9 +305,6 @@ async fn observe_all_peers(runtime: Arc<HostedControlRuntime>, registry: PeerReg
 }
 
 pub fn spawn_certificate_witness_loop(runtime: Arc<HostedControlRuntime>, registry: PeerRegistry) {
-    if !runtime.enabled() {
-        return;
-    }
     tokio::spawn(async move {
         tokio::time::sleep(WITNESS_INITIAL_DELAY).await;
         let mut interval = tokio::time::interval(WITNESS_INTERVAL);
@@ -257,6 +321,7 @@ mod tests {
     use super::*;
     use crate::peer::card::AuthRequirements;
     use crate::peer::id::{PeerId, PeerKind};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn card(transports: Vec<TransportSpec>) -> AgentCard {
         AgentCard {
@@ -271,30 +336,122 @@ mod tests {
     }
 
     #[test]
-    fn ledger_endpoint_uses_direct_peer_route() {
+    fn ledger_endpoints_preserve_direct_peer_route_fallback_order() {
         assert_eq!(
-            certificate_ledger_endpoint(&card(vec![TransportSpec::IntendantWs {
-                url: "wss://peer.example.test:9443/ws".to_string(),
-            }]))
-            .as_deref(),
-            Some("https://peer.example.test:9443/api/hosted-control/certificate-ledger")
+            certificate_ledger_endpoints(&card(vec![
+                TransportSpec::IntendantWs {
+                    url: "wss://dead.example.test:9443/ws".to_string(),
+                },
+                TransportSpec::IntendantWs {
+                    url: "wss://peer.example.test:9443/ws".to_string(),
+                },
+                TransportSpec::IntendantWs {
+                    url: "wss://dead.example.test:9443/ws".to_string(),
+                },
+            ])),
+            vec![
+                "https://dead.example.test:9443/api/hosted-control/certificate-ledger",
+                "https://peer.example.test:9443/api/hosted-control/certificate-ledger",
+            ]
+        );
+    }
+
+    async fn spawn_ledger_response(
+        status: &str,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}{LEDGER_PATH}", listener.local_addr().unwrap());
+        let status = status.to_string();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn ledger_fetch_falls_back_to_the_next_direct_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity =
+            crate::daemon_identity::DaemonIdentity::load_or_create(temp.path().join("id.pk8"))
+                .unwrap();
+        let mut expected = HostedCertificateLedger {
+            protocol: crate::access::hosted_control::CERTIFICATE_LEDGER_PROTOCOL.to_string(),
+            daemon_id: "daemon-test".to_string(),
+            daemon_public_key: identity.public_key_b64u(),
+            fleet_origin: "https://fleet.example.test".to_string(),
+            serials: vec!["a1b2".to_string()],
+            issued_unix_ms: 1_700_000_000_000,
+            signature: String::new(),
+        };
+        expected.signature = identity.sign_b64u(expected.unsigned_payload().as_bytes());
+        let (first, first_task) =
+            spawn_ledger_response("503 Service Unavailable", "{}".to_string()).await;
+        let (second, second_task) =
+            spawn_ledger_response("200 OK", serde_json::to_string(&expected).unwrap()).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        let fetched = fetch_certificate_ledger_from_candidates(&client, &[first, second], None)
+            .await
+            .unwrap();
+
+        assert_eq!(fetched, expected);
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[test]
+    fn destination_address_never_claims_an_outside_network_vantage() {
+        assert_eq!(
+            classify_destination_vantage("192.168.1.20:443".parse().unwrap()),
+            HostedWitnessVantage::SameLan
+        );
+        assert_eq!(
+            classify_destination_vantage("[fd00::20]:443".parse().unwrap()),
+            HostedWitnessVantage::SameLan
+        );
+        assert_eq!(
+            classify_destination_vantage("203.0.113.20:443".parse().unwrap()),
+            HostedWitnessVantage::Unknown
+        );
+        assert_eq!(
+            effective_peer_vantage(HostedWitnessVantage::Unknown, PeerWitnessVantage::Remote),
+            HostedWitnessVantage::Remote
+        );
+        assert_eq!(
+            effective_peer_vantage(HostedWitnessVantage::SameLan, PeerWitnessVantage::Remote),
+            HostedWitnessVantage::SameLan
         );
     }
 
     #[test]
-    fn vantage_requires_a_nonlocal_address_for_remote_weight() {
-        assert_eq!(
-            classify_vantage("192.168.1.20:443".parse().unwrap()),
-            HostedWitnessVantage::SameLan
-        );
-        assert_eq!(
-            classify_vantage("[fd00::20]:443".parse().unwrap()),
-            HostedWitnessVantage::SameLan
-        );
-        assert_eq!(
-            classify_vantage("203.0.113.20:443".parse().unwrap()),
-            HostedWitnessVantage::Remote
-        );
+    fn ledger_source_must_not_be_the_observed_fleet_origin() {
+        assert!(ensure_independent_ledger_source(
+            "https://fleet.example.test/api/hosted-control/certificate-ledger",
+            "https://fleet.example.test",
+        )
+        .unwrap_err()
+        .contains("independent"));
+        ensure_independent_ledger_source(
+            "https://peer-direct.example.test:9443/api/hosted-control/certificate-ledger",
+            "https://fleet.example.test",
+        )
+        .unwrap();
     }
 
     #[tokio::test]

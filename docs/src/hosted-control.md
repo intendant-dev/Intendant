@@ -197,15 +197,19 @@ record, but cannot change its contents without invalidating the daemon-identity
 signature.
 
 Configured peer daemons periodically fetch that record through their existing
-authenticated peer route, dial the fleet name from their own network path with
-ordinary WebPKI verification, and compare the presented leaf serial with the
-ledger. A qualifying signed application may perform the same observation using
-its own network path. Unsigned development artifacts are not application
-witnesses.
+authenticated peer-route candidates, never from the fleet origin being
+observed, dial the fleet name from their own network path with ordinary WebPKI
+verification, and compare the presented leaf serial with the ledger. An
+observer does not need to enable its own hosted lane. A qualifying signed
+application may perform the same observation using its own network path.
+Unsigned development artifacts are not application witnesses.
 
-Reports carry an explicit vantage label. A private or link-local path is a weak
-same-network observation; a remote or cellular path is stronger; an
-unclassifiable path remains visible as unknown. The label affects
+Reports carry an explicit vantage label. A private or link-local destination is
+a weak same-network observation. A public destination alone remains unknown
+because a co-located observer may hairpin through that address. A peer becomes
+`remote` only through the local operator's per-peer
+`certificate_witness_vantage = "remote"` statement; a signed application may
+independently attest a remote or cellular path. The label affects
 corroboration and is shown to the owner.
 
 One verified peer or signed-application report creates an alert and cannot
@@ -219,13 +223,15 @@ The Certificate Transparency result is folded into the same guard as slower,
 independent evidence. A foreign serial reported by the CT monitor suspends the
 hosted lane even when no peer or signed-application witness is available.
 Fetch failures do not create evidence and leave the last durable CT verdict
-visible.
+visible. That verdict is replaced atomically. An existing unreadable verdict
+suspends the lane until a successful check or an exact owner override.
 
-An owner can override the exact current unexpected-serial set from a trusted
-surface. The alert remains visible. Further reports about the same serial do
-not churn the override, while any newly observed serial changes the evidence
-set and suspends the lane again. Confirming an observation later clears the
-override and suspends the lane.
+An owner can override the exact evidence digest displayed on a trusted
+surface. A changed digest is rejected so evidence arriving after rendering is
+not silently included. The alert remains visible. Further reports about the
+same serial do not churn the override, while any newly observed serial changes
+the evidence set and suspends the lane again. Confirming an observation later
+clears the override and suspends the lane.
 
 The public bootstrap projects only the guard status needed to stop or warn a
 hosted browser. Serial evidence, observer labels, reports, and owner
@@ -264,12 +270,14 @@ recorded renewal as unexpected.
 | Private user display is requested | The agent-visible-display boundary refuses it. |
 | No direct ICE route or TURN | Media is reported unavailable; no broader transport is substituted. |
 | One verified certificate-witness mismatch | Alert only; the hosted lane remains available. |
-| Repeated reports from one observer binding | No corroboration; the state remains an alert. |
+| Repeated equivalent reports from one observer binding | No state or audit rewrite; the state remains an alert. |
+| State-changing witness reports exceed the per-observer or global window | The update is rate-limited before IAM persistence. |
 | Distinct weak or unknown vantage reports only | No corroboration; the state remains an alert. |
 | Two distinct observers with a remote or cellular vantage | Hosted lease admission and live rechecks are suspended. |
 | Owner-confirmed mismatch or CT foreign serial | Hosted lease admission and live rechecks are suspended. |
-| Owner override matches the current unexpected-serial set | The lane is available with a persistent warning. |
-| A new unexpected serial appears after override | The evidence set changes and the lane is suspended again. |
+| Existing durable CT verdict cannot be read | The lane is suspended until a successful check or an exact trusted-surface override. |
+| Owner override matches the current evidence digest | The lane is available with a persistent warning. |
+| New evidence appears after override | The evidence digest changes and the lane is suspended again. |
 | Witness report arrives without peer identity or an active signed-app anchor | The report is refused and cannot affect guard state. |
 | Hosted policy/state cannot be loaded | Admission and live authorization fail closed. |
 

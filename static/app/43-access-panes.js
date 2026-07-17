@@ -1177,8 +1177,8 @@ function renderAccessConnectCard() {
 
   // Fleet certificate (docs/src/trust-tiers.md, warning-free discovery):
   // when the rendezvous serves a fleet DNS zone, this daemon owns a real
-  // name. The endpoint serves public shell/discovery bytes only; protected
-  // HTTP/MCP, signaling, and WebSocket traffic is refused on fleet SNI.
+  // name. Ambient fleet traffic remains authority-free; an enabled hosted
+  // lane admits only daemon-minted lease principals and is guarded below.
   const fleetCert = status.fleet_cert || {};
   if (fleetCert.name) {
     const row = document.createElement('div');
@@ -1200,11 +1200,17 @@ function renderAccessConnectCard() {
       ct.textContent = 'CT ALERT';
       ct.title = `The public Certificate Transparency logs hold ${fleetCert.ct_unknown?.length || 'unknown'} certificate(s) for this daemon's fleet name that this daemon never requested: ${(fleetCert.ct_unknown || []).join(' | ')}. If you did not mint these yourself through another channel, someone who controls the fleet zone (or a CA) issued a certificate for this name. Treat its directory metadata as compromised and use an independently verified loopback/direct-mTLS route for control.`;
       row.appendChild(ct);
+    } else if (fleetCert.ct_state === 'unreadable') {
+      const ct = document.createElement('span');
+      ct.className = 'acc-chip route-danger';
+      ct.textContent = 'CT STATE UNREADABLE';
+      ct.title = 'The last durable transparency verdict could not be read. The hosted lease lane remains suspended until a successful check or an exact trusted-surface override.';
+      row.appendChild(ct);
     }
     if (fleetCert.state === 'valid') {
       chip.className = 'acc-chip route-webrtc';
       chip.textContent = validUntil ? `certificate ✓ until ${validUntil}` : 'certificate ✓';
-      chip.title = 'A browser-trusted Let’s Encrypt certificate serves the public shell and discovery endpoint at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. It is not a control origin: protected API, MCP, signaling, and WebSocket access is refused even with browser mTLS. Renewals are automatic.'
+      chip.title = 'A browser-trusted Let’s Encrypt certificate serves the public shell and hosted doorbell at https://' + fleetCert.name + (window.location.port ? ':' + window.location.port : '') + ' without warnings. Ambient requests carry no daemon authority; only a daemon-minted hosted lease can enter its bounded routes. Renewals are automatic.'
         + (fleetCert.ct_state === 'ok' && fleetCert.ct_checked_unix_ms
           ? ` CT tripwire: all publicly logged certificates for this name are this daemon's own (checked ${new Date(Number(fleetCert.ct_checked_unix_ms)).toLocaleString()}).`
           : '');

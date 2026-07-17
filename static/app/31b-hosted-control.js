@@ -549,6 +549,7 @@ function hostedControlRenderManagementCard() {
       corroborated_serials: [],
       ct_serials: [],
       owner_confirmed_serials: [],
+      ct_state_unavailable: false,
       reports: [],
     };
     const guardStatus = String(guard.status || 'clear');
@@ -568,6 +569,9 @@ function hostedControlRenderManagementCard() {
         .map(serial => `<span class="acc-chip hosted-control-serial">${hostedControlEscape(serial)}</span>`)
         .join(' ')}</div>`).join('')
       || '<div><strong>Confirmed sources:</strong> None</div>';
+    const transparencyState = guard.ct_state_unavailable
+      ? '<div><strong>Transparency state:</strong> Durable verdict unreadable; lane remains suspended.</div>'
+      : '';
     const confirmed = new Set(guard.owner_confirmed_serials || []);
     const confirmActions = ['alert', 'overridden'].includes(guardStatus)
       ? (guard.unexpected_serials || [])
@@ -605,7 +609,7 @@ function hostedControlRenderManagementCard() {
         <div><strong>Signed ledger${ledger?.fleet_origin
           ? ` · ${hostedControlEscape(ledger.fleet_origin)}` : ''}:</strong> ${expected}</div>
         <div><strong>Unexpected serials:</strong> ${unexpected}</div>
-        <div class="hosted-control-evidence-sources">${evidenceSources}</div>
+        <div class="hosted-control-evidence-sources">${evidenceSources}${transparencyState}</div>
         <div class="hosted-control-mgmt-row">${confirmActions}${overrideAction}</div>
         <div class="hosted-control-witnesses">${witnessRows}</div>
         <p>One report alerts. Two distinct observers with at least one outside-network vantage,
@@ -676,7 +680,7 @@ function hostedControlRenderManagementCard() {
     if (override) {
       override.onclick = () => hostedControlManagementPost(
         '/api/access/hosted-control/witnesses/override',
-        {},
+        { evidence_sha256: guard.evidence_sha256 },
       ).then(hostedControlRenderManagementCard)
         .catch(error => showControlToast?.('error', error.message));
     }

@@ -32,6 +32,15 @@ use crate::peer::event::{
 use crate::peer::PeerError;
 use async_trait::async_trait;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerWitnessVantage {
+    SameLan,
+    Remote,
+    #[default]
+    Unknown,
+}
+
 // ---------------------------------------------------------------------------
 // TransportFeatures
 // ---------------------------------------------------------------------------

@@ -127,7 +127,7 @@ pub use log_writer::spawn_peer_log_writer;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use log_writer::{EnqueuedPeerEvent, LOG_CHANNEL_CAPACITY};
 pub use registry::{PeerRegistry, RegistryEvent};
-pub use traits::PeerTask;
+pub use traits::{PeerTask, PeerWitnessVantage};
 
 // ---------------------------------------------------------------------------
 // Errors

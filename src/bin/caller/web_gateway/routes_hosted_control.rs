@@ -12,6 +12,14 @@ pub(crate) fn is_public_hosted_control_path(method: &str, path: &str) -> bool {
     )
 }
 
+pub(crate) fn is_fleet_only_hosted_control_path(method: &str, path: &str) -> bool {
+    is_public_hosted_control_path(method, path)
+        && !matches!(
+            (method, path),
+            ("GET", "/api/hosted-control/certificate-ledger")
+        )
+}
+
 fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
     match serde_json::to_value(value) {
         Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
@@ -240,6 +248,12 @@ struct HostedWitnessConfirmInput {
     serial_hex: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostedWitnessOverrideInput {
+    evidence_sha256: String,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_hosted_control_management(
     stream: DemuxStream,
@@ -352,11 +366,19 @@ pub(crate) async fn handle_hosted_control_management(
             }
         }
         ("POST", "/api/access/hosted-control/witnesses/override") => {
-            match runtime
-                .override_witness_guard(actor)
-                .map_err(|error| error.to_string())
-            {
+            match serde_json::from_str::<HostedWitnessOverrideInput>(&body)
+                .map_err(|error| format!("invalid certificate override: {error}"))
+                .and_then(|input| {
+                    runtime
+                        .override_witness_guard(&input.evidence_sha256, actor)
+                        .map_err(|error| error.to_string())
+                }) {
                 Ok(guard) => json_value(guard),
+                Err(error)
+                    if error == crate::access::hosted_control::WITNESS_EVIDENCE_CHANGED_ERROR =>
+                {
+                    ApiResponse::json_error(409, error)
+                }
                 Err(error) => ApiResponse::json_error(400, error),
             }
         }
@@ -393,6 +415,14 @@ mod tests {
         ] {
             assert!(is_public_hosted_control_path(method, path));
         }
+        assert!(!is_fleet_only_hosted_control_path(
+            "GET",
+            "/api/hosted-control/certificate-ledger"
+        ));
+        assert!(is_fleet_only_hosted_control_path(
+            "POST",
+            "/api/hosted-control/requests"
+        ));
         for (method, path) in [
             ("POST", "/api/hosted-control/bootstrap"),
             ("GET", "/api/hosted-control/requests"),

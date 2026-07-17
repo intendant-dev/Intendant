@@ -3355,6 +3355,51 @@ mod tests {
         config.connect.daemon_id = Some("daemon-test".to_string());
         let gateway = spawn_relay_ingress_test_gateway_with_config(config).await;
 
+        std::fs::write(
+            gateway
+                .access_dir
+                .path()
+                .join("fleet-origin-provenance.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "zone": "fleet.example.test",
+                "name": "daemon.fleet.example.test",
+                "known_names": ["daemon.fleet.example.test"],
+                "provenance_incomplete": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            gateway.access_dir.path().join("fleet-cert-serials.json"),
+            serde_json::to_vec_pretty(&serde_json::json!([{
+                "serial_hex": "00a1b2",
+                "name": "daemon.fleet.example.test",
+                "directory": "https://acme.example.test/directory",
+                "issued_unix_ms": 1_700_000_000_000_u64,
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        let direct_ledger = tls_request(
+            gateway.direct_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/api/hosted-control/certificate-ledger", None),
+        )
+        .await;
+        assert!(
+            direct_ledger.starts_with("HTTP/1.1 200"),
+            "the signed ledger must be fetchable over the authenticated direct peer route: {direct_ledger}"
+        );
+        let direct_ledger: crate::access::hosted_control::HostedCertificateLedger =
+            serde_json::from_value(http_json(&direct_ledger)).unwrap();
+        crate::access::hosted_control::verify_certificate_ledger(&direct_ledger).unwrap();
+        assert_eq!(
+            direct_ledger.fleet_origin,
+            "https://daemon.fleet.example.test"
+        );
+        assert_eq!(direct_ledger.serials, ["a1b2"]);
+
         let direct_bootstrap = tls_request(
             gateway.direct_addr,
             gateway.server_cert.clone(),

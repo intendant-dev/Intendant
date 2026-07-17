@@ -24,6 +24,10 @@ pub const HOSTED_WITNESS_REPORTS_CAP: usize = 256;
 pub const HOSTED_WITNESS_CORROBORATED_SERIALS_CAP: usize = 256;
 pub const HOSTED_WITNESS_CONFIRMED_SERIALS_CAP: usize = 64;
 pub const HOSTED_WITNESS_REPORT_BODY_CAP_BYTES: usize = 16 * 1024;
+pub const HOSTED_WITNESS_RATE_WINDOW_MS: i64 = 60 * 60 * 1000;
+pub const HOSTED_WITNESS_GLOBAL_PER_WINDOW: usize = 128;
+pub const HOSTED_WITNESS_PER_BINDING_PER_WINDOW: usize = 8;
+pub const HOSTED_WITNESS_RATE_BINDINGS_CAP: usize = 512;
 pub const REQUEST_PROOF_MAX_SKEW_MS: i64 = 60 * 1000;
 pub const WS_TICKET_TTL_MS: u64 = 15 * 1000;
 pub const PROOF_NONCES_GLOBAL_CAP: usize = 4096;
@@ -418,6 +422,8 @@ pub struct HostedLaneGuardSnapshot {
     pub unexpected_serials: Vec<String>,
     pub corroborated_serials: Vec<String>,
     pub ct_serials: Vec<String>,
+    #[serde(default)]
+    pub ct_state_unavailable: bool,
     pub owner_confirmed_serials: Vec<String>,
     #[serde(default)]
     pub reports: Vec<HostedWitnessRecord>,

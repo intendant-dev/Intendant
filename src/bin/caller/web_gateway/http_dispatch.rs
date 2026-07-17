@@ -304,11 +304,11 @@ pub(crate) async fn serve_http_request(
     let discovery_only_ingress = gateway_ingress.is_reachability_relay()
         || tls_fleet_origin
         || request_names_known_fleet_origin(header_text);
-    if is_public_hosted_control_path(req_method, req_path) && !discovery_only_ingress {
+    if is_fleet_only_hosted_control_path(req_method, req_path) && !discovery_only_ingress {
         use tokio::io::AsyncWriteExt;
         let response = json_error(
             "404 Not Found",
-            "hosted-control doorbells are served only on the fleet-name lane",
+            "hosted-control browser entry points are served only on the fleet-name lane",
         );
         let _ = stream.write_all(response.as_bytes()).await;
         finalize_http_stream(&mut stream).await;
