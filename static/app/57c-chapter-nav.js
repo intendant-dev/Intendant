@@ -606,6 +606,13 @@ function chapterNavResolvePaneWindow() {
     const win = sessionWindows.get(maximizedSessionWindowId);
     if (chapterNavPaneUsable(win)) return win;
   }
+  // Focus layout promotes one window and hides the rest — that promoted
+  // window is what the reader is looking at, whatever foreground says.
+  const promoted = document.querySelector('.session-window.ui2-focus-window');
+  if (promoted) {
+    const win = sessionWindows.get(promoted.dataset?.sessionId || '');
+    if (chapterNavPaneUsable(win)) return win;
+  }
   const host = chapterNavPaneCluster?.host;
   if (host && host.isConnected && host.matches(':hover')) {
     const win = sessionWindows.get(host.dataset?.sessionId || '');
@@ -696,5 +703,42 @@ window.qa = Object.assign(window.qa || {}, {
       return view ? chapterNavJumpDetail(view, mode, dir) : false;
     },
     clusterHost: () => chapterNavPaneCluster?.host?.dataset?.sessionId || '',
+    // QA drivers: thin delegates onto the real pipeline entries (the SPA
+    // is one module, so page-context probes can only reach window.*).
+    // They mint no new capability — same-origin page JS already owns the
+    // rendered state these touch.
+    qaFeed: (cmds) => { processCommands(Array.isArray(cmds) ? cmds : []); },
+    qaPaneSessions: () => (typeof sessionWindows !== 'undefined' ? [...sessionWindows.keys()] : []),
+    qaInsertRecords: (sid, records) => {
+      const win = typeof sessionWindows !== 'undefined' ? sessionWindows.get(String(sid || '')) : null;
+      if (win && Array.isArray(records)) insertSessionWindowHistoryRecords(win, records, false);
+    },
+    qaScrollTail: (sid) => {
+      const win = typeof sessionWindows !== 'undefined' ? sessionWindows.get(String(sid || '')) : null;
+      if (!win || !win.log) return;
+      renderSessionWindowTail(win);
+      win.log.scrollTop = win.log.scrollHeight;
+    },
+    paneHistogram: (sid) => {
+      const win = typeof sessionWindows !== 'undefined' ? sessionWindows.get(String(sid || '')) : null;
+      if (!win) return null;
+      const hist = { nodes: 0, records: 0, reasoning: 0, sourceUser: 0, levelModel: 0, phase: win.phase || '' };
+      for (const item of ensureSessionWindowHistory(win)) {
+        const node = sessionWindowHistoryNode(item);
+        if (node) {
+          hist.nodes += 1;
+          if ((node.dataset?.kind || '') === 'reasoning') hist.reasoning += 1;
+          if (node.classList?.contains('source-user')) hist.sourceUser += 1;
+          if (node.dataset?.level === 'model') hist.levelModel += 1;
+        } else {
+          const record = sessionWindowHistoryRecord(item) || {};
+          hist.records += 1;
+          if ((record.kind || '') === 'reasoning') hist.reasoning += 1;
+          if (String(record.source || '').toLowerCase() === 'user') hist.sourceUser += 1;
+          if (record.level === 'model') hist.levelModel += 1;
+        }
+      }
+      return hist;
+    },
   },
 });

@@ -2100,6 +2100,14 @@ function buildSessionDetailRows(entries) {
       const reasoning = String(e.reasoning_summary || e.reasoningSummary || '').trim();
       if (!reasoning) continue;
       e = { ...e, level: 'model', kind: 'reasoning', content: reasoning, source: e.source || 'model' };
+    } else if (e && e.event === 'model_response') {
+      // Native model_response events carry no level/source of their own —
+      // normalize into the same "model prose" grammar the live WASM lane
+      // and the session-window replay lane use (level model, source model)
+      // so the detail view labels/colors them as model text instead of ℹ
+      // info rows, and level-derived consumers (verbosity, chapter
+      // navigation) classify them consistently across all three lanes.
+      e = { ...e, level: e.level || 'model', source: e.source || 'model' };
     }
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
