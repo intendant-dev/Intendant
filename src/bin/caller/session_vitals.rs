@@ -311,25 +311,14 @@ impl GitVitalsProber {
             };
 
             if facts.branch != primary_branch {
+                // No `rev-parse --verify` gate on `@{upstream}` first: the
+                // `rev-list --count` fails to `None` identically when the
+                // upstream doesn't resolve, so the verify subprocess added
+                // no information.
                 let primary_upstream = format!("{primary_branch}@{{upstream}}");
-                if self
-                    .git(
-                        toplevel,
-                        &[
-                            "rev-parse",
-                            "--verify",
-                            "--quiet",
-                            "--abbrev-ref",
-                            &primary_upstream,
-                        ],
-                    )
-                    .await
-                    .is_some()
-                {
-                    primary_unpushed = self
-                        .git_count(toplevel, &format!("{primary_upstream}..{primary_branch}"))
-                        .await;
-                }
+                primary_unpushed = self
+                    .git_count(toplevel, &format!("{primary_upstream}..{primary_branch}"))
+                    .await;
             }
         }
 
