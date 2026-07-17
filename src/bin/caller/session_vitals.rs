@@ -108,8 +108,12 @@ const PROBER_CACHE_CAP: usize = 256;
 /// fallback (sync, per request) spawn exactly these arguments and feed
 /// the output to [`parse_status_v2`], so "what counts as dirty" — the
 /// chip's count and the tab's file list — is a single definition.
-pub(crate) const GIT_STATUS_ARGS: [&str; 4] =
-    ["--no-optional-locks", "status", "--porcelain=v2", "--branch"];
+pub(crate) const GIT_STATUS_ARGS: [&str; 4] = [
+    "--no-optional-locks",
+    "status",
+    "--porcelain=v2",
+    "--branch",
+];
 
 /// How one working-tree entry differs from HEAD, collapsed to the
 /// Changes-tab kind vocabulary (created / modified / deleted).

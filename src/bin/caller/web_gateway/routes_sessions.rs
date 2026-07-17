@@ -1472,18 +1472,44 @@ pub(crate) fn load_external_change_records(
 /// --numstat` pass (`--no-renames` so every path keys exactly);
 /// untracked files synthesize created-file stats from their content.
 fn git_fallback_change_records(project_root: &Path) -> Vec<ChangeRecord> {
-    let Some(facts) = crate::session_vitals::git_working_tree_status(project_root) else {
+    // Status paths are toplevel-relative whatever the invocation cwd, so
+    // every filesystem join and `--` pathspec below must use the checkout
+    // toplevel — the same resolution the vitals prober keys its probes by
+    // (a project root that is a subdirectory of a checkout probes, and
+    // now lists, that checkout).
+    let Some(toplevel) = git_checkout_toplevel(project_root) else {
+        return Vec::new();
+    };
+    let Some(facts) = crate::session_vitals::git_working_tree_status(&toplevel) else {
         return Vec::new();
     };
     if facts.entries.is_empty() {
         return Vec::new();
     }
-    let numstat = git_diff_head_numstat(project_root);
+    let numstat = git_diff_head_numstat(&toplevel);
     facts
         .entries
         .iter()
-        .map(|entry| git_status_change_record(project_root, entry, numstat.get(&entry.path)))
+        .map(|entry| git_status_change_record(&toplevel, entry, numstat.get(&entry.path)))
         .collect()
+}
+
+/// The checkout containing `root` (`rev-parse --show-toplevel`), the
+/// probe key the vitals prober uses. `None` when `root` is not inside
+/// any working tree — the fallback then states nothing, exactly like
+/// the chip's failed probe.
+fn git_checkout_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!toplevel.is_empty()).then(|| PathBuf::from(toplevel))
 }
 
 /// Kind vocabulary bridge: the shared status parse speaks
@@ -1499,11 +1525,11 @@ fn git_status_entry_kind_str(kind: crate::session_vitals::GitStatusEntryKind) ->
 /// `git diff HEAD --numstat` per-path (added, removed, binary) — one
 /// subprocess for the whole list. Empty on failure (unborn HEAD, no
 /// git): records then carry zero stats but stay listed.
-fn git_diff_head_numstat(project_root: &Path) -> HashMap<String, (u32, u32, bool)> {
+fn git_diff_head_numstat(toplevel: &Path) -> HashMap<String, (u32, u32, bool)> {
     let mut stats = HashMap::new();
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
-        .arg(project_root)
+        .arg(toplevel)
         .args(["diff", "HEAD", "--no-renames", "--numstat"])
         .output()
     else {
@@ -1534,7 +1560,7 @@ fn git_diff_head_numstat(project_root: &Path) -> HashMap<String, (u32, u32, bool
 /// untracked directories and binaries stay listed with an honest
 /// no-textual-diff reason, keeping the row count equal to the chip's.
 fn git_status_change_record(
-    project_root: &Path,
+    toplevel: &Path,
     entry: &crate::session_vitals::GitStatusEntry,
     numstat: Option<&(u32, u32, bool)>,
 ) -> ChangeRecord {
@@ -1560,7 +1586,7 @@ fn git_status_change_record(
         );
     }
     // Untracked file (absent from diff HEAD): stats from its content.
-    match crate::file_watcher::inspect_file(&project_root.join(&entry.path)) {
+    match crate::file_watcher::inspect_file(&toplevel.join(&entry.path)) {
         Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => ChangeRecord {
             path: entry.path.clone(),
             kind,
@@ -1591,7 +1617,8 @@ fn git_status_change_record(
 /// Tracked entries diff against HEAD (staged + unstaged in one body);
 /// untracked files synthesize a created-file diff from content.
 fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Option<ChangeRecord> {
-    let facts = crate::session_vitals::git_working_tree_status(project_root)?;
+    let toplevel = git_checkout_toplevel(project_root)?;
+    let facts = crate::session_vitals::git_working_tree_status(&toplevel)?;
     let entry = facts.entries.iter().find(|entry| entry.path == decoded)?;
     let kind = git_status_entry_kind_str(entry.kind);
     if entry.path.ends_with('/') {
@@ -1603,7 +1630,7 @@ fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Opti
     }
     let tracked_diff = std::process::Command::new("git")
         .arg("-C")
-        .arg(project_root)
+        .arg(&toplevel)
         .args(["diff", "HEAD", "--no-renames", "--"])
         .arg(&entry.path)
         .output()
@@ -1625,7 +1652,7 @@ fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Opti
     }
     // Untracked (invisible to `diff HEAD`): synthesize the created-file
     // diff the snapshot lane would show.
-    match crate::file_watcher::inspect_file(&project_root.join(&entry.path)) {
+    match crate::file_watcher::inspect_file(&toplevel.join(&entry.path)) {
         Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => {
             let diff = crate::file_watcher::compute_unified_diff("", &snapshot.text, &entry.path);
             let (lines_added, lines_removed) = diff_stats_from_unified_diff(&diff);
@@ -6000,7 +6027,14 @@ mod tests {
         test_git(&base, &["commit", "-qm", "base"]);
         test_git(
             &base,
-            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "session-branch"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "session-branch",
+            ],
         );
         // Dirty the WORKTREE only; the base checkout stays clean, so a
         // wrong-root resolution yields an empty list and fails the test.
@@ -6077,9 +6111,8 @@ mod tests {
 
         // Single-file diffs: the tracked change diffs against HEAD, the
         // untracked file synthesizes a created-file diff.
-        let request = format!(
-            "GET /api/session/current/changes/a.txt?session_id={session_id} HTTP/1.1"
-        );
+        let request =
+            format!("GET /api/session/current/changes/a.txt?session_id={session_id} HTTP/1.1");
         let (status, body) = handle_changes_request_for_home(
             &request,
             Some(live_snapshot.path()),
@@ -6093,9 +6126,8 @@ mod tests {
         assert_eq!(json["lines_added"], 1);
         assert_eq!(json["lines_removed"], 1);
 
-        let request = format!(
-            "GET /api/session/current/changes/new.txt?session_id={session_id} HTTP/1.1"
-        );
+        let request =
+            format!("GET /api/session/current/changes/new.txt?session_id={session_id} HTTP/1.1");
         let (status, body) = handle_changes_request_for_home(
             &request,
             Some(live_snapshot.path()),
@@ -6109,9 +6141,8 @@ mod tests {
 
         // A path git does not list stays a 404 — the status entry set is
         // the only key into the filesystem.
-        let request = format!(
-            "GET /api/session/current/changes/absent.txt?session_id={session_id} HTTP/1.1"
-        );
+        let request =
+            format!("GET /api/session/current/changes/absent.txt?session_id={session_id} HTTP/1.1");
         let (status, _) = handle_changes_request_for_home(
             &request,
             Some(live_snapshot.path()),
