@@ -1842,6 +1842,45 @@ impl FileWatcher {
         self.racy_window_nanos = nanos;
     }
 
+    /// Test support: materialize "the next boot resumes this store" as a
+    /// fresh directory carrying the previous boot's bytes.
+    ///
+    /// Cross-boot resume tests must NOT drop a watcher and reopen the
+    /// same store path in-process: the advisory store lock is a `flock`
+    /// owned by the open file description, and under a parallel
+    /// `cargo test` run any concurrently forked subprocess (the
+    /// git-driving tests) briefly inherits that description between
+    /// `fork` and `exec` — pinning the lock past the drop, so the
+    /// resumed instance loses `try_lock` and silently degrades to
+    /// read-only (`live_index_disabled`, `changes_index_snapshot` =
+    /// `None`; observed ejecting the merge queue on the busier CI Mac,
+    /// where the fork→exec window is routinely wide enough to lose the
+    /// race). Production never reacquires in-process — one watcher per
+    /// daemon run — so the deterministic model of "same store, next
+    /// boot" is the same bytes at a fresh path, sharing no lock
+    /// identity with the previous instance. Plant between-boot
+    /// leftovers AFTER cloning; the clone copies regular files and
+    /// directories only (all a store the previous boot wrote can hold).
+    #[cfg(test)]
+    pub(crate) fn clone_store_for_resume(store: &Path) -> tempfile::TempDir {
+        fn copy_dir(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).expect("create resumed-store dir");
+            for entry in std::fs::read_dir(src).expect("read store dir").flatten() {
+                let from = entry.path();
+                let to = dst.join(entry.file_name());
+                let ft = entry.file_type().expect("store entry type");
+                if ft.is_dir() {
+                    copy_dir(&from, &to);
+                } else if ft.is_file() {
+                    std::fs::copy(&from, &to).expect("copy store file");
+                }
+            }
+        }
+        let resumed = tempfile::TempDir::new().expect("resumed store dir");
+        copy_dir(store, resumed.path());
+        resumed
+    }
+
     /// Wrap `self` in an async-mutex-backed shared handle and spawn the
     /// filesystem watcher loop + round-complete listener. Returns the handle
     /// plus the two join handles so callers can keep them alive.
