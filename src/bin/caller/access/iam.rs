@@ -18,7 +18,7 @@ use super::{AccessError, AccessResult};
 
 pub const IAM_STATE_FILE: &str = "iam.json";
 pub const BROWSER_MTLS_INITIALIZED_FILE: &str = "browser-mtls-root.initialized";
-pub const IAM_SCHEMA_VERSION: u32 = 2;
+pub const IAM_SCHEMA_VERSION: u32 = 3;
 const DEFAULT_HOSTED_ORIGIN: &str = "https://connect.intendant.dev";
 /// Newest audit events retained inside `iam.json` (see `normalize`); the
 /// same order of magnitude as the credential custody trail's in-memory cap.
@@ -67,6 +67,10 @@ pub struct LocalIamState {
     /// nothing by itself; ceilings and grants do the enforcing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// Optional fleet-name lease lane. These records are written only by
+    /// daemon-local hosted-control transactions; Connect never writes IAM.
+    #[serde(default)]
+    pub hosted_control: super::hosted_control::HostedControlState,
 }
 
 /// The daemon tier vocabulary, in UI presentation order. Single source for
@@ -728,6 +732,7 @@ impl Default for LocalIamState {
             hosted_origins: default_hosted_origins(),
             trusted_orgs: Vec::new(),
             tier: None,
+            hosted_control: super::hosted_control::HostedControlState::default(),
         }
     }
 }
@@ -803,6 +808,12 @@ impl LocalIamState {
                     ),
                 });
             }
+        }
+        // Schema 3 adds only serde-defaulted hosted-control state. Persist the
+        // normalized version even when the input was already schema 2; keeping
+        // the assignment inside the legacy `< 2` migration would make every
+        // schema-2 load perpetually migration-required.
+        if self.schema_version < IAM_SCHEMA_VERSION {
             self.schema_version = IAM_SCHEMA_VERSION;
         }
         // Default-product invariant: hosted-origin code is a discovery and
@@ -845,6 +856,7 @@ impl LocalIamState {
         self.grants
             .retain(|g| !g.id.trim().is_empty() && !g.principal_id.trim().is_empty());
         self.audit_events.retain(|e| !e.id.trim().is_empty());
+        self.hosted_control.normalize();
         // Bound the audit trail to a recent tail, mirroring the credential
         // custody trail's in-memory cap (`credential_audit::MEM_CAP`).
         // Events are appended chronologically, so the head is the oldest.
@@ -1678,6 +1690,14 @@ pub fn set_daemon_tier(
     if state.tier == normalized {
         return Ok(normalized);
     }
+    if normalized.as_deref() == Some("integrated")
+        && state.hosted_control.policy.ceiling == super::hosted_control::HostedPreset::Operate
+    {
+        return Err(AccessError(
+            "lower the hosted-control ceiling before setting the daemon tier to integrated; Operate can then be re-enabled with the integrated hardening acknowledgement"
+                .to_string(),
+        ));
+    }
     let now = now_unix_ms();
     state.audit_events.push(IamAuditEvent {
         id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
@@ -1700,6 +1720,12 @@ pub fn set_daemon_tier(
 pub const HOSTED_CEILING_BINDINGS: [&str; 2] = ["connect_account", "client_key"];
 
 fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResult<()> {
+    if super::hosted_control::HOSTED_ROLE_IDS.contains(&role_id) {
+        return Err(AccessError(
+            "hosted lease roles are reserved for the dedicated daemon-local lease writer"
+                .to_string(),
+        ));
+    }
     let Some(role) = state.roles.iter().find(|role| role.id == role_id) else {
         return Err(AccessError(format!("unknown IAM role {role_id}")));
     };
@@ -2533,6 +2559,13 @@ fn evaluate_principal_operation_with_state_and_fleet_zone(
     op: crate::access::access_policy::PeerOperation,
     fleet_zone: Option<&str>,
 ) -> AccessDecision {
+    // Hosted leases are the one narrow fleet-origin authority class. Their
+    // exact IAM/lease records and compiled preset are evaluated before the
+    // general hosted-provenance refusal below; no other hosted principal can
+    // reach this carve-out.
+    if super::hosted_control::is_hosted_lease_principal(principal) {
+        return super::hosted_control::evaluate_hosted_operation(state, principal, op);
+    }
     // Connect account assertions are service-owned route/display metadata,
     // never a daemon authentication binding. Keep this invariant in the
     // central evaluator as well as the Connect offer resolver so a future
@@ -4063,6 +4096,34 @@ mod tests {
                 .unwrap()
                 .status,
             "revoked"
+        );
+    }
+
+    #[test]
+    fn schema_v2_adds_default_hosted_control_state_and_persists_v3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut encoded = serde_json::to_value(LocalIamState::default()).unwrap();
+        encoded["schema_version"] = serde_json::json!(2);
+        encoded.as_object_mut().unwrap().remove("hosted_control");
+        std::fs::write(
+            iam_state_path(tmp.path()),
+            serde_json::to_vec_pretty(&encoded).unwrap(),
+        )
+        .unwrap();
+
+        let migrated = load_state(tmp.path()).unwrap();
+        assert_eq!(migrated.schema_version, IAM_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.hosted_control,
+            super::super::hosted_control::HostedControlState::default()
+        );
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(iam_state_path(tmp.path())).unwrap()).unwrap();
+        assert_eq!(persisted["schema_version"], IAM_SCHEMA_VERSION);
+        assert!(
+            persisted.get("hosted_control").is_some(),
+            "schema-3 persistence must materialize the hosted-control store"
         );
     }
 
@@ -5753,6 +5814,27 @@ mod tests {
     }
 
     #[test]
+    fn integrated_tier_transition_requires_operate_to_be_reenabled() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        state.hosted_control.policy.ceiling = crate::access::hosted_control::HostedPreset::Operate;
+        let before = state.clone();
+        let error = set_daemon_tier(&mut state, Some("integrated"), &actor).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lower the hosted-control ceiling"));
+        assert_eq!(state, before);
+
+        state.hosted_control.policy.ceiling = crate::access::hosted_control::HostedPreset::Tasks;
+        assert_eq!(
+            set_daemon_tier(&mut state, Some("integrated"), &actor)
+                .unwrap()
+                .as_deref(),
+            Some("integrated")
+        );
+    }
+
+    #[test]
     fn hosted_control_is_immutable_none_and_direct_sessions_are_untouched() {
         let mut state = LocalIamState::default();
         let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
@@ -5842,6 +5924,93 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("ceiling-only"));
+    }
+
+    #[test]
+    fn generic_iam_mutations_cannot_assign_or_reactivate_hosted_roles() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let before = state.clone();
+        let error = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:BB".to_string()),
+                role_id: Some(super::super::hosted_control::HOSTED_ROLE_OPERATE.to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert_eq!(
+            state, before,
+            "root must not bypass the reserved-role writer"
+        );
+
+        let ordinary = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:CC".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let before = state.clone();
+        let error = update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: ordinary.grant.id,
+                role_id: Some(super::super::hosted_control::HOSTED_ROLE_TASKS.to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert_eq!(state, before);
+
+        state.grants.push(IamGrant {
+            id: "grant:hosted-test".to_string(),
+            principal_id: "principal:hosted-test".to_string(),
+            target_id: "daemon:self".to_string(),
+            role_id: super::super::hosted_control::HOSTED_ROLE_VIEW.to_string(),
+            policy_id: "policy:hosted-control-compiled".to_string(),
+            status: "revoked".to_string(),
+            source: super::super::hosted_control::HOSTED_SOURCE.to_string(),
+            reason: "test fixture".to_string(),
+            created_at_unix_ms: Some(now_unix_ms()),
+            revoked_at_unix_ms: Some(now_unix_ms()),
+            expires_at_unix_ms: Some(now_unix_ms() + 60_000),
+            issued_via: None,
+            fs_scope: None,
+        });
+        state.principals.push(IamPrincipal {
+            id: "principal:hosted-test".to_string(),
+            kind: super::super::hosted_control::HOSTED_PRINCIPAL_KIND.to_string(),
+            label: "Hosted test".to_string(),
+            status: "revoked".to_string(),
+            source: super::super::hosted_control::HOSTED_SOURCE.to_string(),
+            account: None,
+            organization: None,
+            authn: Vec::new(),
+            notes: None,
+            created_at_unix_ms: Some(now_unix_ms()),
+        });
+        let error = update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: "grant:hosted-test".to_string(),
+                status: Some("active".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only local IAM"));
     }
 
     #[test]

@@ -43,29 +43,34 @@ use crate::event::{AppEvent, EventBus};
 use crate::frontend::ModelUsageSnapshot;
 use crate::types::{SessionCacheVitals, SessionConfigVitals, SessionGitVitals, SessionVitals};
 
-/// Probe cadence. Each tick is a handful of subprocess ref reads per
-/// target; emission only happens when the probed state changes.
+/// Probe cadence. Each tick is a couple of subprocess ref reads per
+/// distinct checkout; emission only happens when the probed state changes.
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new("git")
+/// Hard ceiling on any single git subprocess. Probes are local ref reads
+/// that normally finish in milliseconds; a hung git (checkout on a dead
+/// network filesystem, a wedged lock) must fail its probe — feeding the
+/// existing `demote_locus` fallback — instead of freezing the sequential
+/// producer loop, and with it every session's git chip, forever.
+const GIT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run one git subprocess under the anti-wedge guards: `kill_on_drop` so
+/// a timed-out child is reaped instead of orphaned, and `timeout` so no
+/// single invocation can stall the producer loop. `None` on spawn failure
+/// or timeout — callers treat both like the command failing.
+async fn run_git(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+    cwd: &Path,
+    args: &[&str],
+) -> Option<std::process::Output> {
+    let output = tokio::process::Command::new(program)
         .arg("-C")
         .arg(cwd)
         .args(args)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-async fn git_count(cwd: &Path, range: &str) -> Option<u32> {
-    git(cwd, &["rev-list", "--count", range])
-        .await?
-        .parse()
-        .ok()
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(timeout, output).await.ok()?.ok()
 }
 
 /// Modern `git merge-tree --write-tree` needs git ≥ 2.38; probed once per
@@ -93,121 +98,244 @@ fn git_version_at_least(version_line: &str, want_major: u32, want_minor: u32) ->
     major > want_major || (major == want_major && minor >= want_minor)
 }
 
-/// Git prober with a per-(HEAD, primary) merge-parity cache — the
-/// expensive in-memory merge only reruns when either side moves.
-#[derive(Default)]
+/// Loose bound on the prober's per-path/per-checkout caches: entries are
+/// tiny, the live target set is small, and a full clear simply re-resolves
+/// on the next tick — cheap insurance against daemon-lifetime growth.
+const PROBER_CACHE_CAP: usize = 256;
+
+/// Facts one `git status --porcelain=v2 --branch` run yields — the
+/// collapsed replacement for the old separate branch / dirty-count /
+/// upstream-verify / unpushed-count subprocess chain.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StatusFacts {
+    /// `branch.head`, mapped to the spellings the old
+    /// `rev-parse --abbrev-ref HEAD` emitted: `HEAD` when detached, empty
+    /// on an unborn branch (where the old probe failed).
+    branch: String,
+    /// `branch.oid`: HEAD's sha — the merge-parity cache key's HEAD side.
+    /// `None` on an unborn branch (`(initial)`).
+    head_oid: Option<String>,
+    /// `branch.ab` as (ahead, behind) vs the upstream. Git prints the line
+    /// only when the upstream ref actually resolves — exactly the old
+    /// `@{upstream}` verify condition — and the ahead column IS the
+    /// unpushed count, so `None` here means "no upstream to check".
+    upstream_ab: Option<(u32, u32)>,
+    /// Non-header entry lines: changed + unmerged + untracked. One line
+    /// per path, matching porcelain v1's line count (renames included —
+    /// both formats spend one line per rename).
+    dirty_files: u32,
+}
+
+fn parse_status_v2(output: &str) -> StatusFacts {
+    let mut facts = StatusFacts::default();
+    let mut unborn = false;
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix("# ") {
+            if let Some(head) = header.strip_prefix("branch.head ") {
+                facts.branch = match head.trim() {
+                    "(detached)" => "HEAD".to_string(),
+                    name => name.to_string(),
+                };
+            } else if let Some(oid) = header.strip_prefix("branch.oid ") {
+                match oid.trim() {
+                    "(initial)" => unborn = true,
+                    oid => facts.head_oid = Some(oid.to_string()),
+                }
+            } else if let Some(ab) = header.strip_prefix("branch.ab ") {
+                facts.upstream_ab = parse_status_ab(ab);
+            }
+        } else if !line.trim().is_empty() {
+            facts.dirty_files += 1;
+        }
+    }
+    if unborn {
+        // Parity with the old chain: `rev-parse --abbrev-ref HEAD` fails
+        // on an unborn branch, so the emitted branch was empty.
+        facts.branch = String::new();
+    }
+    facts
+}
+
+/// `branch.ab` payload: `+<ahead> -<behind>`.
+fn parse_status_ab(ab: &str) -> Option<(u32, u32)> {
+    let mut cols = ab.split_whitespace();
+    let ahead = cols.next()?.strip_prefix('+')?.parse().ok()?;
+    let behind = cols.next()?.strip_prefix('-')?.parse().ok()?;
+    Some((ahead, behind))
+}
+
+/// Git prober. One collapsed status + rev-list chain per checkout per
+/// tick, plus three caches that keep the steady state at two subprocesses
+/// where the old chain ran a dozen:
+///
+/// - per-(HEAD, primary) merge-parity verdicts — the expensive in-memory
+///   merge only reruns when either side moves;
+/// - registered path → checkout toplevel — resolved once per distinct
+///   path, and the per-tick dedup key, so same-checkout targets share one
+///   probe;
+/// - checkout → primary branch discovery — rediscovered only when the
+///   cached primary ref stops resolving.
 pub(crate) struct GitVitalsProber {
     merge_cache: HashMap<(String, String), String>,
+    /// Registered path → its checkout's toplevel (`--show-toplevel`).
+    /// Dropped when the checkout stops probing so a deleted or replaced
+    /// checkout re-resolves instead of pinning stale state.
+    toplevel_cache: HashMap<PathBuf, PathBuf>,
+    /// Checkout toplevel → (primary branch, resolved comparison ref).
+    /// Invalidated by a failed ahead/behind rev-list (see
+    /// [`Self::probe_checkout`]); never caches a negative — a repo with no
+    /// discoverable primary re-runs discovery each tick, as the old
+    /// per-tick chain did.
+    primary_cache: HashMap<PathBuf, (String, String)>,
+    /// Program spawned for every probe — `git` in production; tests inject
+    /// a stub to prove the timeout guard without a hung real git.
+    git_program: std::ffi::OsString,
+    /// Per-subprocess ceiling ([`GIT_PROBE_TIMEOUT`]); tests shrink it.
+    probe_timeout: std::time::Duration,
+    /// Checkout probes actually run — the tick-dedup observability seam
+    /// (same-checkout targets must share one probe per tick).
+    checkout_probes: u64,
+}
+
+impl Default for GitVitalsProber {
+    fn default() -> Self {
+        Self {
+            merge_cache: HashMap::new(),
+            toplevel_cache: HashMap::new(),
+            primary_cache: HashMap::new(),
+            git_program: "git".into(),
+            probe_timeout: GIT_PROBE_TIMEOUT,
+            checkout_probes: 0,
+        }
+    }
 }
 
 impl GitVitalsProber {
-    pub(crate) async fn probe(&mut self, cwd: &Path) -> Option<SessionGitVitals> {
-        git(cwd, &["rev-parse", "--git-dir"]).await?;
-        let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .await
-            .unwrap_or_default();
-        let dirty_files = git(cwd, &["--no-optional-locks", "status", "--porcelain"])
-            .await
-            .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count() as u32)
-            .unwrap_or(0);
-
-        // Primary branch: origin's default when known, else local main/master.
-        let mut primary_branch = git(
-            cwd,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .await
-        .map(|s| s.trim_start_matches("origin/").to_string());
-        if primary_branch.is_none() {
-            for candidate in ["main", "master"] {
-                let refname = format!("refs/heads/{candidate}");
-                if git(cwd, &["show-ref", "--verify", "--quiet", &refname])
-                    .await
-                    .is_some()
-                {
-                    primary_branch = Some(candidate.to_string());
-                    break;
-                }
-            }
+    async fn git(&self, cwd: &Path, args: &[&str]) -> Option<String> {
+        let output = run_git(&self.git_program, self.probe_timeout, cwd, args).await?;
+        if !output.status.success() {
+            return None;
         }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn git_count(&self, cwd: &Path, range: &str) -> Option<u32> {
+        self.git(cwd, &["rev-list", "--count", range])
+            .await?
+            .parse()
+            .ok()
+    }
+
+    /// Canonical probe key for `cwd`: its checkout's toplevel, resolved
+    /// once per distinct registered path and cached. Distinct paths inside
+    /// one checkout (the root and a subdirectory) share a toplevel — and
+    /// therefore one probe per tick — while linked worktrees have their
+    /// own toplevels and correctly keep their own probes. `None` when
+    /// `cwd` is not inside a working tree.
+    async fn toplevel_for(&mut self, cwd: &Path) -> Option<PathBuf> {
+        if let Some(toplevel) = self.toplevel_cache.get(cwd) {
+            return Some(toplevel.clone());
+        }
+        let toplevel = PathBuf::from(self.git(cwd, &["rev-parse", "--show-toplevel"]).await?);
+        if self.toplevel_cache.len() > PROBER_CACHE_CAP {
+            self.toplevel_cache.clear();
+        }
+        self.toplevel_cache
+            .insert(cwd.to_path_buf(), toplevel.clone());
+        Some(toplevel)
+    }
+
+    pub(crate) async fn probe(&mut self, cwd: &Path) -> Option<SessionGitVitals> {
+        let toplevel = self.toplevel_for(cwd).await?;
+        let probed = self.probe_checkout(&toplevel).await;
+        if probed.is_none() {
+            // The checkout stopped probing (worktree deleted, repo gone,
+            // git wedged): drop the cached resolutions so the next attempt
+            // rediscovers from scratch instead of pinning stale state.
+            self.toplevel_cache.remove(cwd);
+            self.primary_cache.remove(&toplevel);
+        }
+        probed
+    }
+
+    async fn probe_checkout(&mut self, toplevel: &Path) -> Option<SessionGitVitals> {
+        self.checkout_probes += 1;
+        let status = self
+            .git(
+                toplevel,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v2",
+                    "--branch",
+                ],
+            )
+            .await?;
+        let facts = parse_status_v2(&status);
+        let unpushed = facts.upstream_ab.map(|(ahead, _)| ahead);
 
         let mut ahead = 0;
         let mut behind = 0;
         let mut primary_ref = String::new();
         let mut merge_parity = String::new();
         let mut primary_unpushed = None;
-        if let Some(primary_branch) = primary_branch.as_deref() {
-            // Prefer origin/<primary> — a stale local primary would misread
-            // fresh worktrees cut from the remote tip.
-            let remote_primary = format!("origin/{primary_branch}");
-            primary_ref = if git(cwd, &["rev-parse", "--verify", "--quiet", &remote_primary])
-                .await
-                .is_some()
-            {
-                remote_primary
-            } else {
-                primary_branch.to_string()
-            };
-            ahead = git_count(cwd, &format!("{primary_ref}..HEAD"))
-                .await
-                .unwrap_or(0);
-            behind = git_count(cwd, &format!("HEAD..{primary_ref}"))
-                .await
-                .unwrap_or(0);
+        if let Some((primary_branch, resolved_ref)) = self.primary_for(toplevel).await {
+            primary_ref = resolved_ref;
+            match self.ahead_behind(toplevel, &primary_ref).await {
+                Some((a, b)) => {
+                    ahead = a;
+                    behind = b;
+                }
+                // The cached primary stopped resolving (remote-tracking
+                // ref pruned, branch deleted): degrade to 0/0 for this
+                // tick — the old chain's per-call `unwrap_or(0)` — and
+                // drop the cache entry so the next tick rediscovers.
+                None => {
+                    self.primary_cache.remove(toplevel);
+                }
+            }
 
             merge_parity = if (ahead > 0) != (behind > 0) {
                 // Fast-forward in one direction: trivially clean.
                 "clean".to_string()
             } else if ahead > 0 && behind > 0 && merge_tree_supported() {
-                self.merge_parity(cwd, &primary_ref)
-                    .await
-                    .unwrap_or_default()
+                match facts.head_oid.as_deref() {
+                    Some(head_oid) => self
+                        .merge_parity(toplevel, &primary_ref, head_oid)
+                        .await
+                        .unwrap_or_default(),
+                    None => String::new(),
+                }
             } else {
                 String::new()
             };
 
-            if branch != primary_branch {
+            if facts.branch != primary_branch {
                 let primary_upstream = format!("{primary_branch}@{{upstream}}");
-                if git(
-                    cwd,
-                    &[
-                        "rev-parse",
-                        "--verify",
-                        "--quiet",
-                        "--abbrev-ref",
-                        &primary_upstream,
-                    ],
-                )
-                .await
-                .is_some()
+                if self
+                    .git(
+                        toplevel,
+                        &[
+                            "rev-parse",
+                            "--verify",
+                            "--quiet",
+                            "--abbrev-ref",
+                            &primary_upstream,
+                        ],
+                    )
+                    .await
+                    .is_some()
                 {
-                    primary_unpushed =
-                        git_count(cwd, &format!("{primary_upstream}..{primary_branch}")).await;
+                    primary_unpushed = self
+                        .git_count(toplevel, &format!("{primary_upstream}..{primary_branch}"))
+                        .await;
                 }
             }
         }
 
-        let unpushed = if git(
-            cwd,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "--abbrev-ref",
-                "@{upstream}",
-            ],
-        )
-        .await
-        .is_some()
-        {
-            git_count(cwd, "@{upstream}..HEAD").await
-        } else {
-            None
-        };
-
         Some(SessionGitVitals {
-            branch,
-            dirty_files,
+            branch: facts.branch,
+            dirty_files: facts.dirty_files,
             ahead,
             behind,
             primary_ref,
@@ -217,28 +345,113 @@ impl GitVitalsProber {
         })
     }
 
+    /// Primary-branch discovery, cached per checkout: origin's default
+    /// (`symbolic-ref refs/remotes/origin/HEAD`) when known, else local
+    /// main/master. The comparison ref prefers `origin/<primary>` — a
+    /// stale local primary would misread fresh worktrees cut from the
+    /// remote tip. Returns `(primary branch, comparison ref)`.
+    async fn primary_for(&mut self, toplevel: &Path) -> Option<(String, String)> {
+        if let Some(cached) = self.primary_cache.get(toplevel) {
+            return Some(cached.clone());
+        }
+        let mut primary_branch = self
+            .git(
+                toplevel,
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            )
+            .await
+            .map(|s| s.trim_start_matches("origin/").to_string());
+        if primary_branch.is_none() {
+            for candidate in ["main", "master"] {
+                let refname = format!("refs/heads/{candidate}");
+                if self
+                    .git(toplevel, &["show-ref", "--verify", "--quiet", &refname])
+                    .await
+                    .is_some()
+                {
+                    primary_branch = Some(candidate.to_string());
+                    break;
+                }
+            }
+        }
+        let primary_branch = primary_branch?;
+        let remote_primary = format!("origin/{primary_branch}");
+        let primary_ref = if self
+            .git(
+                toplevel,
+                &["rev-parse", "--verify", "--quiet", &remote_primary],
+            )
+            .await
+            .is_some()
+        {
+            remote_primary
+        } else {
+            primary_branch.clone()
+        };
+        if self.primary_cache.len() > PROBER_CACHE_CAP {
+            self.primary_cache.clear();
+        }
+        self.primary_cache.insert(
+            toplevel.to_path_buf(),
+            (primary_branch.clone(), primary_ref.clone()),
+        );
+        Some((primary_branch, primary_ref))
+    }
+
+    /// Divergence vs the primary in ONE subprocess: symmetric three-dot
+    /// `rev-list --left-right --count` prints `<left>\t<right>`, where the
+    /// LEFT column counts commits reachable only from `primary_ref`
+    /// (= behind) and the RIGHT column commits reachable only from HEAD
+    /// (= ahead). Returns `(ahead, behind)`.
+    async fn ahead_behind(&self, toplevel: &Path, primary_ref: &str) -> Option<(u32, u32)> {
+        let counts = self
+            .git(
+                toplevel,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{primary_ref}...HEAD"),
+                ],
+            )
+            .await?;
+        let mut cols = counts.split_whitespace();
+        let behind = cols.next()?.parse().ok()?;
+        let ahead = cols.next()?.parse().ok()?;
+        Some((ahead, behind))
+    }
+
     /// Would merging HEAD and the primary conflict? In-memory 3-way merge,
-    /// cached by the SHA pair so it only reruns when something moves.
-    async fn merge_parity(&mut self, cwd: &Path, primary_ref: &str) -> Option<String> {
-        let head = git(cwd, &["rev-parse", "HEAD"]).await?;
-        let primary = git(cwd, &["rev-parse", primary_ref]).await?;
-        let key = (head, primary);
+    /// cached by the SHA pair so it only reruns when something moves. The
+    /// HEAD side of the key arrives from the status probe (`branch.oid`) —
+    /// no extra `rev-parse HEAD`.
+    async fn merge_parity(
+        &mut self,
+        cwd: &Path,
+        primary_ref: &str,
+        head_oid: &str,
+    ) -> Option<String> {
+        let primary = self.git(cwd, &["rev-parse", primary_ref]).await?;
+        let key = (head_oid.to_string(), primary);
         if let Some(cached) = self.merge_cache.get(&key) {
             return Some(cached.clone());
         }
-        let clean = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(["merge-tree", "--write-tree", "HEAD", primary_ref])
-            .output()
-            .await
-            .ok()?
-            .status
-            .success();
+        // The exit status IS the verdict (0 clean, non-zero conflict), so
+        // this reads the raw output: only spawn failure or timeout is a
+        // `None` (no parity statement).
+        let clean = run_git(
+            &self.git_program,
+            self.probe_timeout,
+            cwd,
+            &["merge-tree", "--write-tree", "HEAD", primary_ref],
+        )
+        .await?
+        .status
+        .success();
         let state = if clean { "clean" } else { "conflict" }.to_string();
         // The cache only grows while refs churn; entries are tiny and the
         // pair space a session actually visits is small.
-        if self.merge_cache.len() > 256 {
+        if self.merge_cache.len() > PROBER_CACHE_CAP {
             self.merge_cache.clear();
         }
         self.merge_cache.insert(key, state.clone());
@@ -806,11 +1019,15 @@ pub(crate) fn register_restored_session_targets(home: &Path, registry: &GitVital
         .count()
 }
 
-/// Probe `cwd` through the per-tick cache: sessions sharing a checkout
-/// (the common shape once restored sessions register at boot — many
-/// idle sessions per project root) pay for one probe per tick instead
-/// of one per session. Git state is a pure function of the cwd within
-/// a tick, so the shared result is exact.
+/// Probe `cwd` through the per-tick cache, keyed by checkout TOPLEVEL:
+/// sessions sharing a checkout (the common shape once restored sessions
+/// register at boot — many idle sessions per project root, or the root
+/// and a subdirectory of one checkout) pay for one probe per tick
+/// instead of one per session. Git state is a pure function of the
+/// checkout within a tick, so the shared result is exact; linked
+/// worktrees have distinct toplevels and correctly keep their own
+/// probes. Paths outside any checkout cache their miss under the raw
+/// path.
 async fn probe_cached(
     prober: &mut GitVitalsProber,
     tick_cache: &mut HashMap<PathBuf, Option<SessionGitVitals>>,
@@ -819,8 +1036,17 @@ async fn probe_cached(
     if let Some(cached) = tick_cache.get(cwd) {
         return cached.clone();
     }
+    let Some(key) = prober.toplevel_for(cwd).await else {
+        tick_cache.insert(cwd.to_path_buf(), None);
+        return None;
+    };
+    if let Some(cached) = tick_cache.get(&key) {
+        return cached.clone();
+    }
+    // Re-resolves the toplevel through the prober's cache (no
+    // subprocess) — keeps the drop-caches-on-failure path in one place.
     let probed = prober.probe(cwd).await;
-    tick_cache.insert(cwd.to_path_buf(), probed.clone());
+    tick_cache.insert(key, probed.clone());
     probed
 }
 
@@ -952,6 +1178,277 @@ mod tests {
         assert!(!git_version_at_least("git version 2.37.9", 2, 38));
         assert!(git_version_at_least("git version 3.0.0", 2, 38));
         assert!(!git_version_at_least("garbage", 2, 38));
+    }
+
+    #[test]
+    fn status_v2_parser_maps_branch_facts() {
+        // The everyday shape: branch + resolving upstream + entries. Entry
+        // lines count one per path — ordinary change, rename (one line in
+        // v2, exactly as in v1), unmerged, untracked.
+        let facts = parse_status_v2(concat!(
+            "# branch.oid 2066c7d7db74e9e097ad8526b47c53a0fa0c39a9\n",
+            "# branch.head main\n",
+            "# branch.upstream origin/main\n",
+            "# branch.ab +3 -1\n",
+            "1 .M N... 100644 100644 100644 aaaa bbbb src/lib.rs\n",
+            "2 R. N... 100644 100644 100644 cccc cccc R100 new.rs\told.rs\n",
+            "u UU N... 100644 100644 100644 100644 dddd eeee ffff conflict.rs\n",
+            "? scratch.txt\n",
+        ));
+        assert_eq!(facts.branch, "main");
+        assert_eq!(
+            facts.head_oid.as_deref(),
+            Some("2066c7d7db74e9e097ad8526b47c53a0fa0c39a9")
+        );
+        assert_eq!(facts.upstream_ab, Some((3, 1)));
+        assert_eq!(facts.dirty_files, 4);
+
+        // Upstream configured but its ref gone: git prints branch.upstream
+        // without branch.ab — exactly the old failed `@{upstream}` verify,
+        // so there is no unpushed statement.
+        let facts = parse_status_v2(
+            "# branch.oid 2066c7d7\n# branch.head main\n# branch.upstream origin/main\n",
+        );
+        assert_eq!(facts.upstream_ab, None);
+        assert_eq!(facts.dirty_files, 0);
+
+        // Detached HEAD keeps the old `rev-parse --abbrev-ref` spelling.
+        let facts = parse_status_v2("# branch.oid 2066c7d7\n# branch.head (detached)\n");
+        assert_eq!(facts.branch, "HEAD");
+        assert_eq!(facts.upstream_ab, None);
+
+        // Unborn branch: the old probe's rev-parse failed, so the emitted
+        // branch stays empty; there is no HEAD oid to key parity with.
+        let facts = parse_status_v2("# branch.oid (initial)\n# branch.head main\n? f.txt\n");
+        assert_eq!(facts.branch, "");
+        assert_eq!(facts.head_oid, None);
+        assert_eq!(facts.dirty_files, 1);
+    }
+
+    /// Build a repo with a local bare `origin` whose `main` is pushed and
+    /// tracked (upstream configured) — the shape the upstream/primary
+    /// probes need, without any network. Returns the working checkout.
+    fn repo_with_origin(root: &Path) -> PathBuf {
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        git_cmd(root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git_cmd(&work, &["init", "-q", "-b", "main"]);
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-qm", "base"]);
+        git_cmd(
+            &work,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git_cmd(&work, &["push", "-q", "-u", "origin", "main"]);
+        work
+    }
+
+    #[tokio::test]
+    async fn probe_reports_upstream_unpushed_and_remote_primary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = repo_with_origin(dir.path());
+
+        // In sync with the upstream: unpushed is a visible zero ("checked
+        // and synced") and the primary comparison rides the remote ref.
+        let mut prober = GitVitalsProber::default();
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.branch, "main");
+        assert_eq!(vitals.primary_ref, "origin/main");
+        assert_eq!(vitals.unpushed, Some(0));
+        assert_eq!((vitals.ahead, vitals.behind), (0, 0));
+        assert_eq!(vitals.merge_parity, "");
+        assert_eq!(vitals.primary_unpushed, None, "on the primary itself");
+
+        // A local commit: ahead of the upstream (unpushed) and of the
+        // remote primary (ahead) by the same one commit.
+        std::fs::write(work.join("b.txt"), "two\n").unwrap();
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-qm", "local work"]);
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.unpushed, Some(1));
+        assert_eq!((vitals.ahead, vitals.behind), (1, 0));
+        assert_eq!(vitals.merge_parity, "clean");
+
+        // A branch without an upstream: unpushed hides entirely, while the
+        // primary's own unpushed count appears (main is 1 ahead of its
+        // upstream and the session is no longer on main).
+        git_cmd(&work, &["checkout", "-qb", "feature"]);
+        std::fs::write(work.join("c.txt"), "three\n").unwrap();
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-qm", "feature work"]);
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.branch, "feature");
+        assert_eq!(vitals.unpushed, None, "no upstream, nothing to check");
+        assert_eq!(vitals.primary_unpushed, Some(1));
+        assert_eq!((vitals.ahead, vitals.behind), (2, 0));
+
+        // Detached HEAD keeps the old rev-parse spelling.
+        git_cmd(&work, &["checkout", "-q", "--detach"]);
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.branch, "HEAD");
+        assert_eq!(vitals.unpushed, None);
+    }
+
+    #[tokio::test]
+    async fn left_right_divergence_mapping_pinned() {
+        // Ahead 2 / behind 3 of the primary — asymmetric on purpose so a
+        // swapped left/right mapping in the combined rev-list cannot pass.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "base"]);
+        git_cmd(root, &["checkout", "-qb", "feature"]);
+        for i in 0..2 {
+            std::fs::write(root.join(format!("f{i}.txt")), "x\n").unwrap();
+            git_cmd(root, &["add", "."]);
+            git_cmd(root, &["commit", "-qm", "feature work"]);
+        }
+        git_cmd(root, &["checkout", "-q", "main"]);
+        for i in 0..3 {
+            std::fs::write(root.join(format!("m{i}.txt")), "x\n").unwrap();
+            git_cmd(root, &["add", "."]);
+            git_cmd(root, &["commit", "-qm", "main work"]);
+        }
+        git_cmd(root, &["checkout", "-q", "feature"]);
+
+        let mut prober = GitVitalsProber::default();
+        let vitals = prober.probe(root).await.expect("repo probes");
+        assert_eq!(vitals.primary_ref, "main");
+        assert_eq!(vitals.ahead, 2, "right column = commits only on HEAD");
+        assert_eq!(
+            vitals.behind, 3,
+            "left column = commits only on the primary"
+        );
+        if merge_tree_supported() {
+            assert_eq!(vitals.merge_parity, "clean", "disjoint files merge clean");
+        }
+    }
+
+    #[tokio::test]
+    async fn same_checkout_subdir_targets_share_one_probe_per_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        git_cmd(root, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "one\n").unwrap();
+        git_cmd(root, &["add", "."]);
+        git_cmd(root, &["commit", "-qm", "base"]);
+
+        let mut prober = GitVitalsProber::default();
+        let mut tick_cache: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
+        let at_root = probe_cached(&mut prober, &mut tick_cache, root).await;
+        let at_subdir = probe_cached(&mut prober, &mut tick_cache, &root.join("src")).await;
+        assert_eq!(at_root.as_ref().map(|g| g.branch.as_str()), Some("main"));
+        assert_eq!(at_root, at_subdir, "one checkout, one shared result");
+        assert_eq!(
+            prober.checkout_probes, 1,
+            "root and subdir share a single probe within the tick"
+        );
+        assert_eq!(tick_cache.len(), 1, "cached under the shared toplevel key");
+
+        // Next tick: fresh per-tick cache, still one probe per checkout —
+        // the path→toplevel resolutions are already cached.
+        let mut next_tick: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
+        probe_cached(&mut prober, &mut next_tick, &root.join("src")).await;
+        probe_cached(&mut prober, &mut next_tick, root).await;
+        assert_eq!(prober.checkout_probes, 2);
+
+        // Paths outside any checkout cache their per-tick miss under the
+        // raw path and never reach a checkout probe.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let mut tick: HashMap<PathBuf, Option<SessionGitVitals>> = HashMap::new();
+        assert!(probe_cached(&mut prober, &mut tick, outside.path())
+            .await
+            .is_none());
+        assert!(probe_cached(&mut prober, &mut tick, outside.path())
+            .await
+            .is_none());
+        assert_eq!(prober.checkout_probes, 2);
+        assert!(tick.contains_key(outside.path()), "miss cached per tick");
+    }
+
+    #[tokio::test]
+    async fn primary_cache_invalidation_rediscovers_after_ref_loss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = repo_with_origin(dir.path());
+        git_cmd(&work, &["checkout", "-qb", "feature"]);
+        std::fs::write(work.join("b.txt"), "two\n").unwrap();
+        git_cmd(&work, &["add", "."]);
+        git_cmd(&work, &["commit", "-qm", "feature work"]);
+
+        let mut prober = GitVitalsProber::default();
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.primary_ref, "origin/main");
+        assert_eq!((vitals.ahead, vitals.behind), (1, 0));
+        assert_eq!(prober.primary_cache.len(), 1, "discovery cached");
+
+        // The remote-tracking ref vanishes (remote pruned): the cached
+        // primary stops resolving. The failing tick degrades to 0/0 —
+        // the old chain's unwrap_or(0) — and invalidates the entry...
+        git_cmd(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.primary_ref, "origin/main", "stale name for one tick");
+        assert_eq!((vitals.ahead, vitals.behind), (0, 0));
+        assert!(
+            prober.primary_cache.is_empty(),
+            "failed rev-list drops the discovery cache entry"
+        );
+
+        // ...so the next tick rediscovers: local main is the primary now.
+        let vitals = prober.probe(&work).await.expect("repo probes");
+        assert_eq!(vitals.primary_ref, "main");
+        assert_eq!((vitals.ahead, vitals.behind), (1, 0));
+    }
+
+    /// A git stand-in that hangs far longer than the probe timeout —
+    /// proves the anti-wedge guard without a hung real git. Hermetic on
+    /// the process ledger too: the unix script `exec`s its sleep so the
+    /// pid `kill_on_drop` reaps IS the sleeper (no shell child to
+    /// orphan), and the Windows sleeper self-bounds at ~3s.
+    fn write_hanging_git_stub(dir: &Path) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let path = dir.join("hung-git.sh");
+            std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("hung-git.bat");
+            // `ping -n` is the canonical batch sleep (`timeout` refuses
+            // the null stdin the probe runner hands its children); the
+            // short count bounds any orphan outliving the killed cmd.exe.
+            std::fs::write(&path, "@ping -n 4 127.0.0.1 > nul\r\n").unwrap();
+            path
+        }
+    }
+
+    #[tokio::test]
+    async fn hung_git_times_out_and_fails_the_probe_promptly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub = write_hanging_git_stub(dir.path());
+        let mut prober = GitVitalsProber {
+            git_program: stub.into(),
+            probe_timeout: std::time::Duration::from_millis(200),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        assert!(
+            prober.probe(dir.path()).await.is_none(),
+            "hung git must fail the probe, not wedge it"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the timeout bounds the probe: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

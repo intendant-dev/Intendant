@@ -201,7 +201,8 @@ impl ServerConnection {
                 // signal the disconnection. The main module handles reconnect.
                 let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
                     &js_sys::Function::new_no_args(&format!(
-                        "if (window.__presenceWeb) window.__presenceWeb.reconnect_server('{}')",
+                        "if (window.__intendantReconnectServer) window.__intendantReconnectServer('{}'); else if (window.__presenceWeb) window.__presenceWeb.reconnect_server('{}')",
+                        url_rc.replace('\'', "\\'"),
                         url_rc.replace('\'', "\\'")
                     )),
                     delay_ms,

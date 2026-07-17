@@ -40,7 +40,7 @@ path = "src/bin/connect/main.rs"
 owner-plane-core = { path = "crates/owner-plane-core" }
 owner-plane-reducer = { path = "crates/owner-plane-reducer", default-features = false }
 tokio = { version = "1.0", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "1.0"
 chrono = "0.4"

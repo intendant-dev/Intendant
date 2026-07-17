@@ -64,6 +64,8 @@ pub(crate) use routes_peers::*;
 
 mod routes_access;
 pub(crate) use routes_access::*;
+mod routes_hosted_control;
+pub(crate) use routes_hosted_control::*;
 mod routes_claude_auth;
 pub(crate) use routes_claude_auth::*;
 mod routes_codex_auth;
@@ -256,6 +258,17 @@ pub struct WebGatewayConfig {
     /// state, not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
     pub connect: crate::project::ConnectConfig,
+    /// Hermetic injection point for hosted-control signing tests. Production
+    /// leaves this unset and uses the daemon identity store. Tests that turn
+    /// the hosted lane on must provide a path under their own temp directory.
+    #[serde(skip)]
+    pub hosted_control_identity_path: Option<std::path::PathBuf>,
+    /// Hermetic injection point paired with `hosted_control_identity_path`.
+    /// Production resolves the ordinary daemon label only when the hosted
+    /// lane is enabled; tests provide a fixed label instead of probing the
+    /// machine's access stores or hostname.
+    #[serde(skip)]
+    pub hosted_control_daemon_label: Option<String>,
 }
 
 impl Default for WebGatewayConfig {
@@ -273,6 +286,8 @@ impl Default for WebGatewayConfig {
             app_build: String::new(),
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
             connect: crate::project::ConnectConfig::default(),
+            hosted_control_identity_path: None,
+            hosted_control_daemon_label: None,
         }
     }
 }

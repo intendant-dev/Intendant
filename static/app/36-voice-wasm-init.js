@@ -492,6 +492,7 @@ function showSettingsDialog() {
 
 // ── WASM Init ──
 async function main() {
+  const hostedLeaseMode = await hostedControlPrepare();
   await init({ module_or_path: '/wasm-web/presence_web_bg.wasm' });
   app = new PresenceWeb();
   installDashboardControlServerSender();
@@ -1229,7 +1230,7 @@ async function main() {
   // Fire-and-forget: vault discovery must not block dashboard bootstrap.
   // The shipped vault uses this trusted daemon/native origin and its secure
   // control channel; Hosted Connect serves no vault client or delivery bridge.
-  vaultInit();
+  if (!hostedLeaseMode) vaultInit();
 
   let connectBootstrapReady = !dashboardConnectModeEnabled();
   if (dashboardConnectModeEnabled()) {
@@ -1275,7 +1276,7 @@ async function main() {
     });
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
-    const wsUrl = buildWsUrl();
+    const wsUrl = await hostedControlWebSocketUrl();
     app.connect_server(wsUrl);
     // Capability watchdog: if this browser cannot open the /ws at all
     // (WebKit + mTLS hangs in CONNECTING forever — no open, no close, no
@@ -1300,22 +1301,24 @@ async function main() {
       applyAgentCardIdentity(card);
     } catch {}
 
-    maybeStartDashboardControlTransport();
+    if (!hostedLeaseMode) maybeStartDashboardControlTransport();
   }
 
   // Initialize multi-host state now that self-label is resolved and the
   // WASM app is ready. Hydrates the peer list from the server-side
   // PeerRegistry via /api/peers (declarative [[peer]] sections from
   // intendant.toml + any peers added through the dashboard at runtime).
-  await initDaemons();
+  if (!hostedLeaseMode) await initDaemons();
 
   // Fetch settings once at startup so the status bar badge (external
   // agent) reflects the persisted value without waiting for the user
   // to open the Settings tab. Idempotent — visiting Settings after
   // this won't refetch.
   if (connectBootstrapReady) {
-    loadSettings();
-    loadNewSessionProjectRoot();
+    if (!hostedLeaseMode) {
+      loadSettings();
+      loadNewSessionProjectRoot();
+    }
   }
 
   // Restore pure-client toggles from localStorage. These are UI

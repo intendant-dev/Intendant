@@ -38,6 +38,7 @@ const CLAIM_PROTOCOL_V2: &str = "intendant-connect-claim-v2";
 /// fresh timestamp and the locally minted route-code hash. Connect never
 /// receives or returns the plaintext code.
 const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
+const HOSTED_CONTROL_CAPABILITY_PROTOCOL: &str = "intendant-connect-hosted-control-capability-v1";
 /// Daemon-signed release of a claim binding, mirrored by the service.
 const UNCLAIM_PROTOCOL: &str = "intendant-connect-unclaim-v1";
 
@@ -61,6 +62,8 @@ struct RegisterRequest {
     claim_code_hash: String,
     issued_at_unix_ms: u64,
     signature: String,
+    hosted_control_enabled: bool,
+    hosted_control_signature: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -855,6 +858,13 @@ async fn register(
         &claim_code_hash,
         issued_at_unix_ms,
     );
+    let hosted_control_payload = hosted_control_capability_signing_payload(
+        daemon_id,
+        &daemon_public_key,
+        &claim_code_hash,
+        issued_at_unix_ms,
+        config.hosted_control_enabled,
+    );
     let request = RegisterRequest {
         protocol: "intendant-connect-rendezvous-v1",
         daemon_id: daemon_id.to_string(),
@@ -862,6 +872,8 @@ async fn register(
         claim_code_hash,
         issued_at_unix_ms,
         signature: identity.sign_b64u(payload.as_bytes()),
+        hosted_control_enabled: config.hosted_control_enabled,
+        hosted_control_signature: identity.sign_b64u(hosted_control_payload.as_bytes()),
     };
     authenticated(
         config,
@@ -1199,6 +1211,21 @@ fn registration_signing_payload(
     )
 }
 
+/// Optional discovery hint for the Connect directory. The daemon still
+/// validates the flag and every lease at its own gateway; this signature binds
+/// the displayed capability state to the exact registration fields.
+fn hosted_control_capability_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    claim_code_hash: &str,
+    issued_at_unix_ms: u64,
+    enabled: bool,
+) -> String {
+    format!(
+        "{HOSTED_CONTROL_CAPABILITY_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{claim_code_hash}\n{issued_at_unix_ms}\n{enabled}\n"
+    )
+}
+
 fn claim_signing_payload(
     claim_id: &str,
     daemon_id: &str,
@@ -1513,8 +1540,8 @@ fn notify_signing_payload(
     )
 }
 
-/// Tell the rendezvous an agent→user request (`kind`: "approval" |
-/// "question") has gone unseen, so it can Web-Push the linked account's
+/// Tell the rendezvous an owner-attention request (closed `kind`
+/// vocabulary) has gone unseen, so it can Web-Push the linked account's
 /// opted-in browsers. Errors are expected weather for unlinked / offline daemons —
 /// the caller degrades silently.
 pub(crate) async fn notify_attention(kind: &str, session_label: &str) -> Result<(), String> {
@@ -1933,6 +1960,16 @@ mod tests {
         assert_eq!(
             registration_signing_payload("daemon-1", "PubKey", "ClaimHash", 1_700_000_000_000),
             "intendant-connect-register-proof-v1\ndaemon-1\nPubKey\nClaimHash\n1700000000000\n"
+        );
+        assert_eq!(
+            hosted_control_capability_signing_payload(
+                "daemon-1",
+                "PubKey",
+                "ClaimHash",
+                1_700_000_000_000,
+                true,
+            ),
+            "intendant-connect-hosted-control-capability-v1\ndaemon-1\nPubKey\nClaimHash\n1700000000000\ntrue\n"
         );
         assert_eq!(
             claim_signing_payload("claim-1", "daemon-1", "PubKey", "challenge-1"),

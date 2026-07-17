@@ -1195,6 +1195,13 @@ function updateControlAppliesNote() {
 }
 
 function dispatchControlMsg(payload) {
+  payload = hostedControlNormalizeControlMessage(payload);
+  if (!payload) {
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'That action is outside this hosted lease preset');
+    }
+    return;
+  }
   const action = String(payload?.action || '').trim();
   if (DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) {
     dispatchSessionControlMsg(payload);

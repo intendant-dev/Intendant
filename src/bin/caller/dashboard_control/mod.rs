@@ -784,6 +784,25 @@ impl DashboardControlGrant {
                 else {
                     return false;
                 };
+                if crate::access::hosted_control::is_hosted_lease_principal(principal) {
+                    let records_current = opening_grant == current_grant
+                        && opening_principal == current_principal
+                        && crate::access::iam::is_enforced_status(&current_grant.status)
+                        && crate::access::iam::is_enforced_status(&current_principal.status)
+                        && crate::access::hosted_control::hosted_preset_for_principal(
+                            &current, principal,
+                        )
+                        .is_ok();
+                    if records_current {
+                        authority_memo
+                            .store(Arc::clone(&current), current_grant.expires_at_unix_ms);
+                    }
+                    return records_current
+                        && match current_grant.expires_at_unix_ms {
+                            Some(expires) => (now_unix_ms as u128) < (expires as u128),
+                            None => false,
+                        };
+                }
                 let role_id = if opening_grant.role_id.trim().is_empty() {
                     "role:scoped-human"
                 } else {
@@ -1018,6 +1037,25 @@ impl DashboardControlGrant {
     /// failure/teardown metadata does not carry the original visibility bit
     /// and remains audit metadata rather than a secrecy boundary.
     pub(crate) fn allows_dashboard_event_line(&self, line: &str) -> bool {
+        if let Self::UserClient { principal, .. } = self {
+            if crate::access::hosted_control::is_hosted_lease_principal(principal) {
+                return !Self::dashboard_event_line_requires_owner(line)
+                    && self
+                        .current_user_client_state()
+                        .ok()
+                        .and_then(|state| {
+                            crate::access::hosted_control::hosted_preset_for_principal(
+                                &state, principal,
+                            )
+                            .ok()
+                        })
+                        .is_some_and(|preset| {
+                            crate::access::hosted_control::hosted_outbound_line_allowed(
+                                preset, line,
+                            )
+                        });
+            }
+        }
         self.has_owner_dashboard_authority() || !Self::dashboard_event_line_requires_owner(line)
     }
 
@@ -1052,7 +1090,7 @@ impl DashboardControlGrant {
     /// live dashboard projection so a historical private `display_ready`
     /// cannot recreate a denied display slot for a scoped client.
     pub(crate) fn filter_dashboard_replay_payload(&self, replay: &mut serde_json::Value) {
-        if self.has_owner_dashboard_authority() {
+        if self.has_owner_dashboard_authority() && !self.is_hosted_lease() {
             return;
         }
         let Some(entries) = replay
@@ -1061,10 +1099,33 @@ impl DashboardControlGrant {
         else {
             return;
         };
+        let hosted = self.is_hosted_lease();
+        let mut hidden_hosted_displays = HashSet::new();
         entries.retain(|entry| {
-            serde_json::to_string(entry)
-                .ok()
-                .is_none_or(|line| !Self::dashboard_event_line_requires_owner(&line))
+            let display_id = entry.get("display_id").and_then(serde_json::Value::as_u64);
+            if hosted {
+                match (
+                    display_id,
+                    entry
+                        .get("agent_visible")
+                        .and_then(serde_json::Value::as_bool),
+                ) {
+                    (Some(display_id), Some(true)) => {
+                        hidden_hosted_displays.remove(&display_id);
+                    }
+                    (Some(display_id), Some(false)) => {
+                        hidden_hosted_displays.insert(display_id);
+                    }
+                    _ => {}
+                }
+            }
+            let targets_hidden_hosted_display =
+                display_id.is_some_and(|display_id| hidden_hosted_displays.contains(&display_id));
+            !targets_hidden_hosted_display
+                && serde_json::to_string(entry).ok().is_some_and(|line| {
+                    !Self::dashboard_event_line_requires_owner(&line)
+                        && (!hosted || self.allows_dashboard_event_line(&line))
+                })
         });
     }
 
@@ -1131,6 +1192,32 @@ impl DashboardControlGrant {
         ctrl: &ControlMsg,
     ) -> crate::access::iam::AccessDecision {
         let operation = crate::access::access_policy::control_msg_operation(ctrl);
+        if let Self::UserClient { principal, .. } = self {
+            if crate::access::hosted_control::is_hosted_lease_principal(principal) {
+                let allowed = self
+                    .current_user_client_state()
+                    .ok()
+                    .and_then(|state| {
+                        crate::access::hosted_control::hosted_preset_for_principal(
+                            &state, principal,
+                        )
+                        .ok()
+                        .map(|preset| {
+                            crate::access::hosted_control::hosted_control_msg_allowed(
+                                &state, preset, ctrl,
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+                if !allowed {
+                    return crate::access::iam::AccessDecision::denied(
+                        principal,
+                        operation,
+                        "concrete action or target is outside the hosted lease action wall",
+                    );
+                }
+            }
+        }
         if crate::access::access_policy::control_msg_requires_owner_dashboard(ctrl)
             && !self.has_owner_dashboard_authority()
         {
@@ -1164,6 +1251,13 @@ impl DashboardControlGrant {
     pub(crate) fn allows_unfiltered_websocket_stream(&self) -> bool {
         use crate::access::access_policy::PeerOperation;
 
+        if self.is_hosted_lease() {
+            // Hosted sockets are not unfiltered: the outbound writer applies
+            // `allows_dashboard_event_line` to bootstrap, direct, replay, and
+            // live frames. This predicate is the admission hook retained by
+            // the legacy `/ws` setup.
+            return self.opening_authority_is_current();
+        }
         [
             PeerOperation::PresenceRead,
             PeerOperation::StatsRead,
@@ -1182,6 +1276,127 @@ impl DashboardControlGrant {
             Self::UserClient { .. } => "user-client",
             Self::Peer { .. } => "peer",
         }
+    }
+
+    pub(crate) fn is_hosted_lease(&self) -> bool {
+        matches!(
+            self,
+            Self::UserClient { principal, .. }
+                if crate::access::hosted_control::is_hosted_lease_principal(principal)
+        )
+    }
+
+    /// Return the exact active hosted lease that opened this connection.
+    /// This is transport-derived provenance for internal session creation,
+    /// never a client-supplied identifier.
+    pub(crate) fn hosted_lease_id(&self) -> Option<String> {
+        let Self::UserClient { principal, .. } = self else {
+            return None;
+        };
+        if !crate::access::hosted_control::is_hosted_lease_principal(principal) {
+            return None;
+        }
+        let state = self.current_user_client_state().ok()?;
+        crate::access::hosted_control::hosted_preset_for_principal(&state, principal).ok()?;
+        let grant_id = principal.grant_id.as_deref()?;
+        state
+            .hosted_control
+            .leases
+            .iter()
+            .find(|lease| {
+                lease.status == crate::access::hosted_control::HostedLeaseStatus::Active
+                    && lease.document.grant_id == grant_id
+                    && lease.document.principal_id == principal.id
+            })
+            .map(|lease| lease.document.lease_id.clone())
+    }
+
+    fn hosted_preset(&self) -> Option<crate::access::hosted_control::HostedPreset> {
+        let Self::UserClient { principal, .. } = self else {
+            return None;
+        };
+        if !crate::access::hosted_control::is_hosted_lease_principal(principal) {
+            return None;
+        }
+        let state = self.current_user_client_state().ok()?;
+        crate::access::hosted_control::hosted_preset_for_principal(&state, principal).ok()
+    }
+
+    pub(crate) fn hosted_dashboard_method_allowed(&self, method: &str) -> bool {
+        !self.is_hosted_lease()
+            || self.hosted_preset().is_some_and(|preset| {
+                crate::access::hosted_control::hosted_dashboard_method_allowed(preset, method)
+            })
+    }
+
+    pub(crate) fn hosted_tunnel_frame_allowed(&self, frame_type: &str) -> bool {
+        !self.is_hosted_lease()
+            || self.hosted_preset().is_some_and(|preset| {
+                crate::access::hosted_control::hosted_tunnel_frame_classification(
+                    preset, frame_type,
+                ) == Some(true)
+            })
+    }
+
+    pub(crate) fn stamp_hosted_session_provenance(
+        &self,
+        ctrl: &mut ControlMsg,
+    ) -> Result<(), String> {
+        if !self.is_hosted_lease() {
+            return Ok(());
+        }
+        if let ControlMsg::CreateSession {
+            hosted_lease_id, ..
+        } = ctrl
+        {
+            *hosted_lease_id = Some(
+                self.hosted_lease_id()
+                    .ok_or_else(|| "hosted lease is no longer active".to_string())?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sanitize_state_snapshot(&self, state: &mut presence_core::AgentStateSnapshot) {
+        if !self.is_hosted_lease() {
+            return;
+        }
+        state.pending_approval = None;
+        state.pending_question = None;
+        state.last_command_preview.clear();
+        state.last_task_result = None;
+        // Display inventory is projected from SessionRegistry through the
+        // agent-visible boundary; the generic snapshot may name private
+        // owner displays and must not become a second inventory lane.
+        state.available_displays.clear();
+    }
+
+    pub(crate) fn project_runtime_config(&self, config: &serde_json::Value) -> serde_json::Value {
+        if !self.is_hosted_lease() {
+            return config.clone();
+        }
+        crate::access::hosted_control::project_hosted_runtime_config(config)
+    }
+
+    pub(crate) fn hosted_ws_frame_allowed(&self, value: &serde_json::Value) -> bool {
+        let Self::UserClient { principal, .. } = self else {
+            return true;
+        };
+        if !crate::access::hosted_control::is_hosted_lease_principal(principal) {
+            return true;
+        }
+        self.current_user_client_state()
+            .ok()
+            .and_then(|state| {
+                crate::access::hosted_control::hosted_preset_for_principal(&state, principal)
+                    .ok()
+                    .map(|preset| {
+                        crate::access::hosted_control::hosted_ws_frame_allowed(
+                            &state, preset, value,
+                        )
+                    })
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -3391,6 +3606,11 @@ fn authorize_dashboard_control_method(
     let Some(spec) = control_method_spec(method) else {
         return Err(format!("unknown dashboard-control method: {method}"));
     };
+    if !runtime.grant.hosted_dashboard_method_allowed(method) {
+        return Err(format!(
+            "dashboard-control method {method} is outside the hosted lease method wall"
+        ));
+    }
     let Some(op) = spec.op else {
         return Ok(());
     };
@@ -3494,6 +3714,11 @@ fn authorize_dashboard_control_upload(
     else {
         return Err(format!("unknown upload method: {method}"));
     };
+    if !runtime.grant.hosted_dashboard_method_allowed(method) {
+        return Err(format!(
+            "dashboard-control upload {method} is outside the hosted lease method wall"
+        ));
+    }
     runtime_operation_decision(runtime, op)
         .ensure_allowed()
         .map_err(|reason| format!("dashboard-control upload {method} is not allowed: {reason}"))
@@ -3503,6 +3728,11 @@ fn authorize_dashboard_control_frame(
     runtime: &ControlRuntime,
     frame_type: &str,
 ) -> Result<(), String> {
+    if !runtime.grant.hosted_tunnel_frame_allowed(frame_type) {
+        return Err(format!(
+            "dashboard-control frame {frame_type} is outside the hosted lease frame wall"
+        ));
+    }
     let Some(op) = dashboard_control_frame_operation(frame_type) else {
         return Ok(());
     };
@@ -5167,6 +5397,102 @@ mod tests {
             features.len(),
             "wire features must not collide with method names"
         );
+    }
+
+    #[test]
+    fn hosted_method_wall_is_pinned_to_the_effective_method_table() {
+        use crate::access::hosted_control::{
+            hosted_dashboard_method_allowed, preset_allows_operation, HostedPreset,
+        };
+        let view: std::collections::BTreeSet<&str> = [
+            "ping",
+            "status",
+            "api_agent_card",
+            "api_cached_bootstrap_events",
+            "subscribe_events",
+            "unsubscribe_events",
+            "api_sessions",
+            "api_sessions_stream",
+            "api_sessions_search",
+            "api_sessions_message_search",
+            "api_session_detail",
+            "api_session_agent_output",
+            "api_session_context_snapshot",
+            "api_session_fork_points",
+            "api_displays",
+            "api_display_bootstrap",
+            "api_display_webrtc_signal",
+            "api_state_snapshot",
+            "api_session_log_replay",
+            "api_external_session_activity_replay",
+            "api_dashboard_bootstrap",
+        ]
+        .into_iter()
+        .collect();
+        let tasks = view
+            .iter()
+            .copied()
+            .chain(["api_control_msg"])
+            .collect::<std::collections::BTreeSet<_>>();
+        let operate = tasks
+            .iter()
+            .copied()
+            .chain([
+                "api_session_control_msg",
+                "api_dashboard_action_msg",
+                "api_fs_stat",
+                "api_fs_list",
+                "api_fs_read",
+                "api_fs_mkdir",
+                "api_fs_write",
+                "api_fs_rename",
+                "api_fs_delete",
+                "api_transfer_jobs",
+                "api_transfer_job_create",
+                "api_transfer_upload_chunk",
+                "api_transfer_upload_commit",
+                "api_transfer_job_delete",
+                "api_transfer_download_read",
+                "api_display_input_authority_snapshot",
+                "api_display_input_authority_request",
+                "api_display_input_authority_release",
+            ])
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for (preset, expected) in [
+            (HostedPreset::View, view),
+            (HostedPreset::Tasks, tasks),
+            (HostedPreset::Operate, operate),
+        ] {
+            let actual = all_control_methods()
+                .iter()
+                .filter(|spec| hosted_dashboard_method_allowed(preset, spec.name))
+                .map(|spec| spec.name)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                actual,
+                expected,
+                "{} hosted method projection drifted",
+                preset.as_str(),
+            );
+            for spec in all_control_methods()
+                .iter()
+                .filter(|spec| hosted_dashboard_method_allowed(preset, spec.name))
+            {
+                assert!(
+                    spec.op
+                        .is_none_or(|operation| preset_allows_operation(preset, operation)),
+                    "{} admits {} without its {:?} IAM floor",
+                    preset.as_str(),
+                    spec.name,
+                    spec.op,
+                );
+            }
+        }
+        assert!(!hosted_dashboard_method_allowed(
+            HostedPreset::Operate,
+            "api_future_method"
+        ));
     }
 
     /// Transport-unification S3 differential pin (design §8, risks

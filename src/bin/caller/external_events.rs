@@ -1058,7 +1058,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 );
                 config.bus.send(AppEvent::ModelResponseDelta {
                     session_id: config.session_id.clone(),
-                    text,
+                    text: text.into(),
                 });
             }
             external_agent::AgentEvent::Message { text } => {

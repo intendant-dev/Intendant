@@ -1178,6 +1178,7 @@ mod tests {
             daemon_id: daemon_id.to_string(),
             label: None,
             daemon_public_key: public_key.to_string(),
+            hosted_control_enabled: false,
             owner_user_id: None,
             claim_code_hash: None,
             claim_code_created_unix_ms: None,

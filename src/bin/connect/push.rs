@@ -439,8 +439,16 @@ pub(crate) fn notify_signing_payload(
 /// `notify` is an urgent `notify_user` agent notification escalated by the
 /// daemon's attention monitor (`src/bin/caller/attention_nudge.rs`);
 /// `display_request` is the user-display doorbell
-/// (`request_user_display`) waiting on the owner's click.
-const NOTIFY_KINDS: &[&str] = &["approval", "question", "notify", "display_request"];
+/// (`request_user_display`) waiting on the owner's click. `hosted_lease`
+/// carries only the fact that the daemon has a pending lease doorbell; the
+/// request id, key, preset, TTL, and label remain daemon-local.
+const NOTIFY_KINDS: &[&str] = &[
+    "approval",
+    "question",
+    "notify",
+    "display_request",
+    "hosted_lease",
+];
 
 /// Compose the Web Push payload for a pending-request nudge.
 ///
@@ -475,6 +483,11 @@ pub(crate) fn attention_push_payload(
                 "Session \u{201c}{session_label}\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
             ),
         ),
+        "hosted_lease" => (
+            format!("{daemon_label}: hosted control request"),
+            "Open a trusted daemon client to review a pending hosted-control request."
+                .to_string(),
+        ),
         _ => (
             format!("{daemon_label}: approval needed"),
             format!("Session \u{201c}{session_label}\u{201d} is waiting for your approval."),
@@ -483,8 +496,9 @@ pub(crate) fn attention_push_payload(
     json!({
         "title": title,
         "body": body,
-        // Connect cannot open the daemon at role:none. Land on the route
-        // directory, whose cards explain which trusted client to use.
+        // Connect carries no approval authority. Land on the route directory,
+        // whose card either offers the daemon-signed fleet navigation hint or
+        // explains which trusted client to use.
         "url": "/connect",
         // One stacked notification per daemon: later nudges replace
         // earlier ones instead of piling up.
@@ -957,6 +971,25 @@ mod tests {
             display["body"],
             "Session \u{201c}s-1\u{201d} is asking for display access. Open a trusted daemon client to allow or deny."
         );
+
+        // Hosted-control nudges expose only the fact that a request exists.
+        // The caller-supplied label is deliberately absent, so it cannot
+        // become a side channel for request ids, keys, presets, or TTLs.
+        let hosted = attention_push_payload(
+            "hosted_lease",
+            "workshop",
+            "request=secret; key=secret; preset=operate; ttl=900",
+            "daemon-1",
+        );
+        assert_eq!(hosted["title"], "workshop: hosted control request");
+        assert_eq!(
+            hosted["body"],
+            "Open a trusted daemon client to review a pending hosted-control request."
+        );
+        let serialized = serde_json::to_string(&hosted).unwrap();
+        for secret in ["request=secret", "key=secret", "preset=operate", "ttl=900"] {
+            assert!(!serialized.contains(secret), "push disclosed {secret}");
+        }
     }
 
     /// The nudge request wire shape has no content-bearing fields: an old
@@ -968,7 +1001,7 @@ mod tests {
         for kind in NOTIFY_KINDS {
             assert!(matches!(
                 *kind,
-                "approval" | "question" | "notify" | "display_request"
+                "approval" | "question" | "notify" | "display_request" | "hosted_lease"
             ));
         }
         let parsed: DaemonNotifyRequest = serde_json::from_value(json!({

@@ -30,6 +30,7 @@ impl SessionSupervisor {
                 attachments,
                 worktree,
                 worktree_branch,
+                hosted_lease_id,
             } => {
                 let worktree_request =
                     worktree.unwrap_or(false).then_some(SessionWorktreeRequest {
@@ -79,6 +80,7 @@ impl SessionSupervisor {
                                             .to_string(),
                                     ),
                                     worktree_request,
+                                    hosted_lease_id,
                                 )
                                 .await;
                             return;
@@ -133,6 +135,7 @@ impl SessionSupervisor {
                         attachments,
                         codex_service_tier,
                         worktree_request,
+                        hosted_lease_id,
                     )
                     .await;
             }
@@ -223,6 +226,7 @@ impl SessionSupervisor {
                                             .to_string(),
                                     ),
                                     None,
+                                    None,
                                 )
                                 .await;
                             if let (Some(id), Some(session_id)) =
@@ -269,6 +273,7 @@ impl SessionSupervisor {
                         reference_frame_ids,
                         display_target,
                         attachments,
+                        None,
                         None,
                         None,
                     )

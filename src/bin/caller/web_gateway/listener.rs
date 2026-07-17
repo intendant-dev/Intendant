@@ -521,6 +521,28 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
+    let display_media_relay_configured = config.ice_servers.iter().any(|server| {
+        server
+            .urls
+            .iter()
+            .any(|url| matches!(url.split(':').next(), Some("turn" | "turns")))
+    });
+    let hosted_control_daemon_label = if config.connect.hosted_control_enabled {
+        config
+            .hosted_control_daemon_label
+            .clone()
+            .unwrap_or_else(crate::access::resolve_host_label)
+    } else {
+        String::new()
+    };
+    let hosted_control = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
+        config.connect.hosted_control_enabled,
+        access_cert_dir.clone(),
+        config.hosted_control_identity_path.as_deref(),
+        config.connect.daemon_id.as_deref(),
+        hosted_control_daemon_label,
+        display_media_relay_configured,
+    ));
     // Cache the most recent worktree inventory scan. Scanning can walk
     // large worktree directories for disk-size accounting, so the
     // dashboard explicitly triggers refreshes instead of doing it on
@@ -1346,6 +1368,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
             let access_cert_dir = access_cert_dir.clone();
+            let hosted_control = Arc::clone(&hosted_control);
             let tls_client_cert_required = tls_client_cert_required;
             let source_hint = peer_addr.ip().to_string();
             let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
@@ -1724,6 +1747,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     );
                     let http_ctx = HttpRequestCtx {
                         access_cert_dir: access_cert_dir.clone(),
+                        hosted_control: Arc::clone(&hosted_control),
                         bus: bus.clone(),
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
@@ -1801,10 +1825,40 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 // ── WebSocket upgrade path — request 1 or any kept-alive
                 //    follow-up whose head asked to upgrade. ──
                 {
-                    if gateway_ingress.is_reachability_relay()
+                    let discovery_only_ws = gateway_ingress.is_reachability_relay()
                         || tls_fleet_origin
-                        || request_names_known_fleet_origin(&header_text)
-                    {
+                        || request_names_known_fleet_origin(&header_text);
+                    let hosted_ws_authority = if discovery_only_ws && hosted_control.enabled() {
+                        let ticket =
+                            query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
+                        match ticket {
+                            Some(ticket) => match fleet_origin_from_request(&header_text, is_tls)
+                                .and_then(|origin| {
+                                    hosted_control.consume_ws_ticket(
+                                        &ticket,
+                                        &origin,
+                                        if gateway_ingress.is_reachability_relay() {
+                                            "hosted-relay-wss"
+                                        } else {
+                                            "hosted-fleet-wss"
+                                        },
+                                    )
+                                }) {
+                                Ok(verified) => Some(verified),
+                                Err(error) => {
+                                    use tokio::io::AsyncWriteExt;
+                                    let response = json_error("401 Unauthorized", error);
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    finalize_http_stream(&mut stream).await;
+                                    return;
+                                }
+                            },
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if discovery_only_ws && hosted_ws_authority.is_none() {
                         use tokio::io::AsyncWriteExt;
                         let response = json_error(
                             "403 Forbidden",
@@ -1851,8 +1905,9 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         tls_client_cert_fingerprint.as_deref(),
                         peer_connection_identity.as_ref(),
                     );
-                    if (tls_client_cert_required && !tls_client_cert_present)
-                        || remote_client_auth_missing
+                    if hosted_ws_authority.is_none()
+                        && ((tls_client_cert_required && !tls_client_cert_present)
+                            || remote_client_auth_missing)
                     {
                         use tokio::io::AsyncWriteExt;
                         let body = serde_json::json!({
@@ -1880,46 +1935,58 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // browsers). Reject with a plain HTTP 401 *before*
                     // the WebSocket handshake so the rejected client
                     // never sees a successful upgrade.
-                    if let Err((status, body)) =
-                        verify_bearer_for_ws(&header_text, inbound_bearer_token.as_deref())
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let reason = match status {
-                            401 => "Unauthorized",
-                            _ => "Error",
-                        };
-                        let response = HttpResponse::with_content(
-                            format!("{} {}", status, reason),
-                            "application/json",
-                            body,
-                        )
-                        .header("WWW-Authenticate", "Bearer")
-                        .header("Connection", "close")
-                        .into_string();
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        // Flush + cleanly shut down before the task returns and
-                        // drops the stream. On the TLS path rustls buffers the
-                        // ciphertext for this 401 inside the session; dropping
-                        // without flushing discards it and the rejected client
-                        // sees an *empty* response instead of the 401 (audit
-                        // F2). A no-op pass-through on plain TCP.
-                        finalize_http_stream(&mut stream).await;
-                        return;
-                    }
-                    let dashboard_control_grant_for_ws = match dashboard_control_grant_for_client(
-                        &access_cert_dir,
-                        peer_connection_identity.as_ref(),
-                        tls_client_cert_fingerprint.as_deref(),
-                        tls_client_cert_present,
-                    ) {
-                        Ok(grant) => grant,
-                        Err(message) => {
+                    if hosted_ws_authority.is_none() {
+                        if let Err((status, body)) =
+                            verify_bearer_for_ws(&header_text, inbound_bearer_token.as_deref())
+                        {
                             use tokio::io::AsyncWriteExt;
-                            let response = json_error("500 Internal Server Error", message);
+                            let reason = match status {
+                                401 => "Unauthorized",
+                                _ => "Error",
+                            };
+                            let response = HttpResponse::with_content(
+                                format!("{} {}", status, reason),
+                                "application/json",
+                                body,
+                            )
+                            .header("WWW-Authenticate", "Bearer")
+                            .header("Connection", "close")
+                            .into_string();
                             let _ = stream.write_all(response.as_bytes()).await;
+                            // Flush + cleanly shut down before the task returns and
+                            // drops the stream. On the TLS path rustls buffers the
+                            // ciphertext for this 401 inside the session; dropping
+                            // without flushing discards it and the rejected client
+                            // sees an *empty* response instead of the 401 (audit
+                            // F2). A no-op pass-through on plain TCP.
                             finalize_http_stream(&mut stream).await;
                             return;
                         }
+                    }
+                    let dashboard_control_grant_for_ws = match hosted_ws_authority {
+                        Some(verified) => {
+                            crate::dashboard_control::DashboardControlGrant::UserClient {
+                                principal: verified.principal,
+                                iam_state: verified.iam_state,
+                                iam_cert_dir: Some(access_cert_dir.clone()),
+                                authority_memo: Default::default(),
+                            }
+                        }
+                        None => match dashboard_control_grant_for_client(
+                            &access_cert_dir,
+                            peer_connection_identity.as_ref(),
+                            tls_client_cert_fingerprint.as_deref(),
+                            tls_client_cert_present,
+                        ) {
+                            Ok(grant) => grant,
+                            Err(message) => {
+                                use tokio::io::AsyncWriteExt;
+                                let response = json_error("500 Internal Server Error", message);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        },
                     };
                     if !dashboard_control_grant_for_ws.allows_unfiltered_websocket_stream() {
                         use tokio::io::AsyncWriteExt;
@@ -1997,14 +2064,47 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // bootstrap sequence. Fired after the last bootstrap
                     // enqueue; `ws_outbound_task`'s biased select drains
                     // direct frames first, then opens the broadcast lane.
+                    // Dropping the sender without firing (a bootstrap stage
+                    // died mid-generation) closes the connection instead —
+                    // never a partial bootstrap followed by live events.
                     let (bootstrap_flushed_tx, bootstrap_flushed_rx) =
                         tokio::sync::oneshot::channel::<()>();
+
+                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
+
+                    // Outbound: broadcast + direct responses → WebSocket.
+                    // Spawned BEFORE bootstrap generation so the frames
+                    // queued below stream to the socket as they are
+                    // produced instead of accumulating on the unbounded
+                    // direct lane until generation finishes — the client's
+                    // first byte no longer waits for the whole bootstrap,
+                    // per-connection bootstrap memory is bounded by socket
+                    // drain, and a client that disconnects mid-generation
+                    // is noticed by the writer immediately. The ordering
+                    // barrier above still holds: the task's biased select
+                    // serves the direct lane ahead of the flush arm, so
+                    // the broadcast + authority lanes stay shut until
+                    // every bootstrap frame is on the wire.
+                    let outbound = tokio::spawn(ws_outbound_task(
+                        outbound_rx,
+                        direct_rx,
+                        terminal_forward_rx,
+                        ws_tx,
+                        authority_change_rx,
+                        connection_id.clone(),
+                        display_input_authority.clone(),
+                        session_registry.clone(),
+                        bootstrap_caches.clone(),
+                        bootstrap_flushed_rx,
+                        dashboard_control_grant_for_ws.clone(),
+                        ws_session_cancel.clone(),
+                    ));
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
                     // doesn't carry those. The top-level `session_id` is the
                     // stable daemon/process session, not the active worker log.
-                    let state = query_ctx
+                    let mut state = query_ctx
                         .as_ref()
                         .map(|ctx| {
                             ctx.agent_state
@@ -2013,6 +2113,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                                 .clone()
                         })
                         .unwrap_or_default();
+                    dashboard_control_grant_for_ws.sanitize_state_snapshot(&mut state);
                     let bootstrap_session_id = daemon_session_id
                         .clone()
                         .or_else(|| {
@@ -2024,6 +2125,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     if query_ctx.is_some() || bootstrap_session_id.is_some() {
                         let config: serde_json::Value =
                             serde_json::from_str(&config_json).unwrap_or_default();
+                        let config = dashboard_control_grant_for_ws.project_runtime_config(&config);
                         let bootstrap = serde_json::json!({
                             "t": "state_snapshot",
                             "state": state,
@@ -2269,15 +2371,25 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         // Cache-fast after the first connect, but still file IO on a
                         // miss — keep it off the reactor (single-flight in the cache
                         // coalesces concurrent connects).
-                        let replay_result = tokio::task::spawn_blocking(move || {
-                            session_log_replay_payload_from_dir_with_limit(
-                                &log_dir,
-                                Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
-                            )
-                        })
-                        .await
-                        .ok()
-                        .flatten();
+                        //
+                        // The writer is already streaming; once it has exited
+                        // (socket closed, grant revoked) nothing queued here
+                        // can reach the client, so skip the replay read for a
+                        // connection that is already gone. Teardown still runs
+                        // through the normal inbound-spawn + join path below.
+                        let replay_result = if direct_tx.is_closed() {
+                            None
+                        } else {
+                            tokio::task::spawn_blocking(move || {
+                                session_log_replay_payload_from_dir_with_limit(
+                                    &log_dir,
+                                    Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
+                                )
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        };
                         if let Some((replay, external_session_id)) = replay_result {
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
@@ -2313,6 +2425,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
                     for (session_id, source) in active_external_sessions {
+                        // Same early-out as the replay read above: the
+                        // per-session external replay is file IO nobody can
+                        // receive once the writer has exited.
+                        if direct_tx.is_closed() {
+                            break;
+                        }
                         // Wrapper-covered sessions replay from the wrapper
                         // log ONLY. The old mtime tiebreak re-sent the whole
                         // external transcript whenever the backend's file
@@ -2331,7 +2449,15 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         if let Some(replay) =
                             external_session_activity_replay_for_websocket(&source, &session_id)
                         {
-                            let _ = direct_tx.send(replay);
+                            if dashboard_control_grant_for_ws.has_owner_dashboard_authority() {
+                                let _ = direct_tx.send(replay);
+                            } else if let Ok(mut replay) =
+                                serde_json::from_str::<serde_json::Value>(&replay)
+                            {
+                                dashboard_control_grant_for_ws
+                                    .filter_dashboard_replay_payload(&mut replay);
+                                let _ = direct_tx.send(replay.to_string());
+                            }
                         }
                     }
 
@@ -2365,8 +2491,6 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     //   {"t":"voice_diagnostic",...}      → AppEvent::VoiceDiagnostic
                     //   {"t":"tool_request", "id":"...", "tool":"...", "args":{}} → tool_response
                     //   {"action":"status", ...}         → AppEvent::ControlCommand
-                    let ws_session_cancel = tokio_util::sync::CancellationToken::new();
-
                     let inbound_ctx = WsInboundCtx {
                         bus: bus.clone(),
                         query_ctx: query_ctx.clone(),
@@ -2403,22 +2527,6 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // Attention-nudge presence: a live `/ws` client is the
                     // "somebody is watching" signal that suppresses pushes.
                     crate::attention_nudge::dashboard_connected();
-
-                    // Outbound: broadcast + direct responses → WebSocket
-                    let outbound = tokio::spawn(ws_outbound_task(
-                        outbound_rx,
-                        direct_rx,
-                        terminal_forward_rx,
-                        ws_tx,
-                        authority_change_rx,
-                        connection_id.clone(),
-                        display_input_authority.clone(),
-                        session_registry.clone(),
-                        bootstrap_caches.clone(),
-                        bootstrap_flushed_rx,
-                        dashboard_control_grant_for_ws.clone(),
-                        ws_session_cancel,
-                    ));
 
                     let _ = tokio::join!(inbound, outbound);
                     crate::attention_nudge::dashboard_disconnected();
@@ -2900,7 +3008,9 @@ mod tests {
         direct_addr: std::net::SocketAddr,
         relay_addr: std::net::SocketAddr,
         server_cert: rustls::pki_types::CertificateDer<'static>,
-        _access_dir: tempfile::TempDir,
+        access_dir: tempfile::TempDir,
+        hosted_identity_path: std::path::PathBuf,
+        bus: EventBus,
     }
 
     impl Drop for RelayIngressTestGateway {
@@ -2910,17 +3020,27 @@ mod tests {
     }
 
     async fn spawn_relay_ingress_test_gateway() -> RelayIngressTestGateway {
+        spawn_relay_ingress_test_gateway_with_config(WebGatewayConfig::default()).await
+    }
+
+    async fn spawn_relay_ingress_test_gateway_with_config(
+        mut config: WebGatewayConfig,
+    ) -> RelayIngressTestGateway {
         let access_dir = tempfile::tempdir().expect("relay gateway test access store");
+        let hosted_identity_path = access_dir.path().join("hosted-identity.pk8");
+        config.hosted_control_identity_path = Some(hosted_identity_path.clone());
+        config.hosted_control_daemon_label = Some("Test daemon".to_string());
         let identity = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_path = access_dir.path().join("server.crt");
         let key_path = access_dir.path().join("server.key");
         std::fs::write(&cert_path, identity.cert.pem()).unwrap();
         std::fs::write(&key_path, identity.signing_key.serialize_pem()).unwrap();
-        let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::Files {
-            cert_path,
-            key_path,
-        })
-        .unwrap();
+        let acceptor =
+            crate::web_tls::build_single_cert_acceptor(&crate::web_tls::TlsCertSource::Files {
+                cert_path,
+                key_path,
+            })
+            .unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let direct_addr = listener.local_addr().unwrap();
@@ -2930,9 +3050,9 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let task = spawn_web_gateway_from_cert_dir_with_relay_listener(
             listener,
-            bus,
+            bus.clone(),
             broadcast_tx,
-            WebGatewayConfig::default(),
+            config,
             ActiveSessionState::empty(),
             None,
             None,
@@ -2953,7 +3073,9 @@ mod tests {
             direct_addr,
             relay_addr,
             server_cert: identity.cert.der().clone(),
-            _access_dir: access_dir,
+            access_dir,
+            hosted_identity_path,
+            bus,
         }
     }
 
@@ -2962,15 +3084,7 @@ mod tests {
         server_cert: rustls::pki_types::CertificateDer<'static>,
         request: &str,
     ) -> String {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(server_cert).unwrap();
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        let mut tls = tls_test_stream(addr, server_cert).await;
         tls.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         tokio::time::timeout(
@@ -2981,6 +3095,99 @@ mod tests {
         .expect("relay ingress response timed out")
         .unwrap();
         String::from_utf8_lossy(&response).into_owned()
+    }
+
+    async fn tls_test_stream(
+        addr: std::net::SocketAddr,
+        server_cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_cert).unwrap();
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        connector.connect(server_name, tcp).await.unwrap()
+    }
+
+    fn http_json(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("HTTP response has a body separator");
+        serde_json::from_str(body).expect("HTTP response body is JSON")
+    }
+
+    struct HostedBrowserKey {
+        pair: ring::signature::EcdsaKeyPair,
+        public_key: String,
+    }
+
+    fn hosted_browser_key() -> HostedBrowserKey {
+        use ring::signature::KeyPair as _;
+
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &rng,
+        )
+        .unwrap();
+        let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8.as_ref(),
+            &rng,
+        )
+        .unwrap();
+        HostedBrowserKey {
+            public_key: crate::daemon_identity::b64u(pair.public_key().as_ref()),
+            pair,
+        }
+    }
+
+    fn hosted_sign(key: &HostedBrowserKey, payload: &str) -> String {
+        let rng = ring::rand::SystemRandom::new();
+        crate::daemon_identity::b64u(key.pair.sign(&rng, payload.as_bytes()).unwrap().as_ref())
+    }
+
+    fn hosted_http_request(method: &str, target: &str, body: Option<&str>) -> String {
+        let body = body.unwrap_or("");
+        let content_headers = if body.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            )
+        };
+        format!(
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{content_headers}Connection: close\r\n\r\n{body}"
+        )
+    }
+
+    fn hosted_proof_headers(
+        key: &HostedBrowserKey,
+        lease: &crate::access::hosted_control::HostedLeaseDocument,
+        method: &str,
+        target: &str,
+        nonce: &str,
+    ) -> String {
+        let timestamp = crate::access::client_key::now_unix_ms();
+        let payload = format!(
+            "{}\n{}\n{}\ndaemon-test\n{}\n{}\n{}",
+            crate::access::hosted_control::REQUEST_PROOF_PROTOCOL,
+            method.to_ascii_uppercase(),
+            target,
+            lease.document_sha256,
+            nonce,
+            timestamp,
+        );
+        format!(
+            "X-Intendant-Hosted-Lease: {}\r\nX-Intendant-Hosted-Nonce: {nonce}\r\nX-Intendant-Hosted-Timestamp: {timestamp}\r\nX-Intendant-Hosted-Proof: {}\r\n",
+            lease.lease_id,
+            hosted_sign(key, &payload),
+        )
     }
 
     async fn next_ws_json_type<S>(ws_rx: &mut S, ty: &str) -> serde_json::Value
@@ -3048,6 +3255,16 @@ mod tests {
             direct.starts_with("HTTP/1.1 200"),
             "genuine direct loopback must retain the trusted-local lane: {direct}"
         );
+        let dark_management = tls_request(
+            gateway.direct_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/api/access/hosted-control", None),
+        )
+        .await;
+        assert!(
+            dark_management.starts_with("HTTP/1.1 404"),
+            "the disabled program must remain absent from trusted dashboard APIs: {dark_management}"
+        );
 
         for request in [
             "GET /config HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -3075,6 +3292,20 @@ mod tests {
         assert!(
             public.starts_with("HTTP/1.1 200"),
             "authority-free discovery bytes must remain reachable through the relay: {public}"
+        );
+        let dark_bootstrap = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/api/hosted-control/bootstrap", None),
+        )
+        .await;
+        assert!(
+            dark_bootstrap.starts_with("HTTP/1.1 404"),
+            "a dark hosted lane must be indistinguishable from an absent endpoint: {dark_bootstrap}"
+        );
+        assert!(
+            !gateway.hosted_identity_path.exists(),
+            "the dark path must not create hosted-control identity material"
         );
 
         let mut cleartext = tokio::net::TcpStream::connect(gateway.relay_addr)
@@ -3104,6 +3335,301 @@ mod tests {
             cleartext_response.is_empty(),
             "relay ingress must not enter the cleartext loopback MCP lane: {}",
             String::from_utf8_lossy(&cleartext_response)
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_lease_is_the_only_relay_control_authority() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        let mut config = WebGatewayConfig::default();
+        config.connect.hosted_control_enabled = true;
+        config.connect.daemon_id = Some("daemon-test".to_string());
+        let gateway = spawn_relay_ingress_test_gateway_with_config(config).await;
+
+        let direct_bootstrap = tls_request(
+            gateway.direct_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/api/hosted-control/bootstrap", None),
+        )
+        .await;
+        assert!(
+            direct_bootstrap.starts_with("HTTP/1.1 404"),
+            "the hosted gate must not replace a direct trusted dashboard: {direct_bootstrap}"
+        );
+
+        let bootstrap_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/api/hosted-control/bootstrap", None),
+        )
+        .await;
+        assert!(
+            bootstrap_response.starts_with("HTTP/1.1 200"),
+            "enabled relay bootstrap must be public: {bootstrap_response}"
+        );
+        let bootstrap: crate::access::hosted_control::HostedControlBootstrap =
+            serde_json::from_value(http_json(&bootstrap_response)).unwrap();
+        assert_eq!(bootstrap.daemon_id, "daemon-test");
+        assert_eq!(bootstrap.fleet_origin, "https://localhost");
+        assert!(
+            !bootstrap.display_media_relay_configured,
+            "control relay must not be reported as display media reachability"
+        );
+
+        let key = hosted_browser_key();
+        let mut input = crate::access::hosted_control::HostedLeaseRequestInput {
+            browser_public_key: key.public_key.clone(),
+            requested_preset: crate::access::hosted_control::HostedPreset::Tasks,
+            requested_ttl_secs: 3600,
+            requester_label: "Relay browser".to_string(),
+            nonce: format!("nonce-{}", uuid::Uuid::new_v4().simple()),
+            timestamp_unix_ms: crate::access::client_key::now_unix_ms(),
+            signature: String::new(),
+        };
+        input.signature = hosted_sign(
+            &key,
+            &input.proof_payload("daemon-test", "https://localhost"),
+        );
+        let create_body = serde_json::to_string(&input).unwrap();
+        let create_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("POST", "/api/hosted-control/requests", Some(&create_body)),
+        )
+        .await;
+        assert!(
+            create_response.starts_with("HTTP/1.1 200"),
+            "signed doorbell creation failed: {create_response}"
+        );
+        let request: crate::access::hosted_control::HostedLeaseRequest =
+            serde_json::from_value(http_json(&create_response)).unwrap();
+        let pending_state = crate::access::iam::load_state(gateway.access_dir.path()).unwrap();
+        assert!(
+            pending_state
+                .principals
+                .iter()
+                .all(|principal| principal.source != crate::access::hosted_control::HOSTED_SOURCE),
+            "a pending doorbell must not create authority"
+        );
+
+        let decision_body = serde_json::json!({
+            "request_id": request.request_id,
+            "approve": true
+        })
+        .to_string();
+        let decision_response = tls_request(
+            gateway.direct_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request(
+                "POST",
+                "/api/access/hosted-control/requests/decide",
+                Some(&decision_body),
+            ),
+        )
+        .await;
+        assert!(
+            decision_response.starts_with("HTTP/1.1 200"),
+            "trusted-local approval failed: {decision_response}"
+        );
+        let lease: crate::access::hosted_control::HostedLeaseDocument =
+            serde_json::from_value(http_json(&decision_response)["lease"].clone()).unwrap();
+
+        let poll_nonce = format!("poll-{}", uuid::Uuid::new_v4().simple());
+        let poll_timestamp = crate::access::client_key::now_unix_ms();
+        let poll_payload = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            crate::access::hosted_control::POLL_PROOF_PROTOCOL,
+            request.request_id,
+            request.document_sha256(),
+            poll_nonce,
+            poll_timestamp,
+        );
+        let poll_body = serde_json::json!({
+            "request_id": request.request_id,
+            "nonce": poll_nonce,
+            "timestamp_unix_ms": poll_timestamp,
+            "signature": hosted_sign(&key, &poll_payload),
+        })
+        .to_string();
+        let poll_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request(
+                "POST",
+                "/api/hosted-control/requests/poll",
+                Some(&poll_body),
+            ),
+        )
+        .await;
+        assert!(poll_response.starts_with("HTTP/1.1 200"));
+        let polled: crate::access::hosted_control::HostedLeasePollResult =
+            serde_json::from_value(http_json(&poll_response)).unwrap();
+        assert_eq!(polled.lease.as_ref(), Some(&lease));
+
+        let config_target = "/config?hosted_probe=1";
+        let config_headers =
+            hosted_proof_headers(&key, &lease, "GET", config_target, "config-proof");
+        let config_request = format!(
+            "GET {config_target} HTTP/1.1\r\nHost: localhost\r\n{config_headers}Connection: close\r\n\r\n"
+        );
+        let config_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &config_request,
+        )
+        .await;
+        assert!(
+            config_response.starts_with("HTTP/1.1 200"),
+            "proved allowed route failed: {config_response}"
+        );
+        let projected_config = http_json(&config_response);
+        assert!(projected_config.get("provider").is_some());
+        assert!(projected_config.get("presence_enabled").is_none());
+        assert!(projected_config.get("connect").is_none());
+
+        let replay_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &config_request,
+        )
+        .await;
+        assert!(
+            replay_response.starts_with("HTTP/1.1 401") && replay_response.contains("already used"),
+            "HTTP proof replay must fail: {replay_response}"
+        );
+
+        let unproved = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &hosted_http_request("GET", "/config", None),
+        )
+        .await;
+        assert!(
+            unproved.starts_with("HTTP/1.1 403") && unproved.contains("discovery-only"),
+            "unproved relay control must retain the discovery-only refusal: {unproved}"
+        );
+        let mcp_headers = hosted_proof_headers(&key, &lease, "POST", "/mcp", "mcp-proof");
+        let proved_mcp = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &format!(
+                "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{mcp_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            proved_mcp.starts_with("HTTP/1.1 403") && proved_mcp.contains("discovery-only"),
+            "a hosted proof must never open MCP: {proved_mcp}"
+        );
+
+        let ticket_target = "/api/hosted-control/ws-ticket";
+        let ticket_headers =
+            hosted_proof_headers(&key, &lease, "POST", ticket_target, "ticket-proof");
+        let ticket_response = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &format!(
+                "POST {ticket_target} HTTP/1.1\r\nHost: localhost\r\n{ticket_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            ticket_response.starts_with("HTTP/1.1 200"),
+            "ticket mint failed: {ticket_response}"
+        );
+        let ticket = http_json(&ticket_response)["ticket"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let tls = tls_test_stream(gateway.relay_addr, gateway.server_cert.clone()).await;
+        let (mut ws, upgrade) = tokio_tungstenite::client_async(
+            format!("wss://localhost/?hosted_ticket={ticket}"),
+            tls,
+        )
+        .await
+        .expect("ticketed hosted WSS upgrade");
+        assert_eq!(
+            upgrade.status(),
+            tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
+        );
+
+        let mut bus_rx = gateway.bus.subscribe();
+        ws.send(Message::Text(r#"{"action":"status"}"#.into()))
+            .await
+            .unwrap();
+        let allowed = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    bus_rx.recv().await.unwrap(),
+                    AppEvent::ControlCommand(ControlMsg::Status { .. })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "Tasks lease did not dispatch an allowed status"
+        );
+
+        ws.send(Message::Text(r#"{"action":"approve","id":7}"#.into()))
+            .await
+            .unwrap();
+        let denied = next_ws_json_type(&mut ws, "ws_denied").await;
+        assert_eq!(denied["frame"], "untyped");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        while let Ok(event) = bus_rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ControlCommand(ControlMsg::Approve { .. })),
+                "immutable approval floor reached the control bus"
+            );
+        }
+
+        let reused_ticket = tls_request(
+            gateway.relay_addr,
+            gateway.server_cert.clone(),
+            &format!(
+                "GET /?hosted_ticket={ticket} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            reused_ticket.starts_with("HTTP/1.1 401") && reused_ticket.contains("already used"),
+            "a consumed WSS ticket must not upgrade again: {reused_ticket}"
+        );
+
+        let runtime = crate::access::hosted_control::HostedControlRuntime::new(
+            true,
+            gateway.access_dir.path().to_path_buf(),
+            Some(&gateway.hosted_identity_path),
+            Some("daemon-test"),
+            "Test daemon".to_string(),
+            false,
+        );
+        runtime
+            .revoke_lease(
+                &lease.lease_id,
+                &crate::access::iam::AccessPrincipal::root_dashboard_session(
+                    "test",
+                    "trusted-local",
+                ),
+            )
+            .unwrap();
+        let closed = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "live hosted socket did not close after lease revocation"
         );
     }
 

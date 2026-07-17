@@ -44,6 +44,7 @@ impl SessionSupervisor {
         attachments: Vec<String>,
         codex_service_tier: Option<String>,
         worktree: Option<SessionWorktreeRequest>,
+        hosted_lease_id: Option<String>,
     ) -> Option<String> {
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
@@ -449,6 +450,38 @@ impl SessionSupervisor {
             .as_ref()
             .map(|b| b.as_short_str().to_string())
             .unwrap_or_else(|| "intendant".to_string());
+
+        if let Some(lease_id) = hosted_lease_id.as_deref() {
+            let mark_result = self
+                .config
+                .hosted_control_cert_dir
+                .as_deref()
+                .ok_or_else(|| {
+                    crate::access::AccessError(
+                        "hosted-control IAM storage is unavailable".to_string(),
+                    )
+                })
+                .and_then(|cert_dir| {
+                    crate::access::hosted_control::mark_session_created_by_hosted_lease(
+                        cert_dir,
+                        lease_id,
+                        &session_id,
+                    )
+                });
+            if let Err(error) = mark_result {
+                let reason = format!("hosted session authorization failed: {error}");
+                slog(&session_log, |log| {
+                    log.write_summary(&task, &format!("error: {reason}"), 0)
+                });
+                self.loop_error(format!("Session create failed: {reason}"));
+                self.config.bus.send(AppEvent::SessionEnded {
+                    session_id,
+                    reason: format!("error: {reason}"),
+                    error_kind: None,
+                });
+                return None;
+            }
+        }
 
         let emit_session_started_after_identity = backend.is_some();
         if !emit_session_started_after_identity {

@@ -123,6 +123,18 @@ impl FleetZone {
         ))
     }
 
+    /// Whether this daemon currently has at least one address published.
+    /// Directory navigation uses this as an availability hint only; the
+    /// target daemon remains authoritative for TLS and hosted leases.
+    pub fn has_daemon_route(&self, daemon_id: &str) -> bool {
+        let Some(label) = daemon_label(daemon_id) else {
+            return false;
+        };
+        let data = self.data.read().unwrap_or_else(|error| error.into_inner());
+        data.v4.get(&label).is_some_and(|values| !values.is_empty())
+            || data.v6.get(&label).is_some_and(|values| !values.is_empty())
+    }
+
     fn bump_serial(&self) {
         self.serial.fetch_add(1, Ordering::Relaxed);
     }
@@ -528,6 +540,17 @@ mod tests {
         assert!(daemon_label("").is_none());
         assert!(daemon_label("   ").is_none());
         assert_ne!(daemon_label("a"), daemon_label("b"));
+    }
+
+    #[test]
+    fn daemon_route_hint_requires_a_published_address() {
+        let zone = FleetZone::new("fleet.example.test", "ns.example.test").unwrap();
+        assert!(!zone.has_daemon_route("daemon-1"));
+        zone.set_daemon_addresses("daemon-1", &["192.0.2.10".parse().unwrap()])
+            .unwrap();
+        assert!(zone.has_daemon_route("daemon-1"));
+        zone.remove_daemon("daemon-1");
+        assert!(!zone.has_daemon_route("daemon-1"));
     }
 
     #[test]

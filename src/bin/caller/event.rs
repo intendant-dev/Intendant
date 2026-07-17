@@ -141,9 +141,14 @@ pub enum AppEvent {
         source: Option<String>,
     },
     /// Incremental text delta from streaming model response.
+    ///
+    /// `text` is `Arc<str>`: this is the highest-rate bus event (one per
+    /// streamed token) and the broadcast ring clones the whole event once
+    /// per subscriber, so a shared payload makes each per-subscriber clone
+    /// a refcount bump instead of a heap copy of the delta text.
     ModelResponseDelta {
         session_id: Option<String>,
-        text: String,
+        text: Arc<str>,
     },
     JsonExtracted {
         preview: String,
@@ -1619,6 +1624,12 @@ pub enum ControlMsg {
         /// `session-<short-id>`; collisions get a numeric suffix.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_branch: Option<String>,
+        /// Internal provenance set only by an authenticated hosted-control
+        /// transport. This is never accepted from or emitted onto the wire;
+        /// the session supervisor revalidates the named lease before marking
+        /// the newly allocated session hosted-eligible.
+        #[serde(skip)]
+        hosted_lease_id: Option<String>,
     },
     /// Delegate a task to a new supervised sub-agent under an existing
     /// internal session (the dashboard "delegate" action). The child is
@@ -3201,7 +3212,10 @@ impl DeltaCoalesceBuffer {
     /// the same byte stream.
     fn flush(&mut self, outbound_tx: &tokio::sync::broadcast::Sender<String>) {
         for (session_id, text) in self.pending.drain(..) {
-            let outbound = crate::types::OutboundEvent::ModelResponseDelta { session_id, text };
+            let outbound = crate::types::OutboundEvent::ModelResponseDelta {
+                session_id,
+                text: text.into(),
+            };
             if let Ok(json) = serde_json::to_string(&outbound) {
                 let _ = outbound_tx.send(json);
             }
@@ -4036,7 +4050,7 @@ mod tests {
             for _ in 0..deltas_per_intent {
                 bus.send(AppEvent::ModelResponseDelta {
                     session_id: Some("flood".to_string()),
-                    text: "x".to_string(),
+                    text: "x".into(),
                 });
             }
             bus.send(AppEvent::ControlCommand(ControlMsg::SetAutonomy {
@@ -4086,7 +4100,7 @@ mod tests {
         // Not on the lane: high-frequency stream events.
         bus.send(AppEvent::ModelResponseDelta {
             session_id: None,
-            text: "ignored".to_string(),
+            text: "ignored".into(),
         });
         bus.send(AppEvent::SessionIdentity {
             session_id: "s2".to_string(),
@@ -4191,12 +4205,12 @@ mod tests {
         for text in ["a", "b", "c"] {
             bus.send(AppEvent::ModelResponseDelta {
                 session_id: Some("s1".to_string()),
-                text: text.to_string(),
+                text: text.into(),
             });
         }
         bus.send(AppEvent::ModelResponseDelta {
             session_id: Some("s2".to_string()),
-            text: "z".to_string(),
+            text: "z".into(),
         });
         // Non-delta event: every delta sent above must flush before it.
         bus.send(AppEvent::DoneSignal {
@@ -4246,7 +4260,7 @@ mod tests {
         });
         bus.send(AppEvent::ModelResponseDelta {
             session_id: Some("s1".to_string()),
-            text: "after".to_string(),
+            text: "after".into(),
         });
 
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
@@ -4614,6 +4628,7 @@ mod tests {
                 attachments: vec!["upload:u1".to_string()],
                 worktree: Some(true),
                 worktree_branch: Some("feature-branch".to_string()),
+                hosted_lease_id: None,
             },
             ControlMsg::StartTask {
                 session_id: None,
@@ -4886,6 +4901,7 @@ mod tests {
                 attachments,
                 worktree,
                 worktree_branch,
+                hosted_lease_id,
             } => {
                 assert_eq!(task, "fix bug");
                 assert!(claude_model.is_none());
@@ -4910,6 +4926,7 @@ mod tests {
                 // Legacy payloads without the worktree fields parse as "off".
                 assert!(worktree.is_none());
                 assert!(worktree_branch.is_none());
+                assert!(hosted_lease_id.is_none());
             }
             _ => panic!("expected CreateSession"),
         }
@@ -6264,7 +6281,7 @@ mod tests {
         for i in 0..5000 {
             bus.send(AppEvent::ModelResponseDelta {
                 session_id: Some("thread-1".to_string()),
-                text: format!("delta-{i}"),
+                text: format!("delta-{i}").into(),
             });
             bus.send(AppEvent::Tick);
         }
@@ -6512,11 +6529,46 @@ mod tests {
     fn outbound_model_response_delta() {
         let event = AppEvent::ModelResponseDelta {
             session_id: None,
-            text: "hello".to_string(),
+            text: "hello".into(),
         };
         let outbound = app_event_to_outbound(&event).unwrap();
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"model_response_delta\""));
+    }
+
+    /// `text` is `Arc<str>`; serde (via the `rc` feature) must serialize it
+    /// exactly like the `String` it replaced — a plain JSON string — so the
+    /// outbound wire line is byte-identical, and wire consumers (the peer
+    /// `WireEventUpcaster`) must deserialize it back.
+    #[test]
+    fn outbound_model_response_delta_wire_json_is_pinned() {
+        let with_session = crate::types::OutboundEvent::ModelResponseDelta {
+            session_id: Some("s1".to_string()),
+            text: "hello".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&with_session).unwrap(),
+            r#"{"event":"model_response_delta","session_id":"s1","text":"hello"}"#
+        );
+
+        let without_session = crate::types::OutboundEvent::ModelResponseDelta {
+            session_id: None,
+            text: "hi".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&without_session).unwrap(),
+            r#"{"event":"model_response_delta","text":"hi"}"#
+        );
+
+        match serde_json::from_str::<crate::types::OutboundEvent>(
+            r#"{"event":"model_response_delta","session_id":"s1","text":"hello"}"#,
+        ) {
+            Ok(crate::types::OutboundEvent::ModelResponseDelta { session_id, text }) => {
+                assert_eq!(session_id.as_deref(), Some("s1"));
+                assert_eq!(&*text, "hello");
+            }
+            other => panic!("expected ModelResponseDelta, got {other:?}"),
+        }
     }
 
     #[test]
