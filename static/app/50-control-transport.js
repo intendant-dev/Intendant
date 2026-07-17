@@ -1651,6 +1651,10 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
+    // Fork points cold-scan the backend's whole transcript server-side
+    // (gigabyte codex rollouts parse in 6-11s per pass, two passes on a
+    // cache miss) — the generic 5 s local-read default aborts mid-scan.
+    case 'api_session_fork_points':
     case 'api_mcp_tool_call':
       return 120000;
     case 'api_session_detail':
