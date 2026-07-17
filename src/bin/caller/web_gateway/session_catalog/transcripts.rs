@@ -3033,8 +3033,7 @@ mod tests {
         assert!(entries
             .iter()
             .filter(|e| e["source"] != "User")
-            .all(|e| e.get("user_turn_index").is_none()
-                && e.get("user_turn_revision").is_none()));
+            .all(|e| e.get("user_turn_index").is_none() && e.get("user_turn_revision").is_none()));
         // The cross-lane contract that makes the signatures collapse: the
         // live lane's counter (UserTurnRevisionState, external_mode round
         // bookkeeping) and the replay/hydration counter mint identical
