@@ -11,15 +11,18 @@ pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TAGS: usize = 32;
 pub(crate) const MAX_TAG_CHARS: usize = 100;
 
-/// What an agenda entry is. `question` is reserved by the umbrella RFC
-/// (§7.1) for a later slice — adding it extends this enum and the fold, not
-/// the wire framing. Kinds and effects are orthogonal: no kind implies any
-/// delivery or execution behavior.
+/// What an agenda entry is. Kinds and effects are orthogonal: no kind
+/// implies any delivery or execution behavior. `Question` (slice A4) is a
+/// durable, non-blocking ask — the counterpart of the ephemeral blocking
+/// `ask_user` rail: an agent parks it, dies, and reads the owner's reply
+/// in a later session via the `answer` op. Older builds reading a newer
+/// log skip `question` lines by the usual forward-compat rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgendaKind {
     Note,
     Task,
+    Question,
 }
 
 /// Fold-derived lifecycle state. Transitions are explicit ops — `Complete`
@@ -74,6 +77,22 @@ impl AgendaActor {
     }
 }
 
+/// The current reply on a question item (fold view of the latest `answer`
+/// op — earlier replies stay in the log as history). Attribution mirrors
+/// [`AgendaActor`]: the answering surface's gate-resolved identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaAnswer {
+    /// The reply text — data, never instructions (same doctrine as bodies).
+    pub(crate) text: String,
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+}
+
 /// Birth attribution carried on the item (from its `add` op).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaProvenance {
@@ -113,6 +132,11 @@ pub struct AgendaItem {
     /// preserved by `Retire` as history).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) completed_ms: Option<u64>,
+    /// The current reply, question items only. Answering resolves the
+    /// question (status `Done`); `Reopen` re-asks and clears this view
+    /// (the log keeps every reply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) answer: Option<AgendaAnswer>,
 }
 
 /// Field-level patch of presentation state (umbrella RFC §7.2: `Patch`
@@ -200,11 +224,17 @@ pub enum AgendaCommand {
     Retire {
         id: String,
     },
+    /// Reply to an open question (question items only). Resolves it.
+    Answer {
+        id: String,
+        text: String,
+    },
 }
 
 /// A durable op — the payload of one log line. Compatible with the
-/// umbrella RFC §7.2 vocabulary; effect/occurrence/journal operations are
-/// reserved there and intentionally absent in v1.
+/// umbrella RFC §7.2 vocabulary (`Answer` rides the `question` kind per
+/// §7.1); effect/occurrence/journal operations are reserved there and
+/// intentionally absent in v1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AgendaOp {
@@ -232,6 +262,10 @@ pub(crate) enum AgendaOp {
     Retire {
         id: String,
     },
+    Answer {
+        id: String,
+        text: String,
+    },
 }
 
 impl AgendaOp {
@@ -242,7 +276,8 @@ impl AgendaOp {
             | AgendaOp::Patch { id, .. }
             | AgendaOp::Complete { id }
             | AgendaOp::Reopen { id }
-            | AgendaOp::Retire { id } => id,
+            | AgendaOp::Retire { id }
+            | AgendaOp::Answer { id, .. } => id,
         }
     }
 }
@@ -313,6 +348,7 @@ pub(crate) fn apply_op(
                     status: AgendaStatus::Open,
                     updated_ms: at_ms,
                     completed_ms: None,
+                    answer: None,
                 },
             );
             None
@@ -359,6 +395,9 @@ pub(crate) fn apply_op(
                 AgendaStatus::Done | AgendaStatus::Retired => {
                     item.status = AgendaStatus::Open;
                     item.completed_ms = None;
+                    // Re-asking a question awaits a fresh reply; earlier
+                    // replies remain in the log as history.
+                    item.answer = None;
                     item.updated_ms = at_ms;
                     None
                 }
@@ -377,6 +416,34 @@ pub(crate) fn apply_op(
                     item.status = AgendaStatus::Retired;
                     item.updated_ms = at_ms;
                     None
+                }
+            }
+        }
+        AgendaOp::Answer { id, text } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("answer for unknown {id} ignored"));
+            };
+            if item.kind != AgendaKind::Question {
+                return Some(format!("answer on non-question {id} ignored"));
+            }
+            match item.status {
+                AgendaStatus::Open => {
+                    let actor = rec.actor.clone().unwrap_or_default();
+                    item.answer = Some(AgendaAnswer {
+                        text: text.clone(),
+                        at_ms,
+                        principal: actor.principal,
+                        session_id: actor.session_id,
+                        kind: actor.kind,
+                    });
+                    // A reply resolves the question.
+                    item.status = AgendaStatus::Done;
+                    item.completed_ms = Some(at_ms);
+                    item.updated_ms = at_ms;
+                    None
+                }
+                AgendaStatus::Done | AgendaStatus::Retired => {
+                    Some(format!("answer on resolved {id} ignored"))
                 }
             }
         }
@@ -606,6 +673,139 @@ mod tests {
         let local = AgendaActor::from_binding(&ActorBinding::dashboard(None)).unwrap();
         assert_eq!(local.principal, None);
         assert_eq!(local.kind.as_deref(), Some("dashboard"));
+    }
+
+    /// A4: answering resolves; re-answer warns; reopen re-asks (clears
+    /// the answer view, history stays in the log); answers carry the
+    /// gate-resolved attribution; non-questions never accept answers.
+    #[test]
+    fn question_lifecycle_answer_resolves_and_reopen_reasks() {
+        let mut items = BTreeMap::new();
+        apply_op(
+            &mut items,
+            &rec(
+                1,
+                AgendaOp::Add {
+                    id: "q".into(),
+                    kind: AgendaKind::Question,
+                    title: "Which DB for the cache?".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                },
+            ),
+        );
+        let mut answer = rec(
+            2,
+            AgendaOp::Answer {
+                id: "q".into(),
+                text: "sqlite is fine".into(),
+            },
+        );
+        answer.actor = Some(AgendaActor {
+            principal: Some("principal:root:dashboard".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        });
+        assert!(apply_op(&mut items, &answer).is_none());
+        let q = &items["q"];
+        assert_eq!(q.status, AgendaStatus::Done);
+        assert_eq!(q.completed_ms, Some(2));
+        let reply = q.answer.as_ref().unwrap();
+        assert_eq!(reply.text, "sqlite is fine");
+        assert_eq!(reply.kind.as_deref(), Some("dashboard"));
+        assert_eq!(reply.principal.as_deref(), Some("principal:root:dashboard"));
+
+        // Re-answer on resolved warns and changes nothing.
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                3,
+                AgendaOp::Answer {
+                    id: "q".into(),
+                    text: "no, postgres".into()
+                }
+            )
+        )
+        .is_some());
+        assert_eq!(items["q"].answer.as_ref().unwrap().text, "sqlite is fine");
+
+        // Reopen re-asks; a fresh answer lands.
+        apply_op(&mut items, &rec(4, AgendaOp::Reopen { id: "q".into() }));
+        assert_eq!(items["q"].status, AgendaStatus::Open);
+        assert!(items["q"].answer.is_none());
+        apply_op(
+            &mut items,
+            &rec(
+                5,
+                AgendaOp::Answer {
+                    id: "q".into(),
+                    text: "postgres after all".into(),
+                },
+            ),
+        );
+        assert_eq!(
+            items["q"].answer.as_ref().unwrap().text,
+            "postgres after all"
+        );
+
+        // Tasks never accept answers.
+        apply_op(&mut items, &rec(6, add("t", "a task")));
+        assert!(apply_op(
+            &mut items,
+            &rec(
+                7,
+                AgendaOp::Answer {
+                    id: "t".into(),
+                    text: "nope".into()
+                }
+            )
+        )
+        .is_some());
+        assert!(items["t"].answer.is_none());
+        assert_eq!(items["t"].status, AgendaStatus::Open);
+    }
+
+    /// Pins the answer op's durable line format (additive to v1).
+    #[test]
+    fn answer_record_line_format_is_pinned() {
+        let record = AgendaOpRecord {
+            v: 1,
+            at_ms: 7,
+            actor: Some(AgendaActor {
+                principal: Some("principal:root:dashboard".into()),
+                session_id: None,
+                kind: Some("dashboard".into()),
+            }),
+            op: AgendaOp::Answer {
+                id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                text: "yes — ship it".into(),
+            },
+        };
+        let line = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            line,
+            r#"{"v":1,"at_ms":7,"actor":{"principal":"principal:root:dashboard","kind":"dashboard"},"op":{"type":"answer","id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","text":"yes — ship it"}}"#
+        );
+        let back: AgendaOpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn question_command_wire_shapes_parse() {
+        let ask: AgendaCommand =
+            serde_json::from_str(r#"{"op":"add","kind":"question","title":"deploy now?"}"#)
+                .unwrap();
+        assert!(matches!(
+            ask,
+            AgendaCommand::Add {
+                kind: AgendaKind::Question,
+                ..
+            }
+        ));
+        let answer: AgendaCommand =
+            serde_json::from_str(r#"{"op":"answer","id":"01X","text":"yes"}"#).unwrap();
+        assert!(matches!(answer, AgendaCommand::Answer { .. }));
     }
 
     #[test]

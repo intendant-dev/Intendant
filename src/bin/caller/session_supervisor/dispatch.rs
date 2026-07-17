@@ -398,6 +398,7 @@ impl SessionSupervisor {
                         claude_permission_mode,
                         claude_allowed_tools,
                         claude_effort,
+                        ..Default::default()
                     },
                 )
                 .await;
@@ -538,6 +539,7 @@ impl SessionSupervisor {
                         claude_permission_mode,
                         claude_allowed_tools,
                         claude_effort,
+                        ..Default::default()
                     },
                 )
                 .await;
