@@ -1990,7 +1990,7 @@ impl SessionLog {
                 meta.last_turn = Some(total_turns);
                 meta.rounds = rounds;
                 if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                    if let Err(e) = fs::write(&meta_path, &json) {
+                    if let Err(e) = write_session_meta_atomic(&self.dir, &json) {
                         eprintln!("session_log: failed to update session_meta.json: {}", e);
                     }
                 }

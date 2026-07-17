@@ -67,7 +67,7 @@ pub(crate) fn fork_native_session_at_seq(
     if let Some(name) = child_name.map(str::trim).filter(|name| !name.is_empty()) {
         meta["name"] = serde_json::Value::String(name.to_string());
     }
-    std::fs::write(child_log_dir.join("session_meta.json"), meta.to_string())
+    crate::session_log::write_session_meta_atomic(&child_log_dir, &meta.to_string())
         .map_err(|err| format!("failed to write the child session meta: {err}"))?;
 
     // Durable lineage edge in the child's own spine, in the exact
