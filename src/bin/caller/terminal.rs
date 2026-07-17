@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder as PtyCommandBuilder, MasterPty, PtySize};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 /// Max scrollback retained per session, in bytes. 256 KB replays several
 /// screens of recent output (full-screen TUI redraws included) on
@@ -1098,11 +1098,47 @@ impl Drop for PtySession {
     }
 }
 
+/// One registry slot: a live session, or a reservation for a spawn in
+/// flight. The `Opening` placeholder is inserted under the write lock and
+/// the PTY spawn then runs with NO lock held, so one slow shell spawn no
+/// longer serializes every other terminal open/attach/close across all
+/// sessions. Concurrent opens of the same key wait on the reservation
+/// instead of double-spawning; reads (`get_visible`, `close_visible`,
+/// `set_shared`) treat a reservation as absent — the session does not
+/// exist yet, so a read racing the open is simply ordered before it.
+enum SessionSlot {
+    Live(Arc<PtySession>),
+    Opening(Arc<OpeningSlot>),
+}
+
+/// A spawn reservation. Waiters subscribe to `done` and re-inspect the
+/// registry once it settles; the opener flips it to `true` only AFTER
+/// publishing the spawn's outcome to the map. If the opener's task is
+/// cancelled between reserving and publishing, the `watch::Sender` drops
+/// with the flag still `false` — waiters observe the closed channel,
+/// heal the registry (restore `prev` / remove the reservation), and
+/// retry, so a reservation can never wedge its key. The wait is bounded
+/// by the spawn attempt itself, exactly as callers previously blocked on
+/// the write lock for the spawn's duration.
+struct OpeningSlot {
+    done: watch::Receiver<bool>,
+    /// The dead session being replaced, restored if the spawn fails or
+    /// is abandoned — a failed replacement must leave the registry as
+    /// the spawn-under-lock code did (dead session still present).
+    prev: Option<Arc<PtySession>>,
+}
+
+/// Whether `entry` is this exact reservation (and not a later slot that
+/// replaced it while the opener was unlocked).
+fn slot_is_current(entry: Option<&SessionSlot>, slot: &Arc<OpeningSlot>) -> bool {
+    matches!(entry, Some(SessionSlot::Opening(current)) if Arc::ptr_eq(current, slot))
+}
+
 /// Process-wide registry of live shell sessions, keyed by
 /// `(host_id, terminal_id)`. Held by the web gateway inside an `Arc` so
 /// every WS connection can reach the same pool.
 pub struct TerminalRegistry {
-    sessions: RwLock<HashMap<TerminalKey, Arc<PtySession>>>,
+    sessions: RwLock<HashMap<TerminalKey, SessionSlot>>,
     project_root: std::path::PathBuf,
 }
 
@@ -1126,6 +1162,13 @@ impl TerminalRegistry {
     /// allowed to attach. `policy.scope` sandboxes the new shell (see
     /// [`ShellSpawnPolicy`]). The `bool` in the Ok tuple is `true` when a
     /// new shell was spawned.
+    ///
+    /// The spawn itself runs with NO registry lock held: the opener
+    /// reserves the key with an [`SessionSlot::Opening`] placeholder
+    /// under the write lock, releases, spawns, then re-takes the lock to
+    /// publish the result. Concurrent opens of the same key wait on the
+    /// reservation and then attach through the same `visible_to` check;
+    /// opens of different keys proceed fully in parallel.
     pub async fn open_or_attach(
         &self,
         key: TerminalKey,
@@ -1134,6 +1177,30 @@ impl TerminalRegistry {
         actor: &TerminalActor,
         policy: ShellSpawnPolicy,
     ) -> Result<(Arc<PtySession>, bool), TerminalOpenError> {
+        let project_root = self.project_root.clone();
+        let owner = actor.owner_tag();
+        let shared = policy.shared;
+        let scope = policy.scope.clone();
+        self.open_or_attach_with(key, actor, policy.may_spawn, move || {
+            PtySession::spawn(cols, rows, Some(project_root), owner, shared, scope.as_ref())
+        })
+        .await
+    }
+
+    /// [`Self::open_or_attach`] behind an injectable spawner, the seam
+    /// the lock-discipline tests use to count, slow down, or fail the
+    /// spawn. The spawner is invoked at most once per call and always
+    /// with no registry lock held.
+    async fn open_or_attach_with<F>(
+        &self,
+        key: TerminalKey,
+        actor: &TerminalActor,
+        may_spawn: bool,
+        spawn: F,
+    ) -> Result<(Arc<PtySession>, bool), TerminalOpenError>
+    where
+        F: FnOnce() -> Result<Arc<PtySession>, String>,
+    {
         let attach = |existing: &Arc<PtySession>| {
             if existing.visible_to(actor) {
                 Ok((existing.clone(), false))
@@ -1141,68 +1208,174 @@ impl TerminalRegistry {
                 Err(TerminalOpenError::NotVisible)
             }
         };
-        {
-            let guard = self.sessions.read().await;
-            if let Some(existing) = guard.get(&key) {
-                if existing.is_alive() {
-                    return attach(existing);
+        // At most one spawn per call: the claiming iteration returns on
+        // both of its branches, so the loop can only re-run as a waiter.
+        let mut spawn = Some(spawn);
+        loop {
+            // Fast path under the read lock.
+            enum Plan {
+                Attach(Arc<PtySession>),
+                Wait(Arc<OpeningSlot>),
+                Claim,
+            }
+            let plan = {
+                let guard = self.sessions.read().await;
+                match guard.get(&key) {
+                    Some(SessionSlot::Live(existing)) if existing.is_alive() => {
+                        Plan::Attach(existing.clone())
+                    }
+                    Some(SessionSlot::Opening(slot)) => Plan::Wait(slot.clone()),
+                    _ => Plan::Claim,
+                }
+            };
+            match plan {
+                Plan::Attach(existing) => return attach(&existing),
+                Plan::Wait(slot) => {
+                    self.await_opening(&key, slot).await;
+                    continue;
+                }
+                Plan::Claim => {}
+            }
+
+            // Claim: re-check under the write lock (another task may have
+            // spawned or reserved while we were unlocked), then reserve
+            // the key and release before spawning.
+            enum Claimed {
+                Attach(Arc<PtySession>),
+                Wait(Arc<OpeningSlot>),
+                Reserved(Arc<OpeningSlot>, watch::Sender<bool>),
+            }
+            let claimed = {
+                let mut guard = self.sessions.write().await;
+                match guard.get(&key) {
+                    Some(SessionSlot::Live(existing)) if existing.is_alive() => {
+                        Claimed::Attach(existing.clone())
+                    }
+                    Some(SessionSlot::Opening(slot)) => Claimed::Wait(slot.clone()),
+                    other => {
+                        // Absent or dead: creating (or replacing — a
+                        // replacement is a spawn and follows spawn rules)
+                        // requires shell.spawn. Refusal leaves the dead
+                        // session in place, exactly as before.
+                        if !may_spawn {
+                            return Err(TerminalOpenError::SpawnNotAllowed);
+                        }
+                        let prev = match other {
+                            Some(SessionSlot::Live(dead)) => Some(dead.clone()),
+                            _ => None,
+                        };
+                        let (done_tx, done_rx) = watch::channel(false);
+                        let slot = Arc::new(OpeningSlot {
+                            done: done_rx,
+                            prev,
+                        });
+                        guard.insert(key.clone(), SessionSlot::Opening(slot.clone()));
+                        Claimed::Reserved(slot, done_tx)
+                    }
+                }
+            };
+            let (slot, done) = match claimed {
+                Claimed::Attach(existing) => return attach(&existing),
+                Claimed::Wait(slot) => {
+                    self.await_opening(&key, slot).await;
+                    continue;
+                }
+                Claimed::Reserved(slot, done) => (slot, done),
+            };
+
+            // Spawn the PTY with no lock held: other keys (and every
+            // other registry operation) proceed while the shell starts.
+            let spawn = spawn.take().expect("spawner consumed twice");
+            let spawned = spawn();
+
+            return match spawned {
+                Ok(session) => {
+                    {
+                        let mut guard = self.sessions.write().await;
+                        if slot_is_current(guard.get(&key), &slot) {
+                            guard.insert(key.clone(), SessionSlot::Live(session.clone()));
+                        }
+                    }
+                    // Wake waiters only after the map shows the result.
+                    let _ = done.send(true);
+                    Ok((session, true))
+                }
+                Err(err) => {
+                    {
+                        let mut guard = self.sessions.write().await;
+                        if slot_is_current(guard.get(&key), &slot) {
+                            match &slot.prev {
+                                Some(dead) => {
+                                    guard.insert(key.clone(), SessionSlot::Live(dead.clone()));
+                                }
+                                None => {
+                                    guard.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    let _ = done.send(true);
+                    // Waiters re-check the map and retry — matching the
+                    // spawn-under-lock era, where each blocked caller
+                    // proceeded to its own attempt once the failed
+                    // spawner released the write lock.
+                    Err(TerminalOpenError::Spawn(err))
+                }
+            };
+        }
+    }
+
+    /// Park until an in-flight open on `key` settles. If the opener
+    /// abandoned the attempt (task cancelled between reserving and
+    /// publishing — the sender dropped with the flag still `false`),
+    /// heal the registry so the key cannot stay wedged: restore the
+    /// replaced dead session, or remove the stale reservation.
+    async fn await_opening(&self, key: &TerminalKey, slot: Arc<OpeningSlot>) {
+        let mut done = slot.done.clone();
+        if done.wait_for(|done| *done).await.is_ok() {
+            return;
+        }
+        let mut guard = self.sessions.write().await;
+        if slot_is_current(guard.get(key), &slot) {
+            match &slot.prev {
+                Some(dead) => {
+                    guard.insert(key.clone(), SessionSlot::Live(dead.clone()));
+                }
+                None => {
+                    guard.remove(key);
                 }
             }
         }
-
-        let mut guard = self.sessions.write().await;
-        // Re-check after acquiring the write lock in case another task
-        // spawned the session concurrently.
-        if let Some(existing) = guard.get(&key) {
-            if existing.is_alive() {
-                return attach(existing);
-            }
-        }
-
-        if !policy.may_spawn {
-            return Err(TerminalOpenError::SpawnNotAllowed);
-        }
-        let session = PtySession::spawn(
-            cols,
-            rows,
-            Some(self.project_root.clone()),
-            actor.owner_tag(),
-            policy.shared,
-            policy.scope.as_ref(),
-        )
-        .map_err(TerminalOpenError::Spawn)?;
-        guard.insert(key, session.clone());
-        Ok((session, true))
     }
 
     /// The live session for `key`, only when `actor` may see it. Invisible
     /// sessions read as absent so foreign private sessions are not
-    /// observable.
+    /// observable. An `Opening` reservation reads as absent too — the
+    /// session does not exist until its spawn publishes.
     pub async fn get_visible(
         &self,
         key: &TerminalKey,
         actor: &TerminalActor,
     ) -> Option<Arc<PtySession>> {
-        self.sessions
-            .read()
-            .await
-            .get(key)
-            .filter(|session| session.visible_to(actor))
-            .cloned()
+        match self.sessions.read().await.get(key) {
+            Some(SessionSlot::Live(session)) if session.visible_to(actor) => Some(session.clone()),
+            _ => None,
+        }
     }
 
     /// Close `key` if `actor` may see it. Returns whether a session was
-    /// closed.
+    /// closed. A close racing an in-flight open reads the key as absent
+    /// (ordered before the open).
     pub async fn close_visible(&self, key: &TerminalKey, actor: &TerminalActor) -> bool {
         let mut guard = self.sessions.write().await;
-        let visible = guard
-            .get(key)
-            .map(|session| session.visible_to(actor))
-            .unwrap_or(false);
+        let visible = matches!(
+            guard.get(key),
+            Some(SessionSlot::Live(session)) if session.visible_to(actor)
+        );
         if !visible {
             return false;
         }
-        if let Some(session) = guard.remove(key) {
+        if let Some(SessionSlot::Live(session)) = guard.remove(key) {
             // Writing EOF (Ctrl-D) to the shell's stdin tells it to exit
             // cleanly; if it ignores, the session is simply dropped and
             // the reader thread hits read error → broadcasts Exited.
@@ -1213,7 +1386,7 @@ impl TerminalRegistry {
 
     /// Toggle sharing on `key`. Only root or the owning principal may;
     /// returns the new shared state, or `None` when the session is absent
-    /// or `actor` may not manage it.
+    /// (or still opening) or `actor` may not manage it.
     pub async fn set_shared(
         &self,
         key: &TerminalKey,
@@ -1221,7 +1394,9 @@ impl TerminalRegistry {
         shared: bool,
     ) -> Option<bool> {
         let guard = self.sessions.read().await;
-        let session = guard.get(key)?;
+        let Some(SessionSlot::Live(session)) = guard.get(key) else {
+            return None;
+        };
         if !session.managed_by(actor) {
             return None;
         }
@@ -1361,6 +1536,155 @@ mod tests {
         assert!(!created_b);
         assert!(Arc::ptr_eq(&a, &b), "expected same Arc on re-open");
         assert_eq!(registry.len().await, 1);
+    }
+
+    /// Concurrent opens of the SAME key spawn exactly one PTY: the first
+    /// caller reserves the key, the rest wait on the reservation and
+    /// attach to the very session it spawned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_same_key_opens_spawn_once() {
+        let registry = Arc::new(TerminalRegistry::new(std::env::temp_dir()));
+        let key = TerminalKey::local("race-same-key");
+        let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for _ in 0..4 {
+            let registry = registry.clone();
+            let key = key.clone();
+            let spawns = spawns.clone();
+            tasks.push(tokio::spawn(async move {
+                registry
+                    .open_or_attach_with(key, &TerminalActor::Root, true, move || {
+                        spawns.fetch_add(1, Ordering::SeqCst);
+                        // Hold the reservation long enough that the other
+                        // callers observably arrive mid-spawn.
+                        std::thread::sleep(Duration::from_millis(300));
+                        PtySession::spawn(80, 24, Some(std::env::temp_dir()), None, false, None)
+                    })
+                    .await
+            }));
+        }
+        let mut sessions = Vec::new();
+        let mut created_count = 0usize;
+        for task in tasks {
+            let (session, created) = task.await.unwrap().unwrap();
+            created_count += usize::from(created);
+            sessions.push(session);
+        }
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "exactly one spawn");
+        assert_eq!(created_count, 1, "exactly one caller reports created");
+        for pair in sessions.windows(2) {
+            assert!(
+                Arc::ptr_eq(&pair[0], &pair[1]),
+                "all callers share the one session"
+            );
+        }
+        assert_eq!(registry.len().await, 1);
+        registry.close_visible(&key, &TerminalActor::Root).await;
+    }
+
+    /// Opens on DIFFERENT keys must not serialize behind each other's
+    /// spawns: two deliberately slow spawners complete in ~one spawn
+    /// duration, not two. Pure sleeps (no real PTY) so the measurement
+    /// reflects lock discipline, not shell startup noise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_different_keys_do_not_serialize() {
+        const SLOW_SPAWN: Duration = Duration::from_millis(600);
+        let registry = Arc::new(TerminalRegistry::new(std::env::temp_dir()));
+        let started = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for name in ["parallel-a", "parallel-b"] {
+            let registry = registry.clone();
+            tasks.push(tokio::spawn(async move {
+                registry
+                    .open_or_attach_with(
+                        TerminalKey::local(name),
+                        &TerminalActor::Root,
+                        true,
+                        move || {
+                            std::thread::sleep(SLOW_SPAWN);
+                            Err("slow spawn failed (test)".to_string())
+                        },
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            let result = task.await.unwrap();
+            assert!(matches!(result, Err(TerminalOpenError::Spawn(_))));
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < SLOW_SPAWN * 2,
+            "different-key opens serialized: {elapsed:?} for two {SLOW_SPAWN:?} spawns"
+        );
+        assert_eq!(
+            registry.len().await,
+            0,
+            "failed spawns must remove their reservations"
+        );
+    }
+
+    /// A failed spawn removes the reservation without poisoning the key:
+    /// a caller that waited on the failed attempt retries and performs
+    /// its own spawn — matching the spawn-under-lock behavior, where each
+    /// blocked caller proceeded once the failed spawner released the
+    /// write lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_spawn_clears_reservation_and_waiter_retries() {
+        let registry = Arc::new(TerminalRegistry::new(std::env::temp_dir()));
+        let key = TerminalKey::local("fail-then-retry");
+
+        let opener = {
+            let registry = registry.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                registry
+                    .open_or_attach_with(key, &TerminalActor::Root, true, move || {
+                        std::thread::sleep(Duration::from_millis(400));
+                        Err("boom".to_string())
+                    })
+                    .await
+            })
+        };
+        // Wait until the opener's reservation is observable, so the
+        // second caller deterministically arrives as a waiter.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let guard = registry.sessions.read().await;
+                if matches!(guard.get(&key), Some(SessionSlot::Opening(_))) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "opener never reserved the key"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let waiter = {
+            let registry = registry.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                registry
+                    .open_or_attach_with(key, &TerminalActor::Root, true, move || {
+                        PtySession::spawn(80, 24, Some(std::env::temp_dir()), None, false, None)
+                    })
+                    .await
+            })
+        };
+
+        match opener.await.unwrap() {
+            Err(TerminalOpenError::Spawn(err)) => assert_eq!(err, "boom"),
+            Err(other) => panic!("expected spawn failure, got {other:?}"),
+            Ok(_) => panic!("expected spawn failure, got a session"),
+        }
+        let (session, created) = waiter.await.unwrap().expect("waiter retries and spawns");
+        assert!(created, "the waiter's retry performs its own spawn");
+        assert!(session.is_alive());
+        assert_eq!(registry.len().await, 1);
+        registry.close_visible(&key, &TerminalActor::Root).await;
     }
 
     /// The ownership model end to end: private sessions are invisible to
