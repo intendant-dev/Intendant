@@ -242,9 +242,8 @@ impl DaemonRig {
         tail(&contents, 4000)
     }
 
-    /// Tail of the daemon's durable federated peer-event record
-    /// (`peers.jsonl`; see `peer::spawn_peer_log_writer`), for failure
-    /// context AND for the delivery-receipt assertion: connection
+    /// The daemon's durable federated peer-event record (`peers.jsonl`;
+    /// see `peer::spawn_peer_log_writer`), in full: connection
     /// transitions and delegation-time activity live here, on the
     /// *sending* daemon, where a lost cross-daemon message leaves its
     /// only trace. The file lives in the daemon's *session* log dir —
@@ -255,7 +254,14 @@ impl DaemonRig {
     /// `.intendant/logs/peers.jsonl` that nothing writes, so the
     /// forensics rail dumped empty; the receipt assertion made that
     /// visible.)
-    fn peer_log_tail(&self) -> String {
+    ///
+    /// Wait probes must search this full record, never
+    /// [`Self::peer_log_tail`]'s bounded window: the record only ever
+    /// grows, so a line that landed early is pushed further above any
+    /// fixed-size tail by every later event — a probe reading the tail
+    /// can permanently miss what it waits for (the 2026-07-16
+    /// `task_receipt` merge-queue ejections).
+    fn peer_log(&self) -> String {
         let logs_dir = self.rig.home.path().join(".intendant").join("logs");
         let mut combined = String::new();
         if let Ok(entries) = std::fs::read_dir(&logs_dir) {
@@ -266,7 +272,14 @@ impl DaemonRig {
                 }
             }
         }
-        tail(&combined, 4000)
+        combined
+    }
+
+    /// Bounded tail of [`Self::peer_log`], for failure-dump context only
+    /// — dumps ride inside panic messages and must stay
+    /// panic-message-sized.
+    fn peer_log_tail(&self) -> String {
+        tail(&self.peer_log(), 4000)
     }
 }
 
@@ -2607,20 +2620,26 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
         dump_daemons()
     );
     // And the receipt leaves a durable trace on A's federated peer-event
-    // record (`peers.jsonl`, the forensics rail dump_daemons reads). The
-    // actor writes it via the async log sink, so it may trail the ctl
-    // response — on a loaded CI box by far more than a beat (a 30s
-    // deadline here ejected two otherwise-green merge-queue entries on
-    // 2026-07-16). PEER_WAIT_TIMEOUT like the test's other cross-daemon
+    // record (`peers.jsonl`). The actor writes it durable-first — the
+    // log-sink send is awaited, under a monotonic seq, before the event
+    // is broadcast — so it is in the file promptly; what it does NOT do
+    // is stay inside a bounded tail window. This wait once probed
+    // peer_log_tail()'s last 4000 chars, and on a fast box the scripted
+    // run's completion flood (a dozen-plus peer events behind the
+    // receipt) had scrolled the receipt above that window before the
+    // first 250 ms poll — the 2026-07-16 merge-queue ejections, misread
+    // at the time as the write trailing the ctl response on a loaded
+    // box. The record only grows, so that miss was permanent: probe the
+    // FULL record. PEER_WAIT_TIMEOUT like the test's other cross-daemon
     // waits: the deadline only bounds failing runs, never green ones.
     poll_until(
         "the task_receipt landing in daemon A's peers.jsonl",
         PEER_WAIT_TIMEOUT,
         || {
-            let tail = a.peer_log_tail();
+            let log = a.peer_log();
             let delegation_id = delegation_id.clone();
             async move {
-                (tail.contains("task_receipt") && tail.contains(&delegation_id)).then_some(())
+                (log.contains("task_receipt") && log.contains(&delegation_id)).then_some(())
             }
         },
         &dump_daemons,
