@@ -37,7 +37,13 @@ impl SessionSupervisor {
                 {
                     Ok(outcome) => {
                         self.announce_native_fork(
-                            &source, &token, &anchor, name, task, project_root, request_id,
+                            &source,
+                            &token,
+                            &anchor,
+                            name,
+                            task,
+                            project_root,
+                            request_id,
                             outcome,
                         )
                         .await;
@@ -63,10 +69,24 @@ impl SessionSupervisor {
                 }
                 Err(error) => error,
             },
-            "claude-code" => {
-                "the claude-code fork engine lands in a follow-up phase (fork points are already served)"
-                    .to_string()
-            }
+            "claude-code" => match self.fork_claude_session(&token, &anchor).await {
+                Ok((backend_id, child_uuid, kept_lines, parent_project_root)) => {
+                    self.announce_claude_fork(
+                        &source,
+                        backend_id,
+                        &anchor,
+                        name,
+                        task,
+                        project_root.or(parent_project_root),
+                        request_id,
+                        child_uuid,
+                        kept_lines,
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => error,
+            },
             other => format!("fork is not supported for {other} sessions"),
         };
 
@@ -270,6 +290,119 @@ impl SessionSupervisor {
             Some(true),
             Vec::new(),
             true,
+            None,
+            overrides,
+            false,
+            false,
+        )
+        .await;
+    }
+    /// Chain-slice the parent transcript into a fresh child uuid in the
+    /// same project dir. Returns `(parent_backend_id, child_uuid,
+    /// kept_lines, parent_project_root)`.
+    async fn fork_claude_session(
+        &self,
+        token: &str,
+        anchor: &ForkAnchorSpec,
+    ) -> Result<(String, String, usize, Option<String>), String> {
+        let home = self.logs_home();
+        let backend_id = match persisted_external_identity_for_session_in_home(&home, token) {
+            Some((source, id)) if source == "claude-code" => id,
+            Some((source, _)) => {
+                return Err(format!(
+                    "session {token} is a {source} session, not claude-code"
+                ));
+            }
+            None => token.to_string(),
+        };
+        let transcript = crate::web_gateway::find_claude_session_file(&home, &backend_id)
+            .ok_or_else(|| {
+                format!(
+                    "transcript for claude-code session {backend_id} not found in the claude session store"
+                )
+            })?;
+        // The child must spawn in the parent's project (claude resolves a
+        // resumed id inside the cwd's project dir).
+        let parent_project_root = crate::session_config::load_for_resume(
+            &home,
+            "claude-code",
+            &backend_id,
+            Some(&backend_id),
+        )
+        .and_then(|cfg| cfg.project_root);
+        let anchor = anchor.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let plan = crate::session_fork::plan_claude_fork(&transcript, &anchor)?;
+            let outcome = crate::session_fork::execute_claude_fork_copy(&plan)?;
+            Ok::<_, String>((plan.child_uuid, outcome.kept_lines))
+        })
+        .await
+        .map_err(|err| format!("fork surgery task failed: {err}"))?;
+        let (child_uuid, kept_lines) = outcome?;
+        Ok((backend_id, child_uuid, kept_lines, parent_project_root))
+    }
+
+    /// Announce a claude-code fork (the child uuid is minted by the
+    /// surgery, so both edge and result carry it immediately) and activate
+    /// the child through the resume funnel — a PLAIN resume of the child's
+    /// own id; `forked_from` rides the internal overrides so the identity
+    /// announce emits the `anchor-fork` edge durably.
+    #[allow(clippy::too_many_arguments)]
+    async fn announce_claude_fork(
+        &self,
+        source: &str,
+        backend_id: String,
+        anchor: &ForkAnchorSpec,
+        name: Option<String>,
+        task: Option<String>,
+        project_root: Option<String>,
+        request_id: Option<String>,
+        child_uuid: String,
+        kept_lines: usize,
+    ) {
+        self.config.bus.send(AppEvent::SessionRelationship {
+            parent_session_id: backend_id.clone(),
+            child_session_id: child_uuid.clone(),
+            relationship: "anchor-fork".to_string(),
+            ephemeral: false,
+        });
+        self.config.bus.send(AppEvent::SessionForkResult {
+            request_id,
+            parent_session_id: backend_id.clone(),
+            child_session_id: Some(child_uuid.clone()),
+            source: source.to_string(),
+            relationship: "anchor-fork".to_string(),
+            anchor_summary: format!("{} ({} lines kept)", anchor.summary(), kept_lines),
+            error: None,
+        });
+        if let Some(name) = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            self.rename_session(
+                child_uuid.clone(),
+                Some(child_uuid.clone()),
+                Some(source.to_string()),
+                name.to_string(),
+            )
+            .await;
+        }
+        let overrides = LaunchOverrides {
+            forked_from: Some(backend_id),
+            fork_relationship: Some("anchor-fork".to_string()),
+            fork_anchor: serde_json::to_string(anchor).ok(),
+            ..Default::default()
+        };
+        self.resume_session(
+            source.to_string(),
+            child_uuid.clone(),
+            Some(child_uuid),
+            project_root,
+            task,
+            Some(true),
+            Vec::new(),
+            false,
             None,
             overrides,
             false,
