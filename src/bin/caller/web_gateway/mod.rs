@@ -53,6 +53,9 @@ pub(crate) use routes_memory::*;
 mod routes_fork_points;
 pub(crate) use routes_fork_points::*;
 
+mod routes_background_tasks;
+pub(crate) use routes_background_tasks::*;
+
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
 

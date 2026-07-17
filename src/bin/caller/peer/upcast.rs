@@ -570,6 +570,7 @@ impl AppEventUpcaster {
             | AppEvent::DisplayMetrics { .. }
             // Hub-internal: peers see the folded SessionVitals instead.
             | AppEvent::SessionActivity { .. }
+            | AppEvent::SessionConfigFacts { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
@@ -4541,6 +4542,7 @@ mod tests {
             cache: None,
             limits: Vec::new(),
             activity: None,
+            config: None,
         }
     }
 

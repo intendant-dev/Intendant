@@ -134,8 +134,8 @@ pub struct SessionGoal {
 // Session-vitals family: hoisted to intendant-core; re-exported here so
 // existing `crate::types::Session*Vitals` paths keep working.
 pub use intendant_core::vitals::{
-    SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionGitVitals,
-    SessionLimitWindow, SessionVitals,
+    SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionConfigVitals,
+    SessionGitVitals, SessionLimitWindow, SessionVitals,
 };
 
 /// Normalized region in a shared display view.

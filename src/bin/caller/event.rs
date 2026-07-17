@@ -377,6 +377,15 @@ pub enum AppEvent {
         session_id: Option<String>,
         activity: crate::types::SessionActivityVitals,
     },
+    /// Partial session-config facts (model / effort / permission mode)
+    /// from a backend's protocol seams — launch config, init echoes,
+    /// mid-session switches. Hub-internal like `SessionActivity`: the
+    /// vitals hub folds fields sticky into `SessionVitals.config`, which
+    /// is the outbound and session-logged carrier.
+    SessionConfigFacts {
+        session_id: Option<String>,
+        facts: crate::types::SessionConfigVitals,
+    },
     SessionAttached {
         session_id: String,
         source: String,
@@ -2473,9 +2482,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             vitals: vitals.clone(),
         }),
-        // Hub-internal: the vitals hub folds it into SessionVitals, which
-        // is the outbound (and session-logged) carrier.
+        // Hub-internal: the vitals hub folds these into SessionVitals,
+        // which is the outbound (and session-logged) carrier.
         AppEvent::SessionActivity { .. } => None,
+        AppEvent::SessionConfigFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),

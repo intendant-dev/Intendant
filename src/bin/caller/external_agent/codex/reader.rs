@@ -20,19 +20,16 @@ pub(crate) async fn reader_task(
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
     context_pressure_floor: Arc<Mutex<Option<CodexContextPressureFloor>>>,
     model: Option<String>,
-    reasoning_effort: Option<String>,
     protocol_watch: Option<crate::external_agent::protocol_watch::ProtocolWatchHandle>,
     writer: SharedCodexWriter,
 ) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     let mut terminal_turns_observed = CodexTerminalObserved::default();
-    let mut notification_state = CodexNotificationState {
-        // Configured effort, first-hand: the value Intendant itself passes
-        // at spawn (`-c model_reasoning_effort=…`) — never inferred.
-        activity: crate::session_activity::ActivityMachine::new(reasoning_effort),
-        ..Default::default()
-    };
+    // Configured effort/model/permission facts ride the config-facts lane
+    // (emitted by the adapter after thread start, echoed here via
+    // thread/settings/updated) — the activity machine is liveness only.
+    let mut notification_state = CodexNotificationState::default();
 
     loop {
         let line = match lines.next_line().await {
@@ -995,6 +992,47 @@ pub(crate) fn codex_collab_agent_tool_call(params: &serde_json::Value) -> Option
         reasoning_effort,
         agents,
     })
+}
+
+/// Config-facts echo from a `thread/settings/updated` notification: the
+/// applied model / reasoning effort — and, when both halves are present,
+/// the approval+sandbox pair — in the server's own words. `None` when the
+/// settings carry none of them (e.g. a cwd-only update). A lone
+/// approval or sandbox half is dropped rather than guessed into a pair.
+pub(crate) fn codex_thread_settings_config_facts(
+    params: &serde_json::Value,
+) -> Option<crate::types::SessionConfigVitals> {
+    let settings = params
+        .get("threadSettings")
+        .or_else(|| params.get("thread_settings"))?;
+    let string_at = |keys: [&str; 2]| -> Option<String> {
+        keys.iter()
+            .filter_map(|key| settings.get(*key))
+            .find_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let model = string_at(["model", "model"]);
+    let effort = string_at(["reasoningEffort", "reasoning_effort"]);
+    let approval = string_at(["approvalPolicy", "approval_policy"]);
+    let sandbox = string_at(["sandbox", "sandbox_mode"]);
+    let (permission_mode, permission_kind, permission_echoed) = match (&approval, &sandbox) {
+        (Some(approval), Some(sandbox)) => (
+            Some(format!("{sandbox} · {approval}")),
+            intendant_core::vitals::codex_permission_kind(approval, sandbox).map(str::to_string),
+            true,
+        ),
+        _ => (None, None, false),
+    };
+    let facts = crate::types::SessionConfigVitals {
+        model,
+        effort,
+        permission_mode,
+        permission_kind,
+        permission_echoed,
+    };
+    (facts != crate::types::SessionConfigVitals::default()).then_some(facts)
 }
 
 pub(crate) fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String)> {
@@ -2927,6 +2965,17 @@ pub(crate) fn translate_notification_with_scope(
                         level: "info".to_string(),
                         message: format!("Codex thread settings applied: cwd {cwd}"),
                     },
+                );
+            }
+            // The applied settings are the server's own config echo —
+            // model / reasoning effort / approval+sandbox ride the
+            // config-facts lane when the notification carries them.
+            if let Some(facts) = codex_thread_settings_config_facts(params) {
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::ConfigFacts { facts },
                 );
             }
         }
@@ -5465,13 +5514,73 @@ error: build failed
         );
     }
 
+    /// `thread/settings/updated` is the server's own config echo: model +
+    /// reasoning effort feed the config-facts lane (camel and snake wire
+    /// spellings both), a lone policy half is dropped rather than guessed
+    /// into a pair, and a cwd-only update carries no facts at all.
     #[test]
-    fn codex_activity_carries_configured_effort() {
-        let mut state = CodexNotificationState::default();
-        state.activity.set_effort(Some("high".into()));
-        let s = observe_codex_activity(&mut state, "turn/started", &serde_json::Value::Null, 100)
-            .expect("dispatch publishes");
-        assert_eq!(s.effort.as_deref(), Some("high"));
+    fn thread_settings_updated_echoes_config_facts() {
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "threadSettings": {
+                "cwd": "/home/user/project",
+                "model": "gpt-5.5",
+                "reasoningEffort": "high"
+            }
+        });
+        let facts = codex_thread_settings_config_facts(&params).expect("facts present");
+        assert_eq!(facts.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(facts.effort.as_deref(), Some("high"));
+        assert_eq!(facts.permission_mode, None, "no policy pair echoed");
+        assert!(!facts.permission_echoed);
+
+        // Snake-case spelling and a full policy pair.
+        let params = serde_json::json!({
+            "thread_settings": {
+                "model": "gpt-5.5",
+                "reasoning_effort": "medium",
+                "approval_policy": "on-request",
+                "sandbox": "workspace-write"
+            }
+        });
+        let facts = codex_thread_settings_config_facts(&params).expect("facts present");
+        assert_eq!(facts.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            facts.permission_mode.as_deref(),
+            Some("workspace-write · on-request")
+        );
+        assert_eq!(facts.permission_kind.as_deref(), Some("auto-sandboxed"));
+        assert!(facts.permission_echoed);
+
+        // A lone sandbox half is not a pair; cwd-only carries nothing.
+        let params = serde_json::json!({
+            "threadSettings": { "sandbox": "workspace-write" }
+        });
+        assert_eq!(codex_thread_settings_config_facts(&params), None);
+        let params = serde_json::json!({
+            "threadSettings": { "cwd": "/somewhere" }
+        });
+        assert_eq!(codex_thread_settings_config_facts(&params), None);
+
+        // The notification arm forwards the facts as a scoped event.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "threadSettings": { "model": "gpt-5.5" }
+        });
+        translate_notification("thread/settings/updated", &params, &tx);
+        let mut saw_facts = false;
+        while let Ok(event) = rx.try_recv() {
+            let inner = match &event {
+                AgentEvent::Scoped { event, .. } => event.as_ref(),
+                other => other,
+            };
+            if let AgentEvent::ConfigFacts { facts } = inner {
+                assert_eq!(facts.model.as_deref(), Some("gpt-5.5"));
+                saw_facts = true;
+            }
+        }
+        assert!(saw_facts, "settings echo emits ConfigFacts");
     }
 
     #[test]

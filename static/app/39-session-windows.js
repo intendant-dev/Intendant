@@ -771,18 +771,65 @@ const VITALS_SEVERITY_RANK = { '': 0, ok: 0, warn: 1, crit: 2 };
 function vitalsLimitLabelLong(label) {
   if (label === '5h') return '5-hour';
   if (label === '7d') return '7-day';
-  return label;
+  // Unknown window names arrive as raw provider vocabulary — keep every
+  // word (the pane owns the full name), just soften the wire spelling.
+  return String(label || '').replace(/_/g, ' ').trim();
+}
+
+// Compact chip form of a limit-window label. Known labels pass through;
+// unknown provider vocabulary ("seven day overage included",
+// "seven_day_overage_included") compresses to chip grammar: abbreviate a
+// leading "<number> <period>" pair (seven day → 7d), drop filler words,
+// hyphenate the rest — "7d-overage". Compression only, never truncation:
+// the full name stays available in the pane (vitalsLimitLabelLong).
+function vitalsLimitLabelShort(label) {
+  const raw = String(label || '').trim();
+  // Already-compact daemon labels ("5h", "7d", "30d", "1w").
+  if (/^\d+\s*(mo|[smhdw])$/i.test(raw)) return raw.replace(/\s+/g, '');
+  const NUMBER_WORDS = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7,
+    eight: 8, nine: 9, ten: 10, twelve: 12, fifteen: 15, twenty: 20,
+    thirty: 30, sixty: 60, ninety: 90,
+  };
+  const PERIOD_WORDS = {
+    second: 's', seconds: 's', sec: 's', secs: 's',
+    minute: 'm', minutes: 'm', min: 'm', mins: 'm',
+    hour: 'h', hours: 'h', hr: 'h', hrs: 'h',
+    day: 'd', days: 'd',
+    week: 'w', weeks: 'w', wk: 'w',
+    month: 'mo', months: 'mo',
+  };
+  const FILLER_WORDS = new Set(['included', 'include', 'window', 'limit', 'limits', 'rate', 'the', 'a', 'an', 'of']);
+  const words = raw.toLowerCase().split(/[\s_-]+/).filter(Boolean);
+  const out = [];
+  let i = 0;
+  if (words.length >= 2) {
+    const n = Object.prototype.hasOwnProperty.call(NUMBER_WORDS, words[0])
+      ? NUMBER_WORDS[words[0]]
+      : (/^\d+$/.test(words[0]) ? Number(words[0]) : null);
+    const period = PERIOD_WORDS[words[1]];
+    if (n !== null && period) {
+      out.push(`${n}${period}`);
+      i = 2;
+    }
+  }
+  for (; i < words.length; i++) {
+    if (!FILLER_WORDS.has(words[i])) out.push(words[i]);
+  }
+  return out.join('-') || raw;
 }
 
 // Live activity — the honest "is the model actually doing something right
 // now" signal. Raw state + epochs arrive on the wire (the vitals
 // `activity` section: state, sinceEpoch, lastStreamByteEpoch,
-// stalledAfterSeconds, effort, resetsAtEpoch); elapsed and quiet tick
+// stalledAfterSeconds, resetsAtEpoch); elapsed and quiet tick
 // client-side, and the `stalled` state is DERIVED here with the same rule
 // the daemon's state machine exposes: a state that promises a live byte
 // stream (stalledAfterSeconds present) quiet past its threshold. States
 // without that promise — tool runs, backends that don't stream reasoning
-// — never claim stalled: honest silence over a fake alarm.
+// — never claim stalled: honest silence over a fake alarm. (Reasoning
+// effort is a session-config fact — the vitals `config` section — not an
+// activity claim.)
 function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
   if (!activity || typeof activity !== 'object') return null;
   const state = String(activity.state || 'idle').trim();
@@ -798,7 +845,6 @@ function deriveSessionActivity(activity, nowSec = Date.now() / 1000) {
     elapsed: since ? Math.max(0, nowSec - since) : 0,
     quiet,
     hasHeartbeat: threshold > 0,
-    effort: String(activity.effort || '').trim(),
     resetsAtEpoch: Number(activity.resetsAtEpoch) || 0,
     // Short descriptions of wire-announced background tasks still running
     // (grounds the parked-on-tasks claim; may ride any state). No
@@ -818,6 +864,14 @@ function sessionWireActivity(sessionId) {
   return activity && typeof activity === 'object' ? activity : null;
 }
 
+// Configured reasoning effort from the session-facts section (wire
+// `config.effort`) — decorates the status pill's "Thinking" label.
+function sessionConfigEffort(sessionId) {
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
+  const config = meta.vitals && typeof meta.vitals === 'object' ? meta.vitals.config : null;
+  return config && typeof config === 'object' ? String(config.effort || '').trim() : '';
+}
+
 const ACTIVITY_STATE_LABELS = {
   reasoning: 'Thinking',
   responding: 'Responding',
@@ -834,7 +888,7 @@ const ACTIVITY_STATE_LABELS = {
 function sessionParkedPillLabel(act) {
   if (!act || act.state !== 'parked-on-tasks') return '';
   const n = (act.backgroundTasks || []).length || 1;
-  return `Parked · ${n} background task${n === 1 ? '' : 's'}`;
+  return `Parked · ${n} task${n === 1 ? '' : 's'}`;
 }
 
 function formatActivityElapsed(seconds) {
@@ -842,6 +896,92 @@ function formatActivityElapsed(seconds) {
   if (s >= 3600) return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
   if (s >= 60) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
   return `${s}s`;
+}
+
+// Plain-language copy for the backend-agnostic permission display kinds
+// (wire `config.permissionKind` — computed once daemon-side from each
+// backend's raw mode by the intendant-core vitals catalog; pinned both
+// ways by vitals_symbol_catalog_covers_wire_fields). The raw mode is
+// always one tap away in the explainer — never hidden, never replaced.
+// `tone: 'warn'` is a cosmetic tint (a chosen configuration, not a
+// failure): it never elevates the chip or colors the health dot.
+// Kinds: bypass, auto-edits, auto-safe, auto-sandboxed, ask, deny-asks,
+// read-only, plan, autonomy (native — label from UI2_AUTONOMY_TAGS).
+const PERMISSION_KIND_COPY = {
+  bypass: {
+    label: 'Acts without asking',
+    tone: 'warn',
+    lines: ['This agent can edit files and run commands without asking first.'],
+  },
+  'auto-edits': {
+    label: 'Auto-accepts edits',
+    lines: ['File edits apply without asking; commands still ask for approval.'],
+  },
+  'auto-safe': {
+    label: 'Auto-approves safe actions',
+    lines: ['Actions judged safe run without asking; riskier ones still ask.'],
+  },
+  'auto-sandboxed': {
+    label: 'Works alone in its sandbox',
+    lines: ['Edits files and runs commands inside its own workspace without asking; asks before reaching outside it.'],
+  },
+  ask: {
+    label: 'Asks before acting',
+    lines: ['Commands and file changes wait for your approval.'],
+  },
+  'deny-asks': {
+    label: 'Never asks — declines instead',
+    lines: ['Anything that would need an approval is declined automatically instead of asking you.'],
+  },
+  'read-only': {
+    label: 'Read-only',
+    lines: ['Reads the project but asks before changing anything.'],
+  },
+  plan: {
+    label: 'Plan mode',
+    lines: ['Researching and planning only — no edits or commands until a plan is approved.'],
+  },
+};
+
+// Resolve a permission kind + raw mode into display copy. `autonomy` is
+// the native backend: the label reuses the sidebar's autonomy vocabulary
+// ("Medium · gate writes"), and the ungated Full level gets the same
+// quiet warning tint as bypass. Unknown kinds show the raw mode verbatim
+// — honest passthrough, never a guessed plain-language claim.
+function permissionDisplay(kind, mode) {
+  if (kind === 'autonomy') {
+    const tag = UI2_AUTONOMY_TAGS[mode] || '';
+    return {
+      label: tag ? `${mode} · ${tag}` : mode,
+      tone: mode === 'Full' ? 'warn' : '',
+      lines: [
+        tag
+          ? `Intendant's autonomy level for this session is ${mode} — ${tag}.`
+          : `Intendant's autonomy level for this session is ${mode}.`,
+        mode === 'Full'
+          ? 'This agent can edit files and run commands without asking first.'
+          : 'The autonomy level decides which actions need your approval.',
+      ],
+    };
+  }
+  const copy = PERMISSION_KIND_COPY[kind];
+  if (copy) return { label: copy.label, tone: copy.tone || '', lines: copy.lines };
+  return {
+    label: mode,
+    tone: '',
+    lines: [`This agent reports permission mode “${mode}” — a mode this dashboard doesn't have plain words for yet.`],
+  };
+}
+
+// Display compression for model ids in chip grammar: drop a vendor
+// prefix and a trailing release date ("claude-sonnet-4-5-20250929" →
+// "sonnet-4-5"). Compression only, never truncation — the pane and the
+// explainer always carry the full id.
+function vitalsModelShortName(model) {
+  const raw = String(model || '').trim();
+  if (!raw) return '';
+  let short = raw.replace(/^claude-/, '').replace(/-\d{8}$/, '');
+  return short || raw;
 }
 
 const VITALS_SYMBOLS = {
@@ -874,7 +1014,7 @@ const VITALS_SYMBOLS = {
       if (v.state === 'responding') return `🗒 Responding · ${v.elapsedText}`;
       if (v.state === 'tool-running') return `🔧 Running tools · ${v.elapsedText}`;
       if (v.state === 'awaiting-api') return `⋯ Awaiting model · ${v.elapsedText}`;
-      if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} background task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
+      if (v.state === 'parked-on-tasks') return `⏸ Parked · ${v.bgCount} task${v.bgCount === 1 ? '' : 's'} · ${v.elapsedText}`;
       if (v.state === 'stalled') return `⚠ Stalled · quiet ${v.quietText}`;
       if (v.state === 'rate-limited') return `⛔ Rate-limited${v.reset ? ` · resets in ${v.reset}` : ''}`;
       return `${ACTIVITY_STATE_LABELS[v.state] || v.state} · ${v.elapsedText}`;
@@ -931,6 +1071,43 @@ const VITALS_SYMBOLS = {
       if (v.state === 'rate-limited') return `Rate-limited${v.reset ? ` — resets in ~${v.reset}` : ''}`;
       if (v.state === 'stalled') return `Model stalled — nothing received for ${v.quietText}`;
       return '';
+    },
+  },
+  // ── Session facts (wire `config` section: model, effort,
+  // permissionMode + permissionKind + permissionEchoed). Wire-first: the
+  // backend's own echoes where the protocol has them, the launch config
+  // otherwise — and the explainer says which. Quiet chips: they live in
+  // the expanded header and the pane, never the collapsed one-liner.
+  model: {
+    label: 'Model',
+    priority: 28,
+    unavailable: 'Not reported yet — appears once the agent names its model (or its launch settings do).',
+    chip: (v) => (v.shortName
+      ? `⬡ ${v.shortName}${v.effort ? ` · ${v.effort}` : ''}`
+      : `⬡ ${v.effort} effort`),
+    explain: (v) => {
+      const lines = [v.model
+        ? `This session runs on ${v.model}.`
+        : "The agent hasn't named its model yet — it runs on its own default."];
+      if (v.effort) {
+        lines.push(`Reasoning effort is set to “${v.effort}” — how hard the model may think before answering. A setting, not a measurement.`);
+      }
+      return lines;
+    },
+    action: (v) => (v.model ? { label: 'Copy model id', run: () => vitalsCopyText(v.model) } : null),
+  },
+  permissions: {
+    label: 'Permissions',
+    priority: 55,
+    unavailable: 'Not reported yet — appears once the agent (or its launch settings) states a permission mode.',
+    chip: (v) => `🛡 ${v.label}`,
+    explain: (v) => {
+      const lines = [...v.lines];
+      lines.push(`In the agent's own vocabulary: “${v.mode}”.`);
+      if (!v.echoed) {
+        lines.push("This is the launch setting — the agent hasn't confirmed it yet.");
+      }
+      return lines;
     },
   },
   worktree: {
@@ -1041,11 +1218,15 @@ const VITALS_SYMBOLS = {
     // used_percentage — never fires in the print mode we drive it in).
     // Without one the chip stays honest: named window, status mark, and
     // the reset countdown we DO know — never a synthesized number.
+    // Chips always speak the SHORT window grammar ("▮95% 7d-overage ·
+    // ↻6h") — a full provider sentence in a header chip is the failure
+    // mode; the pane keeps the full name.
     chip: (v) => {
       const reset = v.reset ? ` · ↻${v.reset}` : '';
-      if (v.usedPct !== null) return `▮${v.usedPct}% ${v.label}${reset}`;
+      const label = vitalsLimitLabelShort(v.label);
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${label}${reset}`;
       const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
-      return `${v.label} ${mark}${reset}`;
+      return `${label} ${mark}${reset}`;
     },
     explain: (v) => {
       const lines = [];
@@ -1070,9 +1251,12 @@ const VITALS_SYMBOLS = {
 
 // Fixed display order for chips and the glossary (semantic, not priority:
 // priority only governs which chips stay visible when space is scarce).
+// model + permissions form the session-facts group, right after the live
+// activity signal.
 const VITALS_SYMBOL_ORDER = [
-  'health', 'activity', 'worktree', 'branch', 'dirty', 'divergence', 'parity',
-  'unpushed', 'primary-unpushed', 'cache-hit', 'cache-ttl', 'limit',
+  'health', 'activity', 'model', 'permissions', 'worktree', 'branch', 'dirty',
+  'divergence', 'parity', 'unpushed', 'primary-unpushed', 'cache-hit',
+  'cache-ttl', 'limit',
 ];
 
 // Seconds until the prompt cache goes cold, from the server-stamped
@@ -1146,11 +1330,16 @@ function vitalsChipModels(vitals, meta, sessionId) {
     });
   };
 
+  // Session facts (the `config` section). The configured effort also
+  // decorates the live thinking chip — one wire carrier, two readouts.
+  const facts = vitals?.config && typeof vitals.config === 'object' ? vitals.config : null;
+  const factsEffort = String(facts?.effort || '').trim();
+
   const act = deriveSessionActivity(vitals?.activity);
   if (act) {
     push('activity', 'activity', {
       state: act.state,
-      effort: act.effort,
+      effort: factsEffort,
       hasHeartbeat: act.hasHeartbeat,
       elapsedText: formatActivityElapsed(act.elapsed),
       quietText: formatActivityElapsed(act.quiet),
@@ -1164,8 +1353,35 @@ function vitalsChipModels(vitals, meta, sessionId) {
       // something other than the model's own work".
       severity: act.state === 'stalled' || act.state === 'rate-limited' ? 'warn' : '',
       ticking: true,
-      sig: `${act.state}|${act.effort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
+      sig: `${act.state}|${factsEffort}|${act.hasHeartbeat ? 1 : 0}|${act.backgroundTasks.join(';')}`,
     });
+  }
+
+  if (facts) {
+    const model = String(facts.model || '').trim();
+    if (model || factsEffort) {
+      push('model', 'model', {
+        model,
+        shortName: vitalsModelShortName(model),
+        effort: factsEffort,
+      });
+    }
+    const mode = String(facts.permissionMode || '').trim();
+    if (mode) {
+      const display = permissionDisplay(String(facts.permissionKind || '').trim(), mode);
+      push('permissions', 'permissions', {
+        label: display.label,
+        lines: display.lines,
+        mode,
+        echoed: facts.permissionEchoed === true,
+      }, {
+        // Cosmetic tint only: a chosen bypass/ungated configuration is
+        // worth noticing, but it is not a failure — no health-dot
+        // severity, no elevation into the collapsed header.
+        severity: '',
+        tone: display.tone || '',
+      });
+    }
   }
 
   const worktree = meta?.worktree && typeof meta.worktree === 'object' ? meta.worktree : null;
@@ -1344,16 +1560,38 @@ function sessionVitalsLimitsSegment(limits) {
   };
 }
 
+// The collapsed header's single attention chip: the most severe elevated
+// symbol (severity rank, then catalog priority as the tiebreak) speaks
+// for the whole set in short grammar; additional attention symbols ride
+// as a "+N" count and the pane names every one (the health verdict's
+// culprit list). Null while nothing is elevated — quiet when healthy.
+function vitalsAttentionSummary(models) {
+  const elevated = models.filter((m) => m.key !== 'health' && m.elevated);
+  if (!elevated.length) return null;
+  const top = elevated.reduce((a, b) => {
+    const d = VITALS_SEVERITY_RANK[b.severity] - VITALS_SEVERITY_RANK[a.severity];
+    if (d !== 0) return d > 0 ? b : a;
+    return (b.priority || 0) > (a.priority || 0) ? b : a;
+  });
+  const extra = elevated.length - 1;
+  return {
+    top,
+    extra,
+    aggregate: extra > 0,
+    text: extra > 0 ? `${top.text} +${extra}` : top.text,
+  };
+}
+
 // Renders the chip row; returns true while a cache countdown is live (the
 // vitals ticker keeps re-rendering until everything is cold or gone).
 //
 // Truncation policy: NEVER mid-string ellipsis. Expanded headers wrap the
-// chips onto extra lines so nothing is ever cut; collapsed headers show
-// the health dot + severity-elevated chips + a "+N" overflow chip that
-// opens the glossary (CSS keys off data-elevated / .header-collapsed).
-// Elevation implies survival: an attention chip is excluded from the +N
-// fold count here and exempt from every CSS drop rule — only quiet chips
-// ever drop, so the dot's culprit is always on screen.
+// chips onto extra lines so nothing is ever cut; collapsed (and minimized)
+// headers fold the whole cluster into the pane behind the health dot and
+// show at most ONE compact attention chip — the most severe elevated
+// symbol plus a "+N" count for the rest (CSS keys off .vit-attn /
+// .header-collapsed / .minimized). Severity-first: a red dot's culprit is
+// always on screen, in short grammar, never as a full sentence.
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
   const meta = sessionMetadataById.get(win.sessionId) || {};
@@ -1384,6 +1622,15 @@ function renderSessionWindowVitals(win, vitals) {
         chip.title = model.explainLines[0] || model.label;
       }
     }
+    // The attention chip mirrors its top model's text (elapsed/quiet
+    // countdowns tick) — same in-place update, never a rebuild.
+    const attnChip = win.vitals.querySelector('.vit-attn');
+    if (attnChip) {
+      const attention = vitalsAttentionSummary(models);
+      if (attention && attnChip.textContent !== attention.text) {
+        attnChip.textContent = attention.text;
+      }
+    }
     return models.some((m) => m.ticking);
   }
   win.vitals.dataset.vitSig = signature;
@@ -1406,6 +1653,28 @@ function renderSessionWindowVitals(win, vitals) {
     chip.title = m.explainLines[0] || m.label;
     chip.setAttribute('aria-label', m.text ? `${m.label}: ${m.text}` : m.label);
     nodes.push(chip);
+  }
+  // The compact states' single attention chip, right after the health dot
+  // (next to the status pill in the collapsed one-liner). Hidden while the
+  // header is expanded — the full chips are on screen there.
+  const attention = vitalsAttentionSummary(models);
+  if (attention) {
+    const attn = document.createElement('button');
+    attn.type = 'button';
+    attn.className = 'vit-chip vit-attn';
+    // A lone attention symbol drills straight into its explainer; an
+    // aggregated chip opens the pane, whose verdict names every culprit.
+    attn.dataset.chip = attention.aggregate ? 'attention' : attention.top.id;
+    if (attention.top.severity) attn.dataset.severity = attention.top.severity;
+    attn.dataset.elevated = '1';
+    attn.textContent = attention.text;
+    attn.title = attention.aggregate
+      ? 'Needs attention — show all vitals'
+      : (attention.top.explainLines[0] || attention.top.label);
+    attn.setAttribute('aria-label', attention.aggregate
+      ? `${attention.top.label}: ${attention.top.text}, plus ${attention.extra} more — show all vitals`
+      : `${attention.top.label}: ${attention.top.text}`);
+    nodes.splice(1, 0, attn);
   }
   if (foldedWhenCollapsed > 0) {
     const more = document.createElement('button');
@@ -1434,7 +1703,7 @@ function wireVitalsChipRow(win) {
     event.preventDefault();
     event.stopPropagation();
     const id = chip.dataset.chip || '';
-    if (id === 'health' || id === 'overflow') openVitalsGlossary(win.sessionId, chip);
+    if (id === 'health' || id === 'overflow' || id === 'attention') openVitalsGlossary(win.sessionId, chip);
     else openVitalsExplainer(win.sessionId, id, chip);
   });
 }
@@ -1486,6 +1755,40 @@ function closeVitalsExplainer() {
   if (!host) return;
   host.hidden = true;
   host.classList.remove('sheet', 'popover');
+  host._vxTick = null;
+  stopVitalsPanelTicker();
+}
+
+// ── Live pane ticking. Countdown-bearing rows (cache freshness, parked/
+// activity elapsed, limit resets, goal elapsed) tick while the pane is
+// open — the open panel registers an in-place updater (host._vxTick) and
+// this 1 Hz interval drives it. Same doctrine as the chip row's
+// stable-DOM fast path: update text nodes in place, never rebuild the
+// panel (rebuilds detach buttons mid-tap and reset scroll).
+let vitalsPanelTicker = null;
+
+function startVitalsPanelTicker() {
+  if (vitalsPanelTicker) return;
+  vitalsPanelTicker = setInterval(() => {
+    const host = document.getElementById('vitals-explainer');
+    if (!host || host.hidden || typeof host._vxTick !== 'function') {
+      stopVitalsPanelTicker();
+      return;
+    }
+    try { host._vxTick(); } catch (_) { /* next tick retries */ }
+  }, 1000);
+}
+
+function stopVitalsPanelTicker() {
+  if (!vitalsPanelTicker) return;
+  clearInterval(vitalsPanelTicker);
+  vitalsPanelTicker = null;
+}
+
+// Write-guarded textContent: no-op when the rendered second hasn't
+// rolled over, so ticks never churn text nodes (or observers) idly.
+function setVxText(el, text) {
+  if (el && el.textContent !== text) el.textContent = text;
 }
 
 function vxEl(tag, cls, text) {
@@ -1543,24 +1846,313 @@ function openVitalsExplainer(sessionId, chipId, anchor) {
   }
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
+  // Content epoch: async enrichers (the background-task rows) must not
+  // append to a panel that has since shown something else.
+  panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
   panel.replaceChildren(
     vxHeader(model.label, model.text),
     ...model.explainLines.map((line) => vxEl('p', 'vx-line', line)),
     ...(model.action ? [vxActionButton(model.action)] : [])
   );
+  // The model-activity explainer additionally lists the session's
+  // background tasks (live from the daemon's task registry) with a
+  // per-task output peek — additive: absent on fetch failure or when
+  // nothing was announced.
+  if (model.key === 'activity') appendSessionBackgroundTaskRows(sessionId, panel);
   presentVitalsPanel(host, panel, anchor);
+  // Tick the value and sentences in place while open (elapsed, quiet,
+  // countdowns). Line COUNT changes (a state flip mid-open) skip the
+  // in-place pass — the stale-by-seconds text settles on next open.
+  host._vxTick = () => {
+    const fresh = vitalsModelsForSession(sessionId).find((m) => m.id === chipId);
+    if (!fresh) return;
+    setVxText(panel.querySelector('.vx-head .vx-value'), fresh.text);
+    const lines = panel.querySelectorAll('.vx-line');
+    if (lines.length === fresh.explainLines.length) {
+      fresh.explainLines.forEach((line, i) => setVxText(lines[i], line));
+    }
+  };
+  startVitalsPanelTicker();
+}
+
+function vxVerdictText(health) {
+  return health?.severity === 'crit' ? 'needs attention'
+    : health?.severity === 'warn' ? 'worth a look'
+    : 'all good';
+}
+
+// A folded-fact row for the glossary: same vx-row skeleton the catalog
+// rows use (value column + label/sentence body) so the pane reads as one
+// list and stays extensible. `onTap` makes the row a button; the sentence
+// SAYS what tapping does — no hover-only affordances.
+function vxFactRow({ label, value, desc, absent = false, onTap = null }) {
+  const row = vxEl('div', `vx-row ${absent ? 'absent' : 'present'}`);
+  row.appendChild(vxEl('span', 'vx-glyph', absent ? '—' : (value || '●')));
+  const body = vxEl('div', 'vx-body');
+  body.appendChild(vxEl('div', 'vx-label', label));
+  body.appendChild(vxEl('div', 'vx-desc', desc || ''));
+  row.appendChild(body);
+  if (onTap && !absent) {
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    row.addEventListener('click', onTap);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onTap(); }
+    });
+  } else {
+    row.classList.add('static');
+  }
+  return row;
+}
+
+// The header's folded facts, as pane rows: project root, working folder,
+// relationship, goal. What the collapsed one-liner no longer shows lives
+// here in plain words — the dot is the door.
+function vitalsGlossaryFactRows(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const meta = sessionMetadataById.get(sid) || {};
+  const rows = [];
+  const projectRoot = String(meta.projectRoot || '').trim();
+  rows.push(vxFactRow(projectRoot ? {
+    label: 'Project',
+    value: meta.projectLabel || compactPathLabel(projectRoot, true),
+    desc: `${projectRoot} — tap to copy the path.`,
+    onTap: () => vitalsCopyText(projectRoot),
+  } : {
+    label: 'Project',
+    desc: 'Project folder not known yet.',
+    absent: true,
+  }));
+  const cwd = String(meta.cwd || '').trim();
+  rows.push(vxFactRow(cwd ? {
+    label: 'Working folder',
+    value: meta.cwdLabel || compactPathLabel(cwd, true),
+    desc: cwd === projectRoot
+      ? 'Same as the project folder — tap to copy the path.'
+      : `${cwd} — tap to copy the path.`,
+    onTap: () => vitalsCopyText(cwd),
+  } : {
+    label: 'Working folder',
+    desc: 'Working folder not known yet.',
+    absent: true,
+  }));
+  const kind = String(meta.relationshipKind || '').trim();
+  const parentId = String(meta.parentId || '').trim();
+  const children = Array.isArray(meta.children) ? meta.children : [];
+  if (kind && parentId) {
+    const kindWord = kind === 'subagent' ? 'sub-agent' : kind;
+    const parentIdentity = typeof sessionIdentityParts === 'function'
+      ? sessionIdentityParts(parentId) : {};
+    const parentLabel = parentIdentity.name || parentIdentity.shortId
+      || (typeof shortSessionId === 'function' ? shortSessionId(parentId) : parentId);
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      value: kindWord,
+      desc: `Started by ${parentLabel} — tap to focus that window.`,
+      onTap: () => {
+        closeVitalsExplainer();
+        if (typeof focusSessionWindow === 'function' && sessionWindows.has(parentId)) {
+          focusSessionWindow(parentId);
+        }
+      },
+    }));
+  } else if (children.length > 0) {
+    const counts = new Map();
+    for (const child of children) {
+      const childKind = String(child?.kind || '').trim().toLowerCase() || 'related';
+      counts.set(childKind, (counts.get(childKind) || 0) + 1);
+    }
+    const summary = Array.from(counts.entries())
+      .map(([k, n]) => `${n} ${k === 'subagent' ? 'sub' : k}`)
+      .join(' · ');
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      value: summary,
+      desc: `Runs ${children.length} related session${children.length === 1 ? '' : 's'} alongside this one.`,
+    }));
+  } else {
+    rows.push(vxFactRow({
+      label: 'Relationship',
+      desc: 'Runs on its own — not started by another session.',
+      absent: true,
+    }));
+  }
+  const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+  if (goal?.objective) {
+    const status = normalizeGoalStatus(goal.status);
+    const row = vxFactRow({
+      label: 'Goal',
+      value: formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)),
+      desc: status === 'active' ? goal.objective : `${status} · ${goal.objective}`,
+    });
+    row.dataset.vxGoal = '1';
+    rows.push(row);
+  }
+  return rows;
+}
+
+// ── Background-task inspector: what a parked (or working) session's
+// wire-announced background commands are, and a read-only peek at their
+// output. List + tail come from the daemon's task registry
+// (`/api/session/{id}/background-tasks[...]`, tunnel twins) — the client
+// names task ids, never paths, and tasks without an announced output
+// file simply get no peek affordance (wire-first honesty).
+async function appendSessionBackgroundTaskRows(sessionId, panel) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || typeof daemonApi === 'undefined') return;
+  const epoch = panel.dataset.vxEpoch;
+  let body = null;
+  try {
+    const resp = await daemonApi.request('api_session_background_tasks', { session_id: sid }, { cache: 'no-store' });
+    if (!resp.ok) return;
+    body = resp.body;
+  } catch (_) {
+    return; // absent section, never a broken explainer
+  }
+  if (panel.dataset.vxEpoch !== epoch || !panel.isConnected) return;
+  const tasks = Array.isArray(body?.tasks) ? body.tasks : [];
+  if (!tasks.length) return;
+  const section = vxEl('div', 'vx-bgtasks');
+  section.appendChild(vxEl('div', 'vx-bgtasks-title', 'Background tasks'));
+  const nowSec = Date.now() / 1000;
+  for (const task of tasks) {
+    const row = vxEl('div', 'vx-bgtask-row');
+    const desc = vxEl('div', 'vx-bgtask-desc', String(task.description || 'background command'));
+    desc.title = String(task.description || '');
+    const status = String(task.status || '');
+    const started = Number(task.startedAtEpoch) || 0;
+    const ended = Number(task.endedAtEpoch) || 0;
+    // Running rows show elapsed-so-far; finished rows their outcome.
+    const meta = status === 'running'
+      ? (started ? `running · ${formatActivityElapsed(nowSec - started)}` : 'running')
+      : `${status}${started && ended ? ` · ${formatActivityElapsed(ended - started)}` : ''}`;
+    row.appendChild(desc);
+    row.appendChild(vxEl('span', 'vx-bgtask-meta', meta));
+    if (task.hasOutput && task.taskId) {
+      const view = vxEl('button', 'vx-bgtask-view', 'View output');
+      view.type = 'button';
+      view.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeVitalsExplainer();
+        openSessionBackgroundTaskOutput(sid, task);
+      });
+      row.appendChild(view);
+    }
+    section.appendChild(row);
+  }
+  panel.appendChild(section);
+}
+
+// Read-only output viewer: monospace tail of the task's output file,
+// auto-refreshed every ~2s while open and the task still runs. Manual
+// close only (button, backdrop, Escape) — never steals focus back.
+function ensureBgOutputViewerHost() {
+  let host = document.getElementById('bg-output-viewer');
+  if (host) return host;
+  host = document.createElement('div');
+  host.id = 'bg-output-viewer';
+  host.hidden = true;
+  const backdrop = vxEl('div', 'bgov-backdrop');
+  backdrop.addEventListener('click', closeBgOutputViewer);
+  const panel = vxEl('div', 'bgov-panel');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-label', 'Background task output');
+  host.appendChild(backdrop);
+  host.appendChild(panel);
+  document.body.appendChild(host);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !host.hidden) closeBgOutputViewer();
+  });
+  return host;
+}
+
+function closeBgOutputViewer() {
+  const host = document.getElementById('bg-output-viewer');
+  if (!host) return;
+  host.hidden = true;
+  if (host._refreshTimer) {
+    clearInterval(host._refreshTimer);
+    host._refreshTimer = null;
+  }
+}
+
+function openSessionBackgroundTaskOutput(sessionId, task) {
+  const sid = String(sessionId || '').trim();
+  const taskId = String(task?.taskId || '').trim();
+  if (!sid || !taskId || typeof daemonApi === 'undefined') return;
+  const host = ensureBgOutputViewerHost();
+  const panel = host.querySelector('.bgov-panel');
+  if (host._refreshTimer) {
+    clearInterval(host._refreshTimer);
+    host._refreshTimer = null;
+  }
+
+  const head = vxEl('div', 'bgov-head');
+  const title = vxEl('span', 'bgov-title', String(task?.description || 'Background task output'));
+  title.title = String(task?.description || '');
+  const statusChip = vxEl('span', 'bgov-status', String(task?.status || ''));
+  const close = vxEl('button', 'bgov-close', '✕');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Close output viewer');
+  close.addEventListener('click', closeBgOutputViewer);
+  head.appendChild(title);
+  head.appendChild(statusChip);
+  head.appendChild(close);
+  const note = vxEl('div', 'bgov-note', 'Loading output…');
+  const pre = vxEl('pre', 'bgov-pre', '');
+  panel.replaceChildren(head, note, pre);
+  host.hidden = false;
+
+  const refresh = async () => {
+    let body = null;
+    try {
+      const resp = await daemonApi.request(
+        'api_session_background_task_output',
+        { session_id: sid, task_id: taskId, tail_kb: 64 },
+        { cache: 'no-store' }
+      );
+      if (!resp.ok) throw new Error(resp?.body?.error || 'output unavailable');
+      body = resp.body;
+    } catch (err) {
+      if (host.hidden) return;
+      note.textContent = `Output unavailable: ${err?.message || err}`;
+      return;
+    }
+    if (host.hidden) return;
+    const status = String(body?.status || '');
+    statusChip.textContent = status;
+    const shownKb = Math.round(String(body?.content || '').length / 1024);
+    const totalKb = Math.round((Number(body?.sizeBytes) || 0) / 1024);
+    note.textContent = body?.truncated
+      ? `Read-only · last ${shownKb} KB of ${totalKb} KB (earlier output not shown)`
+      : `Read-only · ${totalKb} KB`;
+    // Keep the tail in view across refreshes unless the reader scrolled
+    // up to study earlier output.
+    const pinned = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    pre.textContent = String(body?.content || '');
+    if (pinned) pre.scrollTop = pre.scrollHeight;
+    // A finished task's file no longer moves: stop polling.
+    if (status !== 'running' && host._refreshTimer) {
+      clearInterval(host._refreshTimer);
+      host._refreshTimer = null;
+    }
+  };
+  refresh();
+  host._refreshTimer = setInterval(refresh, 2000);
 }
 
 // The glossary is the parity surface: EVERY catalog symbol is listed —
 // present ones with their live value and sentence (tap to drill in),
 // absent ones dimmed with "not reported", so what an agent lacks is
-// visible instead of silently missing. The health dot opens this.
+// visible instead of silently missing. The health dot opens this; the
+// header facts the collapsed one-liner folded away lead the list.
 function openVitalsGlossary(sessionId, anchor) {
   const models = vitalsModelsForSession(sessionId);
   const health = models.find((m) => m.key === 'health');
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
-  const rows = [];
+  const rows = vitalsGlossaryFactRows(sessionId);
   // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
   // the symbol's family has data but this symbol is at rest, say so in
   // its own words; only families the agent never reported read as such.
@@ -1581,6 +2173,13 @@ function openVitalsGlossary(sessionId, anchor) {
         : 'Not reported for this session yet.');
   const addRow = (model, def, label, key) => {
     const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
+    if (model) {
+      // Tick + severity handles for the live pane: the 1 Hz updater finds
+      // rows by model id, and severity tints the value column so the
+      // culprit reads at a glance even with the header chips folded away.
+      row.dataset.vxModel = model.id;
+      if (model.tone) row.dataset.severity = model.tone;
+    }
     row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
     const body = vxEl('div', 'vx-body');
     body.appendChild(vxEl('div', 'vx-label', label || def.label));
@@ -1606,20 +2205,53 @@ function openVitalsGlossary(sessionId, anchor) {
     if (key === 'limit') {
       const limitModels = models.filter((m) => m.key === 'limit');
       if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
-      for (const m of limitModels) addRow(m, VITALS_SYMBOLS.limit, `Rate limit ${m.id.slice('limit:'.length)}`, key);
+      // The chip compresses the window name; the pane owns the FULL name.
+      for (const m of limitModels) {
+        addRow(m, VITALS_SYMBOLS.limit,
+          `Rate limit · ${vitalsLimitLabelLong(m.id.slice('limit:'.length))}`, key);
+      }
       continue;
     }
     addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
   }
   panel.replaceChildren(
-    vxHeader('Session vitals',
-      health?.severity === 'crit' ? 'needs attention' : health?.severity === 'warn' ? 'worth a look' : 'all good'),
+    vxHeader('Session vitals', vxVerdictText(health)),
     // Every health line: the lead-in plus the named culprits — the whole
     // point of the verdict is that nobody has to hunt for a chip.
     ...(health?.explainLines || []).map((line) => vxEl('p', 'vx-line', line)),
     ...rows
   );
   presentVitalsPanel(host, panel, anchor);
+  // Countdown-bearing rows tick in place while the pane is open: value
+  // column + first sentence per catalog row, the goal row's elapsed, and
+  // the verdict word. Rows never appear/disappear per tick — structure
+  // changes wait for the next open (or a real vitals event re-render).
+  host._vxTick = () => {
+    const fresh = vitalsModelsForSession(sessionId);
+    const byId = new Map(fresh.map((m) => [m.id, m]));
+    for (const row of panel.querySelectorAll('[data-vx-model]')) {
+      const m = byId.get(row.dataset.vxModel);
+      if (!m) continue;
+      setVxText(row.querySelector('.vx-glyph'), m.text || '●');
+      setVxText(row.querySelector('.vx-desc'), m.explainLines[0] || '');
+      const tone = m.tone || '';
+      if ((row.dataset.severity || '') !== tone) {
+        if (tone) row.dataset.severity = tone;
+        else delete row.dataset.severity;
+      }
+    }
+    const goalRow = panel.querySelector('[data-vx-goal]');
+    if (goalRow) {
+      const goal = (sessionMetadataById.get(String(sessionId || '').trim()) || {}).goal;
+      if (goal?.objective) {
+        setVxText(goalRow.querySelector('.vx-glyph'),
+          formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)));
+      }
+    }
+    setVxText(panel.querySelector('.vx-head .vx-value'),
+      vxVerdictText(byId.get('health')));
+  };
+  startVitalsPanelTicker();
 }
 
 function vitalsCopyText(text) {
@@ -1867,8 +2499,9 @@ function normalizeSessionVitals(raw) {
   const cache = src.cache && typeof src.cache === 'object' ? src.cache : null;
   const limits = Array.isArray(src.limits) ? src.limits : [];
   const activity = src.activity && typeof src.activity === 'object' ? src.activity : null;
-  if (!git && !cache && !limits.length && !activity) return null;
-  return { git, cache, limits, activity };
+  const config = src.config && typeof src.config === 'object' ? src.config : null;
+  if (!git && !cache && !limits.length && !activity && !config) return null;
+  return { git, cache, limits, activity, config };
 }
 
 // Merge an arriving vitals snapshot over what a session already has. A
@@ -1886,6 +2519,7 @@ function mergeSessionVitals(incoming, existing) {
     cache: incoming.cache || existing.cache || null,
     limits: incoming.limits?.length ? incoming.limits : existing.limits || [],
     activity: incoming.activity || existing.activity || null,
+    config: incoming.config || existing.config || null,
   };
 }
 
@@ -1915,7 +2549,7 @@ function applySessionVitals(raw = {}) {
 function maybeRefreshSessionWindowActivityPill(sid, win, vitals) {
   if (!win || !win.phase || typeof applySessionWindowPhase !== 'function') return;
   const act = deriveSessionActivity(vitals?.activity);
-  const key = act ? `${act.state}|${act.effort}|${act.backgroundTasks.length}` : '';
+  const key = act ? `${act.state}|${act.backgroundTasks.length}` : '';
   if (win.activityPillKey === key) return;
   win.activityPillKey = key;
   applySessionWindowPhase(win, sid, win.phase);

@@ -1127,6 +1127,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionGoal { .. }
         | AppEvent::SessionVitals { .. }
         | AppEvent::SessionActivity { .. }
+        | AppEvent::SessionConfigFacts { .. }
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }

@@ -607,3 +607,39 @@ connects time out". Empty port (default) disables it.
   ignored — which is also why pre-flip confs carrying the retired
   `real_rustc` key stay parseable; malformed lines make the whole
   file fail open).
+
+## Merge queue settings (the main ruleset)
+
+Nothing in-repo configures the queue — the knobs live on the
+`main: merge queue + required checks` ruleset (repo settings → Rules;
+read them with `gh api repos/intendant-dev/Intendant/rulesets`). As of
+2026-07-17:
+
+- `check_response_timeout_minutes: 90` — must stay **≥ windows.yml's
+  60-minute job budget**: a legitimately slow cold build must never
+  get its queue entry swept mid-run. Don't tighten it for "fast
+  feedback"; entries that fail report long before any timeout.
+- `max_entries_to_build: 2` (build concurrency),
+  `max_entries_to_merge: 5`, `min_entries_to_merge: 1` with a 5-minute
+  wait, `ALLGREEN` grouping, `MERGE` method.
+
+Operating notes (paid for live, 2026-07-16/17):
+
+- The single Windows runner is the queue's throughput governor (~one
+  heavy entry per 8-12 warm minutes). Raising build concurrency does
+  not add Windows throughput — it only deepens speculation: more
+  wasted Linux/mac runs per ejection and bigger rebuild storms when an
+  entry ahead fails.
+- During rebuild storms, deep entries can leave the queue **runless**
+  well under the response timeout (observed at 11 and 22 minutes):
+  GitHub occasionally never dispatches a rebuilt entry's group runs,
+  then drops the entry with all sibling checks green. That is a
+  dispatch glitch, not a settings problem — dequeue + re-arm once the
+  queue quiets mints a fresh entry whose runs dispatch normally
+  (verified live 2026-07-16/17).
+- Parked decision — do not tune blind: before changing
+  `max_entries_to_build` or adding a second Windows listener, finish
+  the deferred Windows watchdog/cache-custody items above and
+  remeasure ≥30 merge groups on the post-2026-07-17 regime (the e2e
+  flake fixes and the literal wasm-drift context name). The pre-fix
+  queue numbers are dominated by failure modes that no longer exist.
