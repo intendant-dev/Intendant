@@ -832,11 +832,21 @@ const VITALS_SYMBOLS = {
     label: 'Session health',
     priority: 100,
     chip: () => '',
-    explain: (v) => (v.severity === 'crit'
-      ? ['Something needs your attention — the highlighted symbols say what.']
-      : v.severity === 'warn'
-        ? ['Worth a look soon — the highlighted symbols say why.']
-        : ['Everything looks good.', 'Tap any symbol to learn what it tracks.']),
+    // The verdict NAMES its culprits in plain words (derived from each
+    // attention symbol's `brief`, the same severity computation that
+    // colors the dot) — never just "the highlighted symbols say what",
+    // which strands the reader when a tight header hid the chip.
+    explain: (v) => {
+      const culprits = Array.isArray(v.culprits) ? v.culprits : [];
+      if (v.severity === 'crit' || v.severity === 'warn') {
+        const lead = v.severity === 'crit'
+          ? 'Something needs your attention:'
+          : 'Worth a look soon:';
+        if (!culprits.length) return [lead.replace(':', '.')];
+        return [lead, ...culprits];
+      }
+      return ['Everything looks good.', 'Tap any symbol to learn what it tracks.'];
+    },
   },
   activity: {
     label: 'Model activity',
@@ -886,6 +896,13 @@ const VITALS_SYMBOLS = {
         ];
       }
       return [`The model reports “${v.state}”.`];
+    },
+    // Short attention phrase for the health verdict's culprit list —
+    // only the states that elevate the chip produce one.
+    brief: (v) => {
+      if (v.state === 'rate-limited') return `Rate-limited${v.reset ? ` — resets in ~${v.reset}` : ''}`;
+      if (v.state === 'stalled') return `Model stalled — nothing received for ${v.quietText}`;
+      return '';
     },
   },
   worktree: {
@@ -939,6 +956,7 @@ const VITALS_SYMBOLS = {
     explain: (v) => (v.conflict
       ? [`Merging this work into ${v.primaryRef} would CONFLICT — overlapping edits need a decision before it can land.`]
       : [`Merging this work into ${v.primaryRef} would apply cleanly right now.`]),
+    brief: (v) => (v.conflict ? `Merge conflict with ${v.primaryRef}` : ''),
     action: (v, sessionId) => (v.conflict
       ? { label: 'Open the merge card', run: () => openSessionWorktreeMergeCard(sessionId) }
       : null),
@@ -989,9 +1007,18 @@ const VITALS_SYMBOLS = {
   limit: {
     label: 'Rate limit',
     priority: 80,
-    chip: (v) => (v.usedPct !== null
-      ? `▮${v.usedPct}% ${v.label}`
-      : `${v.label} ${v.statusWord}${v.reset ? ` ↻${v.reset}` : ''}`),
+    // Percentages render only when the provider actually reported one
+    // (Claude Code 2.1.2xx dropped `utilization` from rate_limit_event in
+    // normal operation, and its statusline feed — which does carry
+    // used_percentage — never fires in the print mode we drive it in).
+    // Without one the chip stays honest: named window, status mark, and
+    // the reset countdown we DO know — never a synthesized number.
+    chip: (v) => {
+      const reset = v.reset ? ` · ↻${v.reset}` : '';
+      if (v.usedPct !== null) return `▮${v.usedPct}% ${v.label}${reset}`;
+      const mark = v.severity === 'crit' ? '⛔' : v.severity === 'warn' ? '⚠' : v.statusWord;
+      return `${v.label} ${mark}${reset}`;
+    },
     explain: (v) => {
       const lines = [];
       if (v.usedPct !== null) {
@@ -1002,6 +1029,13 @@ const VITALS_SYMBOLS = {
       if (v.reset) lines.push(`The window resets in ~${v.reset}.`);
       if (v.severity === 'crit') lines.push('When an allowance runs out, the provider pauses this agent until the window resets.');
       return lines;
+    },
+    brief: (v) => {
+      // Name the driver: a hard status outranks the percentage.
+      const what = v.usedPct !== null && v.usedPct >= 90 ? `${v.usedPct}% used`
+        : v.statusWord !== 'ok' ? v.statusWord
+          : `${v.usedPct}% used`;
+      return `${vitalsLimitLabelLong(v.label)} limit: ${what}${v.reset ? ` — resets in ~${v.reset}` : ''}`;
     },
   },
 };
@@ -1072,6 +1106,9 @@ function vitalsChipModels(vitals, meta, sessionId) {
       tone,
       elevated: severity === 'warn' || severity === 'crit',
       explainLines: def.explain({ ...value, severity }),
+      // Short attention phrase for the health culprit list; symbols
+      // without one fall back to "label: chip text" there.
+      brief: def.brief ? (def.brief({ ...value, severity }) || '') : '',
       action: def.action ? (def.action(value, sessionId) || null) : null,
       ticking: !!extra.ticking,
       // Render-identity override for ticking chips: excludes the parts
@@ -1191,6 +1228,12 @@ function vitalsChipModels(vitals, meta, sessionId) {
     (acc, m) => (VITALS_SEVERITY_RANK[m.severity] > VITALS_SEVERITY_RANK[acc] ? m.severity : acc),
     ''
   );
+  // The culprits behind the verdict, named in plain words — the same
+  // models whose severity feeds the dot, so the list can never disagree
+  // with the color.
+  const culprits = models
+    .filter((m) => m.severity === 'warn' || m.severity === 'crit')
+    .map((m) => m.brief || (m.text ? `${m.label}: ${m.text}` : m.label));
   const healthDef = VITALS_SYMBOLS.health;
   models.unshift({
     id: 'health',
@@ -1201,7 +1244,8 @@ function vitalsChipModels(vitals, meta, sessionId) {
     severity: worst === 'ok' ? '' : worst,
     tone: worst === 'ok' ? '' : worst,
     elevated: true,
-    explainLines: healthDef.explain({ severity: worst }),
+    explainLines: healthDef.explain({ severity: worst, culprits }),
+    brief: '',
     action: null,
     ticking: false,
   });
@@ -1276,6 +1320,9 @@ function sessionVitalsLimitsSegment(limits) {
 // chips onto extra lines so nothing is ever cut; collapsed headers show
 // the health dot + severity-elevated chips + a "+N" overflow chip that
 // opens the glossary (CSS keys off data-elevated / .header-collapsed).
+// Elevation implies survival: an attention chip is excluded from the +N
+// fold count here and exempt from every CSS drop rule — only quiet chips
+// ever drop, so the dot's culprit is always on screen.
 function renderSessionWindowVitals(win, vitals) {
   if (!win?.vitals) return false;
   const meta = sessionMetadataById.get(win.sessionId) || {};
@@ -1536,7 +1583,9 @@ function openVitalsGlossary(sessionId, anchor) {
   panel.replaceChildren(
     vxHeader('Session vitals',
       health?.severity === 'crit' ? 'needs attention' : health?.severity === 'warn' ? 'worth a look' : 'all good'),
-    vxEl('p', 'vx-line', health?.explainLines[0] || ''),
+    // Every health line: the lead-in plus the named culprits — the whole
+    // point of the verdict is that nobody has to hunt for a chip.
+    ...(health?.explainLines || []).map((line) => vxEl('p', 'vx-line', line)),
     ...rows
   );
   presentVitalsPanel(host, panel, anchor);

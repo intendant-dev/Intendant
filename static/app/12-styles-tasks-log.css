@@ -1437,6 +1437,7 @@ body.context-focus-active {
   display: inline-flex;
   align-items: center;
   gap: 3px;
+  flex: none; /* shrink-proof: a chip is shown whole or dropped, never crushed */
   margin: 0;
   padding: 1px 7px;
   border: 1px solid color-mix(in srgb, var(--teal) 22%, transparent);
@@ -1484,9 +1485,14 @@ body.context-focus-active {
 }
 .session-window-vitals .vit-health[data-severity="warn"]::before { background: var(--yellow); }
 .session-window-vitals .vit-health[data-severity="crit"]::before { background: var(--red); }
-/* Collapsed header: quiet by default. */
+/* Collapsed header / narrow container: quiet chips fold into "+N", but
+   elevation implies SURVIVAL — an attention chip ([data-elevated]) is
+   never folded into the count, never display:none'd, and never clipped:
+   chips are shrink-proof (flex: none) and the cluster keeps its base
+   flex-wrap (no nowrap override), so surviving chips wrap onto another
+   line instead of vanishing when the header runs tight. A red health
+   dot whose culprit chip is invisible is the one unacceptable outcome. */
 .session-window-vitals .vit-chip.vit-overflow { display: none; }
-.session-window.header-collapsed .session-window-vitals { flex-wrap: nowrap; }
 .session-window.header-collapsed .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
 .session-window.header-collapsed .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
 @container (max-width: 560px) {
