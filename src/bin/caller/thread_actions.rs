@@ -2871,6 +2871,7 @@ pub(crate) async fn drain_external_child_turn(
         persist_model_responses_inline: config.persist_model_responses_inline,
         headless: config.headless,
         context_injection: config.context_injection,
+        reload_credentials: config.reload_credentials,
     };
 
     match drain_external_agent_events(
@@ -3198,7 +3199,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 &text,
                 None,
             );
-            config.bus.send(AppEvent::ModelResponse {
+            config.send_model_response(AppEvent::ModelResponse {
                 session_id,
                 turn: stats
                     .codex_subagent_rounds
@@ -3227,7 +3228,7 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 "",
                 Some(&text),
             );
-            config.bus.send(AppEvent::ModelResponse {
+            config.send_model_response(AppEvent::ModelResponse {
                 session_id,
                 turn: stats
                     .codex_subagent_rounds
@@ -3416,6 +3417,11 @@ pub(crate) fn handle_idle_codex_subagent_event(
                 session_id,
                 activity,
             });
+        }
+        external_agent::AgentEvent::ConfigFacts { facts } => {
+            config
+                .bus
+                .send(AppEvent::SessionConfigFacts { session_id, facts });
         }
         external_agent::AgentEvent::GoalUpdated { goal } => {
             emit_external_session_goal(config, Some(child_thread_id), Some(goal));
@@ -3894,6 +3900,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -3968,6 +3975,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -4087,6 +4095,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let mut stats = LoopStats::default();
 
@@ -4306,6 +4315,7 @@ mod tests {
             persist_model_responses_inline: false,
             headless: true,
             context_injection,
+            reload_credentials: None,
         }
     }
 

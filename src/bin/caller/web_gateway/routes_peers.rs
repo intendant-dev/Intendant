@@ -2849,8 +2849,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_peers_pairing_join_rejects_invalid_invite() {
         let root = tempfile::TempDir::new().unwrap();
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let body = serde_json::json!({"invite": "not an intendant invite"}).to_string();
 
@@ -2945,8 +2944,7 @@ mod tests {
     }
 
     fn empty_test_registry() -> crate::peer::PeerRegistry {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         crate::peer::PeerRegistry::new(log_tx)
     }
 

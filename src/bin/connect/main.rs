@@ -169,8 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pending_authentications: Mutex::new(HashMap::new()),
         pending_offers: Mutex::new(HashMap::new()),
         pending_claims: Mutex::new(HashMap::new()),
-        event_queues: Mutex::new(HashMap::new()),
-        event_notify: Notify::new(),
+        event_lanes: std::sync::Mutex::new(HashMap::new()),
         daemon_sessions: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(RateLimitTable::default()),
         active_sessions: Mutex::new(HashMap::new()),
@@ -771,8 +770,11 @@ struct AppState {
     pending_authentications: Mutex<HashMap<String, PendingAuthentication>>,
     pending_offers: Mutex<HashMap<String, PendingOffer>>,
     pending_claims: Mutex<HashMap<String, PendingClaim>>,
-    event_queues: Mutex<HashMap<String, VecDeque<RendezvousEvent>>>,
-    event_notify: Notify,
+    /// Per-daemon event delivery lanes (rendezvous.rs): each daemon's
+    /// undelivered events plus the Notify its long-poll parks on, so a push
+    /// wakes exactly the daemon it targets. std Mutex on the map: held only
+    /// to get-or-create a lane Arc, never across an await.
+    event_lanes: std::sync::Mutex<HashMap<String, Arc<DaemonEventLane>>>,
     daemon_sessions: Mutex<HashMap<String, DaemonSessionCredential>>,
     rate_limits: Mutex<RateLimitTable>,
     active_sessions: Mutex<HashMap<String, ActiveDashboardSession>>,
@@ -856,8 +858,7 @@ fn build_test_state(root: &Path, mut store: Store, overrides: TestStateOverrides
         pending_authentications: Mutex::new(HashMap::new()),
         pending_offers: Mutex::new(HashMap::new()),
         pending_claims: Mutex::new(HashMap::new()),
-        event_queues: Mutex::new(HashMap::new()),
-        event_notify: Notify::new(),
+        event_lanes: std::sync::Mutex::new(HashMap::new()),
         daemon_sessions: Mutex::new(HashMap::new()),
         rate_limits: Mutex::new(RateLimitTable::default()),
         active_sessions: Mutex::new(HashMap::new()),

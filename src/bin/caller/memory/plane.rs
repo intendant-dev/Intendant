@@ -113,6 +113,46 @@ const GENESIS_BUDGET: Budget = Budget {
     max_bytes: 268_435_456,
 };
 
+/// The plane's custody-tier secrets, surfaced ONLY by
+/// [`EphemeralPlane::bootstrap_with_custody`] for the P1.5 durable
+/// custody adapter (`memory::store`) and its battery. The ephemeral
+/// service path ([`EphemeralPlane::bootstrap`]) drops them.
+#[allow(dead_code)]
+pub(crate) struct PlaneCustody {
+    pub root_seed: [u8; 32],
+    pub recovery_seed: [u8; 32],
+    pub sig_seed: [u8; 32],
+    pub kem_ikm: [u8; 32],
+    /// The zone's epoch-1 KEK. Recoverable from the genesis wrap via
+    /// `kem_ikm` (`keyschedule::open_kek`) regardless; carried
+    /// directly so reopen never re-parses ceremony bodies — same
+    /// custody tier, no new exposure class.
+    pub kek_epoch1: [u8; 32],
+}
+
+/// The ceremony's random identifiers, carried by the durable store's
+/// sidecar so [`EphemeralPlane::resume`] can rebuild the writer side
+/// at reopen (the deterministic remainder re-derives from
+/// [`PlaneCustody`] and the ceremony constants). The rebuilt
+/// cert/grant MUST hash back to the ceremony's `H_cert`/`H_grant` —
+/// the stamped fold rejects the first resumed append otherwise, which
+/// is exactly what the crash battery proves.
+#[allow(dead_code)]
+pub(crate) struct PlaneResume {
+    pub custody: PlaneCustody,
+    pub plane_id: [u8; 32],
+    pub zone_id: [u8; 16],
+    pub home_space: [u8; 16],
+    pub audit_space: [u8; 16],
+    pub device_id: [u8; 16],
+    pub lineage: [u8; 16],
+    pub evidence_hash: [u8; 32],
+    pub revocation_id: [u8; 16],
+    pub grant_id: [u8; 16],
+    /// `op_hash` of the genesis operation (the ctrl chain head).
+    pub genesis_hash: [u8; 32],
+}
+
 /// The daemon's writer device on this plane.
 pub(crate) struct WriterDevice {
     pub device_id: [u8; 16],
@@ -139,7 +179,7 @@ pub(crate) struct EphemeralPlane {
     #[allow(dead_code)]
     pub root_pk: [u8; 32],
     pub dev: WriterDevice,
-    grant: Grant,
+    pub grant: Grant,
     /// name → signed op bytes; names are zero-padded append indexes,
     /// so `BTreeMap` order == append order.
     items: BTreeMap<String, Vec<u8>>,
@@ -164,6 +204,16 @@ impl EphemeralPlane {
     /// row; D-68/D-76 cross-field validity), then fold it and require
     /// admission by the stamped reader.
     pub(crate) fn bootstrap() -> Result<EphemeralPlane, MemoryError> {
+        Ok(Self::bootstrap_with_custody()?.0)
+    }
+
+    /// [`Self::bootstrap`] plus the ceremony's custody-tier secrets —
+    /// the create path of the P1.5 durable custody adapter
+    /// (`memory::store`). Everything the ceremony mints randomly and
+    /// then needs again at reopen rides [`PlaneCustody`]; the
+    /// ephemeral path discards it.
+    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
+    pub(crate) fn bootstrap_with_custody() -> Result<(EphemeralPlane, PlaneCustody), MemoryError> {
         let created_ms = now_ms();
         let root_seed = rand32();
         let (_, root_pk) = suite::ed25519::keypair(&root_seed);
@@ -215,6 +265,13 @@ impl EphemeralPlane {
         let home_space = rand_id();
         let audit_space = rand_id();
         let kek_e1 = rand32();
+        let custody = PlaneCustody {
+            root_seed,
+            recovery_seed,
+            sig_seed,
+            kem_ikm,
+            kek_epoch1: kek_e1,
+        };
         let (enc, ct) = keyschedule::wrap_kek(&kem_pk, &plane_id, &zone_id, 1, &kek_e1, &rand32())
             .ok_or_else(|| {
                 MemoryError::InvalidArg("genesis kek wrap: derived recipient key rejected".into())
@@ -342,7 +399,128 @@ impl EphemeralPlane {
         };
         plane.prev_writer_hash = gen_start(&plane.dev.lineage, 1);
         plane.append(genesis_op)?;
-        Ok(plane)
+        Ok((plane, custody))
+    }
+
+    /// The held op set (name → signed-op bytes; genesis included) —
+    /// what the durable adapter persists at create time.
+    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
+    pub(crate) fn held_items(&self) -> &BTreeMap<String, Vec<u8>> {
+        &self.items
+    }
+
+    /// Rebuild a WRITABLE plane from recovered custody + the recovered
+    /// op set (the P1.5 durable adapter's reopen path). Admission of
+    /// the recovered set rides the STAMPED fold — any rejected
+    /// recovered op surfaces its named outcome verbatim — and the
+    /// writer chain resumes from the fold's own chain head, never
+    /// from a second parse of the log.
+    #[allow(dead_code)] // consumed by the store artifact + its battery until P1.8
+    pub(crate) fn resume(
+        r: &PlaneResume,
+        items: BTreeMap<String, Vec<u8>>,
+    ) -> Result<EphemeralPlane, MemoryError> {
+        let (_, root_pk) = suite::ed25519::keypair(&r.custody.root_seed);
+        let (_, sig_pk) = suite::ed25519::keypair(&r.custody.sig_seed);
+        let (_, kem_pk) = hpke_wrap::derive_keypair(&r.custody.kem_ikm);
+        let cert = Cert {
+            plane_id: r.plane_id,
+            device_id: r.device_id,
+            sig_alg: Sigalg::Ed25519,
+            sig_pk: sig_pk.to_vec(),
+            kem_pk: kem_pk.to_vec(),
+            class: Devclass::Daemon,
+            evidence_hash: r.evidence_hash,
+            evidence_media_type: None,
+            issued_admin_epoch: 1,
+            expiry_deadline_ms: None,
+            revocation_id: r.revocation_id,
+            renews: None,
+        };
+        let dev = WriterDevice {
+            device_id: r.device_id,
+            lineage: r.lineage,
+            sig_seed: r.custody.sig_seed,
+            sig_pk,
+            cert,
+        };
+        let grant = Grant {
+            plane_id: r.plane_id,
+            grant_id: r.grant_id,
+            subject_device: r.device_id,
+            lineage: Some(r.lineage),
+            tenants: vec![GrantTenant::Memory],
+            zone: ZoneSel::Zone(r.zone_id),
+            spaces: SpacesSel::Spaces(vec![r.home_space]),
+            ops: daemon_writer_verbs(),
+            kinds: None,
+            class_ceiling: Class::Sensitive,
+            can_declassify: None,
+            can_raise: None,
+            raise_quota: None,
+            flows: None,
+            budget: Some(GENESIS_BUDGET),
+            online_lease: false,
+            max_age_ms: None,
+            issued_admin_epoch: 1,
+            capability_epoch: 1,
+            expiry_deadline_ms: None,
+        };
+
+        if items.is_empty() {
+            return Err(MemoryError::InvalidArg(
+                "resume needs at least the genesis operation".into(),
+            ));
+        }
+        let (verdicts, state) = fold_set(&items, &BTreeMap::new())
+            .map_err(|Unimplemented(why)| MemoryError::Unimplemented(why))?;
+        for verdict in verdicts.values() {
+            if let Verdict::Rejected(outcome, disposition) = verdict {
+                return Err(MemoryError::Rejected {
+                    outcome,
+                    disposition,
+                });
+            }
+        }
+
+        let (writer_seq, prev_writer_hash) =
+            match state.tenant_chain_head(&r.zone_id, &r.lineage, 1) {
+                Some((next_seq, head)) => (next_seq - 1, head),
+                None => (0, gen_start(&r.lineage, 1)),
+            };
+        // HLC floor: the chain head op's own clock, so monotonicity
+        // holds even if the wall clock stepped backward across the
+        // restart (next_hlc maxes with now() on top).
+        let mut hlc_last_ms = 0;
+        if writer_seq > 0 {
+            for raw in items.values() {
+                if let Ok(op) = owner_plane_reducer::envelope::parse_op(raw) {
+                    if op.op_hash() == prev_writer_hash {
+                        hlc_last_ms = op.header.created_ms;
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(EphemeralPlane {
+            plane_id: r.plane_id,
+            zone_id: r.zone_id,
+            home_space: r.home_space,
+            audit_space: r.audit_space,
+            root_seed: r.custody.root_seed,
+            root_pk,
+            dev,
+            grant,
+            items,
+            verdicts,
+            state,
+            writer_seq,
+            prev_writer_hash,
+            ctrl_seq: 1,
+            ctrl_head: r.genesis_hash,
+            hlc_last_ms,
+        })
     }
 
     fn next_hlc(&mut self) -> Hlc {
@@ -454,6 +632,61 @@ impl EphemeralPlane {
         self.writer_seq = seq;
         self.prev_writer_hash = op_hash;
         Ok(op_hash)
+    }
+
+    /// Retract the most recent op when its durable persistence FAILED
+    /// (P1.8 lockstep: §6.2 L1 says nothing unflushed is ever exposed
+    /// as committed, and the in-memory view must agree). Only valid
+    /// for the op at the chain tail; the fold and chain position are
+    /// re-derived from the remaining set.
+    pub(crate) fn retract_unpersisted(&mut self, op_hash: &[u8; 32]) -> Result<(), MemoryError> {
+        let Some((name, _)) = self
+            .items
+            .iter()
+            .last()
+            .filter(|(_, bytes)| {
+                owner_plane_reducer::envelope::parse_op(bytes)
+                    .is_ok_and(|op| op.op_hash() == *op_hash)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+        else {
+            return Err(MemoryError::InvalidArg(
+                "retract_unpersisted targets only the chain tail".into(),
+            ));
+        };
+        self.items.remove(&name);
+        let (verdicts, state) = fold_set(&self.items, &BTreeMap::new())
+            .map_err(|Unimplemented(why)| MemoryError::Unimplemented(why))?;
+        self.verdicts = verdicts;
+        self.state = state;
+        let (writer_seq, prev_writer_hash) =
+            match self
+                .state
+                .tenant_chain_head(&self.zone_id, &self.dev.lineage, 1)
+            {
+                Some((next_seq, head)) => (next_seq - 1, head),
+                None => (0, gen_start(&self.dev.lineage, 1)),
+            };
+        self.writer_seq = writer_seq;
+        self.prev_writer_hash = prev_writer_hash;
+        Ok(())
+    }
+
+    /// Test seam: seal a tenant op into an ARBITRARY space (the
+    /// space-denial exit test aims at the audit space the writer grant
+    /// does not cover; production sealing always targets home).
+    #[cfg(test)]
+    pub(crate) fn tenant_op_in_space_for_test(
+        &mut self,
+        space_id: [u8; 16],
+        op_type: &str,
+        body: cbor::Value,
+    ) -> Result<[u8; 32], MemoryError> {
+        let home = self.home_space;
+        self.home_space = space_id;
+        let out = self.tenant_op(ActorKind::Daemon, None, op_type, body);
+        self.home_space = home;
+        out
     }
 
     /// Derived claim status via the reducer's §11.2 fold — never a

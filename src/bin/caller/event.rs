@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT: usize = 128 * 1024;
@@ -183,6 +183,17 @@ pub enum AppEvent {
     },
     /// User requested interruption; broadcast to agent loops so they can cancel.
     InterruptRequested {
+        session_id: Option<String>,
+    },
+    /// User asked a supervised external session to reload its backend
+    /// credentials: the supervision loop respawns the backend process
+    /// in place (resume-attach on the same backend session id) so it
+    /// re-reads the credential store. Mid-turn, the drain interrupts the
+    /// backend first (stop semantics) and the loop applies the respawn
+    /// once the turn drain returns; a live rate-limit park is cancelled
+    /// with its pending re-send preserved, so queued/pending messages
+    /// re-deliver after the respawn.
+    ReloadBackendCredentials {
         session_id: Option<String>,
     },
     /// User requested that a managed session stop completely. External-agent
@@ -376,6 +387,15 @@ pub enum AppEvent {
     SessionActivity {
         session_id: Option<String>,
         activity: crate::types::SessionActivityVitals,
+    },
+    /// Partial session-config facts (model / effort / permission mode)
+    /// from a backend's protocol seams — launch config, init echoes,
+    /// mid-session switches. Hub-internal like `SessionActivity`: the
+    /// vitals hub folds fields sticky into `SessionVitals.config`, which
+    /// is the outbound and session-logged carrier.
+    SessionConfigFacts {
+        session_id: Option<String>,
+        facts: crate::types::SessionConfigVitals,
     },
     SessionAttached {
         session_id: String,
@@ -1057,6 +1077,14 @@ pub enum AppEvent {
         counts: crate::agenda::AgendaCounts,
     },
 
+    /// The Memory plane admitted a write (a claim was proposed). Carries
+    /// the provenance-labeled view so frontends update live without
+    /// refetching. The view is quoted DATA for rendering (§6.5), never
+    /// instructions.
+    MemoryChanged {
+        claim: crate::memory::ClaimView,
+    },
+
     /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
     /// listener consumes it (stuck-phase detection), and only MCP mode
     /// spawns the timer.
@@ -1379,6 +1407,15 @@ pub enum ControlMsg {
     /// removes the live session from daemon state and asks the backend process
     /// to shut down.
     StopSession {
+        session_id: String,
+    },
+    /// Ask a live supervised external session to reload its backend
+    /// credentials: graceful in-place respawn with `--resume` on the same
+    /// backend session id, so the new process reads the fresh credential
+    /// store (e.g. after a dashboard Claude sign-in). Interrupts a
+    /// mid-turn backend first; cancels a rate-limit park and re-delivers
+    /// its queued/pending messages after the respawn.
+    ReloadCredentials {
         session_id: String,
     },
     /// Stop a live external-agent session and immediately resume it using the
@@ -2002,14 +2039,6 @@ pub enum ControlMsg {
         #[serde(default)]
         target: Option<String>,
     },
-    RecallMemory {
-        #[serde(default)]
-        keywords: Option<Vec<String>>,
-        #[serde(default)]
-        tags: Option<Vec<String>>,
-        #[serde(default)]
-        channel: Option<String>,
-    },
     InvokeSkill {
         skill_name: String,
         #[serde(default)]
@@ -2116,10 +2145,20 @@ pub enum ControlMsg {
 /// low-volume event subset persisted to `session.jsonl`, and
 /// [`EventBus::subscribe_intents`] is the lossless path for user intents
 /// (`ControlCommand`) and the session-bookkeeping events that route them.
+/// Emitters choose the persistence disposition per event: [`EventBus::send`]
+/// routes session-log-subset events onto the lossless lane for the
+/// session-log writer, while [`EventBus::send_already_persisted`] is for
+/// events the emitter has already written to the owning session's log — it
+/// skips the lane so the writer cannot persist a second copy.
+/// One item on the lossless session-log lane: the event plus the instant it
+/// entered the lane at [`EventBus::send`], so the writer can measure
+/// enqueue→consume latency (see [`warn_writer_lane_slow`]).
+pub type SessionLogLaneItem = (AppEvent, Instant);
+
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
-    session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SessionLogLaneItem>>>>,
     intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
 }
 
@@ -2135,10 +2174,38 @@ impl EventBus {
 
     pub fn send(&self, event: AppEvent) {
         if app_event_writes_to_session_log(&event) {
+            // Stamped at the emit point so the session-log writer can
+            // measure how long the item sat in the lane before it was
+            // consumed (see `warn_writer_lane_slow`).
+            let enqueued_at = Instant::now();
             if let Ok(mut sinks) = self.session_log_sinks.lock() {
+                sinks.retain(|sink| sink.send((event.clone(), enqueued_at)).is_ok());
+            }
+        }
+        if app_event_rides_intent_lane(&event) {
+            if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
             }
         }
+        let _ = self.tx.send(event);
+    }
+
+    /// Send an event the emitter has ALREADY persisted to its owning
+    /// session's log. Identical to [`Self::send`] except the lossless
+    /// session-log lane is skipped: the session-log writer (and every other
+    /// lane subscriber) never sees the event, so it cannot be persisted a
+    /// second time — and in daemon mode the head-session log stops
+    /// aggregating a copy of a child-owned row. Broadcast and intent lanes
+    /// are unchanged, so live frontends and intent consumers observe the
+    /// event exactly as with [`Self::send`].
+    ///
+    /// Intended for `AppEvent::ModelResponse` from paths that inline-log the
+    /// response at the point of origin (the native agent loop; external
+    /// drains with `persist_model_responses_inline`). Events the
+    /// fission-lifecycle watcher folds (DoneSignal/TaskComplete/Interrupted/
+    /// SessionEnded/FileChanged) must keep using [`Self::send`] — that
+    /// watcher consumes the same lane.
+    pub fn send_already_persisted(&self, event: AppEvent) {
         if app_event_rides_intent_lane(&event) {
             if let Ok(mut sinks) = self.intent_sinks.lock() {
                 sinks.retain(|sink| sink.send(event.clone()).is_ok());
@@ -2162,7 +2229,13 @@ impl EventBus {
     /// such as `SteerRequested` / `SteerQueued` during high-volume model
     /// streaming, so the bus keeps a separate unbounded fan-out for just the
     /// event kinds that the session log writer persists.
-    pub fn subscribe_session_log(&self) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
+    ///
+    /// Each item carries the [`Instant`] it was pushed into the lane, so a
+    /// consumer can measure enqueue→consume latency (the session-log writer
+    /// reports pathological lags — see [`warn_writer_lane_slow`]).
+    pub fn subscribe_session_log(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<SessionLogLaneItem> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Ok(mut sinks) = self.session_log_sinks.lock() {
             sinks.push(tx);
@@ -2309,6 +2382,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
         }),
         AppEvent::SessionStopRequested { .. } => None,
+        // Loop-internal respawn signal; frontends follow the reload through
+        // LogEntry lines and session lifecycle events.
+        AppEvent::ReloadBackendCredentials { .. } => None,
         AppEvent::Interrupted { session_id, reason } => Some(OutboundEvent::Interrupted {
             session_id: session_id.clone(),
             reason: reason.clone(),
@@ -2456,9 +2532,10 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             vitals: vitals.clone(),
         }),
-        // Hub-internal: the vitals hub folds it into SessionVitals, which
-        // is the outbound (and session-logged) carrier.
+        // Hub-internal: the vitals hub folds these into SessionVitals,
+        // which is the outbound (and session-logged) carrier.
         AppEvent::SessionActivity { .. } => None,
+        AppEvent::SessionConfigFacts { .. } => None,
         AppEvent::SessionAttached { session_id, source } => Some(OutboundEvent::SessionAttached {
             session_id: session_id.clone(),
             source: source.clone(),
@@ -3065,6 +3142,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             item: item.clone(),
             counts: *counts,
         }),
+        AppEvent::MemoryChanged { claim } => Some(OutboundEvent::MemoryChanged {
+            claim: claim.clone(),
+        }),
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,
         // Internal events — not broadcast to external consumers
@@ -3189,22 +3269,115 @@ pub fn spawn_outbound_broadcaster(
 /// Spawn a task that persists AppEvents to the session log on disk.
 ///
 /// This is the single point where events flowing through the bus are written
-/// to `session.jsonl`. Events that are already logged inline by the agent loop
-/// (turn_start, model_response, agent_input/output, approval decisions, etc.)
-/// are skipped here to avoid duplication — only events that would otherwise be
-/// lost are handled.
+/// to `session.jsonl`. Which events arrive here is a two-part contract:
+///
+/// - the emitter's disposition: an event already written to its owning
+///   session's log at the point of origin is emitted with
+///   [`EventBus::send_already_persisted`] and never enters the lane (the
+///   native loop's `ModelResponse`; external drains persisting inline),
+///   while [`EventBus::send`] routes an event here when this writer is its
+///   only path to disk (e.g. an external-agent `ModelResponse` with no
+///   inline copy);
+/// - the lane filter ([`app_event_writes_to_session_log`]): the low-volume
+///   subset this writer persists at all. Events inline-logged at their
+///   origin and never lane-routed (turn_start, agent_input/output, approval
+///   decisions, etc.) are simply not handled in
+///   [`write_event_to_session_log`].
+///
+/// Per item the task measures enqueue→consume (how long the event sat in the
+/// lossless lane) and consume→durable (how long the locked append+flush took)
+/// and reports pathological stalls on stderr via [`warn_writer_lane_slow`] —
+/// forensics for the observed "broadcast seen, session-log row absent for
+/// minutes" class, which this loop's silence made undecidable between a
+/// never-polled task and a consumed-then-stuck write.
 ///
 /// Counterpart to `spawn_outbound_broadcaster` which handles the WebSocket/
 /// control-socket broadcast path.
 pub fn spawn_session_log_writer(
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionLogLaneItem>,
     session_log: crate::SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        let mut last_slow_warn: Option<Instant> = None;
+        while let Some((event, enqueued_at)) = event_rx.recv().await {
+            let consumed_at = Instant::now();
             write_event_to_session_log(&session_log, &event);
+            warn_writer_lane_slow(
+                "session-log-writer",
+                || debug_variant_name(&event),
+                consumed_at.saturating_duration_since(enqueued_at),
+                consumed_at.elapsed(),
+                &mut last_slow_warn,
+            );
         }
     })
+}
+
+/// A writer-lane stage (enqueue→consume or consume→durable) longer than this
+/// is reported as pathological.
+pub(crate) const WRITER_LANE_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// Minimum spacing between SLOW reports from one writer task, so a clearing
+/// stall (a backlog of delayed items all draining at once) cannot storm the
+/// daemon log.
+pub(crate) const WRITER_LANE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Report a pathologically slow durable-writer event on stderr.
+///
+/// The durable writer tasks (session-log above, `peer::log_writer`) call this
+/// once per item with the item's measured stages:
+///
+/// - `enqueue_to_consume`: producer `send` → writer task `recv` return. Large
+///   values mean the item sat in the channel — an unpolled/wedged writer task
+///   (or, for the bounded peer channel, upstream backpressure).
+/// - `consume_to_durable`: `recv` return → append+flush returned. Large
+///   values mean the write path itself blocked (lock contention or a stuck
+///   filesystem syscall).
+///
+/// Emits at most one line per [`WRITER_LANE_WARN_INTERVAL`] per task
+/// (`last_warned` is task-local state) and nothing below
+/// [`WRITER_LANE_SLOW_THRESHOLD`], so the happy path stays silent. The line
+/// lands on stderr, which the daemon-log tees already capture in tests and CI
+/// dumps. Returns whether a line was emitted (observable for tests).
+pub(crate) fn warn_writer_lane_slow(
+    task: &str,
+    event_kind: impl FnOnce() -> String,
+    enqueue_to_consume: Duration,
+    consume_to_durable: Duration,
+    last_warned: &mut Option<Instant>,
+) -> bool {
+    if enqueue_to_consume < WRITER_LANE_SLOW_THRESHOLD
+        && consume_to_durable < WRITER_LANE_SLOW_THRESHOLD
+    {
+        return false;
+    }
+    let now = Instant::now();
+    if let Some(previous) = *last_warned {
+        if now.saturating_duration_since(previous) < WRITER_LANE_WARN_INTERVAL {
+            return false;
+        }
+    }
+    *last_warned = Some(now);
+    eprintln!(
+        "[{task}] SLOW event={} enqueue_to_consume={:.1}s consume_to_durable={:.1}s",
+        event_kind(),
+        enqueue_to_consume.as_secs_f64(),
+        consume_to_durable.as_secs_f64(),
+    );
+    true
+}
+
+/// Variant name of a `Debug`-rendered enum value (`SessionNote`,
+/// `StatusChanged`, …): the token before the first space, brace, or paren.
+/// Diagnostics-only — evaluated on the rate-limited pathological path, never
+/// per event.
+pub(crate) fn debug_variant_name(value: &impl std::fmt::Debug) -> String {
+    let rendered = format!("{value:?}");
+    rendered
+        .split([' ', '{', '('])
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
@@ -3271,7 +3444,8 @@ fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
 }
 
 /// Write a single AppEvent to the session log if it isn't already logged
-/// inline by the agent loop.
+/// inline by the agent loop (see [`spawn_session_log_writer`] for the full
+/// emit-site disposition contract).
 fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &AppEvent) {
     let Ok(mut log) = session_log.lock() else {
         return;
@@ -3641,6 +3815,14 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             log.live_audio_completed(id, status, *quarantine_count);
         }
 
+        // Disposition-routed (see `EventBus::send_already_persisted`): only
+        // `ModelResponse` events whose emitter did NOT persist them inline
+        // reach this lane — external-agent responses with no inline copy
+        // (added in 5f940065 when they were falling through to the wildcard
+        // and never persisting), for which this writer is the only path to
+        // disk. Inline-persisting emitters (the native loop, supervised
+        // external drains) skip the lane at the emit site, so this arm
+        // cannot double-count their tokens or re-append their `model.txt`.
         AppEvent::ModelResponse {
             session_id,
             content,
@@ -3721,11 +3903,14 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
 
         // ---- Events already logged inline by the agent loop or web_gateway ----
-        // turn_start, model_response, agent_input/output, approval decisions,
+        // turn_start, agent_input/output, approval decisions,
         // json_extracted, reasoning, budget warnings, loop errors, context
         // management, voice_log, voice_diagnostic, presence_connected/disconnected,
         // presence_checkpoint, user_transcript — all have slog() calls at their
-        // point of origin.
+        // point of origin. (model_response is disposition-routed at the emit
+        // site instead: inline-persisting emitters bypass this writer via
+        // `send_already_persisted`, so the arm above only ever sees copies
+        // it must persist.)
         //
         // ---- Terminal-only / internal / high-frequency events ----
         // Tick, ControlCommand, SessionDirChanged,
@@ -4458,11 +4643,6 @@ mod tests {
                 scope: "diff".to_string(),
                 target: None,
             },
-            ControlMsg::RecallMemory {
-                keywords: Some(vec!["auth".to_string()]),
-                tags: None,
-                channel: Some("project_state".to_string()),
-            },
             ControlMsg::TakeDisplay { display_id: 99 },
             ControlMsg::ReleaseDisplay {
                 display_id: 99,
@@ -5160,46 +5340,6 @@ mod tests {
     }
 
     #[test]
-    fn control_msg_recall_memory_deserialize() {
-        let json =
-            r#"{"action":"recall_memory","keywords":["auth","login"],"channel":"project_state"}"#;
-        let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            ControlMsg::RecallMemory {
-                keywords,
-                tags,
-                channel,
-            } => {
-                assert_eq!(
-                    keywords,
-                    Some(vec!["auth".to_string(), "login".to_string()])
-                );
-                assert!(tags.is_none());
-                assert_eq!(channel.as_deref(), Some("project_state"));
-            }
-            _ => panic!("expected RecallMemory"),
-        }
-    }
-
-    #[test]
-    fn control_msg_recall_memory_minimal() {
-        let json = r#"{"action":"recall_memory"}"#;
-        let msg: ControlMsg = serde_json::from_str(json).unwrap();
-        match msg {
-            ControlMsg::RecallMemory {
-                keywords,
-                tags,
-                channel,
-            } => {
-                assert!(keywords.is_none());
-                assert!(tags.is_none());
-                assert!(channel.is_none());
-            }
-            _ => panic!("expected RecallMemory"),
-        }
-    }
-
-    #[test]
     fn control_msg_invoke_skill_deserialize() {
         let json = r#"{"action":"invoke_skill","skill_name":"deploy","arguments":"staging"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
@@ -5878,6 +6018,253 @@ mod tests {
         assert!(contents.contains("Keep the full body."));
     }
 
+    /// `send_already_persisted` is the emit-site disposition for events the
+    /// emitter already wrote to the owning session's log: the lossless
+    /// session-log lane receives nothing (so the writer cannot persist a
+    /// second copy), while broadcast subscribers still observe the event.
+    #[test]
+    fn send_already_persisted_skips_writer_lane_but_still_broadcasts() {
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        let mut broadcast_rx = bus.subscribe();
+
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: Some("native-1".to_string()),
+            turn: 3,
+            content: "already in the owning log".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                total_tokens: 1200,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+
+        assert!(
+            log_rx.try_recv().is_err(),
+            "already-persisted events must not enter the session-log lane"
+        );
+        match broadcast_rx.try_recv() {
+            Ok(AppEvent::ModelResponse { content, usage, .. }) => {
+                assert_eq!(content, "already in the owning log");
+                assert_eq!(usage.total_tokens, 1200);
+            }
+            other => panic!("expected broadcast ModelResponse, got {:?}", other),
+        }
+    }
+
+    /// Regression guard for the writer-owned external path (5f940065): a
+    /// `send`-routed ModelResponse with no inline copy is persisted by the
+    /// bus writer exactly once, source label intact.
+    #[test]
+    fn session_log_writer_persists_external_model_response_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::ModelResponse {
+                session_id: Some("codex-thread".to_string()),
+                turn: 1,
+                content: "external response body".to_string(),
+                usage: TokenUsage::default(),
+                reasoning: None,
+                source: Some("Codex".to_string()),
+            },
+        );
+        drop(shared);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "writer-routed external response persists once");
+        assert!(contents.contains("\"source\":\"Codex\""));
+        assert!(contents.contains("external response body"));
+    }
+
+    /// Single-persist invariant for a native turn: the loop logs the
+    /// response inline (tokens counted there) and emits the bus copy as
+    /// already-persisted, so the summary counts the usage exactly once and
+    /// session.jsonl carries exactly one model_response row.
+    #[test]
+    fn native_turn_counts_tokens_once_under_already_persisted_emit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        // Inline copy — what the native loop writes at the acceptance point.
+        shared.lock().unwrap().model_response_with_message(
+            1,
+            "the assistant text",
+            1000,
+            500,
+            1500,
+            0,
+            0,
+        );
+
+        // Bus copy — same usage, already-persisted disposition: the
+        // session-log lane must stay empty.
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: None,
+            turn: 1,
+            content: "the assistant text".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 1000,
+                completion_tokens: 500,
+                total_tokens: 1500,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+        assert!(log_rx.try_recv().is_err());
+
+        shared.lock().unwrap().write_session_summary();
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(log_dir.join("session_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary["total_tokens"].as_u64(),
+            Some(1500),
+            "usage must be counted exactly once, not once per persisted copy"
+        );
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "exactly one model_response row for the turn");
+    }
+
+    /// Both dispositions end to end through the live writer task: reasoning
+    /// riding an already-persisted ModelResponse never produces a writer
+    /// reasoning row (or any row), while a send-routed external response
+    /// consumed by the same writer lands exactly once.
+    #[tokio::test]
+    async fn writer_task_honors_persistence_disposition() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        let bus = EventBus::new();
+        let writer = spawn_session_log_writer(bus.subscribe_session_log(), shared.clone());
+
+        // Already persisted inline by its emitter: neither the content nor
+        // the reasoning may be re-persisted by the writer.
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: Some("native-1".to_string()),
+            turn: 2,
+            content: "inline-owned response".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 600,
+                completion_tokens: 100,
+                total_tokens: 700,
+                ..Default::default()
+            },
+            reasoning: Some("chain of thought summary".to_string()),
+            source: None,
+        });
+        // Writer-owned external response: the lane is its only path to disk.
+        bus.send(AppEvent::ModelResponse {
+            session_id: Some("codex-thread".to_string()),
+            turn: 2,
+            content: "codex response".to_string(),
+            usage: TokenUsage::default(),
+            reasoning: None,
+            source: Some("Codex".to_string()),
+        });
+
+        // Dropping the bus closes the lane; the writer drains what it
+        // received and exits — deterministic, no polling.
+        drop(bus);
+        writer.await.unwrap();
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        assert!(
+            !contents.contains("\"event\":\"reasoning\""),
+            "already-persisted reasoning must not produce a writer row"
+        );
+        assert!(!contents.contains("inline-owned response"));
+        let rows: Vec<&str> = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .collect();
+        assert_eq!(rows.len(), 1, "only the send-routed response persists");
+        assert!(rows[0].contains("codex response"));
+    }
+
+    /// The CU-only turn shape: the loop inline-logs the EMPTY canonical
+    /// content (tokens counted once) and the bus event carries a
+    /// synthesized non-empty action summary with the SAME usage. The
+    /// already-persisted disposition keeps the writer from counting those
+    /// tokens a second time — the synthesized content used to defeat its
+    /// empty-content guard.
+    #[test]
+    fn cu_only_turn_counts_tokens_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+
+        // Inline copy: empty canonical content, real usage.
+        let _ = shared
+            .lock()
+            .unwrap()
+            .model_response("", 800, 100, 900, 0, 0, None);
+
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+        bus.send_already_persisted(AppEvent::ModelResponse {
+            session_id: None,
+            turn: 1,
+            content: "click(3,4) → screenshot".to_string(),
+            usage: TokenUsage {
+                prompt_tokens: 800,
+                completion_tokens: 100,
+                total_tokens: 900,
+                ..Default::default()
+            },
+            reasoning: None,
+            source: None,
+        });
+        assert!(log_rx.try_recv().is_err());
+
+        shared.lock().unwrap().write_session_summary();
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(log_dir.join("session_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary["total_tokens"].as_u64(),
+            Some(900),
+            "CU-only usage must be counted exactly once"
+        );
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let rows = contents
+            .lines()
+            .filter(|l| l.contains("\"event\":\"model_response\""))
+            .count();
+        assert_eq!(rows, 1, "only the inline canonical row exists");
+        assert!(
+            !contents.contains("click(3,4)"),
+            "the synthesized action summary is display-only, never persisted"
+        );
+    }
+
     #[tokio::test]
     async fn session_log_subscription_filters_high_volume_events_but_keeps_steers() {
         let bus = EventBus::new();
@@ -5896,10 +6283,11 @@ mod tests {
             id: "steer-1".to_string(),
         });
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
-            .await
-            .expect("session-log event should arrive")
-            .expect("session-log channel should remain open");
+        let (event, _enqueued_at) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+                .await
+                .expect("session-log event should arrive")
+                .expect("session-log channel should remain open");
         match event {
             AppEvent::SteerRequested {
                 session_id,
@@ -5915,6 +6303,84 @@ mod tests {
         assert!(
             log_rx.try_recv().is_err(),
             "deltas and ticks must not be queued"
+        );
+    }
+
+    /// The writer-lane SLOW report stays silent below the threshold, fires
+    /// when either stage crosses it, and rate-limits repeats per task.
+    #[test]
+    fn writer_lane_slow_warning_thresholds_and_rate_limit() {
+        let fast = Duration::from_millis(50);
+        let slow = WRITER_LANE_SLOW_THRESHOLD + Duration::from_secs(1);
+
+        // Below both thresholds: silent, and the rate limiter stays unarmed.
+        let mut last_warned = None;
+        assert!(!warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            fast,
+            &mut last_warned,
+        ));
+        assert!(last_warned.is_none());
+
+        // Either stage crossing the threshold warns (enqueue→consume here).
+        assert!(warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            slow,
+            fast,
+            &mut last_warned,
+        ));
+        assert!(last_warned.is_some());
+
+        // A second pathological event inside the warn interval is suppressed
+        // (consume→durable slow this time — the stage doesn't matter).
+        assert!(!warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            slow,
+            &mut last_warned,
+        ));
+
+        // Once the interval has passed, the warning re-arms.
+        let Some(rearmed) =
+            Instant::now().checked_sub(WRITER_LANE_WARN_INTERVAL + Duration::from_secs(1))
+        else {
+            // Box uptime shorter than the warn interval — cannot synthesize
+            // a sufficiently old instant on this run.
+            return;
+        };
+        last_warned = Some(rearmed);
+        assert!(warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            slow,
+            &mut last_warned,
+        ));
+    }
+
+    /// The diagnostics label is the bare variant name for unit, struct, and
+    /// tuple variants alike.
+    #[test]
+    fn debug_variant_name_extracts_the_variant() {
+        assert_eq!(debug_variant_name(&AppEvent::Tick), "Tick");
+        assert_eq!(
+            debug_variant_name(&AppEvent::HumanResponseSent),
+            "HumanResponseSent"
+        );
+        assert_eq!(
+            debug_variant_name(&AppEvent::SessionNote {
+                session_id: Some("s-1".to_string()),
+                note_id: "n-1".to_string(),
+                text: "note body".to_string(),
+                attachments: Vec::new(),
+                source: None,
+                ts: 0,
+            }),
+            "SessionNote"
         );
     }
 

@@ -246,12 +246,14 @@ pub fn spawn_event_listener(
                     | AppEvent::ExternalFollowUpRequested { .. }
                     | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
+                    | AppEvent::ReloadBackendCredentials { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionForkResult { .. }
                     | AppEvent::TaskReceived { .. }
                     | AppEvent::SessionGoal { .. }
                     | AppEvent::SessionVitals { .. }
                     | AppEvent::SessionActivity { .. }
+                    | AppEvent::SessionConfigFacts { .. }
                     | AppEvent::SessionRenameResult { .. }
                     | AppEvent::SessionAgentConfigResult { .. }
                     | AppEvent::ClaudeConfigChanged { .. }
@@ -259,7 +261,8 @@ pub fn spawn_event_listener(
                     | AppEvent::DisplayRequestRaised { .. }
                     | AppEvent::DisplayRequestResolved { .. }
                     | AppEvent::BrowserWorkspaceChanged { .. }
-                    | AppEvent::AgendaChanged { .. } => {} // Derived events — handled by outbound broadcaster
+                    | AppEvent::AgendaChanged { .. }
+                    | AppEvent::MemoryChanged { .. } => {} // Derived events — handled by outbound broadcaster
                     AppEvent::CodexConfigChanged {
                         managed_context, ..
                     } => {

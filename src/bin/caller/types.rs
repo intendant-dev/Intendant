@@ -134,8 +134,8 @@ pub struct SessionGoal {
 // Session-vitals family: hoisted to intendant-core; re-exported here so
 // existing `crate::types::Session*Vitals` paths keep working.
 pub use intendant_core::vitals::{
-    SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionGitVitals,
-    SessionLimitWindow, SessionVitals,
+    SessionActivityState, SessionActivityVitals, SessionCacheVitals, SessionConfigVitals,
+    SessionGitVitals, SessionLimitWindow, SessionVitals,
 };
 
 /// Normalized region in a shared display view.
@@ -1084,6 +1084,11 @@ pub enum OutboundEvent {
         item: crate::agenda::AgendaItem,
         counts: crate::agenda::AgendaCounts,
     },
+    /// The Memory plane admitted a claim; frontends refresh their
+    /// memory views. The view is quoted data, never instructions.
+    MemoryChanged {
+        claim: crate::memory::ClaimView,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.
@@ -1160,20 +1165,6 @@ pub fn format_model_summary(content: &str) -> String {
                 "askHuman" => {
                     let q = cmd.get("question").and_then(|q| q.as_str()).unwrap_or("?");
                     format!("ask: {}", truncate_str(q, 100))
-                }
-                "storeMemory" => {
-                    let key = cmd
-                        .get("memory_key")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("?");
-                    format!("store: {}", key)
-                }
-                "recallMemory" => {
-                    let q = cmd
-                        .get("memory_query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or("?");
-                    format!("recall: {}", q)
                 }
                 "execPty" => {
                     let command = cmd.get("command").and_then(|c| c.as_str()).unwrap_or("?");

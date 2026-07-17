@@ -513,6 +513,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::SetCodexContextArchive { .. }
         | ControlMsg::CodexThreadAction { .. }
         | ControlMsg::ConfigureSessionAgent { .. }
+        | ControlMsg::ReloadCredentials { .. }
         | ControlMsg::SetClaudeModel { .. }
         | ControlMsg::SetClaudePermissionMode { .. }
         | ControlMsg::SetClaudeAllowedTools { .. }
@@ -541,7 +542,6 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::CloseBrowserWorkspace { .. }
         | ControlMsg::AcquireBrowserWorkspace { .. }
         | ControlMsg::ReleaseBrowserWorkspace { .. }
-        | ControlMsg::RecallMemory { .. }
         | ControlMsg::InvokeSkill { .. }
         | ControlMsg::Quit
         | ControlMsg::SetupDebugScreen

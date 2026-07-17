@@ -58,6 +58,10 @@ fn parse_vocab<T: Copy>(
 pub(crate) struct MemoryService {
     plane: EphemeralPlane,
     claims: BTreeMap<[u8; 32], ClaimRecord>,
+    /// P1.8: the durable custody store, when this daemon runs the
+    /// durable plane (macOS — multi-platform custody stays full Gate
+    /// B, so other OSes run ephemeral and say so). `None` = ephemeral.
+    store: Option<super::store::DurableStore>,
 }
 
 impl MemoryService {
@@ -66,7 +70,140 @@ impl MemoryService {
         Ok(MemoryService {
             plane: EphemeralPlane::bootstrap()?,
             claims: BTreeMap::new(),
+            store: None,
         })
+    }
+
+    /// P1.8: open (or create) the DURABLE plane at `dir`. Reopen
+    /// recovers the op set through the stamped walker + fold and
+    /// rebuilds the claim registry from the recovered op bodies.
+    pub(crate) fn new_durable(
+        dir: &std::path::Path,
+    ) -> Result<MemoryService, super::store::StoreError> {
+        use super::store::{DurableStore, RecoveredStore};
+        if dir.join("custody.v1.json").exists() {
+            let RecoveredStore {
+                store,
+                resume,
+                items,
+            } = DurableStore::open(dir)?;
+            let plane = EphemeralPlane::resume(&resume, items)?;
+            let claims = Self::rebuild_claims(&plane)?;
+            Ok(MemoryService {
+                plane,
+                claims,
+                store: Some(store),
+            })
+        } else {
+            let (plane, custody) = EphemeralPlane::bootstrap_with_custody()?;
+            let store = DurableStore::create_from_ceremony(dir, &plane, custody)?;
+            Ok(MemoryService {
+                plane,
+                claims: BTreeMap::new(),
+                store: Some(store),
+            })
+        }
+    }
+
+    /// The honest per-mode durability label every view carries.
+    pub(crate) fn durability_label(&self) -> &'static str {
+        if self.store.is_some() {
+            "durable"
+        } else {
+            "ephemeral"
+        }
+    }
+
+    /// Rebuild the claim registry from recovered ops: decode each held
+    /// `m.claim` body (reducer-side Node walk — write-with-core /
+    /// read-with-reducer, the differential spirit) and re-derive
+    /// provenance from the op envelope. Envelope truth is what
+    /// survives a restart: agent-session/peer actors keep their
+    /// gate-named principals verbatim; `human`/`daemon` actors carry
+    /// the O8 device identity, so they surface as `dashboard` /
+    /// `unattributed` WITHOUT a principal (documented collapse — the
+    /// live-path exit criterion is unaffected).
+    fn rebuild_claims(
+        plane: &EphemeralPlane,
+    ) -> Result<BTreeMap<[u8; 32], ClaimRecord>, MemoryError> {
+        use owner_plane_reducer::envelope::parse_op;
+        let mut claims = BTreeMap::new();
+        for raw in plane.held_items().values() {
+            let Ok(op) = parse_op(raw) else { continue };
+            if op.header.operation_type != Mclaim::OP_TYPE {
+                continue;
+            }
+            let body = op.body.clone();
+            let text = |k: &str| body.get(k).and_then(|v| v.as_text().map(|t| t.to_string()));
+            let prov_node = body.get("provenance");
+            let prov_text = |k: &str| {
+                prov_node
+                    .as_ref()
+                    .and_then(|p| p.get(k))
+                    .and_then(|v| v.as_text().map(|t| t.to_string()))
+            };
+            let kind_str = text("kind").unwrap_or_default();
+            let sens_str = text("sensitivity").unwrap_or_default();
+            let kind = parse_vocab("kind", &kind_str, Kind::ALL, Kind::as_str)?;
+            let sensitivity = parse_vocab("sensitivity", &sens_str, Class::ALL, Class::as_str)?;
+            let labels = body
+                .get("labels")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|n| n.as_text().map(|t| t.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let proposed_by = match op.header.actor_kind {
+                // The envelope carries the PRINCIPAL verbatim; the
+                // gate-bound session is not re-attestable across a
+                // restart (the body's `session` is the writer's context
+                // claim, not attribution), so recovered provenance
+                // collapses `session` to None — documented, and the
+                // live-path exit criterion is unaffected.
+                "agent-session" => ClaimProvenance {
+                    v: 1,
+                    actor: "agent_session".into(),
+                    principal: Some(op.header.actor_id.to_string()),
+                    session: None,
+                },
+                "peer" => ClaimProvenance {
+                    v: 1,
+                    actor: "peer".into(),
+                    principal: Some(op.header.actor_id.to_string()),
+                    session: None,
+                },
+                "human" => ClaimProvenance {
+                    v: 1,
+                    actor: "dashboard".into(),
+                    principal: None,
+                    session: None,
+                },
+                _ => ClaimProvenance {
+                    v: 1,
+                    actor: "unattributed".into(),
+                    principal: None,
+                    session: None,
+                },
+            };
+            claims.insert(
+                op.op_hash(),
+                ClaimRecord {
+                    op_hash: op.op_hash(),
+                    kind,
+                    statement: text("statement").unwrap_or_default(),
+                    sensitivity,
+                    session: prov_text("session"),
+                    project: prov_text("project"),
+                    model: prov_text("model"),
+                    labels,
+                    created_ms: op.header.created_ms,
+                    proposed_by,
+                },
+            );
+        }
+        Ok(claims)
     }
 
     /// The plane id (hex) — logged at wiring so an operator can tell
@@ -189,6 +326,23 @@ impl MemoryService {
             },
         };
         let op_hash = self.seal_write(actor, Verb::Propose, Mclaim::OP_TYPE, body.to_value())?;
+        // P1.8 durability: §6.2 L1 — the claim ACKs only after its
+        // sealed item is flushed. On a store failure the in-memory
+        // admission is RETRACTED (nothing unpersisted is ever exposed)
+        // and the named outcome surfaces verbatim.
+        if let Some(store) = &mut self.store {
+            let op_bytes = self
+                .plane
+                .held_items()
+                .values()
+                .last()
+                .expect("the op just admitted is held")
+                .clone();
+            if let Err(e) = store.append_sealed_op(&op_bytes) {
+                self.plane.retract_unpersisted(&op_hash)?;
+                return Err(MemoryError::InvalidArg(e.to_string()));
+            }
+        }
         self.claims.insert(
             op_hash,
             ClaimRecord {
@@ -274,8 +428,34 @@ impl MemoryService {
             labels: rec.labels.clone(),
             created_ms: rec.created_ms,
             proposed_by: rec.proposed_by.clone(),
-            durability: "ephemeral",
+            durability: self.durability_label().into(),
         }
+    }
+
+    /// Test seam for the space-denial exit test: a claim aimed at the
+    /// AUDIT space, which the ordinary writer grant does not cover.
+    #[cfg(test)]
+    fn tenant_op_for_test_in_audit_space(&mut self) -> Result<[u8; 32], MemoryError> {
+        let body = Mclaim {
+            kind: Kind::Observation,
+            statement: "wrong space".into(),
+            sensitivity: Class::Private,
+            observed_at_ms: Some(1),
+            valid_from_ms: None,
+            valid_until_ms: None,
+            expires_at_ms: None,
+            session: None,
+            project: None,
+            model: None,
+            evidence: vec![],
+            supersedes: None,
+            labels: None,
+        };
+        self.plane.tenant_op_in_space_for_test(
+            self.plane.audit_space,
+            Mclaim::OP_TYPE,
+            body.to_value(),
+        )
     }
 
     /// Test seam: seal an arbitrary Memory-tenant op on the plane as
@@ -591,6 +771,137 @@ mod tests {
             svc.plane.held_ops(),
             held_before,
             "a denied write must never reach the kernel"
+        );
+    }
+
+    /// P1.8 exit battery — durable round-trip through the SERVICE with
+    /// recovered provenance rules: agent-session principals survive a
+    /// restart verbatim (the envelope carries them); owner-surface
+    /// claims collapse to the envelope's O8 device identity
+    /// (dashboard, no principal) — the documented reverse map. The
+    /// mode label flips honestly and the chain keeps accepting.
+    #[test]
+    fn durable_service_roundtrip_recovers_claims_and_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("plane");
+        let agent_hash;
+        {
+            let mut svc = MemoryService::new_durable(&dir).unwrap();
+            assert_eq!(svc.durability_label(), "durable");
+            let view = svc
+                .propose(propose_args("agent durable claim"), &agent_actor())
+                .unwrap();
+            assert_eq!(view.durability, "durable");
+            agent_hash = view.id.clone();
+            svc.propose(
+                propose_args("owner durable claim"),
+                &ActorBinding::dashboard(Some("principal:root:dashboard".into())),
+            )
+            .unwrap();
+        }
+        let mut svc = MemoryService::new_durable(&dir).unwrap();
+        let all = svc.search(&SearchArgs {
+            query: String::new(),
+            limit: 50,
+            include_candidates: true,
+        });
+        assert_eq!(all.len(), 2, "both claims survive the restart");
+        let agent = all.iter().find(|c| c.id == agent_hash).unwrap();
+        assert_eq!(
+            agent.proposed_by.principal.as_deref(),
+            Some("principal:agent-session:sess-1"),
+            "agent principals survive restarts verbatim (envelope truth)"
+        );
+        assert_eq!(
+            agent.proposed_by.session, None,
+            "gate sessions are not re-attestable across restarts (documented collapse)"
+        );
+        assert_eq!(
+            agent.session.as_deref(),
+            Some("test-session"),
+            "the writer's session CONTEXT claim survives as stated"
+        );
+        let owner = all.iter().find(|c| c.id != agent_hash).unwrap();
+        assert_eq!(owner.proposed_by.actor, "dashboard");
+        assert_eq!(
+            owner.proposed_by.principal, None,
+            "owner-surface principals collapse to the O8 device identity across restarts (documented)"
+        );
+        svc.propose(propose_args("post-restart claim"), &agent_actor())
+            .expect("the recovered chain keeps accepting");
+    }
+
+    /// P1.8 exit battery — zone/space denial: an op aimed at a space
+    /// the writer grant does not cover rejects with the kernel's named
+    /// scope outcome. (The service only ever writes the home space;
+    /// this pins what happens if that invariant ever breaks.)
+    #[test]
+    fn ops_outside_the_granted_space_reject_with_named_scope_outcome() {
+        let mut svc = MemoryService::new().unwrap();
+        let err = svc
+            .tenant_op_for_test_in_audit_space()
+            .expect_err("audit space is not in the writer grant");
+        match err {
+            MemoryError::Rejected { outcome, .. } => {
+                assert!(
+                    outcome.starts_with("scope-"),
+                    "expected a named scope rejection, got {outcome}"
+                );
+            }
+            other => panic!("expected a named kernel rejection, got {other:?}"),
+        }
+    }
+
+    /// P1.8 exit battery — conflicting claims COEXIST: contradictory
+    /// statements are both represented and surfaced, never silently
+    /// overwritten or deduplicated (§5.4: conflicts are data).
+    #[test]
+    fn conflicting_claims_coexist_and_both_surface() {
+        let mut svc = MemoryService::new().unwrap();
+        svc.propose(propose_args("the deploy runs at 06:00 UTC"), &no_actor())
+            .unwrap();
+        svc.propose(propose_args("the deploy runs at 18:00 UTC"), &no_actor())
+            .unwrap();
+        let hits = svc.search(&SearchArgs {
+            query: "the deploy runs".into(),
+            limit: 10,
+            include_candidates: true,
+        });
+        assert_eq!(hits.len(), 2, "both contradictory claims surface");
+    }
+
+    /// The Memory Explorer's kind/sensitivity selects are an unavoidable
+    /// static mirror of the kernel's closed vocabularies (the SPA can't
+    /// import `Kind::ALL`), so per the derive-don't-mirror convention a
+    /// daemon-side parity test pins the option values to the source —
+    /// a vocabulary change that forgets the fragment fails here instead
+    /// of shipping as drift.
+    #[test]
+    fn explorer_vocab_selects_mirror_the_kernel() {
+        let app = include_str!("../../../../static/app.html");
+        let options = |select_id: &str| -> Vec<String> {
+            let start = app
+                .find(&format!("<select id=\"{select_id}\""))
+                .unwrap_or_else(|| panic!("{select_id} select not found in static/app.html"));
+            let block = &app[start..start + app[start..].find("</select>").unwrap()];
+            block
+                .match_indices("value=\"")
+                .map(|(at, _)| {
+                    let rest = &block[at + "value=\"".len()..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .collect()
+        };
+        let kernel = |all: &[&str]| all.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            options("memory-add-kind"),
+            kernel(&Kind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>()),
+            "memory-add-kind options drifted from Kind::ALL"
+        );
+        assert_eq!(
+            options("memory-add-sensitivity"),
+            kernel(&Class::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
+            "memory-add-sensitivity options drifted from Class::ALL"
         );
     }
 }

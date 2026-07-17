@@ -3751,8 +3751,7 @@ mod tests {
             "capabilities": [],
         });
 
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         registry
             .add_peer_with_card(crate::peer::AgentCard {

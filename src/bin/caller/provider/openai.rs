@@ -528,6 +528,10 @@ impl ChatProvider for OpenAIProvider {
         self.max_output_tokens
     }
 
+    fn reasoning_effort(&self) -> Option<String> {
+        self.reasoning.as_ref().map(|r| r.effort.clone())
+    }
+
     fn use_tools(&self) -> bool {
         self.use_tools
     }
@@ -616,18 +620,14 @@ impl ChatProvider for OpenAIProvider {
         // Track in-progress function calls by index
         let mut pending_tools: std::collections::HashMap<usize, ToolCall> =
             std::collections::HashMap::new();
-        let mut line_buf = String::new();
+        let mut line_buf = SseLineBuffer::new();
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| CallerError::Provider(format!("Stream error: {}", e)))?;
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            line_buf.push_str(&chunk_str);
+            line_buf.push_chunk(&chunk);
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
-
+            while let Some(line) = line_buf.next_line() {
                 if line.is_empty() {
                     continue;
                 }

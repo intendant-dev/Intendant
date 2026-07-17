@@ -79,9 +79,9 @@ pub fn presence_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "recall_memory".to_string(),
+            name: "search_transcripts".to_string(),
             description:
-                "Search knowledge store and session logs for past context, decisions, and findings."
+                "Search voice transcripts and session logs for past conversation context."
                     .to_string(),
             parameters: json!({
                 "type": "object",
@@ -243,7 +243,7 @@ mod tests {
         assert!(names.contains(&"submit_task"));
         assert!(names.contains(&"check_status"));
         assert!(names.contains(&"query_detail"));
-        assert!(names.contains(&"recall_memory"));
+        assert!(names.contains(&"search_transcripts"));
         assert!(names.contains(&"approve_action"));
         assert!(names.contains(&"deny_action"));
         assert!(names.contains(&"skip_action"));

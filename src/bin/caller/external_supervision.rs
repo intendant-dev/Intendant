@@ -910,9 +910,14 @@ pub(crate) struct DrainConfig<'a> {
     /// emitting `AgentStarted`. The presence path sets this to avoid
     /// duplicating the model reasoning that's already shown via ModelResponse.
     pub(crate) suppress_agent_started: bool,
-    /// Supervised external sessions have their own session log in addition to
-    /// the daemon's root log writer. Persist model responses here too so
-    /// per-session replay does not depend on the root session log.
+    /// When set (supervised sessions with their own session log), the drain
+    /// persists model responses and reasoning inline into the owning
+    /// session's log (`persist_external_model_response_*_if_needed`) and its
+    /// `ModelResponse` bus events skip the session-log writer lane
+    /// ([`DrainConfig::send_model_response`]) — each response persists
+    /// exactly once, in the owning log, and the daemon head log does not
+    /// aggregate a second copy. When unset (foreground shapes sharing the
+    /// writer's log), the bus writer is the response's only path to disk.
     pub(crate) persist_model_responses_inline: bool,
     /// When true and no `json_approval` slot is set, auto-deny approval
     /// requests (headless mode with no interactive input).
@@ -921,6 +926,29 @@ pub(crate) struct DrainConfig<'a> {
     /// does not support mid-turn steering — queued items are drained on
     /// the next turn's follow-up message path.
     pub(crate) context_injection: &'a event::ContextInjectionQueue,
+    /// Reload-credentials handshake with the supervision loop: when a
+    /// `ReloadBackendCredentials` event arrives mid-turn, the drain
+    /// interrupts the backend (stop semantics) and raises this flag; the
+    /// loop applies the in-place respawn once the drain returns. `None`
+    /// for lanes without the in-loop respawn (the foreground persistent
+    /// loop), where the event is simply not consumable mid-turn.
+    pub(crate) reload_credentials: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl DrainConfig<'_> {
+    /// Emit a `ModelResponse` bus event with the persistence disposition
+    /// this drain already applied. When `persist_model_responses_inline` is
+    /// set, the drain wrote the response (and any reasoning) into the owning
+    /// session's log before emitting, so the bus copy must skip the
+    /// session-log writer lane; otherwise the writer is the event's only
+    /// path to disk and the full send is load-bearing.
+    pub(crate) fn send_model_response(&self, event: AppEvent) {
+        if self.persist_model_responses_inline {
+            self.bus.send_already_persisted(event);
+        } else {
+            self.bus.send(event);
+        }
+    }
 }
 
 pub(crate) const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);

@@ -1531,6 +1531,437 @@ function renderAccessCustodySection() {
   }
 }
 
+/* ── Claude sign-in ceremony ──
+   The guided `claude auth login` card (/api/claude-auth/*): the daemon
+   runs the CLI's OAuth ceremony on a private PTY; this card walks the
+   owner through it — open the sign-in URL in THIS browser, paste the
+   code Anthropic shows, done. The PKCE verifier and the token exchange
+   stay inside the CLI on the daemon; this page only ever sees the
+   sign-in URL and passes the pasted code through. Custody-gated on the
+   daemon (credentials.manage + hosted-provenance + lease/egress tier
+   refusals) — this card renders whatever refusal the daemon states. */
+const CLAUDE_SIGNIN_BLAST_COPY =
+  'This changes the Claude account for every Claude Code session on this machine. ' +
+  'Running sessions keep the old account until reloaded.';
+const claudeSigninState = {
+  status: null, // last daemon status payload ({phase, url?, account?, error?…})
+  fetchedAt: 0,
+  busy: false,
+  lastError: '',
+  pollTimer: null,
+  sessions: [], // running claude-code sessions for the reload panel
+  sessionsFetchedAt: 0,
+  reloadRequested: new Set(),
+};
+
+function claudeSigninPhase() {
+  return String(claudeSigninState.status?.phase || 'idle');
+}
+
+function claudeSigninActive() {
+  return ['starting', 'awaiting_browser', 'awaiting_code', 'verifying'].includes(
+    claudeSigninPhase()
+  );
+}
+
+async function claudeSigninRefresh({ force = false } = {}) {
+  const avail = daemonApi.availability('api_claude_auth_status');
+  if (avail.reason === 'denied' || avail.reason === 'unsupported') return;
+  const freshFor = claudeSigninActive() ? 1500 : 15000;
+  if (!force && Date.now() - claudeSigninState.fetchedAt < freshFor) return;
+  claudeSigninState.fetchedAt = Date.now();
+  try {
+    const resp = await daemonApi.request('api_claude_auth_status', {});
+    if (resp.ok) {
+      claudeSigninState.status = resp.body;
+      claudeSigninState.lastError = '';
+    } else {
+      claudeSigninState.lastError = String(resp.body?.error || `status ${resp.status}`);
+    }
+  } catch (err) {
+    claudeSigninState.lastError = String(err?.message || err);
+  }
+  claudeSigninEnsurePoll();
+  renderClaudeSigninSection();
+  if (claudeSigninPhase() === 'success') claudeSigninRefreshSessions().catch(() => {});
+}
+
+/* 2s poll while a ceremony is in flight and the page is looking at it;
+   self-clearing on terminal/idle phases (the render-time refresh with a
+   15s freshness guard covers the rest). */
+function claudeSigninEnsurePoll() {
+  if (claudeSigninActive()) {
+    if (claudeSigninState.pollTimer) return;
+    claudeSigninState.pollTimer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      const watching =
+        typeof paneIsVisible !== 'function' ||
+        paneIsVisible('vault') ||
+        paneIsVisible('access');
+      if (!watching) return;
+      claudeSigninRefresh({ force: true }).catch(() => {});
+    }, 2000);
+  } else if (claudeSigninState.pollTimer) {
+    window.clearInterval(claudeSigninState.pollTimer);
+    claudeSigninState.pollTimer = null;
+  }
+}
+
+async function claudeSigninStart() {
+  if (claudeSigninState.busy) return;
+  claudeSigninState.busy = true;
+  claudeSigninState.lastError = '';
+  renderClaudeSigninSection();
+  try {
+    const resp = await daemonApi.request('api_claude_auth_start', { mode: 'claudeai' });
+    if (resp.ok) {
+      claudeSigninState.status = resp.body?.status || claudeSigninState.status;
+    } else {
+      claudeSigninState.lastError = String(resp.body?.error || `start failed (${resp.status})`);
+      if (resp.status === 409) await claudeSigninRefresh({ force: true });
+    }
+  } catch (err) {
+    claudeSigninState.lastError = String(err?.message || err);
+  } finally {
+    claudeSigninState.busy = false;
+    claudeSigninEnsurePoll();
+    renderClaudeSigninSection();
+  }
+}
+
+async function claudeSigninSubmitCode(code) {
+  if (claudeSigninState.busy) return;
+  claudeSigninState.busy = true;
+  claudeSigninState.lastError = '';
+  renderClaudeSigninSection();
+  try {
+    const resp = await daemonApi.request('api_claude_auth_code', { code });
+    if (resp.ok) {
+      if (claudeSigninState.status) claudeSigninState.status.phase = 'verifying';
+    } else {
+      claudeSigninState.lastError = String(resp.body?.error || `code refused (${resp.status})`);
+      if (resp.status === 409) await claudeSigninRefresh({ force: true });
+    }
+  } catch (err) {
+    claudeSigninState.lastError = String(err?.message || err);
+  } finally {
+    claudeSigninState.busy = false;
+    claudeSigninEnsurePoll();
+    renderClaudeSigninSection();
+  }
+}
+
+async function claudeSigninCancel() {
+  claudeSigninState.lastError = '';
+  try {
+    const resp = await daemonApi.request('api_claude_auth_cancel', {});
+    if (!resp.ok) {
+      claudeSigninState.lastError = String(resp.body?.error || `cancel failed (${resp.status})`);
+    }
+  } catch (err) {
+    claudeSigninState.lastError = String(err?.message || err);
+  }
+  await claudeSigninRefresh({ force: true }).catch(() => {});
+  renderClaudeSigninSection();
+}
+
+/* The reload panel's corpus: live claude-code sessions on this daemon.
+   The daemon is the authority on reloadability — this list only decides
+   which chips to offer. */
+async function claudeSigninRefreshSessions({ force = false } = {}) {
+  if (!force && Date.now() - claudeSigninState.sessionsFetchedAt < 10000) return;
+  claudeSigninState.sessionsFetchedAt = Date.now();
+  try {
+    const resp = await daemonApi.request('api_sessions', { limit: 100 });
+    if (!resp.ok || !Array.isArray(resp.body)) return;
+    claudeSigninState.sessions = resp.body.filter(row => {
+      if (String(row?.status || '') !== 'running') return false;
+      const backend = String(row?.backend_source || row?.source || '').toLowerCase();
+      return backend.includes('claude');
+    });
+    renderClaudeSigninSection();
+  } catch (_) {
+    /* the next poll or manual refresh recovers */
+  }
+}
+
+function claudeSigninReloadSession(sessionId) {
+  claudeSigninState.reloadRequested.add(sessionId);
+  renderClaudeSigninSection();
+  const sent = dispatchSessionControlMsg(
+    { action: 'reload_credentials', session_id: sessionId },
+    {
+      onError: err => {
+        claudeSigninState.reloadRequested.delete(sessionId);
+        showControlToast?.('error', `Reload failed: ${err?.message || err}`);
+        renderClaudeSigninSection();
+      },
+    }
+  );
+  if (sent === false) {
+    claudeSigninState.reloadRequested.delete(sessionId);
+    renderClaudeSigninSection();
+    return;
+  }
+  showControlToast?.('success', 'Reload requested — the session restarts on the new account');
+}
+
+function renderClaudeSigninSection() {
+  const mount = document.getElementById('claude-signin-section');
+  if (!mount) return;
+  // Never clobber a code paste mid-typing.
+  if (
+    mount.contains(document.activeElement) &&
+    document.activeElement.matches('input, textarea, select')
+  ) {
+    return;
+  }
+  mount.innerHTML = '';
+  const card = document.createElement('div');
+  card.className = 'vault-card claude-signin';
+  mount.appendChild(card);
+
+  const note = (text, cls = 'vault-note') => {
+    const el = document.createElement('div');
+    el.className = cls;
+    el.textContent = text;
+    card.appendChild(el);
+    return el;
+  };
+  const actionsRow = (...children) => {
+    const row = document.createElement('div');
+    row.className = 'vault-actions';
+    for (const child of children) if (child) row.appendChild(child);
+    card.appendChild(row);
+    return row;
+  };
+
+  // Availability honesty first (same pattern as the fueling panel).
+  const avail = daemonApi.availability('api_claude_auth_status');
+  if (avail.reason === 'denied') {
+    note("This session's role can't run credential ceremonies — sign-in needs credentials.manage.");
+    return;
+  }
+  if (avail.reason === 'unsupported') {
+    note('This daemon predates the Claude sign-in ceremony — upgrade it to sign in from here.');
+    return;
+  }
+
+  const status = claudeSigninState.status;
+  const phase = claudeSigninPhase();
+  const statusLine = document.createElement('div');
+  statusLine.className = 'vault-status-line';
+  const chip = document.createElement('span');
+  chip.className = 'vault-chip';
+  const CHIPS = {
+    idle: ['ready', ''],
+    starting: ['starting', ''],
+    awaiting_browser: ['waiting for you', 'warn'],
+    awaiting_code: ['waiting for the code', 'warn'],
+    verifying: ['verifying', 'warn'],
+    success: ['signed in', 'ok'],
+    failed: ['failed', 'warn'],
+    cancelled: ['cancelled', ''],
+    timed_out: ['timed out', 'warn'],
+  };
+  const [chipText, chipCls] = CHIPS[phase] || [phase, ''];
+  chip.textContent = chipText;
+  if (chipCls) chip.classList.add(chipCls);
+  statusLine.appendChild(chip);
+  const lineText = {
+    idle: 'Sign this daemon into a Claude account (claude.ai subscription sign-in).',
+    starting: 'Starting the Claude CLI’s sign-in…',
+    awaiting_browser: 'Open the sign-in link, approve access, then paste the code back here.',
+    awaiting_code: 'Open the sign-in link, approve access, then paste the code back here.',
+    verifying: 'Verifying with Anthropic… the CLI is exchanging the code.',
+    success: 'This machine’s Claude Code now uses the new account.',
+    failed: 'The sign-in did not complete.',
+    cancelled: 'Sign-in cancelled — the previous account (if any) still works.',
+    timed_out: 'The sign-in timed out — nothing changed on this machine.',
+  }[phase];
+  statusLine.appendChild(document.createTextNode(lineText || ''));
+  card.appendChild(statusLine);
+
+  if (claudeSigninState.lastError) {
+    note(claudeSigninState.lastError, 'vault-error');
+  }
+  if (status?.error && ['failed', 'timed_out'].includes(phase)) {
+    note(status.error, 'vault-error');
+  }
+
+  if (phase === 'idle' || ['failed', 'cancelled', 'timed_out'].includes(phase)) {
+    note(CLAUDE_SIGNIN_BLAST_COPY, 'vault-warning');
+    actionsRow(
+      vaultButton(
+        phase === 'idle' ? 'Start Claude sign-in' : 'Try again',
+        () => claudeSigninStart(),
+        { primary: true }
+      )
+    );
+    return;
+  }
+
+  if (phase === 'starting') {
+    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
+    return;
+  }
+
+  if (phase === 'awaiting_browser' || phase === 'awaiting_code') {
+    const url = String(status?.url || '');
+    const stepOne = document.createElement('div');
+    stepOne.className = 'claude-signin-step';
+    const stepOneLabel = document.createElement('div');
+    stepOneLabel.className = 'vault-note';
+    stepOneLabel.textContent = '1. Sign in with your browser';
+    stepOne.appendChild(stepOneLabel);
+    if (url) {
+      const openRow = document.createElement('div');
+      openRow.className = 'vault-actions';
+      openRow.appendChild(
+        vaultButton('Open Anthropic sign-in', () => {
+          window.open(url, '_blank', 'noopener');
+        }, { primary: true })
+      );
+      openRow.appendChild(
+        vaultButton('Copy link', () => {
+          navigator.clipboard
+            ?.writeText(url)
+            .then(() => showControlToast?.('success', 'Sign-in link copied'))
+            .catch(() => showControlToast?.('error', 'Copy failed'));
+        })
+      );
+      stepOne.appendChild(openRow);
+      const checkNote = document.createElement('div');
+      checkNote.className = 'vault-note';
+      checkNote.textContent = 'Check that your browser shows claude.com before signing in.';
+      stepOne.appendChild(checkNote);
+      const urlLine = document.createElement('div');
+      urlLine.className = 'claude-signin-url';
+      urlLine.textContent = url;
+      stepOne.appendChild(urlLine);
+    } else {
+      const waiting = document.createElement('div');
+      waiting.className = 'vault-note';
+      waiting.textContent = 'Waiting for the CLI to produce the sign-in link…';
+      stepOne.appendChild(waiting);
+    }
+    card.appendChild(stepOne);
+
+    const stepTwo = document.createElement('div');
+    stepTwo.className = 'claude-signin-step';
+    const stepTwoLabel = document.createElement('div');
+    stepTwoLabel.className = 'vault-note';
+    stepTwoLabel.textContent = '2. Paste the code Anthropic shows you';
+    stepTwo.appendChild(stepTwoLabel);
+    const codeRow = document.createElement('div');
+    codeRow.className = 'vault-actions';
+    const codeInput = document.createElement('input');
+    codeInput.type = 'text';
+    codeInput.className = 'claude-signin-code';
+    codeInput.placeholder = 'Paste code here';
+    codeInput.autocomplete = 'off';
+    codeInput.spellcheck = false;
+    const submit = () => {
+      const code = codeInput.value.trim();
+      if (!code) return;
+      claudeSigninSubmitCode(code);
+    };
+    codeInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submit();
+      }
+    });
+    codeRow.appendChild(codeInput);
+    codeRow.appendChild(vaultButton('Submit code', submit, { primary: true }));
+    stepTwo.appendChild(codeRow);
+    card.appendChild(stepTwo);
+
+    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
+    return;
+  }
+
+  if (phase === 'verifying') {
+    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
+    return;
+  }
+
+  if (phase === 'success') {
+    const account = status?.account || null;
+    if (account) {
+      const row = document.createElement('div');
+      row.className = 'vault-entry-row';
+      const lbl = document.createElement('span');
+      lbl.className = 'lbl';
+      lbl.textContent = account.email || 'Signed in';
+      row.appendChild(lbl);
+      if (account.subscription_type) {
+        const plan = document.createElement('span');
+        plan.className = 'vault-chip ok';
+        plan.textContent = account.subscription_type;
+        row.appendChild(plan);
+      }
+      if (account.org_name) {
+        const org = document.createElement('span');
+        org.className = 'vault-chip';
+        org.textContent = account.org_name;
+        row.appendChild(org);
+      }
+      card.appendChild(row);
+    } else {
+      note('Signed in (the CLI did not report account details).');
+    }
+
+    // The value half: running Claude Code sessions keep the OLD account
+    // until their backend process restarts — offer the per-session
+    // reload (graceful in-place respawn, resume-attached).
+    claudeSigninRefreshSessions().catch(() => {});
+    const reloadHead = document.createElement('div');
+    reloadHead.className = 'vault-status-line';
+    const reloadTitle = document.createElement('span');
+    reloadTitle.className = 'lbl';
+    reloadTitle.style.fontWeight = '600';
+    reloadTitle.textContent = 'Running Claude Code sessions';
+    reloadHead.appendChild(reloadTitle);
+    card.appendChild(reloadHead);
+    if (!claudeSigninState.sessions.length) {
+      note('No running Claude Code sessions — new sessions start on the new account.');
+    } else {
+      note('Running sessions keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
+      const list = document.createElement('div');
+      list.className = 'vault-entry-list';
+      for (const session of claudeSigninState.sessions) {
+        const sessionId = String(session.session_id || '');
+        const row = document.createElement('div');
+        row.className = 'vault-entry-row';
+        const lbl = document.createElement('span');
+        lbl.className = 'lbl';
+        lbl.textContent = session.name || sessionId.slice(0, 12) || 'session';
+        const kindChip = document.createElement('span');
+        kindChip.className = 'vault-chip';
+        kindChip.textContent = 'claude-code';
+        const actions = document.createElement('span');
+        actions.className = 'vault-entry-actions';
+        if (claudeSigninState.reloadRequested.has(sessionId)) {
+          const done = document.createElement('span');
+          done.className = 'vault-chip ok';
+          done.textContent = 'reload requested';
+          actions.appendChild(done);
+        } else {
+          actions.appendChild(
+            vaultButton('Reload credentials', () => claudeSigninReloadSession(sessionId))
+          );
+        }
+        row.append(lbl, kindChip, actions);
+        list.appendChild(row);
+      }
+      card.appendChild(list);
+    }
+    actionsRow(vaultButton('Sign in again', () => claudeSigninStart()));
+    return;
+  }
+}
+
 async function vaultFuelEntry(entry) {
   const kind = vaultEntryLeaseKind(entry);
   if (!kind) return;
@@ -2504,6 +2935,9 @@ function renderAccessVaultSection() {
   // refresh cadence (30s freshness guard inside).
   renderAccessCustodySection();
   vaultRefreshCustody().catch(() => {});
+  // So does the Claude sign-in card (its own mount + freshness guard).
+  renderClaudeSigninSection();
+  claudeSigninRefresh().catch(() => {});
 
   const card = document.createElement('div');
   card.className = 'vault-card';
@@ -2652,9 +3086,15 @@ function ui2VaultAdoptSections() {
   if (!host || !vaultMount || !custodyMount) return;
   const advancedBody = vaultMount.parentElement;
   const vaultHead = vaultMount.previousElementSibling;
+  const signinMount = document.getElementById('claude-signin-section');
+  const signinHead = signinMount?.previousElementSibling;
   const custodyHead = custodyMount.previousElementSibling;
   if (vaultHead?.classList.contains('acc-section-head')) host.appendChild(vaultHead);
   host.appendChild(vaultMount);
+  if (signinMount) {
+    if (signinHead?.classList.contains('acc-section-head')) host.appendChild(signinHead);
+    host.appendChild(signinMount);
+  }
   if (custodyHead?.classList.contains('acc-section-head')) host.appendChild(custodyHead);
   host.appendChild(custodyMount);
   const pagehead = document.getElementById('ui2-vault-pagehead');

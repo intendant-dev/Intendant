@@ -1025,6 +1025,89 @@ pub(crate) async fn api_session_fork_points_response_from_home(
     frame_api_response(id, response, "session fork points")
 }
 
+/// A `params` string that can stand as one path segment of a synthesized
+/// request line (the fork-points twin's refusal, shared by the
+/// background-task twins).
+fn single_segment_param(params: &serde_json::Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| !value.contains(['/', '?', '#', ' ']))
+        .map(str::to_string)
+}
+
+pub(crate) async fn api_session_background_tasks_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // Transport edge: resolve the real home once; tests drive the route
+    // module's `_response` fns with injected temp homes.
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(session_id) = single_segment_param(&params, "session_id") else {
+        return missing_param_response(id, "session_id");
+    };
+    let request_line = format!("GET /api/session/{session_id}/background-tasks HTTP/1.1");
+    let home = crate::platform::home_dir();
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_background_tasks_response(&request_line, &home)
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("background-tasks task failed: {e}"),
+            });
+        }
+    };
+    frame_api_response(id, response, "session background tasks")
+}
+
+pub(crate) async fn api_session_background_task_output_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(session_id) = single_segment_param(&params, "session_id") else {
+        return missing_param_response(id, "session_id");
+    };
+    let Some(task_id) = single_segment_param(&params, "task_id") else {
+        return missing_param_response(id, "task_id");
+    };
+    let mut query = String::new();
+    if let Some(tail_kb) = params.get("tail_kb") {
+        let tail_kb = match tail_kb {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+        query = format!("?tail_kb={tail_kb}");
+    }
+    let request_line =
+        format!("GET /api/session/{session_id}/background-tasks/{task_id}/output{query} HTTP/1.1");
+    let home = crate::platform::home_dir();
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_background_task_output_response(&request_line, &home)
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("background-task output task failed: {e}"),
+            });
+        }
+    };
+    frame_api_response(id, response, "background task output")
+}
+
 pub(crate) async fn api_managed_context_response(
     id: String,
     kind: &'static str,
@@ -1621,6 +1704,7 @@ pub(crate) fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::ConfigureSessionAgent { .. }
             | ControlMsg::StopSession { .. }
             | ControlMsg::RestartSession { .. }
+            | ControlMsg::ReloadCredentials { .. }
             | ControlMsg::CreateSession { .. }
             | ControlMsg::SpawnSubAgent { .. }
             | ControlMsg::StartTask { .. }
@@ -1698,6 +1782,7 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::ConfigureSessionAgent { .. } => "configure_session_agent",
         ControlMsg::StopSession { .. } => "stop_session",
         ControlMsg::RestartSession { .. } => "restart_session",
+        ControlMsg::ReloadCredentials { .. } => "reload_credentials",
         ControlMsg::ResumeSession { .. } => "resume_session",
         ControlMsg::ForkSessionAtAnchor { .. } => "fork_session_at_anchor",
         ControlMsg::SetClaudeModel { .. } => "set_claude_model",
@@ -1719,7 +1804,6 @@ pub(crate) fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::CancelFollowUp { .. } => "cancel_follow_up",
         ControlMsg::EditUserMessage { .. } => "edit_user_message",
         ControlMsg::QueryDetail { .. } => "query_detail",
-        ControlMsg::RecallMemory { .. } => "recall_memory",
         ControlMsg::TakeDisplay { .. } => "take_display",
         ControlMsg::ReleaseDisplay { .. } => "release_display",
         ControlMsg::GrantUserDisplay { .. } => "grant_user_display",
@@ -1766,6 +1850,82 @@ pub(crate) async fn api_api_keys_save_response(
             &body_text,
         ),
         "api keys save",
+    )
+}
+
+/// Hosted-provenance fact for the Claude sign-in twins, from the grant
+/// that opened this control session: the trusted-local surface and peer
+/// daemons are direct by construction; user clients go through the
+/// central evaluator's provenance rules (peer profiles never carry
+/// credentials.manage, so the Peer arm exists only for the type — the
+/// method authorizer has already refused it).
+fn control_grant_is_hosted(grant: &DashboardControlGrant) -> bool {
+    match grant {
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+            ..
+        } => crate::access::iam::is_hosted_session(iam_state, principal),
+        DashboardControlGrant::TrustedLocal | DashboardControlGrant::Peer { .. } => false,
+    }
+}
+
+pub(crate) async fn api_claude_auth_start_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_start_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+            runtime.project_root.as_deref(),
+        ),
+        "claude auth start",
+    )
+}
+
+pub(crate) async fn api_claude_auth_status_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_status_api_response(control_grant_is_hosted(
+            &runtime.grant,
+        )),
+        "claude auth status",
+    )
+}
+
+pub(crate) async fn api_claude_auth_code_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_code_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+        ),
+        "claude auth code",
+    )
+}
+
+pub(crate) async fn api_claude_auth_cancel_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_cancel_api_response(control_grant_is_hosted(
+            &runtime.grant,
+        )),
+        "claude auth cancel",
     )
 }
 
@@ -3293,8 +3453,7 @@ mod tests {
     //      tempdirs (hermeticity convention).
 
     fn empty_peer_registry() -> crate::peer::PeerRegistry {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         crate::peer::PeerRegistry::new(log_tx)
     }
 
@@ -3571,6 +3730,26 @@ mod tests {
             js_set, rust_set,
             "DASHBOARD_ACTION_MSG_RPC_ACTIONS (static/app/31-init-identity-fleet.js) \
              drifted from DASHBOARD_ACTION_MSG_ACTIONS"
+        );
+    }
+
+    /// Reload-credentials rides the session-control lane like restart:
+    /// wire name, lane admission, and the session-manage classification
+    /// (it is session lifecycle — the ceremony that writes the store is
+    /// gated on credentials.manage separately).
+    #[test]
+    fn reload_credentials_control_msg_wires_like_restart() {
+        let msg: ControlMsg = serde_json::from_value(serde_json::json!({
+            "action": "reload_credentials",
+            "session_id": "s1",
+        }))
+        .expect("reload_credentials parses");
+        assert_eq!(dashboard_control_msg_action(&msg), "reload_credentials");
+        assert!(dashboard_session_control_msg_allowed(&msg));
+        assert!(!dashboard_action_msg_allowed(&msg));
+        assert_eq!(
+            crate::access::access_policy::control_msg_operation(&msg),
+            crate::peer::access_policy::PeerOperation::SessionManage,
         );
     }
 
@@ -4158,8 +4337,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_webrtc_signal_returns_http_error_metadata() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(8);
         let mut rt = runtime();
         rt.peer_registry = Some(crate::peer::PeerRegistry::new(log_tx));
 

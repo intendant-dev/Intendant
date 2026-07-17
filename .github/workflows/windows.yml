@@ -481,6 +481,21 @@ jobs:
           --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/"
           --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
 
+      # Deep-link boots evaluate later-fragment code during script
+      # evaluation (the deep-link TDZ class — a let/const declared in a
+      # late fragment but reached from the fragment-48 route apply dies
+      # with "Cannot access before initialization"). #stats and #files
+      # are the two tabs that have regressed this way; boot each one.
+      - name: dashboard-boot smoke (deep links)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        shell: bash
+        run: |
+          for hash in stats files; do
+            node scripts/smoke-dashboard-boot.cjs \
+              --url "http://127.0.0.1:${{ steps.daemon.outputs.port }}/#$hash" \
+              --artifact-dir "${{ steps.daemon.outputs.rig }}/artifacts"
+          done
+
       - name: Stop daemon (dashboard-boot)
         if: always() && steps.daemon.outputs.pid != ''
         shell: bash

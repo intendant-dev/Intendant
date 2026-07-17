@@ -170,6 +170,9 @@ function processCommands(cmds) {
       case 'session_rename_result':
         handleSessionRenameResult(c);
         break;
+      case 'session_fork_result':
+        handleSessionForkResult(c);
+        break;
       // Peer registry push events. The peer payload is a `PeerSnapshot`
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path

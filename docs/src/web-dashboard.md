@@ -240,13 +240,21 @@ undocumented), dimming to `✗` once cold; and a rate-limit gauge —
 `▮NN% 5h` for the most-used window (Claude Code subscription 5h/7d,
 Codex primary/secondary, native Anthropic per-minute headers), dim below
 70%, yellow from 70%, red from 90% with the reset countdown appended;
-the tooltip lists every window. When a cache countdown enters its final
-minute the dashboard raises one toast per idle period (plus a browser
-notification if permission was already granted and the tab is hidden) —
-early enough that a follow-up still reuses the warm cache, never after the
-fact. Sections appear as producers fill them; the chip hides in narrow
-windows. Station's agent focus panel shows the same vitals as git /
-cache / limits rows.
+the tooltip lists every window. Session-facts chips (the vitals `config`
+section, wire-first from each backend's own echoes with the launch config
+as the honestly-marked fallback) show the model + configured reasoning
+effort (`⬡ fable-5 · max`) and the permission mode in plain words
+(`🛡 Acts without asking`) — bypass/ungated modes get a quiet warning
+tint (cosmetic, never the health dot), the raw backend vocabulary
+(`bypassPermissions`, `workspace-write · on-request`, the autonomy level)
+is one tap away in the explainer, and the vitals pane always lists both
+rows, degrading to "not reported" instead of hiding. When a cache
+countdown enters its final minute the dashboard raises one toast per idle
+period (plus a browser notification if permission was already granted and
+the tab is hidden) — early enough that a follow-up still reuses the warm
+cache, never after the fact. Sections appear as producers fill them; the
+chip hides in narrow windows. Station's agent focus panel shows the same
+vitals as git / cache / limits rows.
 
 #### Managed (Activity → Managed)
 
@@ -1687,7 +1695,7 @@ response omits the header.
 | GET | `/api/session/current/history` | SessionManage | own origin | none | Serialized rollback History for the current session |
 | POST | `/api/session/current/rollback` | SessionManage | own origin | bounded | Roll the current session back to a round (optionally reverting files) |
 | GET | `/api/agenda` | AgendaRead | own origin | none | Agenda ledger snapshot: items (oldest first) plus status counts |
-| POST | `/api/agenda/op` | AgendaWrite | own origin | bounded | Apply one agenda command (add, patch, complete, reopen, or retire) |
+| POST | `/api/agenda/op` | AgendaWrite | own origin | bounded | Apply one agenda command (add, answer, patch, transitions, or scheduled-session propose/approve/revoke) |
 | POST | `/api/agenda/reminders/policy` | Settings | own origin | bounded | Merge-patch the agenda reminder policy (quiet hours, urgency, per-item overrides) |
 | GET | `/api/memory/search` | MemoryRead | own origin | none | Bounded Memory claim search (q, limit, candidates); results carry derived status |
 | GET | `/api/memory/claim` | MemoryRead | own origin | none | Read one Memory claim by id prefix (id); status derived at read time |
@@ -1707,6 +1715,8 @@ response omits the header.
 | POST | `/api/session/{id}/{target}/delete` | SessionManage | own origin | none | Delete one data kind for a session (POST fallback) |
 | POST | `/api/session/{id}/agent-output` | SessionInspect | own origin | bounded | Fetch a session's persisted agent output by id (POST-shaped read) |
 | GET | `/api/session/{id}/fork-points` | SessionInspect | own origin | none | Unified fork-point catalog for a session (anchors + eligibility, backend-tagged) |
+| GET | `/api/session/{id}/background-tasks` | SessionInspect | own origin | none | Background tasks a supervised session announced (id, description, status, output availability) |
+| GET | `/api/session/{id}/background-tasks/{task}/output` | SessionInspect | own origin | none | Tail of one background task's output file (tail_kb query, capped; registry-resolved path) |
 | GET | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail and artifact sub-routes |
 | POST | `/api/session/current[/…]` | SessionManage | own origin | none | Current-session detail sub-routes (POST fallback callers) |
 | GET | `/api/session/{id}/context-snapshot` | SessionInspect | own origin | none | Replay one archived context snapshot (file/request_id/request_index/ts selector) |
@@ -1735,6 +1745,10 @@ response omits the header.
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
 | POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
+| GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
+| POST | `/api/claude-auth/code` | CredentialsManage | own origin | ≤ 2 KiB | Submit the pasted authorization code to the Claude sign-in ceremony |
+| POST | `/api/claude-auth/cancel` | CredentialsManage | own origin | none | Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working) |
 | GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |

@@ -13,7 +13,7 @@ You have tools to handle user requests:
 - **Status queries**: "What are you working on?" → use `check_status`
 - **Detail queries**: "Show me the diff" / "What did you change?" → use `query_detail`
 - **Task result retrieval**: "What exactly did you find?" / "Give me the full details" → use `query_detail` with scope `task_result`
-- **Memory recall**: "What did we do last time?" → use `recall_memory`
+- **Conversation recall**: "What did we do last time?" → use `search_transcripts`
 - **Autonomy changes**: "Run everything automatically" → use `set_autonomy`
 
 ### Delegation (you hand off to workers)

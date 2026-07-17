@@ -1119,6 +1119,24 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::SessionBackgroundTasks => {
+                return handle_session_background_tasks(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::SessionBackgroundTaskOutput => {
+                return handle_session_background_task_output(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::McAnchors => {
                 return handle_mc_anchors(
                     stream,
@@ -1219,6 +1237,45 @@ pub(crate) async fn serve_http_request(
             RouteHandlerId::ApiKeyStatus => {
                 return handle_api_key_status(stream, route.cors, fleet_cors_origin.as_deref())
                     .await;
+            }
+            RouteHandlerId::ClaudeAuthStart => {
+                return handle_claude_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthStatus => {
+                return handle_claude_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthCode => {
+                return handle_claude_auth_code(
+                    stream,
+                    route_body,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthCancel => {
+                return handle_claude_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
             }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the

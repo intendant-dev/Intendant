@@ -211,7 +211,7 @@ format.
 |-----------------|--------|
 | `check_status`  | Read the current `AgentStateSnapshot` — phase, turn, budget, last command/output, workers, pending approval, and **`available_displays`**. |
 | `query_detail`  | Detailed lookups by `scope`: `current_turn`, `last_output`, `worker`, `diff`, `logs`, `file` (needs `target`), `task_result`. |
-| `recall_memory` | Search the tagged knowledge store (by `keywords`, optional `tags`/`channel`); falls back to the session log. |
+| `search_transcripts` | Search voice transcripts (by `keywords`); falls back to the session log. |
 
 ### Video / frame tools (read-only, server I/O)
 
@@ -246,7 +246,7 @@ tool call (text model OR browser voice model)
         ├── Respond { text }
         ├── SetAutonomy { level }
         └── NeedsIO { tool_name, args }  — platform must do I/O:
-                 query_detail · recall_memory · send_message
+                 query_detail · search_transcripts · send_message
                  · inspect_frame · inspect_frames
 ```
 

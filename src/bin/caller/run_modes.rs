@@ -156,7 +156,6 @@ pub(crate) async fn run_with_presence(
             task_tx,
             presence_event_rx,
             agent_state.clone(),
-            project.memory_path(),
             log_dir.clone(),
             project.root.clone(),
             presence_paused.clone(),
@@ -829,6 +828,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     match apply_external_context_rewind(
                         agent,
@@ -1218,6 +1218,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
                         .await
@@ -1264,6 +1265,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     if is_fission_spawn_action(&op) {
                         apply_fission_spawn_action(agent, &action_params, &drain_config).await
@@ -1370,6 +1372,7 @@ pub(crate) async fn run_with_presence(
                         persist_model_responses_inline: false,
                         headless: false,
                         context_injection: &context_injection,
+                        reload_credentials: None,
                     };
                     persist_codex_service_tier_for_drain(
                         &drain_config,
@@ -1459,6 +1462,7 @@ pub(crate) async fn run_with_presence(
                                 persist_model_responses_inline: false,
                                 headless: false,
                                 context_injection: &context_injection,
+                                reload_credentials: None,
                             };
                             emit_side_session_started(
                                 &drain_config,
@@ -1540,6 +1544,7 @@ pub(crate) async fn run_with_presence(
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
+                    reload_credentials: None,
                 };
                 if let Some(child_thread_id) =
                     scoped_event_codex_subagent_thread_id(&event_thread_id, &cumulative_stats)
@@ -1603,6 +1608,12 @@ pub(crate) async fn run_with_presence(
                         bus.send(AppEvent::SessionActivity {
                             session_id: session_log_id(&session_log),
                             activity,
+                        });
+                    }
+                    external_agent::AgentEvent::ConfigFacts { facts } => {
+                        bus.send(AppEvent::SessionConfigFacts {
+                            session_id: session_log_id(&session_log),
+                            facts,
                         });
                     }
                     external_agent::AgentEvent::BackendError {
@@ -2374,6 +2385,7 @@ pub(crate) async fn run_with_presence(
                     persist_model_responses_inline: false,
                     headless: false,
                     context_injection: &context_injection,
+                    reload_credentials: None,
                 };
                 let codex_managed_context_enabled =
                     matches!(backend, external_agent::AgentBackend::Codex)
@@ -3343,7 +3355,6 @@ pub(crate) struct NativeSessionConfig {
     /// INTENDANT_SYSTEM_PROMPT semantic, session-scoped).
     pub(crate) system_prompt_override: Option<String>,
     /// Inject the project knowledge store into fresh conversations.
-    pub(crate) inherit_memory: bool,
     /// Present on supervised (daemon) sessions: grants the loop the
     /// spawn_sub_agent / wait_sub_agents / submit_result capability.
     pub(crate) orchestration: Option<session_supervisor::SessionOrchestration>,
@@ -3360,7 +3371,6 @@ impl NativeSessionConfig {
         Self {
             role: sub_agent::SubAgentRole::Custom("direct".to_string()),
             system_prompt_override: None,
-            inherit_memory: false,
             orchestration: None,
             sub_agent_identity: None,
         }
@@ -3447,7 +3457,6 @@ pub(crate) async fn run_direct_mode(
     // Try to resume from saved conversation if it exists in this session dir
     let conv_path = log_dir.join("conversation.jsonl");
     let attachment_images = attachments.conversation_images();
-    let mut fresh_conversation = false;
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
@@ -3517,7 +3526,6 @@ pub(crate) async fn run_direct_mode(
                         }
                     ))
                 });
-                fresh_conversation = true;
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
                 let task_seq = setup_fresh_conversation_with_attachments(
                     &mut conv,
@@ -3533,7 +3541,6 @@ pub(crate) async fn run_direct_mode(
             }
         }
     } else {
-        fresh_conversation = true;
         let mut conv = Conversation::new(system_prompt, provider.context_window());
         let task_seq = setup_fresh_conversation_with_attachments(
             &mut conv,
@@ -3547,20 +3554,7 @@ pub(crate) async fn run_direct_mode(
         conv
     };
 
-    // Inject inherited project knowledge (sub-agents spawned with
-    // inherit_memory). Resumed conversations already carry it.
-    if native.inherit_memory && fresh_conversation && project.config.memory.enabled {
-        if let Ok(kstore) = knowledge::load(&project.memory_path()) {
-            let refs: Vec<&_> = kstore.entries.iter().collect();
-            let msg = knowledge::format_for_injection(&refs);
-            if !msg.is_empty() {
-                conversation.add_user(MessageProvenance::SystemInjection, msg);
-                conversation.add_assistant(
-                    "Acknowledged. I have loaded the project knowledge.".to_string(),
-                );
-            }
-        }
-    }
+    {}
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {

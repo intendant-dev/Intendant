@@ -558,6 +558,10 @@ async function main() {
       serverMsgStep(d, 'agenda_changed', () => agendaObserveServerMessage(d));
       return;
     }
+    if (d.event === 'memory_changed') {
+      serverMsgStep(d, 'memory_changed', () => memoryObserveServerMessage(d));
+      return;
+    }
     if (d.event === 'session_note') {
         // Display-only transcript note: rendered end to end in JS (the
         // WASM presence layer does not know this event).
@@ -1212,7 +1216,7 @@ async function main() {
       if (handoverContext) {
         const waitForVoice = () => {
           if (modelConnected) {
-            app.send_text('[System: handover context] ' + handoverContext + '. Full history available via recall_memory.');
+            app.send_text('[System: handover context] ' + handoverContext + '. Full history available via search_transcripts.');
           } else { setTimeout(waitForVoice, 200); }
         };
         setTimeout(waitForVoice, 500);

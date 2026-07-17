@@ -367,6 +367,9 @@ impl SessionSupervisor {
                 self.stop_managed_session(Some(session_id), "stopped by user")
                     .await;
             }
+            event::ControlMsg::ReloadCredentials { session_id } => {
+                self.route_reload_credentials(session_id).await;
+            }
             event::ControlMsg::RestartSession {
                 source,
                 session_id,

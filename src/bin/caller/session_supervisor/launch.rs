@@ -1168,10 +1168,6 @@ impl SessionSupervisor {
                     system_prompt_override: sub_agent_wiring
                         .as_ref()
                         .and_then(|w| w.system_prompt.clone()),
-                    inherit_memory: sub_agent_wiring
-                        .as_ref()
-                        .map(|w| w.inherit_memory)
-                        .unwrap_or(false),
                     orchestration: Some(SessionOrchestration {
                         supervisor: supervisor.clone(),
                         session_id: session_id.clone(),

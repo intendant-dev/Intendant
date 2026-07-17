@@ -1,7 +1,6 @@
 use crate::conversation::{Conversation, MessageProvenance};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg, EventBus};
-use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
 use crate::types::truncate_str;
@@ -148,8 +147,6 @@ pub struct PresenceLayer {
     event_rx: mpsc::Receiver<PresenceEvent>,
     /// Shared agent state snapshot, updated by the event listener.
     agent_state: Arc<Mutex<AgentStateSnapshot>>,
-    /// Path to the knowledge store.
-    knowledge_path: PathBuf,
     /// Session log directory for query_detail.
     log_dir: PathBuf,
     /// Project root for file reads and git operations.
@@ -183,7 +180,6 @@ impl PresenceLayer {
         task_tx: mpsc::Sender<TaskEnvelope>,
         event_rx: mpsc::Receiver<PresenceEvent>,
         agent_state: Arc<Mutex<AgentStateSnapshot>>,
-        knowledge_path: PathBuf,
         log_dir: PathBuf,
         project_root: PathBuf,
         paused: Arc<AtomicUsize>,
@@ -197,7 +193,6 @@ impl PresenceLayer {
             task_tx,
             event_rx,
             agent_state,
-            knowledge_path,
             log_dir,
             project_root,
             turn: 0,
@@ -485,7 +480,7 @@ impl PresenceLayer {
             PresenceAction::TextResult(text) => text,
             PresenceAction::NeedsIO { tool_name, args } => match tool_name.as_str() {
                 "query_detail" => self.handle_query_detail(&args).await,
-                "recall_memory" => self.handle_recall_memory(&args),
+                "search_transcripts" => self.handle_search_transcripts(&args),
                 "send_message" => {
                     let msg = args["message"].as_str().unwrap_or("").to_string();
                     if msg.is_empty() {
@@ -513,8 +508,8 @@ impl PresenceLayer {
         query_detail(&self.agent_state, &self.project_root, &self.log_dir, args).await
     }
 
-    fn handle_recall_memory(&self, args: &Value) -> String {
-        recall_memory(&self.knowledge_path, &self.log_dir, args)
+    fn handle_search_transcripts(&self, args: &Value) -> String {
+        search_transcripts(&self.log_dir, args)
     }
 
     /// Main run loop: listen for events and user input, process both.
@@ -671,48 +666,19 @@ fn resolve_project_file_for_read(project_root: &Path, target: &str) -> Result<Pa
     Ok(canonical)
 }
 
-/// Handle a `recall_memory` tool call: query knowledge store AND voice transcripts.
-/// Results from both sources are merged and returned.
-pub fn recall_memory(
-    knowledge_path: &std::path::Path,
-    log_dir: &std::path::Path,
-    args: &Value,
-) -> String {
+/// Handle a `search_transcripts` tool call: voice transcripts first,
+/// recent session-log lines as the fallback. (The tombed knowledge
+/// store's lane is gone — transcripts are presence's own product.)
+pub fn search_transcripts(log_dir: &std::path::Path, args: &Value) -> String {
     let keywords: Option<Vec<String>> = args["keywords"].as_array().map(|a| {
         a.iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect()
     });
-    let tags = args["tags"].as_array().map(|a| {
-        a.iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect()
-    });
-    let channel = args["channel"].as_str().map(String::from);
-
-    let query = KnowledgeQuery {
-        keywords: keywords.clone(),
-        tags,
-        channel,
-        ..Default::default()
-    };
 
     let mut sections: Vec<String> = Vec::new();
 
-    // Source 1: Knowledge store
-    if let Ok(store) = knowledge::load(knowledge_path) {
-        let results = knowledge::query(&store, &query);
-        if !results.is_empty() {
-            let formatted: Vec<String> = results
-                .iter()
-                .take(10)
-                .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
-                .collect();
-            sections.push(formatted.join("\n"));
-        }
-    }
-
-    // Source 2: Voice transcript search
+    // Source 1: Voice transcript search
     if let Some(ref kws) = keywords {
         let voice_results = session_log::search_voice_entries(log_dir, kws, 5);
         if !voice_results.is_empty() {
@@ -723,7 +689,7 @@ pub fn recall_memory(
         }
     }
 
-    // Source 3: Fall back to raw session log if nothing found
+    // Source 2: Fall back to raw session log if nothing found
     if sections.is_empty() {
         let entries = session_log::recent_entries(log_dir, 100);
         if let Some(ref kws) = keywords {
@@ -748,7 +714,7 @@ pub fn recall_memory(
     }
 
     if sections.is_empty() {
-        "No memories found.".to_string()
+        "No matching transcript entries found.".to_string()
     } else {
         sections.join("\n\n")
     }
@@ -796,7 +762,6 @@ pub async fn handle_tool_query(
     agent_state: &Arc<Mutex<AgentStateSnapshot>>,
     project_root: &std::path::Path,
     log_dir: &std::path::Path,
-    knowledge_path: &std::path::Path,
     tool_name: &str,
     args: &Value,
     frame_registry: Option<&Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
@@ -817,11 +782,7 @@ pub async fn handle_tool_query(
         "query_detail" => Some(ToolQueryResult::text(
             query_detail(agent_state, project_root, log_dir, args).await,
         )),
-        "recall_memory" => Some(ToolQueryResult::text(recall_memory(
-            knowledge_path,
-            log_dir,
-            args,
-        ))),
+        "search_transcripts" => Some(ToolQueryResult::text(search_transcripts(log_dir, args))),
         "send_message" => {
             let msg = args["message"].as_str().unwrap_or("").to_string();
             if msg.is_empty() {
@@ -1114,6 +1075,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::FollowUpStatus { .. }
         | AppEvent::ExternalFollowUpRequested { .. }
         | AppEvent::AgendaChanged { .. }
+        | AppEvent::MemoryChanged { .. }
         | AppEvent::ExternalAgentChanged { .. }
         | AppEvent::AutonomyChanged { .. }
         | AppEvent::CodexConfigChanged { .. }
@@ -1126,6 +1088,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionGoal { .. }
         | AppEvent::SessionVitals { .. }
         | AppEvent::SessionActivity { .. }
+        | AppEvent::SessionConfigFacts { .. }
         | AppEvent::SessionRenameResult { .. }
         | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::ClaudeConfigChanged { .. }
@@ -1138,6 +1101,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SessionStarted { .. }
         | AppEvent::SessionAttached { .. }
         | AppEvent::SessionStopRequested { .. }
+        | AppEvent::ReloadBackendCredentials { .. }
         | AppEvent::SessionEnded { .. }
         | AppEvent::DebugScreenReady { .. }
         | AppEvent::DebugScreenTornDown { .. }
@@ -1726,7 +1690,7 @@ mod tests {
         assert!(names.contains(&"submit_task"));
         assert!(names.contains(&"check_status"));
         assert!(names.contains(&"query_detail"));
-        assert!(names.contains(&"recall_memory"));
+        assert!(names.contains(&"search_transcripts"));
         assert!(names.contains(&"approve_action"));
         assert!(names.contains(&"deny_action"));
         assert!(names.contains(&"skip_action"));
@@ -1956,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn recall_memory_merges_voice_transcripts() {
+    fn search_transcripts_merges_voice_entries() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
         let mut log = session_log::SessionLog::open(log_dir.clone()).unwrap();
@@ -1964,9 +1928,8 @@ mod tests {
         log.user_transcript("fix the auth module", 1);
         log.voice_log("I'll check auth now.", 2, Some("transcript"));
 
-        let knowledge_path = dir.path().join("knowledge.json");
         let args = serde_json::json!({"keywords": ["auth"]});
-        let result = recall_memory(&knowledge_path, &log_dir, &args);
+        let result = search_transcripts(&log_dir, &args);
 
         // Should find voice transcript results
         assert!(result.contains("Conversation history"));

@@ -570,11 +570,13 @@ impl AppEventUpcaster {
             | AppEvent::DisplayMetrics { .. }
             // Hub-internal: peers see the folded SessionVitals instead.
             | AppEvent::SessionActivity { .. }
+            | AppEvent::SessionConfigFacts { .. }
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::FollowUpCancelRequested { .. }
             | AppEvent::SessionStopRequested { .. }
+            | AppEvent::ReloadBackendCredentials { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }
@@ -602,7 +604,8 @@ impl AppEventUpcaster {
             | AppEvent::ConversationRolledBack { .. }
             // The agenda is home-scoped daemon state; the peer rail does
             // not carry another daemon's ledger (ratified v1 scope).
-            | AppEvent::AgendaChanged { .. } => vec![],
+            | AppEvent::AgendaChanged { .. }
+            | AppEvent::MemoryChanged { .. } => vec![],
 
             AppEvent::UserMessageEditStatus {
                 user_turn_index,
@@ -1967,6 +1970,7 @@ impl WireEventUpcaster {
             | OutboundEvent::DisplayMetrics { .. }
             | OutboundEvent::ContextSnapshot { .. }
             | OutboundEvent::AgendaChanged { .. }
+            | OutboundEvent::MemoryChanged { .. }
             | OutboundEvent::FileChanged { .. }
             | OutboundEvent::UploadReady { .. }
             | OutboundEvent::UploadDeleted { .. }
@@ -4539,6 +4543,7 @@ mod tests {
             cache: None,
             limits: Vec::new(),
             activity: None,
+            config: None,
         }
     }
 

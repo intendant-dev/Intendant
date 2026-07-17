@@ -356,6 +356,35 @@ daemon with no local keys and no lease reports "unfueled" in the
 dashboard rather than erroring opaquely — the same graceful state the
 no-API-key path shows today.
 
+## On-box sign-in: the Claude ceremony
+
+The deliberate counterpoint to leases: the Vault tab's **Claude
+account** card drives the Claude Code CLI's own `claude auth login` on a
+**daemon-private PTY** (`claude_auth_ceremony.rs`; never registered in
+the agent-visible terminal registry), for owners who keep that
+credential on-box. The dashboard shows the sign-in URL (captured by a
+per-ceremony `PATH` shim that swallows `open`/`xdg-open`, with a PTY
+parse fallback, and validated against the claude.com/anthropic.com
+OAuth shape before display), the owner signs in from their own browser
+and pastes the code back, and the CLI performs the PKCE exchange itself
+— the daemon never sees token material, and ceremony I/O is never
+logged. Four `credentials.manage`-gated routes carry it
+(`/api/claude-auth/{start,status,code,cancel}` + datachannel twins,
+docs table in [Web Dashboard](./web-dashboard.md)); hosted-provenance
+clients are hard-refused at the handlers, one ceremony runs at a time,
+and a 5-minute timeout (or explicit cancel — verified non-destructive)
+reaps the process. **Tier gate:** a daemon whose Claude Code credential
+is custody-managed (active `oauth:claude-code` lease) or whose
+Anthropic provider rides a client-egress relay refuses the ceremony —
+a dashboard login would park a durable credential on disk behind the
+owner's off-box custody choice. After a successful sign-in the card
+lists running Claude Code sessions with per-session **Reload
+credentials** chips: a graceful in-place respawn, resume-attached to
+the same backend session, that re-reads the fresh store (a mid-turn
+session is interrupted first; a rate-limit park is cancelled with its
+pending re-send preserved). V1 is the claude.ai lane only
+(`--console` / `--sso` are follow-ups) and local-daemon only.
+
 ## Egress: whose network path
 
 Voice went client-direct because voice is client-shaped: realtime media,

@@ -379,18 +379,14 @@ impl ChatProvider for GeminiProvider {
         let mut cu_calls: Vec<crate::computer_use::CuToolCall> = Vec::new();
         let mut raw_model_parts: Vec<serde_json::Value> = Vec::new();
         let mut usage = TokenUsage::default();
-        let mut line_buf = String::new();
+        let mut line_buf = SseLineBuffer::new();
 
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| CallerError::Provider(format!("Stream error: {}", e)))?;
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            line_buf.push_str(&chunk_str);
+            line_buf.push_chunk(&chunk);
 
-            while let Some(newline_pos) = line_buf.find('\n') {
-                let line = line_buf[..newline_pos].trim_end_matches('\r').to_string();
-                line_buf = line_buf[newline_pos + 1..].to_string();
-
+            while let Some(line) = line_buf.next_line() {
                 if line.is_empty() {
                     continue;
                 }

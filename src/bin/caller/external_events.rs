@@ -44,6 +44,49 @@ pub(crate) async fn interrupt_turn_bounded(
     }
 }
 
+/// Forward a mid-turn interrupt to the backend: the bounded RPC plus its
+/// logging, shared by the user-interrupt and reload-credentials arms. For
+/// backends that don't support mid-turn cancel we log and keep waiting;
+/// the RPC is time-bounded so an unresponsive backend can't wedge the
+/// caller's select arm.
+async fn forward_interrupt_to_backend(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+) {
+    match tokio::time::timeout(EXTERNAL_INTERRUPT_RPC_TIMEOUT, agent.interrupt_turn()).await {
+        Ok(Ok(())) => {
+            config.bus.send(AppEvent::PresenceLog {
+                message: format!("Interrupt sent to {}", agent.name()),
+                level: None,
+                turn: None,
+            });
+        }
+        Ok(Err(e)) => {
+            config.bus.send(AppEvent::PresenceLog {
+                message: format!(
+                    "Interrupt not supported or failed for {}: {}",
+                    agent.name(),
+                    e
+                ),
+                level: Some(types::LogLevel::Warn),
+                turn: None,
+            });
+            slog(config.session_log, |l| {
+                l.warn(&format!("Interrupt failed for {}: {}", agent.name(), e))
+            });
+        }
+        Err(_) => {
+            slog(config.session_log, |l| {
+                l.warn(&format!(
+                    "Interrupt RPC to {} timed out after {}s; interrupt again to abandon the drain",
+                    agent.name(),
+                    EXTERNAL_INTERRUPT_RPC_TIMEOUT.as_secs()
+                ))
+            });
+        }
+    }
+}
+
 /// Also subscribes to the event bus for `AppEvent::InterruptRequested` and
 /// forwards it to the external agent via `ExternalAgent::interrupt_turn()`.
 /// Backends that don't support interruption return a typed error we log and
@@ -331,41 +374,41 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                         // a second interrupt escalates to abandoning the
                         // drain above. The RPC itself is time-bounded so an
                         // unresponsive backend can't wedge this select arm.
-                        match tokio::time::timeout(
-                            EXTERNAL_INTERRUPT_RPC_TIMEOUT,
-                            agent.interrupt_turn(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                config.bus.send(AppEvent::PresenceLog {
-                                    message: format!("Interrupt sent to {}", agent.name()),
-                                    level: None,
-                                    turn: None,
-                                });
-                            }
-                            Ok(Err(e)) => {
-                                config.bus.send(AppEvent::PresenceLog {
-                                    message: format!(
-                                        "Interrupt not supported or failed for {}: {}",
-                                        agent.name(), e
-                                    ),
-                                    level: Some(types::LogLevel::Warn),
-                                    turn: None,
-                                });
+                        forward_interrupt_to_backend(agent, config).await;
+                        continue;
+                    }
+                    Ok(AppEvent::ReloadBackendCredentials { session_id })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &alias_session_id,
+                        ) =>
+                    {
+                        // Mid-turn reload: interrupt now (stop semantics),
+                        // raise the loop handshake flag, and let the loop
+                        // respawn once this drain returns. Without the
+                        // handshake (foreground lane) the request has no
+                        // respawn machinery to land on — say so instead of
+                        // silently eating the event.
+                        match config.reload_credentials {
+                            Some(flag) => {
+                                flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                 slog(config.session_log, |l| {
-                                    l.warn(&format!(
-                                        "Interrupt failed for {}: {}", agent.name(), e
-                                    ))
+                                    l.info(
+                                        "Reload-credentials requested mid-turn — interrupting the backend; the respawn applies when the turn ends",
+                                    )
                                 });
+                                if !interrupt_pending {
+                                    interrupt_pending = true;
+                                    interrupt_reason = "reloading credentials".to_string();
+                                    forward_interrupt_to_backend(agent, config).await;
+                                }
                             }
-                            Err(_) => {
+                            None => {
                                 slog(config.session_log, |l| {
-                                    l.warn(&format!(
-                                        "Interrupt RPC to {} timed out after {}s; interrupt again to abandon the drain",
-                                        agent.name(),
-                                        EXTERNAL_INTERRUPT_RPC_TIMEOUT.as_secs()
-                                    ))
+                                    l.warn(
+                                        "Reload-credentials is not available for this session shape; ignoring",
+                                    )
                                 });
                             }
                         }
@@ -993,6 +1036,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 persist_model_responses_inline: config.persist_model_responses_inline,
                 headless: config.headless,
                 context_injection: config.context_injection,
+                reload_credentials: config.reload_credentials,
             };
             &child_config_storage
         } else {
@@ -1027,7 +1071,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     stats.last_response = Some(text.clone());
                 }
                 persist_external_model_response_if_needed(config, &text, None);
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: text,
@@ -1065,7 +1109,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 // (visible in Verbose + Debug, hidden in Normal) via the
                 // existing reasoning_summary path in app_state.rs.
                 persist_external_model_response_if_needed(config, "", Some(&text));
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: String::new(),
@@ -1090,7 +1134,7 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     md.push_str(&format!("- {} {}\n", marker, content));
                 }
                 persist_external_model_response_if_needed(config, &md, None);
-                config.bus.send(AppEvent::ModelResponse {
+                config.send_model_response(AppEvent::ModelResponse {
                     session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: md,
@@ -1247,6 +1291,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                 config.bus.send(AppEvent::SessionActivity {
                     session_id: config.session_id.clone(),
                     activity,
+                });
+            }
+            external_agent::AgentEvent::ConfigFacts { facts } => {
+                // Session-config facts → the vitals hub (same keying and
+                // aliasing as activity). Pure bookkeeping.
+                config.bus.send(AppEvent::SessionConfigFacts {
+                    session_id: config.session_id.clone(),
+                    facts,
                 });
             }
             external_agent::AgentEvent::GoalUpdated { goal } => {
@@ -2411,6 +2463,11 @@ pub(crate) fn normalize_native_session_target(
                 session_id: local_session_id.clone(),
             }
         }
+        AppEvent::ReloadBackendCredentials { session_id } if matches_native(&session_id) => {
+            AppEvent::ReloadBackendCredentials {
+                session_id: local_session_id.clone(),
+            }
+        }
         AppEvent::SteerRequested {
             session_id,
             text,
@@ -2632,6 +2689,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         // The steer is already on the bus when the drain starts — the
@@ -2720,6 +2778,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -2991,6 +3050,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3157,6 +3217,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3290,6 +3351,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3442,6 +3504,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3646,6 +3709,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3801,6 +3865,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         event_tx
@@ -3908,6 +3973,7 @@ mod tests {
             persist_model_responses_inline: true,
             headless: true,
             context_injection: &context_injection,
+            reload_credentials: None,
         };
         let (_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));

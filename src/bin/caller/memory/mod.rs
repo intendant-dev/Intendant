@@ -18,15 +18,21 @@
 //! that program order. Do not add persistence here ahead of it.
 //!
 //! This module is deliberately unrelated to the legacy
-//! `store_memory`/`recall_memory`/`.intendant/memory.json` system
-//! (tombed; cutover is a later P1 slice) and reuses none of its
+//! per-project `.intendant/memory.json` key-value system (deleted at
+//! the P1.7 cutover) and reuses none of its
 //! identifiers, so the cutover's exact-denylist CI absence test stays
 //! exact while the two coexist.
 
 pub(crate) mod handle;
 pub(crate) mod plane;
 pub(crate) mod service;
+/// The P1.5 Gate-B-lite custody adapter — a de-risking ARTIFACT, not
+/// a live path: nothing here is reachable from the service until the
+/// ratified sequence completes (P0.5 + tombed cutover → P1.8), so
+/// outside its own battery the module is deliberately dead code.
+#[allow(dead_code)]
+pub(crate) mod store;
 pub(crate) mod types;
 
-pub(crate) use handle::MemoryHandle;
-pub(crate) use types::{MemoryError, ProposeArgs, SearchArgs};
+pub(crate) use handle::{MemoryHandle, MemoryStorage};
+pub(crate) use types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};

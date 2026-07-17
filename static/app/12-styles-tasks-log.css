@@ -1015,7 +1015,19 @@ body.context-focus-active {
 .session-window:not(.header-collapsed):not(.minimized) {
   max-height: none;
 }
-.session-window.header-collapsed .session-window-task {
+/* Collapsed header = the one-line glance: health dot, status pill,
+   "id · name", plus the control clusters. Everything else — PROJ/CWD,
+   relationship chips, goal, tier, the quiet vitals chips — folds into
+   the vitals pane behind the dot (openVitalsGlossary). The minimized
+   36px bar shows the same glance primitives, tighter. */
+.session-window.header-collapsed .session-window-task,
+.session-window.header-collapsed .session-window-project,
+.session-window.header-collapsed .session-window-cwd,
+.session-window.header-collapsed .session-window-relation-strip,
+.session-window.header-collapsed .session-window-goal,
+.session-window.header-collapsed .session-window-tier,
+.session-window.minimized .session-window-project,
+.session-window.minimized .session-window-relation-strip {
   display: none;
 }
 .session-window.minimized .session-window-goal {
@@ -1024,6 +1036,15 @@ body.context-focus-active {
 .session-window.minimized .session-window-tier {
   display: none;
 }
+/* Glance order: dot (+ the single attention chip) first, status pill,
+   then identity — controls keep the right edge via the menu cluster's
+   auto margin. Applies to both compact states. */
+.session-window.header-collapsed .session-window-vitals,
+.session-window.minimized .session-window-vitals { order: -3; }
+.session-window.header-collapsed .session-window-status,
+.session-window.minimized .session-window-status { order: -2; }
+.session-window.header-collapsed .session-window-title,
+.session-window.minimized .session-window-title { order: -1; }
 .session-window.header-collapsed .session-window-title {
   gap: 1px;
 }
@@ -1050,7 +1071,10 @@ body.context-focus-active {
   cursor: pointer;
 }
 .session-window.header-collapsed .session-window-header {
-  align-items: flex-start;
+  align-items: center;
+  /* One line by design; when a long name meets an attention chip the
+     header wraps rather than clipping anything (never-chop doctrine). */
+  flex-wrap: wrap;
 }
 .session-window-title {
   min-width: 0;
@@ -1060,8 +1084,8 @@ body.context-focus-active {
   gap: 2px;
 }
 .session-window.header-collapsed .session-window-title {
-  flex: 0 1 min(520px, 46%);
-  max-width: min(520px, 46%);
+  flex: 1 1 auto;
+  max-width: none;
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-title {
   flex: 1 1 100%;
@@ -1325,12 +1349,6 @@ body.context-focus-active {
   border-color: color-mix(in srgb, var(--blue) 26%, transparent);
   color: var(--blue);
 }
-.session-window.header-collapsed .session-window-tier {
-  max-width: 64px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .session-window:not(.header-collapsed):not(.minimized) .session-window-tier,
 .session-window:not(.header-collapsed):not(.minimized) .session-window-status,
 .session-window:not(.header-collapsed):not(.minimized) .session-window-menu-cluster,
@@ -1354,10 +1372,6 @@ body.context-focus-active {
   line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
-}
-.session-window.header-collapsed .session-window-goal {
-  flex: 1 1 220px;
-  max-width: min(460px, 38%);
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-goal {
   flex: 1 1 100%;
@@ -1399,16 +1413,8 @@ body.context-focus-active {
   color: var(--green);
 }
 @container (max-width: 560px) {
-  .session-window.header-collapsed .session-window-tier {
-    display: none;
-  }
   .session-window:not(.header-collapsed) .session-window-goal {
     display: none;
-  }
-  .session-window.header-collapsed .session-window-goal {
-    flex-basis: 120px;
-    max-width: 180px;
-    padding-inline: 6px;
   }
 }
 @container (max-width: 420px) {
@@ -1485,23 +1491,33 @@ body.context-focus-active {
 }
 .session-window-vitals .vit-health[data-severity="warn"]::before { background: var(--yellow); }
 .session-window-vitals .vit-health[data-severity="crit"]::before { background: var(--red); }
-/* Collapsed header / narrow container: quiet chips fold into "+N", but
-   elevation implies SURVIVAL — an attention chip ([data-elevated]) is
-   never folded into the count, never display:none'd, and never clipped:
-   chips are shrink-proof (flex: none) and the cluster keeps its base
-   flex-wrap (no nowrap override), so surviving chips wrap onto another
-   line instead of vanishing when the header runs tight. A red health
-   dot whose culprit chip is invisible is the one unacceptable outcome. */
-.session-window-vitals .vit-chip.vit-overflow { display: none; }
-.session-window.header-collapsed .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
-.session-window.header-collapsed .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
+/* Compact states (collapsed one-liner, minimized bar): the whole cluster
+   folds into the pane behind the dot — only the dot and the single
+   .vit-attn attention chip render (most severe symbol, short grammar,
+   "+N" count for the rest). Severity-first: a red dot's culprit is
+   always on screen and never a full sentence. Expanded headers show
+   every chip and wrap; the "+N" overflow chip serves only the
+   expanded-but-narrow container fold below. */
+.session-window-vitals .vit-chip.vit-overflow,
+.session-window-vitals .vit-chip.vit-attn { display: none; }
+.session-window.header-collapsed .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn),
+.session-window.minimized .session-window-vitals .vit-chip:not(.vit-health):not(.vit-attn) { display: none; }
+.session-window.header-collapsed .session-window-vitals .vit-chip.vit-attn,
+.session-window.minimized .session-window-vitals .vit-chip.vit-attn { display: inline-flex; }
 @container (max-width: 560px) {
+  /* Expanded-but-narrow: quiet chips fold into "+N"; attention chips
+     ([data-elevated]) keep their survival. The compact-state rules above
+     outrank the overflow re-show, so collapsed/minimized never grow a
+     second chip here. */
   .session-window-vitals .vit-chip:not([data-elevated]) { display: none; }
   .session-window-vitals .vit-chip.vit-overflow { display: inline-flex; }
 }
 
-/* ── Vitals explainer: popover on fine pointers, bottom sheet on coarse/
-   narrow (tooltips are mobile-hostile; every symbol answers a tap). */
+/* ── Vitals pane: FACTS FIRST. A dense card of atomic fact tokens on top
+   (always fully visible — the pane itself never scrolls), the plain-
+   language explainers below in their own scroll region. Popover on fine
+   pointers, bottom sheet on coarse/narrow (tooltips are mobile-hostile;
+   every symbol answers a tap). */
 #vitals-explainer[hidden] { display: none; }
 #vitals-explainer .vx-backdrop { display: none; }
 #vitals-explainer.sheet .vx-backdrop {
@@ -1514,12 +1530,16 @@ body.context-focus-active {
 #vitals-explainer .vx-panel {
   position: fixed;
   z-index: 941;
+  display: flex;
+  flex-direction: column;
   background: var(--mantle);
   border: 1px solid var(--surface1);
   border-radius: 12px;
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
   padding: 12px 14px;
-  max-width: 340px;
+  width: min(420px, calc(100vw - 16px));
+  max-height: min(70vh, 560px);
+  overflow: hidden; /* the explainer region scrolls, never the pane */
   font-size: 12px;
   line-height: 1.5;
   color: var(--subtext1);
@@ -1529,14 +1549,15 @@ body.context-focus-active {
   right: 0;
   bottom: 0;
   top: auto;
+  width: auto;
   max-width: none;
   border-radius: 16px 16px 0 0;
   border-bottom: 0;
   max-height: 70vh;
-  overflow: auto;
   padding: 16px 18px calc(16px + env(safe-area-inset-bottom, 0px));
 }
 .vx-head {
+  flex: none;
   display: flex;
   justify-content: space-between;
   align-items: baseline;
@@ -1548,13 +1569,6 @@ body.context-focus-active {
   font-weight: 700;
   font-size: 12.5px;
 }
-.vx-head .vx-value {
-  font-family: var(--mono, monospace);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--subtext0);
-}
-.vx-line { margin: 4px 0; }
 .vx-action {
   margin-top: 9px;
   padding: 6px 12px;
@@ -1567,27 +1581,230 @@ body.context-focus-active {
   cursor: pointer;
 }
 .vx-action:hover { background: var(--surface1); }
-.vx-row {
-  display: grid;
-  grid-template-columns: 40px 1fr;
-  gap: 8px;
+/* — The facts card: each fact is an atomic token (a real <button>) that
+   never wraps internally (white-space: nowrap); lines wrap BETWEEN
+   tokens. Family groups sit a wide gap apart; facts within a group read
+   "a · b · c" — the "·" rides inside the following token, so a wrap can
+   never strand a separator. Tone tints reuse the chip vocabulary
+   (ok/warn/crit); attention culprits float onto the verdict line already
+   named by their brief, so the card needs no descriptions at all. */
+.vfc-card {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 0 10px;
+  border-bottom: 1px solid var(--surface0);
+  margin-bottom: 2px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+.vfc-line {
+  display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  padding: 7px 0;
+  column-gap: 16px;
+  row-gap: 2px;
+  min-width: 0;
+}
+.vfc-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  row-gap: 2px;
+  min-width: 0;
+}
+.vfc-fact {
+  appearance: none;
+  display: inline-flex;
+  align-items: baseline;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--text, var(--subtext1));
+  white-space: nowrap; /* atomic: a fact never breaks inside itself */
+  cursor: pointer;
+  border-radius: 4px;
+}
+.vfc-fact:hover .vfc-text { text-decoration: underline dotted; }
+.vfc-fact:focus-visible { outline: 2px solid var(--lavender); outline-offset: 1px; }
+.vfc-sep { color: var(--subtext0); padding: 0 5px; }
+.vfc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  align-self: center;
+  margin-right: 6px;
+}
+.vfc-fact[data-tone="ok"] .vfc-text { color: var(--green); }
+.vfc-fact[data-tone="warn"] .vfc-text { color: var(--yellow); }
+.vfc-fact[data-tone="crit"] .vfc-text { color: var(--red); }
+.vfc-fact[data-tone="warn"] .vfc-dot { background: var(--yellow); }
+.vfc-fact[data-tone="crit"] .vfc-dot { background: var(--red); }
+/* — The explainer region: the pane's only scroller. */
+.vx-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  position: relative; /* row offsetTop anchors the reveal scroll */
+  scrollbar-width: thin;
+}
+/* Explainer rows: the name, then full-width sentences with the values
+   written inline — no value column (the card owns the glance). Long
+   paths soft-break at their separators (vx-path <wbr>), never mid-word. */
+.vx-row {
+  padding: 8px 6px;
+  margin: 0 -6px;
+  border-radius: 6px;
   border-top: 1px solid var(--surface0);
 }
-.vx-row .vx-glyph {
-  font-family: var(--mono, monospace);
-  font-size: 10.5px;
-  color: var(--subtext0);
+.vx-row:first-child { border-top: 0; }
+.vx-row .vx-body { min-width: 0; }
+.vx-row .vx-label { color: var(--text, var(--subtext1)); font-weight: 650; }
+/* Severity tints the name so a culprit still reads while scrolling
+   (quiet rows stay quiet; cosmetic tones use the same vocabulary). */
+.vx-row[data-severity="warn"] .vx-label { color: var(--yellow); }
+.vx-row[data-severity="crit"] .vx-label { color: var(--red); }
+.vx-row .vx-desc { margin-top: 2px; font-size: 11.5px; overflow-wrap: break-word; }
+.vx-row.absent { opacity: 0.55; }
+/* Whole-row tap is reserved for the folded header facts (copy a path,
+   focus the parent) — their sentences say so. */
+.vx-row[role="button"] { cursor: pointer; }
+.vx-row[role="button"]:hover .vx-label { color: var(--lavender); }
+.vx-row[role="button"]:focus-visible { outline: 2px solid var(--lavender); outline-offset: -2px; }
+/* Tap-a-fact feedback: the revealed explainer flashes briefly. */
+.vx-row.hilite { animation: vx-row-hilite 1.5s ease-out; }
+@keyframes vx-row-hilite {
+  0% { background: color-mix(in srgb, var(--lavender) 20%, transparent); }
+  100% { background: transparent; }
+}
+.vx-row .vx-action {
+  margin-top: 7px;
+  padding: 4px 10px;
+  font-size: 11px;
+}
+
+/* ── Background-task inspector: task rows inside the activity explainer,
+   and the read-only output viewer. Buttons, not hover affordances —
+   every action answers a tap. */
+.vx-bgtasks { margin-top: 10px; border-top: 1px solid var(--surface0); padding-top: 8px; }
+.vx-bgtasks-title {
+  color: var(--text, var(--subtext1));
+  font-weight: 650;
+  font-size: 11.5px;
+  margin-bottom: 4px;
+}
+.vx-bgtask-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.vx-bgtask-desc {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
 }
-.vx-row .vx-label { color: var(--text, var(--subtext1)); font-weight: 650; }
-.vx-row .vx-desc { margin-top: 2px; font-size: 11.5px; }
-.vx-row.absent { opacity: 0.55; }
-.vx-row.present { cursor: pointer; }
-.vx-row.present:hover .vx-label { color: var(--lavender); }
+.vx-bgtask-meta {
+  flex-shrink: 0;
+  color: var(--subtext0);
+  font-size: 10.5px;
+}
+.vx-bgtask-view {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--text, var(--subtext1));
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.vx-bgtask-view:hover { background: var(--surface1); }
+
+#bg-output-viewer[hidden] { display: none; }
+#bg-output-viewer .bgov-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 950;
+  background: rgba(0, 0, 0, 0.45);
+}
+#bg-output-viewer .bgov-panel {
+  position: fixed;
+  z-index: 951;
+  inset: 8vh 8vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  padding: 12px 14px;
+  color: var(--subtext1);
+}
+@media (max-width: 720px) {
+  #bg-output-viewer .bgov-panel { inset: 4vh 3vw; }
+}
+.bgov-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.bgov-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text, var(--subtext1));
+  font-weight: 700;
+  font-size: 12.5px;
+}
+.bgov-status {
+  flex-shrink: 0;
+  color: var(--subtext0);
+  font-family: var(--mono, monospace);
+  font-size: 10.5px;
+}
+.bgov-close {
+  flex-shrink: 0;
+  padding: 4px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--text, var(--subtext1));
+  font: inherit;
+  cursor: pointer;
+}
+.bgov-close:hover { background: var(--surface1); }
+.bgov-note { color: var(--subtext0); font-size: 10.5px; margin-bottom: 6px; }
+.bgov-pre {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--crust, var(--surface0));
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  line-height: 1.45;
+}
 .session-window-action-cluster {
   flex-shrink: 0;
   display: inline-flex;

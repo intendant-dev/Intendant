@@ -207,7 +207,7 @@ impl IntendantServer {
         };
         Ok(serde_json::json!({
             "results": memory.search(&args),
-            "durability": "ephemeral",
+            "durability": memory.durability_label(),
         }))
     }
 

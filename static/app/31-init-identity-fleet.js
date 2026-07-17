@@ -783,6 +783,20 @@ const filesStagedUploads = new Map();
 const peerFileTransferConnections = new Map();
 const peerDashboardControlConnections = new Map(); // hostId|sessionId -> PeerDashboardControlConnection
 const peerDashboardControlConnectionsByHost = new Map(); // hostId -> PeerDashboardControlConnection
+// Same deep-link TDZ rule for #stats: fragment 48's initial route apply
+// runs switchTab('stats') → renderStatsForActiveHost() →
+// loadAllSessionsUsage() during script evaluation, before fragment 53's
+// top-level declarations initialize. The usage-corpus TTL state
+// therefore lives here with the rest of the early state.
+const STATS_USAGE_FORCE_TTL_MS = 45_000;
+const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
+// Deep-link TDZ rule, #files instance (caught by the CI deep-link boot
+// probe): fragment 48's route apply reaches fragment 49's control-lane
+// helpers (dashboardControlTransportEnabled /
+// dashboardControlTunnelIsPrimaryEventLane) during script evaluation.
+let dashboardControlAutoFallback = false;
+let dashboardLegacyWsConnected = false;
+let dashboardLegacyWsEverConnected = false;
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
@@ -856,6 +870,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'codex_thread_action_requested',
   'codex_thread_action_result',
   'session_rename_result',
+  'session_fork_result',
   'session_agent_config_result',
   'codex_config_changed',
   'claude_config_changed',
@@ -907,9 +922,11 @@ const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
   'configure_session_agent',
   'stop_session',
   'restart_session',
+  'reload_credentials',
   'create_session',
   'start_task',
   'resume_session',
+  'fork_session_at_anchor',
   'follow_up',
   'cancel_follow_up',
   'edit_user_message',

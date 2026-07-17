@@ -31,6 +31,99 @@ fn warn_undeliverable_images(
     }
 }
 
+/// In-place backend respawn for reload-credentials (the dashboard's
+/// "Reload credentials" chip after a Claude sign-in): cancel a live
+/// rate-limit park PRESERVING its pending re-send (unlike an interrupt,
+/// which drops it — the reload wants the work to continue on the fresh
+/// account), shut the old process down, and re-create the agent
+/// resume-attached to the same backend session id so the new process
+/// reads the fresh credential store. Queued `parked_follow_ups` stay in
+/// the loop untouched and flush through the normal preamble after the
+/// respawn. Returns `false` when the respawn failed — the old process is
+/// already gone, so the caller exits the loop honestly.
+#[allow(clippy::too_many_arguments)]
+async fn apply_backend_credentials_reload(
+    backend: &external_agent::AgentBackend,
+    project: &Project,
+    web_port: Option<u16>,
+    intendant_session_id: &Option<String>,
+    session_agent_config: &session_config::SessionAgentConfig,
+    stats: &LoopStats,
+    limit_park: &mut Option<LimitParkState>,
+    limit_park_streak: &mut u32,
+    parked_follow_ups: &mut std::collections::VecDeque<FollowUpMessage>,
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    drain_config: &mut DrainConfig<'_>,
+) -> bool {
+    let session_log = drain_config.session_log;
+    let announce = |line: &str| {
+        slog(session_log, |l| l.info(line));
+        drain_config.bus.send(AppEvent::LogEntry {
+            session_id: drain_config.session_id.clone(),
+            level: "info".to_string(),
+            source: "Intendant".to_string(),
+            content: line.to_string(),
+            turn: None,
+        });
+    };
+    if let Some(park) = limit_park.take() {
+        *limit_park_streak = 0;
+        if let Some(pending) = park.pending {
+            // Front of the queue: the parked re-send delivers first, then
+            // everything queued while parked, oldest first.
+            parked_follow_ups.push_front(pending);
+        }
+        announce(
+            "Rate-limit park cancelled for the credential reload — parked messages deliver after the respawn",
+        );
+    }
+    let resume_id = stats
+        .announced_native_session_id
+        .clone()
+        .or_else(|| drain_config.backend_thread_id.clone());
+    announce(&format!(
+        "Reloading credentials: restarting {} resume-attached to its backend session",
+        backend
+    ));
+    if let Err(e) = agent.shutdown().await {
+        slog(session_log, |l| {
+            l.warn(&format!("Backend shutdown before credential reload: {e}"))
+        });
+    }
+    match create_external_agent(
+        backend,
+        project,
+        session_log,
+        web_port,
+        resume_id,
+        intendant_session_id.clone(),
+        session_agent_config.codex_service_tier.clone(),
+        session_agent_config.codex_home.clone(),
+    )
+    .await
+    {
+        Ok((new_agent, new_thread, new_event_rx)) => {
+            *agent = new_agent;
+            *event_rx = new_event_rx;
+            drain_config.backend_thread_id = Some(new_thread.thread_id.clone());
+            announce(
+                "Credential reload complete — the backend restarted on the fresh credential store",
+            );
+            true
+        }
+        Err(e) => {
+            let line = format!(
+                "Credential reload failed: could not respawn {}: {e}",
+                backend
+            );
+            slog(session_log, |l| l.error(&line));
+            drain_config.bus.send(AppEvent::LoopError(line));
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_external_agent_mode(
     backend: external_agent::AgentBackend,
@@ -284,6 +377,11 @@ pub(crate) async fn run_external_agent_mode(
         Some(FollowUpMessage::with_attachments(task, attachments))
     };
 
+    // Reload-credentials handshake: the drain raises this when the request
+    // arrives mid-turn (after interrupting the backend); the loop applies
+    // the in-place respawn at the next safe point. Idle requests apply
+    // immediately in the idle listener below.
+    let backend_credentials_reload = std::sync::atomic::AtomicBool::new(false);
     let mut drain_config = DrainConfig {
         bus: &bus,
         web_port,
@@ -305,6 +403,7 @@ pub(crate) async fn run_external_agent_mode(
         persist_model_responses_inline,
         headless,
         context_injection: &context_injection,
+        reload_credentials: Some(&backend_credentials_reload),
     };
     let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
     if let Some(ready_tx) = ready_for_thread_actions {
@@ -328,6 +427,31 @@ pub(crate) async fn run_external_agent_mode(
                 l.info("Session was stopped before its queued turn started; exiting")
             });
             stats.terminal_outcome = Some("stopped before the queued turn started".to_string());
+            break 'outer;
+        }
+        // A reload-credentials request raised mid-turn applies here, at
+        // the loop's safe point: the drain has already interrupted the
+        // backend and returned; the respawn precedes any queued turn so
+        // the next delivery runs on the fresh credential store.
+        if backend_credentials_reload.swap(false, std::sync::atomic::Ordering::SeqCst)
+            && !apply_backend_credentials_reload(
+                &backend,
+                &project,
+                web_port,
+                &intendant_session_id,
+                &session_agent_config,
+                &stats,
+                &mut limit_park,
+                &mut limit_park_streak,
+                &mut parked_follow_ups,
+                &mut agent,
+                &mut event_rx,
+                &mut drain_config,
+            )
+            .await
+        {
+            stats.terminal_outcome =
+                Some("credential reload could not respawn the backend".to_string());
             break 'outer;
         }
         let followup = match next_turn.take() {
@@ -542,6 +666,12 @@ pub(crate) async fn run_external_agent_mode(
                                         bus.send(AppEvent::SessionActivity {
                                             session_id: drain_config.session_id.clone(),
                                             activity,
+                                        });
+                                    }
+                                    external_agent::AgentEvent::ConfigFacts { facts } => {
+                                        bus.send(AppEvent::SessionConfigFacts {
+                                            session_id: drain_config.session_id.clone(),
+                                            facts,
                                         });
                                     }
                                     external_agent::AgentEvent::BackendError {
@@ -1187,6 +1317,43 @@ pub(crate) async fn run_external_agent_mode(
                                         content: line.to_string(),
                                         turn: None,
                                     });
+                                }
+                            }
+                            Ok(AppEvent::ReloadBackendCredentials { session_id })
+                                if event_targets_external_session_or_side(
+                                    &session_id,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    &open_side_threads,
+                                ) =>
+                            {
+                                // Idle reload: apply the in-place respawn
+                                // right away (the park cancel inside
+                                // preserves the pending re-send; queued
+                                // messages flush through the preamble).
+                                backend_credentials_reload
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                                if !apply_backend_credentials_reload(
+                                    &backend,
+                                    &project,
+                                    web_port,
+                                    &intendant_session_id,
+                                    &session_agent_config,
+                                    &stats,
+                                    &mut limit_park,
+                                    &mut limit_park_streak,
+                                    &mut parked_follow_ups,
+                                    &mut agent,
+                                    &mut event_rx,
+                                    &mut drain_config,
+                                )
+                                .await
+                                {
+                                    stats.terminal_outcome = Some(
+                                        "credential reload could not respawn the backend"
+                                            .to_string(),
+                                    );
+                                    break 'outer;
                                 }
                             }
                             Ok(_) => continue,

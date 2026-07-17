@@ -64,7 +64,126 @@ function sessionsListOptionsKey(options, currentSessionId) {
     // Message lane (flagged): seq bumps on every visible lane change, so
     // arriving/clearing results re-key the pass. Constant 0 when inactive.
     options.mode === 'recent' ? _sessionMsgSearch.seq : 0,
+    _sessionsLineageEpoch,
   ]);
+}
+
+// ── Lineage family tree (Recent): group matched rows into parent→child
+// families — roots ranked by their family's most recent member (first
+// index in the already-sorted matched order), descendants nested
+// depth-first with an indent + a collapse toggle per subtree. Singleton
+// rows render exactly as before; deep-search stays flat (hits are hits).
+const _sessionsCollapsedLineage = new Set();
+let _sessionsLineageEpoch = 0;
+
+function sessionsFamilyOrder(matched, ctx) {
+  if (!ctx || !ctx.lineageIndex || matched.length < 2) return matched;
+  const byId = new Map();
+  for (const m of matched) {
+    const id = m.s && m.s.session_id;
+    if (id && !byId.has(id)) byId.set(id, m);
+  }
+  if (byId.size < 2) return matched;
+  const parentOf = (m) => {
+    const meta = typeof sessionConfigMetadata === 'function' ? sessionConfigMetadata(m.s) : m.s;
+    const parentId = sessionLineageParentId(m.s, meta);
+    return parentId && byId.has(parentId) && parentId !== m.s.session_id ? parentId : null;
+  };
+  const kids = new Map();
+  let hasEdges = false;
+  for (const m of matched) {
+    const id = m.s && m.s.session_id;
+    if (!id) continue;
+    const parent = parentOf(m);
+    if (!parent) continue;
+    hasEdges = true;
+    if (!kids.has(parent)) kids.set(parent, []);
+    kids.get(parent).push(m);
+  }
+  if (!hasEdges) return matched;
+  const out = [];
+  const seen = new Set();
+  const emit = (m, depth) => {
+    const id = m.s && m.s.session_id;
+    if (id) {
+      if (seen.has(id)) return;
+      seen.add(id);
+    }
+    const children = id ? kids.get(id) || [] : [];
+    m.lineageDepth = depth;
+    m.lineageKids = children.length;
+    m.lineageCollapsed = id ? _sessionsCollapsedLineage.has(id) : false;
+    out.push(m);
+    if (m.lineageCollapsed) {
+      // Mark the whole subtree seen so collapsed descendants don't
+      // resurface as roots further down the list.
+      const bury = (mm) => {
+        const mid = mm.s && mm.s.session_id;
+        if (!mid || seen.has(mid)) return;
+        seen.add(mid);
+        for (const child of kids.get(mid) || []) bury(child);
+      };
+      for (const child of children) bury(child);
+      return;
+    }
+    for (const child of children) emit(child, Math.min(depth + 1, 4));
+  };
+  for (const m of matched) {
+    const id = m.s && m.s.session_id;
+    if (id && seen.has(id)) continue;
+    // Walk up to this row's outermost matched ancestor so the family
+    // renders under its most recent member's list position.
+    let root = m;
+    const hop = new Set();
+    for (;;) {
+      const rootId = root.s && root.s.session_id;
+      if (!rootId || hop.has(rootId)) break;
+      hop.add(rootId);
+      const parent = parentOf(root);
+      if (!parent) break;
+      root = byId.get(parent);
+    }
+    emit(root, 0);
+  }
+  return out;
+}
+
+function toggleSessionsLineageCollapse(sessionId) {
+  if (_sessionsCollapsedLineage.has(sessionId)) {
+    _sessionsCollapsedLineage.delete(sessionId);
+  } else {
+    _sessionsCollapsedLineage.add(sessionId);
+  }
+  _sessionsLineageEpoch += 1;
+  renderSessionsViews();
+}
+
+function applySessionCardLineageDecor(card, m) {
+  const depth = m.lineageDepth || 0;
+  for (const cls of Array.from(card.classList)) {
+    if (cls.startsWith('lineage-depth-')) card.classList.remove(cls);
+  }
+  if (depth > 0) card.classList.add(`lineage-depth-${depth}`);
+  let toggle = card.querySelector(':scope > .lineage-toggle');
+  if ((m.lineageKids || 0) > 0) {
+    if (!toggle) {
+      toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'lineage-toggle';
+      card.prepend(toggle);
+    }
+    const id = m.s && m.s.session_id;
+    toggle.textContent = m.lineageCollapsed ? `▸ ${m.lineageKids}` : `▾ ${m.lineageKids}`;
+    toggle.title = m.lineageCollapsed
+      ? `Show ${m.lineageKids} forked/child session(s)`
+      : `Hide ${m.lineageKids} forked/child session(s)`;
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      if (id) toggleSessionsLineageCollapse(id);
+    };
+  } else if (toggle) {
+    toggle.remove();
+  }
 }
 
 function collectSessionsListMatches(sessions, options, ctx) {
@@ -247,7 +366,7 @@ function sessionCardFor(m, ctx, st, nextCards) {
   if (m.msgStub) return sessionMessageSearchStubCardFor(m, ctx, st, nextCards);
   const key = sessionListRowKey(m.s);
   const derived = sessionCardDerived(m, ctx);
-  const sig = sessionCardSig(m, derived, ctx);
+  const sig = `${sessionCardSig(m, derived, ctx)}|d${m.lineageDepth || 0}|k${m.lineageKids || 0}|c${m.lineageCollapsed ? 1 : 0}`;
   const cached = key ? st.cards.get(key) : null;
   let card;
   if (cached && cached.sig === sig) {
@@ -258,6 +377,7 @@ function sessionCardFor(m, ctx, st, nextCards) {
     if (key) card.dataset.sessionKey = key;
     card.dataset.qaBuildSeq = String(++_sessionCardBuildSeq);
   }
+  applySessionCardLineageDecor(card, m);
   if (key) (nextCards || st.cards).set(key, { sig, card });
   return card;
 }
@@ -364,7 +484,9 @@ function renderSessionsList(sessions, el, options = {}) {
   let hiddenSubagentCount = st.hiddenSubagentCount;
   if (!appendOnly) {
     const collected = collectSessionsListMatches(sessions, options, ctx);
-    matched = collected.matched;
+    matched = ctx.deepSearchOnly
+      ? collected.matched
+      : sessionsFamilyOrder(collected.matched, ctx);
     hiddenSubagentCount = collected.hiddenSubagentCount;
   }
   const matchedCount = matched.length;

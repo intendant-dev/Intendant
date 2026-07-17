@@ -49,8 +49,8 @@ pub fn dispatch_tool_call(name: &str, args: &Value, state: &AgentStateSnapshot) 
             tool_name: "query_detail".to_string(),
             args: args.clone(),
         },
-        "recall_memory" => PresenceAction::NeedsIO {
-            tool_name: "recall_memory".to_string(),
+        "search_transcripts" => PresenceAction::NeedsIO {
+            tool_name: "search_transcripts".to_string(),
             args: args.clone(),
         },
         "send_message" => PresenceAction::NeedsIO {
@@ -305,12 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_recall_memory_needs_io() {
+    fn dispatch_search_transcripts_needs_io() {
         let state = AgentStateSnapshot::default();
-        let action = dispatch_tool_call("recall_memory", &json!({"keywords": ["test"]}), &state);
+        let action =
+            dispatch_tool_call("search_transcripts", &json!({"keywords": ["test"]}), &state);
         match action {
             PresenceAction::NeedsIO { tool_name, .. } => {
-                assert_eq!(tool_name, "recall_memory");
+                assert_eq!(tool_name, "search_transcripts");
             }
             _ => panic!("expected NeedsIO"),
         }

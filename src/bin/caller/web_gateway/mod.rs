@@ -53,6 +53,9 @@ pub(crate) use routes_memory::*;
 mod routes_fork_points;
 pub(crate) use routes_fork_points::*;
 
+mod routes_background_tasks;
+pub(crate) use routes_background_tasks::*;
+
 mod routes_sessions;
 pub(crate) use routes_sessions::*;
 
@@ -63,6 +66,8 @@ mod routes_access;
 pub(crate) use routes_access::*;
 mod routes_hosted_control;
 pub(crate) use routes_hosted_control::*;
+mod routes_claude_auth;
+pub(crate) use routes_claude_auth::*;
 
 mod mcp_gate;
 pub(crate) use mcp_gate::*;
@@ -174,7 +179,6 @@ pub struct WebQueryCtx {
     pub agent_state: Arc<Mutex<AgentStateSnapshot>>,
     pub project_root: PathBuf,
     pub log_dir: PathBuf,
-    pub knowledge_path: PathBuf,
     /// Server-authoritative presence session (event window + checkpoint state).
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
     /// Shared context injection queue for mid-task interjections.
@@ -3615,8 +3619,7 @@ mod tests {
     /// `{"peers":[]}`. Baseline for the list endpoint shape.
     #[tokio::test]
     async fn test_api_peers_list_empty_registry() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
         let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
@@ -3640,8 +3643,7 @@ mod tests {
         let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3727,8 +3729,7 @@ mod tests {
     /// diagnostic error message.
     #[tokio::test]
     async fn test_api_peers_post_invalid_body() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3746,8 +3747,7 @@ mod tests {
     /// `DELETE /api/peers` for an unknown peer id returns 404.
     #[tokio::test]
     async fn test_api_peers_delete_unknown_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3805,8 +3805,7 @@ mod tests {
         let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let registry_for_wait = registry.clone();
         let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
@@ -3972,8 +3971,7 @@ mod tests {
     /// peer lookup path before any transport interaction.
     #[tokio::test]
     async fn test_api_peers_op_unknown_peer_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -3996,8 +3994,7 @@ mod tests {
     /// `POST /api/peers/{id}/message` with malformed JSON returns 400.
     #[tokio::test]
     async fn test_api_peers_send_message_invalid_body_returns_400() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4017,8 +4014,7 @@ mod tests {
     /// rejects empty bodies before the peer lookup runs.
     #[tokio::test]
     async fn test_api_peers_send_message_requires_text_or_content() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4043,8 +4039,7 @@ mod tests {
     /// "supported op" from "unrecognized verb".
     #[tokio::test]
     async fn test_api_peers_unknown_op_returns_404() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4086,8 +4081,7 @@ mod tests {
     /// hint that at least one is required.
     #[tokio::test]
     async fn test_api_peers_eligible_requires_capability_param() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4111,8 +4105,7 @@ mod tests {
     /// peers).
     #[tokio::test]
     async fn test_api_peers_eligible_rejects_unknown_capability() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4171,8 +4164,7 @@ mod tests {
     /// Bad JSON body returns 400.
     #[tokio::test]
     async fn test_api_coordinator_route_invalid_body_returns_400() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4192,8 +4184,7 @@ mod tests {
     /// which is almost never what the caller meant.
     #[tokio::test]
     async fn test_api_coordinator_route_rejects_empty_capabilities() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
@@ -4220,8 +4211,7 @@ mod tests {
     /// GET on the route endpoint returns 405 — only POST is allowed.
     #[tokio::test]
     async fn test_api_coordinator_route_get_returns_405() {
-        let (log_tx, _log_rx) =
-            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(16);
+        let (log_tx, _log_rx) = tokio::sync::mpsc::channel::<crate::peer::EnqueuedPeerEvent>(16);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let (port, handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 

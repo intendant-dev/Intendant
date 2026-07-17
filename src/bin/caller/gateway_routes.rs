@@ -198,6 +198,13 @@ pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// Body cap for the Claude sign-in ceremony start (`{"mode": …}` only).
+pub(crate) const CLAUDE_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
+
+/// Body cap for the ceremony's pasted authorization code — a short token;
+/// anything bigger is not one.
+pub(crate) const CLAUDE_AUTH_CODE_BODY_CAP_BYTES: usize = 2 * 1024;
+
 /// Links a table row to its dispatch arm in `web_gateway.rs`. The match
 /// there is exhaustive, so a declared route without an arm — or an arm
 /// whose route was deleted — fails to compile; the uniqueness invariant
@@ -246,6 +253,11 @@ pub(crate) enum RouteHandlerId {
     /// mechanical migration.
     SessionSubRouter,
     SessionForkPoints,
+    /// Background-task inspector list (supervised Claude Code sessions).
+    SessionBackgroundTasks,
+    /// Read-only tail of one background task's output file (path served
+    /// exclusively from the daemon-side task registry).
+    SessionBackgroundTaskOutput,
     McAnchors,
     McRecords,
     McFission,
@@ -264,6 +276,14 @@ pub(crate) enum RouteHandlerId {
     SettingsGet,
     ApiKeysPost,
     ApiKeyStatus,
+    /// Claude sign-in ceremony: start `claude auth login` on a private PTY.
+    ClaudeAuthStart,
+    /// Ceremony state + validated sign-in URL + account info on success.
+    ClaudeAuthStatus,
+    /// Submit the pasted authorization code to the ceremony.
+    ClaudeAuthCode,
+    /// Cancel the ceremony (Ctrl-C + reap; non-destructive to the store).
+    ClaudeAuthCancel,
     ExternalAgents,
     DiagnosticsVisualFreshness,
     Displays,
@@ -305,7 +325,7 @@ pub(crate) enum RouteHandlerId {
     DashboardTabs,
     /// Agenda ledger snapshot (items + counts).
     AgendaList,
-    /// Apply one agenda command (add/patch/complete/reopen/retire).
+    /// Apply one agenda command (add/answer/patch/transitions/effects).
     AgendaOp,
     /// Merge-patch the owner's reminder delivery policy.
     AgendaReminderPolicy,
@@ -828,7 +848,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AgendaWrite,
         BodyPolicy::Default,
         RouteHandlerId::AgendaOp,
-        "Apply one agenda command (add, patch, complete, reopen, or retire)",
+        "Apply one agenda command (add, answer, patch, transitions, or scheduled-session propose/approve/revoke)",
     )
     .with_tunnel(tunnel_method("api_agenda_op")),
     // Reminder delivery policy is owner policy, not agenda authorship:
@@ -1069,6 +1089,43 @@ pub(crate) static ROUTES: &[Route] = &[
         "Unified fork-point catalog for a session (anchors + eligibility, backend-tagged)",
     )
     .with_tunnel(tunnel_method("api_session_fork_points")),
+    // ── Background-task inspector (supervised Claude Code): the list and
+    //    the read-only output peek. Like fork-points, declared ahead of
+    //    the sub-router group so the leaves beat its catch-alls. The
+    //    output route serves paths exclusively from the daemon-side task
+    //    registry — the client names a task id, never a path.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("background-tasks"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionBackgroundTasks,
+        "Background tasks a supervised session announced (id, description, status, output availability)",
+    )
+    .with_tunnel(tunnel_method("api_session_background_tasks")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("background-tasks"),
+                SegmentSpec::Capture("task"),
+                SegmentSpec::Literal("output"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionBackgroundTaskOutput,
+        "Tail of one background task's output file (tail_kb query, capped; registry-resolved path)",
+    )
+    .with_tunnel(tunnel_method("api_session_background_task_output")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
     //    split (current/* manage-gated on every method; {id} inspect on
@@ -1368,6 +1425,49 @@ pub(crate) static ROUTES: &[Route] = &[
         "Which provider keys are configured (presence only)",
     )
     .with_tunnel(tunnel_method("api_key_status")),
+    // ── Claude sign-in ceremony (claude_auth_ceremony.rs): the dashboard
+    //    walks the owner through `claude auth login` on a daemon-private
+    //    PTY. Gated on the credential-custody operation — the same class
+    //    as vault leases and egress, which no peer profile (peer-root
+    //    included) and no scoped default carries — and the handlers
+    //    additionally hard-refuse hosted-provenance clients and custody-
+    //    managed (leased / client-egress) daemons.
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/start"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(CLAUDE_AUTH_START_BODY_CAP_BYTES),
+        RouteHandlerId::ClaudeAuthStart,
+        "Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_start")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/claude-auth/status"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::ClaudeAuthStatus,
+        "Claude sign-in ceremony state (validated sign-in URL; account info on success)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_status")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/code"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::Capped(CLAUDE_AUTH_CODE_BODY_CAP_BYTES),
+        RouteHandlerId::ClaudeAuthCode,
+        "Submit the pasted authorization code to the Claude sign-in ceremony",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_code")),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/claude-auth/cancel"),
+        PeerOperation::CredentialsManage,
+        BodyPolicy::None,
+        RouteHandlerId::ClaudeAuthCancel,
+        "Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working)",
+    )
+    .with_tunnel(tunnel_method("api_claude_auth_cancel")),
     op_route(
         RouteMethod::Get,
         PathPattern::Exact("/api/external-agents"),
@@ -2555,6 +2655,15 @@ mod tests {
             BodyPolicy::Capped(DIAGNOSTICS_BODY_CAP_BYTES)
         );
         assert_eq!(
+            policy("POST", "/api/claude-auth/start"),
+            BodyPolicy::Capped(CLAUDE_AUTH_START_BODY_CAP_BYTES)
+        );
+        assert_eq!(
+            policy("POST", "/api/claude-auth/code"),
+            BodyPolicy::Capped(CLAUDE_AUTH_CODE_BODY_CAP_BYTES)
+        );
+        assert_eq!(policy("POST", "/api/claude-auth/cancel"), BodyPolicy::None);
+        assert_eq!(
             policy("POST", "/api/access/org-grants"),
             BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES)
         );
@@ -2815,6 +2924,31 @@ mod tests {
         ));
         assert!(matches!(
             classify("GET", "/api/transfers/j1/chunk"),
+            TableClassification::NoMatch
+        ));
+        // The Claude sign-in ceremony is credential custody: every leaf —
+        // the status read included — classifies CredentialsManage, the
+        // operation no peer profile (peer-root included) and no scoped
+        // default carries. A widening here is a custody regression.
+        for (method, path) in [
+            ("POST", "/api/claude-auth/start"),
+            ("GET", "/api/claude-auth/status"),
+            ("POST", "/api/claude-auth/code"),
+            ("POST", "/api/claude-auth/cancel"),
+        ] {
+            match classify(method, path) {
+                TableClassification::Matched(op) => assert_eq!(
+                    op,
+                    Some(PeerOperation::CredentialsManage),
+                    "{method} {path} must gate on credentials.manage"
+                ),
+                TableClassification::NoMatch => {
+                    panic!("{method} {path} must classify via table")
+                }
+            }
+        }
+        assert!(matches!(
+            classify("GET", "/api/claude-auth/start"),
             TableClassification::NoMatch
         ));
     }

@@ -26,6 +26,7 @@ ui2-vault.css
 ui2-sessions.css
 ui2-activity.css
 ui2-agenda.css
+ui2-memory.css
 ui2-grid.css
 ui2-live.css
 ui2-usage.css
@@ -89,6 +90,10 @@ ui2-activity.js
 # Its own top level declares only lets/functions; daemonApi (32), routeTo (48),
 # escapeHtml (52) are reached from inside functions at runtime.
 ui2-agenda.js
+# Memory: same deep-link TDZ rule as agenda — a #memory deep link makes the
+# router's eval-time boot call memoryOnTabShown(), which reads this fragment's
+# module-level lets. Top level declares only lets/functions.
+ui2-memory.js
 48-router-settings.js
 48b-context-viz.js
 49-daemons-multihost.js
@@ -106,6 +111,7 @@ ui2-settings.js
 55b-session-launch.js
 56-debug-sessions.js
 57a-sessions-list.js
+57b-session-fork.js
 57-sessions-replay.js
 57-sessions-message-search.js
 57-attention-notifications.js

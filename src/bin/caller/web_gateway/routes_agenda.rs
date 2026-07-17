@@ -108,6 +108,7 @@ fn agenda_error_status(err: &crate::agenda::AgendaError) -> u16 {
     match err {
         crate::agenda::AgendaError::NotFound(_) => 404,
         crate::agenda::AgendaError::Invalid(_) | crate::agenda::AgendaError::Transition(_) => 400,
+        crate::agenda::AgendaError::NotPermitted { .. } => 403,
         crate::agenda::AgendaError::Io(_) => 500,
     }
 }
