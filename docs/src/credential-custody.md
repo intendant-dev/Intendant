@@ -441,7 +441,10 @@ an independently trusted client bridge is still required.
 
 As shipped: a session holding `credentials.manage` registers as the
 relay per kind (`api_credential_egress_register`); the daemon ships each
-request auth-less (`egress_request` + 16 KiB chunks), the browser
+request auth-less (`egress_request` + 16 KiB chunks — themselves sent
+under a 1 MiB request-side credit window with `egress_request_ack`
+refills when the page declared `request_credits` at registration; a
+relay page without the capability gets the legacy push-all), the browser
 attaches the key from the unlocked vault, enforces a fixed per-provider
 host allowlist (a compromised daemon cannot turn the tab into an open
 proxy), performs the fetch, and streams the body back under a 1 MiB

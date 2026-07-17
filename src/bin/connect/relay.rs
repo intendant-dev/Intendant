@@ -646,7 +646,7 @@ pub(crate) async fn dns_relay(
             Some(daemon_id.clone()),
             json!({ "name": name, "enable": body.enable }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(json!({
         "ok": true,

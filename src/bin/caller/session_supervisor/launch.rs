@@ -5,7 +5,28 @@
 
 use super::*;
 
+/// Session identity minted synchronously at intake for a queued create
+/// body: the fresh log dir (pure path computation — nothing exists on
+/// disk until the body opens it) and the session id it will carry. Minting
+/// at intake is what makes the id routable — via the executor's pending
+/// route — before the slow body runs, so a targeted command that arrives
+/// mid-create defers behind the launch instead of failing "not managed".
+pub(crate) struct ReservedSessionLaunch {
+    pub(crate) log_dir: PathBuf,
+    pub(crate) session_id: String,
+}
+
 impl SessionSupervisor {
+    /// Mint a fresh session log dir + id (see [`ReservedSessionLaunch`]).
+    /// Synchronous and side-effect free.
+    pub(crate) fn reserve_session_launch(&self) -> ReservedSessionLaunch {
+        let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
+        ReservedSessionLaunch {
+            session_id: path_file_name(&log_dir),
+            log_dir,
+        }
+    }
+
     /// Register a launched session's effective project root as its
     /// git-vitals probe target (worktree sessions pass their checkout).
     /// No-op when the daemon runs without the vitals producer.
@@ -45,7 +66,9 @@ impl SessionSupervisor {
         codex_service_tier: Option<String>,
         worktree: Option<SessionWorktreeRequest>,
         hosted_lease_id: Option<String>,
+        reserved: Option<ReservedSessionLaunch>,
     ) -> Option<String> {
+        self.wait_for_launch_gate_in_tests().await;
         let session_name = match normalize_session_name_option(name.as_deref()) {
             Ok(name) => name,
             Err(e) => {
@@ -53,7 +76,12 @@ impl SessionSupervisor {
                 return None;
             }
         };
-        let log_dir = session_log::SessionLog::resolve_path_in_home(&self.logs_home(), None);
+        // Identity was minted at intake for a queued create (so the id was
+        // routable before this body ran); direct callers mint here.
+        let ReservedSessionLaunch {
+            log_dir,
+            session_id: reserved_session_id,
+        } = reserved.unwrap_or_else(|| self.reserve_session_launch());
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
             Err(e) => {
@@ -65,7 +93,7 @@ impl SessionSupervisor {
         let session_id = session_log
             .lock()
             .map(|log| log.session_id().to_string())
-            .unwrap_or_else(|_| path_file_name(&log_dir));
+            .unwrap_or(reserved_session_id);
         let project_root = match resolve_project_root_override(
             project_root,
             self.config.project_root.as_deref(),
@@ -101,16 +129,15 @@ impl SessionSupervisor {
         //
         // The git chain (HEAD probe, collision listing, `git worktree add`
         // materializing a full checkout — seconds on large projects) runs on
-        // the blocking pool under the daemon-wide git-ops bound. What that
-        // buys: a tokio worker is no longer pinned for the duration, and a
-        // panic inside the chain surfaces as this session's honest
-        // create-failure instead of unwinding the supervisor. What it does
-        // NOT buy: this function is still awaited inline by the
-        // supervisor's single sequential control-intake loop, so other
-        // sessions' approvals/steers/interrupts still wait out the checkout
-        // — the real fix is dispatching session-create handling off the
-        // intake loop (see the PR follow-up; the delegation ack must keep
-        // its ordering guarantee).
+        // the blocking pool under the daemon-wide git-ops bound: a tokio
+        // worker is not pinned for the duration, and a panic inside the
+        // chain surfaces as this session's honest create-failure instead of
+        // unwinding the caller. Intake-side head-of-line blocking is gone
+        // too: `dispatch_control_msg` runs this whole body on the
+        // per-session executor, so other sessions' approvals / steers /
+        // interrupts no longer wait out the checkout (the delegation ack
+        // keeps its ordering guarantee — it still fires only after this
+        // function dispatched the task; see `acknowledge_delegation`).
         let worktree_meta = match worktree.as_ref() {
             Some(request) => {
                 let permit = worktree::git_ops_semaphore().clone().acquire_owned().await;
@@ -559,6 +586,7 @@ impl SessionSupervisor {
         force_new: bool,
         auto_attach: bool,
     ) {
+        self.wait_for_launch_gate_in_tests().await;
         // A fork never attaches to (or dedupes against) the thread it forks
         // from: it always materializes as a fresh wrapper session that keeps
         // the requested resume token verbatim.
