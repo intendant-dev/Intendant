@@ -30,7 +30,7 @@ pub(crate) enum AgendaError {
 /// preserved on disk but skipped at load (forward compatibility: a newer
 /// build's vocabulary — effects, journal curation — must not brick an older
 /// daemon's ledger).
-const KNOWN_OPS: [&str; 5] = ["add", "patch", "complete", "reopen", "retire"];
+const KNOWN_OPS: [&str; 6] = ["add", "patch", "complete", "reopen", "retire", "answer"];
 
 const LOG_FILE: &str = "agenda.jsonl";
 
@@ -252,6 +252,26 @@ impl AgendaStore {
                 }
                 AgendaStatus::Open | AgendaStatus::Done => Ok(AgendaOp::Retire { id }),
             },
+            AgendaCommand::Answer { id, text } => {
+                let item = self.require(&id)?;
+                if item.kind != super::types::AgendaKind::Question {
+                    return Err(AgendaError::Invalid(format!(
+                        "{id} is not a question — only questions accept answers"
+                    )));
+                }
+                match item.status {
+                    AgendaStatus::Open => Ok(AgendaOp::Answer {
+                        id,
+                        text: validate_answer(&text)?,
+                    }),
+                    AgendaStatus::Done => Err(AgendaError::Transition(format!(
+                        "{id} is already answered — reopen it to re-ask"
+                    ))),
+                    AgendaStatus::Retired => Err(AgendaError::Transition(format!(
+                        "{id} is retired — reopen it first"
+                    ))),
+                }
+            }
         }
     }
 
@@ -366,6 +386,19 @@ fn validate_body(body: String) -> Result<String, AgendaError> {
         )));
     }
     Ok(body)
+}
+
+fn validate_answer(text: &str) -> Result<String, AgendaError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AgendaError::Invalid("answer must not be empty".into()));
+    }
+    if text.len() > MAX_BODY_BYTES {
+        return Err(AgendaError::Invalid(format!(
+            "answer exceeds {MAX_BODY_BYTES} bytes"
+        )));
+    }
+    Ok(text.to_string())
 }
 
 /// Trim, drop duplicates (first occurrence wins), reject empties and
@@ -688,6 +721,89 @@ mod tests {
         // The torn line is preserved on disk, not repaired away.
         let raw = std::fs::read_to_string(&log_path).unwrap();
         assert!(raw.contains("{\"v\":1,\"at_ms\":9,\"op\":{\"ty\n"));
+    }
+
+    /// A4 intake strictness + persistence: answers only land on open
+    /// questions, and the reply (with attribution) survives a reopen of
+    /// the store.
+    #[test]
+    fn answers_are_strict_at_intake_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = AgendaStore::open(dir.path()).unwrap();
+        let question = store
+            .apply_command(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Question,
+                    title: "Rotate the fleet certs this week?".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                },
+                None,
+                1,
+            )
+            .unwrap();
+        let task = store
+            .apply_command(add_cmd("not a question"), None, 2)
+            .unwrap();
+
+        // Wrong kind, empty text, then a real answer.
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Answer {
+                    id: task.id.clone(),
+                    text: "irrelevant".into()
+                },
+                None,
+                3,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Answer {
+                    id: question.id.clone(),
+                    text: "   ".into()
+                },
+                None,
+                4,
+            ),
+            Err(AgendaError::Invalid(_))
+        ));
+        let answered = store
+            .apply_command(
+                AgendaCommand::Answer {
+                    id: question.id.clone(),
+                    text: "yes, before Friday".into(),
+                },
+                owner(),
+                5,
+            )
+            .unwrap();
+        assert_eq!(answered.status, AgendaStatus::Done);
+        assert_eq!(
+            answered.answer.as_ref().unwrap().principal.as_deref(),
+            Some("owner")
+        );
+
+        // Double-answer is a transition error; reopen re-asks.
+        assert!(matches!(
+            store.apply_command(
+                AgendaCommand::Answer {
+                    id: question.id.clone(),
+                    text: "again".into()
+                },
+                None,
+                6,
+            ),
+            Err(AgendaError::Transition(_))
+        ));
+
+        drop(store);
+        let store = AgendaStore::open(dir.path()).unwrap();
+        let reloaded = store.get(&question.id).unwrap();
+        assert_eq!(reloaded.answer.as_ref().unwrap().text, "yes, before Friday");
+        assert_eq!(reloaded.status, AgendaStatus::Done);
     }
 
     /// Two daemons on one home share the log; each converges on the
