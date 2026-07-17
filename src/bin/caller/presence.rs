@@ -1502,6 +1502,7 @@ mod tests {
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
+            project_root: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
 
@@ -1543,6 +1544,7 @@ mod tests {
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
+            project_root: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_some());
     }
