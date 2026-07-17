@@ -1980,6 +1980,10 @@ function renderSessionDetailLogs(entries, el, pageInfo = {}) {
       : pageInfo;
     renderSessionDetailEntries(currentEntries, logsContainer, status, pagerControls, currentPageInfo);
     updateSessionDetailLogsBadge(sessionDetailLogView, currentEntries.length);
+    // Chapter-nav cluster rides the pager toolbar; re-mounting after every
+    // (re)render keeps its mode/count in step with the freshly built rows
+    // (57c-chapter-nav.js; idempotent).
+    if (typeof chapterNavMountDetailCluster === 'function') chapterNavMountDetailCluster(controls);
   };
   filterSelect.addEventListener('change', () => {
     detailLogFilter = filterSelect.value;
@@ -2554,6 +2558,9 @@ function loadOlderRemoteSessionDetailRows(view) {
         renderSessionDetailRange(view, 0);
       }
       updateSessionDetailLogsBadge(view);
+      // Chapter-nav seam: finish a parked prev-chapter jump now that the
+      // older page is merged (57c-chapter-nav.js; no-op without intent).
+      if (typeof chapterNavDetailHistoryLoaded === 'function') chapterNavDetailHistoryLoaded(view);
     })
     .catch(err => {
       console.warn('Failed to load older session detail page', sessionId, err);

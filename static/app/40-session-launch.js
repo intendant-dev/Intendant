@@ -1476,6 +1476,9 @@ function loadOlderRemoteSessionWindowEntries(win) {
       } else {
         renderSessionWindowRange(win, 0);
       }
+      // Chapter-nav seam: finish a parked prev-chapter jump now that the
+      // older page is merged (57c-chapter-nav.js; no-op without intent).
+      if (typeof chapterNavPaneHistoryLoaded === 'function') chapterNavPaneHistoryLoaded(win);
       stationScheduleUpdate();
     })
     .catch(err => {
