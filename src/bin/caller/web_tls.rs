@@ -746,6 +746,25 @@ mod tests {
     }
 
     #[test]
+    fn fleet_certificate_must_match_its_private_key() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["d-mismatch.fleet.example.test".to_string()])
+                .unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
+        let error = install_fleet_certificate(
+            "d-mismatch.fleet.example.test",
+            &certificate.cert.pem(),
+            &other.signing_key.serialize_pem(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("fleet certificate and key do not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn self_signed_acceptor_wildcard_bind() {
         // A wildcard bind contributes no IP SAN but still produces a cert
         // (localhost + ::1 + 127.0.0.1 are always present).

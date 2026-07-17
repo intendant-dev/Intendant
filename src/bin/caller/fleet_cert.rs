@@ -336,16 +336,8 @@ fn cert_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join("fleet-cert.pem")
 }
 
-pub(crate) fn cert_path() -> PathBuf {
-    cert_path_in(&cert_dir())
-}
-
 fn key_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join("fleet-key.pem")
-}
-
-pub(crate) fn key_path() -> PathBuf {
-    key_path_in(&cert_dir())
 }
 
 /// Certificate expiry (`not_after`, unix ms) from a PEM chain's leaf.
@@ -552,11 +544,16 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
             status.name = restored.provenance.name;
         });
     }
-    let (Ok(cert_pem), Ok(key_pem)) = (
-        std::fs::read_to_string(cert_path_in(cert_dir)),
-        std::fs::read_to_string(key_path_in(cert_dir)),
-    ) else {
-        return;
+    let (cert_pem, key_pem) = match read_stored_certificate_pair_in(cert_dir) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return,
+        Err(error) => {
+            with_status(|status| {
+                status.state = "error".to_string();
+                status.last_error = Some(error);
+            });
+            return;
+        }
     };
     let Some(name) = status_snapshot().name else {
         // Cert on disk but no name learned yet: install once the
@@ -574,6 +571,42 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
             status.state = "error".to_string();
             status.last_error = Some(format!("install stored certificate: {error}"));
         }),
+    }
+}
+
+fn read_stored_certificate_pair_in(cert_dir: &Path) -> Result<Option<(String, String)>, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        read_stored_certificate_pair_locked_in(cert_dir).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn read_stored_certificate_pair_locked_in(
+    cert_dir: &Path,
+) -> Result<Option<(String, String)>, String> {
+    let cert_path = cert_path_in(cert_dir);
+    let key_path = key_path_in(cert_dir);
+    match (
+        std::fs::read_to_string(&cert_path),
+        std::fs::read_to_string(&key_path),
+    ) {
+        (Ok(cert), Ok(key)) => Ok(Some((cert, key))),
+        (Err(cert_error), Err(key_error))
+            if cert_error.kind() == std::io::ErrorKind::NotFound
+                && key_error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "stored fleet certificate pair is incomplete: {} is missing",
+            cert_path.display()
+        )),
+        (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "stored fleet certificate pair is incomplete: {} is missing",
+            key_path.display()
+        )),
+        (Err(error), _) => Err(format!("read {}: {error}", cert_path.display())),
+        (_, Err(error)) => Err(format!("read {}: {error}", key_path.display())),
     }
 }
 
@@ -811,9 +844,11 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // Best-effort challenge cleanup; the TXT self-expires regardless.
     let _ = crate::connect_rendezvous::dns_acme_clear().await;
 
-    // 3. Persist + install live.
-    write_private(&key_path(), private_key_pem.as_bytes())?;
-    write_private(&cert_path(), cert_chain_pem.as_bytes())?;
+    // 3. Persist + install live. The per-file replacements are atomic and
+    // the shared authority lock prevents two daemon processes from
+    // interleaving different pairs. A crash between the two replacements is
+    // detected at restore and retried by the renewal loop.
+    persist_certificate_pair_in(&cert_dir(), &cert_chain_pem, &private_key_pem)?;
     crate::web_tls::install_fleet_certificate(&name, &cert_chain_pem, &private_key_pem)?;
     with_status(|status| {
         status.state = "valid".to_string();
@@ -821,6 +856,24 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         status.last_error = None;
     });
     Ok(())
+}
+
+fn persist_certificate_pair_in(
+    cert_dir: &Path,
+    cert_chain_pem: &str,
+    private_key_pem: &str,
+) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        crate::access::authority_store::atomic_write_private_locked(
+            &key_path_in(cert_dir),
+            private_key_pem.as_bytes(),
+        )?;
+        crate::access::authority_store::atomic_write_private_locked(
+            &cert_path_in(cert_dir),
+            cert_chain_pem.as_bytes(),
+        )
+    })
+    .map_err(|error| error.to_string())
 }
 
 /* ── Certificate Transparency tripwire ──
@@ -1211,8 +1264,22 @@ pub async fn ct_check_once() {
 /// Renewal + CT loop: first tick shortly after startup (registration
 /// needs a moment to learn the fleet name), then twice daily. Renewal
 /// fires inside the last 30 days of validity (Let's Encrypt certificates
-/// run 90); the CT tripwire runs every tick. Spawned once at gateway
-/// startup.
+/// run 90), and an error restoring or issuing a certificate is retried even
+/// when no usable expiry could be recovered. The CT tripwire runs every tick.
+/// Spawned once at gateway startup.
+fn should_request_certificate(status: &FleetCertStatus, now_unix_ms: u64) -> bool {
+    if status.name.is_none() || status.state == "requesting" {
+        return false;
+    }
+    if status.state == "error" {
+        return true;
+    }
+    status.state == "valid"
+        && status.not_after_unix_ms.is_some_and(|not_after| {
+            not_after.saturating_sub(now_unix_ms) <= 30 * 24 * 60 * 60 * 1000
+        })
+}
+
 pub fn spawn_renewal_loop() {
     tokio::spawn(async move {
         let mut first = true;
@@ -1222,14 +1289,7 @@ pub fn spawn_renewal_loop() {
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
             ct_check_once().await;
             let status = status_snapshot();
-            let Some(not_after) = status.not_after_unix_ms else {
-                continue;
-            };
-            if status.state != "valid" || status.name.is_none() {
-                continue;
-            }
-            let remaining_ms = not_after.saturating_sub(now_unix_ms());
-            if remaining_ms > 30 * 24 * 60 * 60 * 1000 {
+            if !should_request_certificate(&status, now_unix_ms()) {
                 continue;
             }
             let addresses = if status.addresses.is_empty() {
@@ -1425,7 +1485,7 @@ mod tests {
         let status = status_snapshot();
         assert_eq!(status.state, "valid");
         assert!(status.not_after_unix_ms.unwrap() > now_unix_ms());
-        let cert_pem = std::fs::read_to_string(cert_path()).unwrap();
+        let cert_pem = std::fs::read_to_string(cert_path_in(&cert_dir())).unwrap();
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         println!(
             "staging certificate issued for {name}, valid until {:?}, addresses {:?}",
@@ -1443,6 +1503,39 @@ mod tests {
             .unwrap();
         let not_after = cert_not_after_unix_ms(&cert.pem()).unwrap();
         assert!(not_after > now_unix_ms());
+    }
+
+    #[test]
+    fn renewal_retries_an_unusable_restored_pair_without_an_expiry() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(read_stored_certificate_pair_in(temp.path())
+            .unwrap()
+            .is_none());
+        persist_certificate_pair_in(temp.path(), "certificate", "private key").unwrap();
+        assert_eq!(
+            read_stored_certificate_pair_in(temp.path()).unwrap(),
+            Some(("certificate".to_string(), "private key".to_string()))
+        );
+        std::fs::remove_file(cert_path_in(temp.path())).unwrap();
+        assert!(read_stored_certificate_pair_in(temp.path())
+            .unwrap_err()
+            .contains("pair is incomplete"));
+
+        let repair = FleetCertStatus {
+            name: Some("d-test.fleet.example.test".to_string()),
+            state: "error".to_string(),
+            not_after_unix_ms: None,
+            ..Default::default()
+        };
+        assert!(should_request_certificate(&repair, now_unix_ms()));
+
+        let mut unrequested = repair.clone();
+        unrequested.state = "none".to_string();
+        assert!(!should_request_certificate(&unrequested, now_unix_ms()));
+
+        let mut requesting = repair;
+        requesting.state = "requesting".to_string();
+        assert!(!should_request_certificate(&requesting, now_unix_ms()));
     }
 
     #[test]
