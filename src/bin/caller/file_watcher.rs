@@ -14,8 +14,14 @@
 //! `abandoned_branches` for later pruning.
 //!
 //! Cost model: round scans are fingerprint-cached — every file is stat'd,
-//! only files whose (size, mtime) moved are re-read and re-hashed — so
-//! per-round work is proportional to actual changes. Durable state is split
+//! only files whose fingerprint (size, mtime, platform change signal, file
+//! identity) moved is re-read and re-hashed — so per-round work is
+//! proportional to actual changes; blob existence is answered by an
+//! in-memory object index rather than per-file `objects/` stats; rounds
+//! for sessions working OTHER roots are skipped by root routing; the boot
+//! baseline walk reuses fingerprint-unchanged entries across restarts; and
+//! the live notify path does its read+hash work off the watcher lock.
+//! Durable state is split
 //! between a slim `history.json` index (round scalars + changed paths,
 //! format 2) and one `rounds/round_{id}/manifest.json` per round holding
 //! that round's full path→hash maps; a no-op round writes a tiny
@@ -245,6 +251,22 @@ pub(crate) struct BaselineFileMeta {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Metadata fingerprint of the SOURCE file at recording time. The next
+    /// boot's baseline walk reuses this entry — skipping the re-read and
+    /// the baseline rewrite — when the live file still fingerprints the
+    /// same (ctime/identity included; (len, mtime) alone is spoofable and
+    /// has failed repeatedly in this repo's history). `None` on manifests
+    /// written before the field existed: those entries always take the
+    /// full re-read + rewrite path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<FileFingerprint>,
+    /// Wall-clock time (nanos since epoch, walk start) the fingerprint was
+    /// recorded — the cross-boot racy-distrust gate (see
+    /// [`baseline_entry_reusable`]). The monotonic gate the in-memory scan
+    /// cache also uses cannot survive a restart; the wall clock is what
+    /// crosses boots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at_nanos: Option<u128>,
 }
 
 pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
@@ -261,8 +283,11 @@ pub(crate) type BaselineManifest = HashMap<String, BaselineFileMeta>;
 ///   by every write; not settable through `SetFileTime`) plus the volume +
 ///   file-index identity.
 /// - Elsewhere: no signal exists — see [`FileFingerprint::matches`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileFingerprint {
+///
+/// Serialized (all fields optional-tolerant) inside [`BaselineFileMeta`]
+/// for the cross-boot baseline fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileFingerprint {
     size: u64,
     /// Modification time in nanos since the epoch; `None` when unreadable.
     mtime_nanos: Option<u128>,
@@ -1036,6 +1061,31 @@ fn hex_decode_hash(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Seed the in-memory object index: one `objects/` directory listing,
+/// collecting the blob names that look like sha256 hex (the only names the
+/// store ever writes; in-flight `.intendant-write-*.tmp` staging files are
+/// skipped). A missing or unreadable directory seeds empty — the safe
+/// direction: an absent index entry falls toward re-storing the blob.
+fn seed_object_index(objects_dir: &Path) -> HashSet<String> {
+    let mut index = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(objects_dir) else {
+        return index;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            index.insert(name.to_string());
+        }
+    }
+    index
+}
+
 /// Remove `baseline/` files that are not supported-text entries of the
 /// current baseline manifest — leftovers from a previous run whose source
 /// files were deleted (or stopped being text) before this resume. Keeps the
@@ -1123,6 +1173,55 @@ fn clear_stale_baseline_slot(baseline_dir: &Path, baseline_path: &Path) {
     }
     if baseline_path.is_dir() {
         let _ = std::fs::remove_dir_all(baseline_path);
+    }
+}
+
+/// Whether a previous boot's manifest entry can stand in for re-reading
+/// and re-baselining a live file that currently fingerprints as `live`:
+///
+/// 1. the stored fingerprint must fully match the live one (size, mtime,
+///    platform change signal, file identity — see
+///    [`FileFingerprint::matches`]; a fingerprint-less legacy entry never
+///    matches), and
+/// 2. the entry must pass the wall-clock racy-distrust gate: its mtime
+///    must be comfortably older than its own recording time, exactly like
+///    [`ScanCacheEntry::trustworthy_for`]'s wall-clock condition. (The
+///    monotonic condition cannot cross a process boundary — the wall
+///    clock is all that survives a restart.)
+/// 3. for supported-text entries, the baseline shadow copy behind the
+///    reused hash must still be an intact regular file of the recorded
+///    size — a missing or truncated copy (crashed previous boot) must
+///    heal via the full rewrite path, not be trusted. Residual: baseline
+///    data writes are not fsynced, so a power loss can in principle
+///    leave a full-size zero-filled copy on delayed-allocation
+///    filesystems; the blast radius is display-only (diff baselines) —
+///    restores read `objects/`, which is written via fsynced
+///    [`atomic_write`].
+fn baseline_entry_reusable(
+    meta: &BaselineFileMeta,
+    live: &FileFingerprint,
+    racy_window_nanos: u128,
+    baseline_path: &Path,
+) -> bool {
+    let (Some(stored), Some(recorded_at)) = (meta.fingerprint, meta.recorded_at_nanos) else {
+        return false;
+    };
+    if !stored.matches(live) {
+        return false;
+    }
+    let racy_ok = stored
+        .mtime_nanos
+        .is_some_and(|mtime| mtime.saturating_add(racy_window_nanos) < recorded_at);
+    if !racy_ok {
+        return false;
+    }
+    if meta.supported_text {
+        match std::fs::metadata(baseline_path) {
+            Ok(baseline_meta) => baseline_meta.is_file() && baseline_meta.len() == meta.size,
+            Err(_) => false,
+        }
+    } else {
+        true
     }
 }
 
@@ -1328,6 +1427,17 @@ pub struct FileWatcher {
     /// Per-file fingerprint → hash cache for round scans and post-restore
     /// re-syncs. Rebuilt on every walk so deleted paths fall out.
     round_scan_cache: HashMap<PathBuf, ScanCacheEntry>,
+    /// In-memory index of the blob hashes known to exist under `objects/`.
+    /// Seeded from one directory listing at construction and maintained on
+    /// every object write and GC delete, so round walks consult this set
+    /// instead of stat'ing `objects/{hash}` once per cached file (which
+    /// doubled the stat count of big-tree walks). Repair contract: a
+    /// restore that finds a blob missing on disk removes its hash here
+    /// (later walks re-store the content), and a walk that would write a
+    /// blob the index does not know first re-checks the disk — so an
+    /// index/disk divergence in either direction converges instead of
+    /// making a `files_at_end` hash unrestorable.
+    object_index: HashSet<String>,
     /// True until the notify watcher is confirmed running, and again after a
     /// notify error or loop exit. While degraded, `changes_index_snapshot`
     /// returns `None` so the gateway's changes fast path stands down and the
@@ -1355,6 +1465,11 @@ pub struct FileWatcher {
     /// `scan_and_store_objects` walk actually read (cache misses).
     #[cfg(test)]
     pub(crate) files_read_in_last_scan: usize,
+    /// Test-only observability: how many baseline copies the constructor
+    /// walk wrote (files whose previous-boot manifest entry could not be
+    /// reused — see [`baseline_entry_reusable`]).
+    #[cfg(test)]
+    pub(crate) baseline_files_rewritten_in_new: usize,
     /// Maps of the current head round (see [`HeadMapsCache`]).
     head_maps: Option<HeadMapsCache>,
     /// Running estimate of bytes under `snapshot_dir`, maintained from the
@@ -1374,6 +1489,30 @@ impl FileWatcher {
         project_root: PathBuf,
         snapshot_dir: PathBuf,
         bus: EventBus,
+    ) -> Result<Self, CallerError> {
+        Self::new_with_racy_window(
+            project_root,
+            snapshot_dir,
+            bus,
+            FINGERPRINT_RACY_WINDOW_NANOS,
+        )
+    }
+
+    /// [`Self::new`] with an injectable racy-distrust window, so tests can
+    /// exercise the cross-boot baseline fast path without multi-second
+    /// sleeps. Production always passes `FINGERPRINT_RACY_WINDOW_NANOS`.
+    ///
+    /// HARD INVARIANT: the baseline walk below runs synchronously in this
+    /// constructor — a baseline copy must exist before the first mutation
+    /// can be observed (snapshot-before-first-write), or the first diff
+    /// against a late-written baseline reports the whole file as added.
+    /// The cross-boot reuse check is a fast path OF the walk, never a
+    /// deferral of it.
+    fn new_with_racy_window(
+        project_root: PathBuf,
+        snapshot_dir: PathBuf,
+        bus: EventBus,
+        racy_window_nanos: u128,
     ) -> Result<Self, CallerError> {
         let baseline_dir = snapshot_dir.join("baseline");
         // Only the store root exists before the lock: the lockfile needs a
@@ -1406,6 +1545,8 @@ impl FileWatcher {
         let mut reconcile_failed = false;
         let mut files_seen: usize = 0;
         let mut bytes_seen: u64 = 0;
+        #[cfg(test)]
+        let mut baseline_files_rewritten: usize = 0;
 
         if lock_read_only {
             // Write nothing: adopt the owning process's on-disk baseline
@@ -1418,6 +1559,14 @@ impl FileWatcher {
                 }
             }
         } else {
+            // The previous boot's manifest, consulted per file for the
+            // cross-boot reuse fast path; empty on a fresh store, so every
+            // file takes the full read + rewrite path.
+            let previous_manifest = read_baseline_manifest_file(&snapshot_dir);
+            // Reused/recorded fingerprints carry the walk's start time —
+            // the most conservative recording bound for the wall-clock
+            // racy-distrust gate (recording happens later in the walk).
+            let walk_started_nanos = now_nanos();
             let mut stack = vec![project_root.clone()];
             while let Some(dir) = stack.pop() {
                 let entries = match std::fs::read_dir(&dir) {
@@ -1460,6 +1609,37 @@ impl FileWatcher {
                             project_root.display()
                         )));
                     }
+                    // Stat before any content read: this fingerprint
+                    // describes content no newer than what the reads below
+                    // return, so recording it against that content is
+                    // conservative (the house stat-before-read contract).
+                    let live_fingerprint = std::fs::metadata(&path)
+                        .ok()
+                        .map(|meta| file_fingerprint(&path, &meta));
+                    // Cross-boot fast path: a live file whose fingerprint
+                    // still matches the previous boot's manifest entry (and
+                    // whose baseline copy is intact, for text entries)
+                    // reuses that entry verbatim — no re-read, no rewrite.
+                    if let (Some(live), Some(prev)) =
+                        (live_fingerprint, previous_manifest.get(&rel_key))
+                    {
+                        if baseline_entry_reusable(
+                            prev,
+                            &live,
+                            racy_window_nanos,
+                            &baseline_dir.join(&rel),
+                        ) {
+                            if let Some(hash) = hex_decode_hash(&prev.hash) {
+                                bytes_seen = bytes_seen.saturating_add(prev.size);
+                                if prev.size > SNAPSHOT_MAX_FILE_BYTES {
+                                    large_file_fingerprints.insert(rel.clone(), live);
+                                }
+                                hashes.insert(rel, hash);
+                                baseline_manifest.insert(rel_key, prev.clone());
+                                continue;
+                            }
+                        }
+                    }
                     match inspect_file(&path) {
                         Ok(InspectedFile::Text(snapshot)) => {
                             bytes_seen = bytes_seen.saturating_add(snapshot.size);
@@ -1486,6 +1666,10 @@ impl FileWatcher {
                                     ))
                                 },
                             )?;
+                            #[cfg(test)]
+                            {
+                                baseline_files_rewritten += 1;
+                            }
                             hashes.insert(rel, snapshot.hash);
                             baseline_manifest.insert(
                                 rel_key,
@@ -1494,6 +1678,8 @@ impl FileWatcher {
                                     hash: snapshot.hash_hex,
                                     size: snapshot.size,
                                     reason: None,
+                                    fingerprint: live_fingerprint,
+                                    recorded_at_nanos: Some(walk_started_nanos),
                                 },
                             );
                         }
@@ -1513,6 +1699,8 @@ impl FileWatcher {
                                     hash: snapshot.hash_hex,
                                     size: snapshot.size,
                                     reason: Some(snapshot.reason),
+                                    fingerprint: live_fingerprint,
+                                    recorded_at_nanos: Some(walk_started_nanos),
                                 },
                             );
                         }
@@ -1559,6 +1747,10 @@ impl FileWatcher {
             .map(|meta| meta.len())
             .unwrap_or(0);
 
+        // One boot-time listing seeds the object index the round walks
+        // consult and the write/GC paths maintain incrementally.
+        let object_index = seed_object_index(&snapshot_dir.join("objects"));
+
         let mut watcher = Self {
             project_root,
             snapshot_dir,
@@ -1567,13 +1759,16 @@ impl FileWatcher {
             hashes,
             large_file_fingerprints,
             round_scan_cache: HashMap::new(),
+            object_index,
             live_index_degraded: true,
             live_index_disabled: read_only || reconcile_failed,
             read_only,
             _store_lock: store_lock,
-            racy_window_nanos: FINGERPRINT_RACY_WINDOW_NANOS,
+            racy_window_nanos,
             #[cfg(test)]
             files_read_in_last_scan: 0,
+            #[cfg(test)]
+            baseline_files_rewritten_in_new: baseline_files_rewritten,
             head_maps: None,
             snapshot_dir_size_estimate,
             last_history_index_bytes,
@@ -1669,40 +1864,8 @@ impl FileWatcher {
 
         let round_handle = {
             let shared = shared.clone();
-            let mut rx = bus.subscribe();
-            tokio::task::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        // Deliberately unfiltered by `session_id`: the event
-                        // carries one, but nothing on the bus maps a session
-                        // to its working root, so rounds from sessions in
-                        // other roots (worktrees, external backends) also
-                        // land here — a known attribution wart. Since the
-                        // fingerprint cache + backreference manifests, such
-                        // foreign rounds cost a stat-walk and an O(1)
-                        // persist, not a tree re-read.
-                        Ok(AppEvent::RoundComplete {
-                            round,
-                            turns_in_round,
-                            native_message_count,
-                            ..
-                        }) => {
-                            let summary = format!("Round {}", round);
-                            let mut w = shared.lock().await;
-                            if let Err(e) = w.on_round_complete(
-                                summary,
-                                Some(turns_in_round as u32),
-                                native_message_count,
-                            ) {
-                                eprintln!("[file_watcher] round snapshot failed: {}", e);
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            })
+            let rx = bus.subscribe();
+            tokio::task::spawn(run_round_complete_listener(shared, rx, project_root))
         };
 
         (shared, watcher_handle, round_handle)
@@ -1717,152 +1880,189 @@ impl FileWatcher {
         watcher_handle
     }
 
+    /// Apply one notify path synchronously under the caller's borrow: the
+    /// staged pipeline (see [`PreparedNotifyChange`]) run back-to-back.
+    /// The live notify loop runs the same stages with the read phases OFF
+    /// the shared watcher lock ([`apply_notify_path`]); this composition
+    /// serves tests that already hold exclusive access and drive events
+    /// deterministically.
+    #[cfg(test)]
     pub(crate) fn process_change(&mut self, abs_path: &Path, kind: &notify::EventKind) {
-        // Compute relative path.
-        let rel = match abs_path.strip_prefix(&self.project_root) {
-            Ok(r) => r.to_path_buf(),
-            Err(_) => return,
+        let Some(prepared) = prepare_notify_change(&self.project_root, abs_path, kind) else {
+            return;
         };
+        match prepared {
+            PreparedNotifyChange::Upsert {
+                rel,
+                rel_key,
+                fingerprint,
+                size,
+            } => {
+                let UpsertStage::Read {
+                    existed_at_baseline,
+                    prev_hash,
+                } = self.stage_upsert(&rel, size, &fingerprint)
+                else {
+                    return;
+                };
+                let Some(content) = read_upsert_content(
+                    &self.snapshot_dir,
+                    &self.project_root,
+                    &rel,
+                    existed_at_baseline,
+                    prev_hash,
+                ) else {
+                    return;
+                };
+                self.publish_upsert(rel, rel_key, fingerprint, content);
+            }
+            PreparedNotifyChange::Delete { rel, rel_key } => {
+                let lines_removed = deleted_baseline_line_count(&self.snapshot_dir, &rel);
+                self.publish_delete(rel, rel_key, lines_removed);
+            }
+        }
+    }
 
-        if should_ignore(&rel) {
+    /// Upsert phase B — the pre-read snapshot, taken under the watcher
+    /// lock: the oversized-event dedup (duplicate notify events for an
+    /// unchanged oversized file must not re-hash tens of megabytes) and
+    /// the state bits the off-lock read phase needs.
+    fn stage_upsert(&self, rel: &Path, size: u64, fingerprint: &FileFingerprint) -> UpsertStage {
+        if size > SNAPSHOT_MAX_FILE_BYTES
+            && self
+                .large_file_fingerprints
+                .get(rel)
+                .is_some_and(|prev| prev.matches(fingerprint))
+        {
+            return UpsertStage::Drop;
+        }
+        UpsertStage::Read {
+            existed_at_baseline: self.baseline_manifest.contains_key(&rel_path_key(rel)),
+            prev_hash: self.hashes.get(rel).copied(),
+        }
+    }
+
+    /// Upsert phase D — re-taken under the watcher lock after the off-lock
+    /// read: revalidate, then mutate state and publish. The pre-read
+    /// fingerprint is compared against a fresh stat; if the file moved (or
+    /// vanished) while the lock was released, this read is stale and is
+    /// dropped — the change that invalidated it either has its own notify
+    /// event queued behind this one, or was authored by a lock-holding
+    /// restore that refreshed the mirrors itself.
+    fn publish_upsert(
+        &mut self,
+        rel: PathBuf,
+        rel_key: String,
+        fingerprint: FileFingerprint,
+        content: UpsertContent,
+    ) {
+        let abs = self.project_root.join(&rel);
+        let Ok(meta) = std::fs::metadata(&abs) else {
+            // Deleted while unlocked: the Remove event is queued behind us.
+            return;
+        };
+        if !fingerprint_still_describes(&file_fingerprint(&abs, &meta), &fingerprint) {
             return;
         }
-
-        let rel_key = rel_path_key(&rel);
-        let existed_at_baseline = self.baseline_manifest.contains_key(&rel_key);
-        let known_file = existed_at_baseline || self.hashes.contains_key(&rel);
-        let change_kind = match kind {
-            notify::EventKind::Create(_) => {
-                if !abs_path.is_file() {
-                    return;
-                }
-                if known_file {
-                    FileChangeKind::Modified
-                } else {
-                    FileChangeKind::Created
-                }
-            }
-            notify::EventKind::Modify(_) => {
-                if !abs_path.is_file() {
-                    return;
-                }
-                if known_file {
-                    FileChangeKind::Modified
-                } else {
-                    FileChangeKind::Created
-                }
-            }
-            notify::EventKind::Remove(_) => FileChangeKind::Deleted,
-            _ => return,
+        // The Created/Modified label reflects state at publish time — the
+        // lock we now hold — not the possibly stale pre-read snapshot.
+        let known_file =
+            self.baseline_manifest.contains_key(&rel_key) || self.hashes.contains_key(&rel);
+        let change_kind = if known_file {
+            FileChangeKind::Modified
+        } else {
+            FileChangeKind::Created
         };
-
-        match change_kind {
-            FileChangeKind::Created | FileChangeKind::Modified => {
-                // Stat before the read below, so the fingerprint recorded in
-                // the scan cache is never newer than the content it hashes.
-                let meta = match std::fs::metadata(abs_path) {
-                    Ok(meta) => meta,
-                    Err(_) => return,
-                };
-                let fingerprint = file_fingerprint(abs_path, &meta);
-                if meta.len() > SNAPSHOT_MAX_FILE_BYTES
-                    && self
-                        .large_file_fingerprints
-                        .get(&rel)
-                        .is_some_and(|prev| prev.matches(&fingerprint))
-                {
-                    return;
-                }
-
-                match inspect_file(abs_path) {
-                    Ok(InspectedFile::Text(snapshot)) => {
-                        self.large_file_fingerprints.remove(&rel);
-                        // Live events are the freshest signal — refresh the
-                        // round-scan cache even when the content hash proves
-                        // unchanged (the fingerprint may still have moved).
-                        self.round_scan_cache.insert(
-                            rel.clone(),
-                            ScanCacheEntry {
-                                fingerprint,
-                                hash: snapshot.hash,
-                                hash_hex: snapshot.hash_hex.clone(),
-                                restorable: true,
-                                recorded_at_nanos: now_nanos(),
-                                recorded_at_instant: std::time::Instant::now(),
-                            },
-                        );
-                        if self.hashes.get(&rel) == Some(&snapshot.hash) {
-                            return; // no actual change
-                        }
-                        self.hashes.insert(rel.clone(), snapshot.hash);
-
-                        let (lines_added, lines_removed) =
-                            if let Some(baseline_str) = self.baseline_text_for(&rel) {
-                                diff_stats(&baseline_str, &snapshot.text)
-                            } else if existed_at_baseline {
-                                (0, 0)
-                            } else {
-                                diff_stats("", &snapshot.text)
-                            };
-
-                        self.bus.send(AppEvent::FileChanged {
-                            path: rel_key,
-                            kind: change_kind,
-                            lines_added,
-                            lines_removed,
-                        });
-                    }
-                    Ok(InspectedFile::Unsupported(snapshot)) => {
-                        if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
-                            self.large_file_fingerprints
-                                .insert(rel.clone(), fingerprint);
-                            self.round_scan_cache.remove(&rel);
-                        } else {
-                            self.large_file_fingerprints.remove(&rel);
-                            self.round_scan_cache.insert(
-                                rel.clone(),
-                                ScanCacheEntry {
-                                    fingerprint,
-                                    hash: snapshot.hash,
-                                    hash_hex: snapshot.hash_hex.clone(),
-                                    restorable: false,
-                                    recorded_at_nanos: now_nanos(),
-                                    recorded_at_instant: std::time::Instant::now(),
-                                },
-                            );
-                        }
-                        if self.hashes.get(&rel) == Some(&snapshot.hash) {
-                            return; // no actual change
-                        }
-                        self.hashes.insert(rel.clone(), snapshot.hash);
-                        self.bus.send(AppEvent::FileChanged {
-                            path: rel_key,
-                            kind: change_kind,
-                            lines_added: 0,
-                            lines_removed: 0,
-                        });
-                    }
-                    Err(_) => (),
-                }
-            }
-            FileChangeKind::Deleted => {
-                if known_file {
-                    let lines_removed = self
-                        .baseline_text_for(&rel)
-                        .map(|text| text.lines().count() as u32)
-                        .unwrap_or(0);
-                    self.bus.send(AppEvent::FileChanged {
-                        path: rel_key,
-                        kind: FileChangeKind::Deleted,
-                        lines_added: 0,
-                        lines_removed,
-                    });
-                }
-                self.hashes.remove(&rel);
+        match content.inspected {
+            InspectedFile::Text(snapshot) => {
                 self.large_file_fingerprints.remove(&rel);
-                self.round_scan_cache.remove(&rel);
+                // Live events are the freshest signal — refresh the
+                // round-scan cache even when the content hash proves
+                // unchanged (the fingerprint may still have moved).
+                self.round_scan_cache.insert(
+                    rel.clone(),
+                    ScanCacheEntry {
+                        fingerprint,
+                        hash: snapshot.hash,
+                        hash_hex: snapshot.hash_hex.clone(),
+                        restorable: true,
+                        recorded_at_nanos: now_nanos(),
+                        recorded_at_instant: std::time::Instant::now(),
+                    },
+                );
+                if self.hashes.get(&rel) == Some(&snapshot.hash) {
+                    return; // no actual change
+                }
+                self.hashes.insert(rel.clone(), snapshot.hash);
+
+                // `None` line stats mean the off-lock read predicted a
+                // dedup that publish-time state no longer agrees with (a
+                // rare cross-lock interleave): emit with zeros rather than
+                // hold the lock for a diff — the next event self-corrects.
+                let (lines_added, lines_removed) = content.line_stats.unwrap_or((0, 0));
+                self.bus.send(AppEvent::FileChanged {
+                    path: rel_key,
+                    kind: change_kind,
+                    lines_added,
+                    lines_removed,
+                });
+            }
+            InspectedFile::Unsupported(snapshot) => {
+                if snapshot.size > SNAPSHOT_MAX_FILE_BYTES {
+                    self.large_file_fingerprints
+                        .insert(rel.clone(), fingerprint);
+                    self.round_scan_cache.remove(&rel);
+                } else {
+                    self.large_file_fingerprints.remove(&rel);
+                    self.round_scan_cache.insert(
+                        rel.clone(),
+                        ScanCacheEntry {
+                            fingerprint,
+                            hash: snapshot.hash,
+                            hash_hex: snapshot.hash_hex.clone(),
+                            restorable: false,
+                            recorded_at_nanos: now_nanos(),
+                            recorded_at_instant: std::time::Instant::now(),
+                        },
+                    );
+                }
+                if self.hashes.get(&rel) == Some(&snapshot.hash) {
+                    return; // no actual change
+                }
+                self.hashes.insert(rel.clone(), snapshot.hash);
+                self.bus.send(AppEvent::FileChanged {
+                    path: rel_key,
+                    kind: change_kind,
+                    lines_added: 0,
+                    lines_removed: 0,
+                });
             }
         }
+    }
+
+    /// Delete phase D — under the watcher lock. Revalidates that the path
+    /// is still absent: a path that exists again was recreated while the
+    /// lock was released (a rollback restore, an editor's atomic-rename
+    /// save) and whatever recreated it owns the mirrors — a lock-holding
+    /// restore refreshed them itself; a plain recreate's Create event is
+    /// queued behind this one.
+    fn publish_delete(&mut self, rel: PathBuf, rel_key: String, lines_removed: u32) {
+        if std::fs::symlink_metadata(self.project_root.join(&rel)).is_ok() {
+            return;
+        }
+        let known_file =
+            self.baseline_manifest.contains_key(&rel_key) || self.hashes.contains_key(&rel);
+        if known_file {
+            self.bus.send(AppEvent::FileChanged {
+                path: rel_key,
+                kind: FileChangeKind::Deleted,
+                lines_added: 0,
+                lines_removed,
+            });
+        }
+        self.hashes.remove(&rel);
+        self.large_file_fingerprints.remove(&rel);
+        self.round_scan_cache.remove(&rel);
     }
 
     // ---- Snapshot / history management ----
@@ -2132,9 +2332,14 @@ impl FileWatcher {
     /// Fingerprint-cached: every file is stat'd, but only files whose
     /// fingerprint moved since the last walk (see [`ScanCacheEntry`] for the
     /// exact staleness contract) are re-read and re-hashed. A cached
-    /// restorable entry is only trusted when its object blob still exists on
-    /// disk, so every hash recorded in `files_at_end` is restorable by
-    /// construction.
+    /// restorable entry is only trusted when its object blob is still known
+    /// to the in-memory object index (seeded from one `objects/` listing at
+    /// construction, maintained on every write and GC delete — it replaces
+    /// the per-entry `objects/{hash}` stat that doubled big-tree walk
+    /// costs), so every hash recorded in `files_at_end` is restorable by
+    /// construction up to index accuracy; a restore that finds a blob
+    /// missing anyway repairs the index so later walks re-store the
+    /// content (see [`Self::restore_to_state`]).
     fn scan_and_store_objects(&mut self) -> Result<SnapshotObjectMaps, CallerError> {
         let mut out: HashMap<String, String> = HashMap::new();
         let mut all: HashMap<String, String> = HashMap::new();
@@ -2197,14 +2402,15 @@ impl FileWatcher {
                     if cached.trustworthy_for(&fingerprint, self.racy_window_nanos) {
                         let key = rel_path_key(&rel);
                         if cached.restorable {
-                            if objects_dir.join(&cached.hash_hex).exists() {
+                            if self.object_index.contains(&cached.hash_hex) {
                                 all.insert(key.clone(), cached.hash_hex.clone());
                                 out.insert(key, cached.hash_hex.clone());
                                 next_cache.insert(rel, cached.clone());
                                 continue;
                             }
-                            // Object missing (fresh objects dir, failed
-                            // write): fall through and re-store it.
+                            // Object not in the index (fresh objects dir,
+                            // failed write, restore-time repair): fall
+                            // through and re-store it.
                         } else {
                             all.insert(key, cached.hash_hex.clone());
                             next_cache.insert(rel, cached.clone());
@@ -2223,13 +2429,19 @@ impl FileWatcher {
                 match snapshot {
                     InspectedFile::Text(snapshot) => {
                         all.insert(rel_path_key(&rel), snapshot.hash_hex.clone());
-                        let obj_path = objects_dir.join(&snapshot.hash_hex);
-                        if !obj_path.exists()
-                            && atomic_write(&obj_path, snapshot.text.as_bytes()).is_ok()
-                        {
-                            self.snapshot_dir_size_estimate = self
-                                .snapshot_dir_size_estimate
-                                .saturating_add(snapshot.size);
+                        if !self.object_index.contains(&snapshot.hash_hex) {
+                            let obj_path = objects_dir.join(&snapshot.hash_hex);
+                            if obj_path.exists() {
+                                // Blob present but unindexed (written by a
+                                // path the index missed): repair the
+                                // stale-negative instead of rewriting.
+                                self.object_index.insert(snapshot.hash_hex.clone());
+                            } else if atomic_write(&obj_path, snapshot.text.as_bytes()).is_ok() {
+                                self.object_index.insert(snapshot.hash_hex.clone());
+                                self.snapshot_dir_size_estimate = self
+                                    .snapshot_dir_size_estimate
+                                    .saturating_add(snapshot.size);
+                            }
                         }
                         next_cache.insert(
                             rel.clone(),
@@ -2263,12 +2475,6 @@ impl FileWatcher {
         }
         self.round_scan_cache = next_cache;
         Ok((out, all))
-    }
-
-    /// Read one baseline file's text from the on-disk `baseline/` shadow
-    /// copy. `None` when the path had no supported-text baseline.
-    fn baseline_text_for(&self, rel: &Path) -> Option<String> {
-        std::fs::read_to_string(self.snapshot_dir.join("baseline").join(rel)).ok()
     }
 
     /// Resolve one round's maps: from the head cache when it matches, from
@@ -2473,8 +2679,20 @@ impl FileWatcher {
         let mut touched: u32 = 0;
         let restore_one = |watcher: &mut Self, rel: &str, target_hex: &str| -> bool {
             let obj = objects_dir.join(target_hex);
-            let Ok(bytes) = std::fs::read(&obj) else {
-                return false;
+            let bytes = match std::fs::read(&obj) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::NotFound {
+                        // The blob vanished behind the object index
+                        // (external deletion): repair the index so later
+                        // walks re-read and re-store this content instead
+                        // of trusting the stale entry. This restore still
+                        // skips the file, exactly as a walk-time disk
+                        // check would have skipped storing it.
+                        watcher.object_index.remove(target_hex);
+                    }
+                    return false;
+                }
             };
             let abs = watcher.project_root.join(rel);
             if let Some(parent) = abs.parent() {
@@ -2683,8 +2901,9 @@ impl FileWatcher {
     /// Referenced hashes resolve through the per-round manifests (deduped by
     /// backreference source). Fail-safe: if any live round's maps cannot be
     /// resolved, nothing is deleted — an unreadable manifest must never
-    /// orphan objects a rollback still needs.
-    fn gc_orphaned_objects(&self) -> u64 {
+    /// orphan objects a rollback still needs. Deleted blobs leave the
+    /// in-memory object index in the same motion.
+    fn gc_orphaned_objects(&mut self) -> u64 {
         let mut referenced: HashSet<String> = HashSet::new();
         let sources: HashSet<u64> = self
             .history
@@ -2720,7 +2939,11 @@ impl FileWatcher {
                 if let Ok(m) = std::fs::metadata(&p) {
                     freed += m.len();
                 }
-                let _ = std::fs::remove_file(&p);
+                if std::fs::remove_file(&p).is_ok() {
+                    // Keep the object index honest: a blob that could not
+                    // actually be deleted stays indexed.
+                    self.object_index.remove(name);
+                }
             }
         }
         freed
@@ -2760,6 +2983,300 @@ impl FileWatcher {
     }
 }
 
+/// Round-complete listener: records a rewind round in this watcher's store
+/// for every completed round that belongs to this watcher's root.
+///
+/// Routing: `RoundComplete` carries the emitting session's effective
+/// project root, and rounds are filtered on it — a round for a DIFFERENT
+/// root (a worktree sub-agent, an external session supervised in another
+/// directory) is skipped entirely, where it used to cost this watcher a
+/// full stat walk plus a no-op round persist and polluted this root's
+/// timeline with rounds that changed nothing. A round with NO resolvable
+/// root (`None`: replayed logs, emitters without a project) fails open
+/// and records as before — losing a legitimate snapshot is worse than an
+/// occasional foreign no-op round. Deliberately still unfiltered by
+/// `session_id`: multiple sessions working the SAME root all belong in
+/// its one timeline.
+async fn run_round_complete_listener(
+    shared: SharedFileWatcher,
+    mut rx: tokio::sync::broadcast::Receiver<AppEvent>,
+    watcher_root: PathBuf,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(AppEvent::RoundComplete {
+                round,
+                turns_in_round,
+                native_message_count,
+                project_root,
+                ..
+            }) => {
+                if !round_targets_watcher_root(&watcher_root, project_root.as_deref()) {
+                    continue;
+                }
+                let summary = format!("Round {}", round);
+                let mut w = shared.lock().await;
+                if let Err(e) =
+                    w.on_round_complete(summary, Some(turns_in_round as u32), native_message_count)
+                {
+                    eprintln!("[file_watcher] round snapshot failed: {}", e);
+                }
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Whether a completed round belongs to the watcher rooted at
+/// `watcher_root`: yes for the same root (symlink spellings tolerated via
+/// [`watcher_paths_match`]) and — fail-open — for rounds that resolve no
+/// root at all.
+fn round_targets_watcher_root(watcher_root: &Path, round_root: Option<&Path>) -> bool {
+    round_root.is_none_or(|root| watcher_paths_match(root, watcher_root))
+}
+
+// ---------------------------------------------------------------------------
+// Staged notify pipeline
+// ---------------------------------------------------------------------------
+//
+// One notify path is applied in phases so the live loop never does file
+// read+hash work while holding the shared watcher lock (which stalls round
+// snapshots and gateway rollback requests behind single-file hashing):
+//
+//   A. `prepare_notify_change` — pure path/kind resolution + the pre-read
+//      stat. No watcher state; runs off-lock.
+//   B. `FileWatcher::stage_upsert` — the pre-read snapshot, under the lock.
+//   C. `read_upsert_content` / `deleted_baseline_line_count` — the content
+//      read, hash, and line diff. Off-lock (the expensive part).
+//   D. `FileWatcher::publish_upsert` / `publish_delete` — revalidate and
+//      publish, under the lock again.
+//
+// Ordering: per-path event order is preserved by processing events
+// SEQUENTIALLY — one event completes all its phases before the next
+// starts (the loop below awaits each). The phase-D revalidation exists
+// for the OTHER lock users (round scans, rollbacks) that interleave
+// precisely because the lock is released around the reads: a read the
+// on-disk state has moved past is dropped, never published stale.
+
+/// One notify path resolved by phase A — pure path/kind/stat work.
+enum PreparedNotifyChange {
+    /// A Create/Modify event for a path that currently stats as a file.
+    Upsert {
+        rel: PathBuf,
+        rel_key: String,
+        /// Stat taken BEFORE any content read (the house stat-before-read
+        /// contract): recording it against the later-read content is
+        /// conservative — the fingerprint is never newer than the bytes.
+        fingerprint: FileFingerprint,
+        size: u64,
+    },
+    /// A Remove event.
+    Delete { rel: PathBuf, rel_key: String },
+}
+
+/// Phase-B decision for an upsert.
+enum UpsertStage {
+    /// Duplicate event for an unchanged oversized file — dropped without
+    /// reading (the point of the oversized fingerprint dedup).
+    Drop,
+    /// Proceed to the off-lock content read.
+    Read {
+        /// The path had a baseline entry at session start (immutable after
+        /// construction, so safe to carry across the unlocked read).
+        existed_at_baseline: bool,
+        /// Last-known content hash at stage time — lets phase C skip the
+        /// line diff when the fresh content hashes identically (phase D
+        /// re-checks against live state before trusting the prediction).
+        prev_hash: Option<[u8; 32]>,
+    },
+}
+
+/// Phase-C result for an upsert.
+struct UpsertContent {
+    inspected: InspectedFile,
+    /// `(lines_added, lines_removed)` for supported text whose content
+    /// differed from the staged `prev_hash`; `None` when the diff was
+    /// skipped (predicted dedup) or not applicable (unsupported files).
+    line_stats: Option<(u32, u32)>,
+}
+
+/// Phase A: resolve a notify event against the project root — relative
+/// path, ignore rules, event-kind class, and (for upserts) the pre-read
+/// stat. Pure path + metadata work, no watcher state.
+fn prepare_notify_change(
+    project_root: &Path,
+    abs_path: &Path,
+    kind: &notify::EventKind,
+) -> Option<PreparedNotifyChange> {
+    let rel = abs_path.strip_prefix(project_root).ok()?.to_path_buf();
+    if should_ignore(&rel) {
+        return None;
+    }
+    let rel_key = rel_path_key(&rel);
+    match kind {
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) => {
+            if !abs_path.is_file() {
+                return None;
+            }
+            let meta = std::fs::metadata(abs_path).ok()?;
+            let fingerprint = file_fingerprint(abs_path, &meta);
+            Some(PreparedNotifyChange::Upsert {
+                rel,
+                rel_key,
+                fingerprint,
+                size: meta.len(),
+            })
+        }
+        notify::EventKind::Remove(_) => Some(PreparedNotifyChange::Delete { rel, rel_key }),
+        _ => None,
+    }
+}
+
+/// Phase C for upserts: the content read (inspect = read + hash) plus, for
+/// supported text that actually changed, the baseline read + line diff —
+/// the expensive work the notify path must never do under the watcher
+/// lock. `None` when the file could not be read (vanished mid-flight).
+fn read_upsert_content(
+    snapshot_dir: &Path,
+    project_root: &Path,
+    rel: &Path,
+    existed_at_baseline: bool,
+    prev_hash: Option<[u8; 32]>,
+) -> Option<UpsertContent> {
+    let inspected = inspect_file(&project_root.join(rel)).ok()?;
+    let line_stats = match &inspected {
+        InspectedFile::Text(snapshot) if prev_hash != Some(snapshot.hash) => {
+            Some(
+                match std::fs::read_to_string(snapshot_dir.join("baseline").join(rel)) {
+                    Ok(baseline_str) => diff_stats(&baseline_str, &snapshot.text),
+                    // A tracked path whose baseline copy is unreadable:
+                    // counts unknown, report zeros (matches the historic
+                    // in-lock behavior).
+                    Err(_) if existed_at_baseline => (0, 0),
+                    Err(_) => diff_stats("", &snapshot.text),
+                },
+            )
+        }
+        _ => None,
+    };
+    Some(UpsertContent {
+        inspected,
+        line_stats,
+    })
+}
+
+/// Phase C for deletes: line count of the baseline copy (0 when the path
+/// never had a supported-text baseline). Baseline copies are written only
+/// by the constructor, so this read is race-free off-lock.
+fn deleted_baseline_line_count(snapshot_dir: &Path, rel: &Path) -> u32 {
+    std::fs::read_to_string(snapshot_dir.join("baseline").join(rel))
+        .map(|text| text.lines().count() as u32)
+        .unwrap_or(0)
+}
+
+/// Revalidation gate for phase D: does `current` (a fresh stat) still
+/// describe the same file state as `observed` (the pre-read stat)? Unlike
+/// cache trust ([`FileFingerprint::matches`]) — which must never serve
+/// stale data and therefore fails toward re-reading — this gate must never
+/// DROP a legitimate event: a component missing on either side (a failed
+/// change-signal query, an unreadable mtime) counts as unchanged, and only
+/// a component present on both sides that moved votes "changed".
+fn fingerprint_still_describes(current: &FileFingerprint, observed: &FileFingerprint) -> bool {
+    fn opt_component_eq<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+    current.size == observed.size
+        && opt_component_eq(current.mtime_nanos, observed.mtime_nanos)
+        && opt_component_eq(current.change_signal, observed.change_signal)
+        && opt_component_eq(current.file_id, observed.file_id)
+}
+
+/// Apply one notify path with the read phases OFF the shared watcher lock:
+/// snapshot under the lock, release, do the blocking I/O on the blocking
+/// pool, re-take and revalidate before publishing. See the pipeline notes
+/// above for the ordering contract.
+async fn apply_notify_path(
+    shared: &SharedFileWatcher,
+    project_root: &Path,
+    snapshot_dir: &Path,
+    abs_path: &Path,
+    kind: &notify::EventKind,
+) {
+    // Phase A off-lock: path resolution + the pre-read stat.
+    let prepared = tokio::task::spawn_blocking({
+        let project_root = project_root.to_path_buf();
+        let abs_path = abs_path.to_path_buf();
+        let kind = kind.clone();
+        move || prepare_notify_change(&project_root, &abs_path, &kind)
+    })
+    .await
+    .ok()
+    .flatten();
+    match prepared {
+        Some(PreparedNotifyChange::Upsert {
+            rel,
+            rel_key,
+            fingerprint,
+            size,
+        }) => {
+            // Phase B: the pre-read snapshot, briefly under the lock.
+            let stage = shared.lock().await.stage_upsert(&rel, size, &fingerprint);
+            let UpsertStage::Read {
+                existed_at_baseline,
+                prev_hash,
+            } = stage
+            else {
+                return;
+            };
+            // Phase C off-lock: read + hash + diff.
+            let content = tokio::task::spawn_blocking({
+                let snapshot_dir = snapshot_dir.to_path_buf();
+                let project_root = project_root.to_path_buf();
+                let rel = rel.clone();
+                move || {
+                    read_upsert_content(
+                        &snapshot_dir,
+                        &project_root,
+                        &rel,
+                        existed_at_baseline,
+                        prev_hash,
+                    )
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some(content) = content else {
+                return;
+            };
+            // Phase D: revalidate + publish under the lock.
+            shared
+                .lock()
+                .await
+                .publish_upsert(rel, rel_key, fingerprint, content);
+        }
+        Some(PreparedNotifyChange::Delete { rel, rel_key }) => {
+            let lines_removed = tokio::task::spawn_blocking({
+                let snapshot_dir = snapshot_dir.to_path_buf();
+                let rel = rel.clone();
+                move || deleted_baseline_line_count(&snapshot_dir, &rel)
+            })
+            .await
+            .unwrap_or(0);
+            shared
+                .lock()
+                .await
+                .publish_delete(rel, rel_key, lines_removed);
+        }
+        None => {}
+    }
+}
+
 /// Run the notify-based filesystem watcher. Shared state is updated under the
 /// async mutex on each event so snapshot / rollback operations see a
 /// consistent view.
@@ -2789,6 +3306,8 @@ async fn run_watcher_loop(
 
     let _watcher = watcher;
 
+    let snapshot_dir = { shared.lock().await.snapshot_dir.clone() };
+
     // Close the scan-to-watch gap: the construction scan ran before the
     // watch registration above, so a change landing between them has no
     // event. Re-sync the hash mirrors from disk (a fingerprint walk), drain
@@ -2797,7 +3316,7 @@ async fn run_watcher_loop(
     let resync_ok = { shared.lock().await.refresh_hashes_from_tree() };
     let mut drain_ok = true;
     while let Ok(res) = rx.try_recv() {
-        drain_ok &= apply_notify_result(&shared, res).await;
+        drain_ok &= apply_notify_result(&shared, &project_root, &snapshot_dir, res).await;
     }
     {
         let mut w = shared.lock().await;
@@ -2807,7 +3326,7 @@ async fn run_watcher_loop(
     }
 
     while let Some(res) = rx.recv().await {
-        let _ = apply_notify_result(&shared, res).await;
+        let _ = apply_notify_result(&shared, &project_root, &snapshot_dir, res).await;
     }
 
     shared.lock().await.live_index_degraded = true;
@@ -2819,19 +3338,26 @@ async fn run_watcher_loop(
 /// errors degrade the live index for the rest of the process. Returns
 /// whether the result was applied cleanly (a failed rescan re-sync or a
 /// notify error both degrade and return `false`).
+///
+/// Per-event file I/O runs off the watcher lock via [`apply_notify_path`];
+/// the rescan re-sync deliberately stays under the lock — it rebuilds the
+/// mirrors wholesale and must be atomic against the other lock users.
 async fn apply_notify_result(
     shared: &SharedFileWatcher,
+    project_root: &Path,
+    snapshot_dir: &Path,
     res: Result<notify::Event, notify::Error>,
 ) -> bool {
     match res {
         Ok(notify_event) => {
-            let mut w = shared.lock().await;
-            let mut ok = true;
-            if notify_event.need_rescan() {
-                ok = w.refresh_hashes_from_tree();
-            }
+            let ok = if notify_event.need_rescan() {
+                shared.lock().await.refresh_hashes_from_tree()
+            } else {
+                true
+            };
             for path in &notify_event.paths {
-                w.process_change(path, &notify_event.kind);
+                apply_notify_path(shared, project_root, snapshot_dir, path, &notify_event.kind)
+                    .await;
             }
             ok
         }
@@ -4537,5 +5063,460 @@ mod tests {
             std::fs::read(tmp_snap.path().join("baseline/thing")).unwrap(),
             b"file again"
         );
+    }
+
+    /// Object-index parity + repair: consecutive walks trust the index
+    /// instead of stat'ing `objects/{hash}` per file, and a blob deleted
+    /// behind the index's back is repaired at restore time so the content
+    /// becomes restorable again on the next walk — the
+    /// restorable-by-construction contract survives an index divergence.
+    #[test]
+    fn object_index_repair_keeps_restorability() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.set_racy_window_for_tests(0);
+
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        let h1 = w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"].clone();
+        assert!(w.object_index.contains(&h1), "stored blob is indexed");
+
+        // Parity: an untouched tree costs zero reads AND zero object stats
+        // (the walk consults the index, which this test then deliberately
+        // desyncs below to prove it is what the walk trusts).
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        assert_eq!(w.files_read_in_last_scan, 0);
+
+        // Delete the blob behind the index's back, then change the file so
+        // a rollback to R1 must read that blob.
+        std::fs::remove_file(tmp_snap.path().join("objects").join(&h1)).unwrap();
+        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        w.on_round_complete("R3".into(), None, None).unwrap();
+
+        // The walk above still recorded R1's hash as restorable (the index
+        // is stale-positive); the failed restore is the inconsistency
+        // signal that repairs it.
+        let res = w.rollback(r1).unwrap();
+        assert_eq!(res.files_reverted, 0, "missing blob: nothing restored");
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+        assert!(
+            !w.object_index.contains(&h1),
+            "failed restore must repair the index"
+        );
+
+        // Recreate the original content: the next walk finds the hash
+        // unindexed and re-stores the blob — restorability is back.
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        w.on_round_complete("R4".into(), None, None).unwrap();
+        assert!(tmp_snap.path().join("objects").join(&h1).exists());
+        assert!(w.object_index.contains(&h1));
+        std::fs::write(root.join("a.txt"), b"v5").unwrap();
+        w.on_round_complete("R5".into(), None, None).unwrap();
+        w.rollback(r1).unwrap();
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+    }
+
+    /// A blob present on disk but missing from the index (stale-negative)
+    /// is re-adopted by the walk's write path without rewriting it.
+    #[test]
+    fn stale_negative_object_index_is_repaired_by_walk() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.set_racy_window_for_tests(0);
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        let h1 = w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"].clone();
+
+        // Desync: forget the blob, then rewrite the same content so the
+        // fingerprint moves and the walk re-reads the file.
+        w.object_index.remove(&h1);
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        w.on_round_complete("R2".into(), None, None).unwrap();
+        assert!(w.object_index.contains(&h1), "walk re-adopts the blob");
+        assert!(tmp_snap.path().join("objects").join(&h1).exists());
+    }
+
+    /// A fresh watcher over an existing store seeds its object index from
+    /// the `objects/` listing, so resumed sessions keep the fast path.
+    #[test]
+    fn object_index_is_seeded_on_resume() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let mut w = make_watcher(root, tmp_snap.path());
+        w.on_round_complete("R1".into(), None, None).unwrap();
+        let r1 = w.history.current_head_id.unwrap();
+        let h1 = w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"].clone();
+        drop(w);
+
+        let resumed = make_watcher(root, tmp_snap.path());
+        assert!(resumed.object_index.contains(&h1));
+    }
+
+    #[test]
+    fn round_routing_matches_own_root_and_fails_open() {
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        assert!(round_targets_watcher_root(tmp_a.path(), None));
+        assert!(round_targets_watcher_root(tmp_a.path(), Some(tmp_a.path())));
+        assert!(!round_targets_watcher_root(
+            tmp_a.path(),
+            Some(tmp_b.path())
+        ));
+    }
+
+    /// End-to-end round routing through the bus listener: a round carrying
+    /// a DIFFERENT root records nothing in this watcher's store, while a
+    /// root-less round (fail-open) and a same-root round both record.
+    #[tokio::test]
+    async fn foreign_root_rounds_skip_walk_rootless_rounds_still_record() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let foreign_root = TempDir::new().unwrap();
+        let root = tmp_proj.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), b"content").unwrap();
+
+        let bus = EventBus::new();
+        let watcher = FileWatcher::new(root.clone(), tmp_snap.path().to_path_buf(), bus.clone())
+            .expect("watcher");
+        let shared = Arc::new(AsyncMutex::new(watcher));
+        let rx = bus.subscribe();
+        let listener = tokio::spawn(run_round_complete_listener(
+            shared.clone(),
+            rx,
+            root.clone(),
+        ));
+
+        let send_round = |round: usize, project_root: Option<PathBuf>| {
+            bus.send(AppEvent::RoundComplete {
+                session_id: None,
+                round,
+                turns_in_round: 1,
+                native_message_count: None,
+                project_root,
+            });
+        };
+        send_round(1, Some(foreign_root.path().to_path_buf()));
+        send_round(2, None);
+        send_round(3, Some(root.clone()));
+
+        // The listener applies events in order, so observing the two
+        // expected rounds proves the foreign one (sent first) was skipped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let recorded = shared.lock().await.history.rounds.len();
+            if recorded >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener never recorded the expected rounds"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let w = shared.lock().await;
+        assert_eq!(
+            w.history.rounds.len(),
+            2,
+            "foreign-root round must not create a round here"
+        );
+        assert_eq!(
+            w.history
+                .rounds
+                .iter()
+                .map(|r| r.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Round 2", "Round 3"],
+            "the root-less and same-root rounds recorded, in order"
+        );
+        listener.abort();
+    }
+
+    /// Cross-boot baseline reuse: a second boot over an unchanged tree
+    /// rewrites zero baseline copies (the stored fingerprint matches), a
+    /// changed file rewrites, and a type-flipped path still reconciles
+    /// while its unchanged siblings keep the fast path.
+    #[test]
+    fn baseline_reuse_across_boots_skips_unchanged_rewrites() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("keep.txt"), b"kept content\n").unwrap();
+        std::fs::write(root.join("change.txt"), b"original\n").unwrap();
+        std::fs::write(root.join("thing"), b"i am a file").unwrap();
+
+        let boot = |root: &Path, snap: &Path| {
+            FileWatcher::new_with_racy_window(
+                root.to_path_buf(),
+                snap.to_path_buf(),
+                EventBus::new(),
+                0,
+            )
+            .expect("watcher")
+        };
+
+        let first = boot(root, tmp_snap.path());
+        assert_eq!(first.baseline_files_rewritten_in_new, 3);
+        drop(first);
+
+        // Boot 2 over the untouched tree: zero baseline writes, state
+        // fully adopted from the previous manifest.
+        let second = boot(root, tmp_snap.path());
+        assert_eq!(
+            second.baseline_files_rewritten_in_new, 0,
+            "an unchanged tree must reuse every baseline entry"
+        );
+        assert_eq!(
+            second
+                .baseline_manifest
+                .get("keep.txt")
+                .map(|m| m.hash.as_str()),
+            Some(hex_encode(&sha256_hash(b"kept content\n")).as_str())
+        );
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/keep.txt")).unwrap(),
+            b"kept content\n"
+        );
+        drop(second);
+
+        // Boot 3: one changed file, one file→dir flip. The changed file
+        // and the flipped path rewrite; the untouched sibling still
+        // reuses.
+        std::fs::write(root.join("change.txt"), b"rewritten\n").unwrap();
+        std::fs::remove_file(root.join("thing")).unwrap();
+        std::fs::create_dir_all(root.join("thing")).unwrap();
+        std::fs::write(root.join("thing/inner.rs"), b"nested now").unwrap();
+        let third = boot(root, tmp_snap.path());
+        assert_eq!(
+            third.baseline_files_rewritten_in_new, 2,
+            "only the changed file and the flipped path rewrite"
+        );
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/change.txt")).unwrap(),
+            b"rewritten\n"
+        );
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/thing/inner.rs")).unwrap(),
+            b"nested now"
+        );
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/keep.txt")).unwrap(),
+            b"kept content\n"
+        );
+    }
+
+    /// The reuse gate distrusts a damaged shadow copy: a truncated
+    /// baseline file fails the size check and heals via a full rewrite
+    /// even though the SOURCE file's fingerprint still matches.
+    #[test]
+    fn baseline_reuse_heals_truncated_shadow_copies() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"full content here\n").unwrap();
+        let first = FileWatcher::new_with_racy_window(
+            root.to_path_buf(),
+            tmp_snap.path().to_path_buf(),
+            EventBus::new(),
+            0,
+        )
+        .expect("watcher");
+        drop(first);
+
+        std::fs::write(tmp_snap.path().join("baseline/a.txt"), b"torn").unwrap();
+        let second = FileWatcher::new_with_racy_window(
+            root.to_path_buf(),
+            tmp_snap.path().to_path_buf(),
+            EventBus::new(),
+            0,
+        )
+        .expect("watcher");
+        assert_eq!(second.baseline_files_rewritten_in_new, 1);
+        assert_eq!(
+            std::fs::read(tmp_snap.path().join("baseline/a.txt")).unwrap(),
+            b"full content here\n"
+        );
+    }
+
+    /// The production racy window really gates the cross-boot fast path: an
+    /// entry recorded moments after its file was written is NOT reused (it
+    /// could describe a same-granule torn observation).
+    #[test]
+    fn baseline_reuse_respects_racy_window() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        std::fs::write(root.join("a.txt"), b"fresh write").unwrap();
+        let first = make_watcher(root, tmp_snap.path());
+        assert_eq!(first.baseline_files_rewritten_in_new, 1);
+        drop(first);
+
+        // Second boot immediately after: the stored mtime sits inside the
+        // production racy window of its recording time, so the entry is
+        // distrusted and the file re-baselines.
+        let second = make_watcher(root, tmp_snap.path());
+        assert_eq!(
+            second.baseline_files_rewritten_in_new, 1,
+            "a racy-window entry must not be reused"
+        );
+    }
+
+    /// Off-lock pipeline: a read that on-disk state moved past while the
+    /// watcher lock was released is dropped at publish time (revalidation),
+    /// and the follow-up event for the newer write carries the truth.
+    #[test]
+    fn stale_offlock_read_is_dropped_and_follow_up_event_wins() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let file = root.join("f.txt");
+        std::fs::write(&file, b"zero\n").unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut w = FileWatcher::new(root.to_path_buf(), tmp_snap.path().to_path_buf(), bus)
+            .expect("watcher");
+
+        let modify = notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        ));
+
+        // Event 1: phases A–C run against "one\n"…
+        std::fs::write(&file, b"one\n").unwrap();
+        let Some(PreparedNotifyChange::Upsert {
+            rel,
+            rel_key,
+            fingerprint,
+            size,
+        }) = prepare_notify_change(root, &file, &modify)
+        else {
+            panic!("expected upsert");
+        };
+        let UpsertStage::Read {
+            existed_at_baseline,
+            prev_hash,
+        } = w.stage_upsert(&rel, size, &fingerprint)
+        else {
+            panic!("expected read stage");
+        };
+        let content =
+            read_upsert_content(tmp_snap.path(), root, &rel, existed_at_baseline, prev_hash)
+                .expect("content");
+
+        // …but a second write lands before publish (as a round scan or
+        // rollback interleave would allow). Different length, so the
+        // fingerprint moves on every platform.
+        std::fs::write(&file, b"two-longer\n").unwrap();
+        w.publish_upsert(rel.clone(), rel_key, fingerprint, content);
+        assert!(rx.try_recv().is_err(), "stale read must not publish");
+        assert_eq!(
+            w.hashes.get(&rel),
+            Some(&sha256_hash(b"zero\n")),
+            "stale read must not overwrite the mirror"
+        );
+
+        // The queued event for the second write publishes the fresh state.
+        w.process_change(&file, &modify);
+        match rx.try_recv().expect("follow-up event") {
+            AppEvent::FileChanged { path, kind, .. } => {
+                assert_eq!(path, "f.txt");
+                assert_eq!(kind, FileChangeKind::Modified);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(w.hashes.get(&rel), Some(&sha256_hash(b"two-longer\n")));
+    }
+
+    /// Sequential processing publishes rapid same-path changes in order
+    /// with the correct final content.
+    #[test]
+    fn rapid_double_change_publishes_in_order() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let file = root.join("f.txt");
+        std::fs::write(&file, b"zero\n").unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut w = FileWatcher::new(root.to_path_buf(), tmp_snap.path().to_path_buf(), bus)
+            .expect("watcher");
+        let modify = notify::EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        ));
+
+        std::fs::write(&file, b"one\n").unwrap();
+        w.process_change(&file, &modify);
+        std::fs::write(&file, b"two-longer\n").unwrap();
+        w.process_change(&file, &modify);
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::FileChanged { path, kind, .. } = event {
+                assert_eq!(path, "f.txt");
+                kinds.push(kind);
+            }
+        }
+        assert_eq!(
+            kinds,
+            vec![FileChangeKind::Modified, FileChangeKind::Modified]
+        );
+        assert_eq!(
+            w.hashes.get(Path::new("f.txt")),
+            Some(&sha256_hash(b"two-longer\n")),
+            "the final mirror carries the last write"
+        );
+    }
+
+    /// Delete revalidation: a Remove event for a path that exists again by
+    /// publish time (atomic-rename save, interleaved restore) is dropped —
+    /// the recreate's own event supersedes it.
+    #[test]
+    fn delete_event_for_recreated_path_is_dropped() {
+        let tmp_proj = TempDir::new().unwrap();
+        let tmp_snap = TempDir::new().unwrap();
+        let root = tmp_proj.path();
+        let file = root.join("f.txt");
+        std::fs::write(&file, b"zero\n").unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut w = FileWatcher::new(root.to_path_buf(), tmp_snap.path().to_path_buf(), bus)
+            .expect("watcher");
+
+        // The file was deleted and recreated before the Remove event is
+        // processed (an editor's atomic-rename save).
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, b"back-different\n").unwrap();
+        w.process_change(
+            &file,
+            &notify::EventKind::Remove(notify::event::RemoveKind::File),
+        );
+        assert!(rx.try_recv().is_err(), "no Deleted event for a live path");
+        assert_eq!(
+            w.hashes.get(Path::new("f.txt")),
+            Some(&sha256_hash(b"zero\n")),
+            "the mirror survives the dropped delete"
+        );
+
+        // The Create event queued behind reports one clean modification.
+        w.process_change(
+            &file,
+            &notify::EventKind::Create(notify::event::CreateKind::File),
+        );
+        match rx.try_recv().expect("create-after-rename event") {
+            AppEvent::FileChanged { path, kind, .. } => {
+                assert_eq!(path, "f.txt");
+                assert_eq!(kind, FileChangeKind::Modified);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

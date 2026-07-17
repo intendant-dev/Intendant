@@ -209,9 +209,13 @@ external CLI's edits show up the same as Intendant's own. It does two jobs:
    agent works.
 2. **Per-round content-addressed history** for rewind / redo / branching.
 
-On every `AppEvent::RoundComplete`, the watcher records a `HistoryRound`
-capturing the *full* project state as a `path → sha256` map, plus the subset of
-paths that changed. Content blobs are stored once in a content-addressed
+On every `AppEvent::RoundComplete` that belongs to its root, the watcher
+records a `HistoryRound` capturing the *full* project state as a
+`path → sha256` map, plus the subset of paths that changed. Rounds are
+routed by the event's `project_root`: a round emitted by a session working
+a *different* root (a worktree sub-agent, an external session supervised
+elsewhere) is skipped, while a round with no resolvable root fails open
+and records as before. Content blobs are stored once in a content-addressed
 `objects/` directory, so identical content across rounds costs no extra disk.
 Each round also records `turn_count` and `native_message_count`, which
 conversation rollback uses to truncate the native conversation correctly.
