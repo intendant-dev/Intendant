@@ -794,6 +794,31 @@ fn bg_desc_from_bash_input(input: &serde_json::Value) -> Option<String> {
     None
 }
 
+/// One armed background command (`task_started` → `task_notification`
+/// lifetime). `output_file` fills once the launch ack announces a path
+/// (its `is_none` gates re-parsing) and stays `None` otherwise — never
+/// guessed. The full inspector record — backend task id, launch epoch,
+/// terminal status — lives in `crate::background_tasks`, mirrored at
+/// each transition; this entry keeps only what the reader itself reads.
+#[derive(Debug, Clone)]
+struct BgArmedTask {
+    tool_use_id: String,
+    description: String,
+    output_file: Option<std::path::PathBuf>,
+}
+
+/// A path string from the wire (launch-ack parse or a notification's
+/// `output_file`), admitted only when non-empty and absolute — the
+/// notification fixture with `"output_file":""` is real (probed), and a
+/// relative path is ambiguous about whose cwd anchors it.
+fn bg_wire_output_path(value: Option<&str>) -> Option<std::path::PathBuf> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 /// Plan entries from a `TodoWrite` tool_use input, in `PlanUpdate` shape:
 /// `(content, priority, status)` — todos carry no priority, and statuses
 /// normalize to the shared plan vocabulary ("in_progress" → "inprogress").
@@ -987,12 +1012,15 @@ struct CcReader {
     /// a disarm exists. Ids whose launch never materialized (denied,
     /// failed) idle here inertly, like `plan_tools` orphans.
     bg_task_candidates: HashMap<String, String>,
-    /// The armed background-command set: `(tool_use_id, description)` in
-    /// launch order. Non-empty at turn end means the session parks
-    /// waiting on background work instead of going idle; entries disarm
-    /// on their `system:task_notification` (completion, failure, or
-    /// kill), which — arriving between turns — is the wake signal.
-    bg_armed: Vec<(String, String)>,
+    /// The armed background-command set, in launch order. Non-empty at
+    /// turn end means the session parks waiting on background work
+    /// instead of going idle; entries disarm on their
+    /// `system:task_notification` (completion, failure, or kill), which
+    /// — arriving between turns — is the wake signal. Every arm/ack/
+    /// disarm is mirrored into the inspector registry
+    /// (`crate::background_tasks`) under the backend session id, which
+    /// is what the gateway's background-task routes serve.
+    bg_armed: Vec<BgArmedTask>,
     /// Latest rate-limit window per `rateLimitType` (`five_hour`,
     /// `seven_day`) from `rate_limit_event` — attached to outgoing usage
     /// snapshots for the vitals limit gauges. BTreeMap for stable order.
@@ -1118,7 +1146,11 @@ impl CcReader {
     /// Sync the armed background-command set into the activity machine
     /// (call after every arm/disarm).
     fn observe_bg_tasks(&self, out: &mut CcLineOutcome) {
-        let tasks: Vec<String> = self.bg_armed.iter().map(|(_, desc)| desc.clone()).collect();
+        let tasks: Vec<String> = self
+            .bg_armed
+            .iter()
+            .map(|task| task.description.clone())
+            .collect();
         self.observe_activity(ActivityObs::BackgroundTasksChanged { tasks }, out);
     }
 
@@ -1351,6 +1383,17 @@ impl CcReader {
         if self.announced_session_id.as_deref() == Some(id) {
             return;
         }
+        // Fresh adoption of an id by THIS reader: inspector-registry
+        // records under it belong to a previous process's background
+        // children (a resumed CLI does not own them — their task events
+        // will never arrive here), and on an id CHANGE the old id's
+        // records lose their observer the same way. Clear both sides;
+        // this precedes any arm this reader performs, since adoption
+        // happens before the line's handler runs.
+        if let Some(previous) = self.announced_session_id.as_deref() {
+            crate::background_tasks::clear_session(previous);
+        }
+        crate::background_tasks::clear_session(id);
         self.announced_session_id = Some(id.to_string());
         self.shared.set_session_id(id);
         out.events.push(AgentEvent::NativeSessionId {
@@ -1533,12 +1576,12 @@ impl CcReader {
         // The correlation key is recorded for every task kind: it only
         // feeds task_notification's id resolution, and a stray entry for a
         // Bash task resolves to an id with no registered child (no-op).
-        if let Some(task_id) = msg
+        let task_id = msg
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+            .filter(|s| !s.is_empty());
+        if let Some(task_id) = task_id {
             self.task_ids
                 .insert(task_id.to_string(), tool_use_id.to_string());
         }
@@ -1552,7 +1595,12 @@ impl CcReader {
         if msg.get("task_type").and_then(|v| v.as_str()) == Some("local_bash") {
             let main_thread = self.bg_task_candidates.contains_key(tool_use_id)
                 || matches!(self.open_tools.get(tool_use_id), Some(None));
-            if main_thread && !self.bg_armed.iter().any(|(id, _)| id == tool_use_id) {
+            if main_thread
+                && !self
+                    .bg_armed
+                    .iter()
+                    .any(|task| task.tool_use_id == tool_use_id)
+            {
                 let desc = self
                     .bg_task_candidates
                     .remove(tool_use_id)
@@ -1562,7 +1610,28 @@ impl CcReader {
                             .and_then(bg_desc_snippet)
                     })
                     .unwrap_or_else(|| "background command".to_string());
-                self.bg_armed.push((tool_use_id.to_string(), desc));
+                let started_at_epoch = crate::session_activity::epoch_seconds();
+                // Mirror the arm into the inspector registry, keyed by
+                // the backend session id (adopted before any handler
+                // runs — every wire line carries it). Wire-first: no
+                // task_id on the event means no addressable inspector
+                // row, but the parked claim still arms.
+                if let (Some(session), Some(task_id)) =
+                    (self.announced_session_id.as_deref(), task_id)
+                {
+                    crate::background_tasks::record_started(
+                        session,
+                        task_id,
+                        tool_use_id,
+                        &desc,
+                        started_at_epoch,
+                    );
+                }
+                self.bg_armed.push(BgArmedTask {
+                    tool_use_id: tool_use_id.to_string(),
+                    description: desc,
+                    output_file: None,
+                });
                 self.observe_bg_tasks(out);
             }
             return;
@@ -1628,8 +1697,26 @@ impl CcReader {
         // self-initiated round) — attribute the wake in the log BEFORE the
         // round's activity. Mid-turn (a task finishing while the agent
         // works, or its own TaskStop) it is calm bookkeeping.
-        if let Some(pos) = self.bg_armed.iter().position(|(id, _)| id == &tool_use_id) {
-            let (_, desc) = self.bg_armed.remove(pos);
+        if let Some(pos) = self
+            .bg_armed
+            .iter()
+            .position(|task| task.tool_use_id == tool_use_id)
+        {
+            let BgArmedTask {
+                description: desc, ..
+            } = self.bg_armed.remove(pos);
+            // Finish the inspector record: the notification's
+            // `output_file` is the authoritative path statement (probed:
+            // present on completed/failed/stopped alike, sometimes "").
+            if let Some(session) = self.announced_session_id.as_deref() {
+                crate::background_tasks::record_finished(
+                    session,
+                    &tool_use_id,
+                    crate::background_tasks::BackgroundTaskStatus::from_wire_terminal(status),
+                    bg_wire_output_path(msg.get("output_file").and_then(|v| v.as_str())),
+                    crate::session_activity::epoch_seconds(),
+                );
+            }
             let woke =
                 !self.shared.activity_turn_active() && matches!(status, "completed" | "failed");
             if woke {
@@ -1850,7 +1937,7 @@ impl CcReader {
                         self.observe_activity(ActivityObs::ToolsRunning, out);
                     }
                 }
-                "tool_result" => self.tool_result_events(block, out, false),
+                "tool_result" => self.tool_result_events(block, out, false, None),
                 _ => {}
             }
         }
@@ -1886,7 +1973,7 @@ impl CcReader {
         };
         for block in content {
             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
-                self.tool_result_events(block, out, async_launch);
+                self.tool_result_events(block, out, async_launch, msg.get("tool_use_result"));
             }
         }
     }
@@ -1896,6 +1983,7 @@ impl CcReader {
         block: &serde_json::Value,
         out: &mut CcLineOutcome,
         async_launch: bool,
+        tool_use_result: Option<&serde_json::Value>,
     ) {
         let tool_id = block
             .get("tool_use_id")
@@ -1973,6 +2061,40 @@ impl CcReader {
                 out.log("warn", format!("{plan_tool} failed: {}", message.trim()));
             }
             return;
+        }
+
+        // An armed background command's launch ack: the CLI's only
+        // running-phase statement of WHERE output is being written.
+        // Structured field first — live-probed 2.1.211: the envelope
+        // `tool_use_result` carries only `backgroundTaskId` (no path), so
+        // the probe is for a future CLI that adds one — then the ack
+        // text ("Output is being written to: <path>."). No parse → the
+        // task stays listed without a peek affordance, never a guessed
+        // path. task_started precedes this ack (probed order), so the
+        // armed entry already exists.
+        if !is_error
+            && self
+                .bg_armed
+                .iter()
+                .any(|task| task.tool_use_id == tool_id && task.output_file.is_none())
+        {
+            let structured = tool_use_result
+                .and_then(|r| r.get("outputFile").or_else(|| r.get("output_file")))
+                .and_then(|v| v.as_str());
+            let announced = bg_wire_output_path(structured)
+                .or_else(|| crate::background_tasks::parse_output_path_from_ack(&content_text));
+            if let Some(path) = announced {
+                if let Some(session) = self.announced_session_id.as_deref() {
+                    crate::background_tasks::record_output_file(session, &tool_id, path.clone());
+                }
+                if let Some(task) = self
+                    .bg_armed
+                    .iter_mut()
+                    .find(|task| task.tool_use_id == tool_id)
+                {
+                    task.output_file = Some(path);
+                }
+            }
         }
 
         // Build the failure snippet before the delta event so the (possibly
@@ -2288,7 +2410,11 @@ impl CcReader {
         // the TurnSettled above) — say so next to the round bookkeeping,
         // so "round complete" never reads as done/stuck while work runs.
         if !self.bg_armed.is_empty() {
-            let descs: Vec<&str> = self.bg_armed.iter().map(|(_, d)| d.as_str()).collect();
+            let descs: Vec<&str> = self
+                .bg_armed
+                .iter()
+                .map(|task| task.description.as_str())
+                .collect();
             out.log(
                 "info",
                 format!(
@@ -3332,6 +3458,12 @@ impl ExternalAgent for ClaudeCodeAgent {
     }
 
     async fn shutdown(&mut self) -> Result<(), CallerError> {
+        // The CLI (and its supervision of background commands) is going
+        // away: nobody will confirm task state again, so the inspector
+        // registry must not keep claiming it.
+        if let Some(session) = self.shared.session_id() {
+            crate::background_tasks::clear_session(&session);
+        }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
             let _ = handle.await;
@@ -3358,6 +3490,11 @@ impl ExternalAgent for ClaudeCodeAgent {
 
 impl Drop for ClaudeCodeAgent {
     fn drop(&mut self) {
+        // Backstop for the shutdown-path clear (drop without shutdown):
+        // a dead wrapper's inspector records claim knowledge nobody has.
+        if let Some(session) = self.shared.session_id() {
+            crate::background_tasks::clear_session(&session);
+        }
         if let Some(ref mut child) = self.child {
             let child_pid = child.id();
             let _ = child.start_kill();
@@ -3776,6 +3913,109 @@ mod tests {
             r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":1,"session_id":"s1"}"#,
         );
         assert_eq!(last_activity(&out).unwrap().state, S::Idle);
+    }
+
+    /// The inspector registry (`crate::background_tasks`) mirrors the
+    /// armed lifecycle with the wire's output-path statements: the
+    /// launch-ack TEXT announces the path while running (the probed
+    /// 2.1.211 envelope `tool_use_result` carries only
+    /// `backgroundTaskId`; a structured `outputFile` from a future CLI
+    /// would win — second command below), and the notification's
+    /// `output_file` is the authoritative final word. A fresh reader
+    /// re-adopting the id clears the records — a resumed CLI does not
+    /// own the old process's background children. Session id is unique
+    /// to this test: the registry is process-global.
+    #[test]
+    fn background_task_registry_mirrors_lifecycle_and_output_paths() {
+        use crate::background_tasks::{self, BackgroundTaskStatus};
+        let sid = "cc-bg-inspector-e2e-0001";
+        // Host-shaped absolute paths: the CLI emits native paths and the
+        // absoluteness gate is a host judgment ("/tmp/x" is not absolute
+        // on Windows). `json` escapes the Windows backslashes for the
+        // wire fixtures.
+        let abs = |name: &str| {
+            if cfg!(windows) {
+                format!("C:\\cc-tasks\\{name}")
+            } else {
+                format!("/tmp/cc-tasks/{name}")
+            }
+        };
+        let json = |path: &str| path.replace('\\', "\\\\");
+        let (ack_path, final_path, structured_path) = (
+            abs("breg1.output"),
+            abs("breg1-final.output"),
+            abs("breg2.output"),
+        );
+        let mut reader = test_reader();
+        reader.shared.observe_activity(ActivityObs::TurnDispatched);
+        reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_bgreg1","name":"Bash","input":{{"command":"sleep 8 && echo DONE","run_in_background":true}}}}]}},"session_id":"{sid}"}}"#,
+        ));
+        reader.process_line(&format!(
+            r#"{{"type":"system","subtype":"task_started","task_id":"breg1","tool_use_id":"toolu_bgreg1","description":"sleep 8 && echo DONE","task_type":"local_bash","session_id":"{sid}"}}"#,
+        ));
+        let tasks = background_tasks::tasks_for_session(sid);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "breg1");
+        assert_eq!(tasks[0].status, BackgroundTaskStatus::Running);
+        assert!(tasks[0].output_file.is_none(), "no path before the ack");
+
+        // Launch ack (probed shape): the text names the output file.
+        reader.process_line(&format!(
+            r#"{{"type":"user","tool_use_result":{{"stdout":"","stderr":"","interrupted":false,"isImage":false,"noOutputExpected":false,"backgroundTaskId":"breg1"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg1","content":"Command running in background with ID: breg1. Output is being written to: {}. You will be notified when it completes. To check interim output, use Read on that file path."}}]}},"session_id":"{sid}"}}"#,
+            json(&ack_path),
+        ));
+        let task = background_tasks::find_task(sid, "breg1").expect("registered");
+        assert_eq!(task.status, BackgroundTaskStatus::Running);
+        assert_eq!(
+            task.output_file.as_deref(),
+            Some(std::path::Path::new(&ack_path))
+        );
+
+        // Park, then the completion notification: finished record
+        // retained, its authoritative path adopted.
+        reader.process_line(&format!(
+            r#"{{"type":"result","subtype":"success","is_error":false,"result":"ok","num_turns":2,"session_id":"{sid}"}}"#,
+        ));
+        reader.process_line(&format!(
+            r#"{{"type":"system","subtype":"task_notification","task_id":"breg1","tool_use_id":"toolu_bgreg1","status":"completed","output_file":"{}","summary":"done","session_id":"{sid}"}}"#,
+            json(&final_path),
+        ));
+        let task = background_tasks::find_task(sid, "breg1").expect("retained after finish");
+        assert_eq!(task.status, BackgroundTaskStatus::Completed);
+        assert!(task.ended_at_epoch.is_some());
+        assert_eq!(
+            task.output_file.as_deref(),
+            Some(std::path::Path::new(&final_path))
+        );
+
+        // Second command: a (future-CLI) structured outputFile beats the
+        // text, which here carries no marker at all.
+        reader.process_line(&format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"toolu_bgreg2","name":"Bash","input":{{"command":"sleep 300","run_in_background":true}}}}]}},"session_id":"{sid}"}}"#,
+        ));
+        reader.process_line(&format!(
+            r#"{{"type":"system","subtype":"task_started","task_id":"breg2","tool_use_id":"toolu_bgreg2","description":"sleep 300","task_type":"local_bash","session_id":"{sid}"}}"#,
+        ));
+        reader.process_line(&format!(
+            r#"{{"type":"user","tool_use_result":{{"backgroundTaskId":"breg2","outputFile":"{}"}},"message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_bgreg2","content":"Command running in background with ID: breg2."}}]}},"session_id":"{sid}"}}"#,
+            json(&structured_path),
+        ));
+        let task = background_tasks::find_task(sid, "breg2").expect("second command registered");
+        assert_eq!(
+            task.output_file.as_deref(),
+            Some(std::path::Path::new(&structured_path))
+        );
+
+        // A fresh reader adopting the same backend id clears the records.
+        let mut resumed = test_reader();
+        resumed.process_line(&format!(
+            r#"{{"type":"system","subtype":"init","session_id":"{sid}"}}"#,
+        ));
+        assert!(
+            !background_tasks::session_known(sid),
+            "re-adoption clears a previous process's records"
+        );
     }
 
     /// Write-ish tool_use blocks emit their structured paths alongside

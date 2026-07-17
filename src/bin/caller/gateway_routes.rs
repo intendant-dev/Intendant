@@ -246,6 +246,11 @@ pub(crate) enum RouteHandlerId {
     /// mechanical migration.
     SessionSubRouter,
     SessionForkPoints,
+    /// Background-task inspector list (supervised Claude Code sessions).
+    SessionBackgroundTasks,
+    /// Read-only tail of one background task's output file (path served
+    /// exclusively from the daemon-side task registry).
+    SessionBackgroundTaskOutput,
     McAnchors,
     McRecords,
     McFission,
@@ -1063,6 +1068,43 @@ pub(crate) static ROUTES: &[Route] = &[
         "Unified fork-point catalog for a session (anchors + eligibility, backend-tagged)",
     )
     .with_tunnel(tunnel_method("api_session_fork_points")),
+    // ── Background-task inspector (supervised Claude Code): the list and
+    //    the read-only output peek. Like fork-points, declared ahead of
+    //    the sub-router group so the leaves beat its catch-alls. The
+    //    output route serves paths exclusively from the daemon-side task
+    //    registry — the client names a task id, never a path.
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("background-tasks"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionBackgroundTasks,
+        "Background tasks a supervised session announced (id, description, status, output availability)",
+    )
+    .with_tunnel(tunnel_method("api_session_background_tasks")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Segments(
+            "/api/session",
+            &[
+                SegmentSpec::Capture("id"),
+                SegmentSpec::Literal("background-tasks"),
+                SegmentSpec::Capture("task"),
+                SegmentSpec::Literal("output"),
+            ],
+        ),
+        PeerOperation::SessionInspect,
+        BodyPolicy::None,
+        RouteHandlerId::SessionBackgroundTaskOutput,
+        "Tail of one background task's output file (tail_kb query, capped; registry-resolved path)",
+    )
+    .with_tunnel(tunnel_method("api_session_background_task_output")),
     // ── Session detail + artifacts sub-router. Method-explicit ports of
     //    the method-blind legacy catch-all: the classifier's historical
     //    split (current/* manage-gated on every method; {id} inspect on
