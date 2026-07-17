@@ -250,9 +250,11 @@ function dashboardControlTunnelIsPrimaryEventLane() {
 // status. The promotion is derived, never stored: a browser that can
 // open the /ws never enters it; one that cannot re-derives it each load.
 const DASHBOARD_LEGACY_WS_FALLBACK_MS = 3000;
-let dashboardControlAutoFallback = false;
-let dashboardLegacyWsConnected = false;
-let dashboardLegacyWsEverConnected = false;
+// (dashboardControlAutoFallback / dashboardLegacyWsConnected /
+// dashboardLegacyWsEverConnected are declared in
+// 31-init-identity-fleet.js with the early state: the #files deep link
+// reaches dashboardControlTransportEnabled / TunnelIsPrimaryEventLane
+// during fragment 48's script evaluation — the deep-link TDZ rule.)
 let dashboardLegacyWsWatchdog = null;
 // Visibility-aware quiescence: Safari throttles background-tab timers into
 // uselessness, so probing/reconnect churn while hidden mostly burns cycles
