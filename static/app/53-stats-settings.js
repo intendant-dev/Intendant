@@ -625,8 +625,9 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 // force). The corpus is a couple of MB and changes slowly; a short TTL
 // makes tab flips free while keeping the data fresh. An explicit
 // {ignoreTtl:true} (a manual Refresh affordance) still forces through.
-const STATS_USAGE_FORCE_TTL_MS = 45_000;
-const statsUsageCorpusFetchedAt = new Map(); // hostId -> last real fetch (ms)
+// (STATS_USAGE_FORCE_TTL_MS and statsUsageCorpusFetchedAt are declared in
+// 31-init-identity-fleet.js with the early state: a #stats deep link
+// reaches them during script evaluation — the deep-link TDZ rule.)
 
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
