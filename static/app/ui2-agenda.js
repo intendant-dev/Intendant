@@ -138,6 +138,70 @@ function agendaProvenanceLine(item) {
   return escapeHtml(parts.join(' · '));
 }
 
+// Scheduled-session effect (A5): render the manifest under review, its
+// digest, and the approval state. Approval is an owner-surface act — the
+// dashboard is one, so the Approve button lives here; it carries the digest
+// of exactly the revision rendered, so what you approve is what you read
+// (a concurrent re-propose makes the click fail with "digest mismatch").
+function agendaEffectBlock(item) {
+  const effect = (item.effects || [])[0];
+  if (!effect || !effect.manifest) return '';
+  const manifest = effect.manifest;
+  const when = manifest.fire_at_ms ? new Date(manifest.fire_at_ms) : null;
+  const whenLabel = when
+    ? when.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      + ' ' + when.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+    : '';
+  const chips =
+    (whenLabel ? `<span class="agenda-chip due">at ${escapeHtml(whenLabel)}</span>` : '')
+    + (manifest.orchestrate ? '<span class="agenda-chip">orchestrate</span>' : '');
+  const proposer = agendaActorLabel({
+    kind: effect.proposed_kind,
+    session_id: effect.proposed_session_id,
+    principal: effect.proposed_principal,
+  });
+  const digestShort = escapeHtml(String(effect.digest || '').slice(0, 12));
+  const run = effect.last_run;
+  let stateHtml = '';
+  let noteHtml = '';
+  let actions = '';
+  if (run) {
+    const glyphs = { completed: '✓', failed: '✗', missed: '⊘', unknown: '?', started: '▶' };
+    const classes = { completed: 'completed', failed: 'failed', started: 'armed' };
+    const bits = [`${glyphs[run.state] || '·'} ${run.state}`];
+    if (run.session_id) bits.push(`session ${run.session_id.slice(0, 12)}`);
+    stateHtml = `<span class="agenda-effect-state ${classes[run.state] || 'attention'}">${escapeHtml(bits.join(' · '))}</span>`;
+    if (run.note) {
+      // Session summaries / failure reasons are quoted data, like bodies.
+      noteHtml = `<div class="agenda-effect-note">${escapeHtml(run.note)}</div>`;
+    }
+  } else if (effect.approval) {
+    const who = agendaActorLabel(effect.approval);
+    stateHtml = `<span class="agenda-effect-state armed">approved${who ? ` by ${escapeHtml(who)}` : ''}</span>`;
+    if (item.status === 'open') {
+      actions = `<button type="button" class="agenda-btn" data-op="revoke_effect" data-id="${escapeHtml(item.id)}">Revoke</button>`;
+    }
+  } else {
+    stateHtml = '<span class="agenda-effect-state pending">awaiting your approval</span>';
+    if (item.status === 'open') {
+      actions = `<button type="button" class="agenda-btn approve" data-op="approve_effect" data-id="${escapeHtml(item.id)}" data-digest="${escapeHtml(effect.digest || '')}">Approve</button>`;
+    }
+  }
+  return `<div class="agenda-effect">
+    <div class="agenda-effect-head">
+      <span class="agenda-effect-icon" aria-hidden="true">⏵</span>
+      <span class="agenda-effect-label">Scheduled session</span>
+      ${chips}${stateHtml}
+    </div>
+    <div class="agenda-effect-goal">${escapeHtml(manifest.goal || '')}</div>
+    ${noteHtml}
+    <div class="agenda-item-foot">
+      <span class="agenda-item-meta">digest ${digestShort}${proposer ? ` · proposed by ${escapeHtml(proposer)}` : ''}</span>
+      <span class="agenda-item-actions">${actions}</span>
+    </div>
+  </div>`;
+}
+
 function agendaActionButtons(item) {
   const actions = [];
   if (item.status === 'open') actions.push(['complete', 'Complete'], ['retire', 'Retire']);
@@ -320,7 +384,7 @@ function agendaRenderTab() {
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
         ${agendaDueChip(item)}${tags}
       </div>
-      ${body}${answerBlock}
+      ${body}${answerBlock}${agendaEffectBlock(item)}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -329,8 +393,12 @@ function agendaRenderTab() {
   });
   list.innerHTML = rows.join('');
   list.querySelectorAll('button[data-op]').forEach((btn) => {
-    btn.addEventListener('click', () =>
-      agendaSendOp({ op: btn.dataset.op, id: btn.dataset.id }, btn));
+    btn.addEventListener('click', () => {
+      const params = { op: btn.dataset.op, id: btn.dataset.id };
+      // Approve binds the digest of the revision this render showed.
+      if (btn.dataset.digest) params.digest = btn.dataset.digest;
+      agendaSendOp(params, btn);
+    });
   });
   list.querySelectorAll('select.agenda-bell').forEach((sel) => {
     sel.addEventListener('change', () =>

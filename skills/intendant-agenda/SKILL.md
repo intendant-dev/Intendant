@@ -33,6 +33,7 @@ dashboard, attributed to your session.
 "${INTENDANT:-intendant}" ctl agenda reopen 01KX     # resurrects done or retired
 "${INTENDANT:-intendant}" ctl agenda retire 01KX     # hides without destroying history
 "${INTENDANT:-intendant}" ctl agenda patch 01KX --due +3d   # presentation edits (title/body/tags/due)
+"${INTENDANT:-intendant}" ctl agenda schedule 01KX --goal "Run the soak checks and summarize" --at +2d
 ```
 
 - **Questions**: `ask` parks a durable, non-blocking question — it badges
@@ -42,6 +43,19 @@ dashboard, attributed to your session.
   only when you cannot proceed without the answer. **Check for answers at
   session start** — an answered question is how yesterday's you hears
   back.
+
+- **Scheduled sessions**: `schedule` proposes a session manifest on an
+  item — at `--at`, the daemon spawns a normal supervised session with
+  `--goal` as its task (never raw actions; add `--orchestrate` for the
+  orchestration shape). **Nothing fires until the owner approves the
+  manifest**, so propose and move on; the item badges the owner's
+  attention rail. Approval is the owner's act alone (dashboard or an
+  owner shell) — you may propose, but never attempt `approve` or
+  `revoke-schedule`, including on your own manifest: the daemon refuses
+  agent and peer callers by policy. Approval binds the exact manifest
+  digest, so revising the manifest (re-running `schedule`) voids any
+  approval. The outcome writes back to the item (`effects[].last_run`
+  in `list --json`: state, session id, note) — check it next session.
 
 - Titles are one actionable line; details go in `--body` (markdown, shown
   quoted). `--due` accepts `+45m/+2h/+3d/+1w`, `YYYY-MM-DD`, RFC3339.

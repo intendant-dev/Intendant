@@ -9,7 +9,7 @@
 //! request/response surfaces already provide.
 
 use super::reminders::{ReminderPolicy, ReminderPolicyPatch, ReminderPolicyStore};
-use super::store::{AgendaError, AgendaStore};
+use super::store::{AgendaError, AgendaStore, OccurrenceWriteBack};
 use super::types::{AgendaActor, AgendaCommand, AgendaCounts, AgendaItem};
 use crate::event::{AppEvent, EventBus};
 use std::path::{Path, PathBuf};
@@ -169,24 +169,11 @@ impl AgendaHandle {
     /// `record_occurrence` op and broadcasts the change.
     pub(crate) fn record_occurrence(
         &self,
-        item_id: &str,
-        effect_id: &str,
-        occurrence_id: &str,
-        state: &str,
-        session_id: Option<String>,
-        note: Option<String>,
+        write: OccurrenceWriteBack<'_>,
     ) -> Result<AgendaItem, AgendaError> {
         let (item, counts) = {
             let mut store = self.lock();
-            let item = store.record_occurrence(
-                item_id,
-                effect_id,
-                occurrence_id,
-                state,
-                session_id,
-                note,
-                now_ms(),
-            )?;
+            let item = store.record_occurrence(write, now_ms())?;
             let counts = store.counts();
             (item, counts)
         };
@@ -382,14 +369,18 @@ mod tests {
         // Revocation is owner-surface under the same gate.
         assert!(matches!(
             handle.apply(
-                AgendaCommand::RevokeEffect { id: item.id.clone() },
+                AgendaCommand::RevokeEffect {
+                    id: item.id.clone()
+                },
                 actor("agent_session", Some("sess-a5")),
             ),
             Err(AgendaError::NotPermitted { .. })
         ));
         let revoked = handle
             .apply(
-                AgendaCommand::RevokeEffect { id: item.id.clone() },
+                AgendaCommand::RevokeEffect {
+                    id: item.id.clone(),
+                },
                 actor("local_process", None),
             )
             .unwrap();
@@ -465,7 +456,10 @@ mod tests {
         let effect = &revised.effects[0];
         assert!(effect.approval.is_none(), "edit must invalidate approval");
         assert_ne!(effect.digest, first_digest);
-        assert_eq!(effect.effect_id, first.effects[0].effect_id, "stable lineage");
+        assert_eq!(
+            effect.effect_id, first.effects[0].effect_id,
+            "stable lineage"
+        );
         assert!(matches!(
             handle.apply(
                 AgendaCommand::ApproveEffect {
@@ -479,14 +473,14 @@ mod tests {
 
         // The daemon-internal record path writes the run back.
         let recorded = handle
-            .record_occurrence(
-                &item.id,
-                &effect.effect_id.clone(),
-                "occ-1",
-                "completed",
-                Some("sess-run-1".into()),
-                Some("done: 3 certs rotated".into()),
-            )
+            .record_occurrence(OccurrenceWriteBack {
+                item_id: &item.id,
+                effect_id: &effect.effect_id.clone(),
+                occurrence_id: "occ-1",
+                state: "completed",
+                session_id: Some("sess-run-1".into()),
+                note: Some("done: 3 certs rotated".into()),
+            })
             .unwrap();
         let run = recorded.effects[0].last_run.as_ref().unwrap();
         assert_eq!(run.state, "completed");

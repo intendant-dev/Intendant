@@ -408,7 +408,10 @@ impl OccurrenceJournal {
             self.file.sync_data()?;
         }
         self.folded_len += line.len() as u64;
-        fold_record_into(self.state.entry(record.occurrence_id.clone()).or_default(), record);
+        fold_record_into(
+            self.state.entry(record.occurrence_id.clone()).or_default(),
+            record,
+        );
         Ok(())
     }
 
@@ -456,7 +459,10 @@ fn fold_journal(bytes: &[u8]) -> (BTreeMap<String, OccurrenceProgress>, u64) {
         }
         match serde_json::from_str::<OccurrenceRecord>(line) {
             Ok(record) => {
-                fold_record_into(state.entry(record.occurrence_id.clone()).or_default(), &record);
+                fold_record_into(
+                    state.entry(record.occurrence_id.clone()).or_default(),
+                    &record,
+                );
             }
             Err(err) => {
                 // Torn tail or foreign vocabulary: skip, never brick.
@@ -814,7 +820,14 @@ mod tests {
         let journal = journal(dir.path());
         let policy = ReminderPolicy::default();
         let items = vec![item("a", AgendaStatus::Open, Some(1_000))];
-        let deferred = plan(&items, &journal, &policy, 2_000, Some(9_000), &Default::default());
+        let deferred = plan(
+            &items,
+            &journal,
+            &policy,
+            2_000,
+            Some(9_000),
+            &Default::default(),
+        );
         assert!(deferred.deliver.is_empty());
         assert_eq!(deferred.next_wake_ms, Some(9_000));
         // At the window's end the delivery proceeds.
@@ -900,12 +913,26 @@ mod tests {
         }
         // Same item, same due, reopened: spent occurrence stays spent.
         let reopened = vec![item("a", AgendaStatus::Open, Some(1_000))];
-        assert!(plan(&reopened, &journal, &policy, 2_000, None, &Default::default())
-            .deliver
-            .is_empty());
+        assert!(plan(
+            &reopened,
+            &journal,
+            &policy,
+            2_000,
+            None,
+            &Default::default()
+        )
+        .deliver
+        .is_empty());
         // Patched due: a new occurrence plans fresh.
         let rescheduled = vec![item("a", AgendaStatus::Open, Some(3_000))];
-        let planned = plan(&rescheduled, &journal, &policy, 4_000, None, &Default::default());
+        let planned = plan(
+            &rescheduled,
+            &journal,
+            &policy,
+            4_000,
+            None,
+            &Default::default(),
+        );
         assert_eq!(planned.deliver.len(), 1);
         assert_ne!(planned.deliver[0].occurrence_id, old_occ);
     }

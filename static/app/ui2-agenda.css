@@ -250,6 +250,77 @@ html.ui-v2 .agenda-btn:disabled {
   cursor: default;
 }
 
+/* Scheduled-session effect: the manifest under review, its digest, and the
+   digest-bound approval state (A5). */
+html.ui-v2 .agenda-effect {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+html.ui-v2 .agenda-effect-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+html.ui-v2 .agenda-effect-icon {
+  color: var(--iris);
+  font-size: 12px;
+  line-height: 1;
+}
+html.ui-v2 .agenda-effect-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-3);
+}
+html.ui-v2 .agenda-effect-state {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  margin-left: auto;
+}
+html.ui-v2 .agenda-effect-state.pending { color: var(--amber); }
+html.ui-v2 .agenda-effect-state.armed { color: var(--sky); }
+html.ui-v2 .agenda-effect-state.completed { color: var(--green); }
+html.ui-v2 .agenda-effect-state.failed { color: var(--red); }
+html.ui-v2 .agenda-effect-state.attention { color: var(--amber); }
+/* The goal is the task text under review — quoted data, never instructions. */
+html.ui-v2 .agenda-effect-goal {
+  font-size: 12.5px;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 140px;
+  overflow-y: auto;
+  border-left: 2px solid var(--iris);
+  padding-left: 9px;
+}
+/* Run outcomes (session summaries, failure reasons) are quoted data too. */
+html.ui-v2 .agenda-effect-note {
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 120px;
+  overflow-y: auto;
+  border-left: 2px solid var(--line);
+  padding-left: 9px;
+}
+html.ui-v2 .agenda-btn.approve {
+  border-color: var(--green);
+  color: var(--green);
+}
+html.ui-v2 .agenda-btn.approve:hover {
+  background: rgba(var(--green-rgb), 0.12);
+  border-color: var(--green);
+  color: var(--green);
+}
+
 /* ---- Activity-pane card (stacks under #ui2-vitals-rail) ---- */
 
 html.ui-v2 #ui2-agenda-card {

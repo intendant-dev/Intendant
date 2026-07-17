@@ -174,7 +174,11 @@ pub(crate) fn manifest_digest(
     hasher.update(b"\0");
     hasher.update(effect_id.as_bytes());
     hasher.update(b"\0");
-    hasher.update(serde_json::to_string(manifest).unwrap_or_default().as_bytes());
+    hasher.update(
+        serde_json::to_string(manifest)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(32);
     for byte in digest.iter().take(16) {
@@ -607,8 +611,7 @@ pub(crate) fn apply_op(
             let Some(item) = items.get_mut(id) else {
                 return Some(format!("approve_effect for unknown {id} ignored"));
             };
-            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
-            else {
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id) else {
                 return Some(format!("approve_effect for unknown effect on {id} ignored"));
             };
             if effect.digest != *digest {
@@ -630,8 +633,7 @@ pub(crate) fn apply_op(
             let Some(item) = items.get_mut(id) else {
                 return Some(format!("revoke_effect for unknown {id} ignored"));
             };
-            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
-            else {
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id) else {
                 return Some(format!("revoke_effect for unknown effect on {id} ignored"));
             };
             effect.approval = None;
@@ -649,8 +651,7 @@ pub(crate) fn apply_op(
             let Some(item) = items.get_mut(id) else {
                 return Some(format!("record_occurrence for unknown {id} ignored"));
             };
-            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
-            else {
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id) else {
                 return Some(format!(
                     "record_occurrence for unknown effect on {id} ignored"
                 ));

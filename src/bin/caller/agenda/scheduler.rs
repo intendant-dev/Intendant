@@ -13,6 +13,7 @@ use super::reminders::{
     plan, DueOccurrence, OccurrenceJournal, OccurrenceRecord, OccurrenceState, ReminderUrgency,
     SpawnOccurrence,
 };
+use super::store::OccurrenceWriteBack;
 use crate::event::{AppEvent, ControlMsg};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -92,7 +93,12 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
 /// never auto-retried (RFC §7.5); the sessions themselves, if alive, are
 /// still visible in the Sessions tab.
 fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal) {
-    for (occurrence_id, session_id) in journal.started_unresolved() {
+    let unresolved = journal.started_unresolved();
+    if unresolved.is_empty() {
+        return;
+    }
+    let (items, _, _) = handle.snapshot();
+    for (occurrence_id, session_id) in unresolved {
         let _ = journal.append(&OccurrenceRecord {
             v: 1,
             at_ms: now_ms(),
@@ -103,6 +109,35 @@ fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal)
             urgency: None,
             session_id: session_id.clone(),
         });
+        // The journal row carries no effect_id, so find the owning effect by
+        // its last_run lineage and make the item's state honest too.
+        for item in &items {
+            for effect in &item.effects {
+                if effect
+                    .last_run
+                    .as_ref()
+                    .is_some_and(|run| run.occurrence_id == occurrence_id)
+                {
+                    if let Err(err) = handle.record_occurrence(OccurrenceWriteBack {
+                        item_id: &item.id,
+                        effect_id: &effect.effect_id,
+                        occurrence_id: &occurrence_id,
+                        state: "unknown",
+                        session_id: session_id.clone(),
+                        note: Some(
+                            "daemon restarted while the session ran — outcome \
+                             unknown; check the session log"
+                                .to_string(),
+                        ),
+                    }) {
+                        eprintln!(
+                            "[agenda] occurrence write-back failed (unknown on {}): {err}",
+                            item.id
+                        );
+                    }
+                }
+            }
+        }
         eprintln!(
             "[agenda] occurrence {occurrence_id} resolved to unknown \
              (daemon restarted while session {} ran)",
@@ -140,12 +175,24 @@ async fn run_pass(
         dispatch_session(handle, journal, state, spawn, now);
     }
     for missed in planned.missed_sessions {
-        resolve_spawnless(handle, journal, &missed, OccurrenceState::Missed, now,
-            "missed its window while the daemon was down — re-approve to reschedule");
+        resolve_spawnless(
+            handle,
+            journal,
+            &missed,
+            OccurrenceState::Missed,
+            now,
+            "missed its window while the daemon was down — re-approve to reschedule",
+        );
     }
     for crashed in planned.crashed {
-        resolve_spawnless(handle, journal, &crashed, OccurrenceState::Unknown, now,
-            "crashed before launch confirmation — not retried; re-approve to reschedule");
+        resolve_spawnless(
+            handle,
+            journal,
+            &crashed,
+            OccurrenceState::Unknown,
+            now,
+            "crashed before launch confirmation — not retried; re-approve to reschedule",
+        );
     }
     planned.next_wake_ms
 }
@@ -224,9 +271,17 @@ fn observe_event(
                 Some(session_id.clone()),
             );
             let note = summary.clone().unwrap_or_else(|| reason.clone());
-            record_on_item(handle, &spawn, "completed", Some(session_id.clone()), Some(note));
+            record_on_item(
+                handle,
+                &spawn,
+                "completed",
+                Some(session_id.clone()),
+                Some(note),
+            );
         }
-        AppEvent::SessionEnded { session_id, reason, .. } => {
+        AppEvent::SessionEnded {
+            session_id, reason, ..
+        } => {
             // Normal completion removes the entry first (supervised
             // sessions park after done); reaching here running means the
             // session stopped or errored before finishing.
@@ -313,14 +368,14 @@ fn record_on_item(
     session_id: Option<String>,
     note: Option<String>,
 ) {
-    if let Err(err) = handle.record_occurrence(
-        &spawn.item_id,
-        &spawn.effect_id,
-        &spawn.occurrence_id,
+    if let Err(err) = handle.record_occurrence(OccurrenceWriteBack {
+        item_id: &spawn.item_id,
+        effect_id: &spawn.effect_id,
+        occurrence_id: &spawn.occurrence_id,
         state,
         session_id,
         note,
-    ) {
+    }) {
         eprintln!(
             "[agenda] occurrence write-back failed ({state} on {}): {err}",
             spawn.item_id
@@ -647,10 +702,7 @@ mod tests {
         })
     }
 
-    fn approved_effect_item(
-        handle: &AgendaHandle,
-        fire_at_ms: u64,
-    ) -> (String, String, String) {
+    fn approved_effect_item(handle: &AgendaHandle, fire_at_ms: u64) -> (String, String, String) {
         let item = handle
             .apply(
                 AgendaCommand::Add {
@@ -806,7 +858,10 @@ mod tests {
         run_pass(&handle, &mut journal, &mut state).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
-                !matches!(event, AppEvent::ControlCommand(ControlMsg::StartTask { .. })),
+                !matches!(
+                    event,
+                    AppEvent::ControlCommand(ControlMsg::StartTask { .. })
+                ),
                 "spent occurrence must not re-dispatch"
             );
         }

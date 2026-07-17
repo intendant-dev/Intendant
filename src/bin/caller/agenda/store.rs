@@ -79,6 +79,19 @@ pub(crate) struct AgendaStore {
     folded_len: u64,
 }
 
+/// Facts of one scheduled-session occurrence outcome, written back by the
+/// scheduler. Bundled because they always travel together through the
+/// handle into the store's daemon-only `record_occurrence`.
+pub(crate) struct OccurrenceWriteBack<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) effect_id: &'a str,
+    pub(crate) occurrence_id: &'a str,
+    /// `started` | `completed` | `failed` | `missed` | `unknown`.
+    pub(crate) state: &'a str,
+    pub(crate) session_id: Option<String>,
+    pub(crate) note: Option<String>,
+}
+
 /// Fold raw log bytes into derived state: `(items, ops folded, lines skipped)`.
 fn fold_bytes(bytes: &[u8]) -> (BTreeMap<String, AgendaItem>, u64, u64) {
     let text = String::from_utf8_lossy(bytes);
@@ -335,7 +348,10 @@ impl AgendaStore {
                     .first()
                     .map(|effect| effect.effect_id.clone())
                     .unwrap_or_else(|| {
-                        format!("ef-{}", &super::reminders::occurrence_id(&id, fire_at_ms)[..12])
+                        format!(
+                            "ef-{}",
+                            &super::reminders::occurrence_id(&id, fire_at_ms)[..12]
+                        )
                     });
                 Ok(AgendaOp::ProposeEffect {
                     id,
@@ -402,23 +418,18 @@ impl AgendaStore {
     /// with no actor and folds it.
     pub(crate) fn record_occurrence(
         &mut self,
-        item_id: &str,
-        effect_id: &str,
-        occurrence_id: &str,
-        state: &str,
-        session_id: Option<String>,
-        note: Option<String>,
+        write: OccurrenceWriteBack<'_>,
         now_ms: u64,
     ) -> Result<AgendaItem, AgendaError> {
         self.refresh_if_stale()?;
-        self.require(item_id)?;
+        self.require(write.item_id)?;
         let op = AgendaOp::RecordOccurrence {
-            id: item_id.to_string(),
-            effect_id: effect_id.to_string(),
-            occurrence_id: occurrence_id.to_string(),
-            state: state.to_string(),
-            session_id,
-            note: note.map(|n| n.chars().take(500).collect()),
+            id: write.item_id.to_string(),
+            effect_id: write.effect_id.to_string(),
+            occurrence_id: write.occurrence_id.to_string(),
+            state: write.state.to_string(),
+            session_id: write.session_id,
+            note: write.note.map(|n| n.chars().take(500).collect()),
         };
         self.append_op(op, None, now_ms)
     }
