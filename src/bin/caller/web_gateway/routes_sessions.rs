@@ -199,24 +199,19 @@ pub(crate) fn is_valid_agent_output_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
 }
 
-/// The wildcard-CORS json envelope several session surfaces answer with
-/// (`Cache-Control` + `Access-Control-Allow-Origin: *` + `Connection`
-/// tail — the historical `upload_error_response`/hand-rolled shape).
-pub(crate) fn session_wildcard_json_response(status: u16, body: String) -> ApiResponse {
-    ApiResponse::Json {
-        status,
-        body: JsonBody::PreSerialized(body),
-        headers: vec![
-            ("Cache-Control", "no-cache".to_string()),
-            ("Access-Control-Allow-Origin", "*".to_string()),
-            ("Connection", "close".to_string()),
-        ],
-    }
+/// The canonical json envelope the session surfaces answer with
+/// (`Cache-Control` + `Connection` tail). These responses historically
+/// baked `Access-Control-Allow-Origin: *` in as well — the pre-allowlist
+/// fleet-Stats lane; that header is gone. Cross-origin readability is
+/// decided per route by the declared CORS posture at render time
+/// (`apply_cors_posture`), never baked into a response.
+pub(crate) fn session_json_response(status: u16, body: String) -> ApiResponse {
+    ApiResponse::json(status, JsonBody::PreSerialized(body))
 }
 
-/// `{"error": message}` under the wildcard-CORS tail.
-pub(crate) fn session_wildcard_json_error(status: u16, message: &str) -> ApiResponse {
-    session_wildcard_json_response(status, serde_json::json!({ "error": message }).to_string())
+/// `{"error": message}` under the session json tail.
+pub(crate) fn session_json_error(status: u16, message: &str) -> ApiResponse {
+    session_json_response(status, serde_json::json!({ "error": message }).to_string())
 }
 
 pub(crate) fn current_agent_output_response_for_ids(
@@ -225,7 +220,7 @@ pub(crate) fn current_agent_output_response_for_ids(
     log_dir: &Path,
 ) -> ApiResponse {
     if ids.is_empty() {
-        return session_wildcard_json_error(400, "missing output ids");
+        return session_json_error(400, "missing output ids");
     }
 
     let fallback_logs_dir = Some(crate::platform::intendant_home_in(home).join("logs"));
@@ -244,7 +239,7 @@ pub(crate) fn current_agent_output_response_for_ids(
         "missing": missing,
     })
     .to_string();
-    session_wildcard_json_response(200, body)
+    session_json_response(200, body)
 }
 
 pub(crate) fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
@@ -291,7 +286,7 @@ pub(crate) fn current_agent_output_api_response(
 ) -> ApiResponse {
     match agent_output_ids_from_json_body(body) {
         Ok(ids) => current_agent_output_response_for_ids(home, ids, log_dir),
-        Err(e) => session_wildcard_json_error(400, &e),
+        Err(e) => session_json_error(400, &e),
     }
 }
 
@@ -302,7 +297,7 @@ pub(crate) fn external_agent_output_response_for_ids(
     ids: Vec<String>,
 ) -> ApiResponse {
     let Some(entries) = external_session_entries_from_home(home, source, session_id) else {
-        return session_wildcard_json_error(404, "session not found");
+        return session_json_error(404, "session not found");
     };
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut found: HashMap<String, serde_json::Value> = HashMap::new();
@@ -341,9 +336,6 @@ pub(crate) fn external_agent_output_response_for_ids(
         .map(String::as_str)
         .filter(|id| !output_ids.contains(id))
         .collect();
-    // Historical asymmetry, preserved: the external-source success rides
-    // the canonical json tail (no wildcard CORS header), unlike the
-    // intendant-source success above.
     ApiResponse::json(
         200,
         JsonBody::PreSerialized(
@@ -365,7 +357,7 @@ pub(crate) fn session_agent_output_response_for_ids(
     let source = crate::session_names::normalize_source(source);
     if source == "intendant" {
         let Some(session_dir) = resolve_bare_session_dir_from_home(home, session_id) else {
-            return session_wildcard_json_error(404, "session not found");
+            return session_json_error(404, "session not found");
         };
         return current_agent_output_response_for_ids(home, ids, &session_dir);
     }
@@ -385,11 +377,11 @@ pub(crate) fn session_agent_output_api_response(
 ) -> ApiResponse {
     let session_id = session_id.trim();
     if !session_lookup_id_is_safe(session_id) {
-        return session_wildcard_json_error(400, "invalid session id");
+        return session_json_error(400, "invalid session id");
     }
     match agent_output_ids_from_json_body(body) {
         Ok(ids) => session_agent_output_response_for_ids(home, session_id, source, ids),
-        Err(e) => session_wildcard_json_error(400, &e),
+        Err(e) => session_json_error(400, &e),
     }
 }
 
@@ -2836,7 +2828,7 @@ pub(crate) async fn handle_history_prune(
 
 /// Transport-neutral core of `GET /api/session/current/changes[/…]`
 /// (tunnel twin `api_session_current_changes`): the change list / one
-/// file's unified diff under the wildcard-CORS tail. The request line
+/// file's unified diff under the session json tail. The request line
 /// arrives transport-decoded — HTTP passes it verbatim, the tunnel
 /// synthesizes it from its path/query params.
 pub(crate) fn session_current_changes_api_response(
@@ -2847,7 +2839,7 @@ pub(crate) fn session_current_changes_api_response(
 ) -> ApiResponse {
     let (status, body) =
         handle_changes_request_for_home(request_line, snapshot_dir, project_root, home);
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_session_current_changes(
@@ -2872,12 +2864,12 @@ pub(crate) async fn handle_session_current_changes(
 
 /// Transport-neutral core of `GET /api/session/current/history` (tunnel
 /// twin `api_session_current_history`): the serialized rewind History —
-/// or the 503 watcher-absent shape — under the wildcard-CORS tail.
+/// or the 503 watcher-absent shape — under the session json tail.
 pub(crate) async fn current_history_api_response(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> ApiResponse {
     let (status, body) = handle_history_get(file_watcher).await;
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_history(
@@ -2894,7 +2886,7 @@ pub(crate) async fn handle_current_history(
 /// Transport-neutral core of `POST /api/session/current/rollback`
 /// (tunnel twin `api_session_current_rollback`): the shared rollback
 /// core — validation, file revert, conversation-rollback event — under
-/// the wildcard-CORS tail.
+/// the session json tail.
 pub(crate) async fn current_rollback_api_response(
     body_text: &str,
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
@@ -2902,7 +2894,7 @@ pub(crate) async fn current_rollback_api_response(
     bus: &EventBus,
 ) -> ApiResponse {
     let (status, body) = handle_history_rollback(body_text, file_watcher, agent_state, bus).await;
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_rollback(
@@ -2930,13 +2922,13 @@ pub(crate) async fn handle_current_rollback(
 }
 
 /// Transport-neutral core of `POST /api/session/current/redo` (tunnel
-/// twin `api_session_current_redo`), under the wildcard-CORS tail.
+/// twin `api_session_current_redo`), under the session json tail.
 pub(crate) async fn current_redo_api_response(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
 ) -> ApiResponse {
     let (status, body) = handle_history_redo(file_watcher, agent_state).await;
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_redo(
@@ -2954,12 +2946,12 @@ pub(crate) async fn handle_current_redo(
 }
 
 /// Transport-neutral core of `POST /api/session/current/prune` (tunnel
-/// twin `api_session_current_prune`), under the wildcard-CORS tail.
+/// twin `api_session_current_prune`), under the session json tail.
 pub(crate) async fn current_prune_api_response(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> ApiResponse {
     let (status, body) = handle_history_prune(file_watcher).await;
-    session_wildcard_json_response(status_line_code(status), body)
+    session_json_response(status_line_code(status), body)
 }
 
 pub(crate) async fn handle_current_prune(
@@ -2995,11 +2987,9 @@ pub(crate) async fn handle_current_agent_output(
                 current_agent_output_api_response(&home, &body_text, &dir)
             })
             .await
-            .unwrap_or_else(|e| {
-                session_wildcard_json_error(500, &format!("agent output task failed: {e}"))
-            })
+            .unwrap_or_else(|e| session_json_error(500, &format!("agent output task failed: {e}")))
         }
-        None => session_wildcard_json_error(404, "no active session log"),
+        None => session_json_error(404, "no active session log"),
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
@@ -3008,9 +2998,12 @@ pub(crate) async fn handle_current_agent_output(
 /// `api_sessions`; the hot list path — `PreSerialized` keeps it
 /// allocation-identical, risk R8). Params arrive transport-decoded; the
 /// composition below is the row's semantics: the ids filter wins, then
-/// the limit truncation, then the usage projection. Answers 200 with the
-/// wildcard-CORS tail so the multi-host Stats tab can fetch sibling
-/// daemons' session lists for its "All Sessions" / "Disk Usage" cards.
+/// the limit truncation, then the usage projection. Answers 200 under
+/// the session json tail; the row's fleet-or-loopback CORS posture
+/// echoes allowlisted sibling-dashboard origins at render time so the
+/// multi-host Stats tab can fetch sibling daemons' session lists for
+/// its "All Sessions" / "Disk Usage" cards (the retired baked wildcard
+/// let ANY page do that).
 pub(crate) fn sessions_list_api_response(
     home: &Path,
     ids_filter: Option<Vec<String>>,
@@ -3029,7 +3022,7 @@ pub(crate) fn sessions_list_api_response(
         },
     };
     let body = projected_session_list_body(generation, &body, limit, usage_view);
-    session_wildcard_json_response(200, body)
+    session_json_response(200, body)
 }
 
 pub(crate) async fn handle_sessions_list(
@@ -3048,7 +3041,7 @@ pub(crate) async fn handle_sessions_list(
     .await
     {
         Ok(response) => response,
-        Err(e) => session_wildcard_json_response(
+        Err(e) => session_json_response(
             200,
             serde_json::json!({
                 "error": format!("session list task failed: {e}")
@@ -3061,23 +3054,19 @@ pub(crate) async fn handle_sessions_list(
 
 /// Transport-neutral core of session deletion (all five HTTP wire
 /// shapes; tunnel twin `api_session_delete`): the bare-id policy, target
-/// resolution, and store removal live in `delete_session_data`; the
-/// delete tail historically orders the wildcard CORS header before
-/// `Cache-Control`, unlike the list/search tail.
+/// resolution, and store removal live in `delete_session_data`, under
+/// the canonical json tail (the delete tail's historical extra was a
+/// leading wildcard CORS header, now retired with the rest of the
+/// family's baked wildcards).
 pub(crate) fn session_delete_api_response(
     home: &Path,
     session_id: &str,
     target: &str,
 ) -> ApiResponse {
-    ApiResponse::Json {
-        status: 200,
-        body: JsonBody::PreSerialized(delete_session_data(home, session_id, target)),
-        headers: vec![
-            ("Access-Control-Allow-Origin", "*".to_string()),
-            ("Cache-Control", "no-cache".to_string()),
-            ("Connection", "close".to_string()),
-        ],
-    }
+    ApiResponse::json(
+        200,
+        JsonBody::PreSerialized(delete_session_data(home, session_id, target)),
+    )
 }
 
 pub(crate) async fn handle_session_delete(
@@ -3169,11 +3158,9 @@ pub(crate) async fn handle_session_agent_output_from_home(
             session_agent_output_api_response(&home, &body_text, &session_id, &source)
         })
         .await
-        .unwrap_or_else(|e| {
-            session_wildcard_json_error(500, &format!("agent output task failed: {e}"))
-        })
+        .unwrap_or_else(|e| session_json_error(500, &format!("agent output task failed: {e}")))
     } else {
-        session_wildcard_json_error(404, "unknown session output route")
+        session_json_error(404, "unknown session output route")
     };
     write_api_response(stream, response, cors, fleet_origin).await;
 }
@@ -3183,6 +3170,8 @@ pub(crate) async fn handle_session_sub_router(
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<WebQueryCtx>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     // Transport edge: resolve the real home once; the golden transcripts
     // drive the `_from_home` variant with an injected temp home.
@@ -3191,6 +3180,8 @@ pub(crate) async fn handle_session_sub_router(
         request_line,
         session_log,
         query_ctx,
+        cors,
+        fleet_origin,
         &crate::platform::home_dir(),
     )
     .await;
@@ -3201,9 +3192,17 @@ pub(crate) async fn handle_session_sub_router_from_home(
     request_line: &str,
     session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<WebQueryCtx>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
     home: &Path,
 ) {
     use tokio::io::AsyncWriteExt;
+    // Every write below — the ApiResponse renders AND the hand-rolled
+    // segment/frame/text shapes — funnels through the row's declared
+    // posture, so a future baked ACAO cannot bypass the CORS sanitizer
+    // (`apply_cors_posture` is authoritative; see its docs).
+    let posture_bytes =
+        |http: HttpResponse| apply_cors_posture(http, cors, fleet_origin).into_bytes();
     // Extract the rest after /api/session/ and split into parts
     let rest = request_line
         .split("/api/session/")
@@ -3244,11 +3243,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 Err(error) => ApiResponse::json_error(400, error),
             }
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     } else if rest_parts.len() >= 2 && route_name == "recordings" {
         // Session recording sub-routes: /api/session/{id}/recordings[/...]
@@ -3256,8 +3251,11 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let rec_rest = &rest_parts[2..]; // parts after "recordings"
 
         if !session_lookup_id_is_safe(session_id) {
-            let response = upload_error_response("400 Bad Request", "invalid session id");
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(upload_error_response(
+                "400 Bad Request",
+                "invalid session id",
+            ));
+            let _ = stream.write_all(&response).await;
         } else if rec_rest.len() == 2
             && (rec_rest[1] == "segments" || rec_rest[1] == "playlist.m3u8")
         {
@@ -3270,11 +3268,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 rec_rest[0],
                 rec_rest[1],
             );
-            let bytes = api_response_http_bytes(
-                response,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            );
+            let bytes = api_response_http_bytes(response, cors, fleet_origin);
             let _ = stream.write_all(&bytes).await;
         } else if rec_rest.len() == 2 {
             // GET /api/session/{id}/recordings/{stream}/{filename}
@@ -3295,49 +3289,49 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 if let Some(path) = seg_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", seg_ct)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
+                            let header = posture_bytes(
+                                HttpResponse::new("200 OK")
+                                    .header("Content-Type", seg_ct)
+                                    .header("Content-Length", data.len().to_string())
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&header).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read segment";
-                            let response = HttpResponse::with_content(
-                                "500 Internal Server Error",
-                                "text/plain",
-                                body,
-                            )
-                            .header("Connection", "close")
-                            .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
+                            let response = posture_bytes(
+                                HttpResponse::with_content(
+                                    "500 Internal Server Error",
+                                    "text/plain",
+                                    body,
+                                )
+                                .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&response).await;
                         }
                     }
                 } else {
                     let body = "Segment not found";
-                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                        .header("Connection", "close")
-                        .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    let response = posture_bytes(
+                        HttpResponse::with_content("404 Not Found", "text/plain", body)
+                            .header("Connection", "close"),
+                    );
+                    let _ = stream.write_all(&response).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let response = posture_bytes(
+                    HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                        .header("Connection", "close"),
+                );
+                let _ = stream.write_all(&response).await;
             }
         } else {
             // GET /api/session/{id}/recordings — list streams
             let response = session_recordings_api_response(home, session_id);
-            let bytes = api_response_http_bytes(
-                response,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            );
+            let bytes = api_response_http_bytes(response, cors, fleet_origin);
             let _ = stream.write_all(&bytes).await;
         }
     } else if rest_parts.len() >= 2 && route_name == "report" {
@@ -3354,10 +3348,10 @@ pub(crate) async fn handle_session_sub_router_from_home(
         ) {
             Ok(report) => session_report_api_response(report),
             // Per-lane error framing, historical: the id-policy failure
-            // answers json under the wildcard tail; the resolution and
+            // answers json under the session json tail; the resolution and
             // build failures answer text/plain.
             Err(SessionReportZipError::InvalidSessionId) => {
-                session_wildcard_json_error(400, "invalid session id")
+                session_json_error(400, "invalid session id")
             }
             Err(SessionReportZipError::NotFound) => {
                 session_text_plain_response(404, "Session not found".to_string())
@@ -3366,11 +3360,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 session_text_plain_response(500, format!("Failed to build report: {}", e))
             }
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     } else if rest_parts.len() >= 2 && route_name == "frames" {
         // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
@@ -3379,8 +3369,11 @@ pub(crate) async fn handle_session_sub_router_from_home(
         let frame_rest = &rest_parts[2..];
 
         if !session_lookup_id_is_safe(session_id) {
-            let response = upload_error_response("400 Bad Request", "invalid session id");
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(upload_error_response(
+                "400 Bad Request",
+                "invalid session id",
+            ));
+            let _ = stream.write_all(&response).await;
         } else if frame_rest.len() == 1 {
             // GET /api/session/{id}/frames/{filename}
             let filename = frame_rest[0];
@@ -3398,40 +3391,44 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 if let Some(path) = frame_path.filter(|p| p.exists()) {
                     match tokio::fs::read(&path).await {
                         Ok(data) => {
-                            let header = HttpResponse::new("200 OK")
-                                .header("Content-Type", ct)
-                                .header("Content-Length", data.len().to_string())
-                                .header("Cache-Control", "public, max-age=3600")
-                                .header("Connection", "close")
-                                .into_string();
-                            let _ = stream.write_all(header.as_bytes()).await;
+                            let header = posture_bytes(
+                                HttpResponse::new("200 OK")
+                                    .header("Content-Type", ct)
+                                    .header("Content-Length", data.len().to_string())
+                                    .header("Cache-Control", "public, max-age=3600")
+                                    .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&header).await;
                             let _ = stream.write_all(&data).await;
                         }
                         Err(_) => {
                             let body = "Failed to read frame";
-                            let response = HttpResponse::with_content(
-                                "500 Internal Server Error",
-                                "text/plain",
-                                body,
-                            )
-                            .header("Connection", "close")
-                            .into_string();
-                            let _ = stream.write_all(response.as_bytes()).await;
+                            let response = posture_bytes(
+                                HttpResponse::with_content(
+                                    "500 Internal Server Error",
+                                    "text/plain",
+                                    body,
+                                )
+                                .header("Connection", "close"),
+                            );
+                            let _ = stream.write_all(&response).await;
                         }
                     }
                 } else {
                     let body = "Frame not found";
-                    let response = HttpResponse::with_content("404 Not Found", "text/plain", body)
-                        .header("Connection", "close")
-                        .into_string();
-                    let _ = stream.write_all(response.as_bytes()).await;
+                    let response = posture_bytes(
+                        HttpResponse::with_content("404 Not Found", "text/plain", body)
+                            .header("Connection", "close"),
+                    );
+                    let _ = stream.write_all(&response).await;
                 }
             } else {
                 let body = "Invalid filename";
-                let response = HttpResponse::with_content("400 Bad Request", "text/plain", body)
-                    .header("Connection", "close")
-                    .into_string();
-                let _ = stream.write_all(response.as_bytes()).await;
+                let response = posture_bytes(
+                    HttpResponse::with_content("400 Bad Request", "text/plain", body)
+                        .header("Connection", "close"),
+                );
+                let _ = stream.write_all(&response).await;
             }
         } else {
             // GET /api/session/{id}/frames — list frame filenames
@@ -3454,11 +3451,12 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 } else {
                     "[]".to_string()
                 };
-            let response = HttpResponse::with_content("200 OK", "application/json", body)
-                .header("Cache-Control", "no-cache")
-                .header("Connection", "close")
-                .into_string();
-            let _ = stream.write_all(response.as_bytes()).await;
+            let response = posture_bytes(
+                HttpResponse::with_content("200 OK", "application/json", body)
+                    .header("Cache-Control", "no-cache")
+                    .header("Connection", "close"),
+            );
+            let _ = stream.write_all(&response).await;
         }
     } else {
         // GET /api/session/{id} — session detail
@@ -3495,11 +3493,7 @@ pub(crate) async fn handle_session_sub_router_from_home(
                 ),
             ),
         };
-        let bytes = api_response_http_bytes(
-            response,
-            crate::gateway_routes::CorsPosture::OwnOrigin,
-            None,
-        );
+        let bytes = api_response_http_bytes(response, cors, fleet_origin);
         let _ = stream.write_all(&bytes).await;
     }
     finalize_http_stream(&mut stream).await;
@@ -3746,9 +3740,9 @@ pub(crate) async fn handle_mc_fission(
 /// (`GET /api/sessions/stream`, tunnel twin `api_sessions_stream`, S10):
 /// spawn the ONE line source — quick skeleton, hydrating marker,
 /// replace, done — onto the blocking pool and hand its handle to the
-/// caller's transport writer under the historical NDJSON head (the
-/// wildcard-CORS tail is response decoration on the OwnOrigin row,
-/// exactly like `/api/sessions`).
+/// caller's transport writer under the historical NDJSON head. Like
+/// `/api/sessions`, the row's fleet-or-loopback posture decides any
+/// CORS echo at render time; nothing is baked here.
 pub(crate) fn sessions_stream_api_response(requested_limit: Option<usize>) -> ApiResponse {
     let (tx, lines) = tokio::sync::mpsc::channel::<String>(64);
     let source = tokio::task::spawn_blocking(move || {
@@ -3766,7 +3760,6 @@ pub(crate) fn sessions_stream_api_response_from(stream: LineStream) -> ApiRespon
         content_type: "application/x-ndjson".to_string(),
         headers: vec![
             ("Cache-Control", "no-cache".to_string()),
-            ("Access-Control-Allow-Origin", "*".to_string()),
             ("Connection", "close".to_string()),
         ],
         stream,
@@ -3792,7 +3785,7 @@ pub(crate) async fn handle_sessions_stream(
 /// Transport-neutral core of `GET /api/sessions/search` (tunnel twin
 /// `api_sessions_search`): one search composition — the single-flight
 /// guard plus the blocking store scan — under the caller's cancellation
-/// token, answered 200 under the wildcard-CORS tail.
+/// token, answered 200 under the session json tail.
 pub(crate) async fn sessions_search_api_response(
     query: String,
     source_filter: String,
@@ -3808,7 +3801,7 @@ pub(crate) async fn sessions_search_api_response(
         cancel,
     )
     .await;
-    session_wildcard_json_response(200, body)
+    session_json_response(200, body)
 }
 
 /// Whether the search request opted into the NDJSON progress stream
@@ -3894,7 +3887,6 @@ pub(crate) fn sessions_search_stream_api_response(
         content_type: "application/x-ndjson".to_string(),
         headers: vec![
             ("Cache-Control", "no-cache".to_string()),
-            ("Access-Control-Allow-Origin", "*".to_string()),
             ("Connection", "close".to_string()),
         ],
         stream: LineStream { lines, source },
@@ -4102,9 +4094,11 @@ pub(crate) async fn handle_worktrees_clean(
 }
 
 pub(crate) async fn handle_worktrees_merge(
-    mut stream: DemuxStream,
+    stream: DemuxStream,
     body_text: String,
     worktree_inventory_cache: Arc<Mutex<Option<String>>>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
 ) {
     let home = crate::platform::home_dir();
     let cache = worktree_inventory_cache.clone();
@@ -4131,10 +4125,11 @@ pub(crate) async fn handle_worktrees_merge(
             .to_string(),
         ),
     };
-    let response = json_response(status, body);
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(response.as_bytes()).await;
-    finalize_http_stream(&mut stream).await;
+    // The canonical json tail under the row posture, like the rest of
+    // the worktree family (this handler used to write a raw
+    // `json_response` string past the CORS renderer).
+    let response = ApiResponse::json(status_line_code(status), JsonBody::PreSerialized(body));
+    write_api_response(stream, response, cors, fleet_origin).await;
 }
 
 pub(crate) async fn handle_worktrees_scan(
@@ -4178,7 +4173,7 @@ pub(crate) async fn handle_worktrees_list(
 
 /// GET /api/displays + the tunnel's `api_displays`: the OS display
 /// enumeration annotated with live capture state, under the
-/// wildcard-CORS tail (transport-unification design §2.1, S5). The
+/// session json tail (transport-unification design §2.1, S5). The
 /// enumeration resolves HERE at the production edge; the `_from` core
 /// below takes the set as a parameter so tests inject a fixture
 /// instead of touching machine display state.
@@ -4195,7 +4190,7 @@ pub(crate) async fn displays_api_response_from(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
     include_private: bool,
 ) -> ApiResponse {
-    session_wildcard_json_response(
+    session_json_response(
         200,
         crate::web_gateway::displays_response_body_from(
             displays,
@@ -6280,12 +6275,15 @@ mod tests {
         )
     }
 
-    /// The wildcard-CORS JSON framing (`Cache-Control` +
-    /// `Access-Control-Allow-Origin: *` + `Connection` tail): the session
-    /// list, search, and agent-output shapes, spelled out literally.
-    fn golden_session_wildcard_json_transcript(status_line: &str, body: &str) -> String {
+    /// The session-list framing under the row's fleet-or-loopback
+    /// posture with NO validated cross-origin caller: the canonical
+    /// tail plus `Vary: Origin` and — deliberately — no
+    /// `Access-Control-Allow-Origin` (the family's historical baked
+    /// wildcard is retired; an allowlisted origin is echoed instead,
+    /// pinned separately below).
+    fn golden_session_fleet_json_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\nVary: Origin\r\n\r\n{body}",
             body.len()
         )
     }
@@ -6303,23 +6301,36 @@ mod tests {
             .join(session_id)
     }
 
+    /// The CORS posture dispatch hands the shim — read from the route
+    /// table so a row-posture change fails these byte pins instead of
+    /// silently changing the wire.
+    fn session_route_cors(method: &str, path: &str) -> crate::gateway_routes::CorsPosture {
+        crate::gateway_routes::match_route(method, path)
+            .expect("session route declared")
+            .0
+            .cors
+    }
+
+    /// The session sub-router rows' declared posture (all four `Under`
+    /// rows agree — the posture-consistency invariant), read from the
+    /// table for the same reason as [`session_route_cors`].
+    fn sub_router_cors() -> crate::gateway_routes::CorsPosture {
+        session_route_cors("GET", "/api/session/golden-id/recordings")
+    }
+
     #[tokio::test]
     async fn golden_sessions_list_empty_ids_filter_transcript() {
         // A present-but-empty ids filter answers the empty list without
         // touching the session stores — fully deterministic.
         let request_line = "GET /api/sessions?ids= HTTP/1.1";
+        let cors = session_route_cors("GET", "/api/sessions");
         let response = collect_session_handler_response(|stream| {
-            handle_sessions_list(
-                stream,
-                request_line,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            )
+            handle_sessions_list(stream, request_line, cors, None)
         })
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", "[]")
+            golden_session_fleet_json_transcript("200 OK", "[]")
         );
     }
 
@@ -6328,19 +6339,35 @@ mod tests {
         // The limit and view=usage knobs ride the same empty-filter body:
         // pins the query-parameter plumbing end to end.
         let request_line = "GET /api/sessions?ids=&limit=3&view=usage HTTP/1.1";
+        let cors = session_route_cors("GET", "/api/sessions");
         let response = collect_session_handler_response(|stream| {
-            handle_sessions_list(
-                stream,
-                request_line,
-                crate::gateway_routes::CorsPosture::OwnOrigin,
-                None,
-            )
+            handle_sessions_list(stream, request_line, cors, None)
         })
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", "[]")
+            golden_session_fleet_json_transcript("200 OK", "[]")
         );
+    }
+
+    #[tokio::test]
+    async fn golden_sessions_list_echoes_validated_origin_exactly() {
+        // Dispatch validated this Origin against the fleet-or-loopback
+        // allow set; the row posture echoes it back exactly (plus
+        // `Vary: Origin`) — never the retired wildcard.
+        let request_line = "GET /api/sessions?ids= HTTP/1.1";
+        let cors = session_route_cors("GET", "/api/sessions");
+        let response = collect_session_handler_response(|stream| {
+            handle_sessions_list(stream, request_line, cors, Some("http://127.0.0.1:9321"))
+        })
+        .await;
+        let text = golden_transcript(&response);
+        assert!(
+            text.contains("Access-Control-Allow-Origin: http://127.0.0.1:9321\r\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Access-Control-Allow-Origin: *"), "{text}");
+        assert!(text.contains("Vary: Origin\r\n"), "{text}");
     }
 
     #[tokio::test]
@@ -6372,7 +6399,7 @@ mod tests {
         .to_string();
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", &body)
+            golden_session_json_transcript("200 OK", &body)
         );
     }
 
@@ -6401,7 +6428,7 @@ mod tests {
         .to_string();
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", &body)
+            golden_session_json_transcript("200 OK", &body)
         );
     }
 
@@ -6411,7 +6438,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/.. HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6426,7 +6461,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/golden-detail-missing HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6446,7 +6489,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}?limit=5 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         // Body from the store layer (untouched by the conversion); the
@@ -6475,10 +6526,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
-                "400 Bad Request",
-                r#"{"error":"missing output ids"}"#
-            )
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"missing output ids"}"#)
         );
     }
 
@@ -6499,10 +6547,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
-                "404 Not Found",
-                r#"{"error":"session not found"}"#
-            )
+            golden_session_json_transcript("404 Not Found", r#"{"error":"session not found"}"#)
         );
     }
 
@@ -6540,7 +6585,7 @@ mod tests {
         .to_string();
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", &body)
+            golden_session_json_transcript("200 OK", &body)
         );
     }
 
@@ -6691,7 +6736,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6708,7 +6761,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/abc123/context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6726,7 +6787,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6743,7 +6812,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../context-snapshot?request_index=abc HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6758,7 +6835,15 @@ mod tests {
         let request_line =
             "GET /api/session/golden-snapshot-missing/context-snapshot?file=snapshot.json HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6777,14 +6862,11 @@ mod tests {
     // (design §6 S4, risk R1). The five session-delete wire shapes have
     // routing pins in gateway_routes; these pin the response bytes.
 
-    /// The session-delete json framing — its wildcard tail historically
-    /// orders `Access-Control-Allow-Origin` BEFORE `Cache-Control`,
-    /// unlike the list/search/upload-error tail.
+    /// The session-delete json framing: the canonical tail (the shape's
+    /// historical extra — a wildcard ACAO ordered BEFORE `Cache-Control`
+    /// — is retired with the rest of the family's baked wildcards).
     fn golden_delete_json_transcript(body: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
+        golden_session_json_transcript("200 OK", body)
     }
 
     /// The text/plain framing (report/asset error bodies), spelled out.
@@ -6808,7 +6890,7 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_delete_five_wire_shapes_transcripts() {
-        // All five accepted shapes answer 200 with the wildcard-CORS tail;
+        // All five accepted shapes answer 200 with the canonical tail;
         // `..` fails the bare-id policy so the body is deterministic.
         let home = tempfile::tempdir().unwrap();
         for request_line in [
@@ -6861,15 +6943,20 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/../report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
-                "400 Bad Request",
-                r#"{"error":"invalid session id"}"#
-            )
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"invalid session id"}"#)
         );
     }
 
@@ -6878,7 +6965,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let request_line = "GET /api/session/golden-report-missing/report HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6931,7 +7026,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/report HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         // Zip bytes from the store layer (same-run mtimes make the two
@@ -6963,7 +7066,7 @@ mod tests {
 
     #[tokio::test]
     async fn golden_session_recordings_list_transcripts() {
-        // Invalid id: the branch precheck answers under the wildcard tail.
+        // Invalid id: the branch precheck answers under the session json tail.
         let home = tempfile::tempdir().unwrap();
         let response = collect_session_handler_response(|stream| {
             handle_session_sub_router_from_home(
@@ -6971,22 +7074,29 @@ mod tests {
                 "GET /api/session/../recordings HTTP/1.1",
                 None,
                 None,
+                sub_router_cors(),
+                None,
                 home.path(),
             )
         })
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
-                "400 Bad Request",
-                r#"{"error":"invalid session id"}"#
-            )
+            golden_session_json_transcript("400 Bad Request", r#"{"error":"invalid session id"}"#)
         );
 
         // Missing session: empty list under the canonical tail.
         let request_line = "GET /api/session/golden-recordings-missing/recordings HTTP/1.1";
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -6999,7 +7109,15 @@ mod tests {
         let (_log_dir, _seg) = golden_recordings_fixture(&home, session_id);
         let request_line = format!("GET /api/session/{session_id}/recordings HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let (status, body) = session_recordings_list_response_body(home.path(), session_id);
@@ -7020,7 +7138,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/segments HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let body = r#"[{"end_secs":2.0,"filename":"seg_00001.mp4","start_secs":0.0}]"#;
@@ -7033,7 +7159,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/playlist.m3u8 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.000,\nseg_00001.mp4\n#EXT-X-ENDLIST\n";
@@ -7054,7 +7188,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_00001.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7066,7 +7208,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/evil.txt HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7077,7 +7227,15 @@ mod tests {
         let request_line =
             format!("GET /api/session/{session_id}/recordings/screen/seg_09999.mp4 HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7097,7 +7255,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_0001.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7107,7 +7273,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/evil.exe HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7117,7 +7291,15 @@ mod tests {
 
         let request_line = format!("GET /api/session/{session_id}/frames/frame_9.jpg HTTP/1.1");
         let response = collect_session_handler_response(|stream| {
-            handle_session_sub_router_from_home(stream, &request_line, None, None, home.path())
+            handle_session_sub_router_from_home(
+                stream,
+                &request_line,
+                None,
+                None,
+                sub_router_cors(),
+                None,
+                home.path(),
+            )
         })
         .await;
         assert_eq!(
@@ -7231,7 +7413,7 @@ mod tests {
             .await;
             assert_eq!(
                 golden_transcript(&response),
-                golden_session_wildcard_json_transcript(
+                golden_session_json_transcript(
                     expect_status,
                     r#"{"error":"file watcher not active"}"#
                 )
@@ -7249,7 +7431,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
+            golden_session_json_transcript(
                 "503 Service Unavailable",
                 r#"{"error":"file watcher not active"}"#
             )
@@ -7265,7 +7447,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
+            golden_session_json_transcript(
                 "503 Service Unavailable",
                 r#"{"error":"file watcher not active"}"#
             )
@@ -7285,7 +7467,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
+            golden_session_json_transcript(
                 "503 Service Unavailable",
                 r#"{"error":"file watcher not active"}"#
             )
@@ -7307,7 +7489,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
+            golden_session_json_transcript(
                 "503 Service Unavailable",
                 r#"{"error":"file watcher not active"}"#
             )
@@ -7329,10 +7511,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript(
-                "404 Not Found",
-                r#"{"error":"no active session log"}"#
-            )
+            golden_session_json_transcript("404 Not Found", r#"{"error":"no active session log"}"#)
         );
     }
 
@@ -7394,7 +7573,7 @@ mod tests {
         // Injected display set (a fixture must never enumerate the
         // machine's real displays: the body is machine-dependent, and
         // on a session-less CI account the macOS enumeration never
-        // completes) — the wildcard-CORS 200 framing around the same
+        // completes) — the canonical-tail 200 framing around the same
         // `_from` core the production edge delegates to is the
         // byte-exact pin.
         let displays = golden_fixture_displays();
@@ -7421,7 +7600,7 @@ mod tests {
         .await;
         assert_eq!(
             golden_transcript(&response),
-            golden_session_wildcard_json_transcript("200 OK", &body)
+            golden_session_json_transcript("200 OK", &body)
         );
     }
 }

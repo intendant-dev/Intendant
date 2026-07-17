@@ -54,11 +54,14 @@ pub(crate) async fn handle_doorbell(
 }
 
 /// The peers family's historical JSON framing: the family predates the
-/// posture-derived CORS renderers, so its wildcard tail (`Cache-Control`,
-/// `Access-Control-Allow-Origin: *`, the per-handler `Allow-Methods`
-/// list, `Allow-Headers`, `Connection: close`) rides the response
-/// headers verbatim — the row posture (`OwnOrigin`) appends nothing on
-/// top. The golden transcripts pin these bytes.
+/// posture-derived CORS renderers, so its tail (`Cache-Control`, the
+/// per-handler `Allow-Methods` list, `Allow-Headers`,
+/// `Connection: close`) rides the response headers verbatim. The tail's
+/// historical wildcard `Access-Control-Allow-Origin` is retired with
+/// the rest of the gateway's baked wildcards — same-origin dashboards
+/// and daemon-to-daemon federation calls never needed it, and the
+/// own-origin row posture now strips any baked ACAO anyway. The golden
+/// transcripts pin these bytes.
 fn peers_family_api_response(
     status: u16,
     body: String,
@@ -69,7 +72,6 @@ fn peers_family_api_response(
         body: JsonBody::PreSerialized(body),
         headers: vec![
             ("Cache-Control", "no-cache".to_string()),
-            ("Access-Control-Allow-Origin", "*".to_string()),
             ("Access-Control-Allow-Methods", allow_methods.to_string()),
             ("Access-Control-Allow-Headers", "Content-Type".to_string()),
             ("Connection", "close".to_string()),
@@ -2897,11 +2899,12 @@ mod tests {
     //
     // Byte pins captured BEFORE the family's neutral-core conversion
     // (design §6 S7, risk R1). The family predates the posture-derived
-    // CORS renderers: both handlers answer under a hand-rolled
-    // wildcard tail — `Cache-Control`, `Access-Control-Allow-Origin: *`,
-    // a per-handler `Access-Control-Allow-Methods` list,
-    // `Access-Control-Allow-Headers: Content-Type`, `Connection: close`
-    // — with the family's own reason ladder (notably `502 Bad Gateway`,
+    // CORS renderers: both handlers answer under a hand-rolled tail —
+    // `Cache-Control`, a per-handler `Access-Control-Allow-Methods`
+    // list, `Access-Control-Allow-Headers: Content-Type`,
+    // `Connection: close` (the tail's historical wildcard ACAO is
+    // retired) — with the family's own reason ladder (notably `502 Bad
+    // Gateway`,
     // which the relay-failure paths produce; those need a connected
     // failing peer and stay smoke-covered by the peer validators).
     // Store-dependent leaves run over injected tempdir cert stores and
@@ -2927,7 +2930,7 @@ mod tests {
     /// literally.
     fn golden_peers_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }
@@ -2936,7 +2939,7 @@ mod tests {
     /// methods list.
     fn golden_coordinator_transcript(status_line: &str, body: &str) -> String {
         format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
     }

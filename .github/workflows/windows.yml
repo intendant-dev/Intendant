@@ -107,9 +107,8 @@ jobs:
         # the external per-listener target cache set up below; the
         # in-workspace target/ is wiped by checkout's `git clean -ffdx`
         # every job, so warmth never lives there). Provisioning steps
-        # (dep installs, cache actions) gate on `runner.environment ==
-        # 'github-hosted'`: the fleet boxes are pre-provisioned and keep
-        # their build state.
+        # (dep installs) gate on `runner.environment == 'github-hosted'`:
+        # the fleet boxes are pre-provisioned and keep their build state.
         include:
           - os: windows-latest
             runner: [self-hosted, intendant-windows]
@@ -175,7 +174,13 @@ jobs:
       # other) and keyed by `rustc -V` (a toolchain bump starts a fresh
       # key instead of thrashing the old one). `.last-used` is the recency
       # marker the fleet watchdog prunes stale keys by (scripts/ci).
-      # Hosted runners skip this and keep the rust-cache action below.
+      # Hosted runners skip this and build cold: the rust-cache restore
+      # they used to run could only save on push-to-main runs (a ref this
+      # workflow stopped seeing 2026-07-10), so every hosted leg paid a
+      # restore lookup against a store nothing populates — zero caches
+      # existed when the action was removed. If fork traffic ever warrants
+      # warm hosted legs, seed from a trusted ref; fork code must never
+      # populate a cache other builds consume.
       - name: External cargo target dir (unix)
         if: runner.environment != 'github-hosted' && runner.os != 'Windows'
         shell: bash
@@ -257,6 +262,17 @@ jobs:
           "relevant=$relevant" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Output "CI-relevant change detected: $relevant"
 
+      # ── Quality gate: rustfmt (Linux leg) ──────────────────────────────
+      # fmt is platform-independent, so one leg suffices — and it needs no
+      # build, so it runs before everything else: a formatting failure
+      # surfaces in seconds instead of after a compile+test cycle. Keep it
+      # AFTER the relevance detection above: its `if:` reads that step's
+      # output, and a not-yet-run step's output is empty, which passes the
+      # != 'false' test and would run fmt on docs-only diffs.
+      - name: cargo fmt --check
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo fmt --all --check
+
       # `ring` (our TLS provider — aws-lc-rs is deliberately disabled) builds
       # its x86_64 perlasm assembly with NASM on the MSVC target. Hosted-only,
       # like the other provisioning steps: the self-hosted Windows box has
@@ -300,20 +316,6 @@ jobs:
         if: runner.environment == 'github-hosted' && runner.os == 'macOS'
         run: brew install pkg-config libvpx
 
-      # Restore the cargo cache on every run, but only *save* it on pushes to
-      # main. PR caches live in an isolated scope GitHub discards on merge, so
-      # saving them buys nothing — and the Windows tar/zstd save step is flaky
-      # enough to fail an otherwise-green job. `save-if` keeps the speed-up on
-      # restore while removing the unreliable post-run save from PR checks.
-      # Hosted-only: the self-hosted runners keep their build state in the
-      # external per-listener cargo target dir set up above — shipping it
-      # to GitHub's cache store would only add minutes.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        if: runner.environment == 'github-hosted'
-        with:
-          key: ${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       # Fast pre-queue signal vs the real merge gate. Full suites run in
       # exactly two places: the merge group (all three platforms — the
       # actual gate, revalidating the speculative merge state) and the
@@ -352,6 +354,22 @@ jobs:
           # its §D corpus conformance gate (170 stamped vectors).
           cargo test -p intendant-core -p intendant-display -p intendant-platform -p owner-plane-core -p owner-plane-reducer --locked --target ${{ matrix.target }}
 
+      # ── Quality gate: clippy (Linux leg; baseline zeroed 2026-07-11) ──
+      # clippy is cfg-sensitive: the macOS-cut baseline left the Linux-only
+      # cfg surface unproven, so it started report-only; the Linux delta
+      # was zeroed (30 warnings — cfg-shadowed dead code gated, mechanical
+      # rewrites, established-signature allows) and verified with the exact
+      # gate incantation on the fleet's Linux toolchain in the same change
+      # that flipped this to -D warnings. Like fmt above, it rides the
+      # required Linux context; no ruleset change. Non-test targets only:
+      # --all-targets has its own unzeroed baseline (tracked in the CI
+      # hardening program). Ordered so the deterministic cheap gates fail
+      # before the longer, flakier tail (fmt → unit tests → clippy → e2e →
+      # smokes): a lint-red PR never burns an e2e + smoke cycle.
+      - name: cargo clippy (-D warnings)
+        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
+        run: cargo clippy --workspace --locked --target ${{ matrix.target }} -- -D warnings
+
       # Headless end-to-end: the real `intendant` + `intendant-runtime`
       # binaries driven by the scripted mock provider (see tests/e2e/main.rs).
       # No keys, no network, no display — exercises the production stack the
@@ -361,30 +379,19 @@ jobs:
         if: (github.event_name == 'merge_group' || (runner.os == 'Linux' && github.event_name == 'pull_request')) && steps.relevance_unix.outputs.relevant != 'false' && steps.relevance_win.outputs.relevant != 'false'
         run: cargo test -p intendant --test e2e --locked --target ${{ matrix.target }}
 
-      # ── Quality gates (Linux leg; baselines zeroed 2026-07-11) ──────
-      # fmt is platform-independent, so one leg suffices. clippy is
-      # cfg-sensitive: the macOS-cut baseline left the Linux-only cfg
-      # surface unproven, so it started report-only; the Linux delta was
-      # zeroed (30 warnings — cfg-shadowed dead code gated, mechanical
-      # rewrites, established-signature allows) and verified with the
-      # exact gate incantation on the fleet's Linux toolchain in the
-      # same change that flipped this to -D warnings. Both ride the
-      # required Linux context; no ruleset change. Non-test targets
-      # only: --all-targets has its own unzeroed baseline (tracked in
-      # the CI hardening program).
-      - name: cargo fmt --check
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo fmt --all --check
-
-      - name: cargo clippy (-D warnings)
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo clippy --workspace --locked --target ${{ matrix.target }} -- -D warnings
-
       # ── Linux gate tail: keyless smokes + dashboard-boot ──────────────
       # Formerly smokes.yml's two jobs (deleted 2026-07-11 — coverage
       # rationale preserved in its git history): the live-fire subset of
       # the landing battery that needs NO API keys and NO display — real
-      # binaries driven end to end by the scripted mock provider.
+      # binaries driven end to end by the scripted mock provider. The
+      # binaries are the ones the e2e step above just built and tested:
+      # compiling a package's integration tests builds its bin targets and
+      # uplifts them to <triple>/debug/ (tests/e2e/main.rs references
+      # CARGO_BIN_EXE_intendant{,-runtime}, and the daemon resolves the
+      # runtime as its on-disk sibling). No separate `cargo build --bins`
+      # here: it feature-resolves without dev-deps, so it rebuilt dep
+      # crates and re-linked all three bins (~40s median) only to replace
+      # the e2e-validated binaries with byte-different ones.
       #   - session-vitals-smoke: daemon in a dirty git repo; vitals event
       #     carries git + cache + limits sections end to end.
       #   - native-goal-smoke: the /goal engine over the control socket.
@@ -411,14 +418,6 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/pyws"
           "$RUNNER_TEMP/pyws/bin/pip" install --quiet websockets
           echo "$RUNNER_TEMP/pyws/bin" >> "$GITHUB_PATH"
-
-      # The real binaries for the smoke rigs — incremental on top of the
-      # test/e2e build above (same target dir, same profile): seconds,
-      # not a second build. Debug profile deliberately (the smokes probe
-      # protocol behavior, which the profile doesn't change).
-      - name: cargo build (smoke binaries)
-        if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
-        run: cargo build -p intendant --bins --locked --target ${{ matrix.target }}
 
       - name: session-vitals smoke
         if: runner.os == 'Linux' && steps.relevance_unix.outputs.relevant != 'false'
