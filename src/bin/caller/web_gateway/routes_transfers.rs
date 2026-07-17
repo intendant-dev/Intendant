@@ -1192,10 +1192,7 @@ mod tests {
     fn json_body(response: &ApiResponse) -> (u16, serde_json::Value) {
         match response {
             ApiResponse::Json { status, body, .. } => {
-                let text = match body {
-                    JsonBody::PreSerialized(text) => text.clone(),
-                    JsonBody::Value(value) => value.to_string(),
-                };
+                let text = body.as_text();
                 (*status, serde_json::from_str(&text).unwrap())
             }
             ApiResponse::Bytes { .. } | ApiResponse::Stream { .. } => {
@@ -1223,10 +1220,7 @@ mod tests {
             } => (status, content_type, headers, bytes, meta),
             ApiResponse::Json { status, body, .. } => panic!(
                 "expected a bytes response, got {status}: {}",
-                match body {
-                    JsonBody::PreSerialized(text) => text,
-                    JsonBody::Value(value) => value.to_string(),
-                }
+                body.into_string()
             ),
             ApiResponse::Stream { .. } => panic!("expected a bytes response, got a stream"),
         }

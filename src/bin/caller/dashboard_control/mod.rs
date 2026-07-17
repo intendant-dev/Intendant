@@ -3685,8 +3685,10 @@ async fn api_sessions_response_from_home(
     // polls this with limit:'all' every 15s per tab, and the core already
     // serves the body from its serialized-string cache): a full validating
     // parse into `IgnoredAny` plus the leading-token check, then the body
-    // splices verbatim into a pre-serialized envelope.
-    let body = body.into_string();
+    // splices verbatim into a pre-serialized envelope. `as_text` borrows
+    // the cache's shared allocation — the splice below is this lane's
+    // only copy of the list text.
+    let body = body.as_text();
     let is_array = body.trim_start().starts_with('[')
         && serde_json::from_str::<serde::de::IgnoredAny>(&body).is_ok();
     if !is_array {
