@@ -211,13 +211,7 @@ pub(crate) async fn api_status(
             .iter()
             .find(|d| d.daemon_id == daemon_id)
             .cloned();
-        let queued = state
-            .event_queues
-            .lock()
-            .await
-            .get(daemon_id)
-            .map(|q| q.len())
-            .unwrap_or(0);
+        let queued = queued_event_count(&state, daemon_id);
         let active_sessions = state
             .active_sessions
             .lock()
@@ -843,8 +837,12 @@ pub(crate) async fn daemon_next(
     // protocol-normal — the daemon simply re-polls).
     let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(15_000));
     let deadline = tokio::time::Instant::now() + timeout;
+    // Resolve this daemon's lane once (post-auth: `daemon_id` is proven);
+    // the wait below parks on the lane's own Notify, so pushes for other
+    // daemons never wake this poll.
+    let lane = event_lane(&state, &daemon_id);
     loop {
-        if let Some(event) = pop_event(&state, &daemon_id).await {
+        if let Some(event) = lane.pop() {
             return Ok(Json(event).into_response());
         }
         let now = tokio::time::Instant::now();
@@ -852,7 +850,10 @@ pub(crate) async fn daemon_next(
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
         let remaining = deadline.saturating_duration_since(now);
-        if tokio::time::timeout(remaining, state.event_notify.notified())
+        // `notified()` first consumes any permit a `notify_one` stored
+        // while no waiter was registered, so an event enqueued between the
+        // pop above and this wait is picked up immediately.
+        if tokio::time::timeout(remaining, lane.notify.notified())
             .await
             .is_err()
         {
@@ -927,24 +928,106 @@ pub(crate) struct RendezvousEvent {
     challenge: Option<String>,
 }
 
-pub(crate) async fn enqueue_event(state: &AppState, daemon_id: &str, event: RendezvousEvent) {
-    let mut queues = state.event_queues.lock().await;
-    queues
-        .entry(daemon_id.to_string())
-        .or_default()
-        .push_back(event);
-    drop(queues);
-    state.event_notify.notify_waiters();
+/// Cap on one daemon's undelivered events. A polling daemon drains
+/// continuously, so the bound only bites while a daemon is absent or
+/// wedged; on overflow the OLDEST event is dropped (kinds are not
+/// latest-wins coalescible — distinct claims and sessions all matter —
+/// but the oldest entries are the ones whose claim/close windows have
+/// most likely already expired) and a warning names the daemon.
+const EVENT_QUEUE_CAP: usize = 256;
+
+/// One daemon's event delivery lane: its undelivered events paired with
+/// the `Notify` its long-poll parks on. A push wakes exactly the daemon
+/// it is for (the previous single global `Notify` woke every parked poll
+/// on every event, and all of them then contended on one queue-map lock),
+/// and `notify_one`'s stored permit closes the lost-wakeup race the
+/// global `notify_waiters` left open: an event enqueued between a
+/// poller's empty check and its `notified()` registration completes that
+/// wait immediately instead of sitting out the full poll timeout.
+#[derive(Default)]
+pub(crate) struct DaemonEventLane {
+    /// std Mutex: held only for short synchronous push/pop/len, never
+    /// across an await.
+    queue: std::sync::Mutex<VecDeque<RendezvousEvent>>,
+    notify: Notify,
 }
 
-pub(crate) async fn pop_event(state: &AppState, daemon_id: &str) -> Option<RendezvousEvent> {
-    let mut queues = state.event_queues.lock().await;
-    let queue = queues.get_mut(daemon_id)?;
-    let event = queue.pop_front();
-    if queue.is_empty() {
-        queues.remove(daemon_id);
+impl DaemonEventLane {
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, VecDeque<RendezvousEvent>> {
+        // Transient delivery state: a panic mid-hold cannot leave a
+        // half-applied queue (push/pop are single operations), so recover
+        // instead of propagating the poison.
+        self.queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    event
+
+    pub(crate) fn pop(&self) -> Option<RendezvousEvent> {
+        self.lock_queue().pop_front()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.lock_queue().len()
+    }
+}
+
+fn lock_lanes(
+    state: &AppState,
+) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DaemonEventLane>>> {
+    // Same poison-recovery rationale as `DaemonEventLane::lock_queue`.
+    state
+        .event_lanes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Get-or-create `daemon_id`'s delivery lane. Lanes are retained once
+/// created (never removed on empty): retention keeps a parked waiter's
+/// lane Arc identical to the one a concurrent push resolves — the old
+/// remove-when-drained lifecycle would let a push mint a fresh lane while
+/// a waiter still parks on the previous one, reintroducing lost wakeups.
+/// The map stays bounded because every creating caller is authenticated
+/// daemon-id traffic (registered daemons); an empty lane is a few dozen
+/// idle bytes.
+pub(crate) fn event_lane(state: &AppState, daemon_id: &str) -> Arc<DaemonEventLane> {
+    lock_lanes(state)
+        .entry(daemon_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Read-only queue depth for `/api/status`. Never creates a lane:
+/// `daemon_id` here is an unauthenticated query parameter, and lane
+/// creation must stay driven by authenticated traffic only.
+pub(crate) fn queued_event_count(state: &AppState, daemon_id: &str) -> usize {
+    lock_lanes(state)
+        .get(daemon_id)
+        .map(|lane| lane.len())
+        .unwrap_or(0)
+}
+
+/// Queue `event` for `daemon_id`'s next poll. Stays `async` for call-site
+/// stability (in-flight branches enqueue with `.await`); it never blocks.
+pub(crate) async fn enqueue_event(state: &AppState, daemon_id: &str, event: RendezvousEvent) {
+    let lane = event_lane(state, daemon_id);
+    let overflowed = {
+        let mut queue = lane.lock_queue();
+        let overflowed = queue.len() >= EVENT_QUEUE_CAP;
+        if overflowed {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+        overflowed
+    };
+    if overflowed {
+        eprintln!(
+            "[connect] event queue for daemon {daemon_id} is full ({EVENT_QUEUE_CAP}): dropped the oldest undelivered event"
+        );
+    }
+    // `notify_one` stores a permit when no waiter is registered yet, so a
+    // poller that checked an empty queue just before this push completes
+    // its `notified()` immediately instead of waiting out the poll cap.
+    lane.notify.notify_one();
 }
 
 pub(crate) async fn record_active_dashboard_session(
@@ -2083,8 +2166,7 @@ mod tests {
             pending_authentications: Mutex::new(HashMap::new()),
             pending_offers: Mutex::new(HashMap::new()),
             pending_claims: Mutex::new(HashMap::new()),
-            event_queues: Mutex::new(HashMap::new()),
-            event_notify: Notify::new(),
+            event_lanes: std::sync::Mutex::new(HashMap::new()),
             daemon_sessions: Mutex::new(HashMap::new()),
             rate_limits: Mutex::new(RateLimitTable::default()),
             active_sessions: Mutex::new(HashMap::new()),
@@ -2135,6 +2217,162 @@ mod tests {
         }
     }
 
+    fn lane_test_state(root: &Path) -> Arc<AppState> {
+        let user = UserRecord {
+            id: Uuid::new_v4(),
+            account_name: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            passkeys: Vec::new(),
+            created_unix_ms: 1,
+            updated_unix_ms: 1,
+            last_login_unix_ms: 1,
+            attestations: Vec::new(),
+        };
+        hosted_control_test_state(root, user, daemon_record("seed-daemon", None, None, None))
+    }
+
+    fn test_event(id: &str) -> RendezvousEvent {
+        RendezvousEvent {
+            id: id.to_string(),
+            kind: "claim_challenge".to_string(),
+            ..RendezvousEvent::default()
+        }
+    }
+
+    /// Register `daemon_id` as a pollable daemon: a store record (for
+    /// `touch_daemon`) plus a live daemon-session credential, returning
+    /// the headers `daemon_next` authenticates against.
+    async fn register_polling_daemon(state: &AppState, daemon_id: &str) -> HeaderMap {
+        state
+            .store
+            .lock()
+            .await
+            .daemons
+            .push(daemon_record(daemon_id, None, None, None));
+        let token = format!("{daemon_id}-session-token");
+        state.daemon_sessions.lock().await.insert(
+            daemon_id.to_string(),
+            DaemonSessionCredential {
+                token: token.clone(),
+                expires_unix_ms: now_unix_ms() + 60_000,
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(DAEMON_SESSION_HEADER, token.parse().unwrap());
+        headers
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_event_completes_wait_registered_after_the_push() {
+        // The lost-wakeup regression: a poller checks its lane (empty), the
+        // event lands, and only THEN does the poller register its wait. The
+        // stored permit must complete that wait immediately — the old global
+        // `notify_waiters` had nothing stored, so this ordering slept out
+        // the full poll cap.
+        let root = tempfile::tempdir().unwrap();
+        let state = lane_test_state(root.path());
+        let lane = event_lane(&state, "daemon-1");
+        assert!(lane.pop().is_none()); // the poller's empty check
+        enqueue_event(&state, "daemon-1", test_event("gap-event")).await;
+        tokio::time::timeout(Duration::from_millis(50), lane.notify.notified())
+            .await
+            .expect("enqueue must store a permit for a not-yet-registered waiter");
+        assert_eq!(lane.pop().unwrap().id, "gap-event");
+        // Draining a lane to empty must keep the SAME lane registered:
+        // remove-on-empty would hand the next push a fresh Notify while a
+        // waiter still parks on the old one.
+        assert!(Arc::ptr_eq(&lane, &event_lane(&state, "daemon-1")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn parked_daemon_poll_delivers_promptly_on_enqueue() {
+        let root = tempfile::tempdir().unwrap();
+        let state = lane_test_state(root.path());
+        let headers = register_polling_daemon(&state, "daemon-1").await;
+        let poll = tokio::spawn(daemon_next(
+            State(state.clone()),
+            headers,
+            Query(DaemonNextQuery {
+                daemon_id: "daemon-1".to_string(),
+                timeout_ms: Some(15_000),
+            }),
+        ));
+        // Paused time only advances once every task is parked, so after
+        // this sleep the poll is provably waiting on its lane.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        enqueue_event(&state, "daemon-1", test_event("prompt-event")).await;
+        // Well under the poll deadline: delivery must come from the lane
+        // wakeup, not from the timeout path.
+        let response = tokio::time::timeout(Duration::from_secs(5), poll)
+            .await
+            .expect("parked poll must wake on its own lane's push")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(event["id"], "prompt-event");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn event_wakes_only_the_target_daemons_poll() {
+        let root = tempfile::tempdir().unwrap();
+        let state = lane_test_state(root.path());
+        let headers_a = register_polling_daemon(&state, "daemon-a").await;
+        let headers_b = register_polling_daemon(&state, "daemon-b").await;
+        let poll_a = tokio::spawn(daemon_next(
+            State(state.clone()),
+            headers_a,
+            Query(DaemonNextQuery {
+                daemon_id: "daemon-a".to_string(),
+                timeout_ms: Some(15_000),
+            }),
+        ));
+        let poll_b = tokio::spawn(daemon_next(
+            State(state.clone()),
+            headers_b,
+            Query(DaemonNextQuery {
+                daemon_id: "daemon-b".to_string(),
+                timeout_ms: Some(15_000),
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        enqueue_event(&state, "daemon-a", test_event("a-only")).await;
+        let response_a = tokio::time::timeout(Duration::from_secs(5), poll_a)
+            .await
+            .expect("daemon-a's poll must deliver its event")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response_a.status(), StatusCode::OK);
+        // daemon-b's lane got neither the event nor a wakeup: its poll
+        // stays parked until its own deadline and ends NO_CONTENT, exactly
+        // like any idle poll.
+        let response_b = poll_b.await.unwrap().unwrap();
+        assert_eq!(response_b.status(), StatusCode::NO_CONTENT);
+        assert_eq!(event_lane(&state, "daemon-b").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn overflowing_lane_drops_oldest_and_stays_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let state = lane_test_state(root.path());
+        for i in 0..EVENT_QUEUE_CAP + 3 {
+            enqueue_event(&state, "daemon-1", test_event(&format!("event-{i}"))).await;
+        }
+        let lane = event_lane(&state, "daemon-1");
+        assert_eq!(lane.len(), EVENT_QUEUE_CAP);
+        // Drop-oldest: the first three events made room for the newest
+        // three; delivery order within the survivors is unchanged.
+        assert_eq!(lane.pop().unwrap().id, "event-3");
+        let mut last = None;
+        while let Some(event) = lane.pop() {
+            last = Some(event.id);
+        }
+        assert_eq!(last.unwrap(), format!("event-{}", EVENT_QUEUE_CAP + 2));
+    }
+
     #[tokio::test]
     async fn hosted_control_endpoints_refuse_without_mutating_relay_state() {
         let root = tempfile::tempdir().unwrap();
@@ -2159,14 +2397,16 @@ mod tests {
         );
         headers.insert(CSRF_HEADER, csrf.parse().unwrap());
         headers.insert(header::ORIGIN, state.config.public_origin.parse().unwrap());
-        state.event_queues.lock().await.insert(
-            "daemon-1".to_string(),
-            VecDeque::from([RendezvousEvent {
+        enqueue_event(
+            &state,
+            "daemon-1",
+            RendezvousEvent {
                 id: "existing-route-event".to_string(),
                 kind: "claim_challenge".to_string(),
                 ..RendezvousEvent::default()
-            }]),
-        );
+            },
+        )
+        .await;
         state.active_sessions.lock().await.insert(
             "legacy-session".to_string(),
             ActiveDashboardSession {
@@ -2190,11 +2430,9 @@ mod tests {
         assert_eq!(close.unwrap_err().status, StatusCode::FORBIDDEN);
 
         assert!(state.pending_offers.lock().await.is_empty());
-        let queues = state.event_queues.lock().await;
-        let queue = queues.get("daemon-1").unwrap();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().id, "existing-route-event");
-        drop(queues);
+        let lane = event_lane(&state, "daemon-1");
+        assert_eq!(lane.len(), 1);
+        assert_eq!(lane.pop().unwrap().id, "existing-route-event");
         assert!(state
             .active_sessions
             .lock()

@@ -2425,14 +2425,16 @@ mod tests {
         });
         let state = production_router_test_state(root.path(), store);
         let (session, csrf) = create_session(&state, user_id).await;
-        state.event_queues.lock().await.insert(
-            "daemon-1".to_string(),
-            VecDeque::from([serde_json::from_value(json!({
+        enqueue_event(
+            &state,
+            "daemon-1",
+            serde_json::from_value(json!({
                 "id": "existing-route-event",
                 "kind": "claim_challenge",
             }))
-            .unwrap()]),
-        );
+            .unwrap(),
+        )
+        .await;
         state.active_sessions.lock().await.insert(
             "legacy-session".to_string(),
             ActiveDashboardSession {
@@ -2471,14 +2473,12 @@ mod tests {
         }
 
         assert!(state.pending_offers.lock().await.is_empty());
-        let queues = state.event_queues.lock().await;
-        let queue = queues.get("daemon-1").unwrap();
-        assert_eq!(queue.len(), 1);
+        let lane = event_lane(&state, "daemon-1");
+        assert_eq!(lane.len(), 1);
         assert_eq!(
-            serde_json::to_value(queue.front().unwrap()).unwrap()["id"],
+            serde_json::to_value(lane.pop().unwrap()).unwrap()["id"],
             "existing-route-event"
         );
-        drop(queues);
         assert!(state
             .active_sessions
             .lock()
