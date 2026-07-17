@@ -128,15 +128,35 @@ pub(crate) fn is_dns_credential_env(name: &str) -> bool {
         || name.ends_with("_TSIG_SECRET")
 }
 
+fn child_dns_credential_env() -> &'static RwLock<Option<String>> {
+    static NAME: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+    NAME.get_or_init(|| RwLock::new(None))
+}
+
+/// Set the daemon-level DNS fallback that supervised coding-agent children
+/// must not inherit. Main initializes this even without a web gateway;
+/// runtime Connect configuration changes replace it before later spawns.
+pub(crate) fn configure_dns_credential_child_scrub(config: &crate::project::CustomDomainConfig) {
+    *child_dns_credential_env()
+        .write()
+        .expect("DNS credential child scrub state poisoned") =
+        config.dns_credential_env_for_child_scrub();
+}
+
+pub(crate) fn configured_dns_credential_child_scrub() -> Option<String> {
+    child_dns_credential_env()
+        .read()
+        .expect("DNS credential child scrub state poisoned")
+        .clone()
+}
+
 /// Remove the exact fallback used by the active custom-domain lane from a
 /// supervised coding-agent child. Other API-token variables remain available
 /// to the user's coding session.
-pub(crate) fn scrub_dns_credential_env(command: &mut tokio::process::Command) {
-    let fallback = crate::connect_rendezvous::active_custom_domain_dns_fallback();
-    scrub_dns_credential_env_name(command, fallback.as_ref().map(|(_, name)| name.as_str()));
-}
-
-fn scrub_dns_credential_env_name(command: &mut tokio::process::Command, active_name: Option<&str>) {
+pub(crate) fn scrub_dns_credential_env_name(
+    command: &mut tokio::process::Command,
+    active_name: Option<&str>,
+) {
     if let Some(name) = active_name {
         command.env_remove(name);
     }

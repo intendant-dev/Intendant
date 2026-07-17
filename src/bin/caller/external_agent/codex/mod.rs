@@ -1240,6 +1240,7 @@ impl ExternalAgent for CodexAgent {
         &mut self,
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+        let dns_credential_env = config.dns_credential_env.clone();
         self.model = config.model.or_else(|| self.model.clone());
         self.approval_policy = config.approval_policy.clone();
         self.sandbox = config.sandbox;
@@ -1309,7 +1310,10 @@ impl ExternalAgent for CodexAgent {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
         }
-        crate::credential_leases::scrub_dns_credential_env(&mut command);
+        crate::credential_leases::scrub_dns_credential_env_name(
+            &mut command,
+            dns_credential_env.as_deref(),
+        );
         let mut child = command.spawn().map_err(|e| {
             CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
         })?;
@@ -3538,6 +3542,7 @@ enabled = true
             codex_managed_context: true,
             web_port: Some(mcp_port),
             mcp_auth_token: None,
+            dns_credential_env: None,
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
             fork_resume: false,

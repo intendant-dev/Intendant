@@ -20,6 +20,10 @@ pub(super) struct CertificateStatus {
     pub(super) state: String,
     pub(super) not_after_unix_ms: Option<u64>,
     pub(super) acme_account_uri: Option<String>,
+    /// A stored certificate/key could not be restored. Unlike a retryable
+    /// ACME error, this remains visible until a fresh certificate replaces it.
+    pub(super) restore_error: Option<String>,
+    /// Retryable account, DNS, and issuance error from the latest check.
     pub(super) last_error: Option<String>,
 }
 
@@ -123,7 +127,7 @@ impl CustomDomainRuntime {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             current.state = "error".to_string();
-            current.last_error = Some(error);
+            current.restore_error = Some(error);
         }
         let passkeys = match passkeys::PasskeyRuntime::new(domain.clone(), cert_dir.clone(), hosted)
         {
@@ -229,7 +233,11 @@ impl CustomDomainRuntime {
             },
             certificate_not_after_unix_ms: certificate.not_after_unix_ms,
             acme_account_uri: certificate.acme_account_uri,
-            initialization_error: self.initialization_error.clone().or(certificate.last_error),
+            initialization_error: self
+                .initialization_error
+                .clone()
+                .or(certificate.restore_error)
+                .or(certificate.last_error),
             passkeys,
         }
     }

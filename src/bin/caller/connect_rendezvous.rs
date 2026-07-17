@@ -455,6 +455,7 @@ pub(crate) fn stop_client() {
 /// provided the dashboard-control registry (the gateway calling this
 /// implies it already exists).
 pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
+    crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     stop_client();
     if !config.enabled {
         client_state()
@@ -504,6 +505,7 @@ fn start_client(
     gateway_tcp_port: Option<u16>,
     hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
 ) {
+    crate::credential_leases::configure_dns_credential_child_scrub(&config.custom_domain);
     client_state()
         .lock()
         .expect("connect client state poisoned")

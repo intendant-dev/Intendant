@@ -34,7 +34,8 @@ pub(super) fn restore(
             if cert_error.kind() == std::io::ErrorKind::NotFound
                 && key_error.kind() == std::io::ErrorKind::NotFound =>
         {
-            return account_error.map_or(Ok(()), Err);
+            update_status(status, |current| current.last_error = account_error);
+            return Ok(());
         }
         (Err(error), _) => return Err(format!("read {}: {error}", cert_path.display())),
         (_, Err(error)) => return Err(format!("read {}: {error}", key_path.display())),
@@ -99,15 +100,9 @@ async fn ensure_certificate(
     let account_uri = crate::fleet_cert::acme_account_uri_in(cert_dir)?
         .ok_or_else(|| "ACME account was created without an account URI".to_string())?;
     update_status(status, |current| {
-        current.acme_account_uri = Some(account_uri);
+        record_account_ready(current, account_uri, issuance_enabled);
     });
     if !issuance_enabled {
-        update_status(status, |current| {
-            if current.not_after_unix_ms.is_none() && current.state != "error" {
-                current.state = "waiting_for_caa".to_string();
-                current.last_error = None;
-            }
-        });
         return Ok(());
     }
 
@@ -225,9 +220,29 @@ async fn request_certificate(
     update_status(status, |current| {
         current.state = "valid".to_string();
         current.not_after_unix_ms = Some(not_after);
+        current.restore_error = None;
         current.last_error = None;
     });
     Ok(())
+}
+
+fn record_account_ready(
+    status: &mut CertificateStatus,
+    account_uri: String,
+    issuance_enabled: bool,
+) {
+    status.acme_account_uri = Some(account_uri);
+    status.last_error = None;
+    if issuance_enabled {
+        return;
+    }
+    status.state = match status.not_after_unix_ms {
+        Some(expiry) if expiry > now_unix_ms() => "valid",
+        Some(_) => "expired",
+        None if status.restore_error.is_some() => "error",
+        None => "waiting_for_caa",
+    }
+    .to_string();
 }
 
 fn require_exact_dns_name(cert_pem: &str, expected: &str) -> Result<(), String> {
@@ -289,5 +304,53 @@ mod tests {
         ])
         .unwrap();
         assert!(require_exact_dns_name(&cert.cert.pem(), "box.example.test").is_err());
+    }
+
+    #[test]
+    fn successful_account_retry_clears_only_transient_errors() {
+        let mut transient = CertificateStatus {
+            state: "error".to_string(),
+            last_error: Some("temporary account lookup failure".to_string()),
+            ..Default::default()
+        };
+        record_account_ready(
+            &mut transient,
+            "https://acme.example/account/1".to_string(),
+            false,
+        );
+        assert_eq!(transient.state, "waiting_for_caa");
+        assert_eq!(transient.last_error, None);
+
+        let mut durable = CertificateStatus {
+            state: "error".to_string(),
+            restore_error: Some("stored certificate is unreadable".to_string()),
+            last_error: Some("temporary account lookup failure".to_string()),
+            ..Default::default()
+        };
+        record_account_ready(
+            &mut durable,
+            "https://acme.example/account/1".to_string(),
+            false,
+        );
+        assert_eq!(durable.state, "error");
+        assert_eq!(
+            durable.restore_error.as_deref(),
+            Some("stored certificate is unreadable")
+        );
+        assert_eq!(durable.last_error, None);
+
+        let mut valid = CertificateStatus {
+            state: "valid".to_string(),
+            not_after_unix_ms: Some(u64::MAX),
+            last_error: Some("temporary account lookup failure".to_string()),
+            ..Default::default()
+        };
+        record_account_ready(
+            &mut valid,
+            "https://acme.example/account/1".to_string(),
+            false,
+        );
+        assert_eq!(valid.state, "valid");
+        assert_eq!(valid.last_error, None);
     }
 }

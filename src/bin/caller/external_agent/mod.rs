@@ -1260,6 +1260,10 @@ pub struct AgentConfig {
     /// Shared secret required by the web gateway's secured loopback MCP
     /// exception. Only managed child processes receive it.
     pub mcp_auth_token: Option<String>,
+    /// Exact daemon DNS fallback environment entry to remove from this
+    /// supervised child. Derived before gateway startup as well as on live
+    /// settings changes; the credential value is never copied here.
+    pub dns_credential_env: Option<String>,
     /// Intendant session id to include in the injected MCP URL so tool
     /// exposure can be scoped to the Codex process that is calling.
     pub mcp_session_id: Option<String>,

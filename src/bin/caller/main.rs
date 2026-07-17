@@ -3219,6 +3219,11 @@ async fn main() -> Result<(), CallerError> {
             settings_root.display()
         );
     }
+    // DNS issuance credentials belong to the daemon, never a supervised
+    // coding-agent child. Initialize this from parsed project state even on
+    // --no-web paths; projectless web daemons replace it from connect.toml
+    // when the gateway wires the Connect client.
+    credential_leases::configure_dns_credential_child_scrub(&project.config.connect.custom_domain);
     // Synthetic display for headless test rigs (INTENDANT_MOCK_DISPLAY=
     // synthetic; fail-closed: honored only under PROVIDER=mock). Evaluated
     // here — after the .env load and the --provider override settle the

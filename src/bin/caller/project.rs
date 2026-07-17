@@ -852,6 +852,32 @@ impl CustomDomainConfig {
             None => Ok(None),
         }
     }
+
+    /// Environment entry to remove from supervised child processes. This is
+    /// intentionally derived without validating the domain name: a malformed
+    /// lane must fail closed instead of handing its configured DNS credential
+    /// to a coding-agent child.
+    pub(crate) fn dns_credential_env_for_child_scrub(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let (configured, default) = match &self.dns {
+            Some(CustomDomainDnsConfig::Cloudflare { token_env, .. }) => {
+                (token_env.as_deref(), "CLOUDFLARE_API_TOKEN")
+            }
+            Some(CustomDomainDnsConfig::Rfc2136 { secret_env, .. }) => {
+                (secret_env.as_deref(), "INTENDANT_RFC2136_TSIG_SECRET")
+            }
+            None => return None,
+        };
+        Some(
+            configured
+                .map(str::trim)
+                .filter(|name| !name.is_empty() && !name.contains('=') && !name.contains('\0'))
+                .unwrap_or(default)
+                .to_string(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2664,6 +2690,28 @@ zone_id = "zone-id"
         });
         assert!(invalid.validated().is_err());
         assert!(invalid.validated_dns_credential_fallback().is_err());
+        assert_eq!(
+            invalid.dns_credential_env_for_child_scrub().as_deref(),
+            Some("INTENDANT_UNSCRUBBED_TOKEN")
+        );
+
+        let malformed_domain = CustomDomainConfig {
+            enabled: true,
+            name: Some("*.example.com".to_string()),
+            dns: Some(CustomDomainDnsConfig::Cloudflare {
+                zone_id: "zone-id".to_string(),
+                token_env: Some("OWNER_DNS_API_TOKEN".to_string()),
+                propagation_delay_secs: 10,
+            }),
+            ..Default::default()
+        };
+        assert!(malformed_domain.validated().is_err());
+        assert_eq!(
+            malformed_domain
+                .dns_credential_env_for_child_scrub()
+                .as_deref(),
+            Some("OWNER_DNS_API_TOKEN")
+        );
     }
 
     #[test]

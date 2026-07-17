@@ -119,6 +119,11 @@ pub(crate) fn spawn_check_now() {
     tokio::spawn(check_once());
 }
 
+fn daemon_check_lock() -> &'static tokio::sync::Mutex<()> {
+    static CHECK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    CHECK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn now_unix_ms() -> u64 {
     crate::access::client_key::now_unix_ms().max(0) as u64
 }
@@ -411,7 +416,7 @@ fn parse_manifest_leaf(leaf_json: &str) -> Result<ManifestLeaf, String> {
 
 // ── The pinned tree head (TOFU, then consistency forever) ──
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SthPin {
     size: u64,
     /// b64u, as the service reports it.
@@ -443,17 +448,66 @@ fn pin_path(state_root: &Path, base: &Url) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-fn load_pin(path: &Path) -> Option<SthPin> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+fn load_pin(path: &Path) -> Result<Option<SthPin>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|error| format!("parse {}: {error}", path.display()))
 }
 
-fn save_pin(path: &Path, pin: &SthPin) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let text = serde_json::to_string_pretty(pin).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+fn same_tree_head(left: &SthPin, right: &SthPin) -> bool {
+    left.size == right.size && left.root == right.root && left.public_key == right.public_key
+}
+
+fn pin_lock_dir(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("pin path has no parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("pin path has no file name: {}", path.display()))?;
+    Ok(parent.join(".pin-locks").join(name))
+}
+
+/// Commit a verified tree head without letting an older concurrent check
+/// overwrite a newer observation. The snapshot used for consistency
+/// verification must still be current at commit time; otherwise the caller
+/// retries from the new pin on its next check.
+fn commit_pin(path: &Path, basis: Option<&SthPin>, candidate: &SthPin) -> Result<(), String> {
+    let lock_dir = pin_lock_dir(path)?;
+    crate::access::authority_store::with_lock(&lock_dir, || {
+        let current = load_pin(path).map_err(crate::access::AccessError)?;
+        if current
+            .as_ref()
+            .is_some_and(|pin| same_tree_head(pin, candidate))
+        {
+            return Ok(());
+        }
+        let basis_is_current = match (basis, current.as_ref()) {
+            (None, None) => true,
+            (Some(basis), Some(current)) => same_tree_head(basis, current),
+            _ => false,
+        };
+        if !basis_is_current {
+            return Err(crate::access::AccessError(format!(
+                "transparency pin changed while verification was running for {}; retry against the current pin",
+                path.display()
+            )));
+        }
+
+        let mut committed = candidate.clone();
+        if let Some(current) = current {
+            committed.pinned_unix_ms = current.pinned_unix_ms;
+        }
+        let text = serde_json::to_string_pretty(&committed)
+            .map_err(|error| crate::access::AccessError(error.to_string()))?;
+        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// What the pinned tree head demands of the fetched one. Pure — the
@@ -633,6 +687,7 @@ struct VerifiedLogEntry {
     leaf_json: String,
     sth: Sth,
     pin_file: PathBuf,
+    pin_basis: Option<SthPin>,
     pinned_from_size: Option<u64>,
     pin_candidate: SthPin,
 }
@@ -685,7 +740,7 @@ async fn verify_logged_entry(
 
     // 3. The tree head extends the one pinned last time (append-only).
     let pin_file = pin_path(state_root, base);
-    let pin = load_pin(&pin_file);
+    let pin = load_pin(&pin_file).map_err(Unavailable)?;
     let pinned_from_size = pin.as_ref().map(|p| p.size);
     match pin_decision(pin.as_ref(), &sth).map_err(verification)? {
         PinDecision::FirstContact | PinDecision::Unchanged => {}
@@ -724,13 +779,17 @@ async fn verify_logged_entry(
         size: sth.size,
         root: sth.root_b64u.clone(),
         public_key: sth.public_key_b64u.clone(),
-        pinned_unix_ms: pin.map(|p| p.pinned_unix_ms).unwrap_or_else(now_unix_ms),
+        pinned_unix_ms: pin
+            .as_ref()
+            .map(|p| p.pinned_unix_ms)
+            .unwrap_or_else(now_unix_ms),
     };
     Ok(VerifiedLogEntry {
         index,
         leaf_json: leaf_json.to_string(),
         sth,
         pin_file,
+        pin_basis: pin,
         pinned_from_size,
         pin_candidate,
     })
@@ -791,7 +850,12 @@ pub(crate) async fn verify_hosted_bundle(
     }
 
     // Everything held — advance the pin.
-    save_pin(&entry.pin_file, &entry.pin_candidate).map_err(Unavailable)?;
+    commit_pin(
+        &entry.pin_file,
+        entry.pin_basis.as_ref(),
+        &entry.pin_candidate,
+    )
+    .map_err(Unavailable)?;
 
     Ok(VerifyReport {
         log_size: entry.sth.size,
@@ -1231,7 +1295,12 @@ pub(crate) async fn verify_hosted_release(
     }
 
     // Everything held — advance the pin.
-    save_pin(&entry.pin_file, &entry.pin_candidate).map_err(Unavailable)?;
+    commit_pin(
+        &entry.pin_file,
+        entry.pin_basis.as_ref(),
+        &entry.pin_candidate,
+    )
+    .map_err(Unavailable)?;
 
     Ok(ReleaseVerifyReport {
         log_size: entry.sth.size,
@@ -1254,6 +1323,11 @@ pub(crate) async fn verify_hosted_release(
 /// One check against the configured rendezvous. Skips quietly when the
 /// Connect client is not enabled.
 pub(crate) async fn check_once() {
+    let _single_flight = daemon_check_lock().lock().await;
+    check_once_inner().await;
+}
+
+async fn check_once_inner() {
     let status = crate::connect_rendezvous::status_snapshot();
     if !status.configured {
         note_connect_config(false, None);
@@ -2274,7 +2348,9 @@ mod tests {
         assert_eq!(report.presence_only, 0);
         assert_eq!(report.downloaded, 0);
         assert_eq!(report.pinned_from_size, None);
-        let pin = load_pin(&pin_path(state_root.path(), &base)).expect("pin created");
+        let pin = load_pin(&pin_path(state_root.path(), &base))
+            .expect("pin readable")
+            .expect("pin created");
         assert_eq!(pin.size, 2);
 
         // The log grows: the rerun must fetch and verify consistency
@@ -2298,7 +2374,10 @@ mod tests {
         assert_eq!(report.log_size, 3);
         assert_eq!(report.pinned_from_size, Some(2));
         assert_eq!(
-            load_pin(&pin_path(state_root.path(), &base)).unwrap().size,
+            load_pin(&pin_path(state_root.path(), &base))
+                .unwrap()
+                .unwrap()
+                .size,
             3
         );
 
@@ -2363,7 +2442,9 @@ mod tests {
             other => panic!("divergence must fail verification, got {other:?}"),
         }
         // A verification failure must NOT advance (or create) the pin.
-        assert!(load_pin(&pin_path(state_root.path(), &base)).is_none());
+        assert!(load_pin(&pin_path(state_root.path(), &base))
+            .unwrap()
+            .is_none());
 
         // GitHub not having the release at all is a verdict, not an
         // availability problem: the log commits something GitHub denies.
@@ -2492,15 +2573,15 @@ mod tests {
             path.file_name().and_then(|n| n.to_str()),
             Some("connect.example.test_8443.json")
         );
-        assert!(load_pin(&path).is_none());
+        assert!(load_pin(&path).unwrap().is_none());
         let pin = SthPin {
             size: 12,
             root: "cm9vdA".to_string(),
             public_key: "a2V5".to_string(),
             pinned_unix_ms: 77,
         };
-        save_pin(&path, &pin).unwrap();
-        let loaded = load_pin(&path).unwrap();
+        commit_pin(&path, None, &pin).unwrap();
+        let loaded = load_pin(&path).unwrap().unwrap();
         assert_eq!(loaded.size, 12);
         assert_eq!(loaded.root, "cm9vdA");
         assert_eq!(loaded.public_key, "a2V5");
@@ -2511,5 +2592,75 @@ mod tests {
             &Url::parse("https://other.example.test").unwrap(),
         );
         assert_ne!(path, other);
+    }
+
+    #[test]
+    fn malformed_pin_never_becomes_first_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pin_path(
+            dir.path(),
+            &Url::parse("https://connect.example.test").unwrap(),
+        );
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+        assert!(load_pin(&path).unwrap_err().contains("parse"));
+
+        let candidate = SthPin {
+            size: 1,
+            root: "cm9vdA".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        assert!(commit_pin(&path, None, &candidate)
+            .unwrap_err()
+            .contains("parse"));
+    }
+
+    #[test]
+    fn stale_pin_commit_cannot_regress_a_newer_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = pin_path(
+            dir.path(),
+            &Url::parse("https://connect.example.test").unwrap(),
+        );
+        let old = SthPin {
+            size: 1,
+            root: "b2xk".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        commit_pin(&path, None, &old).unwrap();
+        let newer = SthPin {
+            size: 3,
+            root: "bmV3ZXI".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 99,
+        };
+        commit_pin(&path, Some(&old), &newer).unwrap();
+
+        let stale_candidate = SthPin {
+            size: 2,
+            root: "c3RhbGU".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 77,
+        };
+        assert!(commit_pin(&path, Some(&old), &stale_candidate)
+            .unwrap_err()
+            .contains("changed while verification was running"));
+        let committed = load_pin(&path).unwrap().unwrap();
+        assert!(same_tree_head(&committed, &newer));
+        assert_eq!(committed.pinned_unix_ms, old.pinned_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn daemon_checks_are_single_flight() {
+        let first = daemon_check_lock().lock().await;
+        let waiting = tokio::spawn(async {
+            let _second = daemon_check_lock().lock().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        waiting.await.unwrap();
     }
 }

@@ -813,6 +813,8 @@ pub(crate) async fn create_external_agent(
                 codex_managed_context,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
@@ -858,6 +860,8 @@ pub(crate) async fn create_external_agent(
                 codex_managed_context: false,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
+                dns_credential_env: crate::credential_leases::configured_dns_credential_child_scrub(
+                ),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 fork_resume,
