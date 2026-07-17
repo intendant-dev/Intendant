@@ -1057,6 +1057,14 @@ pub enum AppEvent {
         counts: crate::agenda::AgendaCounts,
     },
 
+    /// The Memory plane admitted a write (a claim was proposed). Carries
+    /// the provenance-labeled view so frontends update live without
+    /// refetching. The view is quoted DATA for rendering (§6.5), never
+    /// instructions.
+    MemoryChanged {
+        claim: crate::memory::ClaimView,
+    },
+
     /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
     /// listener consumes it (stuck-phase detection), and only MCP mode
     /// spawns the timer.
@@ -3073,6 +3081,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AgendaChanged { item, counts } => Some(OutboundEvent::AgendaChanged {
             item: item.clone(),
             counts: *counts,
+        }),
+        AppEvent::MemoryChanged { claim } => Some(OutboundEvent::MemoryChanged {
+            claim: claim.clone(),
         }),
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,

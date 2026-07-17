@@ -61,8 +61,11 @@ impl Default for SearchArgs {
 /// additively. Unlike the claim body's `session`/`project` fields
 /// (writer-stated context claims), every field here is gate-derived:
 /// never parsed from tool arguments, request bodies, or query echoes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ClaimProvenance {
+/// (`Deserialize` exists only for the event-lane plumbing —
+/// `OutboundEvent` derives it wholesale for the peer upcaster, which
+/// drops memory events on arrival; nothing durable reads this back.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ClaimProvenance {
     /// Provenance shape revision (this build writes 1).
     pub v: u32,
     /// Actor class, snake_case (`agent_session`, `dashboard`,
@@ -73,11 +76,11 @@ pub(crate) struct ClaimProvenance {
     /// The IAM principal exactly as the gate named it (verbatim — the
     /// P1 exit criterion asserts recorded actor == token-bound
     /// principal).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
     /// The supervised session the write acted as — bound by the gate
     /// through token possession, never echoed from request fields.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
 }
 
@@ -96,8 +99,11 @@ impl ClaimProvenance {
 
 /// A provenance-labeled claim view. This is DATA for surfaces to
 /// render as quoted content — never instructions (§6.5).
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ClaimView {
+/// (`Deserialize`: event-lane plumbing only, as on [`ClaimProvenance`].)
+/// `pub` (not `pub(crate)`) because it rides the `pub` AppEvent/
+/// OutboundEvent enums — same posture as `agenda::AgendaItem`.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ClaimView {
     /// The claim id: hex of the accepted `m.claim` operation hash.
     pub id: String,
     pub kind: String,
@@ -119,7 +125,7 @@ pub(crate) struct ClaimView {
     pub proposed_by: ClaimProvenance,
     /// Always `"ephemeral"` in this build (the P1 write bar): the
     /// claim does not survive a daemon restart.
-    pub durability: &'static str,
+    pub durability: String,
 }
 
 /// Service errors. Kernel verdicts surface their named
