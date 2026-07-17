@@ -560,6 +560,33 @@ function wireTaskTextarea(id, submit) {
   resizeTaskTextarea(input);
 }
 
+// QA readback (window.qa convention): the composer-autosize verdict. The
+// regression class is silent — content taller than the box under
+// overflow-y:hidden shows no scrollbar, so the user types blind — and
+// the programmatic seams live in this module scope, unreachable from a
+// CDP probe otherwise.
+window.qa = Object.assign(window.qa || {}, {
+  composerAutosize: (id = 'activity-task-input') => {
+    const input = document.getElementById(id);
+    if (!input) return null;
+    const cs = window.getComputedStyle(input);
+    return {
+      height: input.getBoundingClientRect().height,
+      clientHeight: input.clientHeight,
+      scrollHeight: input.scrollHeight,
+      scrollTop: input.scrollTop,
+      overflowY: cs.overflowY,
+      maxHeight: cs.maxHeight,
+      visible: input.getClientRects().length > 0,
+      clipped: input.scrollHeight > input.clientHeight + 1 && cs.overflowY === 'hidden',
+    };
+  },
+  composerSetValue: (text, id = 'activity-task-input') =>
+    setTaskTextareaValue(document.getElementById(id), text),
+  composerClear: (id = 'activity-task-input') =>
+    clearTaskTextarea(document.getElementById(id)),
+});
+
 // Implicit resumes (auto-attach after a dropped follow-up, station/window
 // reattach) carry NO launch overrides: the daemon owns each session's
 // persisted launch config and applies it itself. Echoing dashboard-derived
