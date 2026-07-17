@@ -5217,6 +5217,22 @@ impl State {
         self.claim_status_inner(target_hash, as_of, &mut Vec::new())
     }
 
+    /// Tenant chain head for `(zone, lineage, gen)`: `(next_seq, head
+    /// op hash)`; `None` before the chain's first accepted op.
+    ///
+    /// Added `pub` at vendor time (the P1.5 custody adapter): a durable
+    /// store resuming a writer chain reads its position from THIS fold —
+    /// the stamped reader — never from a second parse of the recovered
+    /// log. Pure read access; no semantic change.
+    pub fn tenant_chain_head(
+        &self,
+        zone_id: &[u8; 16],
+        lineage: &[u8; 16],
+        gen: u64,
+    ) -> Option<(u64, [u8; 32])> {
+        self.tenant_chains.get(&(*zone_id, *lineage, gen)).copied()
+    }
+
     // The `as_of` parameter is threaded for the temporal terms no
     // corpus claim exercises yet (valid_from/expires) — deliberately
     // recursion-only today.
