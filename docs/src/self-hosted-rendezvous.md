@@ -355,8 +355,9 @@ Deployment notes:
   fleet label with `--relay-address` instead of the daemon's own (NAT'd)
   addresses. The store/serve split is unchanged — `dns.rs` serves the
   substituted address verbatim.
-- Abuse is bounded by per-source-IP and per-tunnel connection caps, a
-  per-connection byte cap, idle teardown, and a bounded dial-back wait.
+- Abuse is bounded by pre-demux global and per-source-IP connection caps,
+  a per-tunnel cap, a per-connection byte cap, idle teardown, and a bounded
+  dial-back wait.
 
 A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
 (see the configuration reference). It then holds the control channel,

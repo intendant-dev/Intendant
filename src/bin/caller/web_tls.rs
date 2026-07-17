@@ -256,9 +256,7 @@ fn server_config_from(
         // fleet certificate (fleet_cert.rs) can be installed LIVE for its
         // SNI name — first issuance and every renewal apply without a daemon
         // restart.
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .map_err(|e| format!("rustls server key unusable: {e}"))?;
-        let base = Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key));
+        let base = checked_certified_key(cert_chain, key, "rustls server")?;
         fleet_sni_resolver().set_base(base);
         builder.with_cert_resolver(fleet_sni_resolver())
     } else {
@@ -279,6 +277,20 @@ fn server_config_from(
     // upgrade, streaming lanes), a separate program, not a config flip.
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+fn checked_certified_key(
+    cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+    description: &str,
+) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("{description} key unusable: {e}"))?;
+    let certified_key = rustls::sign::CertifiedKey::new(cert_chain, signing_key);
+    certified_key
+        .keys_match()
+        .map_err(|e| format!("{description} certificate and key do not match: {e}"))?;
+    Ok(Arc::new(certified_key))
 }
 
 /// SNI-aware certificate resolver: the daemon's base certificate by
@@ -433,11 +445,9 @@ pub fn install_fleet_certificate(
     }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .map_err(|e| format!("parse fleet key: {e}"))?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-        .map_err(|e| format!("fleet key unusable: {e}"))?;
     fleet_sni_resolver().set_fleet(
         name.trim().trim_end_matches('.').to_ascii_lowercase(),
-        Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
+        checked_certified_key(cert_chain, key, "fleet")?,
     );
     Ok(())
 }
@@ -459,11 +469,9 @@ pub fn install_custom_domain_certificate(
     }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .map_err(|e| format!("parse custom-domain key: {e}"))?;
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-        .map_err(|e| format!("custom-domain key unusable: {e}"))?;
     fleet_sni_resolver().set_custom(
         name.trim().trim_end_matches('.').to_ascii_lowercase(),
-        Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
+        checked_certified_key(cert_chain, key, "custom-domain")?,
     );
     Ok(())
 }
@@ -717,6 +725,24 @@ mod tests {
             Some(custom.to_string())
         );
         assert_eq!(custom_domain_server_name(Some(fleet)), None);
+    }
+
+    #[test]
+    fn custom_domain_certificate_must_match_its_private_key() {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["mismatch.example.test".to_string()]).unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
+        let error = install_custom_domain_certificate(
+            "mismatch.example.test",
+            &certificate.cert.pem(),
+            &other.signing_key.serialize_pem(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("custom-domain certificate and key do not match"),
+            "{error}"
+        );
     }
 
     #[test]

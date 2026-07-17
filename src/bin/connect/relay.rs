@@ -23,8 +23,8 @@
 //! fleet SNI to a daemon does not change how the daemon classifies that
 //! connection — it still arrives bearing the fleet SNI, which the daemon
 //! gateway treats as discovery-only exactly as it does today. Abuse is bounded
-//! by per-source-IP and per-tunnel connection caps, a per-connection byte cap,
-//! and idle teardown.
+//! by pre-demux global and per-source-IP connection caps, a per-tunnel
+//! connection cap, a per-connection byte cap, and idle teardown.
 //!
 //! All of this is dark by default and gated behind the `--relay-*` config
 //! group (all-or-nothing, mirroring the `--dns-*` group).
@@ -54,9 +54,11 @@ const DIALBACK_MAGIC: &str = "ITRLY1";
 /// Bytes read while looking for the dial-back hello's terminating newline.
 const DIALBACK_HELLO_MAX_BYTES: usize = 160;
 
-/// Max concurrent relay connections accepted from one source IP (browser
-/// side). Bounds a single abusive client; daemon dial-back connections are
-/// nonce-gated and exempt.
+/// Max concurrent relay connections accepted in total. Admission happens
+/// before the first byte is inspected, so silent and malformed sockets count.
+pub(crate) const RELAY_MAX_CONNS_GLOBAL: u32 = 4096;
+/// Max concurrent relay connections accepted from one source IP. Browser,
+/// daemon dial-back, silent, and malformed sockets all count.
 pub(crate) const RELAY_MAX_CONNS_PER_IP: u32 = 64;
 /// Max concurrent spliced browser connections routed into one daemon tunnel.
 pub(crate) const RELAY_MAX_CONNS_PER_TUNNEL: u32 = 128;
@@ -255,6 +257,12 @@ struct TunnelEntry {
     server_names: Vec<String>,
 }
 
+#[derive(Default)]
+struct ConnectionAdmission {
+    total: u32,
+    by_ip: HashMap<IpAddr, u32>,
+}
+
 /// Shared relay state, hung off `AppState` (None when the relay is disabled),
 /// exactly as `dns_zone` hangs the fleet DNS zone.
 pub(crate) struct RelayState {
@@ -265,11 +273,12 @@ pub(crate) struct RelayState {
     /// label -> control-channel presence.
     tunnels: StdMutex<HashMap<String, TunnelEntry>>,
     /// nonce -> the browser splicer waiting for the daemon's dial-back.
-    pending_dialbacks: StdMutex<HashMap<String, oneshot::Sender<TcpStream>>>,
+    pending_dialbacks: StdMutex<HashMap<String, oneshot::Sender<(TcpStream, ConnectionGuard)>>>,
     /// Wakes parked control polls when a nonce is enqueued for them.
     control_notify: Notify,
-    /// Per-source-IP concurrent browser connections.
-    ip_conns: StdMutex<HashMap<IpAddr, u32>>,
+    /// Global and per-source-IP raw-socket admission, taken before protocol
+    /// demux and retained for the physical connection's lifetime.
+    connection_admission: StdMutex<ConnectionAdmission>,
     /// Per-tunnel concurrent spliced browser connections.
     tunnel_splices: StdMutex<HashMap<String, u32>>,
 }
@@ -282,7 +291,7 @@ impl RelayState {
             tunnels: StdMutex::new(HashMap::new()),
             pending_dialbacks: StdMutex::new(HashMap::new()),
             control_notify: Notify::new(),
-            ip_conns: StdMutex::new(HashMap::new()),
+            connection_admission: StdMutex::new(ConnectionAdmission::default()),
             tunnel_splices: StdMutex::new(HashMap::new()),
         }
     }
@@ -396,25 +405,34 @@ impl RelayState {
             });
     }
 
-    fn acquire_ip_conn(self: &Arc<Self>, ip: IpAddr) -> Option<IpConnGuard> {
-        let mut map = self.ip_conns.lock().expect("relay ip conns poisoned");
-        let count = map.entry(ip).or_insert(0);
-        if *count >= RELAY_MAX_CONNS_PER_IP {
+    fn acquire_connection(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionGuard> {
+        let mut admission = self
+            .connection_admission
+            .lock()
+            .expect("relay connection admission poisoned");
+        if admission.total >= RELAY_MAX_CONNS_GLOBAL
+            || admission.by_ip.get(&ip).copied().unwrap_or(0) >= RELAY_MAX_CONNS_PER_IP
+        {
             return None;
         }
-        *count += 1;
-        Some(IpConnGuard {
+        admission.total += 1;
+        *admission.by_ip.entry(ip).or_insert(0) += 1;
+        Some(ConnectionGuard {
             relay: self.clone(),
             ip,
         })
     }
 
-    fn release_ip_conn(&self, ip: IpAddr) {
-        let mut map = self.ip_conns.lock().expect("relay ip conns poisoned");
-        if let Some(count) = map.get_mut(&ip) {
+    fn release_connection(&self, ip: IpAddr) {
+        let mut admission = self
+            .connection_admission
+            .lock()
+            .expect("relay connection admission poisoned");
+        admission.total = admission.total.saturating_sub(1);
+        if let Some(count) = admission.by_ip.get_mut(&ip) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                map.remove(&ip);
+                admission.by_ip.remove(&ip);
             }
         }
     }
@@ -443,14 +461,14 @@ impl RelayState {
     }
 }
 
-struct IpConnGuard {
+struct ConnectionGuard {
     relay: Arc<RelayState>,
     ip: IpAddr,
 }
 
-impl Drop for IpConnGuard {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.relay.release_ip_conn(self.ip);
+        self.relay.release_connection(self.ip);
     }
 }
 
@@ -861,35 +879,52 @@ async fn run_relay_accept_loop(
                 continue;
             }
         };
+        let Some(connection_guard) = relay.acquire_connection(peer.ip()) else {
+            continue;
+        };
         let relay = relay.clone();
         tokio::spawn(async move {
-            handle_relay_connection(relay, stream, peer.ip()).await;
+            handle_relay_connection(relay, stream, connection_guard).await;
         });
     }
 }
 
-async fn handle_relay_connection(relay: Arc<RelayState>, stream: TcpStream, peer_ip: IpAddr) {
+async fn handle_relay_connection(
+    relay: Arc<RelayState>,
+    stream: TcpStream,
+    connection_guard: ConnectionGuard,
+) {
     // One peeked byte disambiguates a browser TLS ClientHello (0x16) from a
     // daemon dial-back hello (ASCII magic). `peek` leaves the bytes in the
     // kernel buffer so the browser path can forward the ClientHello verbatim.
-    let mut first = [0u8; 1];
-    match stream.peek(&mut first).await {
-        Ok(0) | Err(_) => return,
-        Ok(_) => {}
-    }
-    if first[0] == 0x16 {
-        handle_browser_connection(relay, stream, peer_ip).await;
+    // The same absolute deadline covers this peek and the entire dial-back
+    // hello, so a trickle cannot renew its budget byte by byte.
+    let preamble_deadline = tokio::time::Instant::now() + RELAY_DIALBACK_TIMEOUT;
+    let Some(first) = peek_first_byte_until(&stream, preamble_deadline).await else {
+        return;
+    };
+    if first == 0x16 {
+        handle_browser_connection(relay, stream, connection_guard).await;
     } else {
-        handle_dialback_connection(relay, stream).await;
+        handle_dialback_connection(relay, stream, connection_guard, preamble_deadline).await;
+    }
+}
+
+async fn peek_first_byte_until(stream: &TcpStream, deadline: tokio::time::Instant) -> Option<u8> {
+    let mut first = [0u8; 1];
+    match tokio::time::timeout_at(deadline, stream.peek(&mut first)).await {
+        Ok(Ok(1..)) => Some(first[0]),
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => None,
     }
 }
 
 /// A browser TLS connection: peek the ClientHello for its SNI (no
 /// termination), route to the matching active tunnel, and splice.
-async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, peer_ip: IpAddr) {
-    let Some(_ip_guard) = relay.acquire_ip_conn(peer_ip) else {
-        return; // per-source-IP cap
-    };
+async fn handle_browser_connection(
+    relay: Arc<RelayState>,
+    stream: TcpStream,
+    _connection_guard: ConnectionGuard,
+) {
     let sni = match peek_sni(&stream).await {
         Some(sni) => sni,
         None => return, // fragmented-forever, oversized, non-TLS, or no-SNI: refuse
@@ -905,7 +940,7 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
     // Mint a single-use nonce, register the browser waiter, and ask the daemon
     // to dial back.
     let nonce = random_b64u(32);
-    let (tx, rx) = oneshot::channel::<TcpStream>();
+    let (tx, rx) = oneshot::channel::<(TcpStream, ConnectionGuard)>();
     {
         let mut pending = relay
             .pending_dialbacks
@@ -922,18 +957,19 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
         return;
     }
 
-    let data_stream = match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, rx).await {
-        Ok(Ok(data_stream)) => data_stream,
-        _ => {
-            // Timed out or the waiter was dropped: reclaim the nonce slot.
-            relay
-                .pending_dialbacks
-                .lock()
-                .expect("relay dialbacks poisoned")
-                .remove(&nonce);
-            return;
-        }
-    };
+    let (data_stream, _dialback_guard) =
+        match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, rx).await {
+            Ok(Ok(data_stream)) => data_stream,
+            _ => {
+                // Timed out or the waiter was dropped: reclaim the nonce slot.
+                relay
+                    .pending_dialbacks
+                    .lock()
+                    .expect("relay dialbacks poisoned")
+                    .remove(&nonce);
+                return;
+            }
+        };
     // Pure ciphertext splice: the browser's TLS records flow to the daemon,
     // whose fleet certificate completes the handshake. This service never sees
     // plaintext.
@@ -948,8 +984,13 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
 
 /// A daemon dial-back data connection: read `ITRLY1 <nonce>\n`, hand this
 /// stream to the waiting browser splicer.
-async fn handle_dialback_connection(relay: Arc<RelayState>, mut stream: TcpStream) {
-    let Some(nonce) = read_dialback_nonce(&mut stream).await else {
+async fn handle_dialback_connection(
+    relay: Arc<RelayState>,
+    mut stream: TcpStream,
+    connection_guard: ConnectionGuard,
+    preamble_deadline: tokio::time::Instant,
+) {
+    let Some(nonce) = read_dialback_nonce_until(&mut stream, preamble_deadline).await else {
         return;
     };
     let sender = relay
@@ -961,15 +1002,23 @@ async fn handle_dialback_connection(relay: Arc<RelayState>, mut stream: TcpStrea
         return; // unknown / expired / already-claimed nonce
     };
     // The browser splicer owns the splice; hand off this (post-hello) stream.
-    let _ = sender.send(stream);
+    let _ = sender.send((stream, connection_guard));
 }
 
 /// Read a bounded dial-back hello line and extract the nonce.
+#[cfg(test)]
 async fn read_dialback_nonce(stream: &mut TcpStream) -> Option<String> {
+    read_dialback_nonce_until(stream, tokio::time::Instant::now() + RELAY_DIALBACK_TIMEOUT).await
+}
+
+async fn read_dialback_nonce_until(
+    stream: &mut TcpStream,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
     let mut buf = Vec::with_capacity(64);
     let mut byte = [0u8; 1];
     loop {
-        match tokio::time::timeout(RELAY_DIALBACK_TIMEOUT, stream.read(&mut byte)).await {
+        match tokio::time::timeout_at(deadline, stream.read(&mut byte)).await {
             Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return None,
             Ok(Ok(_)) => {}
         }
@@ -1228,13 +1277,33 @@ mod tests {
         let ip: IpAddr = "198.51.100.7".parse().unwrap();
         let mut guards = Vec::new();
         for _ in 0..RELAY_MAX_CONNS_PER_IP {
-            guards.push(relay.acquire_ip_conn(ip).expect("under cap"));
+            guards.push(relay.acquire_connection(ip).expect("under cap"));
         }
-        assert!(relay.acquire_ip_conn(ip).is_none(), "at cap, refuse");
+        assert!(relay.acquire_connection(ip).is_none(), "at cap, refuse");
         drop(guards.pop());
         assert!(
-            relay.acquire_ip_conn(ip).is_some(),
+            relay.acquire_connection(ip).is_some(),
             "a freed slot admits the next connection"
+        );
+    }
+
+    #[test]
+    fn global_connection_cap_is_enforced_and_released() {
+        let relay = relay_state();
+        let mut guards = Vec::new();
+        for index in 0..RELAY_MAX_CONNS_GLOBAL {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(index as u128 + 1));
+            guards.push(relay.acquire_connection(ip).expect("under global cap"));
+        }
+        let overflow: IpAddr = "2001:db8::ffff".parse().unwrap();
+        assert!(
+            relay.acquire_connection(overflow).is_none(),
+            "all sources are refused at the global cap"
+        );
+        drop(guards.pop());
+        assert!(
+            relay.acquire_connection(overflow).is_some(),
+            "a freed global slot admits the next connection"
         );
     }
 
@@ -1354,6 +1423,36 @@ mod tests {
         let (mut client, mut server) = connected_pair().await;
         client.write_all(b"NOPE abc\n").await.unwrap();
         assert_eq!(read_dialback_nonce(&mut server).await, None);
+    }
+
+    #[tokio::test]
+    async fn silent_socket_uses_one_bounded_preamble_deadline() {
+        let (_client, server) = connected_pair().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        assert_eq!(peek_first_byte_until(&server, deadline).await, None);
+    }
+
+    #[tokio::test]
+    async fn dialback_trickle_cannot_renew_the_preamble_deadline() {
+        let (mut client, mut server) = connected_pair().await;
+        tokio::spawn(async move {
+            for byte in b"ITRLY1 a-deliberately-slow-nonce\n" {
+                if client.write_all(std::slice::from_ref(byte)).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                read_dialback_nonce_until(&mut server, deadline)
+            )
+            .await
+            .expect("absolute deadline completes"),
+            None
+        );
     }
 
     #[tokio::test]

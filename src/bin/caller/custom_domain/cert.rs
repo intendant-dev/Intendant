@@ -307,6 +307,34 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_a_certificate_and_key_from_different_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["box.example.test".to_string()]).unwrap();
+        let other =
+            rcgen::generate_simple_self_signed(vec!["other.example.test".to_string()]).unwrap();
+        std::fs::write(dir.path().join(CERT_FILE), certificate.cert.pem()).unwrap();
+        std::fs::write(dir.path().join(KEY_FILE), other.signing_key.serialize_pem()).unwrap();
+        let domain = ValidatedCustomDomain {
+            name: "box.example.test".to_string(),
+            rp_id: "box.example.test".to_string(),
+            origin: "https://box.example.test".to_string(),
+        };
+        let status = Arc::new(RwLock::new(CertificateStatus::default()));
+
+        let error = restore(&domain, dir.path(), &status).unwrap_err();
+        assert!(
+            error.contains("custom-domain certificate and key do not match"),
+            "{error}"
+        );
+        assert_ne!(
+            status.read().unwrap().state,
+            "valid",
+            "a partial certificate/key update must not be restored as usable"
+        );
+    }
+
+    #[test]
     fn successful_account_retry_clears_only_transient_errors() {
         let mut transient = CertificateStatus {
             state: "error".to_string(),

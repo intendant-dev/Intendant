@@ -433,55 +433,63 @@ impl PasskeyRuntime {
         validate_pending_request_shape(&pending.input)?;
         let credential_id = CredentialId::from_b64url(&input.credential.id)
             .map_err(|error| format!("passkey credential id: {error}"))?;
-        self.mutate_store(|store| {
-            if store.user_id != pending.user_id {
-                return Err(
-                    "passkey authentication state changed; start a new ceremony".to_string()
-                );
-            }
-            let stored = store
-                .passkeys
-                .iter_mut()
-                .find(|passkey| passkey.credential.id == credential_id)
-                .ok_or_else(|| "passkey is not registered for this custom domain".to_string())?;
-            let result = self
-                .webauthn
-                .finish_authentication(&pending.state, &input.credential, &stored.credential)
-                .map_err(|error| format!("finish passkey authentication: {error}"))?;
-            stored.credential.counter = result.new_counter;
-            stored.last_used_unix_ms = Some(now_unix_ms());
-            Ok(((), true))
-        })?;
+        self.with_passkey_lease_transaction(|| {
+            self.mutate_store(|store| {
+                if store.user_id != pending.user_id {
+                    return Err(
+                        "passkey authentication state changed; start a new ceremony".to_string()
+                    );
+                }
+                let stored = store
+                    .passkeys
+                    .iter_mut()
+                    .find(|passkey| passkey.credential.id == credential_id)
+                    .ok_or_else(|| {
+                        "passkey is not registered for this custom domain".to_string()
+                    })?;
+                let result = self
+                    .webauthn
+                    .finish_authentication(&pending.state, &input.credential, &stored.credential)
+                    .map_err(|error| format!("finish passkey authentication: {error}"))?;
+                stored.credential.counter = result.new_counter;
+                stored.last_used_unix_ms = Some(now_unix_ms());
+                Ok(((), true))
+            })?;
 
-        let request =
-            self.hosted
-                .create_request(pending.input, origin, pending.source_bucket.as_deref())?;
-        let actor = passkey_actor(&credential_id);
-        let lease = self
-            .hosted
-            .decide_request(
-                HostedLeaseDecisionInput {
-                    request_id: request.request_id,
-                    approve: true,
-                    approved_preset: Some(request.requested_preset),
-                    approved_ttl_secs: Some(request.requested_ttl_secs),
-                },
-                &actor,
-            )?
-            .ok_or_else(|| "passkey-approved lease was not issued".to_string())?;
-        Ok(PasskeyLeaseResult { ok: true, lease })
+            let request = self.hosted.create_request(
+                pending.input,
+                origin,
+                pending.source_bucket.as_deref(),
+            )?;
+            let actor = passkey_actor(&credential_id);
+            let lease = self
+                .hosted
+                .decide_request(
+                    HostedLeaseDecisionInput {
+                        request_id: request.request_id,
+                        approve: true,
+                        approved_preset: Some(request.requested_preset),
+                        approved_ttl_secs: Some(request.requested_ttl_secs),
+                    },
+                    &actor,
+                )?
+                .ok_or_else(|| "passkey-approved lease was not issued".to_string())?;
+            Ok(PasskeyLeaseResult { ok: true, lease })
+        })
     }
 
     pub(crate) fn revoke(&self, input: RevokeInput) -> Result<bool, String> {
         let credential_id = CredentialId::from_b64url(input.credential_id.trim())
             .map_err(|error| format!("passkey credential id: {error}"))?;
-        self.mutate_store(move |store| {
-            let before = store.passkeys.len();
-            store
-                .passkeys
-                .retain(|passkey| passkey.credential.id != credential_id);
-            let revoked = store.passkeys.len() != before;
-            Ok((revoked, revoked))
+        self.with_passkey_lease_transaction(|| {
+            self.mutate_store(move |store| {
+                let before = store.passkeys.len();
+                store
+                    .passkeys
+                    .retain(|passkey| passkey.credential.id != credential_id);
+                let revoked = store.passkeys.len() != before;
+                Ok((revoked, revoked))
+            })
         })
     }
 
@@ -497,26 +505,51 @@ impl PasskeyRuntime {
         &self,
         read: impl FnOnce(&PasskeyStore) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut cached = self
-            .store
-            .lock()
-            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-        let fresh = current_store(&self.cert_dir, &self.domain, &cached)?;
-        *cached = fresh;
-        read(&cached)
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            let mut cached = self.store.lock().map_err(|_| {
+                crate::access::AccessError("custom-domain passkey store is unavailable".to_string())
+            })?;
+            let fresh = load_current_store_locked(&self.cert_dir, &self.domain, &cached)
+                .map_err(crate::access::AccessError)?;
+            *cached = fresh;
+            read(&cached).map_err(crate::access::AccessError)
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn mutate_store<T>(
         &self,
         update: impl FnOnce(&mut PasskeyStore) -> Result<(T, bool), String>,
     ) -> Result<T, String> {
-        let mut cached = self
-            .store
-            .lock()
-            .map_err(|_| "custom-domain passkey store is unavailable".to_string())?;
-        let (fresh, value) = transact_store(&self.cert_dir, &self.domain, &cached, update)?;
-        *cached = fresh;
-        Ok(value)
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            let mut cached = self.store.lock().map_err(|_| {
+                crate::access::AccessError("custom-domain passkey store is unavailable".to_string())
+            })?;
+            let mut fresh = load_current_store_locked(&self.cert_dir, &self.domain, &cached)
+                .map_err(crate::access::AccessError)?;
+            let (value, changed) = update(&mut fresh).map_err(crate::access::AccessError)?;
+            if changed {
+                save_store_locked(&self.cert_dir, &fresh)?;
+            }
+            *cached = fresh;
+            Ok(value)
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Order credential validation + lease issuance against revocation under
+    /// the same process and cross-process authority lock. If issuance wins,
+    /// revocation cannot return until that lease exists; if revocation wins,
+    /// the fresh store check rejects the removed credential before any lease
+    /// request is created.
+    fn with_passkey_lease_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            operation().map_err(crate::access::AccessError)
+        })
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -600,17 +633,6 @@ fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<Passkey
     Ok(store)
 }
 
-fn current_store(
-    cert_dir: &Path,
-    domain: &ValidatedCustomDomain,
-    cached: &PasskeyStore,
-) -> Result<PasskeyStore, String> {
-    crate::access::authority_store::with_lock(cert_dir, || {
-        load_current_store_locked(cert_dir, domain, cached).map_err(crate::access::AccessError)
-    })
-    .map_err(|error| error.to_string())
-}
-
 fn load_current_store_locked(
     cert_dir: &Path,
     domain: &ValidatedCustomDomain,
@@ -624,24 +646,6 @@ fn load_current_store_locked(
             store_path(cert_dir).display()
         )),
     }
-}
-
-fn transact_store<T>(
-    cert_dir: &Path,
-    domain: &ValidatedCustomDomain,
-    cached: &PasskeyStore,
-    update: impl FnOnce(&mut PasskeyStore) -> Result<(T, bool), String>,
-) -> Result<(PasskeyStore, T), String> {
-    crate::access::authority_store::with_lock(cert_dir, || {
-        let mut fresh = load_current_store_locked(cert_dir, domain, cached)
-            .map_err(crate::access::AccessError)?;
-        let (value, changed) = update(&mut fresh).map_err(crate::access::AccessError)?;
-        if changed {
-            save_store_locked(cert_dir, &fresh)?;
-        }
-        Ok((fresh, value))
-    })
-    .map_err(|error| error.to_string())
 }
 
 fn serialized_store(store: &PasskeyStore) -> Result<Vec<u8>, String> {
@@ -781,6 +785,63 @@ mod tests {
             load_store(dir.path(), &domain).unwrap().passkeys.is_empty(),
             "the stale process must reload under the interprocess lock"
         );
+    }
+
+    #[test]
+    fn successful_revocation_waits_for_an_inflight_passkey_authority_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let credential_id = CredentialId(vec![1]).to_b64url();
+        persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name.clone(),
+                rp_id: domain.rp_id.clone(),
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, "one")],
+            },
+        )
+        .unwrap();
+        let hosted = Arc::new(HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let runtime =
+            Arc::new(PasskeyRuntime::new(domain, dir.path().to_path_buf(), hosted).unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut worker = None;
+
+        crate::access::authority_store::with_lock(dir.path(), || {
+            let runtime = Arc::clone(&runtime);
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = runtime.revoke(RevokeInput { credential_id });
+                done_tx.send(result).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap();
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "revocation must not return while issuance can still hold the authority transaction"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap()
+            .unwrap());
+        worker.unwrap().join().unwrap();
     }
 
     #[test]

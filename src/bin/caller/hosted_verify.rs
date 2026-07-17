@@ -473,11 +473,23 @@ fn pin_lock_dir(path: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(".pin-locks").join(name))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PinCommit {
+    Committed,
+    /// Another verifier advanced or replaced the basis while this verifier
+    /// was checking. The caller must reconcile this exact observation now.
+    Changed(Option<SthPin>),
+}
+
 /// Commit a verified tree head without letting an older concurrent check
-/// overwrite a newer observation. The snapshot used for consistency
-/// verification must still be current at commit time; otherwise the caller
-/// retries from the new pin on its next check.
-fn commit_pin(path: &Path, basis: Option<&SthPin>, candidate: &SthPin) -> Result<(), String> {
+/// overwrite a newer observation. A changed basis is returned as typed data
+/// so the caller can reconcile it immediately rather than suppressing the
+/// observation as an availability error until the next daily run.
+fn commit_pin(
+    path: &Path,
+    basis: Option<&SthPin>,
+    candidate: &SthPin,
+) -> Result<PinCommit, String> {
     let lock_dir = pin_lock_dir(path)?;
     crate::access::authority_store::with_lock(&lock_dir, || {
         let current = load_pin(path).map_err(crate::access::AccessError)?;
@@ -485,7 +497,7 @@ fn commit_pin(path: &Path, basis: Option<&SthPin>, candidate: &SthPin) -> Result
             .as_ref()
             .is_some_and(|pin| same_tree_head(pin, candidate))
         {
-            return Ok(());
+            return Ok(PinCommit::Committed);
         }
         let basis_is_current = match (basis, current.as_ref()) {
             (None, None) => true,
@@ -493,10 +505,7 @@ fn commit_pin(path: &Path, basis: Option<&SthPin>, candidate: &SthPin) -> Result
             _ => false,
         };
         if !basis_is_current {
-            return Err(crate::access::AccessError(format!(
-                "transparency pin changed while verification was running for {}; retry against the current pin",
-                path.display()
-            )));
+            return Ok(PinCommit::Changed(current));
         }
 
         let mut committed = candidate.clone();
@@ -505,7 +514,8 @@ fn commit_pin(path: &Path, basis: Option<&SthPin>, candidate: &SthPin) -> Result
         }
         let text = serde_json::to_string_pretty(&committed)
             .map_err(|error| crate::access::AccessError(error.to_string()))?;
-        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())
+        crate::access::authority_store::atomic_write_private_locked(path, text.as_bytes())?;
+        Ok(PinCommit::Committed)
     })
     .map_err(|error| error.to_string())
 }
@@ -642,6 +652,46 @@ async fn fetch_json(client: &reqwest::Client, url: Url) -> Result<serde_json::Va
         .map_err(|e| format!("GET {url}: {e}"))
 }
 
+async fn verify_consistency_extension(
+    client: &reqwest::Client,
+    base: &Url,
+    old_size: u64,
+    old_root: &[u8; 32],
+    new_size: u64,
+    new_root: &[u8; 32],
+) -> Result<(), VerifyFailure> {
+    use VerifyFailure::{Unavailable, Verification};
+    let url = crate::connect_rendezvous::join_url(base, "api/log/consistency")
+        .map_err(Unavailable)
+        .map(|mut url| {
+            url.set_query(Some(&format!("old={old_size}&new={new_size}")));
+            url
+        })?;
+    let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
+    let consistency_proof: Vec<[u8; 32]> = consistency
+        .get("proof")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?
+        .iter()
+        .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
+        .collect::<Result<_, String>>()
+        .map_err(Unavailable)?;
+    if !verify_consistency(
+        old_size as usize,
+        new_size as usize,
+        old_root,
+        new_root,
+        &consistency_proof,
+    ) {
+        return Err(Verification {
+            summary: "consistency proof failed — history was rewritten since a verified tree head"
+                .to_string(),
+            mismatches: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
 /// Fetch one artifact, hashing as it streams. Transport errors bubble as
 /// `Err` (the whole run becomes Unavailable); HTTP error statuses and
 /// oversize bodies are verdicts, not failures.
@@ -680,8 +730,8 @@ async fn fetch_artifact(
 /// A log-endpoint response carried through the shared first half of the
 /// ritual: the tree head stands on its signature, the leaf is IN the
 /// tree the head signs, and the head extends the pinned one. The caller
-/// finishes its own artifact comparison, then advances the pin by
-/// writing `pin_candidate` to `pin_file` — only after everything held.
+/// finishes its own artifact comparison, then advances or reconciles
+/// `pin_candidate` against `pin_file` — only after everything held.
 struct VerifiedLogEntry {
     index: u64,
     leaf_json: String,
@@ -745,33 +795,8 @@ async fn verify_logged_entry(
     match pin_decision(pin.as_ref(), &sth).map_err(verification)? {
         PinDecision::FirstContact | PinDecision::Unchanged => {}
         PinDecision::NeedConsistency { old_size, old_root } => {
-            let url = crate::connect_rendezvous::join_url(base, "api/log/consistency")
-                .map_err(Unavailable)
-                .map(|mut url| {
-                    url.set_query(Some(&format!("old={old_size}&new={}", sth.size)));
-                    url
-                })?;
-            let consistency = fetch_json(client, url).await.map_err(Unavailable)?;
-            let consistency_proof: Vec<[u8; 32]> = consistency
-                .get("proof")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| Unavailable("consistency response missing proof".to_string()))?
-                .iter()
-                .map(|hash| b64u_decode_hash(hash.as_str().unwrap_or_default()))
-                .collect::<Result<_, String>>()
-                .map_err(Unavailable)?;
-            if !verify_consistency(
-                old_size as usize,
-                sth.size as usize,
-                &old_root,
-                &sth.root,
-                &consistency_proof,
-            ) {
-                return Err(verification(
-                    "consistency proof failed — history was rewritten since the pinned tree head"
-                        .to_string(),
-                ));
-            }
+            verify_consistency_extension(client, base, old_size, &old_root, sth.size, &sth.root)
+                .await?;
         }
     }
 
@@ -793,6 +818,128 @@ async fn verify_logged_entry(
         pinned_from_size,
         pin_candidate,
     })
+}
+
+const PIN_RECONCILE_ATTEMPTS: usize = 4;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConcurrentPinOrder {
+    Same,
+    CandidateExtendsCurrent,
+    CurrentExtendsCandidate,
+}
+
+fn concurrent_pin_order(
+    candidate: &SthPin,
+    current: &SthPin,
+) -> Result<ConcurrentPinOrder, VerifyFailure> {
+    use VerifyFailure::Verification;
+    if candidate.public_key != current.public_key {
+        return Err(Verification {
+            summary: "concurrent transparency observations use different log signing keys"
+                .to_string(),
+            mismatches: Vec::new(),
+        });
+    }
+    match candidate.size.cmp(&current.size) {
+        std::cmp::Ordering::Equal if candidate.root == current.root => Ok(ConcurrentPinOrder::Same),
+        std::cmp::Ordering::Equal => Err(Verification {
+            summary: format!(
+                "concurrent transparency observations have different roots at tree size {}",
+                candidate.size
+            ),
+            mismatches: Vec::new(),
+        }),
+        std::cmp::Ordering::Greater => Ok(ConcurrentPinOrder::CandidateExtendsCurrent),
+        std::cmp::Ordering::Less => Ok(ConcurrentPinOrder::CurrentExtendsCandidate),
+    }
+}
+
+fn decoded_verified_pin_root(pin: &SthPin, label: &str) -> Result<[u8; 32], VerifyFailure> {
+    b64u_decode_hash(&pin.root).map_err(|error| VerifyFailure::Verification {
+        summary: format!("{label} transparency pin has an invalid tree root: {error}"),
+        mismatches: Vec::new(),
+    })
+}
+
+/// Finish a successful artifact check by advancing the pin. If another
+/// verifier observed a head meanwhile, compare the two observations now:
+/// same-size disagreement is an immediate verification result; differing
+/// sizes must carry a valid consistency proof before either head is accepted.
+async fn commit_verified_pin(
+    client: &reqwest::Client,
+    base: &Url,
+    entry: &VerifiedLogEntry,
+) -> Result<(), VerifyFailure> {
+    use VerifyFailure::Unavailable;
+    let mut basis = entry.pin_basis.clone();
+    for _ in 0..PIN_RECONCILE_ATTEMPTS {
+        match commit_pin(&entry.pin_file, basis.as_ref(), &entry.pin_candidate)
+            .map_err(Unavailable)?
+        {
+            PinCommit::Committed => return Ok(()),
+            PinCommit::Changed(None) => {
+                return Err(Unavailable(
+                    "transparency pin was removed while verification was running; retrying from a fresh observation is required"
+                        .to_string(),
+                ));
+            }
+            PinCommit::Changed(Some(current)) => {
+                match concurrent_pin_order(&entry.pin_candidate, &current)? {
+                    ConcurrentPinOrder::Same => return Ok(()),
+                    ConcurrentPinOrder::CandidateExtendsCurrent => {
+                        let old_root = decoded_verified_pin_root(&current, "current")?;
+                        let new_root =
+                            decoded_verified_pin_root(&entry.pin_candidate, "candidate")?;
+                        verify_consistency_extension(
+                            client,
+                            base,
+                            current.size,
+                            &old_root,
+                            entry.pin_candidate.size,
+                            &new_root,
+                        )
+                        .await?;
+                        basis = Some(current);
+                    }
+                    ConcurrentPinOrder::CurrentExtendsCandidate => {
+                        let old_root =
+                            decoded_verified_pin_root(&entry.pin_candidate, "candidate")?;
+                        let new_root = decoded_verified_pin_root(&current, "current")?;
+                        verify_consistency_extension(
+                            client,
+                            base,
+                            entry.pin_candidate.size,
+                            &old_root,
+                            current.size,
+                            &new_root,
+                        )
+                        .await?;
+                        // Do not regress the pin. Confirm under the lock that
+                        // the reconciled newer head is still current.
+                        match commit_pin(&entry.pin_file, Some(&current), &current)
+                            .map_err(Unavailable)?
+                        {
+                            PinCommit::Committed => return Ok(()),
+                            PinCommit::Changed(Some(_)) => {
+                                basis = entry.pin_basis.clone();
+                            }
+                            PinCommit::Changed(None) => {
+                                return Err(Unavailable(
+                                    "transparency pin was removed during immediate reconciliation; retrying from a fresh observation is required"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(Unavailable(
+        "transparency pin kept changing during immediate reconciliation; retry the check"
+            .to_string(),
+    ))
 }
 
 /// The full out-of-band check against one rendezvous origin. On success
@@ -850,12 +997,7 @@ pub(crate) async fn verify_hosted_bundle(
     }
 
     // Everything held — advance the pin.
-    commit_pin(
-        &entry.pin_file,
-        entry.pin_basis.as_ref(),
-        &entry.pin_candidate,
-    )
-    .map_err(Unavailable)?;
+    commit_verified_pin(&client, base, &entry).await?;
 
     Ok(VerifyReport {
         log_size: entry.sth.size,
@@ -1295,12 +1437,7 @@ pub(crate) async fn verify_hosted_release(
     }
 
     // Everything held — advance the pin.
-    commit_pin(
-        &entry.pin_file,
-        entry.pin_basis.as_ref(),
-        &entry.pin_candidate,
-    )
-    .map_err(Unavailable)?;
+    commit_verified_pin(&client, base, &entry).await?;
 
     Ok(ReleaseVerifyReport {
         log_size: entry.sth.size,
@@ -2644,12 +2781,140 @@ mod tests {
             public_key: "a2V5".to_string(),
             pinned_unix_ms: 77,
         };
-        assert!(commit_pin(&path, Some(&old), &stale_candidate)
-            .unwrap_err()
-            .contains("changed while verification was running"));
+        let PinCommit::Changed(Some(observed)) =
+            commit_pin(&path, Some(&old), &stale_candidate).unwrap()
+        else {
+            panic!("stale commit must return the current pin");
+        };
+        assert!(same_tree_head(&observed, &newer));
+        assert_eq!(observed.pinned_unix_ms, old.pinned_unix_ms);
         let committed = load_pin(&path).unwrap().unwrap();
         assert!(same_tree_head(&committed, &newer));
         assert_eq!(committed.pinned_unix_ms, old.pinned_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn concurrent_pin_growth_is_reconciled_immediately_in_both_directions() {
+        use ring::signature::KeyPair as _;
+
+        let fixture = std::sync::Arc::new(std::sync::Mutex::new(Fixture {
+            log: FixtureLog::new(vec![
+                serde_json::json!({ "kind": "one" }).to_string(),
+                serde_json::json!({ "kind": "two" }).to_string(),
+                serde_json::json!({ "kind": "three" }).to_string(),
+            ]),
+            manifest_index: 0,
+            release_status: 404,
+            release_body: serde_json::Value::Null,
+            downloads: std::collections::HashMap::new(),
+        }));
+        let (base, server) = spawn_fixture_server(fixture.clone()).await;
+        let (smaller, larger, sth) = {
+            let fixture = fixture.lock().unwrap();
+            let leaves = fixture.log.leaves();
+            let public_key =
+                crate::daemon_identity::b64u(fixture.log.keypair.public_key().as_ref());
+            let pin = |size: usize| SthPin {
+                size: size as u64,
+                root: crate::daemon_identity::b64u(&tree_root(&leaves[..size])),
+                public_key: public_key.clone(),
+                pinned_unix_ms: 1,
+            };
+            (pin(2), pin(3), Sth::parse(&fixture.log.sth_json()).unwrap())
+        };
+        let client = http_client().unwrap();
+
+        // A size-2 verifier finishing after another process pinned size 3
+        // proves 2 -> 3 and keeps the newer pin.
+        let newer_root = tempfile::tempdir().unwrap();
+        let newer_path = pin_path(newer_root.path(), &base);
+        commit_pin(&newer_path, None, &larger).unwrap();
+        let older_entry = VerifiedLogEntry {
+            index: 0,
+            leaf_json: String::new(),
+            sth: sth.clone(),
+            pin_file: newer_path.clone(),
+            pin_basis: None,
+            pinned_from_size: None,
+            pin_candidate: smaller.clone(),
+        };
+        commit_verified_pin(&client, &base, &older_entry)
+            .await
+            .unwrap();
+        assert!(same_tree_head(
+            &load_pin(&newer_path).unwrap().unwrap(),
+            &larger
+        ));
+
+        // A size-3 verifier finishing after another process pinned size 2
+        // proves the same extension and advances without waiting for a later
+        // scheduled check.
+        let older_root = tempfile::tempdir().unwrap();
+        let older_path = pin_path(older_root.path(), &base);
+        commit_pin(&older_path, None, &smaller).unwrap();
+        let newer_entry = VerifiedLogEntry {
+            index: 0,
+            leaf_json: String::new(),
+            sth,
+            pin_file: older_path.clone(),
+            pin_basis: None,
+            pinned_from_size: None,
+            pin_candidate: larger.clone(),
+        };
+        commit_verified_pin(&client, &base, &newer_entry)
+            .await
+            .unwrap();
+        assert!(same_tree_head(
+            &load_pin(&older_path).unwrap().unwrap(),
+            &larger
+        ));
+        server.abort();
+    }
+
+    #[test]
+    fn concurrent_same_size_root_disagreement_is_a_verification_result() {
+        let candidate = SthPin {
+            size: 7,
+            root: "Y2FuZGlkYXRl".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        let current = SthPin {
+            size: 7,
+            root: "Y3VycmVudA".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        match concurrent_pin_order(&candidate, &current) {
+            Err(VerifyFailure::Verification { summary, .. }) => {
+                assert!(summary.contains("different roots"), "{summary}");
+            }
+            other => panic!("same-size disagreement must alarm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_different_sizes_require_directional_reconciliation() {
+        let smaller = SthPin {
+            size: 7,
+            root: "c21hbGxlcg".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        let larger = SthPin {
+            size: 9,
+            root: "bGFyZ2Vy".to_string(),
+            public_key: "a2V5".to_string(),
+            pinned_unix_ms: 1,
+        };
+        assert_eq!(
+            concurrent_pin_order(&larger, &smaller).unwrap(),
+            ConcurrentPinOrder::CandidateExtendsCurrent
+        );
+        assert_eq!(
+            concurrent_pin_order(&smaller, &larger).unwrap(),
+            ConcurrentPinOrder::CurrentExtendsCandidate
+        );
     }
 
     #[tokio::test]
