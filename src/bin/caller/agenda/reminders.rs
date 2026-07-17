@@ -540,6 +540,7 @@ mod tests {
             status,
             updated_ms: 1,
             completed_ms: None,
+            answer: None,
         }
     }
 

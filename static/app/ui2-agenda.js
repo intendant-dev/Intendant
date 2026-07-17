@@ -97,9 +97,10 @@ function agendaFlashError(message) {
   }, 6000);
 }
 
-function agendaGlyph(status) {
+function agendaGlyph(status, kind) {
   if (status === 'done') return '<span class="agenda-glyph done" aria-label="done">✓</span>';
   if (status === 'retired') return '<span class="agenda-glyph retired" aria-label="retired">⊘</span>';
+  if (kind === 'question') return '<span class="agenda-glyph question" aria-label="open question">?</span>';
   return '<span class="agenda-glyph open" aria-label="open">○</span>';
 }
 
@@ -294,14 +295,32 @@ function agendaRenderTab() {
     const body = item.body
       ? `<div class="agenda-item-body">${escapeHtml(item.body)}</div>`
       : '';
+    // The ask-seam reply affordance: open questions take a durable reply
+    // right here; answered ones show it (data, rendered escaped).
+    let answerBlock = '';
+    if (item.kind === 'question' && item.status === 'open') {
+      answerBlock = `<div class="agenda-answer-row">
+        <input type="text" class="agenda-answer-input" maxlength="4000"
+               placeholder="Answer this question…" aria-label="Answer" data-id="${escapeHtml(item.id)}" />
+        <button type="button" class="agenda-btn agenda-answer-btn" data-id="${escapeHtml(item.id)}">Answer</button>
+      </div>`;
+    } else if (item.answer && item.answer.text) {
+      const who = agendaActorLabel(item.answer);
+      const when = item.answer.at_ms
+        ? new Date(item.answer.at_ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+        : '';
+      answerBlock = `<div class="agenda-item-answer">↳ ${escapeHtml(item.answer.text)}
+        <span class="agenda-item-meta">— ${escapeHtml([who && `by ${who}`, when].filter(Boolean).join(' · '))}</span>
+      </div>`;
+    }
     return `<div class="agenda-item" data-status="${escapeHtml(item.status)}">
       <div class="agenda-item-head">
-        ${agendaGlyph(item.status)}
+        ${agendaGlyph(item.status, item.kind)}
         <span class="agenda-item-kind">${escapeHtml(item.kind)}</span>
         <span class="agenda-item-title">${escapeHtml(item.title)}</span>
         ${agendaDueChip(item)}${tags}
       </div>
-      ${body}
+      ${body}${answerBlock}
       <div class="agenda-item-foot">
         <span class="agenda-item-meta">${agendaProvenanceLine(item)}</span>
         <span class="agenda-item-actions">${agendaActionButtons(item)}</span>
@@ -316,6 +335,25 @@ function agendaRenderTab() {
   list.querySelectorAll('select.agenda-bell').forEach((sel) => {
     sel.addEventListener('change', () =>
       agendaSetItemUrgency(sel.dataset.id, sel.value, sel));
+  });
+  const submitAnswer = async (id, input, control) => {
+    const text = (input.value || '').trim();
+    if (!text) return;
+    input.disabled = true;
+    const ok = await agendaSendOp({ op: 'answer', id, text }, control);
+    input.disabled = false;
+    if (!ok) input.focus();
+  };
+  list.querySelectorAll('button.agenda-answer-btn').forEach((btn) => {
+    const input = list.querySelector(`input.agenda-answer-input[data-id="${btn.dataset.id}"]`);
+    if (!input) return;
+    btn.addEventListener('click', () => submitAnswer(btn.dataset.id, input, btn));
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitAnswer(btn.dataset.id, input, btn);
+      }
+    });
   });
 }
 
@@ -379,9 +417,12 @@ function agendaRenderCard() {
     const who = p.session_id
       ? `<span class="agenda-card-row-who">· sess ${escapeHtml(p.session_id.slice(0, 8))}</span>`
       : '';
+    const q = item.kind === 'question'
+      ? '<span class="agenda-card-q" aria-label="question">?</span>'
+      : '';
     return `<div class="agenda-card-row" data-id="${escapeHtml(item.id)}">
       <button type="button" class="agenda-card-done" data-id="${escapeHtml(item.id)}" aria-label="Complete">○</button>
-      <span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
+      ${q}<span class="agenda-card-row-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</span>${who}
     </div>`;
   });
   const more = open.length > 5
@@ -432,7 +473,8 @@ function agendaPositionCard() {
     const submitAdd = async () => {
       const title = (addTitle && addTitle.value || '').trim();
       if (!title) return;
-      const kind = (addKind && addKind.value) === 'note' ? 'note' : 'task';
+      const picked = (addKind && addKind.value) || 'task';
+      const kind = ['task', 'note', 'question'].includes(picked) ? picked : 'task';
       const ok = await agendaSendOp({ op: 'add', kind, title }, addBtn);
       if (ok && addTitle) {
         addTitle.value = '';
