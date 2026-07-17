@@ -170,13 +170,16 @@ html.ui-v2 .ui2-composer-peek .log-entry .log-content {
   max-height: 8.5em;
   overflow: hidden;
 }
-/* …but never the LAST entry: content clipped INSIDE an entry is not in
-   the list's scroll flow, so the tail of a long latest message was
-   unreachable — the list hit scroll-bottom while the fade obscured the
-   end permanently. Unclamped, the list scroller carries the full tail.
-   max-height:none (not a larger cap) so this also keeps superseding the
-   base collapsible 1.5em clamp, exactly like the 8.5em rule it lifts. */
-html.ui-v2 .ui2-composer-peek .log-entry:last-child .log-content {
+/* …but never the TAIL entry — the last one that actually clips, marked
+   .ui2-peek-tail-open by JS. :last-child is not enough: completion meta
+   lines (Done / Round complete) trail the final message. Content
+   clipped INSIDE an entry is not in the list's scroll flow, so the tail
+   of a long latest message was unreachable — the list hit scroll-bottom
+   while the fade obscured the end permanently. Opened, the list
+   scroller carries the full text. max-height:none (not a larger cap)
+   so this also keeps superseding the base collapsible 1.5em clamp,
+   exactly like the 8.5em rule it lifts. */
+html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-tail-open .log-content {
   max-height: none;
 }
 html.ui-v2 .ui2-composer-peek .log-entry:not(.ui2-peek-clamped) .log-content::after { content: none; }
@@ -192,11 +195,11 @@ html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
   background: linear-gradient(to bottom, transparent, var(--surface));
   pointer-events: none;
 }
-/* diff bodies: same digest clamp, same last-entry exemption — unscoped,
-   the trailing diff falls back to the base .diff-log-body scroll box
-   (max-height 460px, overflow auto), so its tail stays readable in
-   place instead of hard-clipping. */
-html.ui-v2 .ui2-composer-peek .diff-log-entry:not(:last-child) .diff-log-body {
+/* diff bodies: same digest clamp, same tail exemption — on the tail
+   entry the body falls back to the base .diff-log-body scroll box
+   (max-height 460px, overflow auto), so a trailing diff stays readable
+   in place instead of hard-clipping. */
+html.ui-v2 .ui2-composer-peek .diff-log-entry:not(.ui2-peek-tail-open) .diff-log-body {
   max-height: 8.5em;
   overflow: hidden;
 }

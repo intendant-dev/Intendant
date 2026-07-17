@@ -83,15 +83,31 @@
     return 'No output yet';
   }
 
-  // CSS cannot see overflow: entries whose body actually clips get the
-  // fade tag; short ones — and the never-clamped last entry — keep their
-  // final line un-washed. Toggle, not add: an entry's clamp state flips
-  // when a newer entry arrives and it stops being :last-child (or the
-  // reverse on a structural removal), so kept clones re-tag too.
-  function peekTagClamped(clone) {
-    const content = clone.querySelector('.log-content');
-    if (!content) return;
-    clone.classList.toggle('ui2-peek-clamped', content.scrollHeight > content.clientHeight + 1);
+  // CSS cannot see overflow, and "the tail" is not simply :last-child —
+  // completion meta lines (Done / Round complete) trail the final
+  // message. Two-phase pass over every rendered clone: measure each one
+  // under the digest clamp, then open the LAST entry that actually
+  // clips (the newest clipping content is the conversation tail the
+  // user must be able to finish reading — the list scroller carries
+  // it), and fade-tag the earlier clippers, whose full text is one tap
+  // away in Activity. Re-run on every render: appends and in-place
+  // growth both move which entry is the tail.
+  function peekRetagClamped() {
+    for (const r of peekRendered) r.clone.classList.remove('ui2-peek-tail-open');
+    const measured = [];
+    for (const r of peekRendered) {
+      const content = r.clone.querySelector('.log-content');
+      measured.push([r.clone, !!content && content.scrollHeight > content.clientHeight + 1]);
+    }
+    let tailOpen = null;
+    for (let i = measured.length - 1; i >= 0; i--) {
+      if (measured[i][1]) { tailOpen = measured[i][0]; break; }
+    }
+    for (const [clone, clips] of measured) {
+      const isTail = clone === tailOpen;
+      clone.classList.toggle('ui2-peek-tail-open', isTail);
+      clone.classList.toggle('ui2-peek-clamped', clips && !isTail);
+    }
   }
 
   // The container-level "more below" fade must never obscure the tail:
@@ -143,10 +159,7 @@
       if (r.clone === cursor) cursor = cursor.nextElementSibling;
       else peekList.insertBefore(r.clone, cursor);
     }
-    // Every rendered clone, not just fresh ones: appending an entry
-    // moves the clamp off the old :last-child, and kept clones must
-    // gain/lose the fade tag with it.
-    for (const r of next) peekTagClamped(r.clone);
+    peekRetagClamped();
     peekPendingDirty.clear();
     if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
     peekSyncMoreBelow();
@@ -171,11 +184,13 @@
       const clone = peekCloneEntry(r.source);
       r.clone.replaceWith(clone);
       r.clone = clone;
-      peekTagClamped(clone);
       touched = true;
     }
     peekPendingDirty.clear();
     if (touched) {
+      // Full re-tag, not per-clone: in-place growth (streaming output)
+      // can turn a short entry into the new tail clipper.
+      peekRetagClamped();
       if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
       peekSyncMoreBelow();
     }
