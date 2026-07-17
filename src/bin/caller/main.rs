@@ -970,14 +970,11 @@ pub(crate) fn finalize_command_batch(json_str: &str) -> String {
 
     if let Some(commands) = value.get_mut("commands").and_then(|c| c.as_array_mut()) {
         for cmd in commands.iter_mut() {
-            match cmd.get("function").and_then(|f| f.as_str()) {
-                Some("writeFile") => {
-                    cmd["function"] = serde_json::Value::String("editFile".to_string());
-                    if cmd.get("operation").is_none() {
-                        cmd["operation"] = serde_json::Value::String("write".to_string());
-                    }
+            if let Some("writeFile") = cmd.get("function").and_then(|f| f.as_str()) {
+                cmd["function"] = serde_json::Value::String("editFile".to_string());
+                if cmd.get("operation").is_none() {
+                    cmd["operation"] = serde_json::Value::String("write".to_string());
                 }
-                _ => {}
             }
         }
     }

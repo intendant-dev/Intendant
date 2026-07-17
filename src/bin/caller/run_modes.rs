@@ -3450,7 +3450,6 @@ pub(crate) async fn run_direct_mode(
     // Try to resume from saved conversation if it exists in this session dir
     let conv_path = log_dir.join("conversation.jsonl");
     let attachment_images = attachments.conversation_images();
-    let mut fresh_conversation = false;
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
@@ -3520,7 +3519,6 @@ pub(crate) async fn run_direct_mode(
                         }
                     ))
                 });
-                fresh_conversation = true;
                 let mut conv = Conversation::new(system_prompt, provider.context_window());
                 let task_seq = setup_fresh_conversation_with_attachments(
                     &mut conv,
@@ -3536,7 +3534,6 @@ pub(crate) async fn run_direct_mode(
             }
         }
     } else {
-        fresh_conversation = true;
         let mut conv = Conversation::new(system_prompt, provider.context_window());
         let task_seq = setup_fresh_conversation_with_attachments(
             &mut conv,
