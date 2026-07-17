@@ -363,6 +363,14 @@ pub trait ChatProvider: Send + Sync {
     #[allow(dead_code)]
     fn max_output_tokens(&self) -> u64;
 
+    /// The configured reasoning effort, when this provider instance has
+    /// one (OpenAI reasoning models via `REASONING_EFFORT`). `None` means
+    /// no such setting exists — surfaced as honest absence, never a
+    /// guessed default.
+    fn reasoning_effort(&self) -> Option<String> {
+        None
+    }
+
     /// Whether this provider instance has native tool calling enabled.
     fn use_tools(&self) -> bool {
         false

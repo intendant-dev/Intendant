@@ -130,11 +130,6 @@ pub struct SessionActivityVitals {
     /// not be claimed (honest degradation for delta-less backends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_after_seconds: Option<u32>,
-    /// Configured reasoning effort, first-hand only: the backend's own
-    /// echo when it states one, else the value Intendant itself passed at
-    /// launch. Never inferred from output volume or timing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
     /// Rate-limit reset epoch while `state` is `rate-limited`, when the
     /// wire carried one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,10 +144,123 @@ pub struct SessionActivityVitals {
     pub background_tasks: Vec<String>,
 }
 
-/// Per-session vitals (git / prompt-cache / rate limits / live activity)
-/// shown by the dashboard and Station — the port of the operator
-/// statusline. Sections are independent: producers fill what they know,
-/// frontends hide what is absent.
+/// Session configuration facts — model, reasoning effort, permission
+/// mode — the vitals `config` section. Wire-first: every value is either
+/// the backend's own echo (Claude Code's `system:init`, a Codex
+/// thread-settings notification, the native loop's own provider
+/// selection) or the session's launch config awaiting one
+/// (`permission_echoed` distinguishes, for the datum where the difference
+/// is live — Claude Code resolves its mode through a 3-layer chain, so
+/// the launch value alone can lie). Absent fields mean "not reported":
+/// frontends render the row with a degraded value, never a guess.
+///
+/// Producers emit *partial* facts at each protocol seam; the vitals hub
+/// folds them sticky per field (a known value is never blanked by a later
+/// partial emission that omits it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigVitals {
+    /// Model identifier in the provider's own vocabulary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Configured reasoning effort, first-hand only: the backend's own
+    /// echo when it states one, else the value Intendant itself passed at
+    /// launch. Never inferred from output volume or timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Raw permission/approval mode in the backend's own vocabulary
+    /// (`bypassPermissions`, `workspace-write · on-request`, an autonomy
+    /// level) — the power-user truth, always displayed verbatim one tap
+    /// away from the plain-language label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Backend-agnostic display class for the mode — one of
+    /// [`PERMISSION_DISPLAY_KINDS`], computed once daemon-side by the
+    /// per-backend catalog functions ([`claude_permission_kind`],
+    /// [`codex_permission_kind`]; native uses [`PERMISSION_KIND_AUTONOMY`]).
+    /// Absent for unknown modes: frontends then show the raw mode without
+    /// a plain-language claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_kind: Option<String>,
+    /// Whether the backend itself vouched for `permission_mode` (an init
+    /// echo, an accepted settings request) or the value is launch config
+    /// the backend has not yet confirmed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub permission_echoed: bool,
+}
+
+/// The backend-agnostic permission display classes — the one catalog
+/// (`permission_kind` vocabulary). The dashboard's plain-language copy is
+/// keyed by exactly these strings; its symbol-catalog parity test pins
+/// them, so an addition here that forgets the frontend fails the suite.
+pub const PERMISSION_KIND_BYPASS: &str = "bypass";
+pub const PERMISSION_KIND_AUTO_EDITS: &str = "auto-edits";
+pub const PERMISSION_KIND_AUTO_SAFE: &str = "auto-safe";
+pub const PERMISSION_KIND_AUTO_SANDBOXED: &str = "auto-sandboxed";
+pub const PERMISSION_KIND_ASK: &str = "ask";
+pub const PERMISSION_KIND_DENY_ASKS: &str = "deny-asks";
+pub const PERMISSION_KIND_READ_ONLY: &str = "read-only";
+pub const PERMISSION_KIND_PLAN: &str = "plan";
+/// Native sessions: the label derives from the Intendant autonomy
+/// vocabulary keyed by the raw level in `permission_mode`.
+pub const PERMISSION_KIND_AUTONOMY: &str = "autonomy";
+
+pub const PERMISSION_DISPLAY_KINDS: [&str; 9] = [
+    PERMISSION_KIND_BYPASS,
+    PERMISSION_KIND_AUTO_EDITS,
+    PERMISSION_KIND_AUTO_SAFE,
+    PERMISSION_KIND_AUTO_SANDBOXED,
+    PERMISSION_KIND_ASK,
+    PERMISSION_KIND_DENY_ASKS,
+    PERMISSION_KIND_READ_ONLY,
+    PERMISSION_KIND_PLAN,
+    PERMISSION_KIND_AUTONOMY,
+];
+
+/// Display class for a Claude Code permission mode. The semantics mirror
+/// the CLI's own behavior (and the dashboard's mode-picker help text):
+/// `default` asks, `acceptEdits` auto-approves file edits only, `auto`
+/// auto-approves classifier-safe calls, `dontAsk` *declines* anything
+/// that would ask, `bypassPermissions` never asks at all, `plan` is
+/// read-only planning. Unknown modes map to `None` — display the raw
+/// name rather than guess.
+pub fn claude_permission_kind(mode: &str) -> Option<&'static str> {
+    match mode.trim() {
+        "bypassPermissions" => Some(PERMISSION_KIND_BYPASS),
+        "acceptEdits" => Some(PERMISSION_KIND_AUTO_EDITS),
+        "auto" => Some(PERMISSION_KIND_AUTO_SAFE),
+        "dontAsk" => Some(PERMISSION_KIND_DENY_ASKS),
+        "default" => Some(PERMISSION_KIND_ASK),
+        "plan" => Some(PERMISSION_KIND_PLAN),
+        _ => None,
+    }
+}
+
+/// Display class for a Codex approval-policy + sandbox pair. The sandbox
+/// leads: `danger-full-access` bypasses approvals and the sandbox
+/// entirely (the launch layer forces approval `never` alongside it), and
+/// a `read-only` sandbox cannot change anything regardless of policy.
+/// Inside `workspace-write`, `never`/`on-failure` act without asking
+/// (the full-auto/yolo class), `on-request` works alone in the sandbox
+/// and asks beyond it, `untrusted` asks first. Unknown combinations map
+/// to `None` — display the raw pair rather than guess.
+pub fn codex_permission_kind(approval_policy: &str, sandbox: &str) -> Option<&'static str> {
+    match (sandbox.trim(), approval_policy.trim()) {
+        ("danger-full-access", _) => Some(PERMISSION_KIND_BYPASS),
+        ("read-only", _) => Some(PERMISSION_KIND_READ_ONLY),
+        ("workspace-write", "never") | ("workspace-write", "on-failure") => {
+            Some(PERMISSION_KIND_BYPASS)
+        }
+        ("workspace-write", "on-request") => Some(PERMISSION_KIND_AUTO_SANDBOXED),
+        ("workspace-write", "untrusted") => Some(PERMISSION_KIND_ASK),
+        _ => None,
+    }
+}
+
+/// Per-session vitals (git / prompt-cache / rate limits / live activity /
+/// config facts) shown by the dashboard and Station — the port of the
+/// operator statusline. Sections are independent: producers fill what
+/// they know, frontends hide what is absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionVitals {
@@ -164,4 +272,140 @@ pub struct SessionVitals {
     pub limits: Vec<SessionLimitWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<SessionActivityVitals>,
+    /// Session configuration facts (model / effort / permission mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SessionConfigVitals>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every known mode maps into the pinned kind vocabulary; unknown
+    /// modes map to None (raw passthrough, never a guessed label).
+    #[test]
+    fn claude_permission_kinds_cover_the_mode_vocabulary() {
+        assert_eq!(
+            claude_permission_kind("bypassPermissions"),
+            Some(PERMISSION_KIND_BYPASS)
+        );
+        assert_eq!(
+            claude_permission_kind("acceptEdits"),
+            Some(PERMISSION_KIND_AUTO_EDITS)
+        );
+        assert_eq!(
+            claude_permission_kind("auto"),
+            Some(PERMISSION_KIND_AUTO_SAFE)
+        );
+        assert_eq!(
+            claude_permission_kind("dontAsk"),
+            Some(PERMISSION_KIND_DENY_ASKS)
+        );
+        assert_eq!(claude_permission_kind("default"), Some(PERMISSION_KIND_ASK));
+        assert_eq!(claude_permission_kind(" plan "), Some(PERMISSION_KIND_PLAN));
+        assert_eq!(claude_permission_kind("delegate"), None);
+        assert_eq!(claude_permission_kind(""), None);
+    }
+
+    #[test]
+    fn codex_permission_kinds_cover_the_policy_sandbox_grid() {
+        // The danger sandbox is bypass regardless of the configured policy
+        // (launch forces approval "never" alongside it).
+        assert_eq!(
+            codex_permission_kind("untrusted", "danger-full-access"),
+            Some(PERMISSION_KIND_BYPASS)
+        );
+        assert_eq!(
+            codex_permission_kind("never", "danger-full-access"),
+            Some(PERMISSION_KIND_BYPASS)
+        );
+        // A read-only sandbox cannot change anything, whatever the policy.
+        assert_eq!(
+            codex_permission_kind("never", "read-only"),
+            Some(PERMISSION_KIND_READ_ONLY)
+        );
+        assert_eq!(
+            codex_permission_kind("on-request", "read-only"),
+            Some(PERMISSION_KIND_READ_ONLY)
+        );
+        // workspace-write: the approval policy decides.
+        assert_eq!(
+            codex_permission_kind("never", "workspace-write"),
+            Some(PERMISSION_KIND_BYPASS)
+        );
+        assert_eq!(
+            codex_permission_kind("on-failure", "workspace-write"),
+            Some(PERMISSION_KIND_BYPASS)
+        );
+        assert_eq!(
+            codex_permission_kind("on-request", "workspace-write"),
+            Some(PERMISSION_KIND_AUTO_SANDBOXED)
+        );
+        assert_eq!(
+            codex_permission_kind("untrusted", "workspace-write"),
+            Some(PERMISSION_KIND_ASK)
+        );
+        // Unknown vocabulary: raw passthrough, no plain-language claim.
+        assert_eq!(codex_permission_kind("sometimes", "workspace-write"), None);
+        assert_eq!(codex_permission_kind("never", "chroot"), None);
+    }
+
+    /// Every kind the mapping functions can return is in the pinned
+    /// vocabulary (the dashboard copy catalog is keyed by these).
+    #[test]
+    fn permission_kind_outputs_stay_in_the_pinned_vocabulary() {
+        let claude_modes = [
+            "bypassPermissions",
+            "acceptEdits",
+            "auto",
+            "dontAsk",
+            "default",
+            "plan",
+        ];
+        for mode in claude_modes {
+            let kind = claude_permission_kind(mode).expect("known mode maps");
+            assert!(
+                PERMISSION_DISPLAY_KINDS.contains(&kind),
+                "claude {mode} mapped outside the pinned vocabulary: {kind}"
+            );
+        }
+        for approval in ["untrusted", "on-request", "on-failure", "never"] {
+            for sandbox in ["read-only", "workspace-write", "danger-full-access"] {
+                if let Some(kind) = codex_permission_kind(approval, sandbox) {
+                    assert!(
+                        PERMISSION_DISPLAY_KINDS.contains(&kind),
+                        "codex {approval}/{sandbox} mapped outside the pinned vocabulary: {kind}"
+                    );
+                }
+            }
+        }
+        assert!(PERMISSION_DISPLAY_KINDS.contains(&PERMISSION_KIND_AUTONOMY));
+    }
+
+    /// The config section's wire shape: camelCase fields, absent when
+    /// unknown, `permissionEchoed` serialized only when true.
+    #[test]
+    fn config_vitals_wire_shape() {
+        let full = SessionConfigVitals {
+            model: Some("claude-fable-5".into()),
+            effort: Some("max".into()),
+            permission_mode: Some("bypassPermissions".into()),
+            permission_kind: Some(PERMISSION_KIND_BYPASS.into()),
+            permission_echoed: true,
+        };
+        let wire = serde_json::to_value(&full).expect("serializes");
+        assert_eq!(wire["model"], "claude-fable-5");
+        assert_eq!(wire["effort"], "max");
+        assert_eq!(wire["permissionMode"], "bypassPermissions");
+        assert_eq!(wire["permissionKind"], "bypass");
+        assert_eq!(wire["permissionEchoed"], true);
+
+        let sparse = SessionConfigVitals::default();
+        let wire = serde_json::to_value(&sparse).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({}),
+            "absent facts serialize to nothing"
+        );
+    }
 }

@@ -544,6 +544,12 @@ pub(crate) async fn run_external_agent_mode(
                                             activity,
                                         });
                                     }
+                                    external_agent::AgentEvent::ConfigFacts { facts } => {
+                                        bus.send(AppEvent::SessionConfigFacts {
+                                            session_id: drain_config.session_id.clone(),
+                                            facts,
+                                        });
+                                    }
                                     external_agent::AgentEvent::BackendError {
                                         message,
                                         code,

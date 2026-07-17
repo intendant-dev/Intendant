@@ -994,6 +994,16 @@ pub enum AgentEvent {
     ActivityUpdate {
         activity: crate::types::SessionActivityVitals,
     },
+    /// Partial session-config facts (model / effort / permission mode)
+    /// observed at a protocol seam: launch config at spawn, the backend's
+    /// own echoes (Claude Code `system:init` / `message_start`, Codex
+    /// thread-settings), accepted mid-session switches. Drains forward it
+    /// as `AppEvent::SessionConfigFacts` for the vitals hub, which folds
+    /// fields sticky into the session's `config` section. Ambient
+    /// bookkeeping — implies no turn.
+    ConfigFacts {
+        facts: crate::types::SessionConfigVitals,
+    },
     /// Informational backend event that should be written to the activity log.
     Log { level: String, message: String },
     /// Latest Codex `/goal` state for a thread.

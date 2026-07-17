@@ -1249,6 +1249,14 @@ pub(crate) async fn drain_external_agent_events_with_prefetched(
                     activity,
                 });
             }
+            external_agent::AgentEvent::ConfigFacts { facts } => {
+                // Session-config facts → the vitals hub (same keying and
+                // aliasing as activity). Pure bookkeeping.
+                config.bus.send(AppEvent::SessionConfigFacts {
+                    session_id: config.session_id.clone(),
+                    facts,
+                });
+            }
             external_agent::AgentEvent::GoalUpdated { goal } => {
                 emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
             }

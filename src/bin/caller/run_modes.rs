@@ -1605,6 +1605,12 @@ pub(crate) async fn run_with_presence(
                             activity,
                         });
                     }
+                    external_agent::AgentEvent::ConfigFacts { facts } => {
+                        bus.send(AppEvent::SessionConfigFacts {
+                            session_id: session_log_id(&session_log),
+                            facts,
+                        });
+                    }
                     external_agent::AgentEvent::BackendError {
                         message,
                         code,

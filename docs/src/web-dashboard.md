@@ -238,13 +238,21 @@ undocumented), dimming to `✗` once cold; and a rate-limit gauge —
 `▮NN% 5h` for the most-used window (Claude Code subscription 5h/7d,
 Codex primary/secondary, native Anthropic per-minute headers), dim below
 70%, yellow from 70%, red from 90% with the reset countdown appended;
-the tooltip lists every window. When a cache countdown enters its final
-minute the dashboard raises one toast per idle period (plus a browser
-notification if permission was already granted and the tab is hidden) —
-early enough that a follow-up still reuses the warm cache, never after the
-fact. Sections appear as producers fill them; the chip hides in narrow
-windows. Station's agent focus panel shows the same vitals as git /
-cache / limits rows.
+the tooltip lists every window. Session-facts chips (the vitals `config`
+section, wire-first from each backend's own echoes with the launch config
+as the honestly-marked fallback) show the model + configured reasoning
+effort (`⬡ fable-5 · max`) and the permission mode in plain words
+(`🛡 Acts without asking`) — bypass/ungated modes get a quiet warning
+tint (cosmetic, never the health dot), the raw backend vocabulary
+(`bypassPermissions`, `workspace-write · on-request`, the autonomy level)
+is one tap away in the explainer, and the vitals pane always lists both
+rows, degrading to "not reported" instead of hiding. When a cache
+countdown enters its final minute the dashboard raises one toast per idle
+period (plus a browser notification if permission was already granted and
+the tab is hidden) — early enough that a follow-up still reuses the warm
+cache, never after the fact. Sections appear as producers fill them; the
+chip hides in narrow windows. Station's agent focus panel shows the same
+vitals as git / cache / limits rows.
 
 #### Managed (Activity → Managed)
 

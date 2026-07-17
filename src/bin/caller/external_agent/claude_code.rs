@@ -283,16 +283,6 @@ impl CcShared {
         machine.turn_active()
     }
 
-    /// Adopt a first-hand effort value (launch config, or the CLI's own
-    /// echo when a future protocol states one).
-    fn set_activity_effort(&self, effort: Option<String>) {
-        let mut machine = match self.activity.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        machine.set_effort(effort);
-    }
-
     fn lock_goal(&self) -> std::sync::MutexGuard<'_, GoalEngine> {
         match self.goal.lock() {
             Ok(guard) => guard,
@@ -375,10 +365,9 @@ impl CcShared {
         *guard = mode.to_string();
     }
 
-    /// The permission mode the CLI last reported running. Stored for
-    /// future consumers (nothing outside the reader's divergence warning
-    /// and its tests reads it yet).
-    #[allow(dead_code)]
+    /// The permission mode the CLI last reported running (`None` until
+    /// the first echo). The reader's change edge for config-facts
+    /// emissions, and the divergence-warning baseline.
     fn effective_permission_mode(&self) -> Option<String> {
         match self.effective_permission_mode.lock() {
             Ok(guard) => guard.clone(),
@@ -1059,6 +1048,9 @@ struct CcReader {
     /// message, so the warning fires once per distinct echoed value, not
     /// per init.
     permission_mode_warned: Option<String>,
+    /// The CLI's last effort echo (2.1.2xx never states one; kept as the
+    /// change edge if a future protocol does).
+    effort_echo: Option<String>,
     announced_session_id: Option<String>,
 }
 
@@ -1089,7 +1081,57 @@ impl CcReader {
             last_intendant_mcp_status: None,
             init_logged: false,
             permission_mode_warned: None,
+            effort_echo: None,
             announced_session_id: None,
+        }
+    }
+
+    /// Track the wire-echoed model and surface a config-facts update when
+    /// it actually changed (`system:init` re-echoes every turn; a live
+    /// `set_model` switch is confirmed by the next echo).
+    fn note_model_echo(&mut self, model: &str, out: &mut CcLineOutcome) {
+        if self.model == model {
+            return;
+        }
+        self.model = model.to_string();
+        out.events.push(AgentEvent::ConfigFacts {
+            facts: crate::types::SessionConfigVitals {
+                model: Some(model.to_string()),
+                ..Default::default()
+            },
+        });
+    }
+
+    /// Reconcile a CLI-echoed EFFECTIVE permission mode (init echo, or the
+    /// 2.1.201 status-channel echo after a live switch) against the mode
+    /// Intendant requested, and surface the echo as config facts. The echo
+    /// is the truth — Claude Code resolves its mode through a 3-layer
+    /// chain (runtime flag / project toml / user settings), so a
+    /// divergence means the process runs under authority the recorded
+    /// session config doesn't name.
+    fn note_permission_mode_echo(&mut self, echoed: &str, out: &mut CcLineOutcome) {
+        let changed = self.shared.effective_permission_mode().as_deref() != Some(echoed);
+        self.shared.set_effective_permission_mode(echoed);
+        let requested = self.shared.requested_permission_mode();
+        if echoed != requested && self.permission_mode_warned.as_deref() != Some(echoed) {
+            self.permission_mode_warned = Some(echoed.to_string());
+            out.log(
+                "warn",
+                format!(
+                    "Claude Code permission mode diverged: requested {requested}, running {echoed}"
+                ),
+            );
+        }
+        if changed {
+            out.events.push(AgentEvent::ConfigFacts {
+                facts: crate::types::SessionConfigVitals {
+                    permission_mode: Some(echoed.to_string()),
+                    permission_kind: intendant_core::vitals::claude_permission_kind(echoed)
+                        .map(str::to_string),
+                    permission_echoed: true,
+                    ..Default::default()
+                },
+            });
         }
     }
 
@@ -1368,6 +1410,11 @@ impl CcReader {
             // General status channel (2.1.201): compaction progress and
             // permission-mode echoes arrive here.
             Some("status") => {
+                if let Some(echoed) = msg.get("permissionMode").and_then(|m| m.as_str()) {
+                    // The CLI's own echo of the live mode (e.g. after an
+                    // accepted set_permission_mode switch).
+                    self.note_permission_mode_echo(echoed, out);
+                }
                 if msg.get("status").and_then(|s| s.as_str()) == Some("compacting") {
                     out.log("info", "Compacting context…");
                 } else if let Some(result) = msg.get("compact_result").and_then(|s| s.as_str()) {
@@ -1417,17 +1464,28 @@ impl CcReader {
             _ => return,
         }
         if let Some(model) = msg.get("model").and_then(|m| m.as_str()) {
-            self.model = model.to_string();
+            self.note_model_echo(model, out);
         }
         // First-hand effort: adopt the CLI's own echo if an init ever
         // states one (2.1.2xx doesn't; the launch `--effort` value seeds
-        // the machine at spawn — effort is never inferred from output).
+        // the config facts at spawn — effort is never inferred from
+        // output).
         if let Some(effort) = msg
             .get("effort")
             .or_else(|| msg.get("reasoningEffort"))
             .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
         {
-            self.shared.set_activity_effort(Some(effort.to_string()));
+            if self.effort_echo.as_deref() != Some(effort) {
+                self.effort_echo = Some(effort.to_string());
+                out.events.push(AgentEvent::ConfigFacts {
+                    facts: crate::types::SessionConfigVitals {
+                        effort: Some(effort.to_string()),
+                        ..Default::default()
+                    },
+                });
+            }
         }
         if !self.init_logged {
             self.init_logged = true;
@@ -1450,20 +1508,10 @@ impl CcReader {
         }
         // Reconcile the CLI's echoed effective mode against the mode
         // Intendant requested (spawn `--permission-mode`, or a live
-        // `set_permission_mode`): a divergence means the process runs under
-        // authority the recorded session config doesn't name.
+        // `set_permission_mode`), and surface the echo as config facts —
+        // the init echo is the EFFECTIVE truth.
         if let Some(echoed) = msg.get("permissionMode").and_then(|m| m.as_str()) {
-            self.shared.set_effective_permission_mode(echoed);
-            let requested = self.shared.requested_permission_mode();
-            if echoed != requested && self.permission_mode_warned.as_deref() != Some(echoed) {
-                self.permission_mode_warned = Some(echoed.to_string());
-                out.log(
-                    "warn",
-                    format!(
-                        "Claude Code permission mode diverged: requested {requested}, running {echoed}"
-                    ),
-                );
-            }
+            self.note_permission_mode_echo(echoed, out);
         }
         if self.expect_intendant_mcp {
             self.report_intendant_mcp_status(msg, out);
@@ -2152,7 +2200,9 @@ impl CcReader {
                     .and_then(|m| m.get("model"))
                     .and_then(|m| m.as_str())
                 {
-                    self.model = model.to_string();
+                    // Mid-session model changes ride message_start; the
+                    // note emits config facts only on an actual change.
+                    self.note_model_echo(model, out);
                 }
                 // message_start usage carries the per-TTL split that the
                 // flat message_delta shape drops.
@@ -2930,6 +2980,19 @@ impl ClaudeCodeAgent {
         // Keep the reader's reconciliation baseline current, so the next
         // init echo is compared against the live mode, not the spawn mode.
         self.shared.set_requested_permission_mode(&mode);
+        // Config facts: the requested switch, honestly unconfirmed until
+        // the CLI's own echo (status channel / next init) upgrades it.
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(AgentEvent::ConfigFacts {
+                facts: crate::types::SessionConfigVitals {
+                    permission_mode: Some(mode.clone()),
+                    permission_kind: intendant_core::vitals::claude_permission_kind(&mode)
+                        .map(str::to_string),
+                    permission_echoed: false,
+                    ..Default::default()
+                },
+            });
+        }
         Ok(format!(
             "permission mode switched to {mode} for the running session"
         ))
@@ -3000,10 +3063,6 @@ impl ExternalAgent for ClaudeCodeAgent {
         } else {
             self.resume_session.clone()
         }));
-        // Seed the activity machine's configured effort with the value we
-        // pass at launch (`--effort`); a backend echo may upgrade it, and
-        // it is never inferred from output volume or timing.
-        self.shared.set_activity_effort(self.effort.clone());
 
         // Build command args
         let mut args = vec![
@@ -3038,7 +3097,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         let permission_mode = normalize_permission_mode(&self.permission_mode);
         self.shared.set_requested_permission_mode(&permission_mode);
         args.push("--permission-mode".into());
-        args.push(permission_mode);
+        args.push(permission_mode.clone());
 
         if let Some(ref effort) = self.effort {
             args.push("--effort".into());
@@ -3127,6 +3186,22 @@ impl ExternalAgent for ClaudeCodeAgent {
         if let Some(stderr) = stderr {
             super::spawn_stderr_forwarder("claude", stderr, event_tx.clone());
         }
+
+        // Launch-config facts, honestly marked unconfirmed: what Intendant
+        // asked the CLI to run (`--model` / `--effort` /
+        // `--permission-mode`). The first `system:init` echo — the
+        // EFFECTIVE truth — upgrades the mode to `permission_echoed` and
+        // corrects the model if the CLI resolved differently.
+        let _ = event_tx.send(AgentEvent::ConfigFacts {
+            facts: crate::types::SessionConfigVitals {
+                model: self.model.clone().or_else(|| config.model.clone()),
+                effort: self.effort.clone(),
+                permission_mode: Some(permission_mode.clone()),
+                permission_kind: intendant_core::vitals::claude_permission_kind(&permission_mode)
+                    .map(str::to_string),
+                permission_echoed: false,
+            },
+        });
 
         let reader_state = CcReader::new(
             Arc::clone(&self.shared),
@@ -3996,16 +4071,108 @@ mod tests {
         );
     }
 
-    /// The launch `--effort` value rides every published snapshot as the
-    /// configured (never inferred) effort.
+    fn config_facts_of(out: &CcLineOutcome) -> Vec<crate::types::SessionConfigVitals> {
+        out.events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ConfigFacts { facts } => Some(facts.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `system:init` echo is the EFFECTIVE truth (Claude Code resolves
+    /// its mode through a 3-layer chain, so the launch value alone can
+    /// lie): it populates the config-facts section — model + permission
+    /// mode with its display kind, marked echoed — and re-echoes of the
+    /// same values stay quiet (init re-fires after every user message).
     #[test]
-    fn activity_carries_configured_effort() {
-        let shared = CcShared::new(None);
-        shared.set_activity_effort(Some("max".into()));
-        let snapshot = shared
-            .observe_activity(ActivityObs::TurnDispatched)
-            .expect("dispatch publishes");
-        assert_eq!(snapshot.effort.as_deref(), Some("max"));
+    fn init_echo_populates_config_facts() {
+        let mut reader = test_reader();
+        reader
+            .shared
+            .set_requested_permission_mode("bypassPermissions");
+        let init = r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"bypassPermissions","session_id":"s1"}"#;
+        let out = reader.process_line(init);
+        let facts = config_facts_of(&out);
+        assert!(
+            facts
+                .iter()
+                .any(|f| f.model.as_deref() == Some("claude-fable-5")),
+            "init model echo populates the section"
+        );
+        let mode = facts
+            .iter()
+            .find(|f| f.permission_mode.is_some())
+            .expect("init mode echo populates the section");
+        assert_eq!(mode.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(mode.permission_kind.as_deref(), Some("bypass"));
+        assert!(mode.permission_echoed, "an init echo is wire truth");
+
+        // The same init re-fires next turn: no new facts (change edge).
+        let out = reader.process_line(init);
+        assert!(config_facts_of(&out).is_empty(), "re-echo stays quiet");
+
+        // A mode change (e.g. an accepted live switch) re-emits.
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"mcp_servers":[{"name":"intendant","status":"connected"}],"permissionMode":"plan","session_id":"s1"}"#,
+        );
+        let facts = config_facts_of(&out);
+        let mode = facts
+            .iter()
+            .find(|f| f.permission_mode.is_some())
+            .expect("changed mode re-emits");
+        assert_eq!(mode.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(mode.permission_kind.as_deref(), Some("plan"));
+    }
+
+    /// Mid-session model changes ride `message_start`; only an actual
+    /// change emits (every API round starts with one).
+    #[test]
+    fn message_start_model_change_emits_config_facts() {
+        let mut reader = test_reader();
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        let facts = config_facts_of(&out);
+        assert_eq!(facts.len(), 1, "first sighting emits");
+        assert_eq!(facts[0].model.as_deref(), Some("claude-fable-5"));
+
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-fable-5","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        assert!(config_facts_of(&out).is_empty(), "same model stays quiet");
+
+        let out = reader.process_line(
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":1,"output_tokens":1}}},"session_id":"s1"}"#,
+        );
+        let facts = config_facts_of(&out);
+        assert_eq!(facts.len(), 1, "model switch emits");
+        assert_eq!(facts[0].model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    /// The 2.1.201 status channel echoes the live permission mode after an
+    /// accepted `set_permission_mode` switch — same wire-truth treatment
+    /// as the init echo.
+    #[test]
+    fn status_channel_permission_echo_emits_config_facts() {
+        let mut reader = test_reader();
+        reader.shared.set_requested_permission_mode("acceptEdits");
+        let out = reader.process_line(
+            r#"{"type":"system","subtype":"status","permissionMode":"acceptEdits","session_id":"s1"}"#,
+        );
+        let facts = config_facts_of(&out);
+        let mode = facts
+            .iter()
+            .find(|f| f.permission_mode.is_some())
+            .expect("status echo populates the section");
+        assert_eq!(mode.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(mode.permission_kind.as_deref(), Some("auto-edits"));
+        assert!(mode.permission_echoed);
+        assert_eq!(
+            reader.shared.effective_permission_mode().as_deref(),
+            Some("acceptEdits")
+        );
     }
 
     #[test]
@@ -6541,10 +6708,30 @@ mod tests {
             "got: {:?}",
             out.events
         );
-        // Permission-mode status echoes stay silent (no log spam per turn).
-        let out = reader.process_line(
-            r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#,
+        // Permission-mode status echoes are consumed as config facts. A
+        // DIVERGENT echo (requested default, running acceptEdits) warns —
+        // once per distinct value, so per-turn re-echoes never spam.
+        let echo = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"s1"}"#;
+        let out = reader.process_line(echo);
+        assert!(
+            logs(&out)
+                .iter()
+                .any(|(l, m)| l == "warn" && m.contains("running acceptEdits")),
+            "divergent status echo warns: {:?}",
+            out.events
         );
-        assert!(logs(&out).is_empty(), "unexpected logs: {:?}", out.events);
+        let out = reader.process_line(echo);
+        assert!(
+            logs(&out).is_empty(),
+            "repeat echo stays silent: {:?}",
+            out.events
+        );
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ConfigFacts { .. })),
+            "unchanged echo emits no facts: {:?}",
+            out.events
+        );
     }
 }
