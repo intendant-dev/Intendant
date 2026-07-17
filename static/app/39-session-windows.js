@@ -1759,12 +1759,13 @@ function closeVitalsExplainer() {
   stopVitalsPanelTicker();
 }
 
-// ── Live pane ticking. Countdown-bearing rows (cache freshness, parked/
-// activity elapsed, limit resets, goal elapsed) tick while the pane is
-// open — the open panel registers an in-place updater (host._vxTick) and
-// this 1 Hz interval drives it. Same doctrine as the chip row's
-// stable-DOM fast path: update text nodes in place, never rebuild the
-// panel (rebuilds detach buttons mid-tap and reset scroll).
+// ── Live pane ticking. Everything time-derived — the facts-card tokens
+// (activity elapsed, cache countdown, limit resets, floated attention
+// briefs) and the explainer rows' sentences (plus goal elapsed) — ticks
+// while the pane is open: the open panel registers an in-place updater
+// (host._vxTick) and this 1 Hz interval drives it. Same doctrine as the
+// chip row's stable-DOM fast path: update text nodes in place, never
+// rebuild the panel (rebuilds detach buttons mid-tap and reset scroll).
 let vitalsPanelTicker = null;
 
 function startVitalsPanelTicker() {
@@ -1798,10 +1799,9 @@ function vxEl(tag, cls, text) {
   return node;
 }
 
-function vxHeader(label, valueText) {
+function vxHeader(label) {
   const head = vxEl('div', 'vx-head');
   head.appendChild(vxEl('span', 'vx-title', label));
-  if (valueText) head.appendChild(vxEl('span', 'vx-value', valueText));
   return head;
 }
 
@@ -1837,42 +1837,13 @@ function presentVitalsPanel(host, panel, anchor) {
   panel.style.top = `${Math.round(top)}px`;
 }
 
+// Per-symbol taps land in the one pane: the facts card on top, that
+// symbol's explainer scrolled into view and briefly highlighted below.
+// (The pre-facts-card single-symbol popover is gone — one surface, one
+// ticker.)
 function openVitalsExplainer(sessionId, chipId, anchor) {
-  const models = vitalsModelsForSession(sessionId);
-  const model = models.find((m) => m.id === chipId);
-  if (!model) {
-    openVitalsGlossary(sessionId, anchor);
-    return;
-  }
-  const host = ensureVitalsExplainerHost();
-  const panel = host.querySelector('.vx-panel');
-  // Content epoch: async enrichers (the background-task rows) must not
-  // append to a panel that has since shown something else.
-  panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
-  panel.replaceChildren(
-    vxHeader(model.label, model.text),
-    ...model.explainLines.map((line) => vxEl('p', 'vx-line', line)),
-    ...(model.action ? [vxActionButton(model.action)] : [])
-  );
-  // The model-activity explainer additionally lists the session's
-  // background tasks (live from the daemon's task registry) with a
-  // per-task output peek — additive: absent on fetch failure or when
-  // nothing was announced.
-  if (model.key === 'activity') appendSessionBackgroundTaskRows(sessionId, panel);
-  presentVitalsPanel(host, panel, anchor);
-  // Tick the value and sentences in place while open (elapsed, quiet,
-  // countdowns). Line COUNT changes (a state flip mid-open) skip the
-  // in-place pass — the stale-by-seconds text settles on next open.
-  host._vxTick = () => {
-    const fresh = vitalsModelsForSession(sessionId).find((m) => m.id === chipId);
-    if (!fresh) return;
-    setVxText(panel.querySelector('.vx-head .vx-value'), fresh.text);
-    const lines = panel.querySelectorAll('.vx-line');
-    if (lines.length === fresh.explainLines.length) {
-      fresh.explainLines.forEach((line, i) => setVxText(lines[i], line));
-    }
-  };
-  startVitalsPanelTicker();
+  const model = vitalsModelsForSession(sessionId).find((m) => m.id === chipId);
+  openVitalsGlossary(sessionId, anchor, model ? model.id : '');
 }
 
 function vxVerdictText(health) {
@@ -1881,114 +1852,418 @@ function vxVerdictText(health) {
     : 'all good';
 }
 
-// A folded-fact row for the glossary: same vx-row skeleton the catalog
-// rows use (value column + label/sentence body) so the pane reads as one
-// list and stays extensible. `onTap` makes the row a button; the sentence
-// SAYS what tapping does — no hover-only affordances.
-function vxFactRow({ label, value, desc, absent = false, onTap = null }) {
-  const row = vxEl('div', `vx-row ${absent ? 'absent' : 'present'}`);
-  row.appendChild(vxEl('span', 'vx-glyph', absent ? '—' : (value || '●')));
-  const body = vxEl('div', 'vx-body');
-  body.appendChild(vxEl('div', 'vx-label', label));
-  body.appendChild(vxEl('div', 'vx-desc', desc || ''));
-  row.appendChild(body);
-  if (onTap && !absent) {
-    row.setAttribute('role', 'button');
-    row.tabIndex = 0;
-    row.addEventListener('click', onTap);
-    row.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onTap(); }
-    });
-  } else {
-    row.classList.add('static');
+// ── The facts card (pane top): dense atomic tokens, no descriptions.
+// Every fact is one nowrap token; lines wrap BETWEEN tokens, never inside
+// one — the cure for the narrow value column that broke "main" into
+// "mai / n". Pure planners (vitalsFactsCardPlan, vitalsGlossaryRowPlan)
+// decide WHAT renders; small DOM builders below render it — the planners
+// are what the headless harness exercises.
+
+// Leading-component path truncation: the tail is the informative part, so
+// drop LEADING components behind "…" — never a mid-word ellipsis. The
+// last component always survives whole.
+function vitalsLeadingTruncatedPath(value, budget = 34) {
+  const path = String(value || '').trim();
+  if (!path || path.length <= budget) return path;
+  const sep = path.includes('/') ? '/' : '\\';
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  if (!parts.length) return path;
+  let tail = parts[parts.length - 1];
+  for (let i = parts.length - 2; i >= 0; i--) {
+    const next = `${parts[i]}${sep}${tail}`;
+    if (`…${sep}${next}`.length > budget) break;
+    tail = next;
   }
-  return row;
+  return `…${sep}${tail}`;
 }
 
-// The header's folded facts, as pane rows: project root, working folder,
-// relationship, goal. What the collapsed one-liner no longer shows lives
-// here in plain words — the dot is the door.
-function vitalsGlossaryFactRows(sessionId) {
-  const sid = String(sessionId || '').trim();
-  const meta = sessionMetadataById.get(sid) || {};
+// Children-by-kind tallies, in chip grammar ("5 sub · 1 fork") for the
+// card token and in plain words ("5 sub-agents, 1 fork") for the
+// explainer sentence. Null when there are no children.
+function vitalsChildrenSummary(children) {
+  const counts = new Map();
+  for (const child of Array.isArray(children) ? children : []) {
+    const kind = String(child?.kind || '').trim().toLowerCase() || 'related';
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+  if (!counts.size) return null;
+  const short = Array.from(counts.entries())
+    .map(([k, n]) => `${n} ${k === 'subagent' ? 'sub' : k}`)
+    .join(' · ');
+  const words = Array.from(counts.entries())
+    .map(([k, n]) => `${n} ${k === 'subagent' ? `sub-agent${n === 1 ? '' : 's'}` : `${k}${n === 1 ? '' : 's'}`}`)
+    .join(', ');
+  return { short, words };
+}
+
+// Card-token text projection, shared by the builder and the 1 Hz ticker
+// so in-place updates can never drift from first render. `chip` is the
+// catalog's chip grammar; `brief` is attention grammar (a floated culprit
+// NAMES itself in plain words); `parity` renders the quiet word — a
+// conflict always floats as its brief, so in-line parity is "clean".
+function vfcProjectText(proj, model) {
+  if (proj === 'verdict') {
+    const word = vxVerdictText(model);
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  }
+  if (proj === 'brief') {
+    return model.brief || (model.text ? `${model.label}: ${model.text}` : model.label);
+  }
+  if (proj === 'parity') return model.severity === 'crit' ? (model.brief || model.text) : 'clean';
+  return model.text || '●';
+}
+
+function vfcProjectTone(proj, model) {
+  if (proj === 'verdict') {
+    return model?.severity === 'warn' || model?.severity === 'crit' ? model.severity : 'ok';
+  }
+  if (proj === 'brief') return model.severity || model.tone || '';
+  return model.tone || '';
+}
+
+// The card's line plan: verdict (+ floated attention culprits), live
+// activity, session config (model, permissions), the git family composed
+// onto one line, cache + limits, then place + relationship. Facts with
+// nothing to say render no token — quiet when healthy; missing-but-
+// expected copy lives in the explainers, never here. Attention-severity
+// models (warn/crit) leave their family line and float next to the
+// verdict, tinted, named by their brief. Cosmetic tone (a bypass config,
+// an expiring cache) tints in place and never floats — tone ≠ severity.
+function vitalsFactsCardPlan(models, meta) {
+  const token = (model, proj = 'chip') => ({
+    id: model.id,
+    anchor: model.id,
+    label: model.label,
+    proj,
+    text: vfcProjectText(proj, model),
+    tone: vfcProjectTone(proj, model),
+  });
+  const health = models.find((m) => m.key === 'health') || null;
+  const floated = models.filter((m) => m.key !== 'health'
+    && (m.severity === 'warn' || m.severity === 'crit'));
+  const floatedIds = new Set(floated.map((m) => m.id));
+  const quiet = (key) => models.filter((m) => m.key === key && !floatedIds.has(m.id));
+  const lines = [];
+  const pushLine = (name, groups) => {
+    const kept = groups.filter((g) => g.length);
+    if (kept.length) lines.push({ name, groups: kept });
+  };
+  pushLine('verdict', [
+    health ? [{ ...token(health, 'verdict'), anchor: 'health' }] : [],
+    floated.map((m) => token(m, 'brief')),
+  ]);
+  pushLine('activity', [quiet('activity').map((m) => token(m))]);
+  pushLine('config', [
+    quiet('model').map((m) => token(m)),
+    quiet('permissions').map((m) => token(m)),
+  ]);
+  pushLine('git', [[
+    ...quiet('worktree').map((m) => token(m)),
+    ...quiet('branch').map((m) => token(m)),
+    ...quiet('parity').map((m) => token(m, 'parity')),
+    ...quiet('dirty').map((m) => token(m)),
+    ...quiet('divergence').map((m) => token(m)),
+    ...quiet('unpushed').map((m) => token(m)),
+    ...quiet('primary-unpushed').map((m) => token(m)),
+  ]]);
+  pushLine('resources', [
+    [...quiet('cache-hit').map((m) => token(m)), ...quiet('cache-ttl').map((m) => token(m))],
+    ...quiet('limit').map((m) => [token(m)]),
+  ]);
+  const placeGroups = [];
+  const projectRoot = String(meta?.projectRoot || '').trim();
+  const cwd = String(meta?.cwd || '').trim();
+  const placePath = cwd || projectRoot;
+  if (placePath) {
+    placeGroups.push([{
+      id: 'fact:place',
+      anchor: cwd ? 'fact:cwd' : 'fact:project',
+      label: cwd ? 'Working folder' : 'Project',
+      proj: 'place',
+      text: `📁 ${vitalsLeadingTruncatedPath(placePath)}`,
+      tone: '',
+      copy: placePath,
+    }]);
+  }
+  const kind = String(meta?.relationshipKind || '').trim();
+  const parentId = String(meta?.parentId || '').trim();
+  const childrenSummary = vitalsChildrenSummary(meta?.children);
+  const relationText = kind && parentId
+    ? (kind === 'subagent' ? 'sub-agent' : kind)
+    : (childrenSummary ? childrenSummary.short : '');
+  if (relationText) {
+    placeGroups.push([{
+      id: 'fact:relationship',
+      anchor: 'fact:relationship',
+      label: 'Relationship',
+      proj: 'relation',
+      text: `🧬 ${relationText}`,
+      tone: '',
+    }]);
+  }
+  pushLine('place', placeGroups);
+  return { lines };
+}
+
+// Card DOM: each token is a real <button> (keyboard + screen reader for
+// free); a tap reveals the symbol's explainer below — and for the place
+// token also copies the full path. Tokens never wrap internally; the "·"
+// separator rides INSIDE the following token, so a wrap can only ever
+// happen between whole facts and never strands a separator.
+function buildVitalsFactsCard(plan, panel) {
+  const card = vxEl('div', 'vfc-card');
+  card.setAttribute('role', 'group');
+  card.setAttribute('aria-label', 'Session facts — select one for its explanation');
+  for (const line of plan.lines) {
+    const lineEl = vxEl('div', 'vfc-line');
+    lineEl.dataset.vfcLine = line.name;
+    for (const group of line.groups) {
+      const groupEl = vxEl('div', 'vfc-group');
+      group.forEach((tok, index) => {
+        const btn = vxEl('button', 'vfc-fact');
+        btn.type = 'button';
+        btn.dataset.vfcId = tok.id;
+        btn.dataset.vfcProj = tok.proj;
+        btn.dataset.vfcAnchor = tok.anchor;
+        if (tok.tone) btn.dataset.tone = tok.tone;
+        if (index > 0) btn.appendChild(vxEl('span', 'vfc-sep', '·'));
+        if (tok.proj === 'verdict') btn.appendChild(vxEl('span', 'vfc-dot'));
+        btn.appendChild(vxEl('span', 'vfc-text', tok.text));
+        btn.setAttribute('aria-label', `${tok.label}: ${tok.text} — show explanation`);
+        btn.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (tok.copy) vitalsCopyText(tok.copy);
+          vitalsRevealExplainer(panel, tok.anchor);
+        });
+        groupEl.appendChild(btn);
+      });
+      lineEl.appendChild(groupEl);
+    }
+    card.appendChild(lineEl);
+  }
+  return card;
+}
+
+// Scroll the anchored explainer into view inside the pane's own scroll
+// region (the card on top never moves) and flash it briefly.
+function vitalsRevealExplainer(panel, anchor, behavior = 'smooth') {
+  const scroller = panel.querySelector('.vx-scroll');
+  if (!scroller) return;
+  const target = Array.from(scroller.querySelectorAll('[data-vx-anchor]'))
+    .find((row) => row.dataset.vxAnchor === anchor);
+  if (!target) return;
+  scroller.scrollTo({ top: Math.max(0, target.offsetTop - 6), behavior });
+  if (target._vxHiliteTimer) clearTimeout(target._vxHiliteTimer);
+  target.classList.remove('hilite');
+  void target.offsetWidth; // restart the flash animation
+  target.classList.add('hilite');
+  target._vxHiliteTimer = setTimeout(() => target.classList.remove('hilite'), 1600);
+}
+
+// Full paths in explainer sentences get soft break opportunities at their
+// separators, so a wrap lands between components — never mid-word.
+function vxPathNode(path) {
+  const span = vxEl('span', 'vx-path');
+  for (const bit of String(path || '').split(/([\\/])/)) {
+    if (!bit) continue;
+    span.appendChild(document.createTextNode(bit));
+    if (bit === '/' || bit === '\\') span.appendChild(document.createElement('wbr'));
+  }
+  return span;
+}
+
+function vitalsGoalElapsedLine(goal) {
+  const elapsed = formatGoalElapsed(currentSessionGoalElapsedSeconds(goal));
+  return normalizeGoalStatus(goal.status) === 'active'
+    ? `Working on it for ${elapsed} so far.`
+    : `Time on it: ${elapsed}.`;
+}
+
+// The explainer plan: one row per catalog symbol — present ones with
+// their full plain-language sentences (raw vocabulary and unconfirmed-
+// provenance honesty lines included), absent ones dimmed with honest
+// "not reported" copy: the parity surface. Then the header facts the
+// collapsed one-liner folded away (project, working folder,
+// relationship, goal). Values live INLINE in the sentences at full width
+// — there is no value column, and a sentence never repeats a value shown
+// beside it. Pure: DOM rendering is vxExplainerRow's job.
+function vitalsGlossaryRowPlan(models, meta, sessionId) {
   const rows = [];
-  const projectRoot = String(meta.projectRoot || '').trim();
-  rows.push(vxFactRow(projectRoot ? {
+  const health = models.find((m) => m.key === 'health') || null;
+  rows.push({
+    anchor: 'health',
+    label: VITALS_SYMBOLS.health.label,
+    lines: health ? health.explainLines.slice() : ['Everything looks good.'],
+    absent: false,
+    severity: health?.severity || '',
+    modelId: 'health',
+  });
+  // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
+  // the symbol's family has data but this symbol is at rest, say so in
+  // its own words; only families the agent never reported read as such.
+  const hasGit = models.some((m) => VITALS_GIT_KEYS.has(m.key));
+  const hasCache = models.some((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
+  const familyPresent = (key) => (VITALS_GIT_KEYS.has(key) ? hasGit
+    : key === 'cache-hit' || key === 'cache-ttl' ? hasCache
+    : false);
+  // Absent-family wording states who actually owns the reading: git is
+  // probed by the daemon from the session's folder (agent-independent);
+  // cache and limits come from the agent's provider responses.
+  const familyAbsentText = (key) => (VITALS_GIT_KEYS.has(key)
+    ? "No git reading for this session — its folder may not be a git project."
+    : key === 'cache-hit' || key === 'cache-ttl'
+      ? "Nothing measured yet — appears after the agent's first reply."
+      : key === 'limit'
+        ? 'No usage limits reported by this provider yet.'
+        : 'Not reported for this session yet.');
+  const addRow = (model, def, label, key) => {
+    rows.push(model ? {
+      anchor: model.id,
+      label: label || def.label,
+      lines: model.explainLines.slice(),
+      absent: false,
+      severity: model.tone || '',
+      modelId: model.id,
+      action: model.action || null,
+      bgTasks: model.key === 'activity',
+    } : {
+      anchor: `absent:${key}`,
+      label: label || def.label,
+      lines: [familyPresent(key) && def.quiet ? def.quiet : (def.unavailable || familyAbsentText(key))],
+      absent: true,
+      severity: '',
+    });
+  };
+  for (const key of VITALS_SYMBOL_ORDER) {
+    if (key === 'health') continue;
+    if (key === 'limit') {
+      const limitModels = models.filter((m) => m.key === 'limit');
+      if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
+      // The chip compresses the window name; the pane owns the FULL name.
+      for (const m of limitModels) {
+        addRow(m, VITALS_SYMBOLS.limit,
+          `Rate limit · ${vitalsLimitLabelLong(m.id.slice('limit:'.length))}`, key);
+      }
+      continue;
+    }
+    addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
+  }
+  const projectRoot = String(meta?.projectRoot || '').trim();
+  rows.push(projectRoot ? {
+    anchor: 'fact:project',
     label: 'Project',
-    value: meta.projectLabel || compactPathLabel(projectRoot, true),
-    desc: `${projectRoot} — tap to copy the path.`,
+    lines: [{ path: projectRoot, suffix: ' — tap to copy the path.' }],
+    absent: false,
     onTap: () => vitalsCopyText(projectRoot),
   } : {
+    anchor: 'fact:project',
     label: 'Project',
-    desc: 'Project folder not known yet.',
+    lines: ['Project folder not known yet.'],
     absent: true,
-  }));
-  const cwd = String(meta.cwd || '').trim();
-  rows.push(vxFactRow(cwd ? {
+  });
+  const cwd = String(meta?.cwd || '').trim();
+  rows.push(cwd ? {
+    anchor: 'fact:cwd',
     label: 'Working folder',
-    value: meta.cwdLabel || compactPathLabel(cwd, true),
-    desc: cwd === projectRoot
-      ? 'Same as the project folder — tap to copy the path.'
-      : `${cwd} — tap to copy the path.`,
+    lines: cwd === projectRoot
+      ? ['Same as the project folder — tap to copy the path.']
+      : [{ path: cwd, suffix: ' — tap to copy the path.' }],
+    absent: false,
     onTap: () => vitalsCopyText(cwd),
   } : {
+    anchor: 'fact:cwd',
     label: 'Working folder',
-    desc: 'Working folder not known yet.',
+    lines: ['Working folder not known yet.'],
     absent: true,
-  }));
-  const kind = String(meta.relationshipKind || '').trim();
-  const parentId = String(meta.parentId || '').trim();
-  const children = Array.isArray(meta.children) ? meta.children : [];
+  });
+  const kind = String(meta?.relationshipKind || '').trim();
+  const parentId = String(meta?.parentId || '').trim();
+  const childrenSummary = vitalsChildrenSummary(meta?.children);
   if (kind && parentId) {
     const kindWord = kind === 'subagent' ? 'sub-agent' : kind;
     const parentIdentity = typeof sessionIdentityParts === 'function'
       ? sessionIdentityParts(parentId) : {};
     const parentLabel = parentIdentity.name || parentIdentity.shortId
       || (typeof shortSessionId === 'function' ? shortSessionId(parentId) : parentId);
-    rows.push(vxFactRow({
+    rows.push({
+      anchor: 'fact:relationship',
       label: 'Relationship',
-      value: kindWord,
-      desc: `Started by ${parentLabel} — tap to focus that window.`,
+      lines: [`A ${kindWord} started by ${parentLabel} — tap to focus that window.`],
+      absent: false,
       onTap: () => {
         closeVitalsExplainer();
         if (typeof focusSessionWindow === 'function' && sessionWindows.has(parentId)) {
           focusSessionWindow(parentId);
         }
       },
-    }));
-  } else if (children.length > 0) {
-    const counts = new Map();
-    for (const child of children) {
-      const childKind = String(child?.kind || '').trim().toLowerCase() || 'related';
-      counts.set(childKind, (counts.get(childKind) || 0) + 1);
-    }
-    const summary = Array.from(counts.entries())
-      .map(([k, n]) => `${n} ${k === 'subagent' ? 'sub' : k}`)
-      .join(' · ');
-    rows.push(vxFactRow({
+    });
+  } else if (childrenSummary) {
+    rows.push({
+      anchor: 'fact:relationship',
       label: 'Relationship',
-      value: summary,
-      desc: `Runs ${children.length} related session${children.length === 1 ? '' : 's'} alongside this one.`,
-    }));
+      lines: [`Runs ${childrenSummary.words} alongside this one.`],
+      absent: false,
+    });
   } else {
-    rows.push(vxFactRow({
+    rows.push({
+      anchor: 'fact:relationship',
       label: 'Relationship',
-      desc: 'Runs on its own — not started by another session.',
+      lines: ['Runs on its own — not started by another session.'],
       absent: true,
-    }));
+    });
   }
-  const goal = meta.goal && typeof meta.goal === 'object' ? meta.goal : null;
+  const goal = meta?.goal && typeof meta.goal === 'object' ? meta.goal : null;
   if (goal?.objective) {
     const status = normalizeGoalStatus(goal.status);
-    const row = vxFactRow({
+    rows.push({
+      anchor: 'fact:goal',
       label: 'Goal',
-      value: formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)),
-      desc: status === 'active' ? goal.objective : `${status} · ${goal.objective}`,
+      lines: [
+        status === 'active' ? goal.objective : `${status} · ${goal.objective}`,
+        vitalsGoalElapsedLine(goal),
+      ],
+      absent: false,
+      goalTick: true,
     });
-    row.dataset.vxGoal = '1';
-    rows.push(row);
   }
   return rows;
+}
+
+// One explainer row: the name, then full-width sentences (every catalog
+// explain line renders — nothing is held back for a drill-in). Actions
+// are real buttons; whole-row tap is reserved for the folded header
+// facts (copy a path, focus the parent) and the sentence SAYS what
+// tapping does — no hover-only affordances.
+function vxExplainerRow(spec) {
+  const row = vxEl('div', `vx-row ${spec.absent ? 'absent' : 'present'}`);
+  row.dataset.vxAnchor = spec.anchor;
+  if (spec.modelId) row.dataset.vxModel = spec.modelId;
+  if (spec.goalTick) row.dataset.vxGoal = '1';
+  if (spec.severity) row.dataset.severity = spec.severity;
+  const body = vxEl('div', 'vx-body');
+  body.appendChild(vxEl('div', 'vx-label', spec.label));
+  for (const line of spec.lines) {
+    const desc = vxEl('div', 'vx-desc');
+    if (line && typeof line === 'object' && line.path) {
+      desc.appendChild(vxPathNode(line.path));
+      if (line.suffix) desc.appendChild(document.createTextNode(line.suffix));
+    } else {
+      desc.textContent = String(line ?? '');
+    }
+    body.appendChild(desc);
+  }
+  if (spec.action) body.appendChild(vxActionButton(spec.action));
+  row.appendChild(body);
+  if (spec.onTap && !spec.absent) {
+    row.setAttribute('role', 'button');
+    row.tabIndex = 0;
+    row.addEventListener('click', spec.onTap);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); spec.onTap(); }
+    });
+  }
+  return row;
 }
 
 // ── Background-task inspector: what a parked (or working) session's
@@ -1996,8 +2271,10 @@ function vitalsGlossaryFactRows(sessionId) {
 // output. List + tail come from the daemon's task registry
 // (`/api/session/{id}/background-tasks[...]`, tunnel twins) — the client
 // names task ids, never paths, and tasks without an announced output
-// file simply get no peek affordance (wire-first honesty).
-async function appendSessionBackgroundTaskRows(sessionId, panel) {
+// file simply get no peek affordance (wire-first honesty). The section
+// appends into `container` (the activity explainer row's body); the
+// panel carries the content epoch.
+async function appendSessionBackgroundTaskRows(sessionId, panel, container = panel) {
   const sid = String(sessionId || '').trim();
   if (!sid || typeof daemonApi === 'undefined') return;
   const epoch = panel.dataset.vxEpoch;
@@ -2009,7 +2286,7 @@ async function appendSessionBackgroundTaskRows(sessionId, panel) {
   } catch (_) {
     return; // absent section, never a broken explainer
   }
-  if (panel.dataset.vxEpoch !== epoch || !panel.isConnected) return;
+  if (panel.dataset.vxEpoch !== epoch || !container.isConnected) return;
   const tasks = Array.isArray(body?.tasks) ? body.tasks : [];
   if (!tasks.length) return;
   const section = vxEl('div', 'vx-bgtasks');
@@ -2041,7 +2318,7 @@ async function appendSessionBackgroundTaskRows(sessionId, panel) {
     }
     section.appendChild(row);
   }
-  panel.appendChild(section);
+  container.appendChild(section);
 }
 
 // Read-only output viewer: monospace tail of the task's output file,
@@ -2142,99 +2419,67 @@ function openSessionBackgroundTaskOutput(sessionId, task) {
   host._refreshTimer = setInterval(refresh, 2000);
 }
 
-// The glossary is the parity surface: EVERY catalog symbol is listed —
-// present ones with their live value and sentence (tap to drill in),
-// absent ones dimmed with "not reported", so what an agent lacks is
-// visible instead of silently missing. The health dot opens this; the
-// header facts the collapsed one-liner folded away lead the list.
-function openVitalsGlossary(sessionId, anchor) {
+// The vitals pane: FACTS FIRST — a dense card of atomic tokens on top
+// (always fully visible, never scrolls, no descriptions), the plain-
+// language explainers below in their own scroll region. The card answers
+// "what is the state" in one glance; the explainers stay the parity
+// surface: EVERY catalog symbol listed, honest "not reported"
+// degradation, full sentences with the values inline. Tapping a card
+// fact reveals its explainer. The health dot, the overflow chip, the
+// attention chip, and every per-symbol chip all land here.
+function openVitalsGlossary(sessionId, anchor, focusId = '') {
   const models = vitalsModelsForSession(sessionId);
-  const health = models.find((m) => m.key === 'health');
+  const meta = sessionMetadataById.get(String(sessionId || '').trim()) || {};
   const host = ensureVitalsExplainerHost();
   const panel = host.querySelector('.vx-panel');
-  const rows = vitalsGlossaryFactRows(sessionId);
-  // Quiet is not unavailable: a clean repo REPORTS zero dirty files. When
-  // the symbol's family has data but this symbol is at rest, say so in
-  // its own words; only families the agent never reported read as such.
-  const hasGit = models.some((m) => VITALS_GIT_KEYS.has(m.key));
-  const hasCache = models.some((m) => m.key === 'cache-hit' || m.key === 'cache-ttl');
-  const familyPresent = (key) => (VITALS_GIT_KEYS.has(key) ? hasGit
-    : key === 'cache-hit' || key === 'cache-ttl' ? hasCache
-    : false);
-  // Absent-family wording states who actually owns the reading: git is
-  // probed by the daemon from the session's folder (agent-independent);
-  // cache and limits come from the agent's provider responses.
-  const familyAbsentText = (key) => (VITALS_GIT_KEYS.has(key)
-    ? "No git reading for this session — its folder may not be a git project."
-    : key === 'cache-hit' || key === 'cache-ttl'
-      ? "Nothing measured yet — appears after the agent's first reply."
-      : key === 'limit'
-        ? 'No usage limits reported by this provider yet.'
-        : 'Not reported for this session yet.');
-  const addRow = (model, def, label, key) => {
-    const row = vxEl('div', `vx-row ${model ? 'present' : 'absent'}`);
-    if (model) {
-      // Tick + severity handles for the live pane: the 1 Hz updater finds
-      // rows by model id, and severity tints the value column so the
-      // culprit reads at a glance even with the header chips folded away.
-      row.dataset.vxModel = model.id;
-      if (model.tone) row.dataset.severity = model.tone;
-    }
-    row.appendChild(vxEl('span', 'vx-glyph', model ? (model.text || '●') : '—'));
-    const body = vxEl('div', 'vx-body');
-    body.appendChild(vxEl('div', 'vx-label', label || def.label));
-    const absentText = familyPresent(key) && def.quiet
-      ? def.quiet
-      : (def.unavailable || familyAbsentText(key));
-    body.appendChild(vxEl('div', 'vx-desc',
-      model ? (model.explainLines[0] || '') : absentText));
-    row.appendChild(body);
-    if (model) {
-      row.setAttribute('role', 'button');
-      row.tabIndex = 0;
-      const open = () => openVitalsExplainer(sessionId, model.id, anchor);
-      row.addEventListener('click', open);
-      row.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); open(); }
-      });
-    }
-    rows.push(row);
-  };
-  for (const key of VITALS_SYMBOL_ORDER) {
-    if (key === 'health') continue;
-    if (key === 'limit') {
-      const limitModels = models.filter((m) => m.key === 'limit');
-      if (!limitModels.length) addRow(null, VITALS_SYMBOLS.limit, 'Rate limits', key);
-      // The chip compresses the window name; the pane owns the FULL name.
-      for (const m of limitModels) {
-        addRow(m, VITALS_SYMBOLS.limit,
-          `Rate limit · ${vitalsLimitLabelLong(m.id.slice('limit:'.length))}`, key);
-      }
-      continue;
-    }
-    addRow(models.find((m) => m.key === key) || null, VITALS_SYMBOLS[key], undefined, key);
+  // Content epoch: async enrichers (the background-task rows) must not
+  // append to a panel that has since shown something else.
+  panel.dataset.vxEpoch = String((Number(panel.dataset.vxEpoch) || 0) + 1);
+  const card = buildVitalsFactsCard(vitalsFactsCardPlan(models, meta), panel);
+  const scroller = vxEl('div', 'vx-scroll');
+  let activityBody = null;
+  for (const spec of vitalsGlossaryRowPlan(models, meta, sessionId)) {
+    const row = vxExplainerRow(spec);
+    if (spec.bgTasks) activityBody = row.querySelector('.vx-body');
+    scroller.appendChild(row);
   }
-  panel.replaceChildren(
-    vxHeader('Session vitals', vxVerdictText(health)),
-    // Every health line: the lead-in plus the named culprits — the whole
-    // point of the verdict is that nobody has to hunt for a chip.
-    ...(health?.explainLines || []).map((line) => vxEl('p', 'vx-line', line)),
-    ...rows
-  );
+  panel.replaceChildren(vxHeader('Session vitals'), card, scroller);
+  // The model-activity explainer additionally lists the session's
+  // background tasks (live from the daemon's task registry) with a
+  // per-task output peek — additive: absent on fetch failure or when
+  // nothing was announced.
+  if (activityBody) appendSessionBackgroundTaskRows(sessionId, panel, activityBody);
   presentVitalsPanel(host, panel, anchor);
-  // Countdown-bearing rows tick in place while the pane is open: value
-  // column + first sentence per catalog row, the goal row's elapsed, and
-  // the verdict word. Rows never appear/disappear per tick — structure
-  // changes wait for the next open (or a real vitals event re-render).
+  if (focusId) vitalsRevealExplainer(panel, focusId, 'auto');
+  // Everything time-derived ticks in place while the pane is open — card
+  // tokens (elapsed, countdowns, resets, floated briefs) and each
+  // explainer row's sentences, plus the goal row's elapsed line — via
+  // the one panel ticker. Text nodes update in place; structure (which
+  // tokens and rows exist, float membership) is fixed per open: state
+  // flips settle on the next open or vitals re-render, never mid-tick.
   host._vxTick = () => {
     const fresh = vitalsModelsForSession(sessionId);
     const byId = new Map(fresh.map((m) => [m.id, m]));
+    for (const btn of panel.querySelectorAll('[data-vfc-id]')) {
+      const proj = btn.dataset.vfcProj || 'chip';
+      if (proj === 'place' || proj === 'relation') continue;
+      const m = byId.get(btn.dataset.vfcId);
+      if (!m) continue;
+      setVxText(btn.querySelector('.vfc-text'), vfcProjectText(proj, m));
+      const tone = vfcProjectTone(proj, m);
+      if ((btn.dataset.tone || '') !== tone) {
+        if (tone) btn.dataset.tone = tone;
+        else delete btn.dataset.tone;
+      }
+    }
     for (const row of panel.querySelectorAll('[data-vx-model]')) {
       const m = byId.get(row.dataset.vxModel);
       if (!m) continue;
-      setVxText(row.querySelector('.vx-glyph'), m.text || '●');
-      setVxText(row.querySelector('.vx-desc'), m.explainLines[0] || '');
-      const tone = m.tone || '';
+      const descs = row.querySelectorAll('.vx-desc');
+      if (descs.length === m.explainLines.length) {
+        m.explainLines.forEach((line, i) => setVxText(descs[i], line));
+      }
+      const tone = m.key === 'health' ? (m.severity || '') : (m.tone || '');
       if ((row.dataset.severity || '') !== tone) {
         if (tone) row.dataset.severity = tone;
         else delete row.dataset.severity;
@@ -2244,12 +2489,10 @@ function openVitalsGlossary(sessionId, anchor) {
     if (goalRow) {
       const goal = (sessionMetadataById.get(String(sessionId || '').trim()) || {}).goal;
       if (goal?.objective) {
-        setVxText(goalRow.querySelector('.vx-glyph'),
-          formatGoalElapsed(currentSessionGoalElapsedSeconds(goal)));
+        const descs = goalRow.querySelectorAll('.vx-desc');
+        if (descs.length === 2) setVxText(descs[1], vitalsGoalElapsedLine(goal));
       }
     }
-    setVxText(panel.querySelector('.vx-head .vx-value'),
-      vxVerdictText(byId.get('health')));
   };
   startVitalsPanelTicker();
 }
@@ -2302,8 +2545,9 @@ function refanSessionVitalsForIdentityGroup(sessionId) {
   refreshSessionVitalsTicker();
 }
 
-// QA readback (window.qa convention): the chip models a session renders,
-// serializable — e2e probes assert backend parity on this.
+// QA readback (window.qa convention): the chip models a session renders
+// and the facts-card plan the pane composes, serializable — e2e probes
+// assert backend parity on these.
 window.qa = Object.assign(window.qa || {}, {
   vitalsChips: (sessionId) => vitalsModelsForSession(sessionId).map((m) => ({
     id: m.id,
@@ -2314,6 +2558,16 @@ window.qa = Object.assign(window.qa || {}, {
     elevated: m.key === 'health' || m.elevated,
     ticking: m.ticking,
   })),
+  vitalsFactsCard: (sessionId) => {
+    const sid = String(sessionId || '').trim();
+    const meta = sessionMetadataById.get(sid) || {};
+    return vitalsFactsCardPlan(vitalsModelsForSession(sid), meta).lines.map((line) => ({
+      name: line.name,
+      groups: line.groups.map((group) => group.map(({ id, anchor, proj, text, tone }) => ({
+        id, anchor, proj, text, tone,
+      }))),
+    }));
+  },
 });
 
 // The vitals conflict chip opens the same worktree finish/merge card the
