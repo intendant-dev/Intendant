@@ -562,153 +562,171 @@ impl ChatProvider for AnthropicProvider {
             )));
         }
 
-        // Parse SSE stream
-        let mut text_parts = Vec::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut cu_calls: Vec<crate::computer_use::CuToolCall> = Vec::new();
-        let mut current_tool_json = String::new();
-        let mut current_tool_id = String::new();
-        let mut current_tool_name = String::new();
-        let mut usage = TokenUsage {
-            rate_limit_windows: response.anthropic_rate_limit_windows(),
-            ..Default::default()
+        let mut fold =
+            AnthropicStreamFold::new(self.cu_enabled, response.anthropic_rate_limit_windows());
+        streaming::run_sse_stream(response, &mut fold, on_event)
+            .await
+            .map_err(streaming::StreamFailure::into_caller_error)?;
+        let response = fold.finish();
+        on_event(StreamEvent::Complete(response.clone()));
+        Ok(response)
+    }
+}
+
+/// The Anthropic arm of the shared SSE driver: exactly the per-event
+/// mutable state the old hand-rolled loop carried (current tool
+/// assembly, prompt-side usage from `message_start`, output tokens from
+/// `message_delta`), with the mechanics living in `provider::streaming`.
+pub(crate) struct AnthropicStreamFold {
+    cu_enabled: bool,
+    json: streaming::EventJson,
+    text_parts: Vec<String>,
+    tool_calls: Vec<ToolCall>,
+    cu_calls: Vec<crate::computer_use::CuToolCall>,
+    current_tool_json: String,
+    current_tool_id: String,
+    current_tool_name: String,
+    usage: TokenUsage,
+}
+
+impl AnthropicStreamFold {
+    pub(crate) fn new(
+        cu_enabled: bool,
+        rate_limit_windows: Vec<crate::types::SessionLimitWindow>,
+    ) -> Self {
+        Self {
+            cu_enabled,
+            json: streaming::EventJson::new(),
+            text_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            cu_calls: Vec::new(),
+            current_tool_json: String::new(),
+            current_tool_id: String::new(),
+            current_tool_name: String::new(),
+            usage: TokenUsage {
+                rate_limit_windows,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Assemble the final response after the stream ends.
+    pub(crate) fn finish(mut self) -> ChatResponse {
+        self.usage.total_tokens = self.usage.prompt_tokens + self.usage.completion_tokens;
+        ChatResponse {
+            content: self.text_parts.join(""),
+            usage: self.usage,
+            reasoning_summary: None,
+            reasoning_content: None,
+            tool_calls: self.tool_calls,
+            cu_calls: self.cu_calls,
+            raw_output: None,
+        }
+    }
+}
+
+impl streaming::SseFold for AnthropicStreamFold {
+    fn on_data(
+        &mut self,
+        data: &str,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<(), CallerError> {
+        let Some(event) = self.json.parse(data) else {
+            return Ok(());
         };
-        let mut line_buf = SseLineBuffer::new();
-
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CallerError::Provider(format!("Stream error: {}", e)))?;
-            line_buf.push_chunk(&chunk);
-
-            // Process complete lines
-            while let Some(line) = line_buf.next_line() {
-                if line.is_empty() {
-                    continue;
-                }
-
-                if let Some(("data", data)) = parse_sse_line(&line) {
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match event_type {
-                            "content_block_start" => {
-                                if let Some(cb) = event.get("content_block") {
-                                    let cb_type =
-                                        cb.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                    if cb_type == "tool_use" {
-                                        current_tool_id = cb
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        current_tool_name = cb
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        current_tool_json.clear();
-                                    }
-                                }
-                            }
-                            "content_block_delta" => {
-                                if let Some(delta) = event.get("delta") {
-                                    let delta_type =
-                                        delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                    match delta_type {
-                                        "text_delta" => {
-                                            if let Some(text) =
-                                                delta.get("text").and_then(|t| t.as_str())
-                                            {
-                                                text_parts.push(text.to_string());
-                                                on_event(StreamEvent::Delta(text.to_string()));
-                                            }
-                                        }
-                                        "input_json_delta" => {
-                                            if let Some(json) =
-                                                delta.get("partial_json").and_then(|t| t.as_str())
-                                            {
-                                                current_tool_json.push_str(json);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            "content_block_stop" => {
-                                if !current_tool_id.is_empty() {
-                                    if current_tool_name == "computer" && self.cu_enabled {
-                                        if let Ok(input) = serde_json::from_str::<serde_json::Value>(
-                                            &current_tool_json,
-                                        ) {
-                                            if let Some(action) = parse_anthropic_cu_action(&input)
-                                            {
-                                                cu_calls.push(crate::computer_use::CuToolCall {
-                                                    call_id: current_tool_id.clone(),
-                                                    actions: vec![action],
-                                                    metadata: crate::computer_use::CuCallMetadata::default(),
-                                                });
-                                            }
-                                        }
-                                    } else {
-                                        tool_calls.push(ToolCall {
-                                            id: current_tool_id.clone(),
-                                            call_id: current_tool_id.clone(),
-                                            name: current_tool_name.clone(),
-                                            arguments: current_tool_json.clone(),
-                                        });
-                                    }
-                                    current_tool_id.clear();
-                                    current_tool_name.clear();
-                                    current_tool_json.clear();
-                                }
-                            }
-                            "message_delta" => {
-                                if let Some(u) = event.get("usage") {
-                                    let output = u
-                                        .get("output_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    usage.completion_tokens = output;
-                                }
-                            }
-                            "message_start" => {
-                                if let Some(msg) = event.get("message") {
-                                    if let Some(parsed) = msg.get("usage").cloned().and_then(|u| {
-                                        serde_json::from_value::<AnthropicUsage>(u).ok()
-                                    }) {
-                                        // Prompt-side counters only; output
-                                        // arrives later via message_delta.
-                                        let prompt_side = parsed.to_token_usage();
-                                        usage.prompt_tokens = prompt_side.prompt_tokens;
-                                        usage.cached_tokens = prompt_side.cached_tokens;
-                                        usage.cache_creation_tokens =
-                                            prompt_side.cache_creation_tokens;
-                                        usage.cache_ttl_seconds = prompt_side.cache_ttl_seconds;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match event_type {
+            "content_block_start" => {
+                if let Some(cb) = event.get("content_block") {
+                    let cb_type = cb.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if cb_type == "tool_use" {
+                        self.current_tool_id = cb
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.current_tool_name = cb
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.current_tool_json.clear();
                     }
                 }
             }
+            "content_block_delta" => {
+                if let Some(delta) = event.get("delta") {
+                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    match delta_type {
+                        "text_delta" => {
+                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                self.text_parts.push(text.to_string());
+                                on_event(StreamEvent::Delta(text.to_string()));
+                            }
+                        }
+                        "input_json_delta" => {
+                            if let Some(json) = delta.get("partial_json").and_then(|t| t.as_str())
+                            {
+                                self.current_tool_json.push_str(json);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "content_block_stop" => {
+                if !self.current_tool_id.is_empty() {
+                    if self.current_tool_name == "computer" && self.cu_enabled {
+                        if let Ok(input) =
+                            serde_json::from_str::<serde_json::Value>(&self.current_tool_json)
+                        {
+                            if let Some(action) = parse_anthropic_cu_action(&input) {
+                                self.cu_calls.push(crate::computer_use::CuToolCall {
+                                    call_id: self.current_tool_id.clone(),
+                                    actions: vec![action],
+                                    metadata: crate::computer_use::CuCallMetadata::default(),
+                                });
+                            }
+                        }
+                    } else {
+                        self.tool_calls.push(ToolCall {
+                            id: self.current_tool_id.clone(),
+                            call_id: self.current_tool_id.clone(),
+                            name: self.current_tool_name.clone(),
+                            arguments: self.current_tool_json.clone(),
+                        });
+                    }
+                    self.current_tool_id.clear();
+                    self.current_tool_name.clear();
+                    self.current_tool_json.clear();
+                }
+            }
+            "message_delta" => {
+                if let Some(u) = event.get("usage") {
+                    let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                    self.usage.completion_tokens = output;
+                }
+            }
+            "message_start" => {
+                if let Some(msg) = event.get("message") {
+                    if let Some(parsed) = msg
+                        .get("usage")
+                        .cloned()
+                        .and_then(|u| serde_json::from_value::<AnthropicUsage>(u).ok())
+                    {
+                        // Prompt-side counters only; output
+                        // arrives later via message_delta.
+                        let prompt_side = parsed.to_token_usage();
+                        self.usage.prompt_tokens = prompt_side.prompt_tokens;
+                        self.usage.cached_tokens = prompt_side.cached_tokens;
+                        self.usage.cache_creation_tokens = prompt_side.cache_creation_tokens;
+                        self.usage.cache_ttl_seconds = prompt_side.cache_ttl_seconds;
+                    }
+                }
+            }
+            _ => {}
         }
-
-        usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
-        let content = text_parts.join("");
-        let response = ChatResponse {
-            content,
-            usage,
-            reasoning_summary: None,
-            reasoning_content: None,
-            tool_calls,
-            cu_calls,
-            raw_output: None,
-        };
-        on_event(StreamEvent::Complete(response.clone()));
-        Ok(response)
+        Ok(())
     }
 }
 
@@ -1879,5 +1897,120 @@ mod tests {
         let serialized = serde_json::to_string(&api_msgs).unwrap();
         assert_eq!(serialized.matches("\"type\":\"image\"").count(), 3);
         assert_eq!(serialized.matches("image elided").count(), 0);
+    }
+
+    // --- Stream fold (the Anthropic arm of the shared SSE driver) ---
+
+    /// A realistic Messages-API SSE transcript: prompt-side usage in
+    /// message_start, split text deltas (multibyte content), a tool_use
+    /// block assembled from input_json_delta fragments, and the output
+    /// count in message_delta.
+    const ANTHROPIC_SSE_TRANSCRIPT: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_read_input_tokens\":90,\"cache_creation_input_tokens\":20}}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n",
+        "\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo \\u00e9🦀\"}}\n",
+        "\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"exec_command\"}}\n",
+        "\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"comm\"}}\n",
+        "\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"and\\\":\\\"ls\\\"}\"}}\n",
+        "\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+        "\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n",
+        "\n",
+    );
+
+    #[tokio::test]
+    async fn anthropic_fold_assembles_text_tools_and_usage() {
+        // 7-byte chunks split every line, the multibyte é, and the 🦀
+        // mid-sequence — the framer must never manufacture U+FFFD or
+        // fragment an event.
+        let mut fold = AnthropicStreamFold::new(false, Vec::new());
+        let deltas = streaming::test_support::drive_transcript(
+            &mut fold,
+            ANTHROPIC_SSE_TRANSCRIPT,
+            7,
+        )
+        .await;
+        assert_eq!(deltas, vec!["Hel", "lo é🦀"]);
+
+        let response = fold.finish();
+        assert_eq!(response.content, "Hello é🦀");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "toolu_1");
+        assert_eq!(response.tool_calls[0].call_id, "toolu_1");
+        assert_eq!(response.tool_calls[0].name, "exec_command");
+        assert_eq!(response.tool_calls[0].arguments, "{\"command\":\"ls\"}");
+        assert!(response.cu_calls.is_empty());
+        assert!(response.raw_output.is_none());
+
+        // Usage: prompt side folded from message_start (uncached + reads
+        // + writes), completion from message_delta, total assembled at
+        // finish, TTL from the flat creation counter.
+        assert_eq!(response.usage.prompt_tokens, 120);
+        assert_eq!(response.usage.completion_tokens, 42);
+        assert_eq!(response.usage.total_tokens, 162);
+        assert_eq!(response.usage.cached_tokens, 90);
+        assert_eq!(response.usage.cache_creation_tokens, 20);
+        assert_eq!(response.usage.cache_ttl_seconds, Some(300));
+    }
+
+    #[tokio::test]
+    async fn anthropic_fold_routes_computer_tool_use_to_cu_calls() {
+        let transcript = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_cu\",\"name\":\"computer\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"action\\\":\\\"screenshot\\\"}\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
+        // CU-enabled: the computer tool becomes a CU call, not a ToolCall.
+        let mut fold = AnthropicStreamFold::new(true, Vec::new());
+        streaming::test_support::drive_transcript(&mut fold, transcript, 11).await;
+        let response = fold.finish();
+        assert!(response.tool_calls.is_empty());
+        assert_eq!(response.cu_calls.len(), 1);
+        assert_eq!(response.cu_calls[0].call_id, "toolu_cu");
+        assert!(matches!(
+            response.cu_calls[0].actions[..],
+            [crate::computer_use::CuAction::Screenshot]
+        ));
+
+        // CU-disabled: the same block is an ordinary tool call.
+        let mut fold = AnthropicStreamFold::new(false, Vec::new());
+        streaming::test_support::drive_transcript(&mut fold, transcript, 11).await;
+        let response = fold.finish();
+        assert!(response.cu_calls.is_empty());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "computer");
+    }
+
+    #[tokio::test]
+    async fn anthropic_fold_carries_rate_limit_windows_and_drops_garbage() {
+        let windows = vec![crate::types::SessionLimitWindow {
+            label: "req/min".to_string(),
+            used_pct: Some(3),
+            resets_at_epoch: None,
+            status: None,
+        }];
+        let transcript = concat!(
+            "data: not json at all\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        );
+        let mut fold = AnthropicStreamFold::new(false, windows);
+        streaming::test_support::drive_transcript(&mut fold, transcript, 64).await;
+        let response = fold.finish();
+        // The unparseable payload degrades to a drop; the stream keeps
+        // folding, and the pre-attached header windows survive.
+        assert_eq!(response.usage.completion_tokens, 5);
+        assert_eq!(response.usage.rate_limit_windows.len(), 1);
+        assert_eq!(response.usage.rate_limit_windows[0].label, "req/min");
     }
 }

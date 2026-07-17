@@ -609,236 +609,249 @@ impl ChatProvider for OpenAIProvider {
             )));
         }
 
-        // Parse SSE stream
-        let mut text_parts = Vec::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut cu_calls: Vec<crate::computer_use::CuToolCall> = Vec::new();
-        let mut raw_output_items: Vec<serde_json::Value> = Vec::new();
-        let mut usage = TokenUsage::default();
-        let mut reasoning_summary_parts = Vec::new();
-        let reasoning_content_parts: Vec<String> = Vec::new();
-        // Track in-progress function calls by index
-        let mut pending_tools: std::collections::HashMap<usize, ToolCall> =
-            std::collections::HashMap::new();
-        let mut line_buf = SseLineBuffer::new();
+        let mut fold = OpenAIStreamFold::new(self.cu_enabled);
+        streaming::run_sse_stream(ProviderHttpResponse::Direct(response), &mut fold, on_event)
+            .await
+            .map_err(streaming::StreamFailure::into_caller_error)?;
+        let response = fold.finish();
+        on_event(StreamEvent::Complete(response.clone()));
+        Ok(response)
+    }
+}
 
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CallerError::Provider(format!("Stream error: {}", e)))?;
-            line_buf.push_chunk(&chunk);
+/// The OpenAI Responses-API arm of the shared SSE driver: exactly the
+/// per-event mutable state the old hand-rolled loop carried (pending
+/// function calls by output index, raw echo-back items, usage from
+/// `response.completed`), with the mechanics living in
+/// `provider::streaming`.
+pub(crate) struct OpenAIStreamFold {
+    cu_enabled: bool,
+    json: streaming::EventJson,
+    text_parts: Vec<String>,
+    tool_calls: Vec<ToolCall>,
+    cu_calls: Vec<crate::computer_use::CuToolCall>,
+    raw_output_items: Vec<serde_json::Value>,
+    usage: TokenUsage,
+    reasoning_summary_parts: Vec<String>,
+    /// Never populated by the streaming vocabulary (full reasoning
+    /// content only arrives on the non-streaming path); kept so the final
+    /// assembly matches the old loop field-for-field.
+    reasoning_content_parts: Vec<String>,
+    /// In-progress function calls by output index.
+    pending_tools: std::collections::HashMap<usize, ToolCall>,
+}
 
-            while let Some(line) = line_buf.next_line() {
-                if line.is_empty() {
-                    continue;
+impl OpenAIStreamFold {
+    pub(crate) fn new(cu_enabled: bool) -> Self {
+        Self {
+            cu_enabled,
+            json: streaming::EventJson::new(),
+            text_parts: Vec::new(),
+            tool_calls: Vec::new(),
+            cu_calls: Vec::new(),
+            raw_output_items: Vec::new(),
+            usage: TokenUsage::default(),
+            reasoning_summary_parts: Vec::new(),
+            reasoning_content_parts: Vec::new(),
+            pending_tools: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Assemble the final response after the stream ends.
+    pub(crate) fn finish(mut self) -> ChatResponse {
+        // Flush any remaining pending tool calls
+        let mut remaining_indices: Vec<usize> = self.pending_tools.keys().copied().collect();
+        remaining_indices.sort();
+        for idx in remaining_indices {
+            if let Some(tc) = self.pending_tools.remove(&idx) {
+                self.tool_calls.push(tc);
+            }
+        }
+
+        let content = self.text_parts.join("");
+        let reasoning_summary = if self.reasoning_summary_parts.is_empty() {
+            None
+        } else {
+            Some(self.reasoning_summary_parts.join("\n"))
+        };
+        let reasoning_content = if self.reasoning_content_parts.is_empty() {
+            None
+        } else {
+            Some(self.reasoning_content_parts.join(""))
+        };
+        let raw_output = if self.raw_output_items.is_empty() {
+            None
+        } else {
+            Some(self.raw_output_items)
+        };
+
+        ChatResponse {
+            content,
+            usage: self.usage,
+            reasoning_summary,
+            reasoning_content,
+            tool_calls: self.tool_calls,
+            cu_calls: self.cu_calls,
+            raw_output,
+        }
+    }
+}
+
+impl streaming::SseFold for OpenAIStreamFold {
+    fn on_data(
+        &mut self,
+        data: &str,
+        on_event: &(dyn Fn(StreamEvent) + Send + Sync),
+    ) -> Result<(), CallerError> {
+        let Some(event) = self.json.parse(data) else {
+            return Ok(());
+        };
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match event_type {
+            "response.output_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                    self.text_parts.push(delta.to_string());
+                    on_event(StreamEvent::Delta(delta.to_string()));
                 }
-                if let Some(("data", data)) = parse_sse_line(&line) {
-                    if data == "[DONE]" {
-                        continue;
+            }
+            "response.output_item.added" => {
+                // Track raw output items
+                if let Some(item) = event.get("item") {
+                    self.raw_output_items.push(item.clone());
+                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    if item_type == "function_call" {
+                        let idx = event
+                            .get("output_index")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let id = item
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.pending_tools.insert(
+                            idx,
+                            ToolCall {
+                                id,
+                                call_id,
+                                name,
+                                arguments: String::new(),
+                            },
+                        );
                     }
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        match event_type {
-                            "response.output_text.delta" => {
-                                if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                                    text_parts.push(delta.to_string());
-                                    on_event(StreamEvent::Delta(delta.to_string()));
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let idx = event
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                    if let Some(tc) = self.pending_tools.get_mut(&idx) {
+                        tc.arguments.push_str(delta);
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let idx = event
+                    .get("output_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                if let Some(tc) = self.pending_tools.remove(&idx) {
+                    self.tool_calls.push(tc);
+                }
+            }
+            "response.output_item.done" => {
+                // Update raw output with final item
+                if let Some(item) = event.get("item") {
+                    let idx = event
+                        .get("output_index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    if idx < self.raw_output_items.len() {
+                        self.raw_output_items[idx] = item.clone();
+                    }
+                    let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    // Parse computer_call items
+                    if item_type == "computer_call" && self.cu_enabled {
+                        if let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) {
+                            let actions = item
+                                .get("actions")
+                                .and_then(|a| a.as_array())
+                                .map(|arr| {
+                                    arr.iter().filter_map(parse_openai_cu_action).collect()
+                                })
+                                .unwrap_or_default();
+                            let safety = item
+                                .get("pending_safety_checks")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            self.cu_calls.push(crate::computer_use::CuToolCall {
+                                call_id: call_id.to_string(),
+                                actions,
+                                metadata: crate::computer_use::CuCallMetadata {
+                                    pending_safety_checks: safety,
+                                    ..Default::default()
+                                },
+                            });
+                        }
+                    }
+                    // Extract reasoning summary
+                    if item_type == "reasoning" {
+                        if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+                            for s in summary {
+                                if let Some(text) = s.get("text").and_then(|t| t.as_str()) {
+                                    self.reasoning_summary_parts.push(text.to_string());
                                 }
                             }
-                            "response.output_item.added" => {
-                                // Track raw output items
-                                if let Some(item) = event.get("item") {
-                                    raw_output_items.push(item.clone());
-                                    let item_type =
-                                        item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                    if item_type == "function_call" {
-                                        let idx = event
-                                            .get("output_index")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0)
-                                            as usize;
-                                        let id = item
-                                            .get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let call_id = item
-                                            .get("call_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let name = item
-                                            .get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        pending_tools.insert(
-                                            idx,
-                                            ToolCall {
-                                                id,
-                                                call_id,
-                                                name,
-                                                arguments: String::new(),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            "response.function_call_arguments.delta" => {
-                                let idx = event
-                                    .get("output_index")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    as usize;
-                                if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                                    if let Some(tc) = pending_tools.get_mut(&idx) {
-                                        tc.arguments.push_str(delta);
-                                    }
-                                }
-                            }
-                            "response.function_call_arguments.done" => {
-                                let idx = event
-                                    .get("output_index")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    as usize;
-                                if let Some(tc) = pending_tools.remove(&idx) {
-                                    tool_calls.push(tc);
-                                }
-                            }
-                            "response.output_item.done" => {
-                                // Update raw output with final item
-                                if let Some(item) = event.get("item") {
-                                    let idx = event
-                                        .get("output_index")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0)
-                                        as usize;
-                                    if idx < raw_output_items.len() {
-                                        raw_output_items[idx] = item.clone();
-                                    }
-                                    let item_type =
-                                        item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                                    // Parse computer_call items
-                                    if item_type == "computer_call" && self.cu_enabled {
-                                        if let Some(call_id) =
-                                            item.get("call_id").and_then(|v| v.as_str())
-                                        {
-                                            let actions = item
-                                                .get("actions")
-                                                .and_then(|a| a.as_array())
-                                                .map(|arr| {
-                                                    arr.iter()
-                                                        .filter_map(parse_openai_cu_action)
-                                                        .collect()
-                                                })
-                                                .unwrap_or_default();
-                                            let safety = item
-                                                .get("pending_safety_checks")
-                                                .and_then(|v| v.as_array())
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            cu_calls.push(crate::computer_use::CuToolCall {
-                                                call_id: call_id.to_string(),
-                                                actions,
-                                                metadata: crate::computer_use::CuCallMetadata {
-                                                    pending_safety_checks: safety,
-                                                    ..Default::default()
-                                                },
-                                            });
-                                        }
-                                    }
-                                    // Extract reasoning summary
-                                    if item_type == "reasoning" {
-                                        if let Some(summary) =
-                                            item.get("summary").and_then(|s| s.as_array())
-                                        {
-                                            for s in summary {
-                                                if let Some(text) =
-                                                    s.get("text").and_then(|t| t.as_str())
-                                                {
-                                                    reasoning_summary_parts.push(text.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "response.completed" => {
-                                if let Some(resp) = event.get("response") {
-                                    if let Some(u) = resp.get("usage") {
-                                        usage.prompt_tokens = u
-                                            .get("input_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        usage.completion_tokens = u
-                                            .get("output_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        usage.total_tokens = u
-                                            .get("total_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(
-                                                usage.prompt_tokens + usage.completion_tokens,
-                                            );
-                                        usage.cached_tokens = u
-                                            .get("input_tokens_details")
-                                            .and_then(|d| d.get("cached_tokens"))
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        usage.cache_creation_tokens = u
-                                            .get("input_tokens_details")
-                                            .and_then(|d| d.get("cache_write_tokens"))
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        usage.cache_ttl_seconds =
-                                            (usage.cache_creation_tokens > 0).then_some(30 * 60);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
             }
-        }
-
-        // Flush any remaining pending tool calls
-        let mut remaining_indices: Vec<usize> = pending_tools.keys().copied().collect();
-        remaining_indices.sort();
-        for idx in remaining_indices {
-            if let Some(tc) = pending_tools.remove(&idx) {
-                tool_calls.push(tc);
+            "response.completed" => {
+                if let Some(resp) = event.get("response") {
+                    if let Some(u) = resp.get("usage") {
+                        self.usage.prompt_tokens = u
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.usage.completion_tokens = u
+                            .get("output_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.usage.total_tokens = u
+                            .get("total_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(self.usage.prompt_tokens + self.usage.completion_tokens);
+                        self.usage.cached_tokens = u
+                            .get("input_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.usage.cache_creation_tokens = u
+                            .get("input_tokens_details")
+                            .and_then(|d| d.get("cache_write_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        self.usage.cache_ttl_seconds =
+                            (self.usage.cache_creation_tokens > 0).then_some(30 * 60);
+                    }
+                }
             }
+            _ => {}
         }
-
-        let content = text_parts.join("");
-        let reasoning_summary = if reasoning_summary_parts.is_empty() {
-            None
-        } else {
-            Some(reasoning_summary_parts.join("\n"))
-        };
-        let reasoning_content = if reasoning_content_parts.is_empty() {
-            None
-        } else {
-            Some(reasoning_content_parts.join(""))
-        };
-        let raw_output = if raw_output_items.is_empty() {
-            None
-        } else {
-            Some(raw_output_items)
-        };
-
-        let response = ChatResponse {
-            content,
-            usage,
-            reasoning_summary,
-            reasoning_content,
-            tool_calls,
-            cu_calls,
-            raw_output,
-        };
-        on_event(StreamEvent::Complete(response.clone()));
-        Ok(response)
+        Ok(())
     }
 }
 
@@ -1395,5 +1408,116 @@ mod tests {
         // Should have only the function_call_output, no user image message
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"].as_str(), Some("function_call_output"));
+    }
+
+    // --- Stream fold (the OpenAI arm of the shared SSE driver) ---
+
+    /// A realistic Responses-API SSE transcript: a function call assembled
+    /// from argument deltas, split text deltas (multibyte content), the
+    /// done-event overwrite of the raw echo-back item, a reasoning
+    /// summary, usage in `response.completed`, and the trailing `[DONE]`.
+    const OPENAI_SSE_TRANSCRIPT: &str = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"exec_command\",\"arguments\":\"\"}}\n",
+        "\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"command\\\":\"}\n",
+        "\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"ls\\\"}\"}\n",
+        "\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0}\n",
+        "\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"message\"}}\n",
+        "\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi \"}\n",
+        "\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"🦀\"}\n",
+        "\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"exec_command\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"status\":\"completed\"}}\n",
+        "\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thought about it\"}]}}\n",
+        "\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":25,\"total_tokens\":125,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":10}}}}\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
+
+    #[tokio::test]
+    async fn openai_fold_assembles_tools_text_raw_output_and_usage() {
+        let mut fold = OpenAIStreamFold::new(false);
+        let deltas =
+            streaming::test_support::drive_transcript(&mut fold, OPENAI_SSE_TRANSCRIPT, 7).await;
+        assert_eq!(deltas, vec!["Hi ", "🦀"]);
+
+        let response = fold.finish();
+        assert_eq!(response.content, "Hi 🦀");
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "fc_1");
+        assert_eq!(response.tool_calls[0].call_id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "exec_command");
+        assert_eq!(response.tool_calls[0].arguments, "{\"command\":\"ls\"}");
+
+        // Raw echo-back items: the done event replaced index 0 with the
+        // final item; the out-of-range done (index 2) was ignored but its
+        // reasoning summary still extracted.
+        let raw = response.raw_output.as_ref().unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[0]["status"].as_str(), Some("completed"));
+        assert_eq!(raw[1]["type"].as_str(), Some("message"));
+        assert_eq!(response.reasoning_summary.as_deref(), Some("thought about it"));
+        assert_eq!(response.reasoning_content, None);
+
+        assert_eq!(response.usage.prompt_tokens, 100);
+        assert_eq!(response.usage.completion_tokens, 25);
+        assert_eq!(response.usage.total_tokens, 125);
+        assert_eq!(response.usage.cached_tokens, 80);
+        assert_eq!(response.usage.cache_creation_tokens, 10);
+        assert_eq!(response.usage.cache_ttl_seconds, Some(1800));
+    }
+
+    #[tokio::test]
+    async fn openai_fold_flushes_pending_tools_in_index_order() {
+        // Calls whose arguments.done never arrives flush at finish,
+        // ordered by output index — exactly the old loop's tail flush.
+        let transcript = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"second\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a\",\"call_id\":\"call_a\",\"name\":\"first\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n",
+        );
+        let mut fold = OpenAIStreamFold::new(false);
+        streaming::test_support::drive_transcript(&mut fold, transcript, 64).await;
+        let response = fold.finish();
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].name, "first");
+        assert_eq!(response.tool_calls[0].arguments, "{}");
+        assert_eq!(response.tool_calls[1].name, "second");
+    }
+
+    #[tokio::test]
+    async fn openai_fold_routes_computer_calls_when_cu_enabled() {
+        let transcript = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"computer_call\",\"call_id\":\"cu_1\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"computer_call\",\"call_id\":\"cu_1\",\"actions\":[{\"type\":\"click\",\"x\":10,\"y\":20,\"button\":\"left\"}],\"pending_safety_checks\":[{\"id\":\"sc_1\"}]}}\n\n",
+        );
+        let mut fold = OpenAIStreamFold::new(true);
+        streaming::test_support::drive_transcript(&mut fold, transcript, 32).await;
+        let response = fold.finish();
+        assert_eq!(response.cu_calls.len(), 1);
+        assert_eq!(response.cu_calls[0].call_id, "cu_1");
+        assert!(matches!(
+            response.cu_calls[0].actions[..],
+            [crate::computer_use::CuAction::Click { x: 10, y: 20, .. }]
+        ));
+        assert_eq!(
+            response.cu_calls[0].metadata.pending_safety_checks.len(),
+            1
+        );
+
+        // CU-disabled: the computer_call is ignored (no CU lane, no tool
+        // call), matching the old loop's guard.
+        let mut fold = OpenAIStreamFold::new(false);
+        streaming::test_support::drive_transcript(&mut fold, transcript, 32).await;
+        let response = fold.finish();
+        assert!(response.cu_calls.is_empty());
+        assert!(response.tool_calls.is_empty());
     }
 }
