@@ -83,13 +83,41 @@
     return 'No output yet';
   }
 
-  // CSS cannot see overflow: entries whose body actually clips get the
-  // fade tag; short ones keep their last line un-washed.
-  function peekTagClamped(clone) {
-    const content = clone.querySelector('.log-content');
-    if (content && content.scrollHeight > content.clientHeight + 1) {
-      clone.classList.add('ui2-peek-clamped');
+  // CSS cannot see overflow, and "the tail" is not simply :last-child —
+  // completion meta lines (Done / Round complete) trail the final
+  // message. Two-phase pass over every rendered clone: measure each one
+  // under the digest clamp, then open the LAST entry that actually
+  // clips (the newest clipping content is the conversation tail the
+  // user must be able to finish reading — the list scroller carries
+  // it), and fade-tag the earlier clippers, whose full text is one tap
+  // away in Activity. Re-run on every render: appends and in-place
+  // growth both move which entry is the tail.
+  function peekRetagClamped() {
+    for (const r of peekRendered) r.clone.classList.remove('ui2-peek-tail-open');
+    const measured = [];
+    for (const r of peekRendered) {
+      const content = r.clone.querySelector('.log-content');
+      measured.push([r.clone, !!content && content.scrollHeight > content.clientHeight + 1]);
     }
+    let tailOpen = null;
+    for (let i = measured.length - 1; i >= 0; i--) {
+      if (measured[i][1]) { tailOpen = measured[i][0]; break; }
+    }
+    for (const [clone, clips] of measured) {
+      const isTail = clone === tailOpen;
+      clone.classList.toggle('ui2-peek-tail-open', isTail);
+      clone.classList.toggle('ui2-peek-clamped', clips && !isTail);
+    }
+  }
+
+  // The container-level "more below" fade must never obscure the tail:
+  // it shows only while unread content sits below the viewport and goes
+  // away at scroll-bottom. Re-synced on scroll and after every render
+  // (content growth changes scrollHeight without firing scroll).
+  function peekSyncMoreBelow() {
+    if (!peekRoot || !peekList) return;
+    const more = peekList.scrollHeight - peekList.scrollTop - peekList.clientHeight > 1;
+    peekRoot.classList.toggle('ui2-peek-more-below', more);
   }
 
   function peekRenderTail() {
@@ -102,11 +130,11 @@
       empty.className = 'ui2-peek-empty';
       empty.textContent = peekEmptyText();
       peekList.replaceChildren(empty);
+      peekSyncMoreBelow();
       return;
     }
     const prev = new Map(peekRendered.map(r => [r.source, r]));
     const next = [];
-    const fresh = [];
     for (const source of sources) {
       const kept = prev.get(source);
       if (kept && !peekPendingDirty.has(source)) {
@@ -115,7 +143,6 @@
       }
       const clone = peekCloneEntry(source);
       next.push({ source, clone });
-      fresh.push(clone);
     }
     peekRendered = next;
     // Surgical reconcile instead of replaceChildren: kept nodes never
@@ -132,9 +159,10 @@
       if (r.clone === cursor) cursor = cursor.nextElementSibling;
       else peekList.insertBefore(r.clone, cursor);
     }
-    for (const clone of fresh) peekTagClamped(clone);
+    peekRetagClamped();
     peekPendingDirty.clear();
     if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    peekSyncMoreBelow();
   }
 
   function peekFlush() {
@@ -156,11 +184,16 @@
       const clone = peekCloneEntry(r.source);
       r.clone.replaceWith(clone);
       r.clone = clone;
-      peekTagClamped(clone);
       touched = true;
     }
     peekPendingDirty.clear();
-    if (touched && peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    if (touched) {
+      // Full re-tag, not per-clone: in-place growth (streaming output)
+      // can turn a short entry into the new tail clipper.
+      peekRetagClamped();
+      if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+      peekSyncMoreBelow();
+    }
   }
 
   function peekSchedule() {
@@ -241,6 +274,7 @@
       peekFlushTimer = 0;
     }
     if (peekList) peekList.replaceChildren();
+    peekRoot.classList.remove('ui2-peek-more-below');
   }
 
   // "Open in Activity" is a lie when the user is ALREADY on Activity —
@@ -406,6 +440,7 @@
     });
     peekList.addEventListener('scroll', () => {
       peekFollow = peekList.scrollTop + peekList.clientHeight >= peekList.scrollHeight - 24;
+      peekSyncMoreBelow();
     });
   }
 
