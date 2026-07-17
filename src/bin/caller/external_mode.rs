@@ -1231,6 +1231,29 @@ pub(crate) async fn run_external_agent_mode(
                                     .await;
                                     continue;
                                 }
+                                // An out-of-band /compact while a rate-limit
+                                // park is armed would fire into the very
+                                // limit the park waits out — defer it with
+                                // the calm reset line instead (twin arm in
+                                // run_modes' ThreadAction chain).
+                                if let Some(deferral) = compact_deferred_by_limit_park(
+                                    &action,
+                                    &limit_park,
+                                    tokio::time::Instant::now(),
+                                    crate::session_activity::epoch_seconds(),
+                                ) {
+                                    slog(&session_log, |l| l.info(&deferral));
+                                    bus.send(AppEvent::CodexThreadActionResult {
+                                        session_id: session_id
+                                            .clone()
+                                            .or_else(|| live_session_id.clone()),
+                                        action,
+                                        success: false,
+                                        message: deferral,
+                                        record_id: None,
+                                    });
+                                    continue;
+                                }
                                 let effect = handle_external_thread_action(
                                     &mut agent,
                                     action,
