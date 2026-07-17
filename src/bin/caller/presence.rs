@@ -1515,8 +1515,8 @@ mod tests {
 
         let event = AppEvent::AgentOutput {
             session_id: None,
-            stdout: "hello".to_string(),
-            stderr: String::new(),
+            stdout: "hello".into(),
+            stderr: "".into(),
             source: None,
             output_id: None,
             item_id: None,
@@ -1640,8 +1640,8 @@ mod tests {
         update_agent_state(
             &AppEvent::AgentOutput {
                 session_id: None,
-                stdout: "hello world".to_string(),
-                stderr: String::new(),
+                stdout: "hello world".into(),
+                stderr: "".into(),
                 source: None,
                 output_id: None,
                 item_id: None,

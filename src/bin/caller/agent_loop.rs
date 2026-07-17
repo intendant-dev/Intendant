@@ -2244,8 +2244,8 @@ pub(crate) async fn run_agent_loop(
 
             bus.send(AppEvent::AgentOutput {
                 session_id: local_session_id.clone(),
-                stdout: output.stdout.clone(),
-                stderr: output.stderr.clone(),
+                stdout: output.stdout.as_str().into(),
+                stderr: output.stderr.as_str().into(),
                 source: None,
                 output_id: Some(output_id),
                 item_id: None,
@@ -2790,8 +2790,8 @@ Proceed with explicit assumptions and continue without additional questions."
 
             bus.send(AppEvent::AgentOutput {
                 session_id: local_session_id.clone(),
-                stdout: output.stdout.clone(),
-                stderr: output.stderr.clone(),
+                stdout: output.stdout.as_str().into(),
+                stderr: output.stderr.as_str().into(),
                 source: None,
                 output_id: Some(output_id),
                 item_id: None,

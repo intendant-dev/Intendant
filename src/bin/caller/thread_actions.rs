@@ -3052,8 +3052,8 @@ pub(crate) fn emit_external_tool_output(
     });
     config.bus.send(AppEvent::AgentOutput {
         session_id: session_id.map(str::to_string),
-        stdout,
-        stderr: String::new(),
+        stdout: stdout.into(),
+        stderr: "".into(),
         source: config.agent_source.clone(),
         output_id: Some(output_id),
         item_id: item_id.map(str::to_string),
