@@ -71,7 +71,6 @@ passkey-auth = "0.1.3"
 # store location, and by tests elsewhere as a dev-dep.
 tempfile = "3"
 async-trait = "0.1"
-tokio-stream = "0.1"
 futures-util = "0.3"
 dirs = "6"
 # PATHEXT-aware executable resolution. Used by `platform::spawn_command` to
@@ -129,7 +128,6 @@ libc = "0.2"
 socket2 = "0.6"
 rtc = { version = "=0.9.1" }
 bytes = "1"
-agent-client-protocol-schema = "0.11.5"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Gzip for the web gateway's embedded static assets (app.html, WASM, JS).
 # Default features = the pure-Rust miniz_oxide backend — no C, consistent
@@ -166,8 +164,6 @@ time = "0.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 ashpd = { version = "0.11", features = ["tokio"] }
-pipewire = "0.8"
-x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
 # Pure-Rust AT-SPI2 (read_screen element trees on X11 + Wayland). Pinned to
 # the 0.28+ line so it shares ashpd 0.11's zbus 5.x — older atspi forks in a
 # second zbus stack.
@@ -178,31 +174,11 @@ atspi = { version = "0.30", features = ["tokio"] }
 # pipeline — macos.rs there is its only user in the workspace.)
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
-shiguredo_video_toolbox = "2026.1"
 accessibility-sys = "0.2"
-
-# Native dep that has no Windows backend yet (Tier-0 Windows port defers the
-# VP8/libvpx encoder). Gated to non-Windows so the MSVC target doesn't try to
-# build the libvpx FFI crate (`env-libvpx-sys` needs a C toolchain + the vpx
-# headers). The VP8 code path is itself cfg'd off Windows so nothing
-# references these symbols there.
-#
-# (The `intendant lan` cert subsystem used to live here too, via OpenSSL; it
-# is now pure-Rust — rcgen + p12-keystore — and moved to `[dependencies]`.)
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-env-libvpx-sys = { version = "5.1", features = ["generate"] }
 
 [target.'cfg(windows)'.dependencies]
 # (windows-sys moved to crates/intendant-platform with platform.rs, its only
 # user in this package.)
-# Windows clipboard backend (display/clipboard.rs). Wraps the Win32 clipboard
-# API (clipboard-win) and provides RGBA image get/set via its default
-# `image-data` feature. That feature pulls in `image` (0.25, png+bmp) and the
-# Win32_Graphics_Gdi surface of windows-sys, both of which unify with our
-# existing copies — no duplicate crate. The objc2/core-graphics deps named by
-# `image-data` are macOS-target-gated in arboard, so they don't reach the MSVC
-# build. Windows-only: the macOS/Linux arms shell out to pbcopy/wl-copy/xclip.
-arboard = "3"
 # The richer `windows` crate (COM wrappers, RAII interface handles) powers the
 # Tier-1 display backend (`display/windows.rs`): DXGI Desktop Duplication for
 # capture, Direct3D 11 for the staging-texture copy, GDI/WindowsAndMessaging

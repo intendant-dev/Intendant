@@ -12,7 +12,6 @@ tokio = { version = "1.0", features = ["process", "sync", "io-util", "macros", "
 # PATHEXT-aware executable resolution for `platform::spawn_command` (npm
 # `.cmd`/`.bat` shims on Windows, which CreateProcess does not resolve).
 which = "8"
-dirs = "6"
 
 [dev-dependencies]
 # platform's spawn/lock tests write into temp dirs.
