@@ -371,7 +371,7 @@ without changing that refusal or the Connect account's `role:none` posture.
 | `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
-| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
+| `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Custom exact-name routes additionally prove possession of their publicly trusted certificate key. Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
 | `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
 | `hosted_control_enabled` | bool | `false` | Enable the daemon-local hosted lease doorbell and exact lease-proof/ticket carve on fleet/relay ingress. Restart-only; deliberately has no environment-variable override |
 | `custom_domain.enabled` | bool | `false` | Enable the separate user-owned-name lane. Restart-only; no environment-variable override |

@@ -459,6 +459,18 @@ pub fn install_custom_domain_certificate(
     cert_chain_pem: &str,
     key_pem: &str,
 ) -> Result<(), String> {
+    let certified_key = checked_custom_domain_certificate(cert_chain_pem, key_pem)?;
+    fleet_sni_resolver().set_custom(
+        name.trim().trim_end_matches('.').to_ascii_lowercase(),
+        certified_key,
+    );
+    Ok(())
+}
+
+fn checked_custom_domain_certificate(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
     use rustls::pki_types::pem::PemObject;
     let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
@@ -469,11 +481,14 @@ pub fn install_custom_domain_certificate(
     }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .map_err(|e| format!("parse custom-domain key: {e}"))?;
-    fleet_sni_resolver().set_custom(
-        name.trim().trim_end_matches('.').to_ascii_lowercase(),
-        checked_certified_key(cert_chain, key, "custom-domain")?,
-    );
-    Ok(())
+    checked_certified_key(cert_chain, key, "custom-domain")
+}
+
+pub(crate) fn validate_custom_domain_certificate_key_pair(
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    checked_custom_domain_certificate(cert_chain_pem, key_pem).map(|_| ())
 }
 
 pub fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {

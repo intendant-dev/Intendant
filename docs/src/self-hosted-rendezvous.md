@@ -626,6 +626,8 @@ daemon's own HTTPS/mTLS root-capable origin.
 
 A daemon can additionally register an opt-in
 [user-owned custom name](./custom-domain.md). The registration is signed by
-the same daemon identity key; Connect uses it only as an exact SNI routing
-hint. Certificate issuance, WebAuthn, and bounded lease minting remain on the
-daemon.
+the same daemon identity key and carries a possession proof made with the
+matching publicly trusted certificate key. Connect verifies the certificate
+chain, singleton exact-name SAN, and proof signature before using it as an
+exact SNI routing hint. Certificate issuance, WebAuthn, and bounded lease
+minting remain on the daemon.

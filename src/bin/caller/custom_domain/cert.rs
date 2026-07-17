@@ -78,6 +78,22 @@ fn read_stored_certificate_pair(cert_dir: &Path) -> Result<Option<(String, Strin
     .map_err(|error| error.to_string())
 }
 
+pub(super) fn relay_certificate_material(
+    domain: &ValidatedCustomDomain,
+    cert_dir: &Path,
+) -> Result<(String, String), String> {
+    let (cert_pem, key_pem) = read_stored_certificate_pair(cert_dir)?
+        .ok_or_else(|| "custom-domain certificate is not installed yet".to_string())?;
+    require_exact_dns_name(&cert_pem, &domain.name)?;
+    let not_after = crate::fleet_cert::cert_not_after_unix_ms(&cert_pem)
+        .ok_or_else(|| "custom-domain certificate has no usable expiry".to_string())?;
+    if not_after <= now_unix_ms() {
+        return Err("custom-domain certificate is expired".to_string());
+    }
+    crate::web_tls::validate_custom_domain_certificate_key_pair(&cert_pem, &key_pem)?;
+    Ok((cert_pem, key_pem))
+}
+
 pub(super) fn spawn(
     domain: ValidatedCustomDomain,
     dns: Option<CustomDomainDnsConfig>,
@@ -114,6 +130,15 @@ async fn ensure_certificate(
     cert_dir: &Path,
     status: &Arc<RwLock<CertificateStatus>>,
 ) -> Result<(), String> {
+    // A prior crash/cancellation may have left the exact DNS-01 value live.
+    // Clear its durable journal before account work or a new order so retries
+    // never stack stale authority records.
+    super::dns::retry_pending_challenge(cert_dir).await?;
+    if crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name)? {
+        return Err(
+            "custom-domain name overlaps a service-controlled fleet name or zone".to_string(),
+        );
+    }
     let account = crate::fleet_cert::acme_account_in(cert_dir).await?;
     let account_uri = crate::fleet_cert::acme_account_uri_in(cert_dir)?
         .ok_or_else(|| "ACME account was created without an account URI".to_string())?;
@@ -157,7 +182,6 @@ async fn request_certificate(
         .await
         .map_err(|error| format!("custom-domain ACME new order: {error}"))?;
 
-    let mut challenge_handle = None;
     let authorization_result: Result<(), String> = async {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
@@ -176,8 +200,7 @@ async fn request_certificate(
                 .challenge(instant_acme::ChallengeType::Dns01)
                 .ok_or_else(|| "custom-domain ACME order offers no dns-01 challenge".to_string())?;
             let value = challenge.key_authorization().dns_value();
-            let handle = super::dns::set_challenge(dns_config, &domain.name, &value).await?;
-            challenge_handle = Some(handle);
+            super::dns::set_challenge_in(dns_config, &domain.name, &value, cert_dir).await?;
             let delay = super::dns::propagation_delay_secs(dns_config);
             if delay > 0 {
                 tokio::time::sleep(Duration::from_secs(delay)).await;
@@ -200,10 +223,13 @@ async fn request_certificate(
     }
     .await;
 
-    if let Some(handle) = challenge_handle {
-        if let Err(error) = super::dns::clear_challenge(handle).await {
-            eprintln!("[custom-domain] DNS-01 cleanup (best-effort): {error}");
-        }
+    if let Err(cleanup_error) = super::dns::retry_pending_challenge(cert_dir).await {
+        return Err(match authorization_result {
+            Ok(()) => format!("custom-domain DNS-01 cleanup remains pending: {cleanup_error}"),
+            Err(authorization_error) => format!(
+                "{authorization_error}; custom-domain DNS-01 cleanup remains pending: {cleanup_error}"
+            ),
+        });
     }
     authorization_result?;
 
@@ -218,8 +244,15 @@ async fn request_certificate(
     require_exact_dns_name(&cert_chain_pem, &domain.name)?;
     let not_after = crate::fleet_cert::cert_not_after_unix_ms(&cert_chain_pem)
         .ok_or_else(|| "custom-domain certificate has no usable expiry".to_string())?;
-
     crate::access::authority_store::with_lock(cert_dir, || {
+        if crate::fleet_cert::is_service_controlled_name_in(cert_dir, &domain.name)
+            .map_err(crate::access::AccessError)?
+        {
+            return Err(crate::access::AccessError(
+                "custom-domain name became service-controlled while issuance was running"
+                    .to_string(),
+            ));
+        }
         crate::access::authority_store::atomic_write_private_locked(
             &cert_dir.join(KEY_FILE),
             private_key_pem.as_bytes(),

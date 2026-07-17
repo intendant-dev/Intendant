@@ -1632,8 +1632,19 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // mutable and cannot establish the stronger direct-mTLS
                     // ceremony.
                     let tls_server_name = tls_stream.get_ref().1.server_name();
-                    tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
-                    tls_custom_domain = crate::web_tls::custom_domain_server_name(tls_server_name);
+                    let selected_custom =
+                        crate::web_tls::custom_domain_server_name(tls_server_name);
+                    if selected_custom.is_some() && !custom_domain.enabled() {
+                        // A name configured as custom can become known to lie
+                        // in a service fleet zone after this process starts.
+                        // Reclassify it at the TLS boundary immediately: it is
+                        // discovery-only, never an owner-name control lane.
+                        tls_fleet_origin = true;
+                        tls_custom_domain = None;
+                    } else {
+                        tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
+                        tls_custom_domain = selected_custom;
+                    }
                     let peer_certs = tls_stream
                         .get_ref()
                         .1

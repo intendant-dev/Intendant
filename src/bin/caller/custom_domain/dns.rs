@@ -4,7 +4,8 @@ use hickory_proto::op::{update_message, ResponseCode};
 use hickory_proto::rr::rdata::{tsig::TsigAlgorithm, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordSet, TSigner};
 use hickory_proto::serialize::binary::BinEncodable as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -14,30 +15,41 @@ const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 const DNS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOUDFLARE_RESPONSE_MAX_BYTES: usize = 256 * 1024;
 const RFC2136_RESPONSE_MAX_BYTES: usize = 65_535;
+const PENDING_CHALLENGE_FILE: &str = "custom-domain-dns-challenge.json";
+const PENDING_CHALLENGE_SCHEMA_VERSION: u32 = 1;
+const PENDING_CHALLENGE_MAX_BYTES: u64 = 64 * 1024;
+const PENDING_CHALLENGE_RETRY_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
-pub(crate) enum ChallengeHandle {
-    Cloudflare {
-        zone_id: String,
-        record_id: String,
-        token: String,
-    },
-    Rfc2136 {
-        server: String,
-        zone: String,
-        key_name: String,
-        key: Vec<u8>,
-        record_name: String,
-        value: String,
-        ttl_secs: u32,
-    },
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingChallenge {
+    schema_version: u32,
+    id: String,
+    domain: String,
+    record_name: String,
+    value: String,
+    provider: CustomDomainDnsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cloudflare_record_id: Option<String>,
 }
 
-pub(crate) async fn set_challenge(
+pub(crate) async fn set_challenge_in(
     config: &CustomDomainDnsConfig,
     domain: &str,
     value: &str,
-) -> Result<ChallengeHandle, String> {
+    cert_dir: &Path,
+) -> Result<(), String> {
     let record_name = format!("_acme-challenge.{domain}");
+    let pending = PendingChallenge {
+        schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        domain: domain.to_string(),
+        record_name: record_name.clone(),
+        value: value.to_string(),
+        provider: config.clone(),
+        cloudflare_record_id: None,
+    };
+    begin_pending_challenge(cert_dir, &pending)?;
     match config {
         CustomDomainDnsConfig::Cloudflare {
             zone_id, token_env, ..
@@ -49,11 +61,7 @@ pub(crate) async fn set_challenge(
                 "_API_TOKEN",
             )?;
             let record_id = cloudflare_create(zone_id.trim(), &token, &record_name, value).await?;
-            Ok(ChallengeHandle::Cloudflare {
-                zone_id: zone_id.trim().to_string(),
-                record_id,
-                token,
-            })
+            record_cloudflare_id(cert_dir, &pending.id, record_id)
         }
         CustomDomainDnsConfig::Rfc2136 {
             server,
@@ -81,48 +89,213 @@ pub(crate) async fn set_challenge(
                 false,
             )
             .await?;
-            Ok(ChallengeHandle::Rfc2136 {
-                server: server.trim().to_string(),
-                zone: zone.trim().to_string(),
-                key_name: key_name.trim().to_string(),
-                key,
-                record_name,
-                value: value.to_string(),
-                ttl_secs: *ttl_secs,
-            })
+            Ok(())
         }
     }
 }
 
-pub(crate) async fn clear_challenge(handle: ChallengeHandle) -> Result<(), String> {
-    match handle {
-        ChallengeHandle::Cloudflare {
-            zone_id,
-            record_id,
-            token,
-        } => cloudflare_delete(&zone_id, &record_id, &token).await,
-        ChallengeHandle::Rfc2136 {
+pub(crate) async fn retry_pending_challenge(cert_dir: &Path) -> Result<(), String> {
+    let Some(pending) = load_pending_challenge(cert_dir)? else {
+        return Ok(());
+    };
+    match &pending.provider {
+        CustomDomainDnsConfig::Cloudflare {
+            zone_id, token_env, ..
+        } => {
+            let token = provider_secret(
+                "dns:cloudflare",
+                token_env.as_deref(),
+                "CLOUDFLARE_API_TOKEN",
+                "_API_TOKEN",
+            )?;
+            if let Some(record_id) = pending.cloudflare_record_id.as_deref() {
+                cloudflare_delete(zone_id.trim(), record_id, &token).await?;
+            } else {
+                let record_ids = cloudflare_find_exact(
+                    zone_id.trim(),
+                    &token,
+                    &pending.record_name,
+                    &pending.value,
+                )
+                .await?;
+                for record_id in record_ids {
+                    cloudflare_delete(zone_id.trim(), &record_id, &token).await?;
+                }
+            }
+        }
+        CustomDomainDnsConfig::Rfc2136 {
             server,
             zone,
             key_name,
-            key,
-            record_name,
-            value,
+            secret_env,
             ttl_secs,
+            ..
         } => {
+            let secret = provider_secret(
+                "dns:rfc2136",
+                secret_env.as_deref(),
+                "INTENDANT_RFC2136_TSIG_SECRET",
+                "_TSIG_SECRET",
+            )?;
+            let key = decode_tsig_secret(&secret)?;
             rfc2136_update(
-                &server,
-                &zone,
-                &key_name,
+                server.trim(),
+                zone.trim(),
+                key_name.trim(),
                 &key,
-                &record_name,
-                &value,
-                ttl_secs,
+                &pending.record_name,
+                &pending.value,
+                *ttl_secs,
                 true,
             )
-            .await
+            .await?;
         }
     }
+    remove_pending_challenge(cert_dir, &pending.id)
+}
+
+pub(crate) fn spawn_cleanup_loop(cert_dir: PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = retry_pending_challenge(&cert_dir).await {
+                eprintln!("[custom-domain] pending DNS-01 cleanup: {error}");
+            }
+            tokio::time::sleep(PENDING_CHALLENGE_RETRY_INTERVAL).await;
+        }
+    });
+}
+
+fn pending_challenge_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(PENDING_CHALLENGE_FILE)
+}
+
+fn load_pending_challenge_locked(cert_dir: &Path) -> Result<Option<PendingChallenge>, String> {
+    use std::io::Read as _;
+
+    let path = pending_challenge_path(cert_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(PENDING_CHALLENGE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > PENDING_CHALLENGE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the pending DNS challenge size limit",
+            path.display()
+        ));
+    }
+    let pending: PendingChallenge = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if pending.schema_version != PENDING_CHALLENGE_SCHEMA_VERSION
+        || pending.id.is_empty()
+        || pending.id.len() > 64
+        || pending.domain.is_empty()
+        || pending.domain.len() > 253
+        || pending.record_name != format!("_acme-challenge.{}", pending.domain)
+        || pending.value.is_empty()
+        || pending.value.len() > 1024
+        || pending.value.chars().any(char::is_control)
+        || pending
+            .cloudflare_record_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        return Err(format!(
+            "{} contains invalid pending DNS challenge state",
+            path.display()
+        ));
+    }
+    Ok(Some(pending))
+}
+
+fn load_pending_challenge(cert_dir: &Path) -> Result<Option<PendingChallenge>, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        load_pending_challenge_locked(cert_dir).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn write_pending_challenge_locked(
+    cert_dir: &Path,
+    pending: &PendingChallenge,
+) -> crate::access::AccessResult<()> {
+    let mut bytes = serde_json::to_vec_pretty(pending).map_err(|error| {
+        crate::access::AccessError(format!("serialize pending DNS challenge: {error}"))
+    })?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > PENDING_CHALLENGE_MAX_BYTES {
+        return Err(crate::access::AccessError(
+            "pending DNS challenge exceeds its size limit".to_string(),
+        ));
+    }
+    crate::access::authority_store::atomic_write_private_locked(
+        &pending_challenge_path(cert_dir),
+        &bytes,
+    )
+}
+
+fn begin_pending_challenge(cert_dir: &Path, pending: &PendingChallenge) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        if load_pending_challenge_locked(cert_dir)
+            .map_err(crate::access::AccessError)?
+            .is_some()
+        {
+            return Err(crate::access::AccessError(
+                "a pending custom-domain DNS challenge must be cleaned up before another is created"
+                    .to_string(),
+            ));
+        }
+        write_pending_challenge_locked(cert_dir, pending)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn record_cloudflare_id(
+    cert_dir: &Path,
+    pending_id: &str,
+    record_id: String,
+) -> Result<(), String> {
+    if record_id.is_empty() || !record_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("Cloudflare DNS create returned an invalid record id".to_string());
+    }
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut pending = load_pending_challenge_locked(cert_dir)
+            .map_err(crate::access::AccessError)?
+            .ok_or_else(|| {
+                crate::access::AccessError(
+                    "pending DNS challenge disappeared before its record id was saved".to_string(),
+                )
+            })?;
+        if pending.id != pending_id {
+            return Err(crate::access::AccessError(
+                "pending DNS challenge changed before its record id was saved".to_string(),
+            ));
+        }
+        pending.cloudflare_record_id = Some(record_id);
+        write_pending_challenge_locked(cert_dir, &pending)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn remove_pending_challenge(cert_dir: &Path, pending_id: &str) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let Some(pending) =
+            load_pending_challenge_locked(cert_dir).map_err(crate::access::AccessError)?
+        else {
+            return Ok(());
+        };
+        if pending.id != pending_id {
+            return Err(crate::access::AccessError(
+                "pending DNS challenge changed during cleanup".to_string(),
+            ));
+        }
+        crate::access::authority_store::remove_file_locked(&pending_challenge_path(cert_dir))
+    })
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn propagation_delay_secs(config: &CustomDomainDnsConfig) -> u64 {
@@ -174,6 +347,8 @@ struct CloudflareEnvelope<T> {
     #[serde(default)]
     errors: Vec<CloudflareError>,
     result: Option<T>,
+    #[serde(default)]
+    result_info: Option<CloudflareResultInfo>,
 }
 
 #[derive(Deserialize)]
@@ -187,6 +362,18 @@ struct CloudflareError {
 #[derive(Deserialize)]
 struct CloudflareRecord {
     id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default, rename = "type")]
+    record_type: String,
+}
+
+#[derive(Deserialize)]
+struct CloudflareResultInfo {
+    #[serde(default)]
+    total_pages: u64,
 }
 
 async fn cloudflare_create(
@@ -239,6 +426,9 @@ async fn cloudflare_delete(zone_id: &str, record_id: &str, token: &str) -> Resul
         .map_err(|error| format!("Cloudflare DNS cleanup: {error}"))?;
     let status = response.status();
     let body = cloudflare_response_body(response, "cleanup response").await?;
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
     let envelope: CloudflareEnvelope<serde_json::Value> = serde_json::from_slice(&body)
         .map_err(|error| format!("parse Cloudflare DNS cleanup response ({status}): {error}"))?;
     if !status.is_success() || !envelope.success {
@@ -248,6 +438,61 @@ async fn cloudflare_delete(zone_id: &str, record_id: &str, token: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+async fn cloudflare_find_exact(
+    zone_id: &str,
+    token: &str,
+    name: &str,
+    value: &str,
+) -> Result<Vec<String>, String> {
+    if zone_id.is_empty() || !zone_id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("Cloudflare zone_id is invalid".to_string());
+    }
+    let response = cloudflare_client()?
+        .get(format!("{CLOUDFLARE_API_BASE}/zones/{zone_id}/dns_records"))
+        .bearer_auth(token)
+        .query(&[
+            ("type", "TXT"),
+            ("name", name),
+            ("per_page", "100"),
+            ("page", "1"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Cloudflare DNS cleanup lookup: {error}"))?;
+    let status = response.status();
+    let body = cloudflare_response_body(response, "cleanup lookup response").await?;
+    let envelope: CloudflareEnvelope<Vec<CloudflareRecord>> = serde_json::from_slice(&body)
+        .map_err(|error| format!("parse Cloudflare DNS cleanup lookup ({status}): {error}"))?;
+    if !status.is_success() || !envelope.success {
+        return Err(format!(
+            "Cloudflare DNS cleanup lookup failed ({status}): {}",
+            cloudflare_error_text(&envelope.errors)
+        ));
+    }
+    if envelope
+        .result_info
+        .as_ref()
+        .is_some_and(|info| info.total_pages > 1)
+    {
+        return Err(
+            "Cloudflare DNS cleanup lookup returned more than 100 exact-name records".to_string(),
+        );
+    }
+    Ok(envelope
+        .result
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| {
+            record.record_type == "TXT"
+                && record.name.trim_end_matches('.').eq_ignore_ascii_case(name)
+                && record.content == value
+                && !record.id.is_empty()
+                && record.id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(|record| record.id)
+        .collect())
 }
 
 fn cloudflare_client() -> Result<reqwest::Client, String> {
@@ -463,5 +708,53 @@ mod tests {
         let error = append_cloudflare_response_chunk(&mut body, &[3], "response").unwrap_err();
         assert!(error.contains("size cap"), "{error}");
         assert_eq!(body.len(), before, "the over-cap chunk is never retained");
+    }
+
+    #[test]
+    fn pending_challenge_journal_survives_until_exact_cleanup_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = PendingChallenge {
+            schema_version: PENDING_CHALLENGE_SCHEMA_VERSION,
+            id: "flow-one".to_string(),
+            domain: "box.example.test".to_string(),
+            record_name: "_acme-challenge.box.example.test".to_string(),
+            value: "challenge-value".to_string(),
+            provider: CustomDomainDnsConfig::Cloudflare {
+                zone_id: "abc123".to_string(),
+                token_env: Some("OWNER_DNS_API_TOKEN".to_string()),
+                propagation_delay_secs: 0,
+            },
+            cloudflare_record_id: None,
+        };
+        begin_pending_challenge(dir.path(), &pending).unwrap();
+        assert!(begin_pending_challenge(dir.path(), &pending)
+            .unwrap_err()
+            .contains("must be cleaned up"));
+        record_cloudflare_id(dir.path(), &pending.id, "record123".to_string()).unwrap();
+        let restored = load_pending_challenge(dir.path()).unwrap().unwrap();
+        assert_eq!(restored.cloudflare_record_id.as_deref(), Some("record123"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(pending_challenge_path(dir.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        remove_pending_challenge(dir.path(), &pending.id).unwrap();
+        assert!(load_pending_challenge(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_pending_challenge_never_decays_into_an_empty_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(pending_challenge_path(dir.path()), b"{").unwrap();
+        assert!(load_pending_challenge(dir.path())
+            .unwrap_err()
+            .contains("parse"));
     }
 }

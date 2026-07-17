@@ -30,10 +30,20 @@ box.example.com. 300 IN CNAME relay.intendant.dev.
 ```
 
 The daemon registers that exact SNI name over its daemon-identity-signed relay
-control channel. The relay routes an exact name only when one active daemon
-claims it. A conflicting live registration is rejected while the incumbent
-route remains active; fleet-label routing remains a separate compatibility
-path. Neither registration nor routing grants daemon authority.
+control channel and proves possession of the matching, publicly trusted
+singleton-SAN certificate key. The relay verifies the chain, exact name, and
+key signature before accepting the route; a daemon identity alone cannot claim
+another tenant's name. The relay routes an exact name only when one active
+daemon proves it. A conflicting live registration is rejected while the
+incumbent route remains active. During a rolling upgrade, a v1 poll may refresh
+fleet-label liveness but cannot erase a v2 exact-name route; an explicit empty
+v2 registration clears it. Neither registration nor routing grants daemon
+authority.
+
+The custom name must also remain outside every current or previously recorded
+service fleet zone. The daemon re-evaluates that separation whenever the route
+is used, so learning a later overlapping fleet zone disables the custom lane
+instead of reclassifying a service-controlled name as owner-controlled.
 
 ## Pin certificate issuance
 
@@ -60,9 +70,14 @@ CAA ceremony.
 
 The daemon reuses the same locally stored ACME account used by its certificate
 client. The DNS credential can add and remove only the exact `_acme-challenge`
-TXT value for the order. Store it as a daemon credential lease where possible;
-configuration names an environment-variable fallback but never embeds the
-secret.
+TXT value for the order. Before changing DNS, the daemon durably journals the
+provider, exact name, and exact value without storing the provider secret.
+Cleanup removes that journal only after the provider confirms the exact record
+is gone. Startup and every later certificate pass retry a surviving journal
+before creating another challenge, covering crashes, cancellation, and
+transient provider failures. Store the credential as a daemon credential lease
+where possible; configuration names an environment-variable fallback but
+never embeds the secret.
 
 Cloudflare requires a narrowly scoped token with DNS edit access to the named
 zone. Generic RFC2136 is also supported:
@@ -93,7 +108,10 @@ owner or enrolled direct-mTLS root dashboard creates a one-time enrollment
 invitation; the link opens the exact custom origin, where WebAuthn creates the
 credential. This split keeps both the owner authorization and the browser's
 rp_id check intact. Invitations expire after ten minutes and are consumed at
-ceremony start. Passkey records and counters stay in the daemon's owner-only
+ceremony start. Invitations, registration/authentication challenges, and the
+ceremony rate window are stored under the daemon's cross-process authority
+lock, so a relay request may move between service processes without duplicating
+or losing the flow. Passkey records and counters stay in the same owner-only
 authority store.
 
 Opening `https://box.example.com/` creates a non-extractable tab key. A

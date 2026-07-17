@@ -18,6 +18,9 @@ use crate::project::ValidatedCustomDomain;
 const STORE_FILE: &str = "custom-domain-passkeys.json";
 const STORE_SCHEMA_VERSION: u32 = 1;
 const STORE_MAX_BYTES: u64 = 1024 * 1024;
+const CEREMONY_STORE_FILE: &str = "custom-domain-passkey-ceremonies.json";
+const CEREMONY_STORE_SCHEMA_VERSION: u32 = 1;
+const CEREMONY_STORE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const FLOW_TTL_MS: u64 = 5 * 60 * 1000;
 const INVITE_TTL_MS: u64 = 10 * 60 * 1000;
 const MAX_PENDING_FLOWS: usize = 64;
@@ -114,6 +117,7 @@ struct PasskeyStore {
     passkeys: Vec<StoredPasskey>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingRegistration {
     label: String,
     user_id: Uuid,
@@ -121,11 +125,13 @@ struct PendingRegistration {
     expires_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingInvitation {
     label: String,
     expires_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingAuthentication {
     user_id: Uuid,
     state: AuthenticationState,
@@ -134,15 +140,23 @@ struct PendingAuthentication {
     expires_unix_ms: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CeremonyStore {
+    schema_version: u32,
+    name: String,
+    rp_id: String,
+    invitations: HashMap<String, PendingInvitation>,
+    registrations: HashMap<String, PendingRegistration>,
+    authentications: HashMap<String, PendingAuthentication>,
+    authentication_starts: VecDeque<u64>,
+}
+
 pub(crate) struct PasskeyRuntime {
     domain: ValidatedCustomDomain,
     cert_dir: PathBuf,
     webauthn: Webauthn,
     store: Mutex<PasskeyStore>,
-    invitations: Mutex<HashMap<String, PendingInvitation>>,
-    registrations: Mutex<HashMap<String, PendingRegistration>>,
-    authentications: Mutex<HashMap<String, PendingAuthentication>>,
-    authentication_starts: Mutex<VecDeque<u64>>,
     hosted: Arc<HostedControlRuntime>,
 }
 
@@ -164,6 +178,12 @@ impl PasskeyRuntime {
         hosted: Arc<HostedControlRuntime>,
     ) -> Result<Self, String> {
         let store = load_store(&cert_dir, &domain)?;
+        crate::access::authority_store::with_lock(&cert_dir, || {
+            load_ceremony_store_locked(&cert_dir, &domain)
+                .map(|_| ())
+                .map_err(crate::access::AccessError)
+        })
+        .map_err(|error| error.to_string())?;
         let webauthn = Webauthn::new(&domain.rp_id, "Intendant", &domain.origin)
             .require_user_verification(true)
             .authenticator_attachment(Attachment::Any)
@@ -173,10 +193,6 @@ impl PasskeyRuntime {
             cert_dir,
             webauthn,
             store: Mutex::new(store),
-            invitations: Mutex::new(HashMap::new()),
-            registrations: Mutex::new(HashMap::new()),
-            authentications: Mutex::new(HashMap::new()),
-            authentication_starts: Mutex::new(VecDeque::new()),
             hosted,
         })
     }
@@ -210,21 +226,19 @@ impl PasskeyRuntime {
         let token = Uuid::new_v4().simple().to_string();
         let now = now_unix_ms();
         let expires_unix_ms = now.saturating_add(INVITE_TTL_MS);
-        let mut invitations = self
-            .invitations
-            .lock()
-            .map_err(|_| "custom-domain enrollment invitation state is unavailable".to_string())?;
-        retain_live(&mut invitations, now, |invite| invite.expires_unix_ms);
-        if invitations.len() >= MAX_PENDING_FLOWS {
-            return Err("too many pending custom-domain enrollment invitations".to_string());
-        }
-        invitations.insert(
-            token.clone(),
-            PendingInvitation {
-                label,
-                expires_unix_ms,
-            },
-        );
+        self.mutate_ceremonies(|ceremonies| {
+            if ceremonies.invitations.len() >= MAX_PENDING_FLOWS {
+                return Err("too many pending custom-domain enrollment invitations".to_string());
+            }
+            ceremonies.invitations.insert(
+                token.clone(),
+                PendingInvitation {
+                    label,
+                    expires_unix_ms,
+                },
+            );
+            Ok(())
+        })?;
         Ok(EnrollmentInvite {
             ok: true,
             enrollment_url: format!("{}#passkey_enroll={token}", self.domain.origin),
@@ -241,12 +255,12 @@ impl PasskeyRuntime {
         if input.token.len() > 64 {
             return Err("passkey enrollment invitation is invalid".to_string());
         }
-        let invitation = self
-            .invitations
-            .lock()
-            .map_err(|_| "custom-domain enrollment invitation state is unavailable".to_string())?
-            .remove(input.token.trim())
-            .ok_or_else(|| "passkey enrollment invitation was not found".to_string())?;
+        let invitation = self.mutate_ceremonies(|ceremonies| {
+            ceremonies
+                .invitations
+                .remove(input.token.trim())
+                .ok_or_else(|| "passkey enrollment invitation was not found".to_string())
+        })?;
         if invitation.expires_unix_ms <= now_unix_ms() {
             return Err("passkey enrollment invitation expired".to_string());
         }
@@ -272,23 +286,21 @@ impl PasskeyRuntime {
         );
         let flow_id = Uuid::new_v4().to_string();
         let now = now_unix_ms();
-        let mut pending = self
-            .registrations
-            .lock()
-            .map_err(|_| "custom-domain registration state is unavailable".to_string())?;
-        retain_live(&mut pending, now, |flow| flow.expires_unix_ms);
-        if pending.len() >= MAX_PENDING_FLOWS {
-            return Err("too many pending custom-domain registration ceremonies".to_string());
-        }
-        pending.insert(
-            flow_id.clone(),
-            PendingRegistration {
-                label,
-                user_id,
-                state,
-                expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
-            },
-        );
+        self.mutate_ceremonies(|ceremonies| {
+            if ceremonies.registrations.len() >= MAX_PENDING_FLOWS {
+                return Err("too many pending custom-domain registration ceremonies".to_string());
+            }
+            ceremonies.registrations.insert(
+                flow_id.clone(),
+                PendingRegistration {
+                    label,
+                    user_id,
+                    state,
+                    expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
+                },
+            );
+            Ok(())
+        })?;
         Ok(CeremonyStart {
             ok: true,
             flow_id,
@@ -301,12 +313,12 @@ impl PasskeyRuntime {
         &self,
         input: RegistrationFinishInput,
     ) -> Result<PasskeyView, String> {
-        let pending = self
-            .registrations
-            .lock()
-            .map_err(|_| "custom-domain registration state is unavailable".to_string())?
-            .remove(input.flow_id.trim())
-            .ok_or_else(|| "passkey registration flow was not found".to_string())?;
+        let pending = self.mutate_ceremonies(|ceremonies| {
+            ceremonies
+                .registrations
+                .remove(input.flow_id.trim())
+                .ok_or_else(|| "passkey registration flow was not found".to_string())
+        })?;
         if pending.expires_unix_ms <= now_unix_ms() {
             return Err("passkey registration flow expired".to_string());
         }
@@ -354,21 +366,6 @@ impl PasskeyRuntime {
         self.require_origin(origin)?;
         validate_pending_request_shape(&input.request)?;
         let now = now_unix_ms();
-        {
-            let mut starts = self.authentication_starts.lock().map_err(|_| {
-                "custom-domain authentication rate state is unavailable".to_string()
-            })?;
-            while starts
-                .front()
-                .is_some_and(|started| now.saturating_sub(*started) >= AUTH_START_WINDOW_MS)
-            {
-                starts.pop_front();
-            }
-            if starts.len() >= AUTH_STARTS_PER_WINDOW {
-                return Err("custom-domain passkey ceremony rate limit reached".to_string());
-            }
-            starts.push_back(now);
-        }
         let (user_id, credentials) = self.with_fresh_store(|store| {
             if store.passkeys.is_empty() {
                 return Err("no passkey is registered for this custom domain".to_string());
@@ -386,24 +383,26 @@ impl PasskeyRuntime {
             .webauthn
             .start_authentication_with_creds_for_user(user_id.as_bytes(), &credentials);
         let flow_id = Uuid::new_v4().to_string();
-        let mut pending = self
-            .authentications
-            .lock()
-            .map_err(|_| "custom-domain authentication state is unavailable".to_string())?;
-        retain_live(&mut pending, now, |flow| flow.expires_unix_ms);
-        if pending.len() >= MAX_PENDING_FLOWS {
-            return Err("too many pending custom-domain authentication ceremonies".to_string());
-        }
-        pending.insert(
-            flow_id.clone(),
-            PendingAuthentication {
-                user_id,
-                state,
-                input: input.request,
-                source_bucket: source_bucket.map(str::to_string),
-                expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
-            },
-        );
+        self.mutate_ceremonies(|ceremonies| {
+            if ceremonies.authentication_starts.len() >= AUTH_STARTS_PER_WINDOW {
+                return Err("custom-domain passkey ceremony rate limit reached".to_string());
+            }
+            if ceremonies.authentications.len() >= MAX_PENDING_FLOWS {
+                return Err("too many pending custom-domain authentication ceremonies".to_string());
+            }
+            ceremonies.authentication_starts.push_back(now);
+            ceremonies.authentications.insert(
+                flow_id.clone(),
+                PendingAuthentication {
+                    user_id,
+                    state,
+                    input: input.request,
+                    source_bucket: source_bucket.map(str::to_string),
+                    expires_unix_ms: now.saturating_add(FLOW_TTL_MS),
+                },
+            );
+            Ok(())
+        })?;
         Ok(CeremonyStart {
             ok: true,
             flow_id,
@@ -418,12 +417,12 @@ impl PasskeyRuntime {
         origin: &str,
     ) -> Result<PasskeyLeaseResult, String> {
         self.require_origin(origin)?;
-        let mut pending = self
-            .authentications
-            .lock()
-            .map_err(|_| "custom-domain authentication state is unavailable".to_string())?
-            .remove(input.flow_id.trim())
-            .ok_or_else(|| "passkey authentication flow was not found".to_string())?;
+        let mut pending = self.mutate_ceremonies(|ceremonies| {
+            ceremonies
+                .authentications
+                .remove(input.flow_id.trim())
+                .ok_or_else(|| "passkey authentication flow was not found".to_string())
+        })?;
         if pending.expires_unix_ms <= now_unix_ms() {
             return Err("passkey authentication flow expired".to_string());
         }
@@ -537,6 +536,21 @@ impl PasskeyRuntime {
         .map_err(|error| error.to_string())
     }
 
+    fn mutate_ceremonies<T>(
+        &self,
+        update: impl FnOnce(&mut CeremonyStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        crate::access::authority_store::with_lock(&self.cert_dir, || {
+            let mut ceremonies = load_ceremony_store_locked(&self.cert_dir, &self.domain)
+                .map_err(crate::access::AccessError)?;
+            prune_ceremonies(&mut ceremonies, now_unix_ms());
+            let result = update(&mut ceremonies);
+            save_ceremony_store_locked(&self.cert_dir, &ceremonies)?;
+            result.map_err(crate::access::AccessError)
+        })
+        .map_err(|error| error.to_string())
+    }
+
     /// Order credential validation + lease issuance against revocation under
     /// the same process and cross-process authority lock. If issuance wins,
     /// revocation cannot return until that lease exists; if revocation wins,
@@ -582,12 +596,120 @@ fn now_unix_ms() -> u64 {
     crate::access::client_key::now_unix_ms().max(0) as u64
 }
 
-fn retain_live<T>(pending: &mut HashMap<String, T>, now: u64, expires: impl Fn(&T) -> u64) {
-    pending.retain(|_, flow| expires(flow) > now);
-}
-
 fn store_path(cert_dir: &Path) -> PathBuf {
     cert_dir.join(STORE_FILE)
+}
+
+fn ceremony_store_path(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(CEREMONY_STORE_FILE)
+}
+
+fn empty_ceremony_store(domain: &ValidatedCustomDomain) -> CeremonyStore {
+    CeremonyStore {
+        schema_version: CEREMONY_STORE_SCHEMA_VERSION,
+        name: domain.name.clone(),
+        rp_id: domain.rp_id.clone(),
+        invitations: HashMap::new(),
+        registrations: HashMap::new(),
+        authentications: HashMap::new(),
+        authentication_starts: VecDeque::new(),
+    }
+}
+
+fn prune_ceremonies(store: &mut CeremonyStore, now: u64) {
+    store
+        .invitations
+        .retain(|_, invite| invite.expires_unix_ms > now);
+    store
+        .registrations
+        .retain(|_, flow| flow.expires_unix_ms > now);
+    store
+        .authentications
+        .retain(|_, flow| flow.expires_unix_ms > now);
+    while store
+        .authentication_starts
+        .front()
+        .is_some_and(|started| now.saturating_sub(*started) >= AUTH_START_WINDOW_MS)
+    {
+        store.authentication_starts.pop_front();
+    }
+}
+
+fn load_ceremony_store_locked(
+    cert_dir: &Path,
+    domain: &ValidatedCustomDomain,
+) -> Result<CeremonyStore, String> {
+    let path = ceremony_store_path(cert_dir);
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(empty_ceremony_store(domain));
+        }
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if metadata.len() > CEREMONY_STORE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the passkey-ceremony store size cap",
+            path.display()
+        ));
+    }
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let store: CeremonyStore = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if store.schema_version != CEREMONY_STORE_SCHEMA_VERSION {
+        return Err(format!(
+            "{} uses unsupported schema version {}",
+            path.display(),
+            store.schema_version
+        ));
+    }
+    if store.name != domain.name || store.rp_id != domain.rp_id {
+        return Err(
+            "stored passkey ceremonies belong to a different custom-domain name or rp_id"
+                .to_string(),
+        );
+    }
+    if store.invitations.len() > MAX_PENDING_FLOWS
+        || store.registrations.len() > MAX_PENDING_FLOWS
+        || store.authentications.len() > MAX_PENDING_FLOWS
+        || store.authentication_starts.len() > AUTH_STARTS_PER_WINDOW
+        || store
+            .invitations
+            .keys()
+            .chain(store.registrations.keys())
+            .chain(store.authentications.keys())
+            .any(|key| key.is_empty() || key.len() > 64)
+        || store.authentications.values().any(|flow| {
+            flow.source_bucket
+                .as_ref()
+                .is_some_and(|bucket| bucket.len() > 256)
+        })
+    {
+        return Err("stored custom-domain passkey ceremonies exceed their bounds".to_string());
+    }
+    Ok(store)
+}
+
+fn serialized_ceremony_store(store: &CeremonyStore) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_vec_pretty(store)
+        .map_err(|error| format!("serialize custom-domain passkey ceremonies: {error}"))?;
+    bytes.push(b'\n');
+    if bytes.len() as u64 > CEREMONY_STORE_MAX_BYTES {
+        return Err("custom-domain passkey-ceremony store exceeds the size cap".to_string());
+    }
+    Ok(bytes)
+}
+
+fn save_ceremony_store_locked(
+    cert_dir: &Path,
+    store: &CeremonyStore,
+) -> crate::access::AccessResult<()> {
+    let bytes = serialized_ceremony_store(store).map_err(crate::access::AccessError)?;
+    crate::access::authority_store::atomic_write_private_locked(
+        &ceremony_store_path(cert_dir),
+        &bytes,
+    )
 }
 
 fn load_store(cert_dir: &Path, domain: &ValidatedCustomDomain) -> Result<PasskeyStore, String> {
@@ -722,6 +844,126 @@ mod tests {
             created_unix_ms: 1,
             last_used_unix_ms: None,
         }
+    }
+
+    fn hosted_runtime(cert_dir: &Path) -> Arc<HostedControlRuntime> {
+        Arc::new(HostedControlRuntime::new(
+            false,
+            cert_dir.to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ))
+    }
+
+    #[test]
+    fn registration_invites_and_flows_cross_process_boundaries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        let hosted = hosted_runtime(dir.path());
+        let first = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        let second = PasskeyRuntime::new(domain.clone(), dir.path().to_path_buf(), hosted).unwrap();
+
+        let invite = first
+            .registration_invite(RegistrationInviteInput {
+                label: "Phone".to_string(),
+            })
+            .unwrap();
+        let token = invite
+            .enrollment_url
+            .split_once("#passkey_enroll=")
+            .unwrap()
+            .1
+            .to_string();
+        let start = second
+            .registration_start(
+                RegistrationStartInput {
+                    token: token.clone(),
+                },
+                &domain.origin,
+            )
+            .unwrap();
+        assert!(
+            first
+                .registration_start(RegistrationStartInput { token }, &domain.origin)
+                .unwrap_err()
+                .contains("not found"),
+            "the durable invitation is consumed exactly once across processes"
+        );
+        let ceremonies = crate::access::authority_store::with_lock(dir.path(), || {
+            load_ceremony_store_locked(dir.path(), &domain).map_err(crate::access::AccessError)
+        })
+        .unwrap();
+        assert!(
+            ceremonies.registrations.contains_key(&start.flow_id),
+            "the finish request may land on any process"
+        );
+    }
+
+    #[test]
+    fn authentication_flow_can_be_consumed_by_a_sibling_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let domain = domain();
+        persist_store(
+            dir.path(),
+            &PasskeyStore {
+                schema_version: STORE_SCHEMA_VERSION,
+                name: domain.name.clone(),
+                rp_id: domain.rp_id.clone(),
+                user_id: Uuid::new_v4(),
+                passkeys: vec![stored_passkey(1, "one")],
+            },
+        )
+        .unwrap();
+        let hosted = hosted_runtime(dir.path());
+        let first = PasskeyRuntime::new(
+            domain.clone(),
+            dir.path().to_path_buf(),
+            Arc::clone(&hosted),
+        )
+        .unwrap();
+        let second = PasskeyRuntime::new(domain.clone(), dir.path().to_path_buf(), hosted).unwrap();
+        let start = first
+            .authentication_start(
+                AuthenticationStartInput {
+                    request: HostedLeaseRequestInput {
+                        browser_public_key: "browser-key".to_string(),
+                        requested_preset: Default::default(),
+                        requested_ttl_secs: 60,
+                        requester_label: "Browser".to_string(),
+                        nonce: String::new(),
+                        timestamp_unix_ms: 0,
+                        signature: String::new(),
+                    },
+                },
+                &domain.origin,
+                Some("test-source"),
+            )
+            .unwrap();
+        let consumed = second
+            .mutate_ceremonies(|ceremonies| {
+                ceremonies
+                    .authentications
+                    .remove(&start.flow_id)
+                    .ok_or_else(|| "missing durable authentication flow".to_string())
+            })
+            .unwrap();
+        assert_eq!(consumed.source_bucket.as_deref(), Some("test-source"));
+        assert!(first
+            .mutate_ceremonies(|ceremonies| {
+                ceremonies
+                    .authentications
+                    .remove(&start.flow_id)
+                    .ok_or_else(|| "already consumed".to_string())
+            })
+            .unwrap_err()
+            .contains("already consumed"));
     }
 
     #[test]

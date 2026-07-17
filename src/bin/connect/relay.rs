@@ -41,7 +41,10 @@ use tokio::net::{TcpListener, TcpStream};
 /// from the registered identity key, mirroring the fleet-DNS publish auth.
 pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
 pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+const RELAY_NAME_PROOF_PROTOCOL: &str = "intendant-connect-relay-name-proof-v1";
 const RELAY_MAX_SERVER_NAMES: usize = 8;
+const RELAY_NAME_PROOF_CHAIN_MAX_BYTES: usize = 128 * 1024;
+const RELAY_NAME_PROOF_CHAIN_MAX_CERTS: usize = 8;
 /// Daemon-signed DNS relay-mode protocol tag: "answer my fleet label with the
 /// relay's address instead of my own".
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
@@ -281,10 +284,22 @@ pub(crate) struct RelayState {
     connection_admission: StdMutex<ConnectionAdmission>,
     /// Per-tunnel concurrent spliced browser connections.
     tunnel_splices: StdMutex<HashMap<String, u32>>,
+    /// Trust roots used to validate exact-name certificate ownership proofs.
+    name_proof_roots: Arc<rustls::RootCertStore>,
 }
 
 impl RelayState {
     pub(crate) fn new(listen: SocketAddr, advertise_addrs: Vec<IpAddr>) -> Self {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::new_with_name_proof_roots(listen, advertise_addrs, Arc::new(roots))
+    }
+
+    fn new_with_name_proof_roots(
+        listen: SocketAddr,
+        advertise_addrs: Vec<IpAddr>,
+        name_proof_roots: Arc<rustls::RootCertStore>,
+    ) -> Self {
         Self {
             listen,
             advertise_addrs,
@@ -293,6 +308,7 @@ impl RelayState {
             control_notify: Notify::new(),
             connection_admission: StdMutex::new(ConnectionAdmission::default()),
             tunnel_splices: StdMutex::new(HashMap::new()),
+            name_proof_roots,
         }
     }
 
@@ -308,9 +324,9 @@ impl RelayState {
     /// have one live incumbent: a second daemon is rejected at admission so
     /// the incumbent retains one unambiguous route. Resolution still retains
     /// its ambiguity check as defense in depth for rolling state.
-    fn touch_tunnel(&self, label: &str, now: u64, server_names: &[String]) -> bool {
+    fn touch_tunnel(&self, label: &str, now: u64, server_names: Option<&[String]>) -> bool {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        let conflicts = server_names.iter().any(|name| {
+        let conflicts = server_names.into_iter().flatten().any(|name| {
             tunnels.iter().any(|(other_label, entry)| {
                 other_label != label
                     && now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
@@ -328,7 +344,13 @@ impl RelayState {
                 server_names: Vec::new(),
             });
         entry.last_seen_unix_ms = now;
-        entry.server_names = server_names.to_vec();
+        // v1 has no exact-name vocabulary, so a rolling old process may only
+        // refresh liveness; it must not erase a v2 route registered by a new
+        // sibling. A v2 poll always supplies Some, including an explicit empty
+        // list when the new daemon wants to clear its exact-name claims.
+        if let Some(server_names) = server_names {
+            entry.server_names = server_names.to_vec();
+        }
         true
     }
 
@@ -495,7 +517,16 @@ pub(crate) struct RelayNextRequest {
     #[serde(default)]
     server_names: Vec<String>,
     #[serde(default)]
+    server_name_proofs: Vec<RelayServerNameProof>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RelayServerNameProof {
+    server_name: String,
+    certificate_chain_pem: String,
+    signature: String,
 }
 
 fn relay_control_signing_payload(
@@ -514,6 +545,19 @@ fn relay_control_signing_payload(
         payload.push(b'\n');
     }
     payload
+}
+
+fn relay_name_proof_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_name: &str,
+) -> Vec<u8> {
+    format!(
+        "{RELAY_NAME_PROOF_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{}\n{server_name}\n",
+        server_name.len(),
+    )
+    .into_bytes()
 }
 
 fn normalize_server_name(name: &str) -> Option<String> {
@@ -576,6 +620,102 @@ fn canonical_server_names(names: &[String]) -> Result<Vec<String>, ApiError> {
     Ok(normalized)
 }
 
+fn verify_server_name_proofs(
+    relay: &RelayState,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_names: &[String],
+    proofs: &[RelayServerNameProof],
+) -> Result<(), ApiError> {
+    use rustls::client::danger::ServerCertVerifier as _;
+    use rustls::pki_types::pem::PemObject as _;
+
+    if proofs.len() != server_names.len() {
+        return Err(ApiError::forbidden(
+            "each exact relay name requires one certificate ownership proof",
+        ));
+    }
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        relay.name_proof_roots.clone(),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|error| ApiError::internal(format!("build relay name verifier: {error}")))?;
+
+    for (name, proof) in server_names.iter().zip(proofs) {
+        if proof.server_name != *name {
+            return Err(ApiError::forbidden(
+                "relay certificate proof does not match its exact server name",
+            ));
+        }
+        if proof.certificate_chain_pem.len() > RELAY_NAME_PROOF_CHAIN_MAX_BYTES {
+            return Err(ApiError::forbidden(
+                "relay certificate proof chain is too large",
+            ));
+        }
+        let certs = rustls::pki_types::CertificateDer::pem_slice_iter(
+            proof.certificate_chain_pem.as_bytes(),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::forbidden("relay certificate proof chain is invalid"))?;
+        if certs.is_empty() || certs.len() > RELAY_NAME_PROOF_CHAIN_MAX_CERTS {
+            return Err(ApiError::forbidden(
+                "relay certificate proof chain has an invalid length",
+            ));
+        }
+        let server_name = rustls::pki_types::ServerName::try_from(name.clone())
+            .map_err(|_| ApiError::forbidden("relay certificate proof name is invalid"))?;
+        verifier
+            .verify_server_cert(
+                &certs[0],
+                &certs[1..],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map_err(|_| {
+                ApiError::forbidden(
+                    "relay certificate proof is not valid for the exact server name",
+                )
+            })?;
+
+        let (_, parsed) = x509_parser::parse_x509_certificate(certs[0].as_ref())
+            .map_err(|_| ApiError::forbidden("relay certificate proof leaf is invalid"))?;
+        let san = parsed
+            .subject_alternative_name()
+            .map_err(|_| ApiError::forbidden("relay certificate proof SAN is invalid"))?
+            .ok_or_else(|| ApiError::forbidden("relay certificate proof has no DNS SAN"))?;
+        let dns_names = san
+            .value
+            .general_names
+            .iter()
+            .filter_map(|entry| match entry {
+                x509_parser::extensions::GeneralName::DNSName(value) => {
+                    Some(value.trim().trim_end_matches('.').to_ascii_lowercase())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if dns_names.as_slice() != [name.as_str()] {
+            return Err(ApiError::forbidden(
+                "relay certificate proof must contain only the exact server-name SAN",
+            ));
+        }
+        let signature = b64u_decode(proof.signature.trim())
+            .map_err(|_| ApiError::forbidden("relay certificate proof signature is invalid"))?;
+        let payload =
+            relay_name_proof_signing_payload(daemon_id, daemon_public_key, issued_at_unix_ms, name);
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_ASN1,
+            parsed.public_key().subject_public_key.data.as_ref(),
+        )
+        .verify(&payload, &signature)
+        .map_err(|_| ApiError::forbidden("relay certificate ownership proof is invalid"))?;
+    }
+    Ok(())
+}
+
 fn is_derived_fleet_label(label: &str) -> bool {
     label.strip_prefix("d-").is_some_and(|digest| {
         digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -630,11 +770,15 @@ pub(crate) async fn relay_next(
 ) -> ApiResult<Response> {
     let daemon_id = body.daemon_id.trim().to_string();
     let server_names = match body.protocol.as_str() {
-        RELAY_CONTROL_PROTOCOL => canonical_server_names(&body.server_names)?,
-        RELAY_CONTROL_PROTOCOL_V1 if body.server_names.is_empty() => Vec::new(),
+        RELAY_CONTROL_PROTOCOL => Some(canonical_server_names(&body.server_names)?),
+        RELAY_CONTROL_PROTOCOL_V1
+            if body.server_names.is_empty() && body.server_name_proofs.is_empty() =>
+        {
+            None
+        }
         RELAY_CONTROL_PROTOCOL_V1 => {
             return Err(ApiError::bad_request(
-                "relay control v1 cannot register server names",
+                "relay control v1 cannot register server names or proofs",
             ));
         }
         _ => {
@@ -644,6 +788,7 @@ pub(crate) async fn relay_next(
     if let Some(zone) = state.dns_zone.as_ref().map(|zone| zone.origin_utf8()) {
         if server_names
             .iter()
+            .flatten()
             .any(|name| server_name_overlaps_zone(name, &zone))
         {
             return Err(ApiError::bad_request(
@@ -666,7 +811,7 @@ pub(crate) async fn relay_next(
         &daemon_id,
         &daemon.daemon_public_key,
         body.issued_at_unix_ms,
-        &server_names,
+        server_names.as_deref().unwrap_or_default(),
     );
     if !verify_ed25519_b64u(&daemon.daemon_public_key, &payload, body.signature.trim()) {
         return Err(ApiError::bad_request("relay control signature invalid"));
@@ -676,12 +821,22 @@ pub(crate) async fn relay_next(
         .as_ref()
         .expect("relay presence checked in relay_request_daemon")
         .clone();
+    if let Some(server_names) = server_names.as_deref() {
+        verify_server_name_proofs(
+            &relay,
+            &daemon_id,
+            &daemon.daemon_public_key,
+            body.issued_at_unix_ms,
+            server_names,
+            &body.server_name_proofs,
+        )?;
+    }
     let Some(label) = daemon_label(&daemon_id) else {
         return Err(ApiError::bad_request(
             "daemon id does not derive a fleet label",
         ));
     };
-    if !relay.touch_tunnel(&label, now_unix_ms(), &server_names) {
+    if !relay.touch_tunnel(&label, now_unix_ms(), server_names.as_deref()) {
         return Err(ApiError::conflict(
             "an active relay tunnel already owns one of the exact server names",
         ));
@@ -707,7 +862,7 @@ pub(crate) async fn relay_next(
         }
         let remaining = deadline.saturating_duration_since(now);
         // Re-touch keeps the tunnel live across a full parked poll.
-        if !relay.touch_tunnel(&label, now_unix_ms(), &server_names) {
+        if !relay.touch_tunnel(&label, now_unix_ms(), server_names.as_deref()) {
             return Err(ApiError::conflict(
                 "an active relay tunnel already owns one of the exact server names",
             ));
@@ -1271,6 +1426,55 @@ mod tests {
         ))
     }
 
+    fn relay_state_and_name_proof(
+        name: &str,
+        daemon_id: &str,
+        daemon_public_key: &str,
+        issued_at_unix_ms: u64,
+    ) -> (Arc<RelayState>, RelayServerNameProof) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key).unwrap();
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let relay = Arc::new(RelayState::new_with_name_proof_roots(
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["203.0.113.10".parse().unwrap()],
+            Arc::new(roots),
+        ));
+
+        let key = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der()).unwrap();
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+        let signer = signing_key
+            .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+            .unwrap();
+        let payload =
+            relay_name_proof_signing_payload(daemon_id, daemon_public_key, issued_at_unix_ms, name);
+        let signature = signer.sign(&payload).unwrap();
+        (
+            relay,
+            RelayServerNameProof {
+                server_name: name.to_string(),
+                certificate_chain_pem: leaf_cert.pem(),
+                signature: crate::b64u(&signature),
+            },
+        )
+    }
+
     #[test]
     fn per_ip_connection_cap_is_enforced_and_released() {
         let relay = relay_state();
@@ -1329,7 +1533,7 @@ mod tests {
         let now = crate::now_unix_ms();
         // No tunnel yet: enqueue refuses.
         assert!(!relay.enqueue_dialback("d-none", "n0".to_string(), now));
-        assert!(relay.touch_tunnel("d-live", now, &[]));
+        assert!(relay.touch_tunnel("d-live", now, None));
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
             assert!(relay.enqueue_dialback("d-live", format!("n{i}"), now));
@@ -1347,14 +1551,14 @@ mod tests {
         let relay = relay_state();
         let now = crate::now_unix_ms();
         let name = "box.example.test".to_string();
-        assert!(relay.touch_tunnel("d-first", now, std::slice::from_ref(&name)));
+        assert!(relay.touch_tunnel("d-first", now, Some(std::slice::from_ref(&name))));
         assert_eq!(
             relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now).as_deref(),
             Some("d-first")
         );
 
         assert!(
-            !relay.touch_tunnel("d-second", now, std::slice::from_ref(&name)),
+            !relay.touch_tunnel("d-second", now, Some(std::slice::from_ref(&name))),
             "a conflicting live claim must be rejected at admission"
         );
         assert_eq!(
@@ -1387,12 +1591,32 @@ mod tests {
     fn fleet_label_route_survives_v1_registration() {
         let relay = relay_state();
         let now = crate::now_unix_ms();
-        assert!(relay.touch_tunnel("d-rolling", now, &[]));
+        assert!(relay.touch_tunnel("d-rolling", now, None));
         assert_eq!(
             relay
                 .resolve_tunnel("d-rolling.fleet.example.test", now)
                 .as_deref(),
             Some("d-rolling")
+        );
+    }
+
+    #[test]
+    fn v1_refresh_preserves_v2_names_and_v2_empty_clears_them() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        assert!(relay.touch_tunnel("d-rolling", now, Some(std::slice::from_ref(&name))));
+        assert!(relay.touch_tunnel("d-rolling", now + 1, None));
+        assert_eq!(
+            relay.resolve_tunnel(&name, now + 1).as_deref(),
+            Some("d-rolling"),
+            "a v1 sibling may refresh liveness but cannot erase a v2 route"
+        );
+        assert!(relay.touch_tunnel("d-rolling", now + 2, Some(&[])));
+        assert_eq!(
+            relay.resolve_tunnel(&name, now + 2),
+            None,
+            "an explicit v2 empty set clears exact-name routing"
         );
     }
 
@@ -1537,6 +1761,7 @@ mod tests {
             issued_at_unix_ms: issued,
             signature: crate::b64u(key.sign(&payload).as_ref()),
             server_names,
+            server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1545,8 +1770,7 @@ mod tests {
             axum::Json(body),
         )
         .await
-        .err()
-        .expect("relay disabled must reject");
+        .expect_err("relay disabled must reject");
         assert_eq!(err.status, StatusCode::NOT_FOUND);
     }
 
@@ -1573,6 +1797,7 @@ mod tests {
             issued_at_unix_ms: issued,
             signature: crate::b64u(&[0u8; 64]),
             server_names: Vec::new(),
+            server_name_proofs: Vec::new(),
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1581,8 +1806,7 @@ mod tests {
             axum::Json(body),
         )
         .await
-        .err()
-        .expect("a bad signature must reject");
+        .expect_err("a bad signature must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
@@ -1617,6 +1841,7 @@ mod tests {
             issued_at_unix_ms: issued,
             signature: crate::b64u(key.sign(&payload).as_ref()),
             server_names: vec!["other.example.test".to_string()],
+            server_name_proofs: Vec::new(),
             timeout_ms: Some(1),
         };
         let err = relay_next(
@@ -1625,9 +1850,52 @@ mod tests {
             axum::Json(body),
         )
         .await
-        .err()
-        .expect("changing the exact names must invalidate the signature");
+        .expect_err("changing the exact names must invalidate the signature");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relay_v2_rejects_an_exact_name_without_certificate_possession() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-name-unproved";
+        let relay = relay_state();
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay),
+                ..Default::default()
+            },
+        );
+        let issued = crate::now_unix_ms();
+        let server_names = vec!["box.example.test".to_string()];
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            &server_names,
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_CONTROL_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            server_names,
+            server_name_proofs: Vec::new(),
+            timeout_ms: Some(1),
+        };
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .expect_err("an unproved exact name must reject");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1639,7 +1907,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (key, public) = test_identity();
             let daemon_id = format!("relay-{}", protocol.rsplit('-').next().unwrap());
-            let relay = relay_state();
+            let issued = crate::now_unix_ms();
+            let (relay, server_name_proofs) = if protocol == RELAY_CONTROL_PROTOCOL {
+                let (relay, proof) =
+                    relay_state_and_name_proof(&server_names[0], &daemon_id, &public, issued);
+                (relay, vec![proof])
+            } else {
+                (relay_state(), Vec::new())
+            };
             let state = crate::build_test_state(
                 dir.path(),
                 registered_store(&daemon_id, &public),
@@ -1649,7 +1924,6 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let issued = crate::now_unix_ms();
             let payload =
                 relay_control_signing_payload(protocol, &daemon_id, &public, issued, &server_names);
             let body = RelayNextRequest {
@@ -1659,6 +1933,7 @@ mod tests {
                 issued_at_unix_ms: issued,
                 signature: crate::b64u(key.sign(&payload).as_ref()),
                 server_names: server_names.clone(),
+                server_name_proofs,
                 timeout_ms: Some(1),
             };
             let response = relay_next(
@@ -1695,7 +1970,6 @@ mod tests {
                 open_daemon_registration: true,
                 dns_zone: Some(zone.clone()),
                 relay: Some(relay),
-                ..Default::default()
             },
         );
         let issued = crate::now_unix_ms();

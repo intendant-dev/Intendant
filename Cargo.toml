@@ -106,6 +106,9 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 # keeps the whole TLS stack on `ring`. `tls12` + `logging` preserve the
 # feature set the default would have given us.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+# Public trust roots for exact-name relay ownership proofs. The relay verifies
+# the daemon-held custom-domain certificate before accepting an SNI claim.
+webpki-roots = "1"
 # Direct because daemon-to-daemon peer WebSocket clients build a custom rustls
 # ClientConfig when presenting the installed access client certificate; the
 # default tokio-tungstenite connector otherwise hides native-root loading.

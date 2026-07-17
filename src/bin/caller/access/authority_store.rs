@@ -177,6 +177,23 @@ pub fn atomic_write_private_locked(path: &Path, contents: &[u8]) -> AccessResult
     Ok(())
 }
 
+/// Remove one authority-state file and durably record the directory change.
+/// The caller must already hold [`with_lock`]. A missing file is already in
+/// the requested state.
+pub fn remove_file_locked(path: &Path) -> AccessResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        AccessError(format!(
+            "authority-state path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent(parent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AccessError(format!("remove {}: {error}", path.display()))),
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent(parent: &Path) -> AccessResult<()> {
     File::open(parent)

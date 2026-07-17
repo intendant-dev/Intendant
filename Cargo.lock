@@ -2964,6 +2964,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "webpki-roots",
  "which 8.0.2",
  "windows 0.59.0",
  "x509-parser 0.18.1",

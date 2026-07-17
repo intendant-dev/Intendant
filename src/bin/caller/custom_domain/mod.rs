@@ -15,6 +15,33 @@ pub(crate) use passkeys::{
     RegistrationStartInput, RevokeInput,
 };
 
+pub(crate) struct RelayCertificateMaterial {
+    pub(crate) server_name: String,
+    pub(crate) certificate_chain_pem: String,
+    pub(crate) private_key_pem: String,
+}
+
+pub(crate) fn relay_certificate_material(
+    config: &CustomDomainConfig,
+) -> Result<Option<RelayCertificateMaterial>, String> {
+    let Some(domain) = config.validated()? else {
+        return Ok(None);
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    if crate::fleet_cert::is_service_controlled_name_in(&cert_dir, &domain.name)? {
+        return Err(
+            "custom-domain name overlaps a service-controlled fleet name or zone".to_string(),
+        );
+    }
+    let (certificate_chain_pem, private_key_pem) =
+        cert::relay_certificate_material(&domain, &cert_dir)?;
+    Ok(Some(RelayCertificateMaterial {
+        server_name: domain.name,
+        certificate_chain_pem,
+        private_key_pem,
+    }))
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct CertificateStatus {
     pub(super) state: String,
@@ -99,11 +126,11 @@ impl CustomDomainRuntime {
                 return Self::invalid(cert_dir, error);
             }
         };
-        match crate::fleet_cert::is_known_fleet_name_in(&cert_dir, &domain.name) {
+        match crate::fleet_cert::is_service_controlled_name_in(&cert_dir, &domain.name) {
             Ok(true) => {
                 return Self::invalid(
                     cert_dir,
-                    "custom-domain name is already recorded as a service-controlled fleet name"
+                    "custom-domain name overlaps a service-controlled fleet name or zone"
                         .to_string(),
                 );
             }
@@ -168,7 +195,7 @@ impl CustomDomainRuntime {
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.domain.is_some()
+        self.domain.is_some() && self.domain_control_error().is_none()
     }
 
     pub(crate) fn configured(&self) -> bool {
@@ -180,10 +207,13 @@ impl CustomDomainRuntime {
     }
 
     pub(crate) fn matches_origin(&self, origin: &str) -> bool {
-        self.origin() == Some(origin)
+        self.enabled() && self.origin() == Some(origin)
     }
 
     pub(crate) fn passkey_available(&self) -> bool {
+        if !self.enabled() {
+            return false;
+        }
         self.passkeys
             .as_ref()
             .and_then(|runtime| runtime.views().ok())
@@ -191,6 +221,12 @@ impl CustomDomainRuntime {
     }
 
     pub(crate) fn spawn_certificate_loop(&self) {
+        // Cleanup survives disabling or invalidating the custom lane: a DNS
+        // mutation journal from an earlier process still has to be retired.
+        dns::spawn_cleanup_loop(self.cert_dir.clone());
+        if !self.enabled() {
+            return;
+        }
         let Some(domain) = self.domain.clone() else {
             return;
         };
@@ -214,6 +250,7 @@ impl CustomDomainRuntime {
             .as_ref()
             .and_then(|runtime| runtime.views().ok())
             .unwrap_or_default();
+        let domain_control_error = self.domain_control_error();
         CustomDomainSnapshot {
             configured: self.configured,
             enabled: self.enabled(),
@@ -226,7 +263,9 @@ impl CustomDomainRuntime {
                 .map(dns::provider_name)
                 .map(str::to_string),
             acme_issuance_enabled: self.acme_issuance_enabled,
-            certificate_state: if certificate.state.is_empty() {
+            certificate_state: if domain_control_error.is_some() {
+                "error".to_string()
+            } else if certificate.state.is_empty() {
                 "disabled".to_string()
             } else {
                 certificate.state
@@ -236,6 +275,7 @@ impl CustomDomainRuntime {
             initialization_error: self
                 .initialization_error
                 .clone()
+                .or(domain_control_error)
                 .or(certificate.restore_error)
                 .or(certificate.last_error),
             passkeys,
@@ -287,11 +327,25 @@ impl CustomDomainRuntime {
     }
 
     fn passkeys(&self) -> Result<&passkeys::PasskeyRuntime, String> {
+        if let Some(error) = self.domain_control_error() {
+            return Err(error);
+        }
         self.passkeys.as_ref().ok_or_else(|| {
             self.initialization_error
                 .clone()
                 .unwrap_or_else(|| "custom-domain passkeys are not configured".to_string())
         })
+    }
+
+    fn domain_control_error(&self) -> Option<String> {
+        let domain = self.domain.as_ref()?;
+        match crate::fleet_cert::is_service_controlled_name_in(&self.cert_dir, &domain.name) {
+            Ok(false) => None,
+            Ok(true) => Some(
+                "custom-domain name overlaps a service-controlled fleet name or zone".to_string(),
+            ),
+            Err(error) => Some(format!("check custom-domain name provenance: {error}")),
+        }
     }
 }
 
@@ -315,5 +369,41 @@ mod tests {
         assert!(!runtime.configured());
         assert!(!runtime.enabled());
         assert_eq!(runtime.snapshot().certificate_state, "disabled");
+    }
+
+    #[test]
+    fn runtime_disables_itself_when_a_later_fleet_zone_overlaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosted = Arc::new(HostedControlRuntime::new(
+            false,
+            dir.path().to_path_buf(),
+            None,
+            None,
+            String::new(),
+            false,
+        ));
+        let config = CustomDomainConfig {
+            enabled: true,
+            name: Some("box.fleet.example.test".to_string()),
+            ..Default::default()
+        };
+        let runtime = CustomDomainRuntime::new(&config, dir.path().into(), hosted);
+        assert!(runtime.enabled());
+        assert!(runtime.matches_origin("https://box.fleet.example.test"));
+
+        crate::fleet_cert::remember_fleet_origin_for_test(
+            dir.path(),
+            Some("fleet.example.test"),
+            "d-1234567890abcdef1234.fleet.example.test",
+        )
+        .unwrap();
+        assert!(!runtime.enabled());
+        assert!(!runtime.matches_origin("https://box.fleet.example.test"));
+        let snapshot = runtime.snapshot();
+        assert_eq!(snapshot.certificate_state, "error");
+        assert!(snapshot
+            .initialization_error
+            .as_deref()
+            .is_some_and(|error| error.contains("service-controlled fleet name or zone")));
     }
 }

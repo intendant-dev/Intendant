@@ -35,6 +35,15 @@ use crate::connect_rendezvous::{
 use crate::daemon_identity::DaemonIdentity;
 use crate::project::ConnectConfig;
 
+const RELAY_NAME_PROOF_PROTOCOL: &str = "intendant-connect-relay-name-proof-v1";
+
+#[derive(serde::Serialize)]
+struct RelayServerNameProof {
+    server_name: String,
+    certificate_chain_pem: String,
+    signature: String,
+}
+
 /// The first line the daemon writes on a dial-back data connection (mirrors
 /// `bin/connect/relay.rs`): this magic and the single-use nonce.
 const DIALBACK_MAGIC: &str = "ITRLY1";
@@ -113,16 +122,22 @@ async fn run_relay_tunnel(relay_endpoint: String, gateway_ingress_addr: SocketAd
                 continue;
             }
         };
-        let server_names = match relay_server_names(&config) {
-            Ok(names) => {
+        let name_materials = match crate::custom_domain::relay_certificate_material(
+            &config.custom_domain,
+        ) {
+            Ok(Some(material)) => {
                 last_custom_error = None;
-                names
+                vec![material]
+            }
+            Ok(None) => {
+                last_custom_error = None;
+                Vec::new()
             }
             Err(error) => {
                 if last_custom_error.as_deref() != Some(error.as_str()) {
                     eprintln!(
-                        "[relay] custom-domain registration unavailable; fleet relay remains active: {error}"
-                    );
+                            "[relay] custom-domain registration unavailable; fleet relay remains active: {error}"
+                        );
                     last_custom_error = Some(error);
                 }
                 Vec::new()
@@ -134,7 +149,7 @@ async fn run_relay_tunnel(relay_endpoint: String, gateway_ingress_addr: SocketAd
             &base_url,
             &identity,
             &daemon_id,
-            &server_names,
+            &name_materials,
         )
         .await
         {
@@ -173,20 +188,19 @@ async fn poll_relay_next(
     base_url: &Url,
     identity: &DaemonIdentity,
     daemon_id: &str,
-    server_names: &[String],
+    name_materials: &[crate::custom_domain::RelayCertificateMaterial],
 ) -> Result<Option<String>, String> {
-    let protocol = relay_control_protocol(server_names);
     let mut response = send_relay_poll(
         client,
         config,
         base_url,
         identity,
         daemon_id,
-        protocol,
-        server_names,
+        RELAY_CONTROL_PROTOCOL,
+        name_materials,
     )
     .await?;
-    if protocol == RELAY_CONTROL_PROTOCOL && exact_name_registration_rejected(response.status()) {
+    if exact_name_registration_rejected(response.status()) {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         eprintln!(
@@ -213,26 +227,6 @@ fn exact_name_registration_rejected(status: reqwest::StatusCode) -> bool {
     )
 }
 
-fn relay_control_protocol(server_names: &[String]) -> &'static str {
-    if server_names.is_empty() {
-        RELAY_CONTROL_PROTOCOL_V1
-    } else {
-        RELAY_CONTROL_PROTOCOL
-    }
-}
-
-fn relay_server_names(config: &ConnectConfig) -> Result<Vec<String>, String> {
-    let mut server_names = config
-        .custom_domain
-        .validated()?
-        .into_iter()
-        .map(|custom| custom.name)
-        .collect::<Vec<_>>();
-    server_names.sort();
-    server_names.dedup();
-    Ok(server_names)
-}
-
 async fn send_relay_poll(
     client: &Client,
     config: &ConnectConfig,
@@ -240,16 +234,20 @@ async fn send_relay_poll(
     identity: &DaemonIdentity,
     daemon_id: &str,
     protocol: &str,
-    server_names: &[String],
+    name_materials: &[crate::custom_domain::RelayCertificateMaterial],
 ) -> Result<reqwest::Response, String> {
     let daemon_public_key = identity.public_key_b64u();
     let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
+    let server_names: Vec<String> = name_materials
+        .iter()
+        .map(|material| material.server_name.clone())
+        .collect();
     let payload = relay_control_signing_payload(
         protocol,
         daemon_id,
         &daemon_public_key,
         issued_at_unix_ms,
-        server_names,
+        &server_names,
     );
     let signature = identity.sign_b64u(&payload);
     let mut body = serde_json::json!({
@@ -261,14 +259,68 @@ async fn send_relay_poll(
         "timeout_ms": CONTROL_POLL_TIMEOUT_MS,
     });
     if protocol == RELAY_CONTROL_PROTOCOL {
-        body["server_names"] = serde_json::to_value(server_names)
+        let proofs = name_materials
+            .iter()
+            .map(|material| {
+                relay_server_name_proof(material, daemon_id, &daemon_public_key, issued_at_unix_ms)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        body["server_names"] = serde_json::to_value(&server_names)
             .map_err(|error| format!("serialize relay server names: {error}"))?;
+        body["server_name_proofs"] = serde_json::to_value(proofs)
+            .map_err(|error| format!("serialize relay server-name proofs: {error}"))?;
     }
     authenticated(config, client.post(join_url(base_url, "api/relay/next")?))
         .json(&body)
         .send()
         .await
         .map_err(|e| e.to_string())
+}
+
+fn relay_server_name_proof(
+    material: &crate::custom_domain::RelayCertificateMaterial,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+) -> Result<RelayServerNameProof, String> {
+    use rustls::pki_types::pem::PemObject as _;
+
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(material.private_key_pem.as_bytes())
+        .map_err(|error| format!("parse custom-domain relay proof key: {error}"))?;
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|error| format!("load custom-domain relay proof key: {error}"))?;
+    let signer = signing_key
+        .choose_scheme(&[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+        .ok_or_else(|| {
+            "custom-domain relay proof requires an ECDSA P-256 certificate key".to_string()
+        })?;
+    let payload = relay_name_proof_signing_payload(
+        daemon_id,
+        daemon_public_key,
+        issued_at_unix_ms,
+        &material.server_name,
+    );
+    let signature = signer
+        .sign(&payload)
+        .map_err(|error| format!("sign custom-domain relay proof: {error}"))?;
+    Ok(RelayServerNameProof {
+        server_name: material.server_name.clone(),
+        certificate_chain_pem: material.certificate_chain_pem.clone(),
+        signature: crate::daemon_identity::b64u(&signature),
+    })
+}
+
+fn relay_name_proof_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_name: &str,
+) -> Vec<u8> {
+    format!(
+        "{RELAY_NAME_PROOF_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n{}\n{server_name}\n",
+        server_name.len(),
+    )
+    .into_bytes()
 }
 
 async fn decode_relay_poll_response(response: reqwest::Response) -> Result<Option<String>, String> {
@@ -409,28 +461,23 @@ mod tests {
     }
 
     #[test]
-    fn relay_names_come_from_the_effective_custom_domain_config() {
-        let mut config = ConnectConfig::default();
-        config.custom_domain.enabled = true;
-        config.custom_domain.name = Some("Box.Example.Test.".to_string());
+    fn name_proof_payload_binds_the_exact_name_and_daemon_identity() {
         assert_eq!(
-            relay_server_names(&config).unwrap(),
-            vec!["box.example.test".to_string()]
-        );
-
-        config.custom_domain.rp_id = Some("example.test".to_string());
-        assert!(
-            relay_server_names(&config).is_err(),
-            "the caller keeps the fleet relay alive while omitting invalid custom claims"
-        );
-    }
-
-    #[test]
-    fn fleet_only_relays_keep_the_v1_compatibility_protocol() {
-        assert_eq!(relay_control_protocol(&[]), RELAY_CONTROL_PROTOCOL_V1);
-        assert_eq!(
-            relay_control_protocol(&["box.example.test".to_string()]),
-            RELAY_CONTROL_PROTOCOL
+            String::from_utf8(relay_name_proof_signing_payload(
+                "daemon",
+                "public",
+                42,
+                "box.example.test",
+            ))
+            .unwrap(),
+            concat!(
+                "intendant-connect-relay-name-proof-v1\n",
+                "daemon\n",
+                "public\n",
+                "42\n",
+                "16\n",
+                "box.example.test\n",
+            )
         );
     }
 
@@ -444,6 +491,9 @@ mod tests {
         ));
         assert!(!exact_name_registration_rejected(
             reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!exact_name_registration_rejected(
+            reqwest::StatusCode::FORBIDDEN
         ));
     }
 

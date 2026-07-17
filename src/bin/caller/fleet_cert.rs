@@ -36,6 +36,13 @@ const FLEET_CERT_REQUESTED_MARKER: &[u8] = b"intendant-fleet-certificate-request
 const FLEET_CERT_SERIALS_MAX_BYTES: u64 = 1024 * 1024;
 const FLEET_CT_STATUS_FILE: &str = "fleet-cert-ct-status.json";
 const FLEET_CT_STATUS_MAX_BYTES: u64 = 1024 * 1024;
+const FLEET_CT_RESPONSE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const FLEET_CT_FOREIGN_SERIALS_MAX: usize = 256;
+const FLEET_CERT_ISSUANCE_FILE: &str = "fleet-cert-issuance.json";
+const FLEET_CERT_ISSUANCE_SCHEMA_VERSION: u32 = 1;
+const FLEET_CERT_ISSUANCE_MAX_BYTES: u64 = 64 * 1024;
+const FLEET_CERT_ISSUANCE_TTL_MS: u64 = 2 * 60 * 60 * 1000;
+const FLEET_CERT_ISSUANCE_MAX_ACTIVE: usize = 16;
 
 /// Durable service-controlled-name provenance. Certificates and Connect
 /// registration are both replaceable/optional at startup, but a name once
@@ -51,6 +58,8 @@ struct FleetOriginProvenance {
     name: Option<String>,
     #[serde(default)]
     known_names: Vec<String>,
+    #[serde(default)]
+    known_zones: Vec<String>,
     /// Recovery could not prove the complete historical name set. While this
     /// is true, IAM treats DNS-origin browser keys conservatively instead of
     /// allowing an unknown former fleet name to decay into a direct anchor.
@@ -69,6 +78,7 @@ impl Default for FleetOriginProvenance {
             zone: None,
             name: None,
             known_names: Vec::new(),
+            known_zones: Vec::new(),
             provenance_incomplete: false,
         }
     }
@@ -118,6 +128,16 @@ fn load_fleet_origin_provenance_in(cert_dir: &Path) -> Result<FleetOriginProvena
     provenance.schema_version = FLEET_ORIGIN_PROVENANCE_SCHEMA_VERSION;
     provenance.zone = provenance.zone.as_deref().and_then(normalized_dns_name);
     provenance.name = provenance.name.as_deref().and_then(normalized_dns_name);
+    provenance.known_zones = provenance
+        .known_zones
+        .iter()
+        .filter_map(|zone| normalized_dns_name(zone))
+        .collect();
+    if let Some(zone) = provenance.zone.clone() {
+        provenance.known_zones.push(zone);
+    }
+    provenance.known_zones.sort();
+    provenance.known_zones.dedup();
     provenance.known_names = provenance
         .known_names
         .iter()
@@ -135,12 +155,24 @@ pub(crate) fn current_fleet_name_in(cert_dir: &Path) -> Result<Option<String>, S
     load_fleet_origin_provenance_in(cert_dir).map(|provenance| provenance.name)
 }
 
-pub(crate) fn is_known_fleet_name_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+pub(crate) fn is_service_controlled_name_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
     let Some(name) = normalized_dns_name(name) else {
         return Ok(false);
     };
-    load_fleet_origin_provenance_in(cert_dir)
-        .map(|provenance| provenance.known_names.iter().any(|known| known == &name))
+    let provenance = load_fleet_origin_provenance_in(cert_dir)?;
+    if provenance.provenance_incomplete {
+        return Err(
+            "fleet-origin provenance is incomplete; custom-domain separation cannot be proven"
+                .to_string(),
+        );
+    }
+    Ok(provenance.known_names.iter().any(|known| known == &name)
+        || provenance.known_zones.iter().any(|zone| {
+            name == *zone
+                || name
+                    .strip_suffix(zone)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }))
 }
 
 fn remember_fleet_origin_in(
@@ -155,6 +187,11 @@ fn remember_fleet_origin_in(
             load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
         let before = provenance.clone();
         provenance.zone = zone.and_then(normalized_dns_name);
+        if let Some(zone) = provenance.zone.clone() {
+            provenance.known_zones.push(zone);
+            provenance.known_zones.sort();
+            provenance.known_zones.dedup();
+        }
         provenance.name = Some(name.clone());
         provenance.known_names.push(name);
         provenance.known_names.sort();
@@ -166,6 +203,15 @@ fn remember_fleet_origin_in(
         Ok(provenance)
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn remember_fleet_origin_for_test(
+    cert_dir: &Path,
+    zone: Option<&str>,
+    name: &str,
+) -> Result<(), String> {
+    remember_fleet_origin_in(cert_dir, zone, name).map(|_| ())
 }
 
 fn fleet_origin_provenance_incomplete_flag() -> &'static AtomicBool {
@@ -265,8 +311,39 @@ pub fn status_snapshot() -> FleetCertStatus {
 }
 
 pub fn ct_guard_evidence() -> CtGuardEvidence {
-    let status = registry().lock().expect("fleet cert status poisoned");
-    ct_guard_evidence_from_status(&status)
+    let snapshot = status_snapshot();
+    let Some(name) = snapshot.name.as_deref().and_then(normalized_dns_name) else {
+        return ct_guard_evidence_from_status(&snapshot);
+    };
+    match durable_ct_status_for_name_in(&cert_dir(), &name) {
+        Ok(Some(durable)) => {
+            let evidence = CtGuardEvidence {
+                foreign_serials: durable.foreign_serials.clone(),
+                state_unavailable: false,
+            };
+            with_status(|status| {
+                if fleet_name_matches(status.name.as_deref(), &name) {
+                    let _ = apply_loaded_ct_status(status, Ok(Some(durable)));
+                }
+            });
+            evidence
+        }
+        Ok(None) => ct_guard_evidence_from_status(&snapshot),
+        Err(error) => {
+            with_status(|status| {
+                if fleet_name_matches(status.name.as_deref(), &name) {
+                    status.ct_state = "unreadable".to_string();
+                    status.ct_foreign_serials.clear();
+                    status.ct_unknown.clear();
+                    status.ct_last_error = Some(error);
+                }
+            });
+            CtGuardEvidence {
+                foreign_serials: Vec::new(),
+                state_unavailable: true,
+            }
+        }
+    }
 }
 
 fn ct_guard_evidence_from_status(status: &FleetCertStatus) -> CtGuardEvidence {
@@ -436,11 +513,11 @@ fn require_fleet_certificate_dns_name(cert_pem: &str, expected: &str) -> Result<
     let expected = normalized_dns_name(expected)
         .ok_or_else(|| "current fleet certificate name is empty".to_string())?;
     let names = fleet_certificate_dns_names(cert_pem)?;
-    if names.iter().any(|name| name == &expected) {
+    if names.as_slice() == [expected.as_str()] {
         Ok(())
     } else {
         Err(format!(
-            "fleet certificate SANs do not include the current exact name {expected}"
+            "fleet certificate SANs must equal only the current exact name {expected}"
         ))
     }
 }
@@ -586,7 +663,6 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
     if let Some(error) = restored.warning {
         eprintln!("[fleet-cert] restore fleet-origin provenance: {error}");
     }
-    restore_ct_status_in(cert_dir);
     // Offline/Connect-disabled startup restores the last current name so an
     // installed certificate remains usable. A register response observed in
     // this process wins, including an explicit null hint; remembered names
@@ -597,6 +673,9 @@ pub(crate) fn refresh_installed_state_in(cert_dir: &Path) {
             status.name = restored.provenance.name;
         });
     }
+    // The durable CT verdict is exact-name bound, so restore the current name
+    // before applying it. A verdict from an older fleet name fails closed.
+    restore_ct_status_in(cert_dir);
     if let Err(error) = own_serial_records_in(cert_dir) {
         with_status(|status| {
             status.ct_state = "unreadable".to_string();
@@ -865,6 +944,178 @@ pub fn default_publish_addresses() -> Vec<String> {
     addresses
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InFlightIssuance {
+    token: String,
+    name: String,
+    started_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InFlightIssuanceStore {
+    schema_version: u32,
+    orders: Vec<InFlightIssuance>,
+}
+
+fn issuance_store_path_in(cert_dir: &Path) -> PathBuf {
+    cert_dir.join(FLEET_CERT_ISSUANCE_FILE)
+}
+
+fn load_issuance_store_locked_in(cert_dir: &Path) -> Result<InFlightIssuanceStore, String> {
+    use std::io::Read as _;
+
+    let path = issuance_store_path_in(cert_dir);
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(InFlightIssuanceStore {
+                schema_version: FLEET_CERT_ISSUANCE_SCHEMA_VERSION,
+                orders: Vec::new(),
+            });
+        }
+        Err(error) => return Err(format!("open {}: {error}", path.display())),
+    };
+    let mut bytes = Vec::new();
+    file.take(FLEET_CERT_ISSUANCE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > FLEET_CERT_ISSUANCE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the issuance-state size limit",
+            path.display()
+        ));
+    }
+    let mut store: InFlightIssuanceStore = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if store.schema_version != FLEET_CERT_ISSUANCE_SCHEMA_VERSION
+        || store.orders.len() > FLEET_CERT_ISSUANCE_MAX_ACTIVE
+        || store.orders.iter().any(|order| {
+            order.token.is_empty()
+                || order.token.len() > 64
+                || normalized_dns_name(&order.name).as_deref() != Some(order.name.as_str())
+        })
+    {
+        return Err(format!(
+            "{} contains invalid issuance state",
+            path.display()
+        ));
+    }
+    let now = now_unix_ms();
+    store
+        .orders
+        .retain(|order| now.saturating_sub(order.started_unix_ms) < FLEET_CERT_ISSUANCE_TTL_MS);
+    Ok(store)
+}
+
+fn write_issuance_store_locked_in(
+    cert_dir: &Path,
+    store: &InFlightIssuanceStore,
+) -> crate::access::AccessResult<()> {
+    let mut serialized = serde_json::to_vec_pretty(store).map_err(|error| {
+        crate::access::AccessError(format!("serialize fleet issuance state: {error}"))
+    })?;
+    serialized.push(b'\n');
+    if serialized.len() as u64 > FLEET_CERT_ISSUANCE_MAX_BYTES {
+        return Err(crate::access::AccessError(
+            "fleet issuance state exceeds its size limit".to_string(),
+        ));
+    }
+    crate::access::authority_store::atomic_write_private_locked(
+        &issuance_store_path_in(cert_dir),
+        &serialized,
+    )
+}
+
+fn begin_issuance_in(cert_dir: &Path, name: &str) -> Result<String, String> {
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "cannot start issuance for an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let provenance =
+            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+        if provenance.name.as_deref() != Some(name.as_str()) {
+            return Err(crate::access::AccessError(format!(
+                "fleet name changed before issuance began for {name}"
+            )));
+        }
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        if store.orders.iter().any(|order| order.name == name) {
+            return Err(crate::access::AccessError(
+                "a certificate request is already running in another daemon process".to_string(),
+            ));
+        }
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        store.orders.push(InFlightIssuance {
+            token: token.clone(),
+            name,
+            started_unix_ms: now_unix_ms(),
+        });
+        write_issuance_store_locked_in(cert_dir, &store)?;
+        Ok(token)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn finish_issuance_in(cert_dir: &Path, token: &str) -> Result<(), String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let mut store =
+            load_issuance_store_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        store.orders.retain(|order| order.token != token);
+        write_issuance_store_locked_in(cert_dir, &store)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn issuance_active_locked_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    let store = load_issuance_store_locked_in(cert_dir)?;
+    Ok(store.orders.iter().any(|order| order.name == name))
+}
+
+struct IssuanceGuard {
+    cert_dir: PathBuf,
+    token: Option<String>,
+}
+
+impl IssuanceGuard {
+    fn begin(cert_dir: &Path, name: &str) -> Result<Self, String> {
+        Ok(Self {
+            cert_dir: cert_dir.to_path_buf(),
+            token: Some(begin_issuance_in(cert_dir, name)?),
+        })
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        let token = self.token.take().expect("issuance guard already finished");
+        let result = finish_issuance_in(&self.cert_dir, &token);
+        if let Err(error) = &result {
+            with_status(|status| {
+                status.ct_state = "unreadable".to_string();
+                status.ct_last_error =
+                    Some(format!("clear durable certificate issuance state: {error}"));
+            });
+        }
+        result
+    }
+}
+
+impl Drop for IssuanceGuard {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        if let Err(error) = finish_issuance_in(&self.cert_dir, &token) {
+            eprintln!("[fleet-cert] clear durable issuance state: {error}");
+            with_status(|status| {
+                status.ct_state = "unreadable".to_string();
+                status.ct_last_error =
+                    Some(format!("clear durable certificate issuance state: {error}"));
+            });
+        }
+    }
+}
+
 /// One guarded flow at a time — a second request while one runs is a
 /// no-op with an honest error.
 fn request_in_flight() -> &'static std::sync::atomic::AtomicBool {
@@ -902,6 +1153,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // missing first pair look indistinguishable from a never-enabled daemon.
     let certificate_dir = cert_dir();
     mark_issuance_requested_in(&certificate_dir)?;
+    let issuance = IssuanceGuard::begin(&certificate_dir, &name)?;
     with_status(|status| {
         status.state = "requesting".to_string();
         status.last_error = None;
@@ -954,8 +1206,6 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
         .poll_certificate(&instant_acme::RetryPolicy::default())
         .await
         .map_err(|e| format!("acme certificate: {e}"))?;
-    // Best-effort challenge cleanup; the TXT self-expires regardless.
-    let _ = crate::connect_rendezvous::dns_acme_clear().await;
     require_fleet_certificate_dns_name(&cert_chain_pem, &name)?;
     ensure_current_fleet_name(&name)?;
     // The CT tripwire's own-serial ledger — recorded before install so a
@@ -963,6 +1213,10 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
     // loud and retryable: installing an unrecorded certificate would create
     // a false CT alert.
     record_own_certificate_in(&certificate_dir, &cert_chain_pem, &name, &acme_directory())?;
+    // Best-effort challenge cleanup after the serial is durable. Keeping the
+    // issuance marker through both steps prevents a CT poll from classifying
+    // the just-issued precertificate before its own-serial record exists.
+    let _ = crate::connect_rendezvous::dns_acme_clear().await;
 
     // 3. Persist + install live. The per-file replacements are atomic and
     // the shared authority lock prevents two daemon processes from
@@ -986,6 +1240,7 @@ async fn request_certificate_inner(addresses: Vec<String>) -> Result<(), String>
             "fleet name changed after certificate issuance completed for {name}; retry against the current name"
         ));
     }
+    issuance.finish()?;
     Ok(())
 }
 
@@ -1092,6 +1347,7 @@ fn own_serial_records_in(cert_dir: &Path) -> Result<Vec<OwnCertRecord>, String> 
     .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 fn own_serials_for_exact_name_in(cert_dir: &Path, name: &str) -> Result<Vec<String>, String> {
     let Some(name) = normalized_dns_name(name) else {
         return Ok(Vec::new());
@@ -1167,37 +1423,67 @@ fn record_own_certificate_in(
         .ok_or_else(|| "issued fleet certificate has no usable serial".to_string())?;
     let name = normalized_dns_name(name)
         .ok_or_else(|| "issued fleet certificate has no usable exact name".to_string())?;
-    crate::access::authority_store::with_lock(cert_dir, || {
+    let reconciled = crate::access::authority_store::with_lock(cert_dir, || {
         let mut records =
             own_serial_records_locked_in(cert_dir).map_err(crate::access::AccessError)?;
-        if records.iter().any(|record| {
+        let already_recorded = records.iter().any(|record| {
             normalize_serial_hex(&record.serial_hex) == serial
                 && normalized_dns_name(&record.name).as_deref() == Some(name.as_str())
-        }) {
-            return Ok(());
-        }
-        records.push(OwnCertRecord {
-            serial_hex: serial,
-            name,
-            directory: directory.to_string(),
-            issued_unix_ms: now_unix_ms(),
         });
-        let mut serialized = serde_json::to_vec_pretty(&records).map_err(|error| {
-            crate::access::AccessError(format!("serialize own-certificate ledger: {error}"))
-        })?;
-        serialized.push(b'\n');
-        if serialized.len() as u64 > FLEET_CERT_SERIALS_MAX_BYTES {
-            return Err(crate::access::AccessError(
-                "own-certificate ledger would exceed its size limit; no record was changed"
-                    .to_string(),
-            ));
+        if !already_recorded {
+            records.push(OwnCertRecord {
+                serial_hex: serial.clone(),
+                name: name.clone(),
+                directory: directory.to_string(),
+                issued_unix_ms: now_unix_ms(),
+            });
+            let mut serialized = serde_json::to_vec_pretty(&records).map_err(|error| {
+                crate::access::AccessError(format!("serialize own-certificate ledger: {error}"))
+            })?;
+            serialized.push(b'\n');
+            if serialized.len() as u64 > FLEET_CERT_SERIALS_MAX_BYTES {
+                return Err(crate::access::AccessError(
+                    "own-certificate ledger would exceed its size limit; no record was changed"
+                        .to_string(),
+                ));
+            }
+            crate::access::authority_store::atomic_write_private_locked(
+                &serials_path_in(cert_dir),
+                &serialized,
+            )?;
         }
-        crate::access::authority_store::atomic_write_private_locked(
-            &serials_path_in(cert_dir),
-            &serialized,
-        )
+
+        let Some(mut durable) =
+            load_ct_status_locked_in(cert_dir).map_err(crate::access::AccessError)?
+        else {
+            return Ok(None);
+        };
+        if durable.name != name || !durable.foreign_serials.contains(&serial) {
+            return Ok(None);
+        }
+        durable.foreign_serials.retain(|foreign| foreign != &serial);
+        durable.unknown_summaries.retain(|summary| {
+            !summary
+                .strip_prefix(&serial)
+                .is_some_and(|suffix| suffix.starts_with(" ·"))
+        });
+        durable.state = if durable.foreign_serials.is_empty() {
+            "ok".to_string()
+        } else {
+            "alert".to_string()
+        };
+        write_ct_status_locked_in(cert_dir, &durable)?;
+        Ok(Some(durable))
     })
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if let Some(durable) = reconciled {
+        with_status(|status| {
+            if fleet_name_matches(status.name.as_deref(), &name) {
+                let _ = apply_loaded_ct_status(status, Ok(Some(durable)));
+            }
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq)]
@@ -1209,6 +1495,8 @@ struct CtEntry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct DurableCtStatus {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     state: String,
     #[serde(default)]
@@ -1223,26 +1511,51 @@ fn ct_status_path_in(cert_dir: &Path) -> PathBuf {
     cert_dir.join(FLEET_CT_STATUS_FILE)
 }
 
-fn persist_ct_status_in(cert_dir: &Path, status: &FleetCertStatus) -> Result<(), String> {
-    let durable = DurableCtStatus {
+#[cfg(test)]
+fn durable_ct_status_from_live(status: &FleetCertStatus) -> Result<DurableCtStatus, String> {
+    let name = status
+        .name
+        .as_deref()
+        .and_then(normalized_dns_name)
+        .ok_or_else(|| "cannot persist a CT verdict without an exact fleet name".to_string())?;
+    Ok(DurableCtStatus {
+        name,
         state: status.ct_state.clone(),
         foreign_serials: status.ct_foreign_serials.clone(),
         unknown_summaries: status.ct_unknown.clone(),
         checked_unix_ms: status.ct_checked_unix_ms,
-    };
-    let mut serialized = serde_json::to_vec_pretty(&durable)
-        .map_err(|error| format!("serialize durable CT status: {error}"))?;
+    })
+}
+
+fn write_ct_status_locked_in(
+    cert_dir: &Path,
+    durable: &DurableCtStatus,
+) -> crate::access::AccessResult<()> {
+    let mut serialized = serde_json::to_vec_pretty(durable).map_err(|error| {
+        crate::access::AccessError(format!("serialize durable CT status: {error}"))
+    })?;
     serialized.push(b'\n');
+    if serialized.len() as u64 > FLEET_CT_STATUS_MAX_BYTES {
+        return Err(crate::access::AccessError(
+            "durable CT status exceeds its size limit".to_string(),
+        ));
+    }
+    crate::access::authority_store::atomic_write_private_locked(
+        &ct_status_path_in(cert_dir),
+        &serialized,
+    )
+}
+
+#[cfg(test)]
+fn persist_ct_status_in(cert_dir: &Path, status: &FleetCertStatus) -> Result<(), String> {
+    let durable = durable_ct_status_from_live(status)?;
     crate::access::authority_store::with_lock(cert_dir, || {
-        crate::access::authority_store::atomic_write_private_locked(
-            &ct_status_path_in(cert_dir),
-            &serialized,
-        )
+        write_ct_status_locked_in(cert_dir, &durable)
     })
     .map_err(|error| error.to_string())
 }
 
-fn load_ct_status_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, String> {
+fn load_ct_status_locked_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, String> {
     use std::io::Read as _;
 
     let path = ct_status_path_in(cert_dir);
@@ -1263,6 +1576,20 @@ fn load_ct_status_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, String>
     }
     let mut durable: DurableCtStatus = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    durable.name = normalized_dns_name(&durable.name)
+        .ok_or_else(|| format!("{} has no exact fleet name", path.display()))?;
+    if durable.foreign_serials.len() > FLEET_CT_FOREIGN_SERIALS_MAX
+        || durable.unknown_summaries.len() > FLEET_CT_FOREIGN_SERIALS_MAX
+        || durable
+            .unknown_summaries
+            .iter()
+            .any(|summary| summary.len() > 1024)
+    {
+        return Err(format!(
+            "{} exceeds the durable CT evidence bounds",
+            path.display()
+        ));
+    }
     let normalized = durable
         .foreign_serials
         .iter()
@@ -1291,6 +1618,38 @@ fn load_ct_status_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, String>
     Ok(Some(durable))
 }
 
+fn load_ct_status_in(cert_dir: &Path) -> Result<Option<DurableCtStatus>, String> {
+    crate::access::authority_store::with_lock(cert_dir, || {
+        load_ct_status_locked_in(cert_dir).map_err(crate::access::AccessError)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn durable_ct_status_for_name_in(
+    cert_dir: &Path,
+    name: &str,
+) -> Result<Option<DurableCtStatus>, String> {
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "cannot load CT evidence for an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        // The own-serial ledger is part of the verdict's interpretation. A
+        // malformed ledger must suspend every process, not look like no own
+        // certificates exist.
+        own_serial_records_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        let durable = load_ct_status_locked_in(cert_dir).map_err(crate::access::AccessError)?;
+        if let Some(durable) = durable.as_ref() {
+            if durable.name != name {
+                return Err(crate::access::AccessError(format!(
+                    "durable CT verdict belongs to {}, not the current fleet name {name}",
+                    durable.name
+                )));
+            }
+        }
+        Ok(durable)
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn restore_ct_status_in(cert_dir: &Path) {
     let loaded = load_ct_status_in(cert_dir);
     let mut warning = None;
@@ -1305,13 +1664,36 @@ fn apply_loaded_ct_status(
     loaded: Result<Option<DurableCtStatus>, String>,
 ) -> Option<String> {
     match loaded {
-        Ok(Some(durable)) => {
+        Ok(Some(durable))
+            if status
+                .name
+                .as_deref()
+                .and_then(normalized_dns_name)
+                .as_deref()
+                == Some(durable.name.as_str()) =>
+        {
             status.ct_state = durable.state;
             status.ct_foreign_serials = durable.foreign_serials;
             status.ct_unknown = durable.unknown_summaries;
             status.ct_checked_unix_ms = durable.checked_unix_ms;
             status.ct_last_error = None;
             None
+        }
+        Ok(Some(durable)) => {
+            let current = status
+                .name
+                .as_deref()
+                .and_then(normalized_dns_name)
+                .unwrap_or_else(|| "<none>".to_string());
+            let error = format!(
+                "durable CT verdict belongs to {}, not the current fleet name {current}",
+                durable.name
+            );
+            status.ct_state = "unreadable".to_string();
+            status.ct_foreign_serials.clear();
+            status.ct_unknown.clear();
+            status.ct_last_error = Some(error.clone());
+            Some(error)
         }
         Ok(None) => None,
         Err(error) => {
@@ -1322,6 +1704,17 @@ fn apply_loaded_ct_status(
             Some(error)
         }
     }
+}
+
+fn extend_ct_response(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), String> {
+    if bytes.len().saturating_add(chunk.len()) > FLEET_CT_RESPONSE_MAX_BYTES {
+        return Err(format!(
+            "crt.sh response exceeds the {} byte limit",
+            FLEET_CT_RESPONSE_MAX_BYTES
+        ));
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 /// Parse a crt.sh `output=json` response, deduplicating the
@@ -1359,6 +1752,7 @@ fn parse_crt_sh_entries(json_text: &str) -> Result<Vec<CtEntry>, String> {
 
 /// The foreign entries: publicly logged certificates for our name whose
 /// serials this daemon never recorded.
+#[cfg(test)]
 fn foreign_entries(logged: Vec<CtEntry>, own_serials: &[String]) -> Vec<CtEntry> {
     logged
         .into_iter()
@@ -1366,9 +1760,116 @@ fn foreign_entries(logged: Vec<CtEntry>, own_serials: &[String]) -> Vec<CtEntry>
         .collect()
 }
 
+enum CtCommit {
+    Applied(DurableCtStatus),
+    DeferredForIssuance,
+}
+
+fn ct_entry_summary(entry: &CtEntry) -> String {
+    format!(
+        "{} · {} · {}",
+        entry.serial_hex, entry.issuer, entry.not_before
+    )
+}
+
+fn commit_ct_entries_in(
+    cert_dir: &Path,
+    name: &str,
+    logged: Vec<CtEntry>,
+    checked_unix_ms: u64,
+) -> Result<CtCommit, String> {
+    let name = normalized_dns_name(name)
+        .ok_or_else(|| "cannot commit CT evidence for an empty fleet name".to_string())?;
+    crate::access::authority_store::with_lock(cert_dir, || {
+        let provenance =
+            load_fleet_origin_provenance_in(cert_dir).map_err(crate::access::AccessError)?;
+        if provenance.name.as_deref() != Some(name.as_str()) {
+            return Err(crate::access::AccessError(format!(
+                "fleet name changed before CT evidence commit for {name}"
+            )));
+        }
+        if issuance_active_locked_in(cert_dir, &name).map_err(crate::access::AccessError)? {
+            return Ok(CtCommit::DeferredForIssuance);
+        }
+
+        let own: std::collections::BTreeSet<String> = own_serial_records_locked_in(cert_dir)
+            .map_err(crate::access::AccessError)?
+            .into_iter()
+            .filter(|record| normalized_dns_name(&record.name).as_deref() == Some(name.as_str()))
+            .filter_map(|record| {
+                let serial = normalize_serial_hex(&record.serial_hex);
+                (!serial.is_empty()
+                    && serial.len() <= 128
+                    && serial.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                .then_some(serial)
+            })
+            .collect();
+        let mut summaries = std::collections::BTreeMap::<String, String>::new();
+        for entry in logged {
+            if !own.contains(&entry.serial_hex) {
+                summaries.insert(entry.serial_hex.clone(), ct_entry_summary(&entry));
+            }
+        }
+
+        // A second process may have committed evidence after this process
+        // began its public-index fetch. Merge it under the authority lock so
+        // an older empty result cannot erase an alert. A serial leaves the
+        // set only when the local issuance ledger proves it belongs here.
+        match load_ct_status_locked_in(cert_dir) {
+            Ok(Some(previous)) if previous.name == name => {
+                for serial in previous.foreign_serials {
+                    if own.contains(&serial) {
+                        continue;
+                    }
+                    let prior_summary = previous
+                        .unknown_summaries
+                        .iter()
+                        .find(|summary| {
+                            summary
+                                .strip_prefix(&serial)
+                                .is_some_and(|suffix| suffix.starts_with(" ·"))
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| format!("{serial} · previously observed"));
+                    summaries.entry(serial).or_insert(prior_summary);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // A complete successful fetch can reconstruct the verdict
+                // after a malformed prior file. The bounded response parser
+                // has already rejected partial/oversized evidence.
+            }
+        }
+        if summaries.len() > FLEET_CT_FOREIGN_SERIALS_MAX {
+            return Err(crate::access::AccessError(
+                "CT evidence exceeds the durable foreign-serial limit".to_string(),
+            ));
+        }
+        let foreign_serials = summaries.keys().cloned().collect::<Vec<_>>();
+        let unknown_summaries = summaries.into_values().collect::<Vec<_>>();
+        let durable = DurableCtStatus {
+            name,
+            state: if foreign_serials.is_empty() {
+                "ok".to_string()
+            } else {
+                "alert".to_string()
+            },
+            foreign_serials,
+            unknown_summaries,
+            checked_unix_ms: Some(checked_unix_ms),
+        };
+        write_ct_status_locked_in(cert_dir, &durable)?;
+        Ok(CtCommit::Applied(durable))
+    })
+    .map_err(|error| error.to_string())
+}
+
 /// One CT check against the public index. Fetch/parse failures set
 /// `ct_last_error` and leave the last successful verdict standing.
 pub async fn ct_check_once() {
+    use futures_util::StreamExt as _;
+
     let Some(name) = status_snapshot().name else {
         return;
     };
@@ -1387,80 +1888,60 @@ pub async fn ct_check_once() {
         if !response.status().is_success() {
             return Err(format!("crt.sh HTTP {}", response.status()));
         }
-        let text = response.text().await.map_err(|e| e.to_string())?;
-        parse_crt_sh_entries(&text)
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| error.to_string())?;
+            extend_ct_response(&mut bytes, &chunk)?;
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|error| format!("crt.sh response is not UTF-8: {error}"))?;
+        parse_crt_sh_entries(text)
     }
     .await;
     let now = now_unix_ms();
     match result {
-        Ok(logged) => {
-            // Issuance can complete while the public-index request is in
-            // flight. Snapshot the locked own-certificate ledger only after
-            // the fetch so a newly recorded serial cannot become a false
-            // foreign-certificate alert.
-            let own = match own_serials_for_exact_name_in(&certificate_dir, &name) {
-                Ok(own) => own,
-                Err(error) => {
-                    with_status(|status| {
-                        if fleet_name_matches(status.name.as_deref(), &name) {
-                            status.ct_state = "unreadable".to_string();
-                            status.ct_foreign_serials.clear();
-                            status.ct_unknown.clear();
-                            status.ct_last_error =
-                                Some(format!("read own-certificate ledger: {error}"));
-                        }
-                    });
-                    return;
-                }
-            };
-            let foreign = foreign_entries(logged, &own);
-            let mut applied = false;
-            with_status(|status| {
-                if !fleet_name_matches(status.name.as_deref(), &name) {
-                    return;
-                }
-                applied = true;
-                status.ct_checked_unix_ms = Some(now);
-                status.ct_last_error = None;
-                if foreign.is_empty() {
-                    status.ct_state = "ok".to_string();
-                    status.ct_unknown = Vec::new();
-                    status.ct_foreign_serials = Vec::new();
-                } else {
-                    status.ct_state = "alert".to_string();
-                    status.ct_foreign_serials = foreign
-                        .iter()
-                        .map(|entry| entry.serial_hex.clone())
-                        .collect();
-                    status.ct_unknown = foreign
-                        .iter()
-                        .map(|entry| {
-                            format!(
-                                "{} · {} · {}",
-                                entry.serial_hex, entry.issuer, entry.not_before
-                            )
-                        })
-                        .collect();
-                }
-            });
-            if !applied {
-                return;
+        Ok(logged) => match commit_ct_entries_in(&certificate_dir, &name, logged, now) {
+            Ok(CtCommit::DeferredForIssuance) => {
+                with_status(|status| {
+                    if fleet_name_matches(status.name.as_deref(), &name) {
+                        status.ct_last_error = Some(
+                            "CT verdict deferred while certificate issuance is active".to_string(),
+                        );
+                    }
+                });
             }
-            let status = status_snapshot();
-            if let Err(error) = persist_ct_status_in(&certificate_dir, &status) {
-                eprintln!("[fleet-cert] persist durable CT status: {error}");
+            Ok(CtCommit::Applied(durable)) => {
+                let alert = durable.state == "alert";
+                let summaries = durable.unknown_summaries.clone();
+                with_status(|status| {
+                    if fleet_name_matches(status.name.as_deref(), &name) {
+                        let _ = apply_loaded_ct_status(status, Ok(Some(durable)));
+                    }
+                });
+                if alert {
+                    eprintln!(
+                            "[fleet-cert] CT ALERT: {} certificate(s) for {name} in the public CT logs \
+                             that this daemon never requested: {:?} — if you did not mint these through \
+                             another channel, treat the fleet route as compromised and reach this \
+                             daemon directly",
+                            summaries.len(),
+                            summaries,
+                        );
+                }
             }
-            if status.ct_state == "alert" {
-                eprintln!(
-                    "[fleet-cert] CT ALERT: {} certificate(s) for {name} in the public CT logs \
-                     that this daemon never requested: {:?} — if you did not mint these through \
-                     another channel, treat the fleet route as compromised and reach this \
-                     daemon directly",
-                    status.ct_unknown.len(),
-                    status.ct_unknown,
-                );
+            Err(error) => {
+                eprintln!("[fleet-cert] commit durable CT status: {error}");
+                with_status(|status| {
+                    if fleet_name_matches(status.name.as_deref(), &name) {
+                        status.ct_state = "unreadable".to_string();
+                        status.ct_foreign_serials.clear();
+                        status.ct_unknown.clear();
+                        status.ct_last_error = Some(format!("commit durable CT status: {error}"));
+                    }
+                });
             }
-        }
+        },
         Err(error) => {
             with_status(|status| {
                 if fleet_name_matches(status.name.as_deref(), &name) {
@@ -1574,6 +2055,7 @@ mod tests {
         .unwrap();
         let restored = load_fleet_origin_provenance_in(temp.path()).unwrap();
         assert_eq!(restored.name.as_deref(), Some("new.fleet.example.test"));
+        assert_eq!(restored.known_zones, vec!["fleet.example.test".to_string()]);
         assert_eq!(
             restored.known_names,
             vec![
@@ -1581,6 +2063,9 @@ mod tests {
                 "old.fleet.example.test".to_string(),
             ]
         );
+        assert!(is_service_controlled_name_in(temp.path(), "custom.fleet.example.test").unwrap());
+        assert!(is_service_controlled_name_in(temp.path(), "fleet.example.test").unwrap());
+        assert!(!is_service_controlled_name_in(temp.path(), "fleet-example.test").unwrap());
 
         let metadata = std::fs::metadata(fleet_origin_provenance_path_in(temp.path())).unwrap();
         #[cfg(unix)]
@@ -1805,6 +2290,15 @@ mod tests {
         let error = require_fleet_certificate_dns_name(&cert.cert.pem(), "new.fleet.example.test")
             .unwrap_err();
         assert!(error.contains("current exact name"), "{error}");
+
+        let extra = rcgen::generate_simple_self_signed(vec![
+            "old.fleet.example.test".to_string(),
+            "custom.example.test".to_string(),
+        ])
+        .unwrap();
+        let error = require_fleet_certificate_dns_name(&extra.cert.pem(), "old.fleet.example.test")
+            .unwrap_err();
+        assert!(error.contains("must equal only"), "{error}");
     }
 
     #[test]
@@ -1959,6 +2453,7 @@ mod tests {
     fn successful_ct_verdict_round_trips_through_the_durable_store() {
         let temp = tempfile::tempdir().unwrap();
         let status = FleetCertStatus {
+            name: Some("one.fleet.example.test".to_string()),
             ct_state: "alert".to_string(),
             ct_unknown: vec!["b · issuer · time".to_string()],
             ct_foreign_serials: vec!["000b".to_string(), "0A".to_string()],
@@ -1970,6 +2465,7 @@ mod tests {
         assert_eq!(
             load_ct_status_in(temp.path()),
             Ok(Some(DurableCtStatus {
+                name: "one.fleet.example.test".to_string(),
                 state: "alert".to_string(),
                 foreign_serials: vec!["a".to_string(), "b".to_string()],
                 unknown_summaries: vec!["b · issuer · time".to_string()],
@@ -1992,6 +2488,91 @@ mod tests {
     }
 
     #[test]
+    fn ct_verdict_is_bound_to_the_exact_fleet_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_name = "old.fleet.example.test";
+        let new_name = "new.fleet.example.test";
+        persist_ct_status_in(
+            temp.path(),
+            &FleetCertStatus {
+                name: Some(old_name.to_string()),
+                ct_state: "ok".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut status = FleetCertStatus {
+            name: Some(new_name.to_string()),
+            ..Default::default()
+        };
+        let warning = apply_loaded_ct_status(&mut status, load_ct_status_in(temp.path()));
+        assert!(warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains(old_name) && warning.contains(new_name)));
+        assert_eq!(status.ct_state, "unreadable");
+    }
+
+    #[test]
+    fn ct_commits_merge_foreign_evidence_until_the_serial_is_recorded_as_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "one.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let first = commit_ct_entries_in(
+            temp.path(),
+            name,
+            vec![CtEntry {
+                serial_hex: "a".to_string(),
+                issuer: "issuer".to_string(),
+                not_before: "time".to_string(),
+            }],
+            1,
+        )
+        .unwrap();
+        assert!(matches!(first, CtCommit::Applied(_)));
+        let stale_empty = commit_ct_entries_in(temp.path(), name, Vec::new(), 2).unwrap();
+        let CtCommit::Applied(stale_empty) = stale_empty else {
+            panic!("no issuance is active");
+        };
+        assert_eq!(stale_empty.foreign_serials, vec!["a".to_string()]);
+
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.serial_number = Some(rcgen::SerialNumber::from(vec![0x0a]));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        record_own_certificate_in(temp.path(), &certificate.pem(), name, "test").unwrap();
+        let reconciled = load_ct_status_in(temp.path()).unwrap().unwrap();
+        assert_eq!(reconciled.state, "ok");
+        assert!(reconciled.foreign_serials.is_empty());
+    }
+
+    #[test]
+    fn ct_commit_defers_while_a_durable_issuance_is_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let name = "one.fleet.example.test";
+        remember_fleet_origin_in(temp.path(), Some("fleet.example.test"), name).unwrap();
+        let token = begin_issuance_in(temp.path(), name).unwrap();
+        assert!(matches!(
+            commit_ct_entries_in(
+                temp.path(),
+                name,
+                vec![CtEntry {
+                    serial_hex: "a".to_string(),
+                    issuer: "issuer".to_string(),
+                    not_before: "time".to_string(),
+                }],
+                1,
+            )
+            .unwrap(),
+            CtCommit::DeferredForIssuance
+        ));
+        finish_issuance_in(temp.path(), &token).unwrap();
+        assert!(matches!(
+            commit_ct_entries_in(temp.path(), name, Vec::new(), 2).unwrap(),
+            CtCommit::Applied(_)
+        ));
+    }
+
+    #[test]
     fn crt_sh_parsing_dedupes_precert_pairs_and_flags_foreign_serials() {
         let fixture = r#"[
             {"issuer_name":"C=US, O=Let's Encrypt, CN=R11","serial_number":"03AB01","not_before":"2026-07-09T00:00:00"},
@@ -2009,5 +2590,14 @@ mod tests {
 
         assert!(parse_crt_sh_entries("<html>rate limited</html>").is_err());
         assert_eq!(parse_crt_sh_entries("[]").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn crt_sh_response_accumulation_is_bounded() {
+        let mut bytes = vec![0; FLEET_CT_RESPONSE_MAX_BYTES];
+        assert!(extend_ct_response(&mut bytes, &[1])
+            .unwrap_err()
+            .contains("byte limit"));
+        assert_eq!(bytes.len(), FLEET_CT_RESPONSE_MAX_BYTES);
     }
 }

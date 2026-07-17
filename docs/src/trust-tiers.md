@@ -357,13 +357,16 @@ the owner's memory. All four are **shipped**:
    integrated-tier warning on any network route. Fleet and hosted classes do
    not admit ordinary browser-key control; an exact hosted lease is evaluated
    separately. The **CT tripwire** is a route diagnostic: `fleet_cert`
-   records the serial of
-   every certificate it obtains (before install, so a crash cannot make
-   an own certificate look foreign), polls crt.sh for the daemon's fleet
-   name on each renewal tick, and flips the Connect card to **CT ALERT**
-   on any serial the daemon never requested. Advisory and fail-open by
-   design: a crt.sh outage stamps `ct_last_error` rather than blocking
-   renewal.
+   records the serial of every certificate it obtains (before install, so a
+   crash cannot make an own certificate look foreign), polls crt.sh for the
+   daemon's exact fleet name on each renewal tick, and flips the Connect card
+   to **CT ALERT** on any serial the daemon never requested. The exact-name
+   verdict and active-issuance marker are durable under the cross-process
+   authority lock; processes merge foreign serials instead of overwriting
+   newer evidence, and only a locally recorded own serial removes one.
+   A foreign serial or unreadable durable verdict suspends hosted-lease
+   admission. A crt.sh fetch failure creates no new evidence, preserves the
+   last durable verdict, and does not block certificate renewal.
 
 ## Two lanes: whose authority a pane spends
 
