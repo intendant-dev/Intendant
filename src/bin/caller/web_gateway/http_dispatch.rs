@@ -26,6 +26,11 @@ pub(crate) struct HttpRequestCtx {
     pub(crate) app_html: Arc<String>,
     pub(crate) app_html_override: Option<Arc<std::path::Path>>,
     pub(crate) app_html_cache: Arc<OnceLock<(String, Vec<u8>)>>,
+    /// The V3 dashboard's `INTENDANT_V3_HTML_PATH` dev override (a whole
+    /// directory) and its entry point's per-spawn ETag/gzip cache — the
+    /// app.html pair's exact counterpart for the /v3 serving arms.
+    pub(crate) v3_override_dir: Option<Arc<std::path::Path>>,
+    pub(crate) v3_html_cache: Arc<OnceLock<(String, Vec<u8>)>>,
     pub(crate) worktree_inventory_cache: Arc<Mutex<Option<String>>>,
     pub(crate) mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     pub(crate) peer_registry: Option<crate::peer::PeerRegistry>,
@@ -94,6 +99,8 @@ pub(crate) async fn serve_http_request(
         app_html,
         app_html_override,
         app_html_cache,
+        v3_override_dir,
+        v3_html_cache,
         worktree_inventory_cache,
         mcp_server,
         peer_registry,
@@ -2123,6 +2130,68 @@ pub(crate) async fn serve_http_request(
             .into_string();
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if req_path == "/v3" || req_path == "/v3/" {
+        // The V3 dashboard's entry point — a standalone shell alongside
+        // the classic app.html, on the same serving policy: no-cache,
+        // ETag, gzip, deny-framing. ETag + gzip are computed once per
+        // gateway spawn, on first load (the app_html_cache pattern).
+        // Under INTENDANT_V3_HTML_PATH the override dir's v3.html is
+        // re-read (and re-tagged) on every request instead.
+        let reuse = stream.exchange_reusable();
+        let response = if let Some(dir) = v3_override_dir.as_deref() {
+            v3_override_response(req_method, header_text, req_query, dir, "", reuse)
+        } else {
+            let (etag, gzip) = v3_html_cache.get_or_init(|| {
+                (
+                    asset_etag(V3_HTML.as_bytes()),
+                    gzip_compress(V3_HTML.as_bytes()),
+                )
+            });
+            build_static_asset_response(
+                req_method,
+                header_text,
+                req_query,
+                asset_version(),
+                StaticAssetView {
+                    content_type: "text/html; charset=utf-8",
+                    body: V3_HTML.as_bytes(),
+                    etag,
+                    gzip: Some(gzip),
+                    cache_control: Some("no-cache"),
+                },
+                reuse,
+            )
+        };
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if let (Some(dir), Some(rest)) =
+        (v3_override_dir.as_deref(), req_path.strip_prefix("/v3/"))
+    {
+        // V3 assets under the override dir: fresh disk read per request,
+        // loud failure — serving the embedded copy would silently mask
+        // the file the developer is iterating on.
+        let reuse = stream.exchange_reusable();
+        let response = v3_override_response(req_method, header_text, req_query, dir, rest, reuse);
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(&response).await.is_ok();
+        parked_ok = reuse && write_ok;
+    } else if let Some(asset) = static_asset_arm(req_method, req_path, v3_asset_paths()) {
+        // The embedded V3 assets, restricted to the declared V3_ASSETS
+        // set — an unregistered /v3/* path falls through to the default
+        // arm like any other unknown path.
+        let reuse = stream.exchange_reusable();
+        let response = build_static_asset_response(
+            req_method,
+            header_text,
+            req_query,
+            asset_version(),
+            asset.view(),
+            reuse,
+        );
+        use tokio::io::AsyncWriteExt;
+        let write_ok = stream.write_all(&response).await.is_ok();
         parked_ok = reuse && write_ok;
     } else if req_method == "GET" || req_method == "HEAD" {
         // Default: serve app.html (also matches /app for

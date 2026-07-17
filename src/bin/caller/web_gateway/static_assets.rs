@@ -103,6 +103,182 @@ pub(crate) const FONT_JBMONO_LATIN: &[u8] =
 pub(crate) const FONT_JBMONO_LATIN_EXT: &[u8] =
     include_bytes!("../../../../static/fonts/jetbrains-mono-latin-ext.woff2");
 
+// The standalone V3 dashboard (static/v3/): a second, self-contained
+// shell served at /v3 alongside the classic app.html. Its assets are
+// unversioned — no `?v=` rewrite — so the entry point is served by its
+// own no-cache arm (like app.html) and only the assets in [`V3_ASSETS`]
+// live in the embedded map.
+pub(crate) const V3_HTML: &str = include_str!("../../../../static/v3/v3.html");
+
+pub(crate) const V3_TOKENS_CSS: &str = include_str!("../../../../static/v3/v3-tokens.css");
+
+pub(crate) const V3_APP_CSS: &str = include_str!("../../../../static/v3/v3-app.css");
+
+pub(crate) const V3_ROOMS_CSS: &str = include_str!("../../../../static/v3/v3-rooms.css");
+
+pub(crate) const V3_ICONS_JS: &str = include_str!("../../../../static/v3/js/v3-icons.js");
+
+pub(crate) const V3_TRANSPORT_JS: &str = include_str!("../../../../static/v3/js/v3-transport.js");
+
+pub(crate) const V3_DATA_JS: &str = include_str!("../../../../static/v3/js/v3-data.js");
+
+pub(crate) const V3_UI_JS: &str = include_str!("../../../../static/v3/js/v3-ui.js");
+
+pub(crate) const V3_PALETTE_JS: &str = include_str!("../../../../static/v3/js/v3-palette.js");
+
+pub(crate) const V3_APP_JS: &str = include_str!("../../../../static/v3/js/v3-app.js");
+
+pub(crate) const V3_VIEW_HOME_JS: &str = include_str!("../../../../static/v3/js/views/home.js");
+
+pub(crate) const V3_VIEW_WORK_JS: &str = include_str!("../../../../static/v3/js/views/work.js");
+
+pub(crate) const V3_VIEW_SESSION_JS: &str =
+    include_str!("../../../../static/v3/js/views/session.js");
+
+pub(crate) const V3_VIEW_SCREENS_JS: &str =
+    include_str!("../../../../static/v3/js/views/screens.js");
+
+pub(crate) const V3_VIEW_FILES_JS: &str = include_str!("../../../../static/v3/js/views/files.js");
+
+pub(crate) const V3_VIEW_MACHINES_JS: &str =
+    include_str!("../../../../static/v3/js/views/machines.js");
+
+pub(crate) const V3_VIEW_PEOPLE_JS: &str = include_str!("../../../../static/v3/js/views/people.js");
+
+pub(crate) const V3_VIEW_BOOKS_JS: &str = include_str!("../../../../static/v3/js/views/books.js");
+
+pub(crate) const V3_VIEW_SETTINGS_JS: &str =
+    include_str!("../../../../static/v3/js/views/settings.js");
+
+pub(crate) const V3_VIEW_STATION_JS: &str =
+    include_str!("../../../../static/v3/js/views/station.js");
+
+pub(crate) const V3_VIEW_STUDIO_JS: &str = include_str!("../../../../static/v3/js/views/studio.js");
+
+/// The V3 dashboard's embedded assets — (request path, content type,
+/// body, compressible). One declaration drives both the embedded-asset
+/// map and the `/v3/*` routing arm's path set ([`v3_asset_paths`]), so
+/// the HTML's `<link>`/`<script>` URLs, the map, and the arm can never
+/// drift. v3.html itself is deliberately absent: it is served by its own
+/// no-cache arm (like app.html), never from this table.
+pub(crate) const V3_ASSETS: [(&str, &str, &[u8], bool); 20] = [
+    (
+        "/v3/v3-tokens.css",
+        "text/css",
+        V3_TOKENS_CSS.as_bytes(),
+        true,
+    ),
+    ("/v3/v3-app.css", "text/css", V3_APP_CSS.as_bytes(), true),
+    (
+        "/v3/v3-rooms.css",
+        "text/css",
+        V3_ROOMS_CSS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-icons.js",
+        "application/javascript",
+        V3_ICONS_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-transport.js",
+        "application/javascript",
+        V3_TRANSPORT_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-data.js",
+        "application/javascript",
+        V3_DATA_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-ui.js",
+        "application/javascript",
+        V3_UI_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-palette.js",
+        "application/javascript",
+        V3_PALETTE_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/v3-app.js",
+        "application/javascript",
+        V3_APP_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/home.js",
+        "application/javascript",
+        V3_VIEW_HOME_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/work.js",
+        "application/javascript",
+        V3_VIEW_WORK_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/session.js",
+        "application/javascript",
+        V3_VIEW_SESSION_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/screens.js",
+        "application/javascript",
+        V3_VIEW_SCREENS_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/files.js",
+        "application/javascript",
+        V3_VIEW_FILES_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/machines.js",
+        "application/javascript",
+        V3_VIEW_MACHINES_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/people.js",
+        "application/javascript",
+        V3_VIEW_PEOPLE_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/books.js",
+        "application/javascript",
+        V3_VIEW_BOOKS_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/settings.js",
+        "application/javascript",
+        V3_VIEW_SETTINGS_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/station.js",
+        "application/javascript",
+        V3_VIEW_STATION_JS.as_bytes(),
+        true,
+    ),
+    (
+        "/v3/js/views/studio.js",
+        "application/javascript",
+        V3_VIEW_STUDIO_JS.as_bytes(),
+        true,
+    ),
+];
+
 /// Compute a short content hash for cache-busting embedded static assets.
 /// When the WASM, JS, or favicon changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
@@ -300,6 +476,11 @@ pub(crate) fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStati
             MANIFEST_WEBMANIFEST.as_bytes(),
             false,
         );
+        // The V3 dashboard's assets (the shell itself is served by its
+        // own no-cache arm, like app.html — never from this map).
+        for (path, content_type, body, compressible) in V3_ASSETS {
+            insert(path, content_type, body, compressible);
+        }
         map
     });
     assets.get(path)
@@ -589,6 +770,128 @@ pub(crate) fn vault_kernel_override_response(
         },
         keep_alive,
     ))
+}
+
+/// The request paths of the V3 dashboard's assets, derived once from
+/// [`V3_ASSETS`] — the `/v3/*` routing arm's exact-path allowlist, so a
+/// declared asset is routable by construction (and nothing else is).
+pub(crate) fn v3_asset_paths() -> &'static [&'static str] {
+    static PATHS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    PATHS.get_or_init(|| V3_ASSETS.iter().map(|(path, ..)| *path).collect())
+}
+
+/// The `INTENDANT_V3_HTML_PATH` dev override: serve the V3 dashboard and
+/// its assets from this disk *directory* instead of the embedded copies,
+/// re-reading on every request — a static/v3/ edit shows up on browser
+/// refresh with no daemon rebuild or restart. Read once at gateway
+/// spawn; a whitespace-only value counts as unset.
+pub(crate) fn v3_html_override_dir() -> Option<std::path::PathBuf> {
+    v3_html_override_dir_from(std::env::var("INTENDANT_V3_HTML_PATH").ok())
+}
+
+fn v3_html_override_dir_from(raw: Option<String>) -> Option<std::path::PathBuf> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Content type for a file served from the V3 override directory, by
+/// extension; anything unrecognized is opaque bytes.
+fn v3_override_content_type(rest: &str) -> &'static str {
+    match rest.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("woff2") => "font/woff2",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Serve one V3 dashboard request under the `INTENDANT_V3_HTML_PATH`
+/// override: `<dir>/v3.html` for the entry point (empty `rest`), else
+/// `<dir>/<rest>` — a fresh disk read either way, a fresh strong ETag
+/// (an unchanged file still revalidates to 304), no-cache, no gzip, and
+/// deny-framing on HTML via [`build_static_asset_response`]. Any `..` in
+/// `rest` is rejected outright: the override dir is the root this lane
+/// may read from. A read failure is a loud 500 naming the override —
+/// falling back to the embedded copy would silently mask the broken path
+/// the developer is trying to iterate on.
+pub(crate) fn v3_override_response(
+    method: &str,
+    header_text: &str,
+    query: &str,
+    dir: &std::path::Path,
+    rest: &str,
+    keep_alive: bool,
+) -> Vec<u8> {
+    if rest.contains("..") {
+        let body = "V3 asset paths may not contain '..'.\n";
+        let mut response = HttpResponse::new("400 Bad Request")
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Content-Length", body.len().to_string())
+            .header("Cache-Control", "no-store")
+            .header("Access-Control-Allow-Origin", "*")
+            .connection_reuse(keep_alive)
+            .into_bytes();
+        if method != "HEAD" {
+            response.extend_from_slice(body.as_bytes());
+        }
+        return response;
+    }
+    let file_rel = if rest.is_empty() { "v3.html" } else { rest };
+    let target = dir.join(file_rel);
+    match std::fs::read(&target) {
+        Ok(body) => {
+            let etag = asset_etag(&body);
+            build_static_asset_response(
+                method,
+                header_text,
+                query,
+                asset_version(),
+                StaticAssetView {
+                    content_type: v3_override_content_type(file_rel),
+                    body: &body,
+                    etag: &etag,
+                    gzip: None,
+                    cache_control: Some("no-cache"),
+                },
+                keep_alive,
+            )
+        }
+        Err(err) => {
+            // The configured path and the OS error stay server-side
+            // (the app.html override's rationale: this response is
+            // served certificate-free from the shell lane, so a body
+            // echoing the absolute override path would hand any
+            // reachable page a local username/project layout whenever
+            // the dev override is broken).
+            eprintln!(
+                "[web_gateway] INTENDANT_V3_HTML_PATH read failed ({}): {err}",
+                target.display()
+            );
+            let body = "INTENDANT_V3_HTML_PATH override is active but the requested \
+                 V3 file could not be read. Check the daemon log for the path and \
+                 error, then fix the override directory (or unset \
+                 INTENDANT_V3_HTML_PATH) and refresh.\n";
+            let mut response = HttpResponse::new("500 Internal Server Error")
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Length", body.len().to_string())
+                .header("Cache-Control", "no-store")
+                .header("Access-Control-Allow-Origin", "*")
+                .connection_reuse(keep_alive)
+                .into_bytes();
+            if method != "HEAD" {
+                response.extend_from_slice(body.as_bytes());
+            }
+            response
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1212,6 +1515,164 @@ mod tests {
         assert!(!text.contains(&dir.path().display().to_string()));
         // HEAD keeps the status but sends headers only.
         let head = app_html_override_response("HEAD", "", "", &path, false);
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 500"));
+        assert!(head.ends_with("\r\n\r\n"));
+    }
+
+    /// The V3 catalog: every declared asset is embedded with its declared
+    /// content type and body, and the shell references every declared
+    /// asset — a declared path v3.html never fetches is drift between the
+    /// catalog and the page.
+    #[test]
+    fn v3_assets_are_embedded_and_referenced_by_the_shell() {
+        assert!(!V3_HTML.is_empty());
+        assert!(V3_HTML.contains("<!DOCTYPE html>"));
+        for (path, content_type, body, _compressible) in V3_ASSETS {
+            assert!(path.starts_with("/v3/"), "{path} must live under /v3/");
+            let asset = embedded_static_asset(path).expect(path);
+            assert_eq!(asset.content_type, content_type, "{path}");
+            assert_eq!(asset.body, body, "{path}");
+            assert!(!body.is_empty(), "{path} must not embed an empty file");
+            assert!(V3_HTML.contains(path), "v3.html must reference {path}");
+        }
+        // The entry point itself is NOT in the embedded map: it is served
+        // by its own no-cache arm, like app.html.
+        assert!(embedded_static_asset("/v3").is_none());
+        assert!(embedded_static_asset("/v3/v3.html").is_none());
+    }
+
+    /// The `/v3/*` arm's allowlist is derived from the declared assets and
+    /// keeps the arm's GET/HEAD + exact-path semantics.
+    #[test]
+    fn v3_asset_paths_match_the_declared_assets() {
+        let paths = v3_asset_paths();
+        assert_eq!(paths.len(), V3_ASSETS.len());
+        for (path, ..) in V3_ASSETS {
+            assert!(paths.contains(&path), "{path} must be routable");
+        }
+        let asset = static_asset_arm("GET", "/v3/v3-app.css", paths).expect("declared css");
+        assert_eq!(asset.content_type, "text/css");
+        assert_eq!(asset.body, V3_APP_CSS.as_bytes());
+        assert!(static_asset_arm("HEAD", "/v3/js/v3-app.js", paths).is_some());
+        // Non-GET/HEAD and undeclared paths (including the shell itself)
+        // fall through to later arms.
+        assert!(static_asset_arm("POST", "/v3/v3-app.css", paths).is_none());
+        assert!(static_asset_arm("GET", "/v3/v3.html", paths).is_none());
+        assert!(static_asset_arm("GET", "/v3/js/views/nope.js", paths).is_none());
+    }
+
+    #[test]
+    fn v3_override_dir_blank_values_count_as_unset() {
+        assert_eq!(v3_html_override_dir_from(None), None);
+        assert_eq!(v3_html_override_dir_from(Some(String::new())), None);
+        assert_eq!(v3_html_override_dir_from(Some("   ".into())), None);
+        assert_eq!(
+            v3_html_override_dir_from(Some(" /tmp/v3 ".into())),
+            Some(std::path::PathBuf::from("/tmp/v3"))
+        );
+    }
+
+    #[test]
+    fn v3_override_content_type_by_extension() {
+        assert_eq!(
+            v3_override_content_type("v3.html"),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(v3_override_content_type("v3-app.css"), "text/css");
+        assert_eq!(
+            v3_override_content_type("js/v3-app.js"),
+            "application/javascript"
+        );
+        assert_eq!(v3_override_content_type("icon.png"), "image/png");
+        assert_eq!(v3_override_content_type("icon.svg"), "image/svg+xml");
+        assert_eq!(v3_override_content_type("font.woff2"), "font/woff2");
+        assert_eq!(v3_override_content_type("data.json"), "application/json");
+        assert_eq!(
+            v3_override_content_type("README"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            v3_override_content_type("archive.bin"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn v3_override_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        for rest in ["../app.html", "js/../../secret", "v3..html"] {
+            let resp = v3_override_response("GET", "", "", dir.path(), rest, false);
+            let text = String::from_utf8_lossy(&resp);
+            assert!(text.starts_with("HTTP/1.1 400"), "{rest} must be rejected");
+        }
+        // HEAD on a rejected path keeps the status but sends headers only.
+        let head = v3_override_response("HEAD", "", "", dir.path(), "../x", false);
+        let head = String::from_utf8_lossy(&head);
+        assert!(head.starts_with("HTTP/1.1 400"));
+        assert!(head.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn v3_override_serves_html_at_empty_rest_and_rereads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("v3.html"), "<!DOCTYPE html>v3-one").unwrap();
+        let first = v3_override_response("GET", "", "", dir.path(), "", false);
+        let first = String::from_utf8_lossy(&first);
+        assert!(first.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(first.contains("Content-Type: text/html"));
+        assert!(first.contains("Cache-Control: no-cache"));
+        // HTML is deny-framed, like every dashboard response.
+        assert!(first.contains("X-Frame-Options: DENY"));
+        assert!(first.ends_with("v3-one"));
+
+        // An edit is visible on the very next request — nothing caches it.
+        std::fs::write(dir.path().join("v3.html"), "<!DOCTYPE html>v3-two").unwrap();
+        let second = v3_override_response("GET", "", "", dir.path(), "", false);
+        let second = String::from_utf8_lossy(&second);
+        assert!(second.ends_with("v3-two"));
+
+        // Unchanged content still revalidates to a 304 via its fresh ETag.
+        let etag = second
+            .split("ETag: \"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("override response carries an ETag")
+            .to_string();
+        let third = v3_override_response(
+            "GET",
+            &format!("If-None-Match: \"{etag}\"\r\n"),
+            "",
+            dir.path(),
+            "",
+            false,
+        );
+        assert!(String::from_utf8_lossy(&third).starts_with("HTTP/1.1 304"));
+    }
+
+    #[test]
+    fn v3_override_serves_assets_and_missing_is_a_loud_500() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("js")).unwrap();
+        std::fs::write(dir.path().join("js/v3-app.js"), "window.V3={};").unwrap();
+        let resp = v3_override_response("GET", "", "", dir.path(), "js/v3-app.js", false);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Type: application/javascript"));
+        assert!(text.contains("Cache-Control: no-cache"));
+        assert!(text.ends_with("window.V3={};"));
+
+        let resp = v3_override_response("GET", "", "", dir.path(), "js/missing.js", false);
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 500"));
+        assert!(text.contains("INTENDANT_V3_HTML_PATH"));
+        // The absolute path (and the OS error) must never reach the body —
+        // this page is readable certificate-free, and the path leaks a
+        // local username/project layout. It is logged server-side instead.
+        assert!(!text.contains("missing.js"));
+        assert!(!text.contains(&dir.path().display().to_string()));
+        // HEAD keeps the status but sends headers only.
+        let head = v3_override_response("HEAD", "", "", dir.path(), "js/missing.js", false);
         let head = String::from_utf8_lossy(&head);
         assert!(head.starts_with("HTTP/1.1 500"));
         assert!(head.ends_with("\r\n\r\n"));

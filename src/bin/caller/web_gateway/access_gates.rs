@@ -261,8 +261,10 @@ pub(crate) fn has_reverse_proxy_provenance(header_text: &str) -> bool {
 /// ICE/TURN configuration) and every state/action route stays behind IAM.
 pub(crate) fn is_public_dashboard_shell_or_asset(method: &str, path: &str) -> bool {
     matches!(method, "GET" | "HEAD")
-        && (matches!(path, "/" | "/index.html" | "/app" | "/access")
-            || path == "/.well-known/agent-card.json"
+        && (matches!(
+            path,
+            "/" | "/index.html" | "/app" | "/access" | "/v3" | "/v3/"
+        ) || path == "/.well-known/agent-card.json"
             || embedded_static_asset(path).is_some())
 }
 
@@ -834,6 +836,7 @@ mod tests {
             "/index.html",
             "/app",
             "/access",
+            "/v3",
             "/.well-known/agent-card.json",
             "/wasm-web/presence_web.js",
             "/icon-128.png",

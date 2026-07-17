@@ -1184,6 +1184,26 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // rewritten HTML is gateway-scoped (unlike the `include_*!` constants
     // behind `embedded_static_asset`), so its cache lives here.
     let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
+    // INTENDANT_V3_HTML_PATH (dev override): read once at spawn; when
+    // set, every /v3 request re-reads that directory instead of serving
+    // the embedded V3 dashboard and its assets.
+    let v3_override_dir: Option<Arc<std::path::Path>> = v3_html_override_dir().map(Arc::from);
+    if let Some(dir) = &v3_override_dir {
+        eprintln!(
+            "[web_gateway] INTENDANT_V3_HTML_PATH: serving the V3 dashboard from {} \
+             (re-read per request; the embedded copy is ignored)",
+            dir.display()
+        );
+        if let Err(err) = std::fs::metadata(dir) {
+            eprintln!(
+                "[web_gateway] WARNING: INTENDANT_V3_HTML_PATH is not readable right now: {err}"
+            );
+        }
+    }
+    // The V3 entry point's per-spawn (ETag token, gzipped body) — the
+    // app_html_cache pattern; V3_HTML is unrewritten, so this is pure
+    // first-load amortization.
+    let v3_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
     let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
     let lifecycle_shared_session = shared_session.clone();
     let lifecycle_authority = Arc::clone(&display_input_authority);
@@ -1345,6 +1365,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let app_html = app_html.clone();
             let app_html_cache = app_html_cache.clone();
             let app_html_override = app_html_override.clone();
+            let v3_override_dir = v3_override_dir.clone();
+            let v3_html_cache = v3_html_cache.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
@@ -1757,6 +1779,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         app_html: app_html.clone(),
                         app_html_override: app_html_override.clone(),
                         app_html_cache: app_html_cache.clone(),
+                        v3_override_dir: v3_override_dir.clone(),
+                        v3_html_cache: v3_html_cache.clone(),
                         worktree_inventory_cache: worktree_inventory_cache.clone(),
                         mcp_server: mcp_server.clone(),
                         peer_registry: peer_registry.clone(),
