@@ -1082,15 +1082,19 @@ const VITALS_SYMBOLS = {
     label: 'Model',
     priority: 28,
     unavailable: 'Not reported yet — appears once the agent names its model (or its launch settings do).',
-    chip: (v) => `⬡ ${v.shortName}${v.effort ? ` · ${v.effort}` : ''}`,
+    chip: (v) => (v.shortName
+      ? `⬡ ${v.shortName}${v.effort ? ` · ${v.effort}` : ''}`
+      : `⬡ ${v.effort} effort`),
     explain: (v) => {
-      const lines = [`This session runs on ${v.model}.`];
+      const lines = [v.model
+        ? `This session runs on ${v.model}.`
+        : "The agent hasn't named its model yet — it runs on its own default."];
       if (v.effort) {
         lines.push(`Reasoning effort is set to “${v.effort}” — how hard the model may think before answering. A setting, not a measurement.`);
       }
       return lines;
     },
-    action: (v) => ({ label: 'Copy model id', run: () => vitalsCopyText(v.model) }),
+    action: (v) => (v.model ? { label: 'Copy model id', run: () => vitalsCopyText(v.model) } : null),
   },
   permissions: {
     label: 'Permissions',
@@ -1357,8 +1361,8 @@ function vitalsChipModels(vitals, meta, sessionId) {
     const model = String(facts.model || '').trim();
     if (model || factsEffort) {
       push('model', 'model', {
-        model: model || 'not reported',
-        shortName: vitalsModelShortName(model) || 'model',
+        model,
+        shortName: vitalsModelShortName(model),
         effort: factsEffort,
       });
     }
