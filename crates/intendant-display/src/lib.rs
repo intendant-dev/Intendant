@@ -4688,9 +4688,7 @@ mod tests {
         let (peers, subs, tile_gauge, counters, old_peer) = reaper_fixture(7);
         let replacement = Arc::new(webrtc::WebRtcPeer::new_for_test(7, Vec::new()));
         peers.write().await.insert(7, Arc::clone(&replacement));
-        assert!(
-            !reap_peer_registration(&peers, &subs, &tile_gauge, &counters, 7, &old_peer).await
-        );
+        assert!(!reap_peer_registration(&peers, &subs, &tile_gauge, &counters, 7, &old_peer).await);
         assert!(Arc::ptr_eq(
             peers.read().await.get(&7).expect("replacement stays"),
             &replacement

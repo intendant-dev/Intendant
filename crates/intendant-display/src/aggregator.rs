@@ -850,12 +850,20 @@ pub struct OnDemandStandbyHooks {
     /// Pause-state probe for one slot (`None` = slot gone — e.g. torn
     /// down between the snapshot and the probe; the reconcile skips it).
     /// Production: [`crate::encode::pool::EncoderPool::is_layer_paused`].
-    pub is_paused: Box<dyn Fn(&EncoderId) -> Option<bool> + Send + Sync>,
+    pub is_paused: OnDemandPauseProbe,
     /// Apply a pause (`true`) / resume (`false`) to one slot.
     /// Production: [`crate::encode::pool::EncoderPool::pause_layer`] /
     /// [`crate::encode::pool::EncoderPool::resume_layer`].
-    pub set_paused: Box<dyn Fn(&EncoderId, bool) + Send + Sync>,
+    pub set_paused: OnDemandPauseAction,
 }
+
+/// Pause-state probe for one on-demand slot — the `(codec, rid)`-keyed
+/// sibling of [`LayerPauseProbe`]. `None` = the pool no longer knows the
+/// slot.
+pub type OnDemandPauseProbe = Box<dyn Fn(&EncoderId) -> Option<bool> + Send + Sync>;
+
+/// Apply a pause (`true`) / resume (`false`) to one on-demand slot.
+pub type OnDemandPauseAction = Box<dyn Fn(&EncoderId, bool) + Send + Sync>;
 
 /// Per-peer facts the standby reconcile needs, snapshotted while the
 /// coordinator holds the peers read guard (so the reconcile itself runs
@@ -940,6 +948,7 @@ pub fn reconcile_on_demand_standby(hooks: &OnDemandStandbyHooks, peers: &[PeerDe
 /// (default 0.05 / 0.02 / 5 s drop / 1 s restore).
 ///
 /// Returned `JoinHandle` exits cleanly on `shutdown.cancelled()`.
+#[allow(clippy::too_many_arguments)] // injected-dependency seam: each param is a distinct policy input, not a bundle
 pub fn spawn_layer_policy_coordinator(
     peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>>,
     get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
