@@ -1037,6 +1037,24 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::SessionBackgroundTasks => {
+                return handle_session_background_tasks(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::SessionBackgroundTaskOutput => {
+                return handle_session_background_task_output(
+                    stream,
+                    request_line,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::McAnchors => {
                 return handle_mc_anchors(
                     stream,

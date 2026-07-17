@@ -361,6 +361,12 @@ pub(crate) async fn control_request_frame(
         "api_worktrees_clean" => api_worktrees_clean_response(id, params.as_ref(), &runtime).await,
         "api_worktrees_merge" => api_worktrees_merge_response(id, params.as_ref(), &runtime).await,
         "api_session_fork_points" => api_session_fork_points_response(id, params.as_ref()).await,
+        "api_session_background_tasks" => {
+            api_session_background_tasks_response(id, params.as_ref()).await
+        }
+        "api_session_background_task_output" => {
+            api_session_background_task_output_response(id, params.as_ref()).await
+        }
         "api_managed_context_records" => {
             api_managed_context_response(id, "records", params.as_ref(), &runtime).await
         }

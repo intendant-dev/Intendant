@@ -1016,6 +1016,90 @@ pub(crate) async fn api_session_fork_points_response_from_home(
     frame_api_response(id, response, "session fork points")
 }
 
+/// A `params` string that can stand as one path segment of a synthesized
+/// request line (the fork-points twin's refusal, shared by the
+/// background-task twins).
+fn single_segment_param(params: &serde_json::Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| !value.contains(['/', '?', '#', ' ']))
+        .map(str::to_string)
+}
+
+pub(crate) async fn api_session_background_tasks_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // Transport edge: resolve the real home once; tests drive the route
+    // module's `_response` fns with injected temp homes.
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(session_id) = single_segment_param(&params, "session_id") else {
+        return missing_param_response(id, "session_id");
+    };
+    let request_line = format!("GET /api/session/{session_id}/background-tasks HTTP/1.1");
+    let home = crate::platform::home_dir();
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_background_tasks_response(&request_line, &home)
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("background-tasks task failed: {e}"),
+            });
+        }
+    };
+    frame_api_response(id, response, "session background tasks")
+}
+
+pub(crate) async fn api_session_background_task_output_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(session_id) = single_segment_param(&params, "session_id") else {
+        return missing_param_response(id, "session_id");
+    };
+    let Some(task_id) = single_segment_param(&params, "task_id") else {
+        return missing_param_response(id, "task_id");
+    };
+    let mut query = String::new();
+    if let Some(tail_kb) = params.get("tail_kb") {
+        let tail_kb = match tail_kb {
+            serde_json::Value::String(value) => value.clone(),
+            other => other.to_string(),
+        };
+        query = format!("?tail_kb={tail_kb}");
+    }
+    let request_line = format!(
+        "GET /api/session/{session_id}/background-tasks/{task_id}/output{query} HTTP/1.1"
+    );
+    let home = crate::platform::home_dir();
+    let response = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_background_task_output_response(&request_line, &home)
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("background-task output task failed: {e}"),
+            });
+        }
+    };
+    frame_api_response(id, response, "background task output")
+}
+
 pub(crate) async fn api_managed_context_response(
     id: String,
     kind: &'static str,
