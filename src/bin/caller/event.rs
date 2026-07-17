@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static NEXT_AGENT_OUTPUT_ID: AtomicU64 = AtomicU64::new(1);
 const OUTBOUND_CONTEXT_SNAPSHOT_RAW_INLINE_LIMIT: usize = 128 * 1024;
@@ -1055,6 +1055,14 @@ pub enum AppEvent {
     AgendaChanged {
         item: crate::agenda::AgendaItem,
         counts: crate::agenda::AgendaCounts,
+    },
+
+    /// The Memory plane admitted a write (a claim was proposed). Carries
+    /// the provenance-labeled view so frontends update live without
+    /// refetching. The view is quoted DATA for rendering (§6.5), never
+    /// instructions.
+    MemoryChanged {
+        claim: crate::memory::ClaimView,
     },
 
     /// 1 Hz heartbeat from [`spawn_tick_timer`]. Only the stdio MCP event
@@ -2110,10 +2118,15 @@ pub enum ControlMsg {
 /// low-volume event subset persisted to `session.jsonl`, and
 /// [`EventBus::subscribe_intents`] is the lossless path for user intents
 /// (`ControlCommand`) and the session-bookkeeping events that route them.
+/// One item on the lossless session-log lane: the event plus the instant it
+/// entered the lane at [`EventBus::send`], so the writer can measure
+/// enqueue→consume latency (see [`warn_writer_lane_slow`]).
+pub type SessionLogLaneItem = (AppEvent, Instant);
+
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
-    session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
+    session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<SessionLogLaneItem>>>>,
     intent_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
 }
 
@@ -2129,8 +2142,12 @@ impl EventBus {
 
     pub fn send(&self, event: AppEvent) {
         if app_event_writes_to_session_log(&event) {
+            // Stamped at the emit point so the session-log writer can
+            // measure how long the item sat in the lane before it was
+            // consumed (see `warn_writer_lane_slow`).
+            let enqueued_at = Instant::now();
             if let Ok(mut sinks) = self.session_log_sinks.lock() {
-                sinks.retain(|sink| sink.send(event.clone()).is_ok());
+                sinks.retain(|sink| sink.send((event.clone(), enqueued_at)).is_ok());
             }
         }
         if app_event_rides_intent_lane(&event) {
@@ -2156,7 +2173,13 @@ impl EventBus {
     /// such as `SteerRequested` / `SteerQueued` during high-volume model
     /// streaming, so the bus keeps a separate unbounded fan-out for just the
     /// event kinds that the session log writer persists.
-    pub fn subscribe_session_log(&self) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
+    ///
+    /// Each item carries the [`Instant`] it was pushed into the lane, so a
+    /// consumer can measure enqueue→consume latency (the session-log writer
+    /// reports pathological lags — see [`warn_writer_lane_slow`]).
+    pub fn subscribe_session_log(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<SessionLogLaneItem> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         if let Ok(mut sinks) = self.session_log_sinks.lock() {
             sinks.push(tx);
@@ -3059,6 +3082,9 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             item: item.clone(),
             counts: *counts,
         }),
+        AppEvent::MemoryChanged { claim } => Some(OutboundEvent::MemoryChanged {
+            claim: claim.clone(),
+        }),
         // Input event for the agent loop — not broadcast to browsers.
         AppEvent::ConversationRollbackRequested { .. } => None,
         // Internal events — not broadcast to external consumers
@@ -3188,17 +3214,100 @@ pub fn spawn_outbound_broadcaster(
 /// are skipped here to avoid duplication — only events that would otherwise be
 /// lost are handled.
 ///
+/// Per item the task measures enqueue→consume (how long the event sat in the
+/// lossless lane) and consume→durable (how long the locked append+flush took)
+/// and reports pathological stalls on stderr via [`warn_writer_lane_slow`] —
+/// forensics for the observed "broadcast seen, session-log row absent for
+/// minutes" class, which this loop's silence made undecidable between a
+/// never-polled task and a consumed-then-stuck write.
+///
 /// Counterpart to `spawn_outbound_broadcaster` which handles the WebSocket/
 /// control-socket broadcast path.
 pub fn spawn_session_log_writer(
-    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionLogLaneItem>,
     session_log: crate::SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
+        let mut last_slow_warn: Option<Instant> = None;
+        while let Some((event, enqueued_at)) = event_rx.recv().await {
+            let consumed_at = Instant::now();
             write_event_to_session_log(&session_log, &event);
+            warn_writer_lane_slow(
+                "session-log-writer",
+                || debug_variant_name(&event),
+                consumed_at.saturating_duration_since(enqueued_at),
+                consumed_at.elapsed(),
+                &mut last_slow_warn,
+            );
         }
     })
+}
+
+/// A writer-lane stage (enqueue→consume or consume→durable) longer than this
+/// is reported as pathological.
+pub(crate) const WRITER_LANE_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
+
+/// Minimum spacing between SLOW reports from one writer task, so a clearing
+/// stall (a backlog of delayed items all draining at once) cannot storm the
+/// daemon log.
+pub(crate) const WRITER_LANE_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Report a pathologically slow durable-writer event on stderr.
+///
+/// The durable writer tasks (session-log above, `peer::log_writer`) call this
+/// once per item with the item's measured stages:
+///
+/// - `enqueue_to_consume`: producer `send` → writer task `recv` return. Large
+///   values mean the item sat in the channel — an unpolled/wedged writer task
+///   (or, for the bounded peer channel, upstream backpressure).
+/// - `consume_to_durable`: `recv` return → append+flush returned. Large
+///   values mean the write path itself blocked (lock contention or a stuck
+///   filesystem syscall).
+///
+/// Emits at most one line per [`WRITER_LANE_WARN_INTERVAL`] per task
+/// (`last_warned` is task-local state) and nothing below
+/// [`WRITER_LANE_SLOW_THRESHOLD`], so the happy path stays silent. The line
+/// lands on stderr, which the daemon-log tees already capture in tests and CI
+/// dumps. Returns whether a line was emitted (observable for tests).
+pub(crate) fn warn_writer_lane_slow(
+    task: &str,
+    event_kind: impl FnOnce() -> String,
+    enqueue_to_consume: Duration,
+    consume_to_durable: Duration,
+    last_warned: &mut Option<Instant>,
+) -> bool {
+    if enqueue_to_consume < WRITER_LANE_SLOW_THRESHOLD
+        && consume_to_durable < WRITER_LANE_SLOW_THRESHOLD
+    {
+        return false;
+    }
+    let now = Instant::now();
+    if let Some(previous) = *last_warned {
+        if now.saturating_duration_since(previous) < WRITER_LANE_WARN_INTERVAL {
+            return false;
+        }
+    }
+    *last_warned = Some(now);
+    eprintln!(
+        "[{task}] SLOW event={} enqueue_to_consume={:.1}s consume_to_durable={:.1}s",
+        event_kind(),
+        enqueue_to_consume.as_secs_f64(),
+        consume_to_durable.as_secs_f64(),
+    );
+    true
+}
+
+/// Variant name of a `Debug`-rendered enum value (`SessionNote`,
+/// `StatusChanged`, …): the token before the first space, brace, or paren.
+/// Diagnostics-only — evaluated on the rate-limited pathological path, never
+/// per event.
+pub(crate) fn debug_variant_name(value: &impl std::fmt::Debug) -> String {
+    let rendered = format!("{value:?}");
+    rendered
+        .split([' ', '{', '('])
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
@@ -5887,10 +5996,11 @@ mod tests {
             id: "steer-1".to_string(),
         });
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
-            .await
-            .expect("session-log event should arrive")
-            .expect("session-log channel should remain open");
+        let (event, _enqueued_at) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+                .await
+                .expect("session-log event should arrive")
+                .expect("session-log channel should remain open");
         match event {
             AppEvent::SteerRequested {
                 session_id,
@@ -5906,6 +6016,84 @@ mod tests {
         assert!(
             log_rx.try_recv().is_err(),
             "deltas and ticks must not be queued"
+        );
+    }
+
+    /// The writer-lane SLOW report stays silent below the threshold, fires
+    /// when either stage crosses it, and rate-limits repeats per task.
+    #[test]
+    fn writer_lane_slow_warning_thresholds_and_rate_limit() {
+        let fast = Duration::from_millis(50);
+        let slow = WRITER_LANE_SLOW_THRESHOLD + Duration::from_secs(1);
+
+        // Below both thresholds: silent, and the rate limiter stays unarmed.
+        let mut last_warned = None;
+        assert!(!warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            fast,
+            &mut last_warned,
+        ));
+        assert!(last_warned.is_none());
+
+        // Either stage crossing the threshold warns (enqueue→consume here).
+        assert!(warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            slow,
+            fast,
+            &mut last_warned,
+        ));
+        assert!(last_warned.is_some());
+
+        // A second pathological event inside the warn interval is suppressed
+        // (consume→durable slow this time — the stage doesn't matter).
+        assert!(!warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            slow,
+            &mut last_warned,
+        ));
+
+        // Once the interval has passed, the warning re-arms.
+        let Some(rearmed) =
+            Instant::now().checked_sub(WRITER_LANE_WARN_INTERVAL + Duration::from_secs(1))
+        else {
+            // Box uptime shorter than the warn interval — cannot synthesize
+            // a sufficiently old instant on this run.
+            return;
+        };
+        last_warned = Some(rearmed);
+        assert!(warn_writer_lane_slow(
+            "test-writer",
+            || "Event".to_string(),
+            fast,
+            slow,
+            &mut last_warned,
+        ));
+    }
+
+    /// The diagnostics label is the bare variant name for unit, struct, and
+    /// tuple variants alike.
+    #[test]
+    fn debug_variant_name_extracts_the_variant() {
+        assert_eq!(debug_variant_name(&AppEvent::Tick), "Tick");
+        assert_eq!(
+            debug_variant_name(&AppEvent::HumanResponseSent),
+            "HumanResponseSent"
+        );
+        assert_eq!(
+            debug_variant_name(&AppEvent::SessionNote {
+                session_id: Some("s-1".to_string()),
+                note_id: "n-1".to_string(),
+                text: "note body".to_string(),
+                attachments: Vec::new(),
+                source: None,
+                ts: 0,
+            }),
+            "SessionNote"
         );
     }
 

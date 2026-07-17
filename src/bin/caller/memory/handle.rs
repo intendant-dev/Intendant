@@ -9,23 +9,29 @@
 
 use std::sync::Mutex;
 
+use crate::event::{AppEvent, EventBus};
+
 use super::service::MemoryService;
 use super::types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};
 
 pub(crate) struct MemoryHandle {
     service: Mutex<MemoryService>,
     plane_id_hex: String,
+    bus: EventBus,
 }
 
 impl MemoryHandle {
     /// Bootstrap the ephemeral plane (the full `c.genesis` ceremony,
     /// admitted by the stamped reducer) and wrap it single-writer.
-    pub(crate) fn bootstrap() -> Result<MemoryHandle, MemoryError> {
+    /// Admitted writes broadcast `memory_changed` on `bus` so every
+    /// connected frontend updates live.
+    pub(crate) fn bootstrap(bus: EventBus) -> Result<MemoryHandle, MemoryError> {
         let service = MemoryService::new()?;
         let plane_id_hex = service.plane_id_hex();
         Ok(MemoryHandle {
             service: Mutex::new(service),
             plane_id_hex,
+            bus,
         })
     }
 
@@ -37,13 +43,18 @@ impl MemoryHandle {
     /// authenticated edge that dispatched this write (the seam
     /// contract in `access/actor.rs`) — the service maps it into the
     /// claim's own provenance fields and the op envelope's actor, and
-    /// makes the ring authorization decision from it.
+    /// makes the ring authorization decision from it. Admission
+    /// broadcasts the fresh view; rejections broadcast nothing.
     pub(crate) fn propose(
         &self,
         args: ProposeArgs,
         actor: &crate::access::actor::ActorBinding,
     ) -> Result<ClaimView, MemoryError> {
-        self.lock().propose(args, actor)
+        let view = self.lock().propose(args, actor)?;
+        self.bus.send(AppEvent::MemoryChanged {
+            claim: view.clone(),
+        });
+        Ok(view)
     }
 
     pub(crate) fn search(&self, args: &SearchArgs) -> Vec<ClaimView> {
@@ -64,5 +75,64 @@ impl MemoryHandle {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::actor::ActorBinding;
+
+    /// Admitted proposals broadcast `memory_changed` with the same view
+    /// the caller received (the live-update lane the Explorer rides);
+    /// rejected writes broadcast nothing.
+    #[test]
+    fn propose_broadcasts_memory_changed() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let handle = MemoryHandle::bootstrap(bus).unwrap();
+
+        let view = handle
+            .propose(
+                ProposeArgs {
+                    kind: "observation".into(),
+                    statement: "the explorer updates live".into(),
+                    sensitivity: "private".into(),
+                    session: None,
+                    project: None,
+                    model: None,
+                    labels: vec![],
+                },
+                &ActorBinding::dashboard(Some("principal:root-session:test".into())),
+            )
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(AppEvent::MemoryChanged { claim }) => {
+                assert_eq!(claim.id, view.id);
+                assert_eq!(claim.proposed_by, view.proposed_by);
+                assert_eq!(claim.durability, "ephemeral");
+            }
+            other => panic!("expected MemoryChanged, got {other:?}"),
+        }
+
+        // Rejections broadcast nothing.
+        let err = handle.propose(
+            ProposeArgs {
+                kind: "fact".into(),
+                statement: "unknown kind".into(),
+                sensitivity: "private".into(),
+                session: None,
+                project: None,
+                model: None,
+                labels: vec![],
+            },
+            &ActorBinding::unattributed(),
+        );
+        assert!(err.is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "a rejected propose must not broadcast"
+        );
     }
 }

@@ -29,6 +29,7 @@ use crate::peer::event::{
 };
 use crate::peer::handle::{ConnectionState, PeerCommand};
 use crate::peer::id::PeerId;
+use crate::peer::log_writer::EnqueuedPeerEvent;
 use crate::peer::traits::PeerTransport;
 use crate::peer::upcast::{MAX_TRACKED_PEER_DISPLAYS, MAX_TRACKED_PEER_SESSIONS};
 use crate::peer::PeerError;
@@ -142,7 +143,7 @@ pub(crate) struct PeerActor {
     pub commands_rx: mpsc::Receiver<PeerCommand>,
     pub events_in_rx: mpsc::Receiver<PeerEvent>,
     pub events_out_tx: broadcast::Sender<PeerEvent>,
-    pub log_sink: mpsc::Sender<TaggedPeerEvent>,
+    pub log_sink: mpsc::Sender<EnqueuedPeerEvent>,
     pub connection_tx: watch::Sender<ConnectionState>,
     pub status_tx: watch::Sender<PeerStatus>,
     pub card_tx: watch::Sender<Arc<AgentCard>>,
@@ -620,7 +621,7 @@ impl PeerActor {
                 },
                 seq: self.seq,
             };
-            let _ = self.log_sink.send(tagged).await;
+            let _ = self.log_sink.send(tagged.into()).await;
         }
     }
 
@@ -667,7 +668,7 @@ impl PeerActor {
             };
             // Durable sink: await. If closed, the log writer is gone
             // (process shutdown) and we drop silently.
-            let _ = self.log_sink.send(tagged).await;
+            let _ = self.log_sink.send(tagged.into()).await;
         }
         // Broadcast: non-blocking. Err means no subscribers — that's
         // fine, we still wrote to the durable sink.
@@ -757,7 +758,7 @@ mod tests {
     /// all other channels are held open by the returned guards.
     #[allow(clippy::type_complexity)]
     fn test_actor(
-        log_tx: mpsc::Sender<TaggedPeerEvent>,
+        log_tx: mpsc::Sender<EnqueuedPeerEvent>,
     ) -> (
         PeerActor,
         (
@@ -848,7 +849,7 @@ mod tests {
             })
             .await;
         let salvage = log_rx.try_recv().expect("coalesced salvage record");
-        match salvage.payload {
+        match salvage.event.payload {
             PeerEvent::Message {
                 content: MessageContent::Text { text },
                 partial: true,
@@ -858,7 +859,7 @@ mod tests {
         }
         let disconnected = log_rx.try_recv().expect("disconnected record");
         assert!(matches!(
-            disconnected.payload,
+            disconnected.event.payload,
             PeerEvent::Disconnected { .. }
         ));
         assert!(log_rx.try_recv().is_err());
@@ -905,7 +906,7 @@ mod tests {
             .await;
         let final_record = log_rx.try_recv().expect("final record");
         assert!(matches!(
-            final_record.payload,
+            final_record.event.payload,
             PeerEvent::Message { partial: false, .. }
         ));
 
@@ -916,7 +917,7 @@ mod tests {
             .await;
         let mut salvaged = Vec::new();
         while let Ok(record) = log_rx.try_recv() {
-            match record.payload {
+            match record.event.payload {
                 PeerEvent::Message {
                     id, partial: true, ..
                 } => salvaged.push(id.0),
@@ -963,7 +964,7 @@ mod tests {
             })
             .await;
         let salvage = log_rx.try_recv().expect("salvage record");
-        match salvage.payload {
+        match salvage.event.payload {
             PeerEvent::Message {
                 content: MessageContent::Text { text },
                 partial: true,
@@ -1016,12 +1017,12 @@ mod tests {
 
         let final_record = log_rx.try_recv().expect("final message record");
         assert!(matches!(
-            final_record.payload,
+            final_record.event.payload,
             PeerEvent::Message { partial: false, .. }
         ));
         let disconnected = log_rx.try_recv().expect("disconnected record");
         assert!(matches!(
-            disconnected.payload,
+            disconnected.event.payload,
             PeerEvent::Disconnected { .. }
         ));
         assert!(

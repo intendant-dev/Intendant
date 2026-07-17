@@ -816,6 +816,50 @@
         </div>
       </div>
     </div>
+
+    <!-- Memory Explorer (P1): browse/search the daemon's Memory plane,
+         propose claims. Claim statements are quoted DATA — rendered
+         escaped, never executed. Kind/sensitivity option values mirror
+         the kernel's closed vocabularies (Kind::ALL / Class::ALL) and
+         are pinned by memory::service's explorer_vocab test. -->
+    <div id="tab-memory" class="tab-pane">
+      <div class="memory-wrap">
+        <div class="memory-head">
+          <h2 class="memory-title">Memory</h2>
+          <div class="memory-counts" id="memory-tab-counts"></div>
+        </div>
+        <div class="memory-ephemeral-note">Ephemeral plane — claims live in daemon memory and vanish on restart. Durable storage arrives later in the program.</div>
+        <div class="memory-compose">
+          <select id="memory-add-kind" aria-label="Claim kind">
+            <option value="observation">observation</option>
+            <option value="decision">decision</option>
+            <option value="episode">episode</option>
+            <option value="procedure">procedure</option>
+            <option value="preference">preference</option>
+          </select>
+          <input id="memory-add-statement" type="text" maxlength="2000"
+                 placeholder="Propose a claim…" aria-label="New claim statement" />
+          <select id="memory-add-sensitivity" aria-label="Sensitivity" title="Writer's sensitivity claim">
+            <option value="public">public</option>
+            <option value="internal">internal</option>
+            <option value="private" selected>private</option>
+            <option value="sensitive">sensitive</option>
+          </select>
+          <button type="button" id="memory-add-btn">Propose</button>
+        </div>
+        <div class="memory-search">
+          <input id="memory-search-input" type="search"
+                 placeholder="Search claims…" aria-label="Search claims" />
+          <label class="memory-cand-toggle" title="Candidates are claims no judgment has accepted yet">
+            <input type="checkbox" id="memory-show-candidates" checked /> show candidates
+          </label>
+        </div>
+        <div class="memory-note" id="memory-tab-note" style="display:none"></div>
+        <div class="memory-list" id="memory-tab-list">
+          <div class="ui-empty" id="memory-tab-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
     <div id="tab-stats" class="tab-pane">
       <div class="stats-host-bar" id="stats-host-bar">
         <label class="stats-host-label" for="stats-host-select">Host</label>

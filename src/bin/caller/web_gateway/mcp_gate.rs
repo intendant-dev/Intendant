@@ -1095,7 +1095,8 @@ mod tests {
             tmp.path().join("logs"),
         );
         state.memory = Some(std::sync::Arc::new(
-            crate::memory::MemoryHandle::bootstrap().expect("ephemeral plane bootstraps"),
+            crate::memory::MemoryHandle::bootstrap(bus.clone())
+                .expect("ephemeral plane bootstraps"),
         ));
         let server = crate::mcp::IntendantServer::new(
             std::sync::Arc::new(tokio::sync::RwLock::new(state)),

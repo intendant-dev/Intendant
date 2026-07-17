@@ -25,9 +25,10 @@
 use crate::peer::card::AgentCard;
 use crate::peer::event::{
     ApprovalDecision, MessageId, PeerDisplayInfo, PeerEvent, PeerMessage, PeerStatus, SessionInfo,
-    TaggedPeerEvent, TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
+    TaskId, TaskUpdate, WebRtcSessionId, WebRtcSignal,
 };
 use crate::peer::id::PeerId;
+use crate::peer::log_writer::EnqueuedPeerEvent;
 use crate::peer::traits::{PeerOp, PeerOpAck, PeerTask, PeerTransport, TransportFeatures};
 use crate::peer::transport::intendant::TransportCredentials;
 use crate::peer::PeerError;
@@ -389,7 +390,8 @@ impl PeerHandle {
     }
 
     /// Subscribe to the peer's event stream. Fan-out is lossy for
-    /// lagging subscribers — [`TaggedPeerEvent`]s land on the session
+    /// lagging subscribers —
+    /// [`TaggedPeerEvent`](crate::peer::event::TaggedPeerEvent)s land on the session
     /// log via the registry's durable sink, so missed broadcast
     /// events are recoverable from the log (which is the authoritative
     /// record for replay).
@@ -901,7 +903,7 @@ pub fn spawn_peer<F>(
     browser_tcp_via_url: Option<String>,
     label_override: Option<String>,
     credentials: TransportCredentials,
-    log_sink: mpsc::Sender<TaggedPeerEvent>,
+    log_sink: mpsc::Sender<EnqueuedPeerEvent>,
     build_transport: F,
 ) -> PeerHandle
 where
@@ -1016,7 +1018,7 @@ mod tests {
         drop(probe);
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let initial_card = AgentCard {
             id: PeerId::new(PeerKind::Intendant, "unreachable"),
             label: "unreachable".into(),
@@ -1126,7 +1128,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let initial_card = AgentCard {
             id: PeerId::new(PeerKind::Intendant, "sess-peer"),
             label: "sess-peer".into(),
@@ -1265,7 +1267,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let initial_card = AgentCard {
             id: PeerId::new(PeerKind::Intendant, "display-peer"),
             label: "display-peer".into(),
@@ -1376,7 +1378,7 @@ mod tests {
         drop(probe);
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
 
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let initial_card = AgentCard {
             id: PeerId::new(PeerKind::Intendant, "bp-test"),
             label: "bp-test".into(),
@@ -1436,7 +1438,7 @@ mod tests {
         drop(probe);
         let ws_url = format!("ws://127.0.0.1:{port}/ws");
 
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(64);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(64);
         let initial_card = AgentCard {
             id: PeerId::new(PeerKind::Intendant, "bp-none"),
             label: "bp-none".into(),
@@ -1520,7 +1522,7 @@ mod tests {
     }
 
     fn spawn_handle_for(name: &str, ws_url: &str) -> PeerHandle {
-        let (log_tx, _log_rx) = mpsc::channel::<TaggedPeerEvent>(256);
+        let (log_tx, _log_rx) = mpsc::channel::<EnqueuedPeerEvent>(256);
         let card = receipt_test_card(name, ws_url);
         let url = ws_url.to_string();
         spawn_peer(
