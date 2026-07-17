@@ -1277,6 +1277,35 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::CodexAuthStart => {
+                return handle_codex_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::CodexAuthStatus => {
+                return handle_codex_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::CodexAuthCancel => {
+                return handle_codex_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity

@@ -6,6 +6,7 @@ mod approval;
 mod atspi_read;
 mod attention_nudge;
 mod audio_routing;
+mod auth_ceremony;
 pub(crate) use intendant_core::autonomy;
 #[cfg(target_os = "macos")]
 mod ax;
@@ -14,6 +15,7 @@ mod browser_workspace;
 #[path = "../../build_info.rs"]
 mod build_info;
 mod claude_auth_ceremony;
+mod codex_auth_ceremony;
 mod computer_use;
 mod connect_rendezvous;
 mod context_rewind;

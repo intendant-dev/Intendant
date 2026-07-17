@@ -1929,6 +1929,45 @@ pub(crate) async fn api_claude_auth_cancel_response(
     )
 }
 
+pub(crate) async fn api_codex_auth_start_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::codex_auth_start_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+            runtime.project_root.as_deref(),
+        ),
+        "codex auth start",
+    )
+}
+
+pub(crate) async fn api_codex_auth_status_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::codex_auth_status_api_response(control_grant_is_hosted(&runtime.grant)),
+        "codex auth status",
+    )
+}
+
+pub(crate) async fn api_codex_auth_cancel_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::codex_auth_cancel_api_response(control_grant_is_hosted(&runtime.grant)),
+        "codex auth cancel",
+    )
+}
+
 pub(crate) async fn api_peer_add_response(
     id: String,
     params: Option<&serde_json::Value>,

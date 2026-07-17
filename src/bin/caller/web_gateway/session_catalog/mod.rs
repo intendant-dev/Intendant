@@ -1739,8 +1739,8 @@ pub(crate) fn session_file_fingerprints_digest(entries: &[SessionFileFingerprint
 /// `idle`, `resident`, `external` — describes a session that may still be
 /// alive). The bare-dir `"abandoned"` classification applied in
 /// `intendant_session_list_row_from_dir` is terminal for consumers too.
-/// The dashboard's Claude sign-in reload panel mirrors this set
-/// (`CLAUDE_SIGNIN_TERMINAL_STATUSES` in `static/app/32-vault-custody.js`)
+/// The dashboard's agent sign-in reload panels mirror this set
+/// (`AGENT_SIGNIN_TERMINAL_STATUSES` in `static/app/32-vault-custody.js`)
 /// — pinned by the parity test below, so a vocabulary change here fails
 /// the suite instead of shipping as drift.
 pub(crate) const SESSION_ENDED_STATUSES: [&str; 3] = ["completed", "failed", "interrupted"];
@@ -2923,24 +2923,24 @@ mod tests {
         assert_eq!(summary_json_status(dir.path()), None);
     }
 
-    /// The Claude sign-in reload panel offers chips for ALIVE claude-code
+    /// The agent sign-in reload panels offer chips for ALIVE supervised
     /// sessions by excluding this module's terminal statuses — a static
     /// frontend mirror ("derive, don't mirror" fallback rule: the mirror
     /// gets a daemon-side parity test). The fragment's set must equal
     /// `SESSION_ENDED_STATUSES` plus the `"abandoned"` classification,
     /// exactly — an addition or rename on either side fails here.
     #[test]
-    fn claude_signin_terminal_status_mirror_matches_catalog_vocabulary() {
+    fn agent_signin_terminal_status_mirror_matches_catalog_vocabulary() {
         let app = include_str!("../../../../../static/app.html");
-        let start = "const CLAUDE_SIGNIN_TERMINAL_STATUSES = new Set([";
+        let start = "const AGENT_SIGNIN_TERMINAL_STATUSES = new Set([";
         let from = app
             .find(start)
-            .expect("CLAUDE_SIGNIN_TERMINAL_STATUSES not found in app.html")
+            .expect("AGENT_SIGNIN_TERMINAL_STATUSES not found in app.html")
             + start.len();
         let rest = &app[from..];
         let to = rest
             .find("])")
-            .expect("CLAUDE_SIGNIN_TERMINAL_STATUSES is unterminated");
+            .expect("AGENT_SIGNIN_TERMINAL_STATUSES is unterminated");
         let mirrored: std::collections::BTreeSet<String> = rest[..to]
             .split('\'')
             .skip(1)
@@ -2955,7 +2955,7 @@ mod tests {
         expected.insert("abandoned".to_string());
         assert_eq!(
             mirrored, expected,
-            "static/app/32-vault-custody.js CLAUDE_SIGNIN_TERMINAL_STATUSES \
+            "static/app/32-vault-custody.js AGENT_SIGNIN_TERMINAL_STATUSES \
              must mirror the catalog's terminal vocabulary"
         );
     }
