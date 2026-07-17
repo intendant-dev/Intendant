@@ -864,3 +864,116 @@ html.ui-v2 .log-entry.source-gemini .log-level { color: var(--iris-2); }
 html.ui-v2 .log-entry.source-claude-code.level-model .log-icon,
 html.ui-v2 .log-entry.source-codex.level-model .log-icon,
 html.ui-v2 .log-entry.source-gemini.level-model .log-icon { background: var(--iris); }
+
+/* ── Chapter navigation (57c-chapter-nav.js) ─────────────────────────────
+   One floating singleton pill per dashboard (attached to the hovered or
+   focused session pane — zero per-pane DOM) plus a static twin in the
+   Sessions detail log toolbar. Mode chip [You|Agent] + prev/next steps +
+   a position readout ("3/17"). */
+html.ui-v2 .chapter-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 3px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--glass);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1;
+  user-select: none;
+}
+html.ui-v2 .chapter-nav-pane {
+  position: absolute;
+  right: 10px;
+  bottom: 40px; /* stacked above the jump-to-latest button's corner slot */
+  z-index: 12;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-fast);
+}
+html.ui-v2 .session-window:hover .chapter-nav-pane,
+html.ui-v2 .session-window:focus-within .chapter-nav-pane,
+html.ui-v2 .chapter-nav-pane.kbd-active {
+  opacity: 1;
+  pointer-events: auto;
+}
+html.ui-v2 .session-window.minimized .chapter-nav-pane { display: none; }
+html.ui-v2 .chapter-nav-detail { margin-right: 6px; }
+
+html.ui-v2 .chapter-nav button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  cursor: pointer;
+  border-radius: 999px;
+  padding: 0;
+}
+html.ui-v2 .chapter-nav .chapter-nav-mode {
+  padding: 3px 7px;
+  font-size: 9px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--amber);
+  background: rgba(var(--amber-rgb), .12);
+}
+html.ui-v2 .chapter-nav .chapter-nav-mode[data-mode="agent"] {
+  color: var(--iris-2);
+  background: rgba(var(--iris-rgb), .14);
+}
+html.ui-v2 .chapter-nav .chapter-nav-step {
+  width: 18px;
+  height: 18px;
+  font-size: 11px;
+}
+html.ui-v2 .chapter-nav .chapter-nav-step:hover {
+  color: var(--text);
+  background: var(--hover-wash);
+}
+html.ui-v2 .chapter-nav-count {
+  min-width: 22px;
+  text-align: center;
+  color: var(--text-3);
+  padding: 0 2px;
+  font-variant-numeric: tabular-nums;
+}
+html.ui-v2 .chapter-nav-count.loading { color: var(--text-2); }
+html.ui-v2 .chapter-nav.empty .chapter-nav-step { opacity: .4; }
+html.ui-v2 .chapter-nav.at-edge { animation: chapterNavEdge .35s ease-out; }
+@keyframes chapterNavEdge {
+  0% { transform: translateY(0); }
+  35% { transform: translateY(-2px); }
+  70% { transform: translateY(1px); }
+  100% { transform: translateY(0); }
+}
+
+/* jump-target flash: mode-tinted wash + inset marker bar, fading out.
+   --chapter-hit-rgb is stamped inline per jump (amber = You, iris =
+   Agent). */
+html.ui-v2 .log-entry.chapter-nav-hit {
+  animation: chapterNavHit 1.4s ease-out;
+}
+@keyframes chapterNavHit {
+  0% {
+    background: rgba(var(--chapter-hit-rgb), .2);
+    box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb));
+  }
+  60% {
+    background: rgba(var(--chapter-hit-rgb), .1);
+    box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb));
+  }
+  100% { background: transparent; box-shadow: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html.ui-v2 .chapter-nav.at-edge { animation: none; }
+  html.ui-v2 .log-entry.chapter-nav-hit {
+    animation: none;
+    box-shadow: inset 2px 0 0 rgb(var(--chapter-hit-rgb));
+  }
+}

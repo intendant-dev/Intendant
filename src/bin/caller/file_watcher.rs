@@ -4237,13 +4237,17 @@ mod tests {
             round.maps_hash = None;
         }
         drop(w);
-        std::fs::remove_dir_all(tmp_snap.path().join("rounds")).unwrap();
+        // The next boot resumes a CLONE of the store rebuilt into the
+        // legacy layout (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        std::fs::remove_dir_all(resumed_store.path().join("rounds")).unwrap();
         let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
-        atomic_write(&tmp_snap.path().join("history.json"), &legacy_bytes).unwrap();
+        atomic_write(&resumed_store.path().join("history.json"), &legacy_bytes).unwrap();
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, resumed_store.path());
         assert!(
-            round_manifest_path(tmp_snap.path(), r1).exists(),
+            round_manifest_path(resumed_store.path(), r1).exists(),
             "legacy load must materialize round manifests"
         );
         assert_eq!(resumed.history.rounds.len(), 2);
@@ -4278,7 +4282,10 @@ mod tests {
         let r2 = w.history.current_head_id.unwrap();
         drop(w);
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        // The restart resumes a CLONE of the store (same-path reopen races
+        // the store flock; see clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let mut resumed = make_watcher(root, resumed_store.path());
         resumed.rollback(r1).unwrap();
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
         assert!(!root.join("b.txt").exists());
@@ -4364,8 +4371,11 @@ mod tests {
         w.on_round_complete("R2".into(), None, None).unwrap();
         drop(w);
 
-        // Tamper: restamp round 1's manifest with a foreign epoch.
-        let manifest_path = round_manifest_path(tmp_snap.path(), r1);
+        // Tamper: restamp round 1's manifest with a foreign epoch, in the
+        // CLONE the next boot resumes (same-path reopen races the store
+        // flock; see clone_store_for_resume).
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let manifest_path = round_manifest_path(boot2_store.path(), r1);
         let mut manifest: HistoryRound =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         manifest.store_epoch = Some("f00df00df00df00d".to_string());
@@ -4375,7 +4385,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, boot2_store.path());
         assert!(
             resumed.resolved_round_maps(r1).is_none(),
             "foreign-epoch manifest must not resolve"
@@ -4389,13 +4399,15 @@ mod tests {
         drop(resumed);
 
         // An unstamped manifest (what an old binary writes) is refused too.
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let manifest_path = round_manifest_path(boot3_store.path(), r1);
         manifest.store_epoch = None;
         atomic_write(
             &manifest_path,
             &serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, boot3_store.path());
         assert!(resumed.resolved_round_maps(r1).is_none());
         assert!(resumed.rollback(r1).is_err());
     }
@@ -4420,8 +4432,12 @@ mod tests {
         let r3 = w.history.current_head_id.unwrap();
         drop(w);
 
+        // Corrupt the backrefs in the CLONE the next boot resumes
+        // (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
         let tamper = |id: u64, backref: u64| {
-            let path = round_manifest_path(tmp_snap.path(), id);
+            let path = round_manifest_path(resumed_store.path(), id);
             let mut manifest: HistoryRound =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             manifest.maps_from_round = Some(backref);
@@ -4434,7 +4450,7 @@ mod tests {
         tamper(r2, r3);
         tamper(r3, r2);
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, resumed_store.path());
         assert!(
             resumed.resolved_round_maps(r1).is_none(),
             "self-referential manifest must fail closed, not resolve to an empty tree"
@@ -4479,23 +4495,27 @@ mod tests {
             round.maps_hash = None;
         }
         drop(w);
-        let rounds_dir = tmp_snap.path().join("rounds");
+        // The next boot resumes a CLONE of the store rebuilt into the
+        // legacy layout (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let rounds_dir = boot2_store.path().join("rounds");
         std::fs::remove_dir_all(&rounds_dir).unwrap();
         std::fs::create_dir_all(&rounds_dir).unwrap();
         atomic_write(
-            &tmp_snap.path().join("history.json"),
+            &boot2_store.path().join("history.json"),
             &serde_json::to_vec_pretty(&legacy).unwrap(),
         )
         .unwrap();
         // ...and make the manifest home unwritable.
         std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let mut blocked = make_watcher(root, tmp_snap.path());
+        let mut blocked = make_watcher(root, boot2_store.path());
         assert!(
             !blocked.history.rounds[0].files_at_end.is_empty(),
             "failed migration must keep the authoritative inline maps"
         );
-        let persisted = std::fs::read_to_string(tmp_snap.path().join("history.json")).unwrap();
+        let persisted = std::fs::read_to_string(boot2_store.path().join("history.json")).unwrap();
         assert!(
             persisted.contains("files_at_end"),
             "retained inline maps must stay durable in the index"
@@ -4504,15 +4524,16 @@ mod tests {
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
         drop(blocked);
 
-        // Writable again: the next load migrates for real.
+        // Writable again: the next load (another clone) migrates for real.
         std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let migrated = make_watcher(root, tmp_snap.path());
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let migrated = make_watcher(root, boot3_store.path());
         assert!(migrated
             .history
             .rounds
             .iter()
             .all(|r| r.files_at_end.is_empty()));
-        assert!(round_manifest_path(tmp_snap.path(), r1).exists());
+        assert!(round_manifest_path(boot3_store.path(), r1).exists());
         assert!(migrated.resolved_round_maps(r1).is_some());
     }
 
@@ -4551,8 +4572,11 @@ mod tests {
         w.on_round_complete("R2".into(), None, None).unwrap();
         drop(w);
 
-        // Poison ONLY the payload: every scalar and the epoch stay intact.
-        let manifest_path = round_manifest_path(tmp_snap.path(), r1);
+        // Poison ONLY the payload — in the CLONE the next boot resumes
+        // (same-path reopen races the store flock; see
+        // clone_store_for_resume): every scalar and the epoch stay intact.
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let manifest_path = round_manifest_path(resumed_store.path(), r1);
         let mut manifest: HistoryRound =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
         let poison_hash = hex_encode(&sha256_hash(b"attacker content"));
@@ -4564,7 +4588,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, resumed_store.path());
         assert!(
             resumed.resolved_round_maps(r1).is_none(),
             "a map-only poison must fail the payload hash, not be served"
@@ -4590,25 +4614,32 @@ mod tests {
         let r1 = w.history.current_head_id.unwrap();
         drop(w);
 
-        // Pre-epoch layout + an unreadable (but correct) manifest.
-        let index_path = tmp_snap.path().join("history.json");
+        // Boot 2 resumes a CLONE of the store (same bytes, fresh path —
+        // reopening the same path in-process races forked children
+        // pinning the dropped store flock; see clone_store_for_resume).
+        // Pre-epoch layout + an unreadable (but correct) manifest,
+        // planted in the clone.
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let index_path = boot2_store.path().join("history.json");
         let mut index: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
         index.as_object_mut().unwrap().remove("store_epoch");
         atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
-        let manifest_path = round_manifest_path(tmp_snap.path(), r1);
+        let manifest_path = round_manifest_path(boot2_store.path(), r1);
         std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let deferred = make_watcher(root, tmp_snap.path());
+        let deferred = make_watcher(root, boot2_store.path());
         assert_eq!(
             deferred.history.store_epoch, None,
             "an unreadable manifest must defer epoch adoption like a failed write"
         );
         drop(deferred);
 
-        // Readable again: the next load completes the mint and restamps.
+        // Readable again: the next load (boot 3, another clone) completes
+        // the mint and restamps.
         std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let adopted = make_watcher(root, tmp_snap.path());
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let adopted = make_watcher(root, boot3_store.path());
         assert!(adopted.history.store_epoch.is_some());
         assert!(adopted.resolved_round_maps(r1).is_some());
     }
@@ -4627,12 +4658,15 @@ mod tests {
         let first = make_watcher(root, tmp_snap.path());
         drop(first);
 
-        // Plant a symlink leftover pointing at live content.
+        // Plant a symlink leftover pointing at live content, in the CLONE
+        // the next boot resumes (same-path reopen races the store flock;
+        // see clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
         let target = root.join("real.rs");
-        let link = tmp_snap.path().join("baseline").join("ghost.rs");
+        let link = resumed_store.path().join("baseline").join("ghost.rs");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let mut second = make_watcher(root, tmp_snap.path());
+        let mut second = make_watcher(root, resumed_store.path());
         assert!(
             !link.exists() && std::fs::symlink_metadata(&link).is_err(),
             "the symlink leftover must be removed"
@@ -4739,15 +4773,18 @@ mod tests {
         let r2 = w.history.current_head_id.unwrap();
         drop(w);
 
-        // Rebuild the epoch-less pre-fix layout: strip the epoch from the
-        // index and from both manifests.
-        let index_path = tmp_snap.path().join("history.json");
+        // Rebuild the epoch-less pre-fix layout in the CLONE the next boot
+        // resumes (same-path reopen races the store flock; see
+        // clone_store_for_resume): strip the epoch from the index and from
+        // both manifests.
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let index_path = resumed_store.path().join("history.json");
         let mut index: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
         index.as_object_mut().unwrap().remove("store_epoch");
         atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
         for id in [r1, r2] {
-            let path = round_manifest_path(tmp_snap.path(), id);
+            let path = round_manifest_path(resumed_store.path(), id);
             let mut manifest: HistoryRound =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             manifest.store_epoch = None;
@@ -4755,7 +4792,7 @@ mod tests {
         }
         // Poison r1's manifest the way an old binary would: same id,
         // different round content entirely.
-        let poison_path = round_manifest_path(tmp_snap.path(), r1);
+        let poison_path = round_manifest_path(resumed_store.path(), r1);
         let mut poison: HistoryRound =
             serde_json::from_slice(&std::fs::read(&poison_path).unwrap()).unwrap();
         poison.summary = "Round 1".to_string();
@@ -4767,13 +4804,13 @@ mod tests {
         )]);
         atomic_write(&poison_path, &serde_json::to_vec_pretty(&poison).unwrap()).unwrap();
 
-        let mut resumed = make_watcher(root, tmp_snap.path());
+        let mut resumed = make_watcher(root, resumed_store.path());
         assert!(
             resumed.history.store_epoch.is_some(),
             "the epoch mint must complete (poison refusal is not a write failure)"
         );
         let stamped: HistoryRound = serde_json::from_slice(
-            &std::fs::read(round_manifest_path(tmp_snap.path(), r2)).unwrap(),
+            &std::fs::read(round_manifest_path(resumed_store.path(), r2)).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -4834,7 +4871,14 @@ mod tests {
         drop(second);
         drop(owner);
 
-        let mut reclaimed = make_watcher(root, tmp_snap.path());
+        // The reclaim models the production shape — a FRESH process (no
+        // inherited lock descriptor) resuming the store after the owner
+        // exits — as a clone: reacquiring the SAME path from the same
+        // process is precisely what production never does, and it races
+        // concurrently forked children transiently pinning the dropped
+        // flock's open file description (see clone_store_for_resume).
+        let reclaimed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let mut reclaimed = make_watcher(root, reclaimed_store.path());
         assert!(!reclaimed.read_only);
         reclaimed
             .on_round_complete("R2".into(), None, None)
@@ -4902,32 +4946,42 @@ mod tests {
         }
         assert!(legacy.rounds[0].files_at_end.is_empty(), "empty-tree round");
         drop(w);
-        let rounds_dir = tmp_snap.path().join("rounds");
+        // The next boot resumes a CLONE of the store rebuilt into the
+        // legacy layout (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let rounds_dir = boot2_store.path().join("rounds");
         std::fs::remove_dir_all(&rounds_dir).unwrap();
         std::fs::create_dir_all(&rounds_dir).unwrap();
         atomic_write(
-            &tmp_snap.path().join("history.json"),
+            &boot2_store.path().join("history.json"),
             &serde_json::to_vec_pretty(&legacy).unwrap(),
         )
         .unwrap();
         std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let blocked = make_watcher(root, tmp_snap.path());
+        let blocked = make_watcher(root, boot2_store.path());
         assert!(
             blocked.history.rounds[0].maps_inline,
             "a retained empty-tree round must carry the explicit inline marker"
         );
-        let persisted = std::fs::read_to_string(tmp_snap.path().join("history.json")).unwrap();
+        let persisted = std::fs::read_to_string(boot2_store.path().join("history.json")).unwrap();
         assert!(
             persisted.contains("maps_inline"),
             "the marker must be durable: {persisted}"
         );
         drop(blocked);
 
-        // Reload (manifest dir still unwritable): the marker alone must keep
-        // the round restorable — rolling back to the empty tree deletes the
-        // file created since.
-        let mut reloaded = make_watcher(root, tmp_snap.path());
+        // Reload (manifest dir still unwritable — the clone's directories
+        // are freshly created, so the condition is re-stated on the new
+        // store): the marker alone must keep the round restorable —
+        // rolling back to the empty tree deletes the file created since.
+        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let reload_rounds_dir = boot3_store.path().join("rounds");
+        std::fs::set_permissions(&reload_rounds_dir, std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        let mut reloaded = make_watcher(root, boot3_store.path());
         std::fs::write(root.join("late.txt"), b"created later").unwrap();
         reloaded.rollback(r1).unwrap();
         assert!(
@@ -4935,7 +4989,8 @@ mod tests {
             "restore-to-empty must still be exact after reload"
         );
 
-        std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&reload_rounds_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
     }
 
     /// FIX 6: when a binding manifest cannot be restamped (transiently
@@ -4959,20 +5014,23 @@ mod tests {
         drop(w);
 
         // Strip the epoch everywhere (pre-epoch store) and make the
-        // manifest home unwritable so the restamp cannot land.
-        let index_path = tmp_snap.path().join("history.json");
+        // manifest home unwritable so the restamp cannot land — all in
+        // the CLONE the next boot resumes (same-path reopen races the
+        // store flock; see clone_store_for_resume).
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let index_path = boot2_store.path().join("history.json");
         let mut index: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
         index.as_object_mut().unwrap().remove("store_epoch");
         atomic_write(&index_path, &serde_json::to_vec_pretty(&index).unwrap()).unwrap();
         for id in [r1, r1 + 1] {
-            let path = round_manifest_path(tmp_snap.path(), id);
+            let path = round_manifest_path(boot2_store.path(), id);
             let mut manifest: HistoryRound =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             manifest.store_epoch = None;
             atomic_write(&path, &serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         }
-        let rounds_dir = tmp_snap.path().join("rounds");
+        let rounds_dir = boot2_store.path().join("rounds");
         std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         // Manifest subdirs must stay readable but unwritable too.
         for id in [r1, r1 + 1] {
@@ -4980,7 +5038,7 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
 
-        let mut deferred = make_watcher(root, tmp_snap.path());
+        let mut deferred = make_watcher(root, boot2_store.path());
         assert_eq!(
             deferred.history.store_epoch, None,
             "epoch adoption must be deferred when a binding manifest cannot be stamped"
@@ -4996,16 +5054,17 @@ mod tests {
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
         drop(deferred);
 
-        // Writable again: the next load completes the mint.
+        // Writable again: the next load (another clone) completes the mint.
         for id in [r1, r1 + 1] {
             let dir = rounds_dir.join(format!("round_{id}"));
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::set_permissions(&rounds_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let adopted = make_watcher(root, tmp_snap.path());
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let adopted = make_watcher(root, boot3_store.path());
         assert!(adopted.history.store_epoch.is_some());
         let stamped: HistoryRound = serde_json::from_slice(
-            &std::fs::read(round_manifest_path(tmp_snap.path(), r1)).unwrap(),
+            &std::fs::read(round_manifest_path(boot3_store.path(), r1)).unwrap(),
         )
         .unwrap();
         assert_eq!(stamped.store_epoch, adopted.history.store_epoch);
@@ -5024,12 +5083,16 @@ mod tests {
         w.on_round_complete("R1".into(), None, None).unwrap();
         drop(w);
 
+        // The damage is planted in the CLONE the next boot resumes
+        // (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
         let garbage = b"{not json at all";
-        atomic_write(&tmp_snap.path().join("history.json"), garbage).unwrap();
+        atomic_write(&resumed_store.path().join("history.json"), garbage).unwrap();
 
-        let resumed = make_watcher(root, tmp_snap.path());
+        let resumed = make_watcher(root, resumed_store.path());
         assert!(resumed.history.rounds.is_empty(), "fresh timeline");
-        let damaged: Vec<_> = std::fs::read_dir(tmp_snap.path())
+        let damaged: Vec<_> = std::fs::read_dir(resumed_store.path())
             .unwrap()
             .flatten()
             .filter(|entry| {
@@ -5063,13 +5126,16 @@ mod tests {
         let first = make_watcher(root, tmp_snap.path());
         drop(first);
 
-        // The source disappears between runs; the stale baseline copy is
-        // made undeletable.
+        // The source disappears between runs; the next boot resumes a
+        // CLONE of the store (same-path reopen races the store flock; see
+        // clone_store_for_resume) whose stale baseline copy is made
+        // undeletable.
         std::fs::remove_file(root.join("sub/stale.rs")).unwrap();
-        let locked_dir = tmp_snap.path().join("baseline").join("sub");
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let locked_dir = resumed_store.path().join("baseline").join("sub");
         std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        let mut second = make_watcher(root, tmp_snap.path());
+        let mut second = make_watcher(root, resumed_store.path());
         second.mark_live_index_healthy_for_tests();
         assert!(
             second.changes_index_snapshot().is_none(),
@@ -5093,14 +5159,17 @@ mod tests {
         let first = make_watcher(root, tmp_snap.path());
         drop(first);
 
-        // Run 2: `thing` became a directory.
+        // Run 2: `thing` became a directory. Each run resumes a CLONE of
+        // the previous run's store (same-path reopen races the store
+        // flock; see clone_store_for_resume).
         std::fs::remove_file(root.join("thing")).unwrap();
         std::fs::create_dir_all(root.join("thing")).unwrap();
         std::fs::write(root.join("thing/inner.rs"), b"nested now").unwrap();
-        let second = make_watcher(root, tmp_snap.path());
+        let run2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let second = make_watcher(root, run2_store.path());
         assert!(second.baseline_manifest.contains_key("thing/inner.rs"));
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/thing/inner.rs")).unwrap(),
+            std::fs::read(run2_store.path().join("baseline/thing/inner.rs")).unwrap(),
             b"nested now"
         );
         drop(second);
@@ -5108,10 +5177,11 @@ mod tests {
         // Run 3: `thing` is a file again.
         std::fs::remove_dir_all(root.join("thing")).unwrap();
         std::fs::write(root.join("thing"), b"file again").unwrap();
-        let third = make_watcher(root, tmp_snap.path());
+        let run3_store = FileWatcher::clone_store_for_resume(run2_store.path());
+        let third = make_watcher(root, run3_store.path());
         assert!(third.baseline_manifest.contains_key("thing"));
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/thing")).unwrap(),
+            std::fs::read(run3_store.path().join("baseline/thing")).unwrap(),
             b"file again"
         );
     }
@@ -5220,7 +5290,10 @@ mod tests {
         let h1 = w.resolved_round_maps(r1).unwrap().files_at_end["a.txt"].clone();
         drop(w);
 
-        let resumed = make_watcher(root, tmp_snap.path());
+        // The next boot resumes a CLONE of the store (same-path reopen
+        // races the store flock; see clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let resumed = make_watcher(root, resumed_store.path());
         assert!(resumed.object_index.contains(&h1));
     }
 
@@ -5336,9 +5409,12 @@ mod tests {
         assert_eq!(first.baseline_files_rewritten_in_new, 3);
         drop(first);
 
-        // Boot 2 over the untouched tree: zero baseline writes, state
-        // fully adopted from the previous manifest.
-        let second = boot(root, tmp_snap.path());
+        // Boot 2 over the untouched tree, resuming a CLONE of the store
+        // (same-path reopen races the store flock; see
+        // clone_store_for_resume): zero baseline writes, state fully
+        // adopted from the previous manifest.
+        let boot2_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let second = boot(root, boot2_store.path());
         assert_eq!(
             second.baseline_files_rewritten_in_new, 0,
             "an unchanged tree must reuse every baseline entry"
@@ -5351,7 +5427,7 @@ mod tests {
             Some(hex_encode(&sha256_hash(b"kept content\n")).as_str())
         );
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/keep.txt")).unwrap(),
+            std::fs::read(boot2_store.path().join("baseline/keep.txt")).unwrap(),
             b"kept content\n"
         );
         drop(second);
@@ -5363,21 +5439,22 @@ mod tests {
         std::fs::remove_file(root.join("thing")).unwrap();
         std::fs::create_dir_all(root.join("thing")).unwrap();
         std::fs::write(root.join("thing/inner.rs"), b"nested now").unwrap();
-        let third = boot(root, tmp_snap.path());
+        let boot3_store = FileWatcher::clone_store_for_resume(boot2_store.path());
+        let third = boot(root, boot3_store.path());
         assert_eq!(
             third.baseline_files_rewritten_in_new, 2,
             "only the changed file and the flipped path rewrite"
         );
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/change.txt")).unwrap(),
+            std::fs::read(boot3_store.path().join("baseline/change.txt")).unwrap(),
             b"rewritten\n"
         );
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/thing/inner.rs")).unwrap(),
+            std::fs::read(boot3_store.path().join("baseline/thing/inner.rs")).unwrap(),
             b"nested now"
         );
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/keep.txt")).unwrap(),
+            std::fs::read(boot3_store.path().join("baseline/keep.txt")).unwrap(),
             b"kept content\n"
         );
     }
@@ -5404,17 +5481,21 @@ mod tests {
         .expect("watcher");
         drop(first);
 
-        std::fs::write(tmp_snap.path().join("baseline/a.txt"), b"torn").unwrap();
+        // The torn shadow copy is planted in the CLONE the next boot
+        // resumes (same-path reopen races the store flock; see
+        // clone_store_for_resume).
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        std::fs::write(resumed_store.path().join("baseline/a.txt"), b"torn").unwrap();
         let second = FileWatcher::new_with_racy_window(
             root.to_path_buf(),
-            tmp_snap.path().to_path_buf(),
+            resumed_store.path().to_path_buf(),
             EventBus::new(),
             0,
         )
         .expect("watcher");
         assert_eq!(second.baseline_files_rewritten_in_new, 1);
         assert_eq!(
-            std::fs::read(tmp_snap.path().join("baseline/a.txt")).unwrap(),
+            std::fs::read(resumed_store.path().join("baseline/a.txt")).unwrap(),
             b"full content here\n"
         );
     }
@@ -5432,10 +5513,13 @@ mod tests {
         assert_eq!(first.baseline_files_rewritten_in_new, 1);
         drop(first);
 
-        // Second boot immediately after: the stored mtime sits inside the
+        // Second boot immediately after, resuming a CLONE of the store
+        // (same-path reopen races the store flock; see
+        // clone_store_for_resume): the stored mtime sits inside the
         // production racy window of its recording time, so the entry is
         // distrusted and the file re-baselines.
-        let second = make_watcher(root, tmp_snap.path());
+        let resumed_store = FileWatcher::clone_store_for_resume(tmp_snap.path());
+        let second = make_watcher(root, resumed_store.path());
         assert_eq!(
             second.baseline_files_rewritten_in_new, 1,
             "a racy-window entry must not be reused"

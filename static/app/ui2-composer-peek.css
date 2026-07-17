@@ -170,6 +170,18 @@ html.ui-v2 .ui2-composer-peek .log-entry .log-content {
   max-height: 8.5em;
   overflow: hidden;
 }
+/* …but never the TAIL entry — the last one that actually clips, marked
+   .ui2-peek-tail-open by JS. :last-child is not enough: completion meta
+   lines (Done / Round complete) trail the final message. Content
+   clipped INSIDE an entry is not in the list's scroll flow, so the tail
+   of a long latest message was unreachable — the list hit scroll-bottom
+   while the fade obscured the end permanently. Opened, the list
+   scroller carries the full text. max-height:none (not a larger cap)
+   so this also keeps superseding the base collapsible 1.5em clamp,
+   exactly like the 8.5em rule it lifts. */
+html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-tail-open .log-content {
+  max-height: none;
+}
 html.ui-v2 .ui2-composer-peek .log-entry:not(.ui2-peek-clamped) .log-content::after { content: none; }
 html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
   content: '';
@@ -183,10 +195,33 @@ html.ui-v2 .ui2-composer-peek .log-entry.ui2-peek-clamped .log-content::after {
   background: linear-gradient(to bottom, transparent, var(--surface));
   pointer-events: none;
 }
-html.ui-v2 .ui2-composer-peek .diff-log-entry .diff-log-body {
+/* diff bodies: same digest clamp, same tail exemption — on the tail
+   entry the body falls back to the base .diff-log-body scroll box
+   (max-height 460px, overflow auto), so a trailing diff stays readable
+   in place instead of hard-clipping. */
+html.ui-v2 .ui2-composer-peek .diff-log-entry:not(.ui2-peek-tail-open) .diff-log-body {
   max-height: 8.5em;
   overflow: hidden;
 }
+
+/* container-level "more below" cue: pinned to the sheet, not the scroll
+   content, and visible only while unread lines sit below the viewport —
+   JS toggles the class from scroll position, so the fade signals
+   direction and vanishes at scroll-bottom instead of ever sitting on
+   the tail. The root's overflow:hidden clips it to the rounded box. */
+html.ui-v2 .ui2-composer-peek::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 26px;
+  background: linear-gradient(to bottom, transparent, var(--surface));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-fast) ease;
+}
+html.ui-v2 .ui2-composer-peek.ui2-peek-more-below::after { opacity: 1; }
 
 /* — phones: keep the header one quiet row — */
 @media (max-width: 500px) {
