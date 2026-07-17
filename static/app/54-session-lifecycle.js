@@ -346,32 +346,52 @@ function renderWorktreeFinishCard(win, sid, info, options = {}) {
 }
 
 const TASK_TEXTAREA_MIN_HEIGHT_PX = 28;
+// Fallback cap for states whose CSS declares no max-height. When the
+// stylesheet does declare one (120px desktop composer, em-based caps on
+// phones, 180px new-session form), the computed value wins — resolved
+// fresh on every pass because it is state-dependent (media queries,
+// :focus-within widening the phone cap).
 const TASK_TEXTAREA_MAX_HEIGHT_PX = 120;
-const TASK_TEXTAREA_ESTIMATED_LINE_HEIGHT_PX = 17;
-const TASK_TEXTAREA_VERTICAL_PADDING_PX = 10;
-const TASK_TEXTAREA_ESTIMATED_CHARS_PER_LINE = 72;
 
-function estimateTaskTextareaRows(value) {
-  const text = String(value || '');
-  if (!text) return 1;
-  return text.split('\n').reduce((rows, line) => {
-    return rows + Math.max(1, Math.ceil(line.length / TASK_TEXTAREA_ESTIMATED_CHARS_PER_LINE));
-  }, 0);
-}
-
+// Measured autosize (grow *and* shrink) for the composer/new-session
+// textareas. Sizing must come from a real layout measurement: the
+// char-count estimate this replaces (72 chars/line at 17px, from the
+// 8a91c0ef reconnect-perf pass) predated the ui-v2 chrome and undershot
+// real wrapping (13.5px/16px fonts, narrow flex bars), then hid the
+// shortfall with overflow-y:hidden — multi-line drafts clipped mid-glyph
+// with no scrollbar. One forced reflow per call; typing is rAF-deduped
+// via scheduleTaskTextareaResize.
 function resizeTaskTextarea(input) {
   if (!input || input.tagName !== 'TEXTAREA') return;
   input._taskResizeFrame = 0;
-  const rows = estimateTaskTextareaRows(input.value);
-  const height = Math.min(
-    TASK_TEXTAREA_MAX_HEIGHT_PX,
-    Math.max(
-      TASK_TEXTAREA_MIN_HEIGHT_PX,
-      rows * TASK_TEXTAREA_ESTIMATED_LINE_HEIGHT_PX + TASK_TEXTAREA_VERTICAL_PADDING_PX,
-    ),
-  );
-  input.style.height = `${height}px`;
-  input.style.overflowY = height >= TASK_TEXTAREA_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+  // display:none (pilled composer, closed new-session view) measures 0 —
+  // keep the last real height and let the reveal seams (ResizeObserver,
+  // ui2:composer-state, focusNewSessionInput) re-measure once visible.
+  // getClientRects, not offsetParent: the ui-v2 dock is position:fixed,
+  // whose offsetParent is null even when visible.
+  if (input.getClientRects().length === 0) return;
+  const prevScrollTop = input.scrollTop;
+  input.style.height = 'auto';
+  const cssMax = Number.parseFloat(window.getComputedStyle(input).maxHeight);
+  const maxHeight = Number.isFinite(cssMax) && cssMax > 0 ? cssMax : TASK_TEXTAREA_MAX_HEIGHT_PX;
+  // border-box: the height style includes borders; scrollHeight (content
+  // + padding) does not. wrap=soft, so offsetHeight - clientHeight is
+  // borders only (no horizontal scrollbar).
+  const borderHeight = input.offsetHeight - input.clientHeight;
+  const contentHeight = input.scrollHeight + borderHeight;
+  const overflowing = contentHeight > maxHeight;
+  input.style.height = `${Math.max(TASK_TEXTAREA_MIN_HEIGHT_PX, Math.min(maxHeight, contentHeight))}px`;
+  // Scroll only at the cap. Below it the height *is* the content height,
+  // so hidden cannot clip — it just suppresses rounding-ghost scrollbars.
+  // Never hidden with content beyond the cap: that is the silent clip
+  // this function exists to prevent.
+  input.style.overflowY = overflowing ? 'auto' : 'hidden';
+  if (overflowing) {
+    // Keep the caret in view while typing at the end; preserve the
+    // browser's own scroll decision for mid-text edits.
+    const caretAtEnd = input.selectionEnd >= input.value.length;
+    input.scrollTop = caretAtEnd ? input.scrollHeight : prevScrollTop;
+  }
 }
 
 function scheduleTaskTextareaResize(input) {
@@ -515,6 +535,28 @@ function wireTaskTextarea(id, submit) {
     e.preventDefault();
     submit();
   });
+  // Height depends on the wrap width and on state-dependent CSS (siblings
+  // appear/disappear around the flex bar; the phone composer's max-height
+  // widens on :focus-within), so re-measure whenever the box or the focus
+  // state changes — not only on typed input. The width guard stops
+  // observer feedback: our own height writes never change the width.
+  input.addEventListener('focus', () => scheduleTaskTextareaResize(input));
+  input.addEventListener('blur', () => scheduleTaskTextareaResize(input));
+  if (typeof ResizeObserver === 'function') {
+    input._taskResizeObserver = new ResizeObserver((entries) => {
+      const width = entries[entries.length - 1].contentRect.width;
+      if (width === input._taskLastMeasuredWidth) return;
+      input._taskLastMeasuredWidth = width;
+      scheduleTaskTextareaResize(input);
+    });
+    input._taskResizeObserver.observe(input);
+  } else {
+    window.addEventListener('resize', () => scheduleTaskTextareaResize(input));
+  }
+  // Pill → expanded flips the dock's children from display:none; the
+  // observer fires on the reveal too, but this seam is the deterministic
+  // one (and the only one when ResizeObserver is unavailable).
+  window.addEventListener('ui2:composer-state', () => scheduleTaskTextareaResize(input));
   resizeTaskTextarea(input);
 }
 
