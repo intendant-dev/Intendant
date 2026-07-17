@@ -33,13 +33,45 @@
 //! saturated `log_sink.send().await`, at which point those
 //! actors observe `NotConnected`-style backpressure and continue
 //! running (they don't hard-depend on the log for correctness).
+//!
+//! ## Stall forensics
+//!
+//! Each channel item carries its enqueue instant ([`EnqueuedPeerEvent`]);
+//! the writer measures enqueue→consume and consume→durable per event and
+//! emits one rate-limited `[peer-log-writer] SLOW …` stderr line when
+//! either stage exceeds the shared writer-lane threshold
+//! ([`crate::event::warn_writer_lane_slow`]). Silent on the happy path.
 
 use crate::peer::event::TaggedPeerEvent;
 use std::path::PathBuf;
+use std::time::Instant;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// A [`TaggedPeerEvent`] paired with the instant it was handed to the
+/// writer channel. Only the inner event is serialized to the log; the
+/// instant exists so the writer can attribute a stall to the lane
+/// (enqueue→consume) vs the write path (consume→durable).
+#[derive(Debug)]
+pub struct EnqueuedPeerEvent {
+    pub event: TaggedPeerEvent,
+    pub enqueued_at: Instant,
+}
+
+impl From<TaggedPeerEvent> for EnqueuedPeerEvent {
+    /// Stamp the enqueue instant at conversion — producers convert at the
+    /// `send` call site, so a bounded-channel backpressure wait counts
+    /// toward enqueue→consume (to the producer, that wait IS enqueue
+    /// latency).
+    fn from(event: TaggedPeerEvent) -> Self {
+        Self {
+            event,
+            enqueued_at: Instant::now(),
+        }
+    }
+}
 
 /// Bounded capacity for the writer's input channel. Same sizing
 /// philosophy as `peer::handle::EVENTS_CAPACITY`: generous enough
@@ -68,8 +100,10 @@ pub const LOG_ROTATE_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// Dropping the `Sender` (and all its clones held inside peer
 /// actors) causes the writer task to drain the channel and exit.
-pub fn spawn_peer_log_writer(log_path: PathBuf) -> (mpsc::Sender<TaggedPeerEvent>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel::<TaggedPeerEvent>(LOG_CHANNEL_CAPACITY);
+pub fn spawn_peer_log_writer(
+    log_path: PathBuf,
+) -> (mpsc::Sender<EnqueuedPeerEvent>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel::<EnqueuedPeerEvent>(LOG_CHANNEL_CAPACITY);
     let handle = tokio::spawn(run_writer(log_path, rx, LOG_ROTATE_BYTES));
     (tx, handle)
 }
@@ -96,7 +130,11 @@ async fn open_log(log_path: &PathBuf) -> Option<(BufWriter<tokio::fs::File>, u64
     Some((BufWriter::new(file), len))
 }
 
-async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>, rotate_bytes: u64) {
+async fn run_writer(
+    log_path: PathBuf,
+    mut rx: mpsc::Receiver<EnqueuedPeerEvent>,
+    rotate_bytes: u64,
+) {
     // Ensure the parent directory exists before the append open.
     // Failing to create it is the same failure class as failing to
     // open the file, so we report and exit.
@@ -113,8 +151,10 @@ async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>, 
     let Some((mut writer, mut written)) = open_log(&log_path).await else {
         return;
     };
+    let mut last_slow_warn: Option<Instant> = None;
 
-    while let Some(event) = rx.recv().await {
+    while let Some(EnqueuedPeerEvent { event, enqueued_at }) = rx.recv().await {
+        let consumed_at = Instant::now();
         let line = match serde_json::to_string(&event) {
             Ok(s) => s,
             Err(e) => {
@@ -140,6 +180,17 @@ async fn run_writer(log_path: PathBuf, mut rx: mpsc::Receiver<TaggedPeerEvent>, 
             eprintln!("peer log writer: flush failed, shutting down");
             return;
         }
+        // Writer-lane latency forensics: measured right after the flush so
+        // consume→durable covers exactly the append+flush path; rotation
+        // cost below lands in the NEXT item's enqueue→consume, where it
+        // belongs. Stderr only on pathology, rate-limited.
+        crate::event::warn_writer_lane_slow(
+            "peer-log-writer",
+            || crate::event::debug_variant_name(&event.payload),
+            consumed_at.saturating_duration_since(enqueued_at),
+            consumed_at.elapsed(),
+            &mut last_slow_warn,
+        );
         written = written.saturating_add(line.len() as u64 + 1);
 
         // Size-based rotation: shift the full file to `<name>.1`
@@ -205,9 +256,13 @@ mod tests {
         let log_path = dir.path().join("peers.jsonl");
         let (tx, handle) = spawn_peer_log_writer(log_path.clone());
 
-        tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
-        tx.send(make_event(2, PeerStatus::Working)).await.unwrap();
-        tx.send(make_event(3, PeerStatus::NeedsApproval))
+        tx.send(make_event(1, PeerStatus::Idle).into())
+            .await
+            .unwrap();
+        tx.send(make_event(2, PeerStatus::Working).into())
+            .await
+            .unwrap();
+        tx.send(make_event(3, PeerStatus::NeedsApproval).into())
             .await
             .unwrap();
 
@@ -237,7 +292,9 @@ mod tests {
         let log_path = dir.path().join("peers.jsonl");
         let (tx, _handle) = spawn_peer_log_writer(log_path.clone());
 
-        tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
+        tx.send(make_event(1, PeerStatus::Idle).into())
+            .await
+            .unwrap();
 
         // Open the log and read a line without waiting for the
         // writer task to finish. If flushes are deferred, the
@@ -271,7 +328,9 @@ mod tests {
         assert!(!log_path.parent().unwrap().exists());
 
         let (tx, _handle) = spawn_peer_log_writer(log_path.clone());
-        tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
+        tx.send(make_event(1, PeerStatus::Idle).into())
+            .await
+            .unwrap();
 
         // Wait for the write to land.
         timeout(Duration::from_secs(2), async {
@@ -299,7 +358,9 @@ mod tests {
             .unwrap();
 
         let (tx, handle) = spawn_peer_log_writer(log_path.clone());
-        tx.send(make_event(1, PeerStatus::Idle)).await.unwrap();
+        tx.send(make_event(1, PeerStatus::Idle).into())
+            .await
+            .unwrap();
         drop(tx);
         timeout(Duration::from_secs(2), handle)
             .await
@@ -324,10 +385,14 @@ mod tests {
         let (tx1, handle) = spawn_peer_log_writer(log_path.clone());
         let tx2 = tx1.clone();
 
-        tx1.send(make_event(1, PeerStatus::Idle)).await.unwrap();
+        tx1.send(make_event(1, PeerStatus::Idle).into())
+            .await
+            .unwrap();
         drop(tx1);
         // tx2 still alive; writer should still be running.
-        tx2.send(make_event(2, PeerStatus::Working)).await.unwrap();
+        tx2.send(make_event(2, PeerStatus::Working).into())
+            .await
+            .unwrap();
         drop(tx2);
         // Now all senders gone, writer should exit.
         timeout(Duration::from_secs(2), handle)
@@ -357,11 +422,13 @@ mod tests {
     async fn rotates_log_at_size_cap() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join("peers.jsonl");
-        let (tx, rx) = mpsc::channel::<TaggedPeerEvent>(LOG_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<EnqueuedPeerEvent>(LOG_CHANNEL_CAPACITY);
         let rotate_bytes: u64 = 1024;
         let handle = tokio::spawn(run_writer(log_path.clone(), rx, rotate_bytes));
         for seq in 1..=40 {
-            tx.send(make_event(seq, PeerStatus::Idle)).await.unwrap();
+            tx.send(make_event(seq, PeerStatus::Idle).into())
+                .await
+                .unwrap();
         }
         drop(tx);
         timeout(Duration::from_secs(5), handle)
