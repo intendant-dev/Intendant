@@ -331,6 +331,7 @@ pub(crate) fn codex_removed_turn_ids_for_user_turns(
 pub(crate) fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
     user_turn_revisions: &mut ReplayUserTurnRevisionState,
+    steer_cursor: &mut ExternalSteerCursor<'_>,
     pending_replacement_for_user_turn: &mut Option<u32>,
     synthetic_item_seq: &mut u64,
     item_id: Option<&str>,
@@ -350,14 +351,31 @@ pub(crate) fn push_codex_transcript_message(
     let mut user_turn_index = None;
     let mut user_turn_revision = None;
     if normalized_role == "user" {
-        let (recorded_turn_index, recorded_turn_revision) = user_turn_revisions.record_next_turn();
-        user_turn_index = Some(recorded_turn_index);
-        user_turn_revision = Some(recorded_turn_revision);
-        if let Some(entry) = entries.last_mut() {
-            entry["user_turn_index"] = serde_json::json!(recorded_turn_index);
-            entry["user_turn_revision"] = serde_json::json!(recorded_turn_revision);
-            if let Some(turn) = pending_replacement_for_user_turn.take() {
-                entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
+        // Mid-turn steers are user rows the wrapper never counted: the
+        // live lane logged them WITHOUT turn metadata (the `turn/steer`
+        // accept path), so hydration must render them the same way and
+        // must not burn a turn index — otherwise every later prompt
+        // drifts out of alignment with the wrapper's round counter (and
+        // the frontend's text-signature dedupe bridge with it).
+        let rendered_content = entries
+            .last()
+            .and_then(|entry| entry.get("content"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let is_mid_turn_steer = steer_cursor
+            .try_consume_mid_turn_steer(&rendered_content, timestamp_millis_from_str(ts));
+        if !is_mid_turn_steer {
+            let (recorded_turn_index, recorded_turn_revision) =
+                user_turn_revisions.record_next_turn();
+            user_turn_index = Some(recorded_turn_index);
+            user_turn_revision = Some(recorded_turn_revision);
+            if let Some(entry) = entries.last_mut() {
+                entry["user_turn_index"] = serde_json::json!(recorded_turn_index);
+                entry["user_turn_revision"] = serde_json::json!(recorded_turn_revision);
+                if let Some(turn) = pending_replacement_for_user_turn.take() {
+                    entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
+                }
             }
         }
     }
@@ -394,11 +412,15 @@ pub(crate) fn push_codex_transcript_message(
     }
 }
 
-pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn parse_codex_session_entries(
+    path: &Path,
+    steers: &ExternalSteerLedger,
+) -> Option<Vec<serde_json::Value>> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
+    let mut steer_cursor = steers.cursor();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
     let mut rollout_session_id: Option<String> = None;
     let mut current_turn_id: Option<String> = None;
@@ -576,6 +598,7 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
                 push_codex_transcript_message(
                     &mut entries,
                     &mut user_turn_revisions,
+                    &mut steer_cursor,
                     &mut pending_replacement_for_user_turn,
                     &mut synthetic_item_seq,
                     response_item_id.as_deref(),
@@ -603,6 +626,7 @@ pub(crate) fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json:
                 push_codex_transcript_message(
                     &mut entries,
                     &mut user_turn_revisions,
+                    &mut steer_cursor,
                     &mut pending_replacement_for_user_turn,
                     &mut synthetic_item_seq,
                     response_item_id.as_deref(),
@@ -823,12 +847,24 @@ pub(crate) fn codex_session_canonical_lanes(path: &Path) -> (bool, bool) {
 /// initial prompt rendered twice in the Activity log (observed live: a
 /// 6s create→ready gap put the copies in different near-time buckets).
 ///
+/// Counting is content-aware, not blind: user rows whose text the
+/// wrapper's steer ledger proves entered mid-turn (`steers`) render
+/// WITHOUT turn metadata — the live lane logged those with no index —
+/// so post-steer prompts keep the wrapper's numbering. Synthetic
+/// interrupt markers (`[Request interrupted by user…]`) are dropped
+/// entirely, mirroring the live adapter's disposition
+/// (`claude_code.rs::handle_user`): the live feed never rendered them,
+/// and burning indexes on them shifted every later prompt.
+///
 /// The flat predecessor extracted every block's text with
 /// `message_content_text` and stamped user-role envelopes as source
 /// `"user"` — which put tool_result payloads (command output!) in the log
 /// as USER speech, dropped tool-call rows entirely, and used a source
 /// label ("claude") the live rows never carry ("Claude Code").
-pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+pub(crate) fn parse_claude_session_entries(
+    path: &Path,
+    steers: &ExternalSteerLedger,
+) -> Option<Vec<serde_json::Value>> {
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut entries = Vec::new();
@@ -840,6 +876,7 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
     // initial prompt hydrates as turn 1 rev 1 — the values the live
     // `UserMessageLog` row carries.
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
+    let mut steer_cursor = steers.cursor();
 
     for line in reader.lines() {
         let Ok(line) = line else {
@@ -900,14 +937,21 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
         if let Some(text) = content.and_then(|c| c.as_str()) {
             let text = user_prose(text);
             if typ == "user" && !text.is_empty() && !is_injected_external_user_text(&text) {
-                let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
-                push(serde_json::json!({
+                let mut entry = serde_json::json!({
                     "level": "info",
                     "source": "User",
                     "content": text,
-                    "user_turn_index": user_turn_index,
-                    "user_turn_revision": user_turn_revision,
-                }));
+                });
+                // Mid-turn steer texts render turnless — the live row
+                // carried no metadata, and counting them drifts every
+                // later prompt off the wrapper's numbering.
+                if !steer_cursor.try_consume_mid_turn_steer(&text, ts_ms) {
+                    let (user_turn_index, user_turn_revision) =
+                        user_turn_revisions.record_next_turn();
+                    entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                    entry["user_turn_revision"] = serde_json::json!(user_turn_revision);
+                }
+                push(entry);
             }
             continue;
         }
@@ -915,8 +959,10 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
             continue;
         };
         // One user turn per transcript line: a multi-block user message is
-        // one live prompt, so its prose blocks share the line's turn.
-        let mut line_user_turn: Option<(u32, u32)> = None;
+        // one live prompt, so its prose blocks share the line's turn — or
+        // the line's steer-ness (`Some(None)` = classified as a mid-turn
+        // steer, rendered without turn metadata).
+        let mut line_user_turn: Option<Option<(u32, u32)>> = None;
         for block in blocks {
             match block.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "text" => {
@@ -940,15 +986,24 @@ pub(crate) fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json
                         let text = user_prose(text);
                         if !text.is_empty() {
                             // Live shape: UserMessageLog → LogEntry.
-                            let (user_turn_index, user_turn_revision) = *line_user_turn
-                                .get_or_insert_with(|| user_turn_revisions.record_next_turn());
-                            push(serde_json::json!({
+                            let line_turn = *line_user_turn.get_or_insert_with(|| {
+                                if steer_cursor.try_consume_mid_turn_steer(&text, ts_ms) {
+                                    None
+                                } else {
+                                    Some(user_turn_revisions.record_next_turn())
+                                }
+                            });
+                            let mut entry = serde_json::json!({
                                 "level": "info",
                                 "source": "User",
                                 "content": text,
-                                "user_turn_index": user_turn_index,
-                                "user_turn_revision": user_turn_revision,
-                            }));
+                            });
+                            if let Some((user_turn_index, user_turn_revision)) = line_turn {
+                                entry["user_turn_index"] = serde_json::json!(user_turn_index);
+                                entry["user_turn_revision"] =
+                                    serde_json::json!(user_turn_revision);
+                            }
+                            push(entry);
                         }
                     }
                 }
@@ -1194,10 +1249,11 @@ pub(crate) fn parse_external_session_entries_from_file(
     source: &str,
     session_id: &str,
     path: &Path,
+    steers: &ExternalSteerLedger,
 ) -> Option<Vec<serde_json::Value>> {
     match source {
-        "codex" => parse_codex_session_entries(path),
-        "claude-code" => parse_claude_session_entries(path),
+        "codex" => parse_codex_session_entries(path, steers),
+        "claude-code" => parse_claude_session_entries(path, steers),
         "gemini" => parse_gemini_session_entries(path, session_id),
         _ => None,
     }
@@ -1205,7 +1261,15 @@ pub(crate) fn parse_external_session_entries_from_file(
 
 /// Shared-snapshot form: read-only consumers take the cache's Arc
 /// directly instead of deep-cloning the whole parsed transcript per hit.
+///
+/// The steer ledger is built only on a cache MISS: a cached parse of an
+/// unchanged transcript is invariant under ledger growth, because a new
+/// ledger entry's timestamp guard admits only rows written after its
+/// request — rows the keyed snapshot cannot contain (and when the steer's
+/// row does land, the transcript's len/mtime key changes and the parse
+/// reruns with the fresh ledger).
 pub(crate) fn external_session_entries_from_file_arc(
+    home: &Path,
     source: &str,
     session_id: &str,
     path: &Path,
@@ -1215,7 +1279,11 @@ pub(crate) fn external_session_entries_from_file_arc(
         return Some(entries);
     }
 
-    let mut entries = parse_external_session_entries_from_file(source, session_id, path)?;
+    let steers = match source {
+        "codex" | "claude-code" => external_mid_turn_steer_ledger(home, source, session_id),
+        _ => ExternalSteerLedger::default(),
+    };
+    let mut entries = parse_external_session_entries_from_file(source, session_id, path, &steers)?;
     annotate_external_transcript_entries(source, session_id, &mut entries);
     let entries = std::sync::Arc::new(entries);
     store_external_transcript_entries(key, &entries);
@@ -1235,7 +1303,7 @@ pub(crate) fn external_session_entries_from_home_arc(
         _ => None,
     }?;
 
-    external_session_entries_from_file_arc(&source, session_id, &path)
+    external_session_entries_from_file_arc(home, &source, session_id, &path)
 }
 
 pub(crate) fn external_session_entries_from_home(
@@ -2874,7 +2942,7 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path).expect("parse");
+        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let rows: Vec<(String, String, String, String, String)> = entries
             .iter()
             .map(|e| {
@@ -2958,7 +3026,7 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path).expect("parse");
+        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let contents: Vec<&str> = entries
             .iter()
             .map(|e| e["content"].as_str().unwrap_or(""))
@@ -3011,7 +3079,7 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path).expect("parse");
+        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let user_rows: Vec<(&str, u64, u64)> = entries
             .iter()
             .filter(|e| e["source"] == "User")
@@ -3044,6 +3112,279 @@ mod tests {
         assert_eq!(live.record_next_turn(), replay.record_next_turn());
     }
 
+    fn rfc3339_ms(value: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("fixture timestamp")
+            .timestamp_millis()
+    }
+
+    /// End-to-end mid-turn steer alignment for Codex: a steer the wrapper
+    /// log proves entered mid-turn (`steer_requested` + `steer_accepted`,
+    /// the `turn/steer` OK arc) hydrates as a user row WITHOUT turn
+    /// metadata — the live lane logged it with none — and consumes no
+    /// index, so the post-steer follow-up keeps the wrapper's numbering
+    /// (turn 2, matching the live `emit_user_message_log` row) instead of
+    /// drifting to 3 and falling back to the fragile near-time dedupe
+    /// bucket. Exercises the full pipeline: wrapper-index discovery →
+    /// ledger build → parse.
+    #[test]
+    fn codex_transcript_mid_turn_steer_rows_stay_turnless() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_id = "019e37b2-steer-alignment";
+        let wrapper_id = "wrapper-steer-alignment";
+        let steer_text = "also update the docs";
+
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        let requested_ts_ms = rfc3339_ms("2026-07-15T10:00:29Z");
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({
+                    "ts": "10:00:29", "ts_ms": requested_ts_ms,
+                    "event": "steer_requested", "level": "info",
+                    "message": format!("Steer requested: {steer_text}"),
+                    "data": { "session_id": session_id, "id": "steer-1", "status": "pending", "text": steer_text },
+                }),
+                serde_json::json!({
+                    "ts": "10:00:29", "ts_ms": requested_ts_ms + 150,
+                    "event": "steer_accepted", "level": "info",
+                    "message": "Steer accepted",
+                    "data": { "session_id": session_id, "id": "steer-1", "status": "accepted" },
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            session_id,
+            wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-07-15T10-00-00-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "task_started", "turn_id": "codex-turn-1" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "fix the flaky auth test" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:00:10Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Looking at it." }
+                }),
+                // The mid-turn steer, echoed into the rollout AFTER the
+                // wrapper logged its request.
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:00:30Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": steer_text }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-07-15T10:01:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "now ship the fix" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(home.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let user_rows: Vec<(&str, Option<u64>, Option<u64>)> = entries
+            .iter()
+            .filter(|e| e["source"] == "user")
+            .map(|e| {
+                (
+                    e["content"].as_str().unwrap_or(""),
+                    e.get("user_turn_index").and_then(|v| v.as_u64()),
+                    e.get("user_turn_revision").and_then(|v| v.as_u64()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![
+                ("fix the flaky auth test", Some(1), Some(1)),
+                (steer_text, None, None),
+                ("now ship the fix", Some(2), Some(1)),
+            ],
+            "the mid-turn steer renders turnless and burns no index"
+        );
+        // The steer row still belongs to the turn it steered — its thread
+        // projection attributes it to the active turn, not a phantom one.
+        let steer_row = entries
+            .iter()
+            .find(|e| e["source"] == "user" && e["content"] == steer_text)
+            .expect("steer row rendered");
+        assert_eq!(steer_row["turn_id"].as_str(), Some("codex-turn-1"));
+    }
+
+    /// Steer classification never collapses or re-classifies repeated
+    /// identical prompts: one ledger entry justifies AT MOST one turnless
+    /// row, and every other occurrence of the same text keeps minting its
+    /// own distinct turn (turn identity is what distinguishes legitimately
+    /// repeated prompts — the #444 safety bar).
+    #[test]
+    fn codex_transcript_repeated_identical_prompts_stay_distinct_after_steer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-repeat-steer.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "timestamp": "2026-07-15T11:00:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": "019e37b2-repeat-steer" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-07-15T11:00:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "start the migration" }
+                }),
+                // Mid-turn steer (in the ledger, echoed after its request).
+                serde_json::json!({
+                    "timestamp": "2026-07-15T11:00:30Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "keep going" }
+                }),
+                // The user later sends the IDENTICAL text as a real
+                // follow-up: the spent ledger entry must not touch it.
+                serde_json::json!({
+                    "timestamp": "2026-07-15T11:05:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "keep going" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let steers = ExternalSteerLedger::from_entries(vec![ExternalSteerLedgerEntry {
+            text: "keep going".to_string(),
+            requested_ts_ms: Some(rfc3339_ms("2026-07-15T11:00:29Z")),
+        }]);
+        let entries = parse_codex_session_entries(&path, &steers).expect("parse");
+        let user_rows: Vec<(&str, Option<u64>, Option<u64>)> = entries
+            .iter()
+            .filter(|e| e["source"] == "user")
+            .map(|e| {
+                (
+                    e["content"].as_str().unwrap_or(""),
+                    e.get("user_turn_index").and_then(|v| v.as_u64()),
+                    e.get("user_turn_revision").and_then(|v| v.as_u64()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![
+                ("start the migration", Some(1), Some(1)),
+                ("keep going", None, None),
+                ("keep going", Some(2), Some(1)),
+            ],
+            "one ledger entry = at most one turnless row; the repeat is a distinct real turn"
+        );
+    }
+
+    /// Claude Code twin of the steer-alignment contract, plus the CC
+    /// synthetic abort marker: a ledger-proven mid-turn steer renders
+    /// turnless (block form — the classification is per transcript line),
+    /// `[Request interrupted by user]` rows disappear entirely (the live
+    /// adapter drops them — `handle_user`; hydration painting them as
+    /// User rows also burned an index and shifted every later prompt),
+    /// the initial prompt keeps the #444 contract (turn 1 rev 1, addendum
+    /// trimmed), and identical repeated prompts keep distinct turns.
+    #[test]
+    fn claude_transcript_steer_and_interrupt_rows_do_not_shift_turns() {
+        let addendum_marker =
+            crate::external_agent::claude_code::CLAUDE_CODE_BOOTSTRAP_ADDENDUM_MARKER;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let initial_prompt = format!("refactor the parser\\n\\n{addendum_marker}\\nsupervisor plumbing");
+        let lines = [
+            format!(
+                r#"{{"type":"user","timestamp":"2026-07-15T12:00:00.000Z","message":{{"role":"user","content":"{initial_prompt}"}}}}"#
+            ),
+            r#"{"type":"assistant","timestamp":"2026-07-15T12:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Starting."}]}}"#.to_string(),
+            // CC's synthetic abort marker rides a user message; the live
+            // feed never rendered it and no turn may burn on it.
+            r#"{"type":"user","timestamp":"2026-07-15T12:00:20.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#.to_string(),
+            // The mid-turn steer (block form), echoed after its request.
+            r#"{"type":"user","timestamp":"2026-07-15T12:00:30.000Z","message":{"role":"user","content":[{"type":"text","text":"also fix the docs"}]}}"#.to_string(),
+            r#"{"type":"user","timestamp":"2026-07-15T12:01:00.000Z","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}},{"type":"text","text":"resume with plan B"}]}}"#.to_string(),
+            // Identical repeated prompt: a distinct real turn.
+            r#"{"type":"user","timestamp":"2026-07-15T12:02:00.000Z","message":{"role":"user","content":"resume with plan B"}}"#.to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let steers = ExternalSteerLedger::from_entries(vec![ExternalSteerLedgerEntry {
+            text: "also fix the docs".to_string(),
+            requested_ts_ms: Some(rfc3339_ms("2026-07-15T12:00:29Z")),
+        }]);
+        let entries = parse_claude_session_entries(&path, &steers).expect("parse");
+        let user_rows: Vec<(&str, Option<u64>, Option<u64>)> = entries
+            .iter()
+            .filter(|e| e["source"] == "User")
+            .map(|e| {
+                (
+                    e["content"].as_str().unwrap_or(""),
+                    e.get("user_turn_index").and_then(|v| v.as_u64()),
+                    e.get("user_turn_revision").and_then(|v| v.as_u64()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            user_rows,
+            vec![
+                ("refactor the parser", Some(1), Some(1)),
+                ("also fix the docs", None, None),
+                ("resume with plan B", Some(2), Some(1)),
+                ("resume with plan B", Some(3), Some(1)),
+            ],
+            "steer turnless, interrupt marker absent, repeats distinct, initial prompt intact"
+        );
+        assert!(
+            entries.iter().all(|e| !e["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Request interrupted")),
+            "synthetic abort markers never render on any row"
+        );
+    }
+
     /// Transcript entries carry the line's `message_uuid`, abandoned sibling
     /// branches are flagged `off_active_chain`, and every Claude fork point's
     /// `at_message_uuid` display anchor resolves to a rendered row with the
@@ -3063,7 +3404,7 @@ mod tests {
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
 
-        let entries = parse_claude_session_entries(&path).expect("parse");
+        let entries = parse_claude_session_entries(&path, &ExternalSteerLedger::default()).expect("parse");
         let entry_for = |uuid: &str| {
             entries
                 .iter()
