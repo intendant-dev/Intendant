@@ -5682,6 +5682,7 @@ mod tests {
             "api_sessions_search",
             "api_sessions_message_search",
             "api_session_detail",
+            "api_session_fork_points",
             "api_session_report",
             "api_session_context_snapshot",
             "api_session_recordings",
