@@ -257,6 +257,9 @@ impl HostedControlRuntime {
             request_ttl_ms: PENDING_REQUEST_TTL_MS,
             display_media_relay_configured: self.display_media_relay_configured,
             lane_guard,
+            custom_domain: false,
+            rp_id: None,
+            passkey_available: false,
         })
     }
 

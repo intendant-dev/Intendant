@@ -374,6 +374,24 @@ without changing that refusal or the Connect account's `role:none` posture.
 | `relay_enabled` | bool | `false` | Hold a reachability-relay control channel to Connect so this daemon's NAT'd fleet name is reachable through the relay's SNI passthrough (docs/src/self-hosted-rendezvous.md). Dial-backs terminate on a dedicated loopback-only gateway ingress and cannot enter the trusted-local lane. Requires `relay_endpoint` |
 | `relay_endpoint` | string | unset | `host:port` of the relay's raw passthrough port, where this daemon dials back browser connections (e.g. `relay.example.com:443`) |
 | `hosted_control_enabled` | bool | `false` | Enable the daemon-local hosted lease doorbell and exact lease-proof/ticket carve on fleet/relay ingress. Restart-only; deliberately has no environment-variable override |
+| `custom_domain.enabled` | bool | `false` | Enable the separate user-owned-name lane. Restart-only; no environment-variable override |
+| `custom_domain.name` | string | unset | Exact ASCII/punycode DNS name served by the daemon |
+| `custom_domain.rp_id` | string | `custom_domain.name` | WebAuthn relying-party id; when present it must equal the exact name |
+| `custom_domain.acme_issuance_enabled` | bool | `false` | Allow certificate orders after the displayed ACME account URI has been pinned in CAA |
+
+`[connect.custom_domain.dns]` selects the DNS-01 provider. `provider =
+"cloudflare"` requires `zone_id`, with optional `token_env` (default
+`CLOUDFLARE_API_TOKEN`) and `propagation_delay_secs` (default 10).
+`provider = "rfc2136"` requires `server`, `zone`, and `key_name`, with optional
+`secret_env` (default `INTENDANT_RFC2136_TSIG_SECRET`), `ttl_secs` (default
+60), and `propagation_delay_secs` (default 2). Provider secrets come from the
+`dns:cloudflare` / `dns:rfc2136` daemon credential lease or the named
+environment fallback, never this table. Alternate names must end in
+`_API_TOKEN` or `_TSIG_SECRET` respectively so they remain excluded from
+runtime children; custom names cannot occupy the reserved `INTENDANT_`
+namespace. See
+[Your Fleet, Your Name](./custom-domain.md) for CNAME, CAA account pinning,
+and passkey enrollment.
 
 `INTENDANT_CONNECT_RELAY_ENDPOINT` force-enables the relay tunnel and sets
 `relay_endpoint`. The relay is availability-only: it never terminates TLS,
@@ -409,6 +427,16 @@ rendezvous_url = "https://connect.intendant.dev"
 daemon_id = "vortex-deb-x11-intendant"
 auth_token = "same daemon token configured on intendant-connect"
 hosted_control_enabled = false
+
+[connect.custom_domain]
+enabled = false
+name = "box.example.com"
+acme_issuance_enabled = false
+
+[connect.custom_domain.dns]
+provider = "cloudflare"
+zone_id = "your-zone-id"
+token_env = "CLOUDFLARE_API_TOKEN"
 ```
 
 The service is a separate binary:

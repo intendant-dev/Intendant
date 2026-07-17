@@ -24,6 +24,9 @@ Every real deployment decision sits on two independent axes:
   cannot authenticate to that daemon. An owner may separately enable the
   [hosted-control lane](./hosted-control.md), where a disposable fleet-origin
   tab borrows only a short-lived, confirmed lease under a compiled preset.
+  The opt-in [user-owned-name lane](./custom-domain.md) binds WebAuthn and the
+  daemon's ACME account to an exact owner-controlled name, while retaining the
+  same bounded presets and immutable floor.
   Root-capable control starts with code whose provenance you accept: a
   dashboard served by a daemon you own over loopback or an independently
   fingerprint-verified direct-mTLS route (the

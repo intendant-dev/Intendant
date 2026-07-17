@@ -289,11 +289,16 @@ fn server_config_from(
 pub struct FleetSniResolver {
     base: std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
     fleet: std::sync::RwLock<Option<(String, Arc<rustls::sign::CertifiedKey>)>>,
+    custom: std::sync::RwLock<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
     // Never forget a name during this process. Accepted connections keep
     // their SNI for HTTP/1 keep-alive, and a hot fleet-name replacement must
     // not reclassify an already-open old-name connection as a pinned/direct
     // authority-bearing origin.
     fleet_names: std::sync::RwLock<std::collections::HashSet<String>>,
+    // User-owned names are a separate provenance class. Keep their history
+    // sticky for the same keep-alive/hot-reload reason as fleet names, without
+    // ever folding them into the service-controlled fleet-name set.
+    custom_names: std::sync::RwLock<std::collections::HashSet<String>>,
 }
 
 impl FleetSniResolver {
@@ -320,6 +325,30 @@ impl FleetSniResolver {
             .expect("tls resolver poisoned")
             .contains(&normalized)
     }
+
+    fn set_custom(&self, name: String, key: Arc<rustls::sign::CertifiedKey>) {
+        self.register_custom_name(&name);
+        self.custom
+            .write()
+            .expect("tls resolver poisoned")
+            .insert(name, key);
+    }
+
+    fn register_custom_name(&self, name: &str) {
+        self.custom_names
+            .write()
+            .expect("tls resolver poisoned")
+            .insert(name.trim().trim_end_matches('.').to_ascii_lowercase());
+    }
+
+    fn custom_name(&self, name: &str) -> Option<String> {
+        let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+        self.custom_names
+            .read()
+            .expect("tls resolver poisoned")
+            .contains(&normalized)
+            .then_some(normalized)
+    }
 }
 
 impl rustls::server::ResolvesServerCert for FleetSniResolver {
@@ -328,6 +357,15 @@ impl rustls::server::ResolvesServerCert for FleetSniResolver {
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         if let Some(server_name) = client_hello.server_name() {
+            let normalized = server_name.trim_end_matches('.').to_ascii_lowercase();
+            if let Some(key) = self
+                .custom
+                .read()
+                .expect("tls resolver poisoned")
+                .get(&normalized)
+            {
+                return Some(key.clone());
+            }
             let fleet = self.fleet.read().expect("tls resolver poisoned");
             if let Some((name, key)) = fleet.as_ref() {
                 if server_name.eq_ignore_ascii_case(name) {
@@ -364,6 +402,19 @@ pub fn register_fleet_server_name(name: &str) {
     fleet_sni_resolver().register_fleet_name(name);
 }
 
+/// Whether an accepted TLS connection named a configured user-owned origin.
+/// The exact SNI captured at the TLS boundary is returned for the HTTP
+/// Host/Origin match; no mutable HTTP header can create this provenance.
+pub fn custom_domain_server_name(name: Option<&str>) -> Option<String> {
+    name.and_then(|name| fleet_sni_resolver().custom_name(name))
+}
+
+/// Remember a configured user-owned name before certificate issuance. This
+/// keeps the name in its own public-origin class while ACME is pending.
+pub fn register_custom_domain_server_name(name: &str) {
+    fleet_sni_resolver().register_custom_name(name);
+}
+
 /// Install (or replace) the fleet certificate served for `name` —
 /// called by `fleet_cert.rs` at startup-restore, first issuance, and
 /// every renewal. Applies to live acceptors immediately.
@@ -385,6 +436,32 @@ pub fn install_fleet_certificate(
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("fleet key unusable: {e}"))?;
     fleet_sni_resolver().set_fleet(
+        name.trim().trim_end_matches('.').to_ascii_lowercase(),
+        Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
+    );
+    Ok(())
+}
+
+/// Install (or replace) the certificate for one exact user-owned name. Custom
+/// names use a separate resolver map and provenance set from fleet names.
+pub fn install_custom_domain_certificate(
+    name: &str,
+    cert_chain_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    use rustls::pki_types::pem::PemObject;
+    let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(cert_chain_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("parse custom-domain certificate: {e}"))?;
+    if cert_chain.is_empty() {
+        return Err("custom-domain certificate PEM holds no certificates".to_string());
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| format!("parse custom-domain key: {e}"))?;
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+        .map_err(|e| format!("custom-domain key unusable: {e}"))?;
+    fleet_sni_resolver().set_custom(
         name.trim().trim_end_matches('.').to_ascii_lowercase(),
         Arc::new(rustls::sign::CertifiedKey::new(cert_chain, signing_key)),
     );
@@ -624,6 +701,22 @@ mod tests {
         assert!(is_fleet_server_name(Some(second_name)));
         assert!(is_fleet_server_name(Some("OLD-FLEET-ORIGIN.TEST.")));
         assert!(!is_fleet_server_name(Some("direct-daemon.test")));
+    }
+
+    #[test]
+    fn custom_and_fleet_origin_classes_remain_distinct_and_sticky() {
+        let fleet = "d-separate.fleet.example.test";
+        let custom = "box.owner.example";
+        register_fleet_server_name(fleet);
+        register_custom_domain_server_name(custom);
+
+        assert!(is_fleet_server_name(Some(fleet)));
+        assert!(!is_fleet_server_name(Some(custom)));
+        assert_eq!(
+            custom_domain_server_name(Some("BOX.OWNER.EXAMPLE.")),
+            Some(custom.to_string())
+        );
+        assert_eq!(custom_domain_server_name(Some(fleet)), None);
     }
 
     #[test]

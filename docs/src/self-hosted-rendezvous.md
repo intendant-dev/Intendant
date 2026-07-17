@@ -311,6 +311,10 @@ Connect ever terminating TLS or seeing plaintext:
   relay correlates the two and splices them 1:1. On the daemon side the
   tunnel opens a second connection to a dedicated, ephemeral,
   loopback-only gateway ingress instead of the public gateway listener.
+- Control protocol v2 also binds a normalized, sorted list of exact custom
+  names into that daemon signature. An exact SNI claim routes only when one
+  active tunnel owns it; competing live claims fail closed. The derived
+  fleet-label route remains available for rolling v1 compatibility.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 
@@ -517,8 +521,8 @@ tree head pinned under the daemon state root
 (`~/.intendant/hosted-verify/<host>.json`, honoring `$INTENDANT_HOME`),
 then downloads every listed artifact exactly as a browser would and
 compares hashes — nonzero exit and a per-artifact diff on divergence.
-Every daemon with Connect enabled also runs this check twice daily as an
-advisory tripwire (the CT tripwire's sibling): a divergence flips
+Every daemon with Connect enabled also runs this check on boot and then
+daily as an advisory tripwire (the CT tripwire's sibling): a divergence flips
 `hosted_bundle_state` to `alert` on the Connect status payload and
 raises **HOSTED CODE ALERT** on the dashboard's Connect card; network
 failures only stamp `hosted_bundle_last_error` and never block anything.
@@ -618,3 +622,9 @@ that document verbatim for signed-application observation; its daemon
 signature, exact fleet origin, and canonical serial set remain independently
 verifiable. An independently recorded direct daemon URL still opens the
 daemon's own HTTPS/mTLS root-capable origin.
+
+A daemon can additionally register an opt-in
+[user-owned custom name](./custom-domain.md). The registration is signed by
+the same daemon identity key; Connect uses it only as an exact SNI routing
+hint. Certificate issuance, WebAuthn, and bounded lease minting remain on the
+daemon.

@@ -2396,6 +2396,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
 dependencies = [
+ "bitflags 2.11.0",
  "data-encoding",
  "idna",
  "ipnet",
@@ -2403,8 +2404,10 @@ dependencies = [
  "once_cell",
  "rand 0.10.1",
  "ring",
+ "rustls-pki-types",
  "serde",
  "thiserror 2.0.18",
+ "time",
  "tinyvec",
  "tracing",
  "url",
@@ -2912,6 +2915,7 @@ dependencies = [
  "env_logger",
  "flate2",
  "futures-util",
+ "hickory-proto",
  "hickory-server",
  "html2text",
  "image",

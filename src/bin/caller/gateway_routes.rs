@@ -198,6 +198,11 @@ pub(crate) const MCP_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// batches).
 pub(crate) const DIAGNOSTICS_BODY_CAP_BYTES: usize = 16 * 1024 * 1024;
 
+/// WebAuthn registration/assertion envelopes. Attestation is requested as
+/// `none`; 128 KiB leaves ample authenticator headroom without exposing the
+/// public ceremony endpoints to the generic 4 MiB command-body allowance.
+pub(crate) const CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES: usize = 128 * 1024;
+
 /// Body cap for the Claude sign-in ceremony start (`{"mode": …}` only).
 pub(crate) const CLAUDE_AUTH_START_BODY_CAP_BYTES: usize = 4 * 1024;
 
@@ -306,6 +311,7 @@ pub(crate) enum RouteHandlerId {
     HostedControlAnchorDecision,
     HostedControlCertificateLedger,
     HostedControlWitnessReport,
+    CustomDomainPasskey,
     HostedControlWsTicket,
     HostedControlManagement,
     /// Shared by the user-client-grants / grants-update pair (one legacy
@@ -609,6 +615,28 @@ const fn public_route(
         pattern,
         authz: RouteAuthz::Public,
         cors: CorsPosture::Public,
+        body,
+        handler,
+        doc,
+        tunnel: None,
+    }
+}
+
+/// Public authentication ceremony whose browser surface must still be the
+/// exact request origin. WebAuthn supplies the authority; own-origin CORS
+/// keeps foreign pages from driving the ceremony.
+const fn public_own_origin_route(
+    method: RouteMethod,
+    pattern: PathPattern,
+    body: BodyPolicy,
+    handler: RouteHandlerId,
+    doc: &'static str,
+) -> Route {
+    Route {
+        method,
+        pattern,
+        authz: RouteAuthz::Public,
+        cors: CorsPosture::OwnOrigin,
         body,
         handler,
         doc,
@@ -1601,6 +1629,34 @@ pub(crate) static ROUTES: &[Route] = &[
         RouteHandlerId::HostedControlWitnessReport,
         "Present a certificate observation signed by an enrolled application witness",
     ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/register/start"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Consume an owner-authorized custom-domain passkey enrollment invitation",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/register/finish"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Finish passkey enrollment at the exact configured custom-domain rp_id",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/start"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Start an exact-rp_id WebAuthn ceremony for a custom-domain bounded lease",
+    ),
+    public_own_origin_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/passkey/finish"),
+        BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES),
+        RouteHandlerId::CustomDomainPasskey,
+        "Finish custom-domain WebAuthn and issue the requested bounded lease",
+    ),
     op_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/hosted-control/ws-ticket"),
@@ -1788,7 +1844,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::None,
         RouteHandlerId::HostedControlManagement,
-        "Hosted-control policy, lease, signed-app anchor, and certificate-guard state",
+        "Hosted-control policy, lease, signed-app anchor, certificate-guard, custom-domain certificate, and passkey state",
     ),
     op_route(
         RouteMethod::Post,
@@ -1796,7 +1852,7 @@ pub(crate) static ROUTES: &[Route] = &[
         PeerOperation::AccessManage,
         BodyPolicy::Default,
         RouteHandlerId::HostedControlManagement,
-        "Decide requests, revoke leases, change policy, mark hosted-eligible sessions, or act on certificate evidence",
+        "Decide requests, revoke leases, change policy, mark hosted-eligible sessions, act on certificate evidence, or manage custom-domain passkeys",
     ),
     // ── Connect rendezvous administration. Status is inspect-grade but
     //    never carries the one-time claim code; revealing the code is its own
@@ -2592,6 +2648,7 @@ mod tests {
             RouteHandlerId::PeersSubRouter,
             RouteHandlerId::McpStream,
             RouteHandlerId::HostedControlManagement,
+            RouteHandlerId::CustomDomainPasskey,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();
         let mut previous: Option<RouteHandlerId> = None;
@@ -2747,6 +2804,17 @@ mod tests {
             policy("POST", "/api/hosted-control/witness-reports"),
             BodyPolicy::Capped(crate::access::hosted_control::HOSTED_WITNESS_REPORT_BODY_CAP_BYTES,)
         );
+        for path in [
+            "/api/hosted-control/passkey/register/start",
+            "/api/hosted-control/passkey/register/finish",
+            "/api/hosted-control/passkey/start",
+            "/api/hosted-control/passkey/finish",
+        ] {
+            assert_eq!(
+                policy("POST", path),
+                BodyPolicy::Capped(CUSTOM_DOMAIN_PASSKEY_BODY_CAP_BYTES)
+            );
+        }
         // Handler-owned streams: uploads spool to a tempfile; the doorbell's
         // cap is runtime config the table cannot carry.
         assert_eq!(

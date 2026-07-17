@@ -12,6 +12,7 @@
 - [Peer Federation](./peer-federation.md)
 - [Self-Hosted Rendezvous](./self-hosted-rendezvous.md)
 - [Hosted Control](./hosted-control.md)
+- [Your Fleet, Your Name](./custom-domain.md)
 - [Credential Custody: the Vault and Leases](./credential-custody.md)
 - [Trust Architecture](./trust-architecture.md)
 - [Trust Tiers](./trust-tiers.md)

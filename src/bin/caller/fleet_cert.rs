@@ -132,6 +132,14 @@ pub(crate) fn current_fleet_name_in(cert_dir: &Path) -> Result<Option<String>, S
     load_fleet_origin_provenance_in(cert_dir).map(|provenance| provenance.name)
 }
 
+pub(crate) fn is_known_fleet_name_in(cert_dir: &Path, name: &str) -> Result<bool, String> {
+    let Some(name) = normalized_dns_name(name) else {
+        return Ok(false);
+    };
+    load_fleet_origin_provenance_in(cert_dir)
+        .map(|provenance| provenance.known_names.iter().any(|known| known == &name))
+}
+
 fn remember_fleet_origin_in(
     cert_dir: &Path,
     zone: Option<&str>,
@@ -340,12 +348,8 @@ pub(crate) fn key_path() -> PathBuf {
     key_path_in(&cert_dir())
 }
 
-fn acme_account_path() -> PathBuf {
-    cert_dir().join("acme-account.json")
-}
-
 /// Certificate expiry (`not_after`, unix ms) from a PEM chain's leaf.
-fn cert_not_after_unix_ms(cert_pem: &str) -> Option<u64> {
+pub(crate) fn cert_not_after_unix_ms(cert_pem: &str) -> Option<u64> {
     let leaf = pem_certificates(cert_pem).into_iter().next()?;
     let (_, parsed) = x509_parser::parse_x509_certificate(&leaf).ok()?;
     let seconds = parsed.validity().not_after.timestamp();
@@ -579,7 +583,7 @@ fn now_unix_ms() -> u64 {
 
 /// The ACME directory: Let's Encrypt production unless overridden (the
 /// staging directory for rig runs: `INTENDANT_ACME_DIRECTORY`).
-fn acme_directory() -> String {
+pub(crate) fn acme_directory() -> String {
     std::env::var("INTENDANT_ACME_DIRECTORY")
         .ok()
         .map(|value| value.trim().to_string())
@@ -588,15 +592,15 @@ fn acme_directory() -> String {
 }
 
 async fn acme_account() -> Result<instant_acme::Account, String> {
-    let path = acme_account_path();
-    if let Ok(stored) = std::fs::read_to_string(&path) {
-        if let Ok(credentials) = serde_json::from_str::<instant_acme::AccountCredentials>(&stored) {
-            return instant_acme::Account::builder()
-                .map_err(|e| format!("acme http client: {e}"))?
-                .from_credentials(credentials)
-                .await
-                .map_err(|e| format!("restore acme account: {e}"));
-        }
+    acme_account_in(&cert_dir()).await
+}
+
+pub(crate) async fn acme_account_in(cert_dir: &Path) -> Result<instant_acme::Account, String> {
+    let path = cert_dir.join("acme-account.json");
+    match std::fs::read_to_string(&path) {
+        Ok(stored) => return restore_acme_account(&path, &stored).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
     }
     let (account, credentials) = instant_acme::Account::builder()
         .map_err(|e| format!("acme http client: {e}"))?
@@ -613,11 +617,82 @@ async fn acme_account() -> Result<instant_acme::Account, String> {
         .map_err(|e| format!("create acme account: {e}"))?;
     let serialized = serde_json::to_string(&credentials)
         .map_err(|e| format!("serialize acme credentials: {e}"))?;
-    write_private(&path, serialized.as_bytes())?;
-    Ok(account)
+    let installed =
+        crate::access::authority_store::with_lock(cert_dir, || match std::fs::metadata(&path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::access::authority_store::atomic_write_private_locked(
+                    &path,
+                    serialized.as_bytes(),
+                )?;
+                Ok(true)
+            }
+            Err(error) => Err(crate::access::AccessError(format!(
+                "inspect {}: {error}",
+                path.display()
+            ))),
+        })
+        .map_err(|error| error.to_string())?;
+    if installed {
+        return Ok(account);
+    }
+
+    // Another daemon process won the first-account race. The durable account
+    // is the CAA-pinned identity; discard this process's unused account
+    // instead of overwriting or silently rotating it.
+    let stored = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    restore_acme_account(&path, &stored).await
 }
 
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+async fn restore_acme_account(path: &Path, stored: &str) -> Result<instant_acme::Account, String> {
+    let credentials =
+        serde_json::from_str::<instant_acme::AccountCredentials>(stored).map_err(|error| {
+            format!(
+                "parse {}: {error}; refusing to rotate the stored ACME account",
+                path.display()
+            )
+        })?;
+    instant_acme::Account::builder()
+        .map_err(|e| format!("acme http client: {e}"))?
+        .from_credentials(credentials)
+        .await
+        .map_err(|e| format!("restore acme account {}: {e}", path.display()))
+}
+
+pub(crate) fn acme_account_uri_in(cert_dir: &Path) -> Result<Option<String>, String> {
+    let path = cert_dir.join("acme-account.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let _credentials = serde_json::from_slice::<instant_acme::AccountCredentials>(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let account_uri = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{} has no ACME account URI", path.display()))?;
+    let parsed = url::Url::parse(account_uri).map_err(|error| {
+        format!(
+            "{} has an invalid ACME account URI: {error}",
+            path.display()
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(format!(
+            "{} has an invalid ACME account URI",
+            path.display()
+        ));
+    }
+    Ok(Some(account_uri.to_string()))
+}
+
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
@@ -1172,6 +1247,21 @@ pub fn spawn_renewal_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn malformed_stored_acme_account_is_never_silently_rotated() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("acme-account.json"), b"{").unwrap();
+        let error = match acme_account_in(temp.path()).await {
+            Ok(_) => panic!("malformed account must not be replaced"),
+            Err(error) => error,
+        };
+        assert!(error.contains("refusing to rotate"), "{error}");
+        assert_eq!(
+            std::fs::read(temp.path().join("acme-account.json")).unwrap(),
+            b"{"
+        );
+    }
 
     fn write_legacy_fleet_certificate(cert_dir: &Path, names: &[&str]) {
         let certificate = rcgen::generate_simple_self_signed(

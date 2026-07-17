@@ -9,6 +9,20 @@ pub(crate) fn is_public_hosted_control_path(method: &str, path: &str) -> bool {
             | ("POST", "/api/hosted-control/anchor-decisions")
             | ("GET", "/api/hosted-control/certificate-ledger")
             | ("POST", "/api/hosted-control/witness-reports")
+            | ("POST", "/api/hosted-control/passkey/start")
+            | ("POST", "/api/hosted-control/passkey/finish")
+            | ("POST", "/api/hosted-control/passkey/register/start")
+            | ("POST", "/api/hosted-control/passkey/register/finish")
+    )
+}
+
+pub(crate) fn is_custom_domain_only_hosted_control_path(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST", "/api/hosted-control/passkey/start")
+            | ("POST", "/api/hosted-control/passkey/finish")
+            | ("POST", "/api/hosted-control/passkey/register/start")
+            | ("POST", "/api/hosted-control/passkey/register/finish")
     )
 }
 
@@ -18,6 +32,18 @@ pub(crate) fn is_fleet_only_hosted_control_path(method: &str, path: &str) -> boo
             (method, path),
             ("GET", "/api/hosted-control/certificate-ledger")
         )
+}
+
+pub(crate) fn is_public_lease_ingress(discovery_only: bool, custom_domain_sni: bool) -> bool {
+    discovery_only || custom_domain_sni
+}
+
+pub(crate) fn is_public_control_lane_configured(
+    discovery_only: bool,
+    custom_domain_sni: bool,
+    fleet_lane_enabled: bool,
+) -> bool {
+    custom_domain_sni || (discovery_only && fleet_lane_enabled)
 }
 
 fn json_value<T: serde::Serialize>(value: T) -> ApiResponse {
@@ -50,6 +76,23 @@ pub(crate) fn fleet_origin_from_request(header_text: &str, is_tls: bool) -> Resu
     Ok(url.origin().ascii_serialization())
 }
 
+pub(crate) fn public_origin_from_request(
+    header_text: &str,
+    is_tls: bool,
+    tls_custom_domain: Option<&str>,
+) -> Result<String, String> {
+    let origin = fleet_origin_from_request(header_text, is_tls)?;
+    if let Some(custom_name) = tls_custom_domain {
+        let expected = format!("https://{custom_name}");
+        if origin != expected {
+            return Err(
+                "request Host must equal the exact custom-domain TLS server name".to_string(),
+            );
+        }
+    }
+    Ok(origin)
+}
+
 pub(crate) fn hosted_request_proof_from_headers(
     header_text: &str,
 ) -> Result<crate::access::hosted_control::HostedRequestProof, String> {
@@ -73,14 +116,26 @@ pub(crate) fn hosted_request_proof_from_headers(
 pub(crate) async fn handle_hosted_control_bootstrap(
     stream: DemuxStream,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
     header_text: &str,
     is_tls: bool,
+    tls_custom_domain: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
-    let response = match fleet_origin_from_request(header_text, is_tls)
-        .and_then(|origin| runtime.bootstrap(&origin))
-    {
-        Ok(bootstrap) => json_value(bootstrap),
+    let response = match public_origin_from_request(header_text, is_tls, tls_custom_domain)
+        .and_then(|origin| {
+            runtime
+                .bootstrap(&origin)
+                .map(|bootstrap| (origin, bootstrap))
+        }) {
+        Ok((origin, mut bootstrap)) => {
+            if custom_domain.matches_origin(&origin) {
+                bootstrap.custom_domain = true;
+                bootstrap.rp_id = custom_domain.snapshot().rp_id;
+                bootstrap.passkey_available = custom_domain.passkey_available();
+            }
+            json_value(bootstrap)
+        }
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
         Err(error) => ApiResponse::json_error(400, error),
@@ -92,8 +147,7 @@ pub(crate) async fn handle_hosted_control_request_create(
     stream: DemuxStream,
     body: String,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
-    header_text: &str,
-    is_tls: bool,
+    public_origin: Result<String, String>,
     source_bucket: Option<&str>,
     cors: crate::gateway_routes::CorsPosture,
 ) {
@@ -101,7 +155,7 @@ pub(crate) async fn handle_hosted_control_request_create(
         serde_json::from_str::<crate::access::hosted_control::HostedLeaseRequestInput>(&body)
             .map_err(|error| format!("invalid hosted lease request: {error}"));
     let response = match input.and_then(|input| {
-        let origin = fleet_origin_from_request(header_text, is_tls)?;
+        let origin = public_origin?;
         runtime.create_request(input, &origin, source_bucket)
     }) {
         Ok(request) => {
@@ -114,6 +168,83 @@ pub(crate) async fn handle_hosted_control_request_create(
         }
         Err(error) if !runtime.configured() => ApiResponse::json_error(404, error),
         Err(error) if !runtime.enabled() => ApiResponse::json_error(503, error),
+        Err(error) => ApiResponse::json_error(400, error),
+    };
+    write_api_response(stream, response, cors, None).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_custom_domain_passkey(
+    stream: DemuxStream,
+    path: &str,
+    body: String,
+    custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
+    header_text: &str,
+    is_tls: bool,
+    tls_custom_domain: Option<&str>,
+    source_bucket: Option<&str>,
+    cors: crate::gateway_routes::CorsPosture,
+) {
+    let result =
+        public_origin_from_request(header_text, is_tls, tls_custom_domain).and_then(|origin| {
+            if !custom_domain.matches_origin(&origin) {
+                return Err("custom-domain passkey endpoint is unavailable on this origin".into());
+            }
+            match path {
+                "/api/hosted-control/passkey/register/start" => {
+                    let input =
+                        serde_json::from_str::<crate::custom_domain::RegistrationStartInput>(&body)
+                            .map_err(|error| {
+                                format!("invalid passkey registration start: {error}")
+                            })?;
+                    custom_domain
+                        .registration_start(input, &origin)
+                        .and_then(|value| {
+                            serde_json::to_value(value).map_err(|error| error.to_string())
+                        })
+                }
+                "/api/hosted-control/passkey/register/finish" => {
+                    let input =
+                        serde_json::from_str::<crate::custom_domain::RegistrationFinishInput>(
+                            &body,
+                        )
+                        .map_err(|error| format!("invalid passkey registration finish: {error}"))?;
+                    custom_domain.registration_finish(input).map(|value| {
+                        serde_json::json!({
+                            "ok": true,
+                            "passkey": value,
+                        })
+                    })
+                }
+                "/api/hosted-control/passkey/start" => {
+                    let input = serde_json::from_str::<
+                        crate::custom_domain::AuthenticationStartInput,
+                    >(&body)
+                    .map_err(|error| format!("invalid passkey start request: {error}"))?;
+                    custom_domain
+                        .authentication_start(input, &origin, source_bucket)
+                        .and_then(|value| {
+                            serde_json::to_value(value).map_err(|error| error.to_string())
+                        })
+                }
+                "/api/hosted-control/passkey/finish" => {
+                    let input = serde_json::from_str::<
+                        crate::custom_domain::AuthenticationFinishInput,
+                    >(&body)
+                    .map_err(|error| format!("invalid passkey finish request: {error}"))?;
+                    custom_domain
+                        .authentication_finish(input, &origin)
+                        .and_then(|value| {
+                            serde_json::to_value(value).map_err(|error| error.to_string())
+                        })
+                }
+                _ => Err("custom-domain passkey endpoint was not found".to_string()),
+            }
+        });
+    let response = match result {
+        Ok(value) => ApiResponse::json(200, JsonBody::Value(value)),
+        Err(error) if !custom_domain.configured() => ApiResponse::json_error(404, error),
+        Err(error) if !custom_domain.enabled() => ApiResponse::json_error(503, error),
         Err(error) => ApiResponse::json_error(400, error),
     };
     write_api_response(stream, response, cors, None).await;
@@ -261,11 +392,12 @@ pub(crate) async fn handle_hosted_control_management(
     path: &str,
     body: String,
     runtime: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
     authority: HttpAccessContext,
     cors: crate::gateway_routes::CorsPosture,
     fleet_origin: Option<&str>,
 ) {
-    if !runtime.configured() {
+    if !runtime.configured() && !custom_domain.configured() {
         write_api_response(
             stream,
             ApiResponse::json_error(404, "hosted control is disabled"),
@@ -290,10 +422,44 @@ pub(crate) async fn handle_hosted_control_management(
     }
     let actor = &authority.principal;
     let response = match (method, path) {
-        ("GET", "/api/access/hosted-control") => runtime
-            .management_snapshot()
-            .map(json_value)
-            .unwrap_or_else(|error| ApiResponse::json_error(500, error.to_string())),
+        ("GET", "/api/access/hosted-control") => {
+            let value = if runtime.configured() {
+                runtime
+                    .management_snapshot()
+                    .map_err(|error| error.to_string())
+                    .and_then(|snapshot| {
+                        serde_json::to_value(snapshot).map_err(|error| error.to_string())
+                    })
+            } else {
+                Ok(serde_json::json!({"configured": false, "enabled": false}))
+            };
+            match value {
+                Ok(mut value) => {
+                    value["custom_domain"] = serde_json::to_value(custom_domain.snapshot())
+                        .unwrap_or(serde_json::Value::Null);
+                    ApiResponse::json(200, JsonBody::Value(value))
+                }
+                Err(error) => ApiResponse::json_error(500, error),
+            }
+        }
+        ("POST", "/api/access/hosted-control/passkeys/enrollment") => {
+            match serde_json::from_str::<crate::custom_domain::RegistrationInviteInput>(&body)
+                .map_err(|error| format!("invalid passkey enrollment invitation: {error}"))
+                .and_then(|input| custom_domain.registration_invite(input))
+            {
+                Ok(invitation) => json_value(invitation),
+                Err(error) => ApiResponse::json_error(400, error),
+            }
+        }
+        ("POST", "/api/access/hosted-control/passkeys/revoke") => {
+            match serde_json::from_str::<crate::custom_domain::RevokeInput>(&body)
+                .map_err(|error| format!("invalid passkey revocation: {error}"))
+                .and_then(|input| custom_domain.revoke(input))
+            {
+                Ok(revoked) => json_value(serde_json::json!({"ok": true, "revoked": revoked})),
+                Err(error) => ApiResponse::json_error(400, error),
+            }
+        }
         ("POST", "/api/access/hosted-control/requests/decide") => match serde_json::from_str::<
             crate::access::hosted_control::HostedLeaseDecisionInput,
         >(&body)
@@ -412,6 +578,10 @@ mod tests {
             ("POST", "/api/hosted-control/anchor-decisions"),
             ("GET", "/api/hosted-control/certificate-ledger"),
             ("POST", "/api/hosted-control/witness-reports"),
+            ("POST", "/api/hosted-control/passkey/register/start"),
+            ("POST", "/api/hosted-control/passkey/register/finish"),
+            ("POST", "/api/hosted-control/passkey/start"),
+            ("POST", "/api/hosted-control/passkey/finish"),
         ] {
             assert!(is_public_hosted_control_path(method, path));
         }
@@ -422,6 +592,10 @@ mod tests {
         assert!(is_fleet_only_hosted_control_path(
             "POST",
             "/api/hosted-control/requests"
+        ));
+        assert!(is_custom_domain_only_hosted_control_path(
+            "POST",
+            "/api/hosted-control/passkey/start"
         ));
         for (method, path) in [
             ("POST", "/api/hosted-control/bootstrap"),
@@ -462,6 +636,25 @@ mod tests {
                 "invalid Host authority {host:?} was accepted",
             );
         }
+    }
+
+    #[test]
+    fn custom_origin_requires_exact_tls_sni_and_host_agreement() {
+        let request = "GET / HTTP/1.1\r\nHost: box.example.test\r\n\r\n";
+        assert_eq!(
+            public_origin_from_request(request, true, Some("box.example.test")).unwrap(),
+            "https://box.example.test"
+        );
+        assert!(public_origin_from_request(request, true, Some("other.example.test")).is_err());
+        assert!(public_origin_from_request(request, false, Some("box.example.test")).is_err());
+    }
+
+    #[test]
+    fn custom_lane_enablement_does_not_open_the_fleet_name_lane() {
+        assert!(!is_public_control_lane_configured(true, false, false));
+        assert!(is_public_control_lane_configured(false, true, false));
+        assert!(is_public_control_lane_configured(true, false, true));
+        assert!(!is_public_control_lane_configured(false, false, true));
     }
 
     #[test]

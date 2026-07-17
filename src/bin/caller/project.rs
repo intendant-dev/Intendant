@@ -670,6 +670,163 @@ pub struct ProjectConfig {
 /// rendezvous_url = "https://connect.intendant.dev"
 /// daemon_id = "my-laptop"
 /// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CustomDomainConfig {
+    /// Master switch for the user-owned-name lane. There is deliberately no
+    /// environment override: a checked-in/default config cannot turn this on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exact user-owned DNS name served by this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// WebAuthn relying-party id. When omitted it is the exact `name`; when
+    /// present it must still equal `name` so credentials cannot widen to a
+    /// parent domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    /// Separate issuance ceremony. Leave false while the daemon creates its
+    /// ACME account and exposes the account URI; enable only after publishing
+    /// the accounturi + dns-01 CAA policy.
+    #[serde(default)]
+    pub acme_issuance_enabled: bool,
+    /// DNS-01 provider. Credentials are supplied by the daemon's credential
+    /// lease store or the named environment variable, never inline here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<CustomDomainDnsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum CustomDomainDnsConfig {
+    Cloudflare {
+        zone_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_env: Option<String>,
+        #[serde(default = "default_cloudflare_propagation_delay_secs")]
+        propagation_delay_secs: u64,
+    },
+    Rfc2136 {
+        /// Authoritative update endpoint (`host:port`; TCP).
+        server: String,
+        /// Zone apex that accepts the update.
+        zone: String,
+        /// TSIG key name.
+        key_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_env: Option<String>,
+        #[serde(default = "default_custom_dns_ttl_secs")]
+        ttl_secs: u32,
+        #[serde(default = "default_rfc2136_propagation_delay_secs")]
+        propagation_delay_secs: u64,
+    },
+}
+
+fn default_cloudflare_propagation_delay_secs() -> u64 {
+    10
+}
+
+fn default_rfc2136_propagation_delay_secs() -> u64 {
+    2
+}
+
+fn default_custom_dns_ttl_secs() -> u32 {
+    60
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedCustomDomain {
+    pub name: String,
+    pub rp_id: String,
+    pub origin: String,
+}
+
+fn normalize_custom_domain_name(value: &str) -> Result<String, String> {
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.is_ascii()
+        || normalized.contains('*')
+    {
+        return Err("custom domain must be one exact ASCII DNS name".to_string());
+    }
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if labels.len() < 2
+        || normalized.parse::<std::net::IpAddr>().is_ok()
+        || labels.first().is_some_and(|label| {
+            label.strip_prefix("d-").is_some_and(|digest| {
+                digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        })
+        || labels
+            .last()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(
+            "custom domain must contain valid DNS labels (use the ASCII/punycode form)".to_string(),
+        );
+    }
+    let parsed = url::Url::parse(&format!("https://{normalized}"))
+        .map_err(|_| "custom domain is not a canonical ASCII/punycode DNS name".to_string())?;
+    if parsed.host_str() != Some(normalized.as_str()) {
+        return Err("custom domain is not a canonical ASCII/punycode DNS name".to_string());
+    }
+    Ok(normalized)
+}
+
+impl CustomDomainConfig {
+    pub fn validated(&self) -> Result<Option<ValidatedCustomDomain>, String> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let name = self
+            .name
+            .as_deref()
+            .ok_or_else(|| "custom_domain.name is required when enabled".to_string())
+            .and_then(normalize_custom_domain_name)?;
+        let rp_id = self
+            .rp_id
+            .as_deref()
+            .map(normalize_custom_domain_name)
+            .transpose()?
+            .unwrap_or_else(|| name.clone());
+        if rp_id != name {
+            return Err("custom_domain.rp_id must equal the exact custom domain name".to_string());
+        }
+        if let Some(dns) = &self.dns {
+            match dns {
+                CustomDomainDnsConfig::Cloudflare { token_env, .. } => {
+                    crate::credential_leases::dns_credential_env_name(
+                        token_env.as_deref(),
+                        "CLOUDFLARE_API_TOKEN",
+                        "_API_TOKEN",
+                    )?;
+                }
+                CustomDomainDnsConfig::Rfc2136 { secret_env, .. } => {
+                    crate::credential_leases::dns_credential_env_name(
+                        secret_env.as_deref(),
+                        "INTENDANT_RFC2136_TSIG_SECRET",
+                        "_TSIG_SECRET",
+                    )?;
+                }
+            }
+        }
+        Ok(Some(ValidatedCustomDomain {
+            origin: format!("https://{name}"),
+            name,
+            rp_id,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectConfig {
     /// Master switch. Environment variable
@@ -712,6 +869,9 @@ pub struct ConnectConfig {
     /// behavior. There is intentionally no environment-variable override.
     #[serde(default)]
     pub hosted_control_enabled: bool,
+    /// Opt-in user-owned-name control lane.
+    #[serde(default)]
+    pub custom_domain: CustomDomainConfig,
 }
 
 /// Rendezvous applied when `[connect] enabled = true` names no
@@ -782,6 +942,7 @@ impl Default for ConnectConfig {
             relay_enabled: false,
             relay_endpoint: None,
             hosted_control_enabled: false,
+            custom_domain: CustomDomainConfig::default(),
         }
     }
 }
@@ -2384,6 +2545,93 @@ context_recovery = "managed"
         config.enabled = false;
         save_daemon_connect_config_in(&path, &config).unwrap();
         assert!(!load_daemon_connect_config_in(&path).unwrap().enabled);
+    }
+
+    #[test]
+    fn custom_domain_is_dark_and_exact_by_default() {
+        let config = ConnectConfig::default();
+        assert!(!config.custom_domain.enabled);
+        assert!(!config.custom_domain.acme_issuance_enabled);
+        assert_eq!(config.custom_domain.validated().unwrap(), None);
+
+        let enabled = CustomDomainConfig {
+            enabled: true,
+            name: Some("Box.Example.COM.".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            enabled.validated().unwrap(),
+            Some(ValidatedCustomDomain {
+                name: "box.example.com".to_string(),
+                rp_id: "box.example.com".to_string(),
+                origin: "https://box.example.com".to_string(),
+            })
+        );
+
+        let widened = CustomDomainConfig {
+            rp_id: Some("example.com".to_string()),
+            ..enabled.clone()
+        };
+        assert!(widened.validated().unwrap_err().contains("must equal"));
+        let wildcard = CustomDomainConfig {
+            name: Some("*.example.com".to_string()),
+            ..enabled
+        };
+        assert!(wildcard.validated().is_err());
+        let ip_literal = CustomDomainConfig {
+            enabled: true,
+            name: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+        assert!(ip_literal.validated().is_err());
+        let fleet_shaped = CustomDomainConfig {
+            enabled: true,
+            name: Some("d-30a08371a38c1b447038.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(fleet_shaped.validated().is_err());
+    }
+
+    #[test]
+    fn custom_domain_provider_config_round_trips_without_inline_secrets() {
+        let text = r#"
+[connect]
+enabled = true
+relay_enabled = true
+relay_endpoint = "relay.example.com:443"
+
+[connect.custom_domain]
+enabled = true
+name = "box.example.com"
+acme_issuance_enabled = true
+
+[connect.custom_domain.dns]
+provider = "cloudflare"
+zone_id = "zone-id"
+        token_env = "CLOUDFLARE_API_TOKEN"
+"#;
+        let parsed: ProjectConfig = toml::from_str(text).unwrap();
+        let custom = &parsed.connect.custom_domain;
+        assert_eq!(
+            custom.validated().unwrap().unwrap().rp_id,
+            "box.example.com"
+        );
+        assert!(custom.acme_issuance_enabled);
+        assert!(matches!(
+            &custom.dns,
+            Some(CustomDomainDnsConfig::Cloudflare { zone_id, .. }) if zone_id == "zone-id"
+        ));
+        let serialized = toml::to_string(&parsed.connect).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("secret ="));
+        assert!(!serialized.to_ascii_lowercase().contains("token ="));
+
+        let mut invalid = (*custom).clone();
+        invalid.dns = Some(CustomDomainDnsConfig::Cloudflare {
+            zone_id: "zone-id".to_string(),
+            token_env: Some("INTENDANT_UNSCRUBBED_TOKEN".to_string()),
+            propagation_delay_secs: 10,
+        });
+        assert!(invalid.validated().is_err());
     }
 
     #[test]

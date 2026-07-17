@@ -31,8 +31,10 @@
 //! precedent); golden tests below twin the service's constants.
 
 use sha2::{Digest as _, Sha256};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use url::Url;
 
 // ── Status registry (the tripwire's verdict; fleet_cert.rs pattern) ──
@@ -1256,19 +1258,26 @@ pub(crate) async fn check_once() {
     }
 }
 
-/// First tick shortly after startup (registration needs a moment), then
-/// twice daily — the CT tripwire's cadence. Spawned once at gateway
-/// startup, beside `fleet_cert::spawn_renewal_loop`.
+const HOSTED_BUNDLE_MONITOR_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+async fn run_hosted_bundle_monitor<F, Fut>(mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    loop {
+        // This verifier does not depend on daemon registration. Running
+        // before the first sleep gives every daemon boot an immediate
+        // out-of-band observation of its configured Connect origin.
+        check().await;
+        tokio::time::sleep(HOSTED_BUNDLE_MONITOR_INTERVAL).await;
+    }
+}
+
+/// Check on boot, then daily. Spawned once at gateway startup, beside
+/// `fleet_cert::spawn_renewal_loop`.
 pub(crate) fn spawn_hosted_bundle_monitor() {
-    tokio::spawn(async move {
-        let mut first = true;
-        loop {
-            let delay = if first { 7 * 60 } else { 12 * 60 * 60 };
-            first = false;
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-            check_once().await;
-        }
-    });
+    tokio::spawn(run_hosted_bundle_monitor(check_once));
 }
 
 // ── The CLI front door: `intendant hosted-verify` ──
@@ -1532,6 +1541,32 @@ async fn run_release_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_monitor_checks_on_boot_then_daily() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(run_hosted_bundle_monitor(move || {
+            let tx = tx.clone();
+            async move {
+                tx.send(()).unwrap();
+            }
+        }));
+
+        rx.recv().await.expect("boot check");
+        tokio::time::advance(HOSTED_BUNDLE_MONITOR_INTERVAL - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "the daily check must not run early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        rx.recv().await.expect("daily check");
+        handle.abort();
+    }
 
     // ── Local producers (RFC 6962 §2.1) so the replicated verifiers are
     // exercised against real trees, mirroring the service's tests. ──

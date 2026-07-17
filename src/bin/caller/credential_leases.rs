@@ -111,9 +111,51 @@ pub fn known_kind(kind: &str) -> bool {
         "api_key:anthropic"
             | "api_key:openai"
             | "api_key:gemini"
+            | "dns:cloudflare"
+            | "dns:rfc2136"
             | "oauth:codex"
             | "oauth:claude-code"
     )
+}
+
+pub(crate) const DNS_CREDENTIAL_ENV_VARS: &[&str] =
+    &["CLOUDFLARE_API_TOKEN", "INTENDANT_RFC2136_TSIG_SECRET"];
+
+pub(crate) fn is_dns_credential_env(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    DNS_CREDENTIAL_ENV_VARS.contains(&name.as_str())
+        || name.ends_with("_API_TOKEN")
+        || name.ends_with("_TSIG_SECRET")
+}
+
+pub(crate) fn dns_credential_env_name(
+    configured: Option<&str>,
+    default: &str,
+    required_suffix: &str,
+) -> Result<String, String> {
+    let name = configured
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(default);
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("custom-domain credential environment name is invalid".to_string());
+    }
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("INTENDANT_") && !upper.eq_ignore_ascii_case(default) {
+        return Err(
+            "custom-domain credential environment names in the INTENDANT_ namespace must use the documented default"
+                .to_string(),
+        );
+    }
+    if !upper.ends_with(required_suffix) || !is_dns_credential_env(&upper) {
+        return Err(format!(
+            "custom-domain credential environment name must end in {required_suffix}"
+        ));
+    }
+    Ok(name.to_string())
 }
 
 fn env_kind(env_name: &str) -> Option<&'static str> {
@@ -245,6 +287,8 @@ fn kind_has_env_fallback(kind: &str) -> bool {
         "api_key:anthropic" => &["ANTHROPIC_API_KEY", "ANTHROPIC"],
         "api_key:openai" => &["OPENAI_API_KEY", "OPENAI"],
         "api_key:gemini" => &["GEMINI_API_KEY", "GEMINI"],
+        "dns:cloudflare" => &["CLOUDFLARE_API_TOKEN"],
+        "dns:rfc2136" => &["INTENDANT_RFC2136_TSIG_SECRET"],
         // The external agents have no env fallback — an expired oauth
         // lease always means dry.
         _ => &[],

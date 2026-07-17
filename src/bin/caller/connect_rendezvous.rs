@@ -1408,7 +1408,7 @@ const DNS_ACME_PROTOCOL: &str = "intendant-connect-dns-acme-v1";
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
 /// Persistent relay control-channel long-poll protocol (mirrors
 /// `bin/connect/relay.rs`).
-pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
 
 #[cfg(test)] // golden-test twin of the payload `dns_signed_post` builds inline
 fn dns_publish_signing_payload(

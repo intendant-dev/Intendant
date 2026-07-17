@@ -527,7 +527,16 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             .iter()
             .any(|url| matches!(url.split(':').next(), Some("turn" | "turns")))
     });
-    let hosted_control_daemon_label = if config.connect.hosted_control_enabled {
+    let custom_domain_configured = config
+        .connect
+        .custom_domain
+        .validated()
+        .ok()
+        .flatten()
+        .is_some();
+    let public_control_configured =
+        config.connect.hosted_control_enabled || custom_domain_configured;
+    let hosted_control_daemon_label = if public_control_configured {
         config
             .hosted_control_daemon_label
             .clone()
@@ -536,7 +545,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
         String::new()
     };
     let hosted_control = Arc::new(crate::access::hosted_control::HostedControlRuntime::new(
-        config.connect.hosted_control_enabled,
+        public_control_configured,
         access_cert_dir.clone(),
         config.hosted_control_identity_path.as_deref(),
         config.connect.daemon_id.as_deref(),
@@ -1022,6 +1031,12 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
     // SNI resolver and keep it renewed (fleet_cert.rs).
     crate::fleet_cert::refresh_installed_state_in(&access_cert_dir);
     crate::fleet_cert::spawn_renewal_loop();
+    let custom_domain = Arc::new(crate::custom_domain::CustomDomainRuntime::new(
+        &config.connect.custom_domain,
+        access_cert_dir.clone(),
+        Arc::clone(&hosted_control),
+    ));
+    custom_domain.spawn_certificate_loop();
     // Hosted-bundle code transparency: when Connect is enabled,
     // periodically verify what the rendezvous serves against its public
     // transparency log (hosted_verify.rs — advisory and fail-open, the
@@ -1376,6 +1391,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
             let worktree_inventory_cache = worktree_inventory_cache.clone();
             let access_cert_dir = access_cert_dir.clone();
             let hosted_control = Arc::clone(&hosted_control);
+            let custom_domain = Arc::clone(&custom_domain);
             let tls_client_cert_required = tls_client_cert_required;
             let source_hint = peer_addr.ip().to_string();
             let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
@@ -1590,6 +1606,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                 let buf_owned: Vec<u8>;
                 let mut stream: DemuxStream;
                 let tls_fleet_origin: bool;
+                let tls_custom_domain: Option<String>;
                 let tls_client_cert_present: bool;
                 let tls_client_cert_fingerprint: Option<String>;
                 if is_tls {
@@ -1614,8 +1631,9 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // endpoint, never an authority anchor; HTTP Host alone is
                     // mutable and cannot establish the stronger direct-mTLS
                     // ceremony.
-                    tls_fleet_origin =
-                        crate::web_tls::is_fleet_server_name(tls_stream.get_ref().1.server_name());
+                    let tls_server_name = tls_stream.get_ref().1.server_name();
+                    tls_fleet_origin = crate::web_tls::is_fleet_server_name(tls_server_name);
+                    tls_custom_domain = crate::web_tls::custom_domain_server_name(tls_server_name);
                     let peer_certs = tls_stream
                         .get_ref()
                         .1
@@ -1654,6 +1672,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     // reads the request straight from the socket.
                     buf_owned = buf[..peeked].to_vec();
                     tls_fleet_origin = false;
+                    tls_custom_domain = None;
                     tls_client_cert_present = false;
                     tls_client_cert_fingerprint = None;
                     stream = DemuxStream::new(Box::pin(crate::web_tls::PrefixedStream::new(
@@ -1755,6 +1774,8 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     let http_ctx = HttpRequestCtx {
                         access_cert_dir: access_cert_dir.clone(),
                         hosted_control: Arc::clone(&hosted_control),
+                        custom_domain: Arc::clone(&custom_domain),
+                        fleet_hosted_control_enabled: config.connect.hosted_control_enabled,
                         bus: bus.clone(),
                         config_json: config_json.clone(),
                         session_provider: session_provider.clone(),
@@ -1794,6 +1815,7 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                         source_hint.clone(),
                         is_tls,
                         tls_fleet_origin,
+                        tls_custom_domain.clone(),
                         tls_client_cert_present,
                         tls_client_cert_fingerprint.clone(),
                         peer_connection_identity,
@@ -1835,22 +1857,35 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     let discovery_only_ws = gateway_ingress.is_reachability_relay()
                         || tls_fleet_origin
                         || request_names_known_fleet_origin(&header_text);
-                    let hosted_ws_authority = if discovery_only_ws && hosted_control.enabled() {
+                    let public_lease_ws =
+                        is_public_lease_ingress(discovery_only_ws, tls_custom_domain.is_some());
+                    let configured_public_ws = is_public_control_lane_configured(
+                        discovery_only_ws,
+                        tls_custom_domain.is_some(),
+                        config.connect.hosted_control_enabled,
+                    );
+                    let hosted_ws_authority = if configured_public_ws && hosted_control.enabled() {
                         let ticket =
                             query_param(header_text.lines().next().unwrap_or(""), "hosted_ticket");
                         match ticket {
-                            Some(ticket) => match fleet_origin_from_request(&header_text, is_tls)
-                                .and_then(|origin| {
-                                    hosted_control.consume_ws_ticket(
-                                        &ticket,
-                                        &origin,
-                                        if gateway_ingress.is_reachability_relay() {
-                                            "hosted-relay-wss"
-                                        } else {
-                                            "hosted-fleet-wss"
-                                        },
-                                    )
-                                }) {
+                            Some(ticket) => match public_origin_from_request(
+                                &header_text,
+                                is_tls,
+                                tls_custom_domain.as_deref(),
+                            )
+                            .and_then(|origin| {
+                                hosted_control.consume_ws_ticket(
+                                    &ticket,
+                                    &origin,
+                                    if tls_custom_domain.is_some() {
+                                        "custom-domain-wss"
+                                    } else if gateway_ingress.is_reachability_relay() {
+                                        "hosted-relay-wss"
+                                    } else {
+                                        "hosted-fleet-wss"
+                                    },
+                                )
+                            }) {
                                 Ok(verified) => Some(verified),
                                 Err(error) => {
                                     use tokio::io::AsyncWriteExt;
@@ -1865,12 +1900,14 @@ fn spawn_web_gateway_from_cert_dir_with_relay_listener(
                     } else {
                         None
                     };
-                    if discovery_only_ws && hosted_ws_authority.is_none() {
+                    if public_lease_ws && hosted_ws_authority.is_none() {
                         use tokio::io::AsyncWriteExt;
-                        let response = json_error(
-                            "403 Forbidden",
-                            "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control",
-                        );
+                        let error = if tls_custom_domain.is_some() {
+                            "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
+                        } else {
+                            "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control"
+                        };
+                        let response = json_error("403 Forbidden", error);
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;

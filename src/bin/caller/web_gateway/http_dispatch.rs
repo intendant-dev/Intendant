@@ -15,6 +15,8 @@ pub(crate) struct HttpRequestCtx {
     /// runner's real account.
     pub(crate) access_cert_dir: PathBuf,
     pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
+    pub(crate) custom_domain: Arc<crate::custom_domain::CustomDomainRuntime>,
+    pub(crate) fleet_hosted_control_enabled: bool,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -77,6 +79,7 @@ pub(crate) async fn serve_http_request(
     source_hint: String,
     is_tls: bool,
     tls_fleet_origin: bool,
+    tls_custom_domain: Option<String>,
     tls_client_cert_present: bool,
     tls_client_cert_fingerprint: Option<String>,
     peer_connection_identity: Option<PeerConnectionIdentity>,
@@ -85,6 +88,8 @@ pub(crate) async fn serve_http_request(
     let HttpRequestCtx {
         access_cert_dir,
         hosted_control,
+        custom_domain,
+        fleet_hosted_control_enabled,
         bus,
         config_json,
         session_provider,
@@ -304,11 +309,32 @@ pub(crate) async fn serve_http_request(
     let discovery_only_ingress = gateway_ingress.is_reachability_relay()
         || tls_fleet_origin
         || request_names_known_fleet_origin(header_text);
-    if is_fleet_only_hosted_control_path(req_method, req_path) && !discovery_only_ingress {
+    let public_lease_ingress =
+        is_public_lease_ingress(discovery_only_ingress, tls_custom_domain.is_some());
+    let configured_public_control_lane = is_public_control_lane_configured(
+        discovery_only_ingress,
+        tls_custom_domain.is_some(),
+        fleet_hosted_control_enabled,
+    );
+    if is_custom_domain_only_hosted_control_path(req_method, req_path)
+        && tls_custom_domain.is_none()
+    {
         use tokio::io::AsyncWriteExt;
         let response = json_error(
             "404 Not Found",
-            "hosted-control browser entry points are served only on the fleet-name lane",
+            "custom-domain passkey endpoint is unavailable on this TLS name",
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+    if is_fleet_only_hosted_control_path(req_method, req_path)
+        && (!public_lease_ingress || !configured_public_control_lane)
+    {
+        use tokio::io::AsyncWriteExt;
+        let response = json_error(
+            "404 Not Found",
+            "hosted-control browser entry points require a configured public TLS lane",
         );
         let _ = stream.write_all(response.as_bytes()).await;
         finalize_http_stream(&mut stream).await;
@@ -320,20 +346,25 @@ pub(crate) async fn serve_http_request(
     // the live runtime before disclosing or mutating hosted-control state.
     let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path)
         || is_public_hosted_control_path(req_method, req_path);
-    let hosted_verified = if discovery_only_ingress
+    let cross_origin_exempt_request =
+        authority_free_request && !is_custom_domain_only_hosted_control_path(req_method, req_path);
+    let hosted_verified = if configured_public_control_lane
         && !authority_free_request
         && hosted_control.enabled()
         && req_path != "/mcp"
         && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
     {
         let result = hosted_request_proof_from_headers(header_text).and_then(|proof| {
-            let fleet_origin = fleet_origin_from_request(header_text, is_tls)?;
+            let fleet_origin =
+                public_origin_from_request(header_text, is_tls, tls_custom_domain.as_deref())?;
             hosted_control.verify_request_proof(
                 req_method,
                 request_line.split_whitespace().nth(1).unwrap_or(req_path),
                 &fleet_origin,
                 &proof,
-                if gateway_ingress.is_reachability_relay() {
+                if tls_custom_domain.is_some() {
+                    "custom-domain-https"
+                } else if gateway_ingress.is_reachability_relay() {
                     "hosted-relay-https"
                 } else {
                     "hosted-fleet-https"
@@ -353,10 +384,15 @@ pub(crate) async fn serve_http_request(
     } else {
         None
     };
-    if discovery_only_ingress && !authority_free_request && hosted_verified.is_none() {
+    if public_lease_ingress && !authority_free_request && hosted_verified.is_none() {
         use tokio::io::AsyncWriteExt;
+        let error = if tls_custom_domain.is_some() {
+            "this public endpoint requires a valid bounded lease; use a trusted direct surface for root administration"
+        } else {
+            "the public fleet-name endpoint is discovery-only without a valid bounded lease; use loopback or the independently fingerprint-verified direct mTLS address for control"
+        };
         let body = serde_json::json!({
-            "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
+            "error": error
         })
         .to_string();
         let response = json_response("403 Forbidden", body);
@@ -378,7 +414,7 @@ pub(crate) async fn serve_http_request(
         match cross_origin_request_decision(
             origin,
             req_path,
-            authority_free_request,
+            cross_origin_exempt_request,
             peer_addr,
             is_tls,
             header_text,
@@ -402,7 +438,7 @@ pub(crate) async fn serve_http_request(
                 return;
             }
         }
-    } else if !authority_free_request
+    } else if !cross_origin_exempt_request
         && matches!(
             http_header_value(header_text, "sec-fetch-site")
                 .map(str::trim)
@@ -1358,8 +1394,10 @@ pub(crate) async fn serve_http_request(
                 return handle_hosted_control_bootstrap(
                     stream,
                     hosted_control,
+                    custom_domain,
                     header_text,
                     is_tls,
+                    tls_custom_domain.as_deref(),
                     route.cors,
                 )
                 .await;
@@ -1371,8 +1409,7 @@ pub(crate) async fn serve_http_request(
                     stream,
                     route_body,
                     hosted_control,
-                    header_text,
-                    is_tls,
+                    public_origin_from_request(header_text, is_tls, tls_custom_domain.as_deref()),
                     source_bucket,
                     route.cors,
                 )
@@ -1406,6 +1443,22 @@ pub(crate) async fn serve_http_request(
                     hosted_control,
                     header_text,
                     is_tls,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::CustomDomainPasskey => {
+                let source_bucket =
+                    (!gateway_ingress.is_reachability_relay()).then_some(source_hint.as_str());
+                return handle_custom_domain_passkey(
+                    stream,
+                    req_path,
+                    route_body,
+                    custom_domain,
+                    header_text,
+                    is_tls,
+                    tls_custom_domain.as_deref(),
+                    source_bucket,
                     route.cors,
                 )
                 .await;
@@ -1568,6 +1621,7 @@ pub(crate) async fn serve_http_request(
                     req_path,
                     route_body,
                     hosted_control,
+                    custom_domain,
                     http_access_context,
                     route.cors,
                     fleet_cors_origin.as_deref(),

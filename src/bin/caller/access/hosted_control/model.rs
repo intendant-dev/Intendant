@@ -466,6 +466,12 @@ pub struct HostedControlBootstrap {
     pub request_ttl_ms: u64,
     pub display_media_relay_configured: bool,
     pub lane_guard: HostedPublicLaneGuard,
+    #[serde(default)]
+    pub custom_domain: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rp_id: Option<String>,
+    #[serde(default)]
+    pub passkey_available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -596,6 +596,11 @@ The pieces that implement the model, mapped to the codebase:
   exercise only the compiled preset. Generic IAM APIs cannot create, assign,
   or reactivate hosted principals, grants, or roles, and the lane's dedicated
   ceiling ceremony cannot lift its immutable floor.
+  The optional [user-owned custom-domain lane](./custom-domain.md) is a
+  separate TLS provenance class: exact SNI, Host, Origin, and WebAuthn rp_id
+  agree on the configured name. Its passkey ceremony approves only the signed
+  tab request and mints the same bounded lease; it creates no ambient IAM or
+  root principal.
   The local IAM write boundary also refuses an active pure browser-key grant
   whose recorded origin is hosted, under the currently learned fleet zone, or
   an exact fleet name the daemon learned previously. Fleet-name provenance is

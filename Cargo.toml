@@ -62,6 +62,9 @@ axum = "0.8"
 # features, and nothing here may re-enable rustls/aws_lc_rs (the
 # workspace is pinned to the ring provider).
 hickory-server = { version = "0.26", default-features = false }
+# RFC2136 DNS-01 updates for the opt-in custom-domain lane. TSIG uses
+# the same ring provider as the rest of the TLS/certificate stack.
+hickory-proto = { version = "0.26", default-features = false, features = ["std", "dnssec-ring"] }
 # Daemon-side ACME (Let's Encrypt DNS-01) for fleet certificates
 # (bin/caller fleet_cert.rs). ring feature, matching the workspace
 # crypto stack; default aws-lc-rs feature explicitly avoided.

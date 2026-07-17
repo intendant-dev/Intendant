@@ -150,10 +150,21 @@ async fn poll_relay_next(
 ) -> Result<Option<String>, String> {
     let daemon_public_key = identity.public_key_b64u();
     let issued_at_unix_ms = crate::access::client_key::now_unix_ms().max(0) as u64;
-    let payload = format!(
-        "{RELAY_CONTROL_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n"
+    let mut server_names = config
+        .custom_domain
+        .validated()?
+        .into_iter()
+        .map(|custom| custom.name)
+        .collect::<Vec<_>>();
+    server_names.sort();
+    server_names.dedup();
+    let payload = relay_control_signing_payload(
+        daemon_id,
+        &daemon_public_key,
+        issued_at_unix_ms,
+        &server_names,
     );
-    let signature = identity.sign_b64u(payload.as_bytes());
+    let signature = identity.sign_b64u(&payload);
     let response = authenticated(config, client.post(join_url(base_url, "api/relay/next")?))
         .json(&serde_json::json!({
             "protocol": RELAY_CONTROL_PROTOCOL,
@@ -161,6 +172,7 @@ async fn poll_relay_next(
             "daemon_public_key": daemon_public_key,
             "issued_at_unix_ms": issued_at_unix_ms,
             "signature": signature,
+            "server_names": server_names,
             "timeout_ms": CONTROL_POLL_TIMEOUT_MS,
         }))
         .send()
@@ -179,6 +191,25 @@ async fn poll_relay_next(
         .pointer("/dialback/nonce")
         .and_then(|v| v.as_str())
         .map(str::to_string))
+}
+
+fn relay_control_signing_payload(
+    daemon_id: &str,
+    daemon_public_key: &str,
+    issued_at_unix_ms: u64,
+    server_names: &[String],
+) -> Vec<u8> {
+    let mut payload = format!(
+        "{RELAY_CONTROL_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n"
+    )
+    .into_bytes();
+    for name in server_names {
+        payload.extend_from_slice(name.len().to_string().as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(b'\n');
+    }
+    payload
 }
 
 /// Dial back a browser connection: connect the relay's passthrough port,
@@ -260,6 +291,27 @@ mod tests {
         let ingress = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 8765)));
         spawn_relay_tunnel_client(relay_disabled(), ingress);
         spawn_relay_tunnel_client(ConnectConfig::default(), ingress);
+    }
+
+    #[test]
+    fn v2_signature_payload_binds_length_prefixed_exact_names() {
+        let payload = relay_control_signing_payload(
+            "daemon",
+            "public",
+            42,
+            &["box.example.test".to_string()],
+        );
+        assert_eq!(
+            String::from_utf8(payload).unwrap(),
+            concat!(
+                "intendant-connect-relay-control-v2\n",
+                "daemon\n",
+                "public\n",
+                "42\n",
+                "16\n",
+                "box.example.test\n",
+            )
+        );
     }
 
     /// The dial-back path splices the relay data connection to the dedicated

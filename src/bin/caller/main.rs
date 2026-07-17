@@ -22,6 +22,7 @@ mod context_rewind;
 mod control;
 mod control_plane;
 mod coordination;
+mod custom_domain;
 mod cutover_absence;
 pub(crate) use intendant_core::conversation;
 mod credential_audit;

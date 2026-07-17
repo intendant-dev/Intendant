@@ -5,6 +5,12 @@ reaches a daemon at its fleet name. It is off by default. When off, the
 fleet-name and reachability-relay surfaces retain their discovery-only
 `role:none` behavior.
 
+The separate [user-owned custom-domain lane](./custom-domain.md) uses the same
+compiled presets, immutable floor, proof-bound HTTP, and one-use WebSocket
+tickets. Its exact-name WebAuthn ceremony can approve the signed tab request
+directly; it does not widen the fleet-name lane or turn the passkey into a
+general IAM/root principal.
+
 The lane does not turn a Connect account, passkey assertion, fleet route, or
 browser origin into daemon authority. A trusted owner surface approves a
 short-lived lease, the daemon materializes that lease in local IAM, and the

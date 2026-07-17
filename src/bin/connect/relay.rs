@@ -39,7 +39,9 @@ use tokio::net::{TcpListener, TcpStream};
 /// Daemon-signed control-channel protocol tag. The daemon long-polls this
 /// endpoint to receive dial-back requests; the signature proves the poll comes
 /// from the registered identity key, mirroring the fleet-DNS publish auth.
-pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL_V1: &str = "intendant-connect-relay-control-v1";
+pub(crate) const RELAY_CONTROL_PROTOCOL: &str = "intendant-connect-relay-control-v2";
+const RELAY_MAX_SERVER_NAMES: usize = 8;
 /// Daemon-signed DNS relay-mode protocol tag: "answer my fleet label with the
 /// relay's address instead of my own".
 pub(crate) const DNS_RELAY_PROTOCOL: &str = "intendant-connect-dns-relay-v1";
@@ -248,6 +250,9 @@ fn sni_route_label(sni: &str) -> Option<String> {
 struct TunnelEntry {
     last_seen_unix_ms: u64,
     pending: VecDeque<String>,
+    /// Exact SNI names bound into the daemon-signed v2 control registration.
+    /// The derived fleet label remains the rolling-compatibility route.
+    server_names: Vec<String>,
 }
 
 /// Shared relay state, hung off `AppState` (None when the relay is disabled),
@@ -291,15 +296,17 @@ impl RelayState {
     }
 
     /// Refresh a tunnel's control-channel presence on each poll.
-    fn touch_tunnel(&self, label: &str, now: u64) {
+    fn touch_tunnel(&self, label: &str, now: u64, server_names: &[String]) {
         let mut tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
-        tunnels
+        let entry = tunnels
             .entry(label.to_string())
             .or_insert_with(|| TunnelEntry {
                 last_seen_unix_ms: now,
                 pending: VecDeque::new(),
-            })
-            .last_seen_unix_ms = now;
+                server_names: Vec::new(),
+            });
+        entry.last_seen_unix_ms = now;
+        entry.server_names = server_names.to_vec();
     }
 
     /// Pop the next unclaimed dial-back nonce for a tunnel, if any.
@@ -309,10 +316,39 @@ impl RelayState {
     }
 
     /// Whether a tunnel has an active (recently polled) control channel.
+    #[cfg(test)]
     fn tunnel_active(&self, label: &str, now: u64) -> bool {
         let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
         tunnels.get(label).is_some_and(|entry| {
             now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+        })
+    }
+
+    /// Resolve an SNI to one active daemon tunnel. Exact v2 registrations take
+    /// precedence. If more than one live daemon claims the same exact name,
+    /// refuse rather than choosing one. With no exact registration, retain the
+    /// v1 fleet-label route for rolling upgrades.
+    fn resolve_tunnel(&self, sni: &str, now: u64) -> Option<String> {
+        let normalized = normalize_server_name(sni)?;
+        let tunnels = self.tunnels.lock().expect("relay tunnels poisoned");
+        let mut exact = tunnels
+            .iter()
+            .filter(|(_, entry)| {
+                now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS
+                    && entry.server_names.iter().any(|name| name == &normalized)
+            })
+            .map(|(label, _)| label.as_str());
+        let first = exact.next();
+        if exact.next().is_some() {
+            return None;
+        }
+        if let Some(label) = first {
+            return Some(label.to_string());
+        }
+        let label = sni_route_label(&normalized)?;
+        tunnels.get(&label).and_then(|entry| {
+            (now.saturating_sub(entry.last_seen_unix_ms) <= RELAY_TUNNEL_LIVENESS_MS)
+                .then_some(label)
         })
     }
 
@@ -425,15 +461,101 @@ pub(crate) struct RelayNextRequest {
     issued_at_unix_ms: u64,
     signature: String,
     #[serde(default)]
+    server_names: Vec<String>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
 }
 
 fn relay_control_signing_payload(
+    protocol: &str,
     daemon_id: &str,
     daemon_public_key: &str,
     issued_at_unix_ms: u64,
-) -> String {
-    format!("{RELAY_CONTROL_PROTOCOL}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n")
+    server_names: &[String],
+) -> Vec<u8> {
+    let mut payload =
+        format!("{protocol}\n{daemon_id}\n{daemon_public_key}\n{issued_at_unix_ms}\n").into_bytes();
+    for name in server_names {
+        payload.extend_from_slice(name.len().to_string().as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(b'\n');
+    }
+    payload
+}
+
+fn normalize_server_name(name: &str) -> Option<String> {
+    let normalized = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let labels: Vec<&str> = normalized.split('.').collect();
+    if normalized.is_empty()
+        || normalized.len() > 253
+        || !normalized.is_ascii()
+        || normalized.parse::<std::net::IpAddr>().is_ok()
+        || labels.len() < 2
+        || labels
+            .last()
+            .is_some_and(|label| label.bytes().all(|byte| byte.is_ascii_digit()))
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(&format!("https://{normalized}")).ok()?;
+    if parsed.host_str() != Some(normalized.as_str()) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn canonical_server_names(names: &[String]) -> Result<Vec<String>, ApiError> {
+    if names.len() > RELAY_MAX_SERVER_NAMES {
+        return Err(ApiError::bad_request("too many relay server names"));
+    }
+    let mut normalized = names
+        .iter()
+        .map(|name| {
+            normalize_server_name(name)
+                .ok_or_else(|| ApiError::bad_request("invalid relay server name"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    normalized.sort();
+    normalized.dedup();
+    if normalized.len() != names.len() || normalized != names {
+        return Err(ApiError::bad_request(
+            "relay server names must be normalized, sorted, and unique",
+        ));
+    }
+    if normalized.iter().any(|name| {
+        name.split_once('.')
+            .map(|(label, _)| is_derived_fleet_label(label))
+            .unwrap_or(false)
+    }) {
+        return Err(ApiError::bad_request(
+            "exact relay names cannot use the derived fleet-label form",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn is_derived_fleet_label(label: &str) -> bool {
+    label.strip_prefix("d-").is_some_and(|digest| {
+        digest.len() == 20 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn server_name_overlaps_zone(name: &str, zone: &str) -> bool {
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    name == zone
+        || name
+            .strip_suffix(zone.as_str())
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Require the relay to be enabled, then run the shared daemon-signed
@@ -475,26 +597,46 @@ pub(crate) async fn relay_next(
     Json(body): Json<RelayNextRequest>,
 ) -> ApiResult<Response> {
     let daemon_id = body.daemon_id.trim().to_string();
+    let server_names = match body.protocol.as_str() {
+        RELAY_CONTROL_PROTOCOL => canonical_server_names(&body.server_names)?,
+        RELAY_CONTROL_PROTOCOL_V1 if body.server_names.is_empty() => Vec::new(),
+        RELAY_CONTROL_PROTOCOL_V1 => {
+            return Err(ApiError::bad_request(
+                "relay control v1 cannot register server names",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad_request("relay control protocol mismatch"));
+        }
+    };
+    if let Some(zone) = state.dns_zone.as_ref().map(|zone| zone.origin_utf8()) {
+        if server_names
+            .iter()
+            .any(|name| server_name_overlaps_zone(name, &zone))
+        {
+            return Err(ApiError::bad_request(
+                "exact relay names cannot overlap the service fleet zone",
+            ));
+        }
+    }
     let daemon = relay_request_daemon(
         &state,
         &headers,
         "relay_next",
-        (&body.protocol, RELAY_CONTROL_PROTOCOL),
+        (&body.protocol, &body.protocol),
         &daemon_id,
         &body.daemon_public_key,
         body.issued_at_unix_ms,
     )
     .await?;
     let payload = relay_control_signing_payload(
+        &body.protocol,
         &daemon_id,
         &daemon.daemon_public_key,
         body.issued_at_unix_ms,
+        &server_names,
     );
-    if !verify_ed25519_b64u(
-        &daemon.daemon_public_key,
-        payload.as_bytes(),
-        body.signature.trim(),
-    ) {
+    if !verify_ed25519_b64u(&daemon.daemon_public_key, &payload, body.signature.trim()) {
         return Err(ApiError::bad_request("relay control signature invalid"));
     }
     let relay = state
@@ -507,7 +649,7 @@ pub(crate) async fn relay_next(
             "daemon id does not derive a fleet label",
         ));
     };
-    relay.touch_tunnel(&label, now_unix_ms());
+    relay.touch_tunnel(&label, now_unix_ms(), &server_names);
 
     let timeout = Duration::from_millis(
         body.timeout_ms
@@ -529,7 +671,7 @@ pub(crate) async fn relay_next(
         }
         let remaining = deadline.saturating_duration_since(now);
         // Re-touch keeps the tunnel live across a full parked poll.
-        relay.touch_tunnel(&label, now_unix_ms());
+        relay.touch_tunnel(&label, now_unix_ms(), &server_names);
         if tokio::time::timeout(remaining, relay.control_notify.notified())
             .await
             .is_err()
@@ -730,13 +872,10 @@ async fn handle_browser_connection(relay: Arc<RelayState>, stream: TcpStream, pe
         Some(sni) => sni,
         None => return, // fragmented-forever, oversized, non-TLS, or no-SNI: refuse
     };
-    let Some(label) = sni_route_label(&sni) else {
-        return;
-    };
     let now = now_unix_ms();
-    if !relay.tunnel_active(&label, now) {
-        return; // no active tunnel for this fleet name
-    }
+    let Some(label) = relay.resolve_tunnel(&sni, now) else {
+        return; // no unique active tunnel for this exact or fleet-label name
+    };
     let Some(_splice_guard) = relay.acquire_tunnel_splice(&label) else {
         return; // per-tunnel cap
     };
@@ -1099,7 +1238,7 @@ mod tests {
         let now = crate::now_unix_ms();
         // No tunnel yet: enqueue refuses.
         assert!(!relay.enqueue_dialback("d-none", "n0".to_string(), now));
-        relay.touch_tunnel("d-live", now);
+        relay.touch_tunnel("d-live", now, &[]);
         assert!(relay.tunnel_active("d-live", now));
         for i in 0..RELAY_MAX_PENDING_PER_TUNNEL {
             assert!(relay.enqueue_dialback("d-live", format!("n{i}"), now));
@@ -1110,6 +1249,57 @@ mod tests {
         );
         // A stale tunnel is inactive and unroutable.
         assert!(!relay.tunnel_active("d-live", now + RELAY_TUNNEL_LIVENESS_MS + 1));
+    }
+
+    #[test]
+    fn exact_server_name_routes_and_collisions_fail_closed() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        let name = "box.example.test".to_string();
+        relay.touch_tunnel("d-first", now, std::slice::from_ref(&name));
+        assert_eq!(
+            relay.resolve_tunnel("BOX.EXAMPLE.TEST.", now).as_deref(),
+            Some("d-first")
+        );
+
+        relay.touch_tunnel("d-second", now, std::slice::from_ref(&name));
+        assert_eq!(
+            relay.resolve_tunnel("box.example.test", now),
+            None,
+            "two active exact-name claims must not be routed"
+        );
+    }
+
+    #[test]
+    fn exact_server_names_cannot_enter_the_service_fleet_zone() {
+        assert!(server_name_overlaps_zone(
+            "box.fleet.example.test",
+            "fleet.example.test"
+        ));
+        assert!(server_name_overlaps_zone(
+            "fleet.example.test",
+            "fleet.example.test."
+        ));
+        assert!(!server_name_overlaps_zone(
+            "notfleet.example.test",
+            "fleet.example.test"
+        ));
+        assert!(
+            canonical_server_names(&["d-30a08371a38c1b447038.example.test".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn fleet_label_route_survives_v1_registration() {
+        let relay = relay_state();
+        let now = crate::now_unix_ms();
+        relay.touch_tunnel("d-rolling", now, &[]);
+        assert_eq!(
+            relay
+                .resolve_tunnel("d-rolling.fleet.example.test", now)
+                .as_deref(),
+            Some("d-rolling")
+        );
     }
 
     // ── Dial-back framing ───────────────────────────────────────────────────
@@ -1208,13 +1398,21 @@ mod tests {
             },
         );
         let issued = crate::now_unix_ms();
-        let payload = relay_control_signing_payload(daemon_id, &public, issued);
+        let server_names = Vec::new();
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            &server_names,
+        );
         let body = RelayNextRequest {
             protocol: RELAY_CONTROL_PROTOCOL.to_string(),
             daemon_id: daemon_id.to_string(),
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
-            signature: crate::b64u(key.sign(payload.as_bytes()).as_ref()),
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            server_names,
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1250,6 +1448,7 @@ mod tests {
             daemon_public_key: public.clone(),
             issued_at_unix_ms: issued,
             signature: crate::b64u(&[0u8; 64]),
+            server_names: Vec::new(),
             timeout_ms: Some(10),
         };
         let err = relay_next(
@@ -1261,6 +1460,99 @@ mod tests {
         .err()
         .expect("a bad signature must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relay_v2_signature_binds_exact_server_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (key, public) = test_identity();
+        let daemon_id = "relay-name-binding";
+        let relay = relay_state();
+        let state = crate::build_test_state(
+            dir.path(),
+            registered_store(daemon_id, &public),
+            crate::TestStateOverrides {
+                open_daemon_registration: true,
+                relay: Some(relay),
+                ..Default::default()
+            },
+        );
+        let issued = crate::now_unix_ms();
+        let signed_names = vec!["box.example.test".to_string()];
+        let payload = relay_control_signing_payload(
+            RELAY_CONTROL_PROTOCOL,
+            daemon_id,
+            &public,
+            issued,
+            &signed_names,
+        );
+        let body = RelayNextRequest {
+            protocol: RELAY_CONTROL_PROTOCOL.to_string(),
+            daemon_id: daemon_id.to_string(),
+            daemon_public_key: public,
+            issued_at_unix_ms: issued,
+            signature: crate::b64u(key.sign(&payload).as_ref()),
+            server_names: vec!["other.example.test".to_string()],
+            timeout_ms: Some(1),
+        };
+        let err = relay_next(
+            axum::extract::State(state),
+            HeaderMap::new(),
+            axum::Json(body),
+        )
+        .await
+        .err()
+        .expect("changing the exact names must invalidate the signature");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn relay_accepts_v2_exact_names_and_v1_fleet_fallback() {
+        for (protocol, server_names) in [
+            (RELAY_CONTROL_PROTOCOL, vec!["box.example.test".to_string()]),
+            (RELAY_CONTROL_PROTOCOL_V1, Vec::new()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (key, public) = test_identity();
+            let daemon_id = format!("relay-{}", protocol.rsplit('-').next().unwrap());
+            let relay = relay_state();
+            let state = crate::build_test_state(
+                dir.path(),
+                registered_store(&daemon_id, &public),
+                crate::TestStateOverrides {
+                    open_daemon_registration: true,
+                    relay: Some(relay.clone()),
+                    ..Default::default()
+                },
+            );
+            let issued = crate::now_unix_ms();
+            let payload =
+                relay_control_signing_payload(protocol, &daemon_id, &public, issued, &server_names);
+            let body = RelayNextRequest {
+                protocol: protocol.to_string(),
+                daemon_id: daemon_id.clone(),
+                daemon_public_key: public,
+                issued_at_unix_ms: issued,
+                signature: crate::b64u(key.sign(&payload).as_ref()),
+                server_names: server_names.clone(),
+                timeout_ms: Some(1),
+            };
+            let response = relay_next(
+                axum::extract::State(state),
+                HeaderMap::new(),
+                axum::Json(body),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let label = daemon_label(&daemon_id).unwrap();
+            let routed = if protocol == RELAY_CONTROL_PROTOCOL {
+                relay.resolve_tunnel(&server_names[0], issued)
+            } else {
+                relay.resolve_tunnel(&format!("{label}.fleet.example.test"), issued)
+            };
+            assert_eq!(routed.as_deref(), Some(label.as_str()));
+        }
     }
 
     #[tokio::test]
@@ -1452,8 +1744,15 @@ mod tests {
             let client = reqwest::Client::new();
             loop {
                 let issued = crate::now_unix_ms();
-                let payload = relay_control_signing_payload(&daemon_id, &public, issued);
-                let signature = crate::b64u(key.sign(payload.as_bytes()).as_ref());
+                let server_names = Vec::<String>::new();
+                let payload = relay_control_signing_payload(
+                    RELAY_CONTROL_PROTOCOL,
+                    &daemon_id,
+                    &public,
+                    issued,
+                    &server_names,
+                );
+                let signature = crate::b64u(key.sign(&payload).as_ref());
                 let request = client
                     .post(format!("{connect_base}/api/relay/next"))
                     .json(&serde_json::json!({
@@ -1462,6 +1761,7 @@ mod tests {
                         "daemon_public_key": public,
                         "issued_at_unix_ms": issued,
                         "signature": signature,
+                        "server_names": server_names,
                         "timeout_ms": 1000,
                     }))
                     .send()

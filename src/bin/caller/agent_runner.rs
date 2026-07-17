@@ -89,10 +89,10 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
     "GEMINI",
 ];
 
-/// True when `name` names a provider/model-API credential that must not
-/// reach the runtime. `INTENDANT_*` names are the controller→runtime
-/// control channel (the mock-provider e2e rig rides `PROVIDER` +
-/// `INTENDANT_MOCK_*` into children) and are never treated as credentials.
+/// True when `name` names a controller-held credential that must not reach
+/// the runtime. Most `INTENDANT_*` names are the controller→runtime control
+/// channel (the mock-provider e2e rig rides `PROVIDER` + `INTENDANT_MOCK_*`
+/// into children); explicitly catalogued credential names remain scrubbed.
 ///
 /// Classification is done on the ASCII-uppercased name: Windows environment
 /// names are case-insensitive (`%mistral_api_key%` and `%MISTRAL_API_KEY%`
@@ -101,6 +101,9 @@ const EXTRA_PROVIDER_CREDENTIAL_ENV_VARS: &[&str] = &[
 /// slip past the scrub.
 fn is_provider_credential_env(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
+    if crate::credential_leases::is_dns_credential_env(&name) {
+        return true;
+    }
     if name.starts_with("INTENDANT_") {
         return false;
     }
@@ -132,6 +135,7 @@ fn scrub_provider_credential_env<'a>(
     for name in crate::provider::PROVIDER_KEY_ENV_VARS
         .iter()
         .chain(EXTRA_PROVIDER_CREDENTIAL_ENV_VARS.iter())
+        .chain(crate::credential_leases::DNS_CREDENTIAL_ENV_VARS.iter())
     {
         cmd.env_remove(name);
     }
@@ -528,6 +532,9 @@ mod tests {
             "MISTRAL_API_KEY",
             "SOME_SERVICE_API_TOKEN",
             "ANTHROPIC_AUTH_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
+            "OWNER_DNS_TSIG_SECRET",
             // Windows env names are case-insensitive and dotenvy preserves
             // the .env file's casing — %mistral_api_key% resolves as
             // %MISTRAL_API_KEY% inside the runtime, so casing must not
@@ -548,7 +555,7 @@ mod tests {
             "INTENDANT_MOCK_SCRIPT",
             "INTENDANT_MOCK_DISPLAY",
             "INTENDANT_LOG_DIR",
-            "INTENDANT_FAKE_API_KEY", // the INTENDANT_* namespace is never scrubbed
+            "INTENDANT_FAKE_API_KEY", // non-credential INTENDANT_* controls survive
             "intendant_fake_api_key", // …in any casing
             "OPENAI_BASE_URL",
         ] {
@@ -574,6 +581,9 @@ mod tests {
                 "GEMINI_API_KEY",
                 "MISTRAL_API_KEY",
                 "CUSTOM_API_TOKEN",
+                "CLOUDFLARE_API_TOKEN",
+                "INTENDANT_RFC2136_TSIG_SECRET",
+                "OWNER_DNS_TSIG_SECRET",
                 "mistral_api_key",
                 "Custom_Api_Token",
                 "PATH",
@@ -607,6 +617,9 @@ mod tests {
             "GOOGLE_API_KEY",
             "MISTRAL_API_KEY",
             "CUSTOM_API_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "INTENDANT_RFC2136_TSIG_SECRET",
+            "OWNER_DNS_TSIG_SECRET",
             "mistral_api_key",
             "Custom_Api_Token",
         ] {

@@ -1374,6 +1374,12 @@ function vaultEntryLeaseKind(entry) {
   if (entry.kind === 'api_key' && ['anthropic', 'openai', 'gemini'].includes(entry.provider)) {
     return `api_key:${entry.provider}`;
   }
+  if (entry.kind === 'api_key' && entry.provider === 'cloudflare-dns') {
+    return 'dns:cloudflare';
+  }
+  if (entry.kind === 'api_key' && entry.provider === 'rfc2136-dns') {
+    return 'dns:rfc2136';
+  }
   if (entry.kind === 'oauth' && ['codex', 'claude-code'].includes(entry.provider)) {
     return `oauth:${entry.provider}`;
   }
@@ -2616,6 +2622,8 @@ function vaultProviderLabel(provider) {
   if (provider === 'gemini') return 'Gemini';
   if (provider === 'codex') return 'Codex (subscription)';
   if (provider === 'claude-code') return 'Claude Code (subscription)';
+  if (provider === 'cloudflare-dns') return 'Cloudflare DNS';
+  if (provider === 'rfc2136-dns') return 'RFC2136 TSIG';
   return provider || 'custom';
 }
 
@@ -2826,7 +2834,7 @@ function vaultRenderAddForm(card) {
     providerSelect.innerHTML = '';
     const providers = kindSelect.value === 'oauth'
       ? ['codex', 'claude-code']
-      : ['anthropic', 'openai', 'gemini'];
+      : ['anthropic', 'openai', 'gemini', 'cloudflare-dns', 'rfc2136-dns'];
     for (const provider of providers) {
       const option = document.createElement('option');
       option.value = provider;
