@@ -57,6 +57,7 @@ pub(crate) async fn run_daemon_loop(config: DaemonConfig) {
         provider_factory: None,
         logs_home_override: None,
         git_vitals_targets: config.git_vitals_targets,
+        hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
     })
     .run()
     .await;
@@ -229,6 +230,7 @@ pub(crate) async fn run_daemon(
             provider_factory: None,
             logs_home_override: None,
             git_vitals_targets: Some(vitals_git_targets.clone()),
+            hosted_control_cert_dir: Some(crate::startup::installed_access_cert_dir()),
         })
         .spawn();
     // --continue/--resume under the daemon: the supervisor (subscribed

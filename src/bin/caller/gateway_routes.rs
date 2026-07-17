@@ -289,6 +289,12 @@ pub(crate) enum RouteHandlerId {
     Displays,
     /// The public peer access-request doorbell (create + status poll).
     Doorbell,
+    HostedControlBootstrap,
+    HostedControlRequestCreate,
+    HostedControlRequestPoll,
+    HostedControlAnchorDecision,
+    HostedControlWsTicket,
+    HostedControlManagement,
     /// Shared by the user-client-grants / grants-update pair (one legacy
     /// arm served both paths).
     AccessIamGrants,
@@ -1505,6 +1511,42 @@ pub(crate) static ROUTES: &[Route] = &[
         "Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath)",
     ),
     public_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/hosted-control/bootstrap"),
+        BodyPolicy::None,
+        RouteHandlerId::HostedControlBootstrap,
+        "Hosted-control doorbell bootstrap (dark unless enabled; no authority)",
+    ),
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/requests"),
+        BodyPolicy::Default,
+        RouteHandlerId::HostedControlRequestCreate,
+        "Submit a bounded hosted-control lease request to daemon-local IAM",
+    ),
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/requests/poll"),
+        BodyPolicy::Default,
+        RouteHandlerId::HostedControlRequestPoll,
+        "Poll one hosted-control request with proof by its browser key",
+    ),
+    public_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/anchor-decisions"),
+        BodyPolicy::Default,
+        RouteHandlerId::HostedControlAnchorDecision,
+        "Present a signed application-anchor decision document",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Exact("/api/hosted-control/ws-ticket"),
+        PeerOperation::PresenceRead,
+        BodyPolicy::None,
+        RouteHandlerId::HostedControlWsTicket,
+        "Mint one short-lived, single-use WebSocket ticket from a proved hosted lease",
+    ),
+    public_route(
         RouteMethod::Post,
         PathPattern::Exact("/api/access/org-grants"),
         BodyPolicy::Capped(crate::access::org::MAX_ORG_GRANT_DOC_BYTES),
@@ -1677,6 +1719,22 @@ pub(crate) static ROUTES: &[Route] = &[
         "Access overview for the calling principal",
     )
     .with_tunnel(tunnel_method("api_access_overview")),
+    op_route(
+        RouteMethod::Get,
+        PathPattern::Exact("/api/access/hosted-control"),
+        PeerOperation::AccessManage,
+        BodyPolicy::None,
+        RouteHandlerId::HostedControlManagement,
+        "Hosted-control policy, pending request, active lease, and signed-app anchor state",
+    ),
+    op_route(
+        RouteMethod::Post,
+        PathPattern::Under("/api/access/hosted-control"),
+        PeerOperation::AccessManage,
+        BodyPolicy::Default,
+        RouteHandlerId::HostedControlManagement,
+        "Decide requests, revoke leases, change policy, or mark hosted-eligible sessions",
+    ),
     // ── Connect rendezvous administration. Status is inspect-grade but
     //    never carries the one-time claim code; revealing the code is its own
     //    manage-gated route so the sensitive one-time-code response has the
@@ -2470,6 +2528,7 @@ mod tests {
             RouteHandlerId::AccessOrgManage,
             RouteHandlerId::PeersSubRouter,
             RouteHandlerId::McpStream,
+            RouteHandlerId::HostedControlManagement,
         ];
         let mut seen: HashSet<RouteHandlerId> = HashSet::new();
         let mut previous: Option<RouteHandlerId> = None;

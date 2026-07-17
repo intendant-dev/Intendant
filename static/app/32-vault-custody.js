@@ -3412,6 +3412,13 @@ function dashboardJsonFetch(method, params, fallback, label = method, options = 
 }
 
 function dispatchSessionControlMsg(payload, options = {}) {
+  payload = hostedControlNormalizeControlMessage(payload);
+  if (!payload) {
+    const error = new Error('That action is outside this hosted lease preset');
+    if (typeof options.onError === 'function') options.onError(error);
+    else if (typeof showControlToast === 'function') showControlToast('error', error.message);
+    return false;
+  }
   const action = String(payload?.action || '').trim();
   const fallback = () => {
     if (dashboardConnectModeEnabled()) {

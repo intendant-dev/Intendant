@@ -219,7 +219,9 @@ Five subtabs:
   (the reconnect bootstrap rebuilds what still stands). For closed tabs
   entirely, the daemon nudges the Connect rendezvous and opted-in
   browsers get a Web Push (see `self-hosted-rendezvous.md` —
-  Notifications; payloads never carry work content).
+  Notifications; payloads never carry work content). The same opt-in channel
+  may announce only that a hosted lease request exists; its key, preset,
+  lifetime, label, and request id remain daemon-local.
 - **Context** — the agent's current working context (what it is operating on).
 - **Managed** — operator console for managed-Codex context maintenance (see
   below).
@@ -609,8 +611,10 @@ peer target. The tab is split into two sub-tabs: **Editor** (the default) and
 summary uses the same access abstraction as Terminal: local/mTLS and peer
 dashboard-control routes are shown as targets with their available
 capabilities rather than as transport internals. Hosted Connect directory
-records are not Files or Terminal targets: they carry no control URL or
-authority and appear only as non-operable discovery/remembered metadata.
+records are not Files or Terminal targets by themselves: they carry no
+authority and appear as discovery/remembered metadata. After navigation and
+trusted approval, a daemon-origin **Operate** lease may expose the exact hosted
+Files/Terminal routes; **View** and **Tasks** never do.
 
 The daemon-side durable state behind this surface — staged uploads
 (`uploads/<session-id>/` blob + sidecar) and transfer job metadata
@@ -717,23 +721,27 @@ Unified administration for how dashboards and daemons reach each other:
 
 Access uses one vocabulary across trusted daemon-served loopback/direct-mTLS
 dashboards and peer federation. The packaged macOS app contains a local mTLS
-bridge, but no signed/notarized distribution exists for this alpha. Hosted Connect
-contributes directory metadata only; it is not an Access or control surface:
+bridge, but no signed/notarized distribution exists for this alpha. Hosted
+Connect itself contributes directory/navigation metadata only. A daemon may
+separately expose the optional [hosted-control lane](./hosted-control.md) at
+its fleet origin:
 
-- A **target** is a daemon the trusted dashboard can operate. A Connect-linked
-  directory record is navigation metadata, not a target, until it carries a
-  separately trusted direct route.
+- A **target** is a daemon the dashboard can operate. A Connect-linked directory
+  record is navigation metadata, not authority; it becomes operable through a
+  separately trusted direct route or an approved hosted lease.
 - A **principal** is the actor being trusted: the current local session, an
   mTLS browser certificate, or a peer daemon. Browser identity-key records and
   future organization groups also exist in the model, but keys are not an
-  active alpha login credential. `connect_account` remains in the IAM vocabulary for compatibility,
+  active general alpha login credential. An exact `hosted_lease` is a separate
+  short-lived principal bound to a tab key. `connect_account` remains in the IAM vocabulary for compatibility,
   but a hosted account assertion is route metadata and does not authenticate to
   the daemon.
 - A **grant** connects one principal to one target with a role and status. A
   loopback browser or a verified owner-mTLS browser is root-compatible with the
   local daemon. A hosted-origin key may exist in IAM and may be assigned a
   scoped grant for use after trusted re-enrollment, but presentation through
-  Connect cannot exercise that grant or open a control session. A peer route
+  Connect cannot exercise that grant. A hosted lease is written only by the
+  dedicated trusted-confirmation transaction and expires automatically. A peer route
   has a daemon peer-profile grant. An
   approved inbound peer identity appears as
   a peer-daemon principal with a peer-profile grant to this daemon; revoked
@@ -750,6 +758,8 @@ contributes directory metadata only; it is not an Access or control surface:
   authority. Local user/client bindings can also use enforced scoped roles:
   `scoped-human` (access model inspection only), `observer`, `session-reader`,
   `terminal`, `files-read`, `files-write`, `peer-user`, and `operator`.
+  Hosted leases use separate compiled `View`, `Tasks`, and `Operate` presets;
+  persisted role rows do not define their permissions.
   Directory-scoped file access, public shares, organization groups, and
   external identity policy are design targets, not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
@@ -771,8 +781,9 @@ contributes directory metadata only; it is not an Access or control surface:
   `agent_visible` sessions; private user-session displays additionally require
   an owner/root dashboard.
 - A **transport** is only how an authorized route is carried: browser mTLS,
-  loopback HTTP, trusted daemon-origin WebRTC control, or daemon-to-daemon peer
-  mTLS. Hosted Connect is a directory/link surface, not an access transport.
+  loopback HTTP, daemon-origin HTTPS/WSS through the reachability relay,
+  trusted daemon-origin WebRTC control, or daemon-to-daemon peer mTLS. Hosted
+  Connect is a directory/link and ciphertext-relay surface, not the authority.
 
 The browser may also maintain a local fleet registry for navigation: daemon ids,
 labels, remembered URLs, and the route/auth summary last seen from a daemon. This
@@ -800,7 +811,11 @@ record on another device. Connect-served code can also wield the hosted
 origin's browser key while loaded. These signatures are metadata
 integrity/attribution hints, not daemon authentication. The former hosted
 `/app?connect=1&daemon_id=...` dashboard route is retired and always redirects
-to `/connect`; linked targets expose no dashboard URL or Open action. Direct mTLS
+to `/connect`. A linked card exposes **Request control** only when the daemon
+registration carries a valid signed hosted-capability hint and the daemon has a
+relay-mode fleet-DNS route. The action is an ordinary navigation to the
+daemon's fleet-origin public doorbell; it carries no Connect assertion or
+authority. Direct mTLS
 dashboards on daemon origins remain local-first; cross-origin sync to
 `intendant.dev` is a separate explicit-consent design problem, not something the
 current cookie model does silently.
@@ -813,8 +828,10 @@ The important security-domain split is:
   root-compatible only when the browser is loopback or presents the verified
   owner client certificate. Hosted Connect passkeys authenticate only the
   directory account; Connect browser signaling is disabled at the service and
-  legacy Connect control events are dropped by the daemon. A local grant does
-  not turn that page into a control session. Future
+  legacy Connect control events are dropped by the daemon. A local generic
+  grant does not turn that page into a control session. The optional
+  fleet-origin lane instead authenticates an exact, approved `hosted_lease`
+  with fresh tab-key proofs. Future
   coworker/team access belongs on trusted user/client surfaces, not in peer
   federation.
 - **Peer access** means one daemon can call capabilities on another daemon. That
@@ -836,7 +853,7 @@ checks, or peer profiles.
 The local IAM foundation lives beside the native access cert store as
 `iam.json` and is also available at `GET /api/access/iam/state` or
 dashboard-control `api_access_iam_state`. Its schema contains `principals`,
-`roles`, `grants`, and `audit_events`. The daemon exposes this state for
+`roles`, `grants`, `audit_events`, and daemon-local `hosted_control` state. The daemon exposes this state for
 inspection, merges managed principals/grants into the unified overview, and
 enforces active scoped user/client grants when a request can be bound to a
 stable local principal. Today the shipped browser binding is a browser/native
@@ -848,11 +865,13 @@ root-compatible without a stored binding only when they are loopback or present
 the verified owner mTLS certificate. Certless remote `--tls` supplies HTTPS and
 a secure context, not daemon authority; remote protected HTTP, WebSocket, and
 dashboard-control routes require mTLS. `--allow-public-plaintext` never opts a
-remote caller into ambient root. Hosted Connect has no root fallback or control
-request path: the service returns `403` for browser offer/ICE/close before
-mutation, and the daemon drops those events from old/self-hosted services before
-inspecting a browser key or grant. There is no hosted-ceiling raise in the
-default build. Active grants are evaluated by role on trusted routes, while draft
+remote caller into ambient root. Hosted Connect has no root fallback and its
+browser offer/ICE/close path remains refused before mutation. The daemon drops
+those events from old/self-hosted services before inspecting a browser key or
+grant. Separately, fleet-origin code can create a signed public doorbell when
+`hosted_control_enabled` is true; only local/direct-mTLS owner surfaces can
+approve it, and the resulting lease is evaluated under a dedicated ceiling and
+immutable floor. Active generic grants are evaluated by role on trusted routes, while draft
 or revoked records deny instead of silently becoming root again. The
 `iam.enforcement` object reports
 `root_session_grants: true`, `peer_profile_grants: true`,
@@ -863,6 +882,20 @@ or update local user/client grants through the People & Devices pane,
 `api_access_iam_upsert_user_client_grant`. Existing grants can be activated,
 drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
 dashboard-control `api_access_iam_update_grant`.
+
+The Access pane's **Hosted control** card is manage-gated and hidden from
+authority-free fleet pages. It shows the daemon's current `View`, `Tasks`, or
+`Operate` ceiling; pending daemon-signed requests; active leases; and the
+hosted-eligible session set. Trusted local and direct-mTLS owner sessions can
+reduce and decide a pending request, revoke a lease, change the ceiling, or
+mark an existing session eligible through `/api/access/hosted-control/*`.
+Approval can only reduce the requested preset/lifetime. An integrated daemon
+requires the explicit hardening acknowledgement before **Operate**. Lowering
+the ceiling revokes leases above it; raising it leaves existing leases
+unchanged. The card cannot edit the compiled floor, which excludes IAM/access,
+credentials/vault unseal, organization-root operations, approval resolution,
+peer administration, settings/API-key management, and its own ceiling from
+every hosted preset.
 
 An active grant whose only credential is a browser key is refused when that
 key records a hosted or rendezvous-controlled fleet origin. Renaming the
@@ -896,9 +929,12 @@ top-level-navigation and subresource cases where browsers omit `Origin`.
 it requires `presence.read`, echoes only the daemon's own or a fleet-allowlisted
 Origin, and returns `Cache-Control: no-store` because ICE configuration can
 contain TURN credentials. Only authority-free shell/static bytes, the agent
-card, `/connect/bootstrap`, `/connect/status`, and the public signed-document
-doorbells remain public; those requests always use an anonymous `role:none`
-context even on loopback or when a client certificate is present. Authority-bearing
+card, `/connect/bootstrap`, `/connect/status`, the hosted bootstrap/request/poll
+doorbell, and public signed-document doorbells remain public; those requests
+always use an anonymous `role:none` context even on loopback or when a client
+certificate is present. A successful hosted poll returns a lease document but
+does not make the public request itself an authority-bearing session.
+Authority-bearing
 direct signaling under `/connect/dashboard/*` and the legacy `/ws` event lane
 accept browser requests only from the daemon's own origin or the local packaged-app
 scheme, before mTLS/local transport facts become a grant. For cleartext
@@ -910,10 +946,16 @@ not send a browser Origin remain transport-authenticated as before. The macOS
 app is unaffected: its custom-scheme pages are proxied natively, and the
 `intendant://` scheme is treated as the daemon's own origin.
 
+Fleet/relay HTTPS requests take a separate path when hosted control is enabled:
+each protected request carries a tab-key proof bound to its lease, daemon,
+origin, method, raw path/query, nonce, and timestamp. `/ws` consumes a
+seconds-lived one-use ticket minted through such a proof. Neither mechanism
+changes relay provenance into trusted-local authority.
+
 Device enrollment has implemented queue/state/UI plumbing, but it is staged in
 this alpha: the production queue intentionally has no writer, direct `/ws` and
 dashboard-control offers do not present a browser identity-key proof, and
-hosted/fleet traffic is refused before enrollment. The GET response reports
+raw hosted/fleet browser-key traffic is refused before enrollment. The GET response reports
 `status: staged` and `writer_available: false`; ordinary alpha traffic therefore
 cannot create a request or a usable key-login enrollment.
 `GET /api/access/enrollment-requests` /
@@ -956,8 +998,10 @@ input-authority wire follows). The Access **Overview** renders this as the
 **Open dashboards** card — "N tabs connected · this tab · holds voice /
 display input" — refreshed on pane entry and every 15 s while the pane is
 visible; peer-daemon control connections are counted separately from tabs.
-Hosted Connect cannot create an entry: the service refuses browser signaling
-and the daemon drops legacy Connect control events before the registry.
+A Connect-origin tab cannot create an entry: the service refuses browser
+signaling and the daemon drops legacy Connect control events before the
+registry. A fleet-origin tab admitted with a one-use hosted WebSocket ticket
+does appear, labeled by its hosted lease rather than a Connect account.
 
 ### Debug
 
@@ -1287,8 +1331,9 @@ This slice is a local low-level harness for the dashboard-control tunnel. It
 does not implement account signup, passkeys, daemon linking, or a durable
 daemon registry. Its job is to keep the same-origin tunnel protocol easy to
 exercise while the hosted Connect service owns the account and route-link UX.
-It is not a claim-authority path; hosted acceptance tests assert persistent
-`role:none` refusal instead of authorizing this local transport through Connect.
+It is not a claim-authority path; legacy/feature-off hosted acceptance tests
+assert persistent `role:none` refusal instead of authorizing this local
+transport through Connect.
 
 ### Retired Local Rendezvous Control Emulator
 
@@ -1305,14 +1350,15 @@ mixed-version refusal check. It sends a legacy hosted offer and requires the
 daemon to reject it before registry, IAM, enrollment, or DataChannel mutation.
 Trusted daemon-origin tests cover successful dashboard-control transport.
 
-### Hosted Connect Production Alpha
+### Hosted Connect and Hosted-Control Production Alpha
 
 The hosted-service slice is implemented as a separate binary,
 `intendant-connect`. It serves a public web origin, handles passkey-only account
 registration/login, lets a signed-in user link a daemon route with a single-use
 12-word claim code, and stores directory/fleet metadata. Browser dashboard
 signaling is compiled off: authenticated offer/ICE/close calls return `403`
-before service state mutation.
+before service state mutation. The optional reachability relay moves raw
+daemon-terminated TLS; it does not host the daemon SPA or mint authority.
 
 In production, run it behind ordinary public TLS for a public origin such as
 `https://connect.intendant.dev`:
@@ -1342,9 +1388,11 @@ so the same binary can be E2E-tested without public TLS.
 
 The hosted service also serves `/access` as the account/fleet entry point.
 `/connect` is the canonical passkey, route-link, daemon-list, label, release,
-and audit surface. It exposes no Open-dashboard action or daemon control URL.
-The historical `/app` route always redirects to `/connect`, including crafted
-`?connect=1&daemon_id=...` queries.
+and audit surface. A daemon with the optional lane enabled may publish a
+separately signed capability hint; when it also has a relay-mode fleet-DNS
+route, its card shows **Request control** and navigates to the daemon's HTTPS
+fleet origin. The historical `/app` route always redirects to `/connect`,
+including crafted `?connect=1&daemon_id=...` queries.
 
 The daemon side still uses the normal `[connect]` outbound rendezvous client:
 
@@ -1354,6 +1402,9 @@ enabled = true
 rendezvous_url = "https://connect.intendant.dev"
 daemon_id = "vortex-deb-x11-intendant"
 auth_token = "same daemon token configured on intendant-connect"
+relay_enabled = true
+relay_endpoint = "connect.intendant.dev:443"
+hosted_control_enabled = false
 ```
 
 The hosted MVP flow is:
@@ -1361,7 +1412,10 @@ The hosted MVP flow is:
 1. The daemon locally generates a short-lived 12-word BIP39 claim code, then
    registers its `daemon_id`, persistent identity public key, code hash, fresh
    timestamp, and identity signature through `/api/daemon/register`. Connect
-   never receives or returns the plaintext code or URL.
+   never receives or returns the plaintext code or URL. When the optional lane
+   is enabled, a separate daemon signature binds that capability bit to the
+   same identity, code hash, and registration timestamp; old services can still
+   verify the unchanged registration proof.
 2. A successful, single-use registration proof rotates a short-lived
    daemon-session credential. The daemon must present it on `/api/daemon/next`,
    `answer`, `error`, `dry`, and `claim-proof`, including when deployment-wide
@@ -1376,16 +1430,20 @@ The hosted MVP flow is:
    challenge with its daemon identity key, and Connect verifies the signature
    before recording the account/route link. This changes no daemon IAM state
    and grants no access.
-5. Control is established separately through a loopback local console or a
-   daemon-served mTLS dashboard. A remote signed-native authentication bridge
-   is future work. A Connect account
-   assertion never authenticates to the daemon, and daemon-stamped hosted
-   provenance is always `role:none` in the default build.
-6. Selecting the daemon in Connect shows directory metadata only. The service
-   rejects browser offer/ICE/close calls with `403` before queue, rate-limit, or
-   active-session mutation; a current daemon also drops those event kinds from
-   an old/self-hosted service before registry, IAM, or enrollment mutation. A
-   browser-key grant does not override either refusal.
+5. The Connect card offers fleet-origin navigation only when the capability
+   signature verifies and relay-mode DNS is live. The Connect passkey/account
+   assertion is not sent as daemon authentication and creates no principal.
+6. The fleet-origin page generates a non-extractable tab-ephemeral P-256 key
+   and signs a bounded lease request. A local console, direct-mTLS owner
+   dashboard, or qualifying signed app reviews the daemon-signed request.
+   Approval may only reduce the preset or lifetime and mints an exact expiring
+   `hosted_lease`.
+7. The tab signs each protected HTTPS request and obtains a one-use WebSocket
+   ticket for the event lane. The daemon intersects the active lease, current
+   ceiling, compiled preset, route/method/frame classification, and concrete
+   action/target wall. Root control and lease management remain on local or
+   direct-mTLS owner surfaces. The retired Connect offer/ICE/close path remains
+   refused at both ends; a generic browser-key grant does not override it.
 
 The state file durably stores users, passkeys, daemon account/route links,
 hashed claim codes, account-scoped fleet navigation metadata, and a capped
@@ -1393,20 +1451,25 @@ audit log. Plain claim codes are never in the service; WebAuthn challenge
 state and rotating daemon-session credentials are memory-only. The service
 does not accept browser offers. It exposes a minimal account/fleet UI today: passkey
 registration/login, claim-code entry, daemon list, daemon labels, route
-metadata, release link, fleet target listing/forget, and audit events.
+metadata, signed fleet-origin navigation, release link, fleet target
+listing/forget, and audit events.
 The visible account identity is the globally unique account name/handle; the
 internal WebAuthn display-name field is derived from that handle and is not a
 separate user-facing profile field in the MVP UI.
 
-Hosted Connect does not provide daemon control or team IAM. The local daemon
-IAM schema already has portable account/provider, verified-provider, handle,
-and organization fields, but hosted account metadata remains non-authenticating
-directory data.
+Hosted Connect does not provide team IAM or authenticate daemon control. The
+target daemon's separately enabled lease lane provides the bounded control
+surface. The local IAM schema already has portable account/provider,
+verified-provider, handle, and organization fields, but hosted account metadata
+remains non-authenticating directory data.
 
-There is no hosted dashboard or Settings/Debug control panel in the default
-service. Connect shows directory/link health. Lower-level transport self-tests
-run on trusted loopback/mTLS harnesses; hosted validators stop before dashboard
-RPC and expect zero control sessions.
+There is no hosted dashboard or Settings/Debug control panel in the Connect
+service. Connect shows directory/link health and a conditional navigation
+button. The daemon's fleet origin serves the bounded UI. Its event stream is an
+explicit projection: sessions/logs, bounded status/usage, agent-visible display
+state, and required live events; it omits IAM/access, settings, credentials,
+approval payloads, peer state, browser workspaces, private displays, app-anchor
+state, and lease-management records.
 
 Production-alpha hardening now includes:
 
@@ -1425,7 +1488,7 @@ Production-alpha hardening now includes:
 
 For mixed-version alpha upgrades, restarting only Connect does not terminate a
 legacy P2P DataChannel that was already established. Upgrade and restart each
-daemon, close old Connect tabs, and let IAM schema v2 revoke legacy
+daemon, close old Connect tabs, and let the IAM migration revoke legacy
 `connect-bootstrap` grants. New mixed-version attempts are blocked twice: at
 the current service and at the current daemon.
 
@@ -1480,12 +1543,13 @@ Current alpha limits:
   mutation, and plaintext route codes never enter the service;
 - no high-availability storage or database migrations; the state file is a
   single-node alpha persistence layer;
-- no hosted daemon-control path or application-layer dashboard RPC relay in the
-  default build; successful WebRTC/dashboard transport is exercised only from
-  trusted local/direct clients;
-- Connect exposes no Files or Terminal target. File-transfer history, resumed
-  offsets, and staged uploads belong to authenticated daemon dashboards, not
-  the hosted directory;
+- the hosted lane is off by default and dark when off. Connect carries no
+  application-layer dashboard RPC and cannot approve a lease; its relay carries
+  only daemon-terminated TLS ciphertext;
+- **View** and **Tasks** expose no Files or Terminal surface. **Operate** may
+  use the daemon-served terminal, filesystem, and agent-visible display-input
+  routes, but never private displays, IAM/access, credentials, approvals,
+  peers, settings, or its own ceiling;
 - peer daemon-to-daemon mTLS remains separate from Connect account login.
 
 Run the hosted MVP E2E locally with:
@@ -1503,15 +1567,19 @@ grant as an adversarial regression fixture, and verifies the service still
 creates zero control sessions. A daemon regression feeds the same events as if
 from an old/self-hosted service and checks that control, IAM, and enrollment
 state stay unchanged. The validator then releases the route and verifies the
-audit events. Successful
+audit events. This remains the feature-off/legacy-path validator. The Rust E2E
+`hosted_lease_is_the_only_relay_control_authority` covers the enabled lane
+through the real relay ingress: signed request, trusted approval, proof-bound
+HTTP, replay refusal, one-use WebSocket ticket, action denial, ticket reuse
+refusal, and closure on revocation. Successful
 Shell, Files, media, display, and byte-stream transport remain covered by the
 trusted local/direct dashboard-control validators.
 
-### Rejected Hosted-Dashboard Design
+### Rejected Connect-Served Dashboard Design
 
-> **Historical decision only; there is no hosted dashboard contract here.**
-> The public-origin WebRTC prototype was rejected because encrypted transport
-> did not make replaceable hosted JavaScript a trusted authority client.
+> **Historical decision only; this is not the current hosted-lease contract.**
+> The Connect-origin WebRTC prototype was rejected because encrypted transport
+> did not make replaceable Connect-served JavaScript a trusted authority client.
 > Its detailed success-path, session-grant, relay, RPC, media, and rollout
 > specifications were removed: they were not a roadmap and no longer describe
 > callable code.
@@ -1519,16 +1587,19 @@ trusted local/direct dashboard-control validators.
 The surviving engineering result is narrower: daemon-signed WebRTC bindings and
 the dashboard transport abstraction remain useful on authenticated daemon-origin
 paths and local packaged-app development builds. No signed/notarized packaged
-release exists for this alpha. Hosted Connect is an account, route, presence, push, and
-metadata directory. It serves no daemon SPA or privileged dashboard assets;
+release exists for this alpha. Hosted Connect is an account, route, presence,
+push, metadata, and ciphertext-relay service. It serves no daemon SPA or
+privileged dashboard assets;
 `/app` and `/app.html` redirect to `/connect`; browser
 offer/ICE/close calls are refused before mutation; and current daemons drop
-legacy hosted-control events. No browser-key grant or persisted ceiling edit can
-reactivate the design.
+legacy hosted-control events. No browser-key grant or compatibility-ceiling edit
+can reactivate that design.
 
-Any future hosted-control product would require a separate binary/product and a
-new trust design. The current boundaries and migration are specified in
-[Trust Architecture](./trust-architecture.md).
+The current hosted-control product is a different construction: daemon-served
+fleet-origin code borrows an exact short-lived lease after trusted
+confirmation, and a compiled immutable floor bounds every preset. Its contract
+is specified in [Hosted Control](./hosted-control.md); the broader boundary and
+migration remain in [Trust Architecture](./trust-architecture.md).
 
 ## HTTP endpoints
 
@@ -1548,7 +1619,7 @@ family (sub-routes elided where the family is uniform):
 | `GET /vault-kernel.js` | The vault crypto kernel worker; the SPA hash-verifies it against its assembled-in pin before instantiating (see [credential custody](./credential-custody.md#the-crypto-kernel)) |
 | `GET /.well-known/agent-card.json` | Agent card (identity + capabilities) for peers and integrations |
 | `POST /mcp` | Streamable-HTTP MCP server (per-tool IAM; see [MCP server](./mcp-server.md)) |
-| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling; browser upgrades require the daemon's independently trusted origin or the local app scheme before transport authority is resolved; fleet SNI is refused |
+| `WS /` or `WS /ws` | Main WebSocket: events, fallback Shell terminal I/O, presence protocol, WebRTC signaling; direct browser upgrades require the daemon's independently trusted origin or local app scheme; fleet/relay upgrades require a one-use hosted ticket and receive only the hosted event/action projection |
 | `GET /api/sessions` | List past sessions (`/stream` NDJSON variant, `/search` full-text) |
 | `GET /api/session/{id}/*` | Per-session detail, report, log replay, context snapshots, recordings, frame assets |
 | `POST /api/session/{id}/agent-output` | Fetch persisted agent output by id for a historical/session-scoped transcript (POST-shaped read: the ids ride the body) |
@@ -1562,8 +1633,11 @@ family (sub-routes elided where the family is uniform):
 | `GET/POST /api/settings`, `POST /api/api-keys`, `GET /api/api-key-status`, `GET /api/project-root` | Settings and provider-key management |
 | `GET /api/external-agents` | External-agent backend availability (configured command, installed, auth posture, last used) plus passive zero-quota compatibility status (artifact fingerprint, in-band version, manifest digest, finding counts) — drives the fueling nudge and new-session picker |
 | `GET /api/displays`, `POST /api/diagnostics/visual-freshness` | Display inventory; visual-freshness probe marker |
+| `GET /api/hosted-control/bootstrap`, `POST /api/hosted-control/{requests,requests/poll,anchor-decisions}` | Public hosted doorbell: dark when disabled; request creation/poll proves the tab key, while signed-app decisions verify the enrolled anchor |
+| `POST /api/hosted-control/ws-ticket` | Mint a seconds-lived one-use WebSocket ticket from a proved active hosted lease |
 | `GET /api/access/{overview,iam/state}`, `GET /api/dashboard/targets` | Trust-architecture snapshots (IAM state, fleet targets) |
-| `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
+| `GET/POST /api/access/hosted-control[/*]` | Manage-gated hosted policy, pending decisions, active revocation, and session eligibility |
+| `POST /api/access/...` | Trust mutations: enrollment decide, IAM grant upsert/update, hosted lease management, org trust/revoke, org-grant issue/renew/revoke-member, issuer init/delegate/install, revocation-list apply |
 | `GET /api/peers[/*]`, `POST /api/peers[/*]`, `DELETE /api/peers` | Peer federation: registry reads (GET), pairing + management/signaling (POST), registry removal (DELETE) |
 | `POST /api/coordinator/route` | Multi-agent coordinator task routing (peer lane) |
 | `GET /api/worktrees`, `POST /api/worktrees/{inspect,scan,remove,clean,merge}` | Agent worktree inventory and lifecycle (clean = reclaim a checkout's Cargo target/; merge = session-linked worktree finish card) |
@@ -1586,11 +1660,12 @@ its operation per method/path from `federation_http_operation`.
 `fleet allowlist` in the generated CORS column describes which already-trusted
 dashboard origins may call a daemon's **independently verified direct-mTLS
 URL**. It does not authorize the rendezvous-controlled fleet WebPKI URL. The
-listener classifies fleet SNI first and rejects all non-public HTTP/MCP,
-signaling, and WebSocket traffic before route CORS, browser mTLS, or IAM is
-resolved. The fleet certificate endpoint itself can therefore be requested
-only from a trusted direct surface; the resulting name is discovery/public
-shell only. `fleet or loopback` (the session-list rows the multi-daemon Stats
+listener classifies fleet SNI first. It rejects non-public HTTP/MCP, signaling,
+and WebSocket traffic before route CORS, browser mTLS, or IAM is resolved unless
+the optional hosted lane validates an exact lease proof/ticket and the route's
+hosted classifier admits it. The fleet certificate endpoint itself is not in
+that classifier and can therefore be requested only from a trusted direct
+surface. `fleet or loopback` (the session-list rows the multi-daemon Stats
 tab reads) is the same allowlist echo plus loopback-host page origins on
 connections that themselves arrive over loopback — a sibling daemon's
 dashboard on another port of the same machine; these rows historically
@@ -1678,6 +1753,11 @@ response omits the header.
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |
 | any | `/api/peer-pairing/requests[/…]` | public | public | streaming | Peer access-request doorbell: knock (POST, size-capped) or poll one request's status (GET subpath) |
+| GET | `/api/hosted-control/bootstrap` | public | public | none | Hosted-control doorbell bootstrap (dark unless enabled; no authority) |
+| POST | `/api/hosted-control/requests` | public | public | bounded | Submit a bounded hosted-control lease request to daemon-local IAM |
+| POST | `/api/hosted-control/requests/poll` | public | public | bounded | Poll one hosted-control request with proof by its browser key |
+| POST | `/api/hosted-control/anchor-decisions` | public | public | bounded | Present a signed application-anchor decision document |
+| POST | `/api/hosted-control/ws-ticket` | PresenceRead | own origin | none | Mint one short-lived, single-use WebSocket ticket from a proved hosted lease |
 | POST | `/api/access/org-grants` | public | public | ≤ 16 KiB | Present a signed org grant document (verified against locally trusted org keys) |
 | GET | `/api/access/orgs/{org_handle}/revocations` | public | public | none | Org revocation list (ORL) for a trusted org |
 | POST | `/api/access/orgs/revocations/apply` | public | public | ≤ 64 KiB | Apply a signed org revocation list |
@@ -1695,6 +1775,8 @@ response omits the header.
 | GET | `/api/access/enrollment-requests` | AccessInspect | fleet allowlist | none | Staged enrollment capability and normally empty queue |
 | GET | `/api/access/iam/state` | AccessInspect | fleet allowlist | none | Local IAM state (roles, grants, bindings) |
 | GET | `/api/access/overview` | AccessInspect | fleet allowlist | none | Access overview for the calling principal |
+| GET | `/api/access/hosted-control` | AccessManage | own origin | none | Hosted-control policy, pending request, active lease, and signed-app anchor state |
+| POST | `/api/access/hosted-control[/…]` | AccessManage | own origin | bounded | Decide requests, revoke leases, change policy, or mark hosted-eligible sessions |
 | GET | `/api/access/connect/status` | AccessInspect | fleet allowlist | none | Connect rendezvous status (discovery-link state and provenance; no claim code) |
 | GET | `/api/access/connect/claim-code` | AccessManage | fleet allowlist | none | Reveal the current one-time twelve-word claim code (unlinked daemons only) |
 | POST | `/api/access/connect/config` | AccessManage | fleet allowlist | bounded | Enable/disable the Connect client (persists to intendant.toml, applies live) |

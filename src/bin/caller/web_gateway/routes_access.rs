@@ -3057,6 +3057,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peer_filesystem_audit_never_crosses_the_hosted_event_projection() {
+        let bus = EventBus::new();
+        let mut events = bus.subscribe();
+        let identity = PeerConnectionIdentity {
+            fingerprint: "peer-fingerprint".to_string(),
+            label: "Peer label".to_string(),
+            profile: "file-reader".to_string(),
+            filesystem: Default::default(),
+            record: None,
+        };
+        audit_peer_filesystem_access(
+            &bus,
+            &identity,
+            crate::peer::access_policy::PeerOperation::FilesystemRead,
+            "/workspace/private.txt",
+            false,
+            "outside scope",
+        );
+        let event = events.try_recv().expect("peer audit event");
+        let outbound = crate::event::app_event_to_outbound(&event).expect("outbound peer audit");
+        let line = serde_json::to_string(&outbound).unwrap();
+        assert!(line.contains("peer-fingerprint"));
+        assert!(line.contains("/workspace/private.txt"));
+        for preset in crate::access::hosted_control::HostedPreset::ALL {
+            assert!(
+                !crate::access::hosted_control::hosted_outbound_line_allowed(preset, &line),
+                "{} admitted a peer filesystem audit",
+                preset.as_str(),
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn revoke_member_fails_loud_and_same_request_retries_local_apply() {

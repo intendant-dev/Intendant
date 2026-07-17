@@ -14,6 +14,7 @@ pub(crate) struct HttpRequestCtx {
     /// Tests inject a temp store so request authentication never consults the
     /// runner's real account.
     pub(crate) access_cert_dir: PathBuf,
+    pub(crate) hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
     pub(crate) bus: EventBus,
     pub(crate) config_json: String,
     pub(crate) session_provider: String,
@@ -83,6 +84,7 @@ pub(crate) async fn serve_http_request(
 ) {
     let HttpRequestCtx {
         access_cert_dir,
+        hosted_control,
         bus,
         config_json,
         session_provider,
@@ -291,8 +293,6 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path);
-
     // A public fleet/WebPKI name is convenient discovery, but it is not an
     // authority anchor: the fleet DNS operator can serve JavaScript at that
     // exact origin and later point it at this daemon. SOP, Origin checks, and
@@ -304,7 +304,56 @@ pub(crate) async fn serve_http_request(
     let discovery_only_ingress = gateway_ingress.is_reachability_relay()
         || tls_fleet_origin
         || request_names_known_fleet_origin(header_text);
-    if discovery_only_ingress && !authority_free_request {
+    if is_public_hosted_control_path(req_method, req_path) && !discovery_only_ingress {
+        use tokio::io::AsyncWriteExt;
+        let response = json_error(
+            "404 Not Found",
+            "hosted-control doorbells are served only on the fleet-name lane",
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        finalize_http_stream(&mut stream).await;
+        return;
+    }
+    // The doorbell endpoints remain authority-free even while the feature is
+    // dark so the bootstrap handler can return its indistinguishable 404 and
+    // the ordinary fleet discovery page keeps working. The handlers consult
+    // the live runtime before disclosing or mutating hosted-control state.
+    let authority_free_request = allows_remote_certless_http(request_line, req_method, req_path)
+        || is_public_hosted_control_path(req_method, req_path);
+    let hosted_verified = if discovery_only_ingress
+        && !authority_free_request
+        && hosted_control.enabled()
+        && req_path != "/mcp"
+        && http_header_value(header_text, "x-intendant-hosted-lease").is_some()
+    {
+        let result = hosted_request_proof_from_headers(header_text).and_then(|proof| {
+            let fleet_origin = fleet_origin_from_request(header_text, is_tls)?;
+            hosted_control.verify_request_proof(
+                req_method,
+                request_line.split_whitespace().nth(1).unwrap_or(req_path),
+                &fleet_origin,
+                &proof,
+                if gateway_ingress.is_reachability_relay() {
+                    "hosted-relay-https"
+                } else {
+                    "hosted-fleet-https"
+                },
+            )
+        });
+        match result {
+            Ok(verified) => Some(verified),
+            Err(error) => {
+                use tokio::io::AsyncWriteExt;
+                let response = json_error("401 Unauthorized", error);
+                let _ = stream.write_all(response.as_bytes()).await;
+                finalize_http_stream(&mut stream).await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if discovery_only_ingress && !authority_free_request && hosted_verified.is_none() {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
             "error": "the public fleet-name endpoint is discovery-only; use loopback or the independently fingerprint-verified direct mTLS address for control"
@@ -384,6 +433,7 @@ pub(crate) async fn serve_http_request(
     if ((tls_client_cert_required && !tls_client_cert_present) || remote_client_auth_missing)
         && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, header_text)
         && !authority_free_request
+        && hosted_verified.is_none()
     {
         use tokio::io::AsyncWriteExt;
         let body = serde_json::json!({
@@ -403,7 +453,13 @@ pub(crate) async fn serve_http_request(
         return;
     }
 
-    let http_access_context = if authority_free_request {
+    let hosted_verified_for_handler = hosted_verified.clone();
+    let http_access_context = if let Some(verified) = hosted_verified.as_ref() {
+        HttpAccessContext {
+            principal: verified.principal.clone(),
+            iam_state: Some(Arc::clone(&verified.iam_state)),
+        }
+    } else if authority_free_request {
         authority_free_http_access_context(is_tls)
     } else {
         match http_access_context(
@@ -504,6 +560,28 @@ pub(crate) async fn serve_http_request(
         if !decision.allowed {
             use tokio::io::AsyncWriteExt;
             let response = http_access_forbidden_response(&http_access_context, decision);
+            let _ = stream.write_all(response.as_bytes()).await;
+            finalize_http_stream(&mut stream).await;
+            return;
+        }
+    }
+    if let Some(verified) = hosted_verified.as_ref() {
+        let preset = crate::access::hosted_control::hosted_preset_for_principal(
+            &verified.iam_state,
+            &verified.principal,
+        );
+        if !matches!(
+            preset,
+            Ok(preset)
+                if crate::access::hosted_control::hosted_http_route_allowed(
+                    preset, req_method, req_path,
+                )
+        ) {
+            use tokio::io::AsyncWriteExt;
+            let response = json_error(
+                "403 Forbidden",
+                "route is outside the hosted lease HTTP projection",
+            );
             let _ = stream.write_all(response.as_bytes()).await;
             finalize_http_stream(&mut stream).await;
             return;
@@ -1247,6 +1325,52 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::HostedControlBootstrap => {
+                return handle_hosted_control_bootstrap(
+                    stream,
+                    hosted_control,
+                    header_text,
+                    is_tls,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::HostedControlRequestCreate => {
+                let source_bucket =
+                    (!gateway_ingress.is_reachability_relay()).then_some(source_hint.as_str());
+                return handle_hosted_control_request_create(
+                    stream,
+                    route_body,
+                    hosted_control,
+                    header_text,
+                    is_tls,
+                    source_bucket,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::HostedControlRequestPoll => {
+                return handle_hosted_control_request_poll(
+                    stream,
+                    route_body,
+                    hosted_control,
+                    route.cors,
+                )
+                .await;
+            }
+            RouteHandlerId::HostedControlAnchorDecision => {
+                return handle_hosted_control_anchor_decision(stream, hosted_control, route.cors)
+                    .await;
+            }
+            RouteHandlerId::HostedControlWsTicket => {
+                return handle_hosted_control_ws_ticket(
+                    stream,
+                    hosted_control,
+                    hosted_verified_for_handler,
+                    route.cors,
+                )
+                .await;
+            }
             RouteHandlerId::AccessOrgGrantPresent => {
                 return handle_access_org_grant_present(
                     stream,
@@ -1384,6 +1508,19 @@ pub(crate) async fn serve_http_request(
                     http_access_context,
                     peer_registry,
                     agent_card_value_for_targets,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::HostedControlManagement => {
+                return handle_hosted_control_management(
+                    stream,
+                    req_method,
+                    req_path,
+                    route_body,
+                    hosted_control,
+                    http_access_context,
                     route.cors,
                     fleet_cors_origin.as_deref(),
                 )
@@ -1939,13 +2076,22 @@ pub(crate) async fn serve_http_request(
         // that approved origin instead of publishing wildcard CORS. This is
         // intentionally no-store because TURN credentials can be long-lived.
         let reuse = stream.exchange_reusable();
-        let response =
-            HttpResponse::with_content("200 OK", "application/json", config_json.clone())
-                .header("Cache-Control", "no-store")
-                .fleet_cors(request_origin.as_deref())
-                .header("Connection", "close")
-                .connection_reuse(reuse)
-                .into_string();
+        let config_body = if hosted_verified.is_some() {
+            serde_json::from_str::<serde_json::Value>(&config_json)
+                .map(|config| {
+                    crate::access::hosted_control::project_hosted_runtime_config(&config)
+                        .to_string()
+                })
+                .unwrap_or_else(|_| "{}".to_string())
+        } else {
+            config_json.clone()
+        };
+        let response = HttpResponse::with_content("200 OK", "application/json", config_body)
+            .header("Cache-Control", "no-store")
+            .fleet_cors(request_origin.as_deref())
+            .header("Connection", "close")
+            .connection_reuse(reuse)
+            .into_string();
         use tokio::io::AsyncWriteExt;
         let write_ok = stream.write_all(response.as_bytes()).await.is_ok();
         parked_ok = reuse && write_ok;

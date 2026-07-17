@@ -2522,6 +2522,7 @@ function renderAccessAdminSummaries() {
   // Relative-time texts ("expires in 2h") go stale without a model change;
   // a minute bucket re-renders them at a sane cadence.
   const minuteFp = String(Math.floor(Date.now() / 60_000));
+  hostedControlRenderManagementCard();
 
   accessGuardedRender('access-attention',
     accessSectionFp([transportFp, overviewFp, accessPendingEnrollments.length, accessOwnDeviceFingerprint]),

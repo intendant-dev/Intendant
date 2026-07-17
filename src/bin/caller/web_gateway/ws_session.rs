@@ -208,6 +208,9 @@ pub(crate) async fn ws_outbound_task(
                             session_cancel.cancel();
                             break;
                         }
+                        if !grant.allows_dashboard_event_line(&line) {
+                            continue;
+                        }
                         if ws_tx
                             .send(Message::Text(line.into()))
                             .await
@@ -233,6 +236,9 @@ pub(crate) async fn ws_outbound_task(
                             let _ = ws_tx.send(Message::Close(None)).await;
                             session_cancel.cancel();
                             break;
+                        }
+                        if !grant.allows_dashboard_event_line(&line) {
+                            continue;
                         }
                         if ws_tx
                             .send(Message::Text(line.into()))
@@ -264,12 +270,10 @@ pub(crate) async fn ws_outbound_task(
                 }
                 match msg {
                     Ok(line) => {
-                        let owner = grant.has_owner_dashboard_authority();
-                        if !owner
-                            && crate::dashboard_control::DashboardControlGrant::dashboard_event_line_requires_owner(&line)
-                        {
+                        if !grant.allows_dashboard_event_line(&line) {
                             continue;
                         }
+                        let owner = grant.has_owner_dashboard_authority();
                         if !owner {
                             if let Some(session_registry) = session_registry.as_ref() {
                                 let registry = session_registry.read().await;
@@ -2306,7 +2310,19 @@ pub(crate) async fn ws_inbound_task(
                                     bus_resume.send(AppEvent::ControlCommand(ctrl));
                                 });
                             }
-                            Ok(ctrl) => {
+                            Ok(mut ctrl) => {
+                                if let Err(error) = dashboard_control_grant_inbound
+                                    .stamp_hosted_session_provenance(&mut ctrl)
+                                {
+                                    bus_inbound.send(AppEvent::PresenceLog {
+                                        message: format!(
+                                            "[ws] hosted session provenance refused: {error}"
+                                        ),
+                                        level: Some(LogLevel::Warn),
+                                        turn: None,
+                                    });
+                                    continue;
+                                }
                                 bus_inbound.send(AppEvent::PresenceLog {
                                     message: format!(
                                         "[ws] ControlMsg: {:?}",

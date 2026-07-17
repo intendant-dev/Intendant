@@ -23,6 +23,7 @@ pub mod cert_server;
 pub mod certs;
 pub mod client_key;
 pub mod enrollment;
+pub mod hosted_control;
 pub mod iam;
 pub mod org;
 pub mod pinning;

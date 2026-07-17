@@ -70,6 +70,10 @@ pub struct SessionSupervisorConfig {
     /// `SessionEnded` prunes on the producer side. None when the daemon
     /// runs without the vitals producer (no web frontends).
     pub git_vitals_targets: Option<crate::session_vitals::GitVitalsTargets>,
+    /// Daemon-owned IAM directory used to revalidate internal hosted lease
+    /// provenance before a hosted-created session becomes an eligible target.
+    /// None in hermetic tests and non-hosted execution shapes.
+    pub hosted_control_cert_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -771,6 +775,7 @@ mod tests {
                     .unwrap_or(0)
             ))),
             git_vitals_targets: None,
+            hosted_control_cert_dir: None,
         })
     }
 

@@ -41,6 +41,7 @@ pub(crate) use relay::*;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
+const HOSTED_CONTROL_CAPABILITY_PROTOCOL: &str = "intendant-connect-hosted-control-capability-v1";
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
 /// v2 claim proofs bind the claiming account (user id + handle at claim
 /// time) into the payload the daemon signs, so the account↔daemon binding
@@ -1131,6 +1132,11 @@ struct DaemonRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     daemon_public_key: String,
+    /// Daemon-signed directory hint. It controls only whether Connect offers
+    /// fleet-route navigation; the target daemon still verifies every lease
+    /// and may refuse the route.
+    #[serde(default)]
+    hosted_control_enabled: bool,
     /// Connect account association for discovery/routing. The legacy
     /// field name is retained for store compatibility; it is not a daemon
     /// IAM owner and carries no daemon authority.
@@ -1714,7 +1720,33 @@ fn user_view(user: &UserRecord) -> serde_json::Value {
     })
 }
 
-fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
+fn daemon_hosted_control_url(
+    state: &AppState,
+    store: &Store,
+    daemon: &DaemonRecord,
+) -> Option<String> {
+    if !daemon.hosted_control_enabled {
+        return None;
+    }
+    // The fleet name is HTTPS-on-443 only for the relay lane. Direct DNS
+    // publication points at the daemon's native gateway port instead, which
+    // Connect does not publish and must not guess.
+    if !store
+        .dns_records
+        .iter()
+        .any(|record| record.daemon_id == daemon.daemon_id && record.via_relay)
+    {
+        return None;
+    }
+    let zone = state.dns_zone.as_ref()?;
+    if !zone.has_daemon_route(&daemon.daemon_id) {
+        return None;
+    }
+    zone.daemon_fqdn(&daemon.daemon_id)
+        .map(|name| format!("https://{name}/"))
+}
+
+fn daemon_view(daemon: &DaemonRecord, hosted_control_url: Option<&str>) -> serde_json::Value {
     let now = now_unix_ms();
     json!({
         "daemon_id": daemon.daemon_id,
@@ -1725,6 +1757,10 @@ fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
         "presence_hours": daemon.presence_hours,
         "registered_unix_ms": daemon.registered_unix_ms,
         "last_seen_unix_ms": daemon.last_seen_unix_ms,
+        // Signed daemon capability + currently published fleet DNS route.
+        // This is navigation metadata; opening it still begins at the
+        // daemon's public doorbell with no authority.
+        "hosted_control_url": hosted_control_url,
     })
 }
 
@@ -1886,6 +1922,68 @@ mod tests {
         assert_eq!(*hours.last().unwrap(), 209);
     }
 
+    #[test]
+    fn hosted_navigation_requires_signed_hint_and_live_relay_dns() {
+        let root = tempfile::tempdir().unwrap();
+        let zone = Arc::new(FleetZone::new("fleet.example.test", "ns.fleet.example.test").unwrap());
+        let state = build_test_state(
+            root.path(),
+            Store::default(),
+            TestStateOverrides {
+                dns_zone: Some(zone.clone()),
+                ..TestStateOverrides::default()
+            },
+        );
+        let mut daemon = DaemonRecord {
+            daemon_id: "daemon-1".to_string(),
+            label: None,
+            daemon_public_key: "daemon-key".to_string(),
+            hosted_control_enabled: false,
+            owner_user_id: None,
+            claim_code_hash: None,
+            claim_code_created_unix_ms: None,
+            last_registration_proof_unix_ms: None,
+            route_link_revision: 0,
+            last_unclaim_proof_unix_ms: None,
+            registered_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            updated_unix_ms: 1,
+            presence_hours: Vec::new(),
+        };
+        let mut store = Store {
+            dns_records: vec![DnsRecordEntry {
+                daemon_id: daemon.daemon_id.clone(),
+                addresses: vec!["192.0.2.10".to_string()],
+                updated_unix_ms: 1,
+                via_relay: true,
+            }],
+            ..Store::default()
+        };
+
+        assert_eq!(daemon_hosted_control_url(&state, &store, &daemon), None);
+        daemon.hosted_control_enabled = true;
+        assert_eq!(
+            daemon_hosted_control_url(&state, &store, &daemon),
+            None,
+            "a persisted relay record without a live route is not advertised"
+        );
+
+        zone.set_daemon_addresses(&daemon.daemon_id, &["192.0.2.10".parse().unwrap()])
+            .unwrap();
+        let expected_url = format!("https://{}/", zone.daemon_fqdn(&daemon.daemon_id).unwrap());
+        assert_eq!(
+            daemon_hosted_control_url(&state, &store, &daemon).as_deref(),
+            Some(expected_url.as_str())
+        );
+
+        store.dns_records[0].via_relay = false;
+        assert_eq!(
+            daemon_hosted_control_url(&state, &store, &daemon),
+            None,
+            "direct-mode DNS does not imply HTTPS on the relay's public port"
+        );
+    }
+
     fn store_with_marker() -> Store {
         let mut store = Store::default();
         store.users.push(UserRecord {
@@ -1971,6 +2069,7 @@ mod tests {
                 daemon_id: "daemon-flush".to_string(),
                 label: None,
                 daemon_public_key: "key".to_string(),
+                hosted_control_enabled: false,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,
@@ -2050,6 +2149,7 @@ mod tests {
                 daemon_id: "daemon-drain".to_string(),
                 label: None,
                 daemon_public_key: "key".to_string(),
+                hosted_control_enabled: false,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,

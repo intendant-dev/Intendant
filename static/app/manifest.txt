@@ -14,6 +14,7 @@
 12-styles-tasks-log.css
 13-styles-sessions-terminal.css
 14-styles-displays-voice.css
+15-styles-hosted-control.css
 16-styles-v2-tokens.css
 ui2-chrome.css
 ui2-voice.css
@@ -51,6 +52,7 @@ ui2-chrome.js
 ui2-voice.js
 ui2-activity.js
 31-init-identity-fleet.js
+31b-hosted-control.js
 # 32-daemon-api.js must stay AFTER 31-init-identity-fleet.js (it reads the
 # transport `let` bindings and peer registries declared there) and BEFORE
 # every daemonApi consumer fragment (the F1+ family migrations start at
