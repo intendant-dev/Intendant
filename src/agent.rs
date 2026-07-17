@@ -35,18 +35,23 @@ struct PtySession {
     // Shared with the reader thread so it can answer terminal queries (see
     // below) on the same PTY input stream that `exec_pty` writes commands to.
     writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
-    // All bytes the shell has emitted so far, accumulated by a dedicated
-    // background reader thread (see `exec_pty`). A background thread — rather
-    // than an inline blocking `read()` in the command loop — is what makes the
-    // per-command read timeout robust: `portable_pty`'s reader is blocking and
-    // has no portable non-blocking / deadline mode, so an inline read against
-    // a shell that has gone quiet (e.g. PowerShell sitting at its prompt on
-    // Windows ConPTY) blocks indefinitely and the loop's elapsed-time check
-    // never runs. Draining on a thread lets `exec_pty` poll this buffer under
-    // an async deadline that always fires.
+    // Bytes the shell has emitted and no `exec_pty` call has consumed yet,
+    // accumulated by a dedicated background reader thread (see `exec_pty`;
+    // each call drains the prefix it consumed, so this stays bounded by the
+    // in-flight command's output rather than the session's whole transcript).
+    // A background thread — rather than an inline blocking `read()` in the
+    // command loop — is what makes the per-command read timeout robust:
+    // `portable_pty`'s reader is blocking and has no portable non-blocking /
+    // deadline mode, so an inline read against a shell that has gone quiet
+    // (e.g. PowerShell sitting at its prompt on Windows ConPTY) blocks
+    // indefinitely and the loop's elapsed-time check never runs. Draining on
+    // a thread lets `exec_pty` poll this buffer under an async deadline that
+    // always fires.
     output: Arc<std::sync::Mutex<Vec<u8>>>,
-    // How many bytes of `output` previous `exec_pty` calls have already
-    // consumed, so each call only scans newly-produced bytes for its markers.
+    // How many bytes at the front of `output` previous `exec_pty` calls have
+    // already consumed, so each call only scans newly-produced bytes for its
+    // markers. Every call drains what it consumed and rebases this to 0 on
+    // the way out, so between calls it is always 0.
     read_offset: usize,
     // Keep master alive to prevent EOF
     _master: Box<dyn portable_pty::MasterPty + Send>,
@@ -1068,16 +1073,23 @@ impl Agent {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Mark this call's bytes consumed regardless of outcome, and decode
-        // them once, now that the scan is over.
-        session.read_offset = scanned_to;
+        // Consume this call's bytes regardless of outcome: decode them once,
+        // then drain the consumed prefix so the shared buffer holds only
+        // not-yet-consumed bytes instead of accumulating the session's whole
+        // transcript. One lock hold keeps extract + drain atomic: the reader
+        // thread only ever appends under this mutex, so bytes it added after
+        // `scanned_to` are retained by the drain and belong to the next call.
         let output = {
-            let guard = session
+            let mut guard = session
                 .output
                 .lock()
                 .map_err(|_| AgentError::Process("PTY reader buffer poisoned".to_string()))?;
-            String::from_utf8_lossy(&guard[call_start..scanned_to]).into_owned()
+            let output = String::from_utf8_lossy(&guard[call_start..scanned_to]).into_owned();
+            guard.drain(..scanned_to);
+            output
         };
+        // The drain rebased the buffer, so the next call starts at 0.
+        session.read_offset = 0;
 
         // Clean output: strip ANSI escapes and carriage returns
         let cleaned = ANSI_RE.replace_all(&output, "").to_string();
@@ -2439,6 +2451,42 @@ mod tests {
             !output.contains("first_out"),
             "second call must not re-consume the first call's bytes: {output}"
         );
+    }
+
+    /// The shared reader buffer must not accumulate the session's whole
+    /// transcript: every call drains the prefix it consumed, so after each
+    /// large-output command the buffer holds only the unconsumed tail
+    /// (post-marker prompt bytes), not the cumulative history. Unix-only,
+    /// like the isolation test above: the generator loop is bash syntax and
+    /// ConPTY repaints make exact byte accounting unreliable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_pty_drains_consumed_output_between_commands() {
+        let (agent, _log) = create_test_agent();
+        // ~33 KB per command — well over the bound asserted below, so the
+        // pre-drain cumulative behavior fails from the first iteration.
+        let big = "for i in {1..1000}; do printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\n'; done";
+        for nonce in 1..=3u64 {
+            let cmd = AgentCommand {
+                function: "execPty".to_string(),
+                nonce,
+                command: Some(big.to_string()),
+                ..Default::default()
+            };
+            match agent.exec_pty(&cmd).await {
+                Ok(_) => {}
+                Err(AgentError::Process(msg)) if msg.contains("Permission denied") => return,
+                Err(e) => panic!("unexpected exec_pty error: {}", e),
+            }
+            let sessions = agent.pty_sessions.lock().await;
+            let session = sessions.get("default").expect("session exists");
+            let len = session.output.lock().unwrap().len();
+            assert!(
+                len < 16 * 1024,
+                "shared PTY buffer must stay bounded at the unconsumed tail, \
+                 got {len} bytes after command {nonce}"
+            );
+        }
     }
 
     /// The split-form marker input never contains the assembled marker for
