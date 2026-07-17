@@ -576,6 +576,7 @@ impl AppEventUpcaster {
             | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::FollowUpCancelRequested { .. }
             | AppEvent::SessionStopRequested { .. }
+            | AppEvent::ReloadBackendCredentials { .. }
             | AppEvent::SessionCapabilities { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::SharedView { .. }

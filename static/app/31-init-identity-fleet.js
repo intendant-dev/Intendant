@@ -915,6 +915,7 @@ const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
   'configure_session_agent',
   'stop_session',
   'restart_session',
+  'reload_credentials',
   'create_session',
   'start_task',
   'resume_session',
