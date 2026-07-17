@@ -118,6 +118,13 @@ html.ui-v2 .ui2-nav-bottom {
   padding: 10px; border-top: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 8px;
 }
+html.ui-v2 .ui2-v3-link {
+  display: block; padding: 6px 10px; border: 1px solid rgba(var(--iris-rgb), .35);
+  border-radius: var(--r-ctl); color: var(--iris); text-decoration: none;
+  font: 600 12px var(--sans); text-align: center; letter-spacing: .02em;
+  background: rgba(var(--iris-rgb), .08);
+}
+html.ui-v2 .ui2-v3-link:hover { background: rgba(var(--iris-rgb), .16); }
 html.ui-v2 .ui2-autonomy {
   display: flex; align-items: center; gap: 10px; width: 100%;
   padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-ctl);
