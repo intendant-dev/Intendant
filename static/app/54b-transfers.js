@@ -1579,7 +1579,7 @@ async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
     throw new Error('Rename-on-conflict needs the dashboard control channel — choose "Fail on conflict" or "Overwrite" for direct connections');
   }
   const destination = await filesResolveHttpUploadDestinationPath(transfer, file);
-  setFilesUploadStatus('warn', `Uploading ${transfer.name} to ${destination}`);
+  filesUploadBatchProgress(`Uploading ${transfer.name} to ${destination}`);
   const bytes = new Uint8Array(await file.arrayBuffer());
   const resp = await filesIdeWriteFile('', destination, bytes, {
     ...(conflict === 'overwrite' ? { force: true } : { create_new: true }),
@@ -1594,7 +1594,7 @@ async function runFilesFilesystemUploadHttpFallback(transfer, controller) {
     result: { ok: true, path: destination, transport: 'http-fs-write' },
   });
   await filesTransferDeleteUploadBlob(transfer.id);
-  setFilesUploadStatus('ok', `Uploaded ${transfer.name} to ${destination}`);
+  filesUploadBatchSettle(transfer, 'ok', `Uploaded ${transfer.name} to ${destination}`);
 }
 
 // Mirror the durable-job destination semantics client-side: an existing
@@ -1708,7 +1708,7 @@ async function settleCommittedFilesUpload(transfer, job) {
   transfer.descriptor = descriptor;
   filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
   await filesTransferDeleteUploadBlob(transfer.id);
-  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+  filesUploadBatchSettle(transfer, 'ok', `Uploaded ${transfer.name || 'upload.bin'}`);
 }
 
 async function runFilesFilesystemUploadTransfer(transfer, controller) {
@@ -1855,7 +1855,7 @@ async function runFilesFilesystemUploadTransfer(transfer, controller) {
     transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
     filesTransferPersistStateSoon();
     renderFilesTransfers();
-    setFilesUploadStatus('warn', `Uploading ${filesTransferProgressText(transfer)}`);
+    filesUploadBatchProgress(`Uploading ${filesTransferProgressText(transfer)}`);
     if (
       transfer.debugFailAfterChunks > 0 &&
       !transfer.debugFailedOnce &&
@@ -1934,7 +1934,7 @@ async function runFilesUploadTransfer(transfer) {
   try {
     const filesystemUpload = Boolean(transfer.destination && transfer.destination !== 'task');
     if (filesystemUpload && transfer.uploadBlobPersistPromise) {
-      setFilesUploadStatus('warn', `Preparing ${transfer.name || 'upload.bin'}`);
+      filesUploadBatchProgress(`Preparing ${transfer.name || 'upload.bin'}`);
       const persisted = await transfer.uploadBlobPersistPromise;
       transfer.uploadBlobPersistPromise = null;
       if (!persisted && !transfer.file) {
@@ -1978,7 +1978,7 @@ async function runFilesUploadTransfer(transfer) {
       }
       if (stagedAvail.reason === 'http-only') transfer.transport = 'http-staged-upload';
       const name = transfer.file.name || transfer.name || 'upload.bin';
-      setFilesUploadStatus('warn', `Uploading ${name}`);
+      filesUploadBatchProgress(`Uploading ${name}`);
       const uploaded = await daemonApi.upload('api_session_current_upload', {
         destination: 'task',
         name,
@@ -1995,7 +1995,7 @@ async function runFilesUploadTransfer(transfer) {
       transfer.descriptor = descriptor;
       filesTransferTransition(transfer, 'completed', { actor: 'runner', result: descriptor });
       filesStagedUploads.set(String(descriptor.id || transfer.id), descriptor);
-      setFilesUploadStatus('ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
+      filesUploadBatchSettle(transfer, 'ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
       renderFilesStagedUploads();
     }
   } catch (err) {
@@ -2003,9 +2003,10 @@ async function runFilesUploadTransfer(transfer) {
       // Facade aborts are DaemonApiError kind:'abort' (name differs from
       // the DOM AbortError this branch historically matched).
       filesTransferTransition(transfer, 'cancelled', { actor: 'runner', error: '', failure: err });
+      filesUploadBatchSettle(transfer, 'cancelled');
     } else {
       filesTransferTransition(transfer, 'failed', { actor: 'runner', error: err?.message || String(err), failure: err });
-      setFilesUploadStatus('error', transfer.error);
+      filesUploadBatchSettle(transfer, 'failed', transfer.error);
     }
   } finally {
     transfer.abortController = null;
@@ -2042,6 +2043,7 @@ async function pumpFilesTransfers() {
           failure: failure || undefined,
           reason: 'runner exited without settling its transfer',
         });
+        filesUploadBatchSettle(transfer, 'failed', transfer.error);
       }
       // Macrotask yield: even a misbehaving runner that settles instantly
       // can only busy the tab, never wedge the event loop.
@@ -2072,6 +2074,9 @@ function pauseFilesTransfer(id) {
     // Not started yet: park it in place. The completion promise stays
     // pending until Resume re-arms it — only a runner teardown rejects.
     filesTransferTransition(transfer, 'paused', { actor: 'user' });
+    // A parked upload leaves its batch (Resume re-registers it); the rest
+    // of the batch still settles into one summary.
+    filesUploadBatchDrop(transfer);
     return;
   }
   if (transfer.status !== 'running') return;
@@ -2093,6 +2098,9 @@ function cancelFilesTransfer(id) {
       actor: 'user',
       failure: new Error('transfer cancelled'),
     });
+    // Cancelled before the pump picked it up: no runner teardown will
+    // settle this batch member, so account for it here.
+    filesUploadBatchSettle(transfer, 'cancelled');
     pumpFilesTransfers();
   }
 }
@@ -2102,6 +2110,7 @@ function resumeFilesTransfer(id) {
   if (!transfer || !['paused', 'failed'].includes(transfer.status)) return null;
   // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
   filesTransferTransition(transfer, 'queued', { actor: 'user' });
+  filesUploadBatchRegister(transfer);
   pumpFilesTransfers();
   return transfer.completion;
 }
@@ -2112,6 +2121,7 @@ function retryFilesTransfer(id) {
   if (transfer.kind === 'download') resetFilesDownloadTransfer(transfer);
   // Entering 'queued' re-arms the attempt (epoch bump, flags, completion).
   filesTransferTransition(transfer, 'queued', { actor: 'user' });
+  filesUploadBatchRegister(transfer);
   pumpFilesTransfers();
   return transfer.completion;
 }
@@ -2171,6 +2181,148 @@ function setFilesUploadStatus(kind, text) {
   el.textContent = text || '';
   el.title = text || '';
 }
+
+// ── Upload status batching ───────────────────────────────────────────────
+// The Files pane has ONE upload status line but the pump runs uploads
+// back-to-back, so N files picked together used to write N successive
+// "Uploaded X" messages — last writer wins and the user saw one. Uploads
+// enqueued while another is still pending form one batch: while any member
+// is pending the line shows batch progress ("Uploading 2 of 3…"), and when
+// the last member settles it shows one honest summary. A single-member
+// batch keeps the exact per-site copy from before this layer existed.
+// Members settle exactly once each — at the runner's success/failure
+// sites, at cancel-before-the-pump-picked-it-up, or at the pump backstop.
+const filesUploadBatchMembers = new Map(); // transfer.id → { name, outcome: 'pending'|'ok'|'failed'|'cancelled', text }
+
+function filesUploadBatchPendingCount() {
+  let pending = 0;
+  for (const member of filesUploadBatchMembers.values()) {
+    if (member.outcome === 'pending') pending += 1;
+  }
+  return pending;
+}
+
+// Drop pending members whose transfer vanished or settled without passing
+// a batch settle site (future call sites, externally mutated rows): a
+// ghost must not hold the batch open forever. Runs after the settling
+// member is marked, and at register time before a new member joins.
+function filesUploadBatchSweepGhosts() {
+  for (const [id, member] of filesUploadBatchMembers) {
+    if (member.outcome !== 'pending') continue;
+    const entry = filesTransferById(id);
+    if (!entry || !['queued', 'running'].includes(entry.status)) {
+      filesUploadBatchMembers.delete(id);
+    }
+  }
+}
+
+// Every path that (re-)queues an upload joins it to the batch: the queue
+// entry point plus Resume/Retry. No-op for downloads.
+function filesUploadBatchRegister(transfer) {
+  if (!transfer || transfer.kind !== 'upload') return;
+  filesUploadBatchSweepGhosts();
+  if (filesUploadBatchPendingCount() === 0) {
+    // The previous batch fully settled: this upload starts a fresh one.
+    filesUploadBatchMembers.clear();
+  }
+  filesUploadBatchMembers.set(transfer.id, {
+    name: filesTransferTitle(transfer),
+    outcome: 'pending',
+    text: '',
+  });
+}
+
+// A paused (parked) upload leaves the batch — Resume re-registers it. If
+// the rest of the batch already settled, that summary emits now.
+function filesUploadBatchDrop(transfer) {
+  if (!transfer || !filesUploadBatchMembers.has(transfer.id)) return;
+  filesUploadBatchMembers.delete(transfer.id);
+  if (filesUploadBatchMembers.size > 0 && filesUploadBatchPendingCount() === 0) {
+    filesUploadBatchFinalize();
+  }
+}
+
+// Status write for the in-progress sites: with more than one member in
+// flight the batch counter replaces the per-file text; a solo upload keeps
+// today's exact copy.
+function filesUploadBatchProgress(fallbackText) {
+  const pending = filesUploadBatchPendingCount();
+  const total = filesUploadBatchMembers.size;
+  if (total <= 1 || pending === 0) {
+    setFilesUploadStatus('warn', fallbackText);
+    return;
+  }
+  const position = Math.min(total - pending + 1, total);
+  setFilesUploadStatus('warn', `Uploading ${position} of ${total}…`);
+}
+
+// One member's terminal outcome. `text` carries the single-upload copy —
+// for 'ok' the exact success message the site composed, for 'failed' the
+// failure text — so a batch of one keeps today's status line verbatim.
+// The last settle emits the batch summary.
+function filesUploadBatchSettle(transfer, outcome, text = '') {
+  if (!transfer || transfer.kind !== 'upload') return;
+  let member = filesUploadBatchMembers.get(transfer.id);
+  if (!member) {
+    // A row no batch tracked (restored/server-merged entries): cancels
+    // keep today's no-write behavior; a run that really finished reports
+    // as its own batch (joining the active one when it overlapped).
+    if (outcome === 'cancelled') return;
+    if (filesUploadBatchPendingCount() === 0) filesUploadBatchMembers.clear();
+    member = { name: '', outcome: 'pending', text: '' };
+    filesUploadBatchMembers.set(transfer.id, member);
+  }
+  if (member.outcome !== 'pending') return; // exactly once per attempt
+  member.outcome = outcome;
+  member.text = text || '';
+  member.name = filesTransferTitle(transfer);
+  filesUploadBatchSweepGhosts();
+  if (filesUploadBatchPendingCount() === 0) filesUploadBatchFinalize();
+}
+
+// "a.txt, b.png, c.pdf" up to three names; past that keep the first two
+// whole and fold the tail into "+N more" — whole names only, never a
+// mid-name cut. The full list stays in the Transfers rows.
+function filesUploadBatchNameList(names) {
+  const list = names.map(name => name || 'upload.bin');
+  if (list.length <= 3) return list.join(', ');
+  return `${list[0]}, ${list[1]} +${list.length - 2} more`;
+}
+
+// The single end-of-batch status write. Mixed outcomes never read as a
+// clean success: any failure reports "Uploaded X of Y · Z failed", and
+// cancelled members are counted, not silently absorbed.
+function filesUploadBatchFinalize() {
+  const members = Array.from(filesUploadBatchMembers.values());
+  if (members.length === 0) return;
+  const ok = members.filter(member => member.outcome === 'ok');
+  const failed = members.filter(member => member.outcome === 'failed').length;
+  const cancelled = members.filter(member => member.outcome === 'cancelled').length;
+  const total = members.length;
+  if (failed > 0) {
+    if (total === 1) {
+      setFilesUploadStatus('error', members[0].text || 'Upload failed');
+      return;
+    }
+    const cancelledNote = cancelled > 0 ? ` · ${cancelled} cancelled` : '';
+    setFilesUploadStatus('error', `Uploaded ${ok.length} of ${total} · ${failed} failed${cancelledNote}`);
+    return;
+  }
+  if (cancelled > 0) {
+    if (ok.length === 0) {
+      setFilesUploadStatus('warn', total === 1 ? 'Upload cancelled' : `${total} uploads cancelled`);
+      return;
+    }
+    setFilesUploadStatus('ok', `Uploaded ${ok.length} of ${total} · ${cancelled} cancelled`);
+    return;
+  }
+  if (total === 1) {
+    setFilesUploadStatus('ok', members[0].text || `Uploaded ${members[0].name || 'upload.bin'}`);
+    return;
+  }
+  setFilesUploadStatus('ok', `Uploaded ${total} files · ${filesUploadBatchNameList(ok.map(member => member.name))}`);
+}
+// ── end upload status batching ───────────────────────────────────────────
 
 function filesStagedDescriptorName(descriptor) {
   return String(descriptor?.original_name || descriptor?.originalName || descriptor?.name || descriptor?.filename || 'upload.bin');
@@ -2335,7 +2487,10 @@ function queueFilesUpload(file, options = {}) {
   if (transfer.destination !== 'task') {
     transfer.uploadBlobPersistPromise = filesTransferPutUploadBlob(transfer, file);
   }
-  setFilesUploadStatus('warn', 'Queued upload');
+  // Join the in-flight batch before the pump can pick the entry up, so a
+  // multi-select shows "Uploading 1 of N…" from the first status write.
+  filesUploadBatchRegister(transfer);
+  filesUploadBatchProgress('Queued upload');
   return queueFilesTransfer(transfer);
 }
 
