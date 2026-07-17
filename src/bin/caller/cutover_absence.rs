@@ -37,10 +37,13 @@ mod tests {
 
     /// Directories/files scanned, relative to the crate root. Scoped to
     /// the surfaces Appendix A names (plus docs and skills so teaching
-    /// text cannot resurrect the vocabulary).
+    /// text cannot resurrect the vocabulary). Repo-root prompt files
+    /// (`SysPrompt*`, CLAUDE.md, AGENTS.md) are a dynamic family, so the
+    /// test body scans them by name instead of a static row here.
     const ROOTS: &[&str] = &[
         "src",
         "crates/intendant-core/src",
+        "crates/presence-core/prompts",
         "crates/presence-core/src",
         "crates/presence-web/src",
         "crates/station-web/src",
