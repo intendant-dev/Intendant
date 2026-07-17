@@ -197,8 +197,8 @@ mod tests {
     use super::*;
     use crate::event::EventBus;
     use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
-    use crate::peer::event::TaggedPeerEvent;
     use crate::peer::id::PeerKind;
+    use crate::peer::log_writer::EnqueuedPeerEvent;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use std::time::{Duration, Instant};
     use tokio::sync::{broadcast, mpsc};
@@ -229,7 +229,7 @@ mod tests {
         (port, handle)
     }
 
-    fn make_registry() -> (PeerRegistry, mpsc::Sender<TaggedPeerEvent>) {
+    fn make_registry() -> (PeerRegistry, mpsc::Sender<EnqueuedPeerEvent>) {
         let (log_tx, _log_rx) = mpsc::channel(64);
         let registry = PeerRegistry::new(log_tx.clone());
         (registry, log_tx)

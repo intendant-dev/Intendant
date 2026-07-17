@@ -167,6 +167,7 @@ const DAEMON_API_HTTP_MAP = Object.freeze({
   api_sessions_search: { verb: 'GET', path: '/api/sessions/search', query: ['q', 'source', 'mode', 'projects'], queryJson: ['projects'] },
   api_sessions_message_search: { verb: 'GET', path: '/api/sessions/message-search', query: ['q', 'source', 'include_superseded', 'subagents', 'cursor', 'limit'] },
   api_session_detail: { verb: 'GET', path: '/api/session/{id}', alias: { id: 'session_id' }, query: ['source', 'limit', 'before'] },
+  api_session_fork_points: { verb: 'GET', path: '/api/session/{id}/fork-points', alias: { id: 'session_id' }, query: ['include_non_recovery', 'offset', 'limit'] },
   api_session_report: { verb: 'GET', path: '/api/session/{id}/report', alias: { id: 'session_id' }, lane: 'bytes' },
   api_session_context_snapshot: { verb: 'GET', path: '/api/session/{id}/context-snapshot', alias: { id: 'session_id' }, query: ['file', 'source', 'request_id', 'request_index', 'ts'] },
   api_session_recordings: { verb: 'GET', path: '/api/session/{id}/recordings', alias: { id: 'session_id' } },

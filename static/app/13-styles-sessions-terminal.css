@@ -3296,3 +3296,119 @@ html.ui-v2[data-theme="light"] .control-toast {
 .keybar-toggle:hover { color: var(--text); }
 .keybar-toggle.active { color: var(--blue); border-color: var(--blue); }
 
+
+/* Session detail: fork-points panel (fork any session from any anchor). */
+.session-detail-title .sd-fork-points {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.session-detail-title .sd-fork-points > summary {
+  cursor: pointer;
+  color: var(--overlay1);
+  font-size: 11px;
+  user-select: none;
+}
+.session-detail-title .sd-fork-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0 2px;
+}
+.session-detail-title .sd-fork-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.session-detail-title .sd-fork-point {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+.session-detail-title .sd-fork-kind {
+  flex: 0 0 auto;
+  color: var(--mauve);
+  border: 1px solid color-mix(in srgb, var(--mauve) 45%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 10%, transparent);
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 9px;
+  line-height: 1.45;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+.session-detail-title .sd-fork-chip {
+  flex: 0 0 auto;
+  color: var(--peach, var(--yellow));
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 9px;
+}
+.session-detail-title .sd-fork-chip-muted {
+  color: var(--overlay1);
+}
+.session-detail-title .sd-fork-preview {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--subtext0);
+}
+.session-detail-title .sd-fork-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.session-detail-title .sd-fork-form input {
+  width: 150px;
+  font-size: 11px;
+}
+.session-detail-title .sd-fork-status {
+  min-height: 14px;
+  color: var(--overlay1);
+}
+.session-detail-title .sd-fork-status[data-tone='error'] {
+  color: var(--red);
+}
+.session-detail-title .sd-fork-status[data-tone='ok'] {
+  color: var(--green);
+}
+.session-detail-title .sd-fork-note {
+  color: var(--overlay1);
+  font-size: 10px;
+}
+
+/* Recent list: lineage family tree (indent rail + collapse toggle). */
+.session-card.lineage-depth-1 { margin-left: 16px; }
+.session-card.lineage-depth-2 { margin-left: 32px; }
+.session-card.lineage-depth-3 { margin-left: 48px; }
+.session-card.lineage-depth-4 { margin-left: 64px; }
+.session-card[class*='lineage-depth-'] {
+  position: relative;
+  border-left: 2px solid color-mix(in srgb, var(--mauve) 35%, var(--surface1));
+}
+.session-card .lineage-toggle {
+  float: right;
+  margin: 2px 2px 0 6px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--overlay1);
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.session-card .lineage-toggle:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+}
