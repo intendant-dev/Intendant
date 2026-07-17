@@ -1670,6 +1670,10 @@ response omits the header.
 | GET | `/api/settings` | Settings | own origin | none | Current runtime settings |
 | POST | `/api/api-keys` | Settings | own origin | bounded | Store provider API keys in the project .env |
 | GET | `/api/api-key-status` | Settings | own origin | none | Which provider keys are configured (presence only) |
+| POST | `/api/claude-auth/start` | CredentialsManage | own origin | ≤ 4 KiB | Start the Claude sign-in ceremony (`claude auth login` on a daemon-private PTY) |
+| GET | `/api/claude-auth/status` | CredentialsManage | own origin | none | Claude sign-in ceremony state (validated sign-in URL; account info on success) |
+| POST | `/api/claude-auth/code` | CredentialsManage | own origin | ≤ 2 KiB | Submit the pasted authorization code to the Claude sign-in ceremony |
+| POST | `/api/claude-auth/cancel` | CredentialsManage | own origin | none | Cancel the Claude sign-in ceremony (non-destructive; prior login keeps working) |
 | GET | `/api/external-agents` | SessionInspect | own origin | none | Detected external coding agents (codex, claude) |
 | POST | `/api/diagnostics/visual-freshness` | DisplayInput | own origin | ≤ 16 MiB | Visual-freshness diagnostics transcript sink (NDJSON body) |
 | GET | `/api/displays` | DisplayView | own origin | none | Enumerate active displays |

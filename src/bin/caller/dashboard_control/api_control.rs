@@ -1819,6 +1819,82 @@ pub(crate) async fn api_api_keys_save_response(
     )
 }
 
+/// Hosted-provenance fact for the Claude sign-in twins, from the grant
+/// that opened this control session: the trusted-local surface and peer
+/// daemons are direct by construction; user clients go through the
+/// central evaluator's provenance rules (peer profiles never carry
+/// credentials.manage, so the Peer arm exists only for the type — the
+/// method authorizer has already refused it).
+fn control_grant_is_hosted(grant: &DashboardControlGrant) -> bool {
+    match grant {
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+            ..
+        } => crate::access::iam::is_hosted_session(iam_state, principal),
+        DashboardControlGrant::TrustedLocal | DashboardControlGrant::Peer { .. } => false,
+    }
+}
+
+pub(crate) async fn api_claude_auth_start_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_start_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+            runtime.project_root.as_deref(),
+        ),
+        "claude auth start",
+    )
+}
+
+pub(crate) async fn api_claude_auth_status_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_status_api_response(control_grant_is_hosted(
+            &runtime.grant,
+        )),
+        "claude auth status",
+    )
+}
+
+pub(crate) async fn api_claude_auth_code_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_code_api_response(
+            control_grant_is_hosted(&runtime.grant),
+            &body_text,
+        ),
+        "claude auth code",
+    )
+}
+
+pub(crate) async fn api_claude_auth_cancel_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    frame_api_response(
+        id,
+        crate::web_gateway::claude_auth_cancel_api_response(control_grant_is_hosted(
+            &runtime.grant,
+        )),
+        "claude auth cancel",
+    )
+}
+
 pub(crate) async fn api_peer_add_response(
     id: String,
     params: Option<&serde_json::Value>,

@@ -1156,6 +1156,45 @@ pub(crate) async fn serve_http_request(
                 return handle_api_key_status(stream, route.cors, fleet_cors_origin.as_deref())
                     .await;
             }
+            RouteHandlerId::ClaudeAuthStart => {
+                return handle_claude_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthStatus => {
+                return handle_claude_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthCode => {
+                return handle_claude_auth_code(
+                    stream,
+                    route_body,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::ClaudeAuthCancel => {
+                return handle_claude_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity

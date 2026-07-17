@@ -1086,4 +1086,51 @@ mod tests {
             PeerOperation::RuntimeControl
         );
     }
+
+    /// Credential custody is unreachable through `/mcp`: no tool on the
+    /// MCP surface classifies as `credentials.manage` — the operation the
+    /// Claude sign-in ceremony routes (and the vault/egress tunnel
+    /// methods) gate on — and the unmapped-tool fall-through lands on
+    /// RuntimeControl, never on custody. A tool classifying here would
+    /// hand every root-compatible supervised agent session a lever over
+    /// the daemon's credential ceremonies; that must be a deliberate
+    /// design change, not a mapping slip.
+    #[test]
+    fn no_mcp_tool_classifies_as_credentials_manage() {
+        use crate::event::EventBus;
+        use crate::mcp::tests::{test_server, test_state};
+        use crate::peer::access_policy::PeerOperation;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_home, server) = test_server(test_state(), EventBus::new());
+            // The widest surface: unfiltered list + managed-context tools.
+            for listing in [
+                server.list_tools_json().await,
+                server
+                    .list_tools_json_for_session(None, Some(true), Some("full"))
+                    .await,
+            ] {
+                let tools = listing["tools"].as_array().expect("tools array");
+                assert!(!tools.is_empty(), "tool listing must not be empty");
+                for tool in tools {
+                    let name = tool["name"].as_str().expect("tool name");
+                    assert_ne!(
+                        mcp_tool_operation(name),
+                        PeerOperation::CredentialsManage,
+                        "MCP tool {name} must never classify as credentials.manage"
+                    );
+                }
+            }
+        });
+        // The fall-through default for unclassified tools is not custody
+        // either — a future unmapped tool cannot drift into it.
+        assert_ne!(
+            mcp_tool_operation("tool_added_without_classification"),
+            PeerOperation::CredentialsManage
+        );
+    }
 }
