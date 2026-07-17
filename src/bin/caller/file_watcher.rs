@@ -3409,6 +3409,18 @@ mod tests {
         FileWatcher::new(root.to_path_buf(), snap.to_path_buf(), bus).expect("new")
     }
 
+    /// Backdate a file's mtime a full hour so fingerprints recorded for it
+    /// are trustworthy under a zero test racy window on every platform,
+    /// and any LATER fresh write moves the mtime deterministically.
+    /// Linux's coarse kernel file-time clock otherwise aliases same-tick
+    /// timestamps that macOS keeps distinct (bit the object-index tests
+    /// live on the Linux CI leg).
+    fn backdate_mtime(path: &Path) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let handle = std::fs::File::options().write(true).open(path).unwrap();
+        handle.set_modified(past).unwrap();
+    }
+
     #[test]
     fn test_should_ignore() {
         assert!(should_ignore(Path::new(".git/config")));
@@ -5075,7 +5087,13 @@ mod tests {
         let tmp_proj = TempDir::new().unwrap();
         let tmp_snap = TempDir::new().unwrap();
         let root = tmp_proj.path();
-        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        let file = root.join("a.txt");
+        std::fs::write(&file, b"v1").unwrap();
+        // Deterministic fingerprints on every platform: the initial mtime
+        // is backdated (trustworthy under the zero window), and every
+        // rewrite below changes the CONTENT LENGTH, so fingerprints move
+        // via size regardless of file-time clock granularity.
+        backdate_mtime(&file);
         let mut w = make_watcher(root, tmp_snap.path());
         w.set_racy_window_for_tests(0);
 
@@ -5093,7 +5111,7 @@ mod tests {
         // Delete the blob behind the index's back, then change the file so
         // a rollback to R1 must read that blob.
         std::fs::remove_file(tmp_snap.path().join("objects").join(&h1)).unwrap();
-        std::fs::write(root.join("a.txt"), b"v2").unwrap();
+        std::fs::write(&file, b"v2-longer").unwrap();
         w.on_round_complete("R3".into(), None, None).unwrap();
 
         // The walk above still recorded R1's hash as restorable (the index
@@ -5101,22 +5119,24 @@ mod tests {
         // signal that repairs it.
         let res = w.rollback(r1).unwrap();
         assert_eq!(res.files_reverted, 0, "missing blob: nothing restored");
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2-longer");
         assert!(
             !w.object_index.contains(&h1),
             "failed restore must repair the index"
         );
 
-        // Recreate the original content: the next walk finds the hash
-        // unindexed and re-stores the blob — restorability is back.
-        std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        // Recreate the ORIGINAL bytes (so the re-stored blob carries
+        // exactly h1; the size change from "v2-longer" keeps the
+        // fingerprint distinct): the next walk finds the hash unindexed
+        // and re-stores the blob — restorability is back.
+        std::fs::write(&file, b"v1").unwrap();
         w.on_round_complete("R4".into(), None, None).unwrap();
         assert!(tmp_snap.path().join("objects").join(&h1).exists());
         assert!(w.object_index.contains(&h1));
-        std::fs::write(root.join("a.txt"), b"v5").unwrap();
+        std::fs::write(&file, b"v5-longer-yet").unwrap();
         w.on_round_complete("R5".into(), None, None).unwrap();
         w.rollback(r1).unwrap();
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v1");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1");
     }
 
     /// A blob present on disk but missing from the index (stale-negative)
@@ -5127,6 +5147,11 @@ mod tests {
         let tmp_snap = TempDir::new().unwrap();
         let root = tmp_proj.path();
         std::fs::write(root.join("a.txt"), b"v1").unwrap();
+        // Backdated so the same-content rewrite below moves the mtime
+        // deterministically — the rewrite keeps size AND hash identical,
+        // so mtime distance is what forces the re-read on platforms whose
+        // coarse file-time clock would alias a same-tick rewrite.
+        backdate_mtime(&root.join("a.txt"));
         let mut w = make_watcher(root, tmp_snap.path());
         w.set_racy_window_for_tests(0);
         w.on_round_complete("R1".into(), None, None).unwrap();
@@ -5251,6 +5276,12 @@ mod tests {
         std::fs::write(root.join("keep.txt"), b"kept content\n").unwrap();
         std::fs::write(root.join("change.txt"), b"original\n").unwrap();
         std::fs::write(root.join("thing"), b"i am a file").unwrap();
+        // Backdated so boot 1's recorded fingerprints pass the (zeroed)
+        // racy gate deterministically on coarse file-time clocks, and the
+        // boot-3 rewrite of change.txt moves its mtime unambiguously.
+        for name in ["keep.txt", "change.txt", "thing"] {
+            backdate_mtime(&root.join(name));
+        }
 
         let boot = |root: &Path, snap: &Path| {
             FileWatcher::new_with_racy_window(
@@ -5321,6 +5352,10 @@ mod tests {
         let tmp_snap = TempDir::new().unwrap();
         let root = tmp_proj.path();
         std::fs::write(root.join("a.txt"), b"full content here\n").unwrap();
+        // Backdated so the SOURCE fingerprint genuinely matches and passes
+        // the racy gate on boot 2 — the shadow-copy size check must be the
+        // one gate this test exercises.
+        backdate_mtime(&root.join("a.txt"));
         let first = FileWatcher::new_with_racy_window(
             root.to_path_buf(),
             tmp_snap.path().to_path_buf(),
