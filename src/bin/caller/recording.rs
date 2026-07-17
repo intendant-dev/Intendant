@@ -2,8 +2,9 @@
 //!
 //! Uses ffmpeg to record displays (x11grab on Linux, screencapture feeding
 //! image2pipe on macOS) and browser camera frames (image2pipe) into segmented
-//! MP4 files stored in the session directory. Follows the same RAII guard
-//! pattern as `vision::XvfbGuard`.
+//! MP4 files stored in the session directory. Stop paths extract the
+//! [`RecordingGuard`] from the registry and await its async `finalize`;
+//! plain `Drop` is only the kill-on-drop last resort.
 
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::project::RecordingConfig;
@@ -12,8 +13,14 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Child;
 
-/// RAII guard for a single ffmpeg recording process.
-/// Kills the ffmpeg process on drop.
+/// Guard for a single ffmpeg recording process.
+///
+/// Deliberate stop paths extract the guard from the registry (releasing the
+/// registry lock first) and await [`RecordingGuard::finalize`], which asks
+/// ffmpeg to exit and waits for it to flush. `Drop` is only the last resort
+/// for guards that never reach `finalize`: it aborts the bridge, closes
+/// stdin, and lets `kill_on_drop(true)` reap the process — no blocking wait,
+/// so dropping is safe on a tokio worker.
 pub struct RecordingGuard {
     child: Child,
     /// Stdin handle for piping frames (None for x11grab mode).
@@ -65,36 +72,45 @@ impl RecordingGuard {
         }
         Ok(())
     }
+
+    /// Gracefully finalize the recording without blocking a worker thread.
+    ///
+    /// Stops the feed bridge, closes stdin (image2pipe inputs finish cleanly
+    /// on EOF), sends SIGINT (no-op on non-unix, where the EOF is the
+    /// graceful path), and waits up to five seconds for ffmpeg to exit and
+    /// flush its segment list. If ffmpeg is still alive after the timeout,
+    /// dropping the guard lets `kill_on_drop(true)` reap it; the
+    /// fragmented-MP4 segments stay playable without the final flush.
+    ///
+    /// Callers must not hold the recording-registry lock across this await —
+    /// extract the guard under the lock, release it, then finalize.
+    pub async fn finalize(mut self) {
+        if let Some(handle) = self.bridge_task.take() {
+            handle.abort();
+        }
+        // Drop stdin first so ffmpeg sees EOF and can finalize.
+        self.stdin.take();
+        if let Some(id) = self.child.id() {
+            crate::platform::interrupt_process(id);
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await;
+    }
 }
 
 impl Drop for RecordingGuard {
+    /// Last resort for guards that never went through
+    /// [`RecordingGuard::finalize`] (every deliberate stop path does).
+    /// Closing stdin hands ffmpeg its EOF; `kill_on_drop(true)` reaps the
+    /// process right after this returns (a no-op when `finalize` already
+    /// waited it out). No graceful wait happens here — Drop can run on a
+    /// tokio worker, and the fragmented-MP4 segment format
+    /// (`+frag_keyframe+empty_moov`) keeps already-written segments playable
+    /// without ffmpeg's final flush.
     fn drop(&mut self) {
         if let Some(handle) = self.bridge_task.take() {
             handle.abort();
         }
-        // Drop stdin first so ffmpeg sees EOF and can finalize
         self.stdin.take();
-        // Send SIGINT for graceful shutdown — ffmpeg finalizes the MP4 moov atom.
-        // kill_on_drop(true) sends SIGKILL after Drop as a safety net for hangs.
-        #[cfg(unix)]
-        {
-            if let Some(id) = self.child.id() {
-                crate::platform::interrupt_process(id);
-                // Wait for ffmpeg to exit and finalize (up to 5 seconds)
-                for _ in 0..50 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    match self.child.try_wait() {
-                        Ok(Some(_)) => break, // exited cleanly
-                        Ok(None) => continue, // still running
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.start_kill();
-        }
     }
 }
 
@@ -628,43 +644,61 @@ impl RecordingRegistry {
         self.recordings.contains_key(stream_name)
     }
 
-    /// Stop recording a specific stream.
-    pub fn stop(&mut self, stream_name: &str) -> Option<StopRecordingOutcome> {
-        let guard = self.recordings.remove(stream_name)?;
-        Some(finalize_stopped_recording(guard))
+    /// Remove a recording from the registry for stopping, handing its guard
+    /// to the caller. Callers release the registry lock, then await
+    /// [`RecordingGuard::finalize`] (typically via
+    /// [`finalize_stopped_recording`]) — finalization waits on ffmpeg and
+    /// must never run under the registry write lock, where it would freeze
+    /// every other recording's feed path.
+    #[must_use]
+    pub fn take_stop(&mut self, stream_name: &str) -> Option<RecordingGuard> {
+        self.recordings.remove(stream_name)
     }
 
-    /// Delete a recording's files from disk. Stops it first if still active.
-    pub fn delete(&mut self, stream_name: &str) {
-        self.recordings.remove(stream_name);
+    /// Remove a recording from the registry for deletion (also forgetting
+    /// external-stream membership), handing its guard to the caller.
+    /// Finalize off-lock, then call [`Self::delete_files`].
+    #[must_use]
+    pub fn take_delete(&mut self, stream_name: &str) -> Option<RecordingGuard> {
         self.external_streams.remove(stream_name);
+        self.recordings.remove(stream_name)
+    }
+
+    /// Delete a recording's files from disk. Any active guard must be taken
+    /// out via [`Self::take_delete`] and finalized first, so ffmpeg is no
+    /// longer writing into the directory being removed.
+    pub fn delete_files(&self, stream_name: &str) {
         let dir = self.session_dir.join("recordings").join(stream_name);
         if dir.is_dir() {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
-    /// Stop all recordings.
-    pub fn stop_all(&mut self) {
-        self.recordings.clear();
+    /// Remove every recording (including external `--record-display`
+    /// streams), handing the guards to the caller for finalization.
+    #[must_use]
+    pub fn take_all(&mut self) -> Vec<(String, RecordingGuard)> {
+        self.recordings.drain().collect()
     }
 
-    /// Stop only agent-managed recordings, keeping external (--record-display) streams alive.
-    /// Returns the names of streams that were stopped.
-    pub fn stop_agent_streams(&mut self) -> Vec<(String, StopRecordingOutcome)> {
+    /// Remove only agent-managed recordings, keeping external
+    /// (`--record-display`) streams alive. The caller finalizes each
+    /// returned guard off-lock.
+    #[must_use]
+    pub fn take_agent_streams(&mut self) -> Vec<(String, RecordingGuard)> {
         let to_stop: Vec<String> = self
             .recordings
             .keys()
             .filter(|name| !self.external_streams.contains(*name))
             .cloned()
             .collect();
-        let mut stopped = Vec::new();
-        for name in to_stop {
-            if let Some(guard) = self.recordings.remove(&name) {
-                stopped.push((name, finalize_stopped_recording(guard)));
-            }
-        }
-        stopped
+        to_stop
+            .into_iter()
+            .filter_map(|name| {
+                let guard = self.recordings.remove(&name)?;
+                Some((name, guard))
+            })
+            .collect()
     }
 
     /// List active recording stream names.
@@ -744,9 +778,11 @@ impl RecordingRegistry {
     }
 }
 
-fn finalize_stopped_recording(guard: RecordingGuard) -> StopRecordingOutcome {
+/// Gracefully finalize an extracted guard, then classify the artifact.
+/// Await this only after releasing the recording-registry lock.
+async fn finalize_stopped_recording(guard: RecordingGuard) -> StopRecordingOutcome {
     let segments_dir = guard.segments_dir().to_path_buf();
-    drop(guard);
+    guard.finalize().await;
 
     if recording_dir_has_playable_segments(&segments_dir) {
         StopRecordingOutcome::Saved
@@ -900,6 +936,50 @@ fn frame_to_jpeg(frame: &crate::display::Frame) -> Option<Vec<u8>> {
     Some(buf.into_inner())
 }
 
+/// Reuse-or-encode step for one recording-bridge tick.
+///
+/// Idle displays return the same `Arc<Frame>` from `latest_frame()` tick
+/// after tick (event-driven capture backends emit nothing while the desktop
+/// is unchanged), so `encode` runs on the blocking pool only when `frame` is
+/// not pointer-identical to the frame the cached bytes were encoded from.
+/// The caller still feeds every tick — ffmpeg's image2pipe wallclock timing
+/// assumes a steady cadence — it just feeds the cached bytes. Mirrors the
+/// FrameRegistry sampler's `last_jpeg` cache in `intendant-display`.
+///
+/// Returns `true` when `cache` now holds JPEG bytes for `frame` (reused or
+/// freshly encoded); `false` when encoding failed and this tick's feed must
+/// be skipped. On failure the previous entry is kept: it is identity-keyed,
+/// so it can only ever be reused for the exact frame it was encoded from.
+async fn reuse_or_encode_jpeg<E>(
+    cache: &mut Option<(std::sync::Arc<crate::display::Frame>, Vec<u8>)>,
+    frame: std::sync::Arc<crate::display::Frame>,
+    encode: E,
+) -> bool
+where
+    E: FnOnce(&crate::display::Frame) -> Option<Vec<u8>> + Send + 'static,
+{
+    let cache_hit = cache
+        .as_ref()
+        .is_some_and(|(cached, _)| std::sync::Arc::ptr_eq(cached, &frame));
+    if cache_hit {
+        return true;
+    }
+    let encoded = tokio::task::spawn_blocking({
+        let frame = std::sync::Arc::clone(&frame);
+        move || encode(&frame)
+    })
+    .await
+    .ok()
+    .flatten();
+    match encoded {
+        Some(jpeg) => {
+            *cache = Some((frame, jpeg));
+            true
+        }
+        None => false,
+    }
+}
+
 /// Spawn the bridge task that feeds frames into a frame-fed recording.
 ///
 /// Ticks at the configured recording framerate and polls the session's
@@ -926,6 +1006,10 @@ fn spawn_frame_bridge(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The frame the cached JPEG was encoded from, so an unchanged
+        // `latest_frame` reuses the encoded bytes instead of burning an RGB
+        // conversion + JPEG encode per tick on an idle display.
+        let mut last_jpeg: Option<(std::sync::Arc<crate::display::Frame>, Vec<u8>)> = None;
         loop {
             tick.tick().await;
             match recording_session_state(&session_registry, display_id, &session).await {
@@ -938,38 +1022,35 @@ fn spawn_frame_bridge(
             let Some(frame) = session.latest_frame().await else {
                 continue;
             };
-            let jpeg = tokio::task::spawn_blocking({
-                let frame = frame.clone();
-                move || frame_to_jpeg(&frame)
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(jpeg) = jpeg {
-                // JPEG encoding runs on the blocking pool. Re-check after it,
-                // then retain the registry read guard through the final feed.
-                // A revoke/replacement needs the write guard, so the artifact
-                // write is linearized wholly before or wholly after that
-                // lifecycle boundary.
-                let session_guard = session_registry.read().await;
-                let state = recording_session_state_in(&session_guard, display_id, &session);
-                if state != RecordingSessionState::Authorized {
-                    drop(session_guard);
-                    stop_recording_for_session_change(&bus, &stream_name, display_id, state);
-                    break;
-                }
-                let feed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                    let mut r = registry.write().await;
-                    r.feed_frame(&stream_name, &jpeg).await
-                })
-                .await;
+            if !reuse_or_encode_jpeg(&mut last_jpeg, frame, frame_to_jpeg).await {
+                continue;
+            }
+            let Some((_, jpeg)) = last_jpeg.as_ref() else {
+                continue;
+            };
+            // JPEG encoding runs on the blocking pool. Re-check after it,
+            // then retain the registry read guard through the final feed.
+            // A revoke/replacement needs the write guard, so the artifact
+            // write is linearized wholly before or wholly after that
+            // lifecycle boundary.
+            let session_guard = session_registry.read().await;
+            let state = recording_session_state_in(&session_guard, display_id, &session);
+            if state != RecordingSessionState::Authorized {
                 drop(session_guard);
-                if !matches!(feed, Ok(Ok(()))) {
-                    bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
-                        stream_name: stream_name.clone(),
-                    }));
-                    break;
-                }
+                stop_recording_for_session_change(&bus, &stream_name, display_id, state);
+                break;
+            }
+            let feed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut r = registry.write().await;
+                r.feed_frame(&stream_name, jpeg).await
+            })
+            .await;
+            drop(session_guard);
+            if !matches!(feed, Ok(Ok(()))) {
+                bus.send(AppEvent::ControlCommand(ControlMsg::StopRecording {
+                    stream_name: stream_name.clone(),
+                }));
+                break;
             }
         }
     })
@@ -1094,8 +1175,12 @@ async fn start_display_auto(
     // feed bridge; otherwise discard it immediately.
     if !recording_session_remains_authorized(&session_registry, display_id, &display_session).await
     {
-        let mut reg = registry.write().await;
-        let _ = reg.stop(&stream_name);
+        let guard = registry.write().await.take_stop(&stream_name);
+        if let Some(guard) = guard {
+            // Nothing was fed yet, so finalization discards the empty
+            // artifact; run it after the registry lock is released.
+            let _ = finalize_stopped_recording(guard).await;
+        }
         return Err(format!(
             "display {display_id} stopped being an active agent-visible session"
         ));
@@ -1198,50 +1283,81 @@ pub fn spawn_recording_listener(
                 AppEvent::ControlCommand(crate::event::ControlMsg::StopRecording {
                     stream_name,
                 }) => {
+                    // Extract the guards under the write lock, but finalize
+                    // them (ffmpeg SIGINT + bounded wait) in background
+                    // tasks: holding the registry lock across finalization
+                    // froze every other recording's feed path, and blocking
+                    // the lossless control lane would delay the commands
+                    // behind this one. RecordingStopped still fires only
+                    // once the artifact is finalized and playable.
                     let stopped = {
                         let mut reg = registry.write().await;
                         let active = reg.active_streams();
                         recording_stop_targets(&active, &stream_name)
                             .into_iter()
-                            .filter_map(|actual| reg.stop(&actual).map(|outcome| (actual, outcome)))
+                            .filter_map(|actual| {
+                                reg.take_stop(&actual).map(|guard| (actual, guard))
+                            })
                             .collect::<Vec<_>>()
                     };
-                    for (actual, outcome) in stopped {
-                        emit_recording_stopped(&bus, actual, outcome);
+                    for (actual, guard) in stopped {
+                        let bus = bus.clone();
+                        tokio::spawn(async move {
+                            let outcome = finalize_stopped_recording(guard).await;
+                            emit_recording_stopped(&bus, actual, outcome);
+                        });
                     }
                 }
                 AppEvent::ControlCommand(crate::event::ControlMsg::DeleteRecording {
                     stream_name,
                 }) => {
-                    let mut reg = registry.write().await;
-                    let was_recording = reg.is_recording(&stream_name);
-                    reg.delete(&stream_name);
-                    if was_recording {
-                        bus.send(AppEvent::RecordingStopped {
-                            stream_name: stream_name.clone(),
-                        });
-                    }
-                    bus.send(AppEvent::RecordingDeleted { stream_name });
-                }
-                AppEvent::TaskComplete { .. } => {
-                    // Stop agent-managed recordings, keep external (--record-display) alive
-                    let mut reg = registry.write().await;
-                    let stopped = reg.stop_agent_streams();
-                    for (stream, outcome) in &stopped {
-                        bus.send(AppEvent::RecordingStopped {
-                            stream_name: stream.clone(),
-                        });
-                        if *outcome == StopRecordingOutcome::DiscardedEmpty {
-                            bus.send(AppEvent::RecordingError {
-                                stream_name: stream.clone(),
-                                message:
-                                    "No playable video frames were captured; empty recording discarded"
-                                        .to_string(),
-                            });
-                            bus.send(AppEvent::RecordingDeleted {
-                                stream_name: stream.clone(),
+                    let active_guard = {
+                        let mut reg = registry.write().await;
+                        let guard = reg.take_delete(&stream_name);
+                        if guard.is_none() {
+                            // Not live — nothing to finalize, remove in place.
+                            reg.delete_files(&stream_name);
+                        }
+                        guard
+                    };
+                    match active_guard {
+                        None => bus.send(AppEvent::RecordingDeleted { stream_name }),
+                        Some(guard) => {
+                            // Finalize off-lock so a live delete cannot stall
+                            // other recordings; ffmpeg must be gone before its
+                            // directory is removed. The removal itself re-takes
+                            // the lock so it stays serialized with stream-name
+                            // picking, which probes the same directories.
+                            let registry = registry.clone();
+                            let bus = bus.clone();
+                            tokio::spawn(async move {
+                                guard.finalize().await;
+                                registry.write().await.delete_files(&stream_name);
+                                bus.send(AppEvent::RecordingStopped {
+                                    stream_name: stream_name.clone(),
+                                });
+                                bus.send(AppEvent::RecordingDeleted { stream_name });
                             });
                         }
+                    }
+                }
+                AppEvent::TaskComplete { .. } => {
+                    // Stop agent-managed recordings, keep external
+                    // (--record-display) alive. Guards come out under the
+                    // lock; finalization runs in background tasks so the
+                    // next task's DisplayReady is not delayed behind ffmpeg
+                    // shutdown, and events fire only once each artifact is
+                    // finalized.
+                    let stopped = {
+                        let mut reg = registry.write().await;
+                        reg.take_agent_streams()
+                    };
+                    for (stream, guard) in stopped {
+                        let bus = bus.clone();
+                        tokio::spawn(async move {
+                            let outcome = finalize_stopped_recording(guard).await;
+                            emit_recording_stopped(&bus, stream, outcome);
+                        });
                     }
                     // Don't break — keep listening for new tasks (--continue)
                 }
@@ -1249,20 +1365,126 @@ pub fn spawn_recording_listener(
             }
         }
         // Lossless lane closed — stop everything including external streams.
-        let mut reg = registry.write().await;
-        let streams = reg.active_streams();
-        for stream in &streams {
+        // Shutdown can afford awaiting each finalize inline; the emit still
+        // follows finalization so a listener that observes RecordingStopped
+        // sees a playable artifact.
+        let stopped = {
+            let mut reg = registry.write().await;
+            reg.take_all()
+        };
+        for (stream, guard) in stopped {
+            guard.finalize().await;
             bus.send(AppEvent::RecordingStopped {
-                stream_name: stream.clone(),
+                stream_name: stream,
             });
         }
-        reg.stop_all();
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_frame() -> std::sync::Arc<crate::display::Frame> {
+        std::sync::Arc::new(crate::display::Frame {
+            data: vec![0u8; 2 * 2 * 4],
+            format: crate::display::FrameFormat::Bgra,
+            width: 2,
+            height: 2,
+            stride: 8,
+            timestamp: std::time::Instant::now(),
+            dirty_rects: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn bridge_jpeg_cache_reuses_bytes_for_identical_frame_arc() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let encodes = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = |bytes: Vec<u8>| {
+            let encodes = std::sync::Arc::clone(&encodes);
+            move |_: &crate::display::Frame| {
+                encodes.fetch_add(1, Ordering::SeqCst);
+                Some(bytes)
+            }
+        };
+
+        let mut cache = None;
+        let frame_a = test_frame();
+        assert!(
+            reuse_or_encode_jpeg(
+                &mut cache,
+                std::sync::Arc::clone(&frame_a),
+                counting(vec![1])
+            )
+            .await
+        );
+        assert_eq!(encodes.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.as_ref().unwrap().1, vec![1]);
+
+        // The identical Arc<Frame> reuses the cached bytes without re-encoding.
+        assert!(
+            reuse_or_encode_jpeg(
+                &mut cache,
+                std::sync::Arc::clone(&frame_a),
+                counting(vec![2])
+            )
+            .await
+        );
+        assert_eq!(
+            encodes.load(Ordering::SeqCst),
+            1,
+            "an unchanged Arc<Frame> must not re-encode"
+        );
+        assert_eq!(cache.as_ref().unwrap().1, vec![1]);
+
+        // A new frame re-encodes even when its contents are identical:
+        // the cache is keyed on frame identity, not pixel equality.
+        let frame_b = test_frame();
+        assert!(
+            reuse_or_encode_jpeg(
+                &mut cache,
+                std::sync::Arc::clone(&frame_b),
+                counting(vec![3])
+            )
+            .await
+        );
+        assert_eq!(encodes.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.as_ref().unwrap().1, vec![3]);
+
+        // Encode failure skips the tick but keeps the previous entry, which
+        // still hits for its own frame afterwards.
+        let failing = {
+            let encodes = std::sync::Arc::clone(&encodes);
+            move |_: &crate::display::Frame| {
+                encodes.fetch_add(1, Ordering::SeqCst);
+                None
+            }
+        };
+        assert!(!reuse_or_encode_jpeg(&mut cache, test_frame(), failing).await);
+        assert_eq!(encodes.load(Ordering::SeqCst), 3);
+        assert!(
+            reuse_or_encode_jpeg(
+                &mut cache,
+                std::sync::Arc::clone(&frame_b),
+                counting(vec![4])
+            )
+            .await
+        );
+        assert_eq!(encodes.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.as_ref().unwrap().1, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn bridge_jpeg_cache_carries_real_encoder_output() {
+        let mut cache = None;
+        assert!(reuse_or_encode_jpeg(&mut cache, test_frame(), frame_to_jpeg).await);
+        let (_, jpeg) = cache.as_ref().unwrap();
+        assert!(
+            jpeg.starts_with(&[0xFF, 0xD8]),
+            "cached bytes must be a JPEG (SOI marker)"
+        );
+    }
 
     #[test]
     fn display_recording_stream_matching_is_id_scoped_and_suffix_strict() {
