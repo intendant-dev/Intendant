@@ -39,6 +39,7 @@
 //! (`synthetic_backend_survives_start_stop_stress`), because this backend
 //! needs no display hardware.
 
+use super::capture::pacing::{self, DemandProbeSlot};
 use super::{DisplayBackend, DisplayInfo, DisplayInfoKind, Frame, FrameFormat, InputEvent};
 use async_trait::async_trait;
 use intendant_core::error::CallerError;
@@ -112,6 +113,12 @@ struct CaptureState {
 pub struct SyntheticBackend {
     capture: Mutex<Option<CaptureState>>,
     shutdown: Arc<AtomicBool>,
+    /// Demand probe slot shared with the producer thread. The synthetic
+    /// source is a polling backend like X11, so it honors the same
+    /// demand pacing ([`super::capture::pacing`]) — which is also what
+    /// lets CI exercise the pacing contract (keepalive on demand drop,
+    /// full rate + wake on demand restore) without a real display.
+    demand: Arc<DemandProbeSlot>,
 }
 
 impl SyntheticBackend {
@@ -119,7 +126,16 @@ impl SyntheticBackend {
         Self {
             capture: Mutex::new(None),
             shutdown: Arc::new(AtomicBool::new(false)),
+            demand: Arc::new(DemandProbeSlot::new()),
         }
+    }
+
+    /// Test observability: the pacing slot, exposing pace-mode counters
+    /// (see [`DemandProbeSlot::full_paces`] /
+    /// [`DemandProbeSlot::keepalive_paces`]). Pacing tests assert on
+    /// counter transitions instead of wall-clock frame rates.
+    pub fn demand_slot(&self) -> Arc<DemandProbeSlot> {
+        Arc::clone(&self.demand)
     }
 }
 
@@ -211,6 +227,7 @@ impl DisplayBackend for SyntheticBackend {
 
         let (tx, rx) = mpsc::channel::<Frame>(4);
         let shutdown = Arc::clone(&self.shutdown);
+        let demand = Arc::clone(&self.demand);
         let interval = std::time::Duration::from_millis(1000 / u64::from(fps.clamp(1, MAX_FPS)));
 
         // The producer owns `tx` (the channel's only sender): thread exit IS
@@ -223,18 +240,15 @@ impl DisplayBackend for SyntheticBackend {
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
+                let start = Instant::now();
                 // Bounded channel, drop-on-full per the capture contract.
                 let _ = tx.try_send(synthetic_frame(&base, frame_index));
                 frame_index += 1;
-                // Sleep in small slices so `stop_capture`'s join stays
-                // responsive regardless of the requested cadence.
-                let deadline = Instant::now() + interval;
-                while Instant::now() < deadline {
-                    if shutdown.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                // Demand-aware pacing, same contract as the X11 loops:
+                // full fps with demand, 1 fps keepalive without, and a
+                // sliced sleep that keeps `stop_capture`'s join and
+                // demand wake-edges responsive.
+                let _ = pacing::pace_capture_interval(&demand, &shutdown, start, interval);
             }
         });
 
@@ -244,6 +258,9 @@ impl DisplayBackend for SyntheticBackend {
 
     async fn stop_capture(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        // Same probe hygiene as the X11 backend: a fresh session paces
+        // fail-open until its own probe is installed.
+        self.demand.clear();
         // Taking the state makes double-stop / stop-without-start no-ops;
         // the join doubles as the bounded channel-close (the thread owns
         // the only sender). Joined on the blocking pool like the other
@@ -254,6 +271,10 @@ impl DisplayBackend for SyntheticBackend {
             })
             .await;
         }
+    }
+
+    fn set_capture_demand_probe(&self, probe: pacing::CaptureDemandProbe) {
+        self.demand.install(probe);
     }
 
     async fn inject_input(&self, _event: InputEvent) -> Result<(), CallerError> {

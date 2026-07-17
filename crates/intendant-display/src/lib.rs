@@ -24,7 +24,7 @@
 //! - `latest_frame`: always overwritten, latest-wins.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -995,6 +995,25 @@ pub trait DisplayBackend: Send + Sync + 'static {
     /// and a subsequent `start_capture` gets a clean slate.
     async fn stop_capture(&self);
 
+    /// Install a demand probe the backend MAY consult to pace capture
+    /// (see [`capture::pacing`]): full configured fps while the probe
+    /// reports demand, the 1 fps keepalive cadence while it reports
+    /// none, waking within one poll slice when demand returns. A rate
+    /// reduction, never a stop — a stopped capture has cold-start
+    /// latency and breaks `latest_frame` consumers, while the 1 fps
+    /// keepalive keeps `latest_frame` fresh enough for an instant
+    /// first paint and the FrameRegistry's 1 Hz sampler.
+    ///
+    /// Default: ignore the probe (capture at full rate). Only polling
+    /// backends benefit — event-driven backends (ScreenCaptureKit,
+    /// PipeWire, DXGI) already emit nothing while the desktop is idle.
+    /// [`DisplaySession::start`] installs a probe composed from the
+    /// session's demand sources; pacing is a CPU optimization and must
+    /// never become a correctness gate (probe absent = full rate).
+    fn set_capture_demand_probe(&self, probe: capture::pacing::CaptureDemandProbe) {
+        let _ = probe;
+    }
+
     /// Inject a browser input event into the display.
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError>;
 
@@ -1104,6 +1123,47 @@ pub struct DisplaySession {
     /// channels yet, so subscribers are registered explicitly by the
     /// federated offer path instead of inferred from `peers`.
     tile_subscribers: Arc<RwLock<HashSet<PeerId>>>,
+    /// Lock-free mirror of `tile_subscribers.len()`, maintained inside
+    /// every mutation's write-lock critical section. Exists so the
+    /// capture demand probe (evaluated on the backend's capture
+    /// thread) can read tile demand without an async lock.
+    tile_subscriber_gauge: Arc<AtomicUsize>,
+    /// Whether the tile bridge is currently in video-fallback mode
+    /// (`true` after a `FallbackToVideo` transition, `false` in tile
+    /// mode). Written only by the tile-stream bridge; read by the
+    /// tile-control `Subscribe` handler to decide whether a newly
+    /// subscribing peer starts in video standby (see
+    /// [`webrtc::WebRtcPeer::set_video_standby`]).
+    tile_video_active: Arc<AtomicBool>,
+    /// Wakes the layer-policy coordinator for an immediate evaluation
+    /// when per-peer video demand changes (tile standby edges). The
+    /// coordinator still owns every pause/resume decision — the kick
+    /// only collapses its up-to-one-tick reaction latency so the
+    /// `fallback_to_video` SLA (prompt first paint) holds.
+    layer_policy_kick: Arc<tokio::sync::Notify>,
+    /// Millisecond deadline (relative to `session_epoch`) until which
+    /// the peer-join burst window counts as capture demand. Written by
+    /// [`Self::signal_peer_join_burst`]; read by the capture demand
+    /// probe. 0 = no burst.
+    capture_burst_until_ms: Arc<AtomicU64>,
+    /// Millisecond deadline (relative to `session_epoch`) until which
+    /// recent *external* frame reads count as capture demand. Public
+    /// frame accessors ([`Self::latest_frame`], [`Self::current_frame`],
+    /// [`Self::fresh_frame`], the screenshot wrappers) and
+    /// [`Self::inject_input`] refresh it, so pull-style consumers —
+    /// the recording bridge's `latest_frame` polling, CU action
+    /// screenshots — hold capture at full rate while they are active.
+    /// Session-internal readers (FrameRegistry sampler, tile snapshot
+    /// senders) deliberately bypass these accessors: the 1 fps
+    /// keepalive already serves them, and marking them would pin
+    /// capture at full rate forever.
+    external_frame_demand_until_ms: Arc<AtomicU64>,
+    /// Count of session-internal `frame_tx` subscriptions (the pool-feed
+    /// and tile-stream bridges). The demand probe treats
+    /// `frame_tx.receiver_count()` above this baseline as external
+    /// frame demand (CU quiesce observation, `fresh_frame` waiters, any
+    /// caller-side [`Self::subscribe_frames`] consumer).
+    internal_frame_subscribers: Arc<AtomicUsize>,
     /// D-3c: capture-damage-to-tile bridge task. Sends initial
     /// snapshots and XDamage-driven tile updates to `tile_subscribers`
     /// over WebRTC data channels while leaving the VP8 video track alive
@@ -1240,6 +1300,22 @@ fn convert_for_pool_feed(
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
 const TILE_DELTA_TARGET_FPS: u32 = 15;
+
+/// Peer-join burst window. Sized to comfortably exceed one Linux ffmpeg
+/// H.264 GOP at 30fps (`-g 30` → ~1s) so the natural keyframe lands
+/// inside the window even though `force_keyframe` is ignored on the
+/// rawvideo pipe. Shared by the pool-feed bridge's burst arm and the
+/// capture demand probe (the burst also counts as capture demand so a
+/// joining peer's first frames are captured at full rate immediately).
+const PEER_JOIN_BURST: Duration = Duration::from_millis(1500);
+
+/// How long a single external frame read ([`DisplaySession::latest_frame`]
+/// and friends) or an injected input event counts as capture demand.
+/// Long enough that continuous pollers (the recording bridge at its
+/// configured framerate, a CU action sequence) never fall back to the
+/// keepalive cadence between touches; short enough that one stray
+/// screenshot doesn't hold full-rate capture for long.
+const EXTERNAL_FRAME_DEMAND_WINDOW: Duration = Duration::from_secs(3);
 
 fn tile_delta_min_interval() -> Duration {
     Duration::from_millis(1_000 / TILE_DELTA_TARGET_FPS as u64)
@@ -1575,6 +1651,31 @@ async fn send_latest_tile_snapshot_to_peer_id(
     .await;
 }
 
+/// Insert into the tile-subscriber set, refreshing the lock-free gauge
+/// inside the same write critical section so the capture demand probe
+/// never observes a set/gauge mismatch.
+async fn tile_subscribers_insert(
+    subscribers: &Arc<RwLock<HashSet<PeerId>>>,
+    gauge: &Arc<AtomicUsize>,
+    peer_id: PeerId,
+) {
+    let mut set = subscribers.write().await;
+    set.insert(peer_id);
+    gauge.store(set.len(), Ordering::Relaxed);
+}
+
+/// Remove from the tile-subscriber set; same gauge contract as
+/// [`tile_subscribers_insert`].
+async fn tile_subscribers_remove(
+    subscribers: &Arc<RwLock<HashSet<PeerId>>>,
+    gauge: &Arc<AtomicUsize>,
+    peer_id: PeerId,
+) {
+    let mut set = subscribers.write().await;
+    set.remove(&peer_id);
+    gauge.store(set.len(), Ordering::Relaxed);
+}
+
 async fn tile_subscriber_peer_handles(
     peers: &Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
     subscribers: &Arc<RwLock<HashSet<PeerId>>>,
@@ -1597,6 +1698,7 @@ async fn tile_subscriber_peer_handles(
 async fn reap_peer_registration(
     peers: &Arc<RwLock<HashMap<PeerId, Arc<webrtc::WebRtcPeer>>>>,
     tile_subscribers: &Arc<RwLock<HashSet<PeerId>>>,
+    tile_subscriber_gauge: &Arc<AtomicUsize>,
     counters: &Arc<DisplayMetricsCounters>,
     peer_id: PeerId,
     peer: &Arc<webrtc::WebRtcPeer>,
@@ -1612,7 +1714,7 @@ async fn reap_peer_registration(
         }
     };
     if removed {
-        tile_subscribers.write().await.remove(&peer_id);
+        tile_subscribers_remove(tile_subscribers, tile_subscriber_gauge, peer_id).await;
         counters.peer_count.fetch_sub(1, Ordering::Relaxed);
     }
     removed
@@ -1641,6 +1743,12 @@ impl DisplaySession {
             pool: std::sync::OnceLock::new(),
             pool_feed_bridge_handle: Mutex::new(None),
             tile_subscribers: Arc::new(RwLock::new(HashSet::new())),
+            tile_subscriber_gauge: Arc::new(AtomicUsize::new(0)),
+            tile_video_active: Arc::new(AtomicBool::new(false)),
+            layer_policy_kick: Arc::new(tokio::sync::Notify::new()),
+            capture_burst_until_ms: Arc::new(AtomicU64::new(0)),
+            external_frame_demand_until_ms: Arc::new(AtomicU64::new(0)),
+            internal_frame_subscribers: Arc::new(AtomicUsize::new(0)),
             tile_stream_handle: Mutex::new(None),
             tile_replay: Arc::new(RwLock::new(tile::recovery::TileUpdateReplayBuffer::new())),
             tile_epoch: Arc::new(AtomicU32::new(1)),
@@ -1888,6 +1996,13 @@ impl DisplaySession {
             ))
         }));
 
+        // Demand-aware capture pacing: give the backend the composed
+        // demand probe before the bridges spawn. Polling backends (X11,
+        // synthetic) drop to the 1 fps keepalive while nothing consumes
+        // frames; event-driven backends ignore the probe. See
+        // [`Self::install_capture_demand_probe`].
+        self.install_capture_demand_probe(&pool_arc);
+
         // 3c.4d: spawn the pool-feed bridge eagerly. The bridge owns
         // BGRA→I420 conversion and `pool.push_i420_frame`; it pumps
         // every always-on encoder for the lifetime of the session,
@@ -1976,11 +2091,34 @@ impl DisplaySession {
                     }
                 }
             });
+        // Tile-standby reconcile hooks for on-demand slots (the
+        // always-on bank's standby falls out of the demanded-layer
+        // bound; on-demand slots are lease-refcounted per peer and
+        // need their own holder-aware pause/resume). Same
+        // closure-injection shape as the always-on hooks above.
+        let pool_for_od_ids = Arc::clone(&pool_arc);
+        let pool_for_od_probe = Arc::clone(&pool_arc);
+        let pool_for_od_action = Arc::clone(&pool_arc);
+        let on_demand_hooks = aggregator::OnDemandStandbyHooks {
+            subscribed_ids: Box::new(move || pool_for_od_ids.subscribed_on_demand_ids()),
+            is_paused: Box::new(move |id: &encode::pool::EncoderId| {
+                pool_for_od_probe.is_layer_paused(id.codec, id.rid.clone())
+            }),
+            set_paused: Box::new(move |id: &encode::pool::EncoderId, paused: bool| {
+                if paused {
+                    pool_for_od_action.pause_layer(id.codec, id.rid.clone());
+                } else {
+                    pool_for_od_action.resume_layer(id.codec, id.rid.clone());
+                }
+            }),
+        };
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
             Arc::clone(&self.peers),
             get_current_rids,
             is_layer_paused,
             on_action,
+            on_demand_hooks,
+            Arc::clone(&self.layer_policy_kick),
             aggregator::CapacityPolicyConfig::default(),
             self.shutdown.clone(),
         );
@@ -2228,7 +2366,14 @@ impl DisplaySession {
     }
 
     /// Get the most recently captured frame, or `None` if no frame yet.
+    ///
+    /// Marks external frame demand: repeated polls (the recording
+    /// bridge, CU screenshot sequences) hold a demand-paced capture
+    /// backend at full rate; a lone read after an idle stretch returns
+    /// the keepalive-fresh frame (≤ ~1 s stale — the
+    /// [`capture::pacing`] floor) and warms capture for the next one.
     pub async fn latest_frame(&self) -> Option<Arc<Frame>> {
+        self.note_external_frame_demand();
         self.latest_frame.read().await.clone()
     }
 
@@ -2243,25 +2388,43 @@ impl DisplaySession {
     /// predate that D-4d2 protocol and encoded/shipped the same
     /// baseline a second time on every federated join.
     pub async fn register_tile_subscriber(&self, peer_id: PeerId) {
-        self.tile_subscribers.write().await.insert(peer_id);
+        tile_subscribers_insert(&self.tile_subscribers, &self.tile_subscriber_gauge, peer_id).await;
         if self.get_peer(peer_id).await.is_none() {
             // Raced with a fast Close: the peer left the map between
             // handle_offer returning and this registration. Drop the
             // just-inserted entry (mirrors the Close arm's unregister)
             // instead of leaving it for the reaper.
-            self.tile_subscribers.write().await.remove(&peer_id);
+            tile_subscribers_remove(&self.tile_subscribers, &self.tile_subscriber_gauge, peer_id)
+                .await;
         }
+        // Registration alone does NOT engage video standby: the
+        // federated offer path registers every tile-capable peer, but
+        // the browser stays on the video surface until its explicit
+        // tile-control `Subscribe` lands (the compositor is created on
+        // the first snapshot). Standby engages there.
     }
 
     /// D-3c: unregister a tile subscriber. Safe to call even when the
     /// peer was never registered.
     pub async fn unregister_tile_subscriber(&self, peer_id: PeerId) {
-        self.tile_subscribers.write().await.remove(&peer_id);
+        tile_subscribers_remove(&self.tile_subscribers, &self.tile_subscriber_gauge, peer_id).await;
+        // A still-connected peer that leaves tile streaming is back on
+        // the video surface: restore its video demand and wake the
+        // layer-policy coordinator so paused layers resume promptly.
+        if let Some(peer) = self.get_peer(peer_id).await {
+            if peer.video_standby() {
+                peer.set_video_standby(false);
+                self.layer_policy_kick.notify_one();
+            }
+        }
     }
 
     fn build_tile_control_handler(&self, peer_id: PeerId) -> self::webrtc::TileControlHandler {
         let peers = Arc::clone(&self.peers);
         let subscribers = Arc::clone(&self.tile_subscribers);
+        let subscriber_gauge = Arc::clone(&self.tile_subscriber_gauge);
+        let tile_video_active = Arc::clone(&self.tile_video_active);
+        let layer_policy_kick = Arc::clone(&self.layer_policy_kick);
         let latest_frame = Arc::clone(&self.latest_frame);
         let tile_epoch = Arc::clone(&self.tile_epoch);
         let tile_snapshot_id = Arc::clone(&self.tile_snapshot_id);
@@ -2273,6 +2436,9 @@ impl DisplaySession {
         Arc::new(move |msg| {
             let peers = Arc::clone(&peers);
             let subscribers = Arc::clone(&subscribers);
+            let subscriber_gauge = Arc::clone(&subscriber_gauge);
+            let tile_video_active = Arc::clone(&tile_video_active);
+            let layer_policy_kick = Arc::clone(&layer_policy_kick);
             let latest_frame = Arc::clone(&latest_frame);
             let tile_epoch = Arc::clone(&tile_epoch);
             let tile_snapshot_id = Arc::clone(&tile_snapshot_id);
@@ -2283,7 +2449,24 @@ impl DisplaySession {
             tokio::spawn(async move {
                 match msg {
                     self::webrtc::TileControlMessage::Subscribe { .. } => {
-                        subscribers.write().await.insert(peer_id);
+                        tile_subscribers_insert(&subscribers, &subscriber_gauge, peer_id).await;
+                        // The browser is now painting tiles (its
+                        // compositor is created on this subscription's
+                        // snapshot), so its demand on the video
+                        // encoders can be released — unless the bridge
+                        // is currently in video-fallback mode, where
+                        // the video surface is what the peer watches.
+                        // The layer-policy coordinator owns the
+                        // resulting pause/resume; the kick just makes
+                        // it react now instead of on its next tick.
+                        if !tile_video_active.load(Ordering::Relaxed) {
+                            if let Some(peer) = peers.read().await.get(&peer_id) {
+                                if !peer.video_standby() {
+                                    peer.set_video_standby(true);
+                                    layer_policy_kick.notify_one();
+                                }
+                            }
+                        }
                         send_latest_tile_snapshot_to_peer_id(
                             peers,
                             latest_frame,
@@ -2817,9 +3000,83 @@ impl DisplaySession {
     /// of a started session — the `if let Some` is defense-in-depth
     /// for a session whose `start()` hasn't run yet.
     async fn signal_peer_join_burst(&self) {
+        // Mirror the burst deadline for the capture demand probe: the
+        // burst must count as capture demand (a joining peer's first
+        // frames need capturing at full rate even before the layer
+        // policy's resume lands), and the probe runs on the capture
+        // thread where the bridge task's local window is unreachable.
+        self.capture_burst_until_ms.store(
+            self.session_ms_now()
+                .saturating_add(PEER_JOIN_BURST.as_millis() as u64),
+            Ordering::Relaxed,
+        );
         if let Some(tx) = self.pool_feed_keyframe_tx.lock().await.as_ref() {
             let _ = tx.send(());
         }
+    }
+
+    /// Milliseconds since `session_epoch` — the time base the capture
+    /// demand deadlines use (an `Instant` cannot live in an atomic).
+    fn session_ms_now(&self) -> u64 {
+        Instant::now()
+            .saturating_duration_since(self.session_epoch)
+            .as_millis() as u64
+    }
+
+    /// Record that an external consumer just pulled (or is about to act
+    /// on) frame content, holding capture at full rate for
+    /// [`EXTERNAL_FRAME_DEMAND_WINDOW`]. See the
+    /// `external_frame_demand_until_ms` field docs for which callers
+    /// mark and which deliberately do not.
+    fn note_external_frame_demand(&self) {
+        self.external_frame_demand_until_ms.store(
+            self.session_ms_now()
+                .saturating_add(EXTERNAL_FRAME_DEMAND_WINDOW.as_millis() as u64),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Build and install the capture demand probe on the backend (see
+    /// [`capture::pacing`] and [`DisplayBackend::set_capture_demand_probe`]).
+    /// Called from [`Self::start`] once the pool exists. The probe ORs
+    /// every demand class the session knows:
+    ///
+    /// 1. encoder demand — [`encode::pool::EncoderPool::has_active_consumer`]
+    ///    (an unpaused always-on layer or a subscribed, unpaused
+    ///    on-demand encoder);
+    /// 2. an open peer-join burst window (capture must be hot before
+    ///    the layer policy's resume lands);
+    /// 3. tile subscribers (dirty-region streaming consumes raw frames
+    ///    directly, independent of the video encoders);
+    /// 4. external raw-frame broadcast subscribers — receiver count
+    ///    above the session-internal baseline (CU quiesce observation,
+    ///    [`Self::fresh_frame`] waiters, any caller-side
+    ///    [`Self::subscribe_frames`] consumer);
+    /// 5. a recent external frame read or injected input
+    ///    ([`Self::note_external_frame_demand`] — the recording
+    ///    bridge's `latest_frame` polling and CU screenshots).
+    ///
+    /// The FrameRegistry's 1 Hz sampler is deliberately NOT a demand
+    /// class: the keepalive floor is 1 fps precisely so the sampler
+    /// (and instant-first-paint `latest_frame` reads) stay served
+    /// while nothing else consumes frames.
+    fn install_capture_demand_probe(&self, pool: &Arc<encode::pool::EncoderPool>) {
+        let pool = Arc::clone(pool);
+        let frame_tx = self.frame_tx.clone();
+        let internal_subs = Arc::clone(&self.internal_frame_subscribers);
+        let tile_gauge = Arc::clone(&self.tile_subscriber_gauge);
+        let burst_until = Arc::clone(&self.capture_burst_until_ms);
+        let external_until = Arc::clone(&self.external_frame_demand_until_ms);
+        let epoch = self.session_epoch;
+        let probe: capture::pacing::CaptureDemandProbe = Arc::new(move || {
+            let now_ms = Instant::now().saturating_duration_since(epoch).as_millis() as u64;
+            now_ms < burst_until.load(Ordering::Relaxed)
+                || tile_gauge.load(Ordering::Relaxed) > 0
+                || now_ms < external_until.load(Ordering::Relaxed)
+                || frame_tx.receiver_count() > internal_subs.load(Ordering::Relaxed)
+                || pool.has_active_consumer()
+        });
+        self.backend.set_capture_demand_probe(probe);
     }
 
     async fn spawn_tile_stream_bridge(&self, _fps: u32) {
@@ -2828,6 +3085,11 @@ impl DisplaySession {
         }
 
         let mut broadcast_rx = self.frame_tx.subscribe();
+        // Session-internal subscription: raise the baseline the capture
+        // demand probe subtracts, so this bridge's receiver never
+        // counts as external frame demand.
+        self.internal_frame_subscribers
+            .fetch_add(1, Ordering::Relaxed);
         let peers = Arc::clone(&self.peers);
         let subscribers = Arc::clone(&self.tile_subscribers);
         let shutdown = self.shutdown.clone();
@@ -2840,6 +3102,20 @@ impl DisplaySession {
         let session_epoch = self.session_epoch;
         let (initial_w, initial_h) = self.backend.resolution();
         let backend_kind = self.backend.kind();
+        // Tile-standby plumbing (per-peer RTP standby under tile mode):
+        // the bridge owns every standby transition, mirrors the mode
+        // into `tile_video_active` for the Subscribe handler, kicks the
+        // layer-policy coordinator on demand edges, and reuses the
+        // peer-join keyframe + burst machinery on the
+        // `fallback_to_video` edge. `start()` initializes the pool and
+        // the pool-feed keyframe channel before spawning this bridge,
+        // so both captures are `Some` in production; the `Option`s
+        // fail soft for direct-construction tests.
+        let tile_video_active = Arc::clone(&self.tile_video_active);
+        let layer_policy_kick = Arc::clone(&self.layer_policy_kick);
+        let capture_burst_until_ms = Arc::clone(&self.capture_burst_until_ms);
+        let pool_for_fallback = self.pool.get().cloned();
+        let pool_feed_kf_tx = self.pool_feed_keyframe_tx.lock().await.clone();
 
         let task = tokio::spawn(async move {
             let mut damage = make_damage_backend(initial_w, initial_h, backend_kind);
@@ -2882,6 +3158,7 @@ impl DisplaySession {
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
                             tile_mode = tile::policy::TileMode::Tiles;
+                            tile_video_active.store(false, Ordering::Relaxed);
                             next_snapshot_at = Instant::now() + tile_snapshot_period(tile_mode);
                             last_delta_tick_at = None;
                             pending_rects.clear();
@@ -2897,7 +3174,9 @@ impl DisplaySession {
                             seq = 1;
                             grid = Some(next_grid);
                             tile_policy = tile::policy::TilePolicy::new(Instant::now());
+                            let was_video = tile_mode == tile::policy::TileMode::Video;
                             tile_mode = tile::policy::TileMode::Tiles;
+                            tile_video_active.store(false, Ordering::Relaxed);
                             last_delta_tick_at = None;
                             pending_rects.clear();
                             synthetic_dirty.reset_cursor();
@@ -2909,6 +3188,38 @@ impl DisplaySession {
                                 tile_size_px: next_grid.tile_size_px,
                             };
                             send_tile_control_to_peers(&peers_now, resize, "resize").await;
+                            if was_video {
+                                // The resize reset the server to tile
+                                // mode, but browsers that took the
+                                // earlier FallbackToVideo are still on
+                                // the video surface — historically they
+                                // stayed there (deltas applied to a
+                                // hidden canvas) until the next
+                                // fallback round-trip. With encoders
+                                // pausing under tile standby that
+                                // mismatch would freeze their visible
+                                // video, so converge the surface
+                                // explicitly: same epoch as the Resize,
+                                // snapshot follows below.
+                                let fallback = tile::transport::TileFrame::FallbackToTile {
+                                    new_epoch: epoch,
+                                };
+                                send_tile_control_to_peers(
+                                    &peers_now,
+                                    fallback,
+                                    "resize-to-tile",
+                                )
+                                .await;
+                            }
+                            // Every subscriber is (back) on tiles after
+                            // this transition: engage standby so the
+                            // video encoders stop paying for hidden
+                            // surfaces. Peers already in standby are
+                            // untouched.
+                            for peer in &peers_now {
+                                peer.set_video_standby(true);
+                            }
+                            layer_policy_kick.notify_one();
                             let snapshot_id = tile_snapshot_id.fetch_add(1, Ordering::Relaxed);
                             // Encode the snapshot once, fan the wire
                             // frames out refcounted — a full-screen
@@ -3070,6 +3381,38 @@ impl DisplaySession {
                                         "[display/tile] display {display_id} fallback_to_video \
                                          dirty_fraction={dirty_fraction:.3}"
                                     );
+                                    // Re-acquire video demand BEFORE the
+                                    // browsers are told to switch
+                                    // surfaces: clear standby, kick the
+                                    // coordinator for an immediate
+                                    // resume (whose paused→active edge
+                                    // forces a keyframe), and reuse the
+                                    // peer-join keyframe + burst
+                                    // machinery so the pool-feed bridge
+                                    // clocks the encoders through the
+                                    // transition — the fallback SLA is
+                                    // a prompt first paint, and this is
+                                    // the same recipe a joining peer
+                                    // already relies on.
+                                    tile_video_active.store(true, Ordering::Relaxed);
+                                    for peer in &peers_now {
+                                        peer.set_video_standby(false);
+                                    }
+                                    layer_policy_kick.notify_one();
+                                    if let Some(pool) = pool_for_fallback.as_ref() {
+                                        pool.request_keyframe_all();
+                                    }
+                                    capture_burst_until_ms.store(
+                                        Instant::now()
+                                            .saturating_duration_since(session_epoch)
+                                            .as_millis()
+                                            as u64
+                                            + PEER_JOIN_BURST.as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    if let Some(tx) = pool_feed_kf_tx.as_ref() {
+                                        let _ = tx.send(());
+                                    }
                                     let fallback = tile::transport::TileFrame::FallbackToVideo {
                                         new_epoch: epoch,
                                     };
@@ -3084,6 +3427,7 @@ impl DisplaySession {
                                         "[display/tile] display {display_id} fallback_to_tile \
                                          dirty_fraction={dirty_fraction:.3}"
                                     );
+                                    tile_video_active.store(false, Ordering::Relaxed);
                                     let fallback = tile::transport::TileFrame::FallbackToTile {
                                         new_epoch: epoch,
                                     };
@@ -3111,6 +3455,14 @@ impl DisplaySession {
                                             );
                                         }
                                     }
+                                    // Back on tiles with the baseline
+                                    // snapshot queued on the reliable
+                                    // channel: release the subscribers'
+                                    // video demand again.
+                                    for peer in &peers_now {
+                                        peer.set_video_standby(true);
+                                    }
+                                    layer_policy_kick.notify_one();
                                 }
                             }
                             continue;
@@ -3318,6 +3670,11 @@ impl DisplaySession {
         events: Option<DisplayEventSender>,
     ) {
         let mut broadcast_rx = self.frame_tx.subscribe();
+        // Session-internal subscription: raise the baseline the capture
+        // demand probe subtracts, so this bridge's receiver never
+        // counts as external frame demand.
+        self.internal_frame_subscribers
+            .fetch_add(1, Ordering::Relaxed);
         let (initial_w, initial_h) = self.backend.resolution();
         let shutdown = self.shutdown.clone();
         let display_id = self.display_id;
@@ -3794,6 +4151,7 @@ impl DisplaySession {
     fn spawn_peer_reaper(&self, peer_id: PeerId, peer: &Arc<self::webrtc::WebRtcPeer>) {
         let peers = Arc::clone(&self.peers);
         let tile_subscribers = Arc::clone(&self.tile_subscribers);
+        let tile_gauge = Arc::clone(&self.tile_subscriber_gauge);
         let counters = Arc::clone(&self.counters);
         let peer = Arc::clone(peer);
         let closed = peer.closed();
@@ -3803,8 +4161,15 @@ impl DisplaySession {
                 _ = closed => {}
                 _ = shutdown.cancelled() => peer.close().await,
             }
-            let _ =
-                reap_peer_registration(&peers, &tile_subscribers, &counters, peer_id, &peer).await;
+            let _ = reap_peer_registration(
+                &peers,
+                &tile_subscribers,
+                &tile_gauge,
+                &counters,
+                peer_id,
+                &peer,
+            )
+            .await;
         });
     }
 
@@ -3849,6 +4214,11 @@ impl DisplaySession {
     /// from per-event tasks is exactly the ordering race the input queue
     /// exists to fix.
     pub async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
+        // Input is a frame-demand precursor: a CU click is invariably
+        // followed by an observation, so warm a demand-paced capture
+        // backend now — the post-action frame is then captured at full
+        // rate instead of on the keepalive cadence.
+        self.note_external_frame_demand();
         self.backend.inject_input(event).await
     }
 
@@ -6325,6 +6695,165 @@ mod tests {
              leaving the slot empty (parity with capture/encoder/\
              clipboard cleanup at display/mod.rs:792-800)"
         );
+    }
+
+    // ---- Demand propagation: capture pacing + tile video standby ----
+
+    /// Demand-aware capture pacing end-to-end through a real
+    /// `DisplaySession` on the synthetic backend: an agent-only session
+    /// (empty synthetic always-on bank, no viewers, no external
+    /// consumers) paces at the keepalive cadence; an external frame
+    /// consumer restores full-rate pacing; the peer-join burst counts
+    /// as demand on its own. Asserts on the pacing seam's mode counters
+    /// (`DemandProbeSlot`) rather than wall-clock frame rates, so the
+    /// test is load-tolerant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_pacing_follows_session_demand() {
+        let backend = Arc::new(synthetic::SyntheticBackend::new());
+        let slot = backend.demand_slot();
+        let session = DisplaySession::new(0, backend);
+        session.start(30, None, None).await.expect("start");
+
+        // Phase 1 — no demand: the probe (installed by start()) sees no
+        // pool consumer, no tile subscribers, no burst, no external
+        // reads → keepalive paces accumulate. Generous deadline: each
+        // keepalive pace spans up to 1 s.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while slot.keepalive_paces() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "agent-only session must reach keepalive pacing                  (full={} keepalive={})",
+                slot.full_paces(),
+                slot.keepalive_paces(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Phase 2 — demand restore: an external raw-frame subscriber
+        // (the CU-quiesce / recording shape) must pull pacing back to
+        // full rate within a poll slice.
+        let external_rx = session.subscribe_frames();
+        let full_before = slot.full_paces();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while slot.full_paces() < full_before + 3 {
+            assert!(
+                Instant::now() < deadline,
+                "external frame subscriber must restore full-rate pacing                  (full={} keepalive={})",
+                slot.full_paces(),
+                slot.keepalive_paces(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(external_rx);
+
+        // Phase 3 — burst-as-demand: after external demand decays, a
+        // peer-join burst alone must count. (The external-read window
+        // is 3 s; wait it out at keepalive first.)
+        let keepalive_before = slot.keepalive_paces();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while slot.keepalive_paces() < keepalive_before + 2 {
+            assert!(
+                Instant::now() < deadline,
+                "dropping the subscriber must return pacing to keepalive"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        session.signal_peer_join_burst().await;
+        let full_before = slot.full_paces();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while slot.full_paces() == full_before {
+            assert!(
+                Instant::now() < deadline,
+                "the peer-join burst window must count as capture demand"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        session.stop().await;
+    }
+
+    /// The tile-subscriber gauge mirrors the async set through every
+    /// mutation path the capture demand probe depends on: register,
+    /// the register-races-fast-close cleanup, and unregister.
+    #[tokio::test]
+    async fn tile_subscriber_gauge_mirrors_registration() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = DisplaySession::new(0, backend);
+        assert_eq!(session.tile_subscriber_gauge.load(Ordering::Relaxed), 0);
+
+        // No such peer in the map → insert is rolled back (fast-close
+        // race path) and the gauge returns to zero.
+        session.register_tile_subscriber(7).await;
+        assert_eq!(
+            session.tile_subscriber_gauge.load(Ordering::Relaxed),
+            0,
+            "rolled-back registration must not leak gauge demand"
+        );
+
+        session.register_test_peer_for_cleanup(7).await;
+        session.register_tile_subscriber(7).await;
+        assert_eq!(session.tile_subscriber_gauge.load(Ordering::Relaxed), 1);
+
+        session.unregister_tile_subscriber(7).await;
+        assert_eq!(session.tile_subscriber_gauge.load(Ordering::Relaxed), 0);
+        session.stop().await;
+    }
+
+    /// Poll until `peer.video_standby()` equals `want` (the tile
+    /// control handler applies standby from a spawned task).
+    async fn wait_for_standby(peer: &Arc<webrtc::WebRtcPeer>, want: bool, context: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while peer.video_standby() != want {
+            assert!(
+                Instant::now() < deadline,
+                "{context}: video_standby must become {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Per-peer RTP standby edges: a tile-control `Subscribe` while the
+    /// bridge is in tile mode releases that peer's video demand;
+    /// unregistering restores it. A `Subscribe` arriving while the
+    /// display is in video-fallback mode must NOT engage standby (the
+    /// video surface is what that client watches until the next
+    /// fallback-to-tile).
+    #[tokio::test]
+    async fn tile_subscribe_toggles_video_standby() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
+        let session = DisplaySession::new(0, backend);
+        session.register_test_peer_for_cleanup(7).await;
+        let peer = session.get_peer(7).await.expect("test peer registered");
+        assert!(!peer.video_standby(), "peers start demanding video");
+
+        let handler = session.build_tile_control_handler(7);
+        handler(webrtc::TileControlMessage::Subscribe { client_id: 1 });
+        wait_for_standby(&peer, true, "subscribe in tile mode").await;
+
+        // Unregister (peer leaves tile streaming, stays connected):
+        // demand restored.
+        session.unregister_tile_subscriber(7).await;
+        wait_for_standby(&peer, false, "unregister").await;
+
+        // Video-fallback active: Subscribe must leave demand in place.
+        session.tile_video_active.store(true, Ordering::Relaxed);
+        handler(webrtc::TileControlMessage::Subscribe { client_id: 1 });
+        // The handler runs on a spawned task; give it time to (not)
+        // engage standby, keyed on the snapshot send completing for a
+        // missing latest_frame (immediate).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !peer.video_standby(),
+            "subscribe during video fallback must not release video demand"
+        );
+
+        session.stop().await;
     }
 
     // ---- Phase 5a.1 gated-input-handler tests ------------------------

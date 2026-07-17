@@ -12,6 +12,7 @@
 
 pub mod damage;
 pub mod frame_diff;
+pub mod pacing;
 
 #[cfg(target_os = "linux")]
 pub mod x11_damage;

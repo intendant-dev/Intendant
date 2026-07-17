@@ -317,10 +317,61 @@ fn sample_dirty_rects(sample: &CMSampleBuffer, frame_w: u32, frame_h: u32) -> Op
     Some(rects)
 }
 
+/// The dirty rects attached to one outgoing [`Frame`] when SCK dirty-rect
+/// extraction is enabled: the sample's native rects when the attachment is
+/// present, otherwise a single **full-frame** rect.
+///
+/// The full-frame fallback (rather than `None`) follows the same
+/// conservative rule Chromium's ScreenCaptureKit capturer applies when the
+/// attachment is missing or malformed (observed around stream
+/// reconfiguration): treat the whole frame as changed. Handing `None`
+/// downstream instead would drop the tile bridge into its frame-diff path
+/// for just those frames, diffing against a baseline that stopped
+/// advancing while native rects were served — content that reverts to a
+/// stale baseline hash would then silently never repaint until the
+/// periodic snapshot. A rare full-frame update is the safe shape.
+fn dirty_rects_for_frame(native: Option<Vec<Rect>>, frame_w: u32, frame_h: u32) -> Vec<Rect> {
+    native.unwrap_or_else(|| vec![Rect::new(0, 0, frame_w, frame_h)])
+}
+
+/// Whether ScreenCaptureKit dirty-rect extraction is enabled. **Default
+/// ON** since the 2026-07 demand-propagation pass; the env var is the
+/// opt-out escape hatch (`INTENDANT_MACOS_SCK_DIRTY_RECTS=0`).
+///
+/// Why the default flipped from the initial opt-in:
+///
+/// - Without native rects, macOS tile streaming hashes **every tile of
+///   every frame** on the blocking pool (the frame-diff fallback, up to
+///   15 Hz full-frame work); with them, per-frame damage costs what SCK
+///   already computed. The full-display WebRTC hot path the opt-in was
+///   guarding has since soaked.
+/// - Both `Frame::dirty_rects` consumers degrade per-frame, not
+///   per-session: the tile bridge takes native rects when a frame
+///   carries them and frame-diffs otherwise, and CU's quiesce settle
+///   fingerprints frames without rects. A frame without the attachment
+///   ships a full-frame rect (see [`dirty_rects_for_frame`]) so neither
+///   consumer ever trusts a stale diff baseline.
+/// - The X11 hazard class ("hardware-cursor moves fire no damage") does
+///   not transfer: SCK composites the cursor into the frame it reports
+///   (`with_shows_cursor(true)`), so cursor motion is content change in
+///   the same pipeline that mints the dirty rects, and production SCK
+///   consumers (Chromium's capturer) drive their updated region from
+///   these rects with the cursor embedded. Residual staleness of any
+///   kind is bounded by the tile protocol's periodic snapshot (30 s in
+///   tile mode).
 fn sck_dirty_rects_enabled() -> bool {
-    std::env::var("INTENDANT_MACOS_SCK_DIRTY_RECTS")
-        .map(|raw| sck_dirty_rects_enabled_value(&raw))
-        .unwrap_or(false)
+    sck_dirty_rects_enabled_env(
+        std::env::var("INTENDANT_MACOS_SCK_DIRTY_RECTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`sck_dirty_rects_enabled`]: `None` (unset) = enabled;
+/// any set value is parsed by [`sck_dirty_rects_enabled_value`], so `0`
+/// / `false` / `no` / `off` disable and truthy spellings keep it on.
+fn sck_dirty_rects_enabled_env(raw: Option<&str>) -> bool {
+    raw.map(sck_dirty_rects_enabled_value).unwrap_or(true)
 }
 
 fn sck_dirty_rects_enabled_value(raw: &str) -> bool {
@@ -757,7 +808,11 @@ impl DisplayBackend for MacOSBackend {
                     );
                 }
                 let dirty_rects = if dirty_rects_enabled {
-                    sample_dirty_rects(&sample, w, h)
+                    Some(dirty_rects_for_frame(
+                        sample_dirty_rects(&sample, w, h),
+                        w,
+                        h,
+                    ))
                 } else {
                     None
                 };
@@ -1085,6 +1140,52 @@ mod tests {
         for value in ["", "0", "false", "no", "off", "enabled"] {
             assert!(!sck_dirty_rects_enabled_value(value), "{value}");
         }
+    }
+
+    /// SCK dirty-rect extraction defaults ON; the env var is the opt-OUT
+    /// escape hatch. Pins the default flip (see
+    /// [`sck_dirty_rects_enabled`] for the rationale) and the opt-out
+    /// spellings an operator would reach for.
+    #[test]
+    fn dirty_rects_default_on_with_env_opt_out() {
+        assert!(
+            sck_dirty_rects_enabled_env(None),
+            "unset env must enable SCK dirty rects (default ON)"
+        );
+        for off in ["0", "false", "no", "off"] {
+            assert!(
+                !sck_dirty_rects_enabled_env(Some(off)),
+                "{off} must opt out"
+            );
+        }
+        for on in ["1", "true", "yes", "on"] {
+            assert!(
+                sck_dirty_rects_enabled_env(Some(on)),
+                "{on} must keep it on"
+            );
+        }
+    }
+
+    /// A frame whose sample lacks the dirty-rect attachment ships a
+    /// full-frame rect, never `None` — the conservative
+    /// missing-attachment rule that keeps downstream consumers off a
+    /// stale frame-diff baseline. Present attachments pass through
+    /// untouched (empty = SCK's idle "nothing changed" verdict).
+    #[test]
+    fn missing_attachment_becomes_full_frame_rect() {
+        assert_eq!(
+            dirty_rects_for_frame(None, 1280, 720),
+            vec![Rect::new(0, 0, 1280, 720)]
+        );
+        assert_eq!(
+            dirty_rects_for_frame(Some(Vec::new()), 1280, 720),
+            Vec::<Rect>::new()
+        );
+        let native = vec![Rect::new(4, 8, 16, 32)];
+        assert_eq!(
+            dirty_rects_for_frame(Some(native.clone()), 1280, 720),
+            native
+        );
     }
 
     /// Real-ScreenCaptureKit teardown-contract stress: fast start/stop

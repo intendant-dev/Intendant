@@ -9,6 +9,7 @@
 //! If the XShm extension is unavailable, the backend falls back to `XGetImage`
 //! (slower but always works).
 
+use super::capture::pacing::{self, DemandProbeSlot, PaceMode};
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use async_trait::async_trait;
 use intendant_core::error::CallerError;
@@ -33,6 +34,13 @@ pub struct X11Backend {
     height: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     display: String,
+    /// Demand probe slot shared with the capture thread. X11 capture is
+    /// a full-screen copy at configured fps whether or not anything
+    /// consumes it (~249 MB/s at 1080p30), so this polling backend is
+    /// the primary beneficiary of demand pacing: no demand → the loop
+    /// drops to the 1 fps keepalive; demand restored → full rate within
+    /// one poll slice. See [`pacing`].
+    demand: Arc<DemandProbeSlot>,
 }
 
 impl X11Backend {
@@ -60,6 +68,7 @@ impl X11Backend {
             height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
             display: display_str,
+            demand: Arc::new(DemandProbeSlot::new()),
         })
     }
 
@@ -81,6 +90,7 @@ impl X11Backend {
             height: Arc::new(AtomicU32::new(height)),
             shutdown: Arc::new(AtomicBool::new(false)),
             display: display_str.to_string(),
+            demand: Arc::new(DemandProbeSlot::new()),
         })
     }
 }
@@ -233,6 +243,7 @@ impl DisplayBackend for X11Backend {
         let height = self.height.load(Ordering::SeqCst);
         let shared_w = Arc::clone(&self.width);
         let shared_h = Arc::clone(&self.height);
+        let demand = Arc::clone(&self.demand);
 
         let thread = std::thread::spawn(move || {
             run_x11_capture(
@@ -244,6 +255,7 @@ impl DisplayBackend for X11Backend {
                 height,
                 shared_w,
                 shared_h,
+                demand,
             );
         });
 
@@ -253,6 +265,11 @@ impl DisplayBackend for X11Backend {
 
     async fn stop_capture(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        // Drop the demand probe with the session it was composed for: a
+        // later `start_capture` must pace at the fail-open full rate
+        // until its own session installs a fresh probe, never off a
+        // previous session's stale demand sources.
+        self.demand.clear();
 
         // Teardown contract: the capture thread owns the frame channel's only
         // sender, so the join below doubles as the bounded channel-close —
@@ -339,6 +356,10 @@ impl DisplayBackend for X11Backend {
         Ok(())
     }
 
+    fn set_capture_demand_probe(&self, probe: pacing::CaptureDemandProbe) {
+        self.demand.install(probe);
+    }
+
     fn resolution(&self) -> (u32, u32) {
         (
             self.width.load(Ordering::SeqCst),
@@ -380,6 +401,7 @@ fn run_x11_capture(
     height: u32,
     shared_width: Arc<AtomicU32>,
     shared_height: Arc<AtomicU32>,
+    demand: Arc<DemandProbeSlot>,
 ) {
     use x11rb::connection::Connection;
     use x11rb::protocol::shm;
@@ -423,6 +445,7 @@ fn run_x11_capture(
             frame_interval,
             &shared_width,
             &shared_height,
+            &demand,
         );
     } else {
         eprintln!(
@@ -440,6 +463,7 @@ fn run_x11_capture(
             frame_interval,
             &shared_width,
             &shared_height,
+            &demand,
         );
     }
 }
@@ -472,6 +496,7 @@ fn run_shm_capture(
     frame_interval: std::time::Duration,
     shared_width: &Arc<AtomicU32>,
     shared_height: &Arc<AtomicU32>,
+    demand: &Arc<DemandProbeSlot>,
 ) {
     use x11rb::protocol::shm::ConnectionExt as ShmConnectionExt;
     use x11rb::protocol::xproto::ImageFormat;
@@ -526,6 +551,7 @@ fn run_shm_capture(
             frame_interval,
             shared_width,
             shared_height,
+            demand,
         );
         return;
     }
@@ -536,6 +562,11 @@ fn run_shm_capture(
     const MAX_CONSECUTIVE_ERRORS: u32 = 30;
     // Re-query root window geometry every N frames to detect resolution changes.
     const GEOMETRY_CHECK_INTERVAL: u64 = 60;
+    // Whether the previous iteration paced at the keepalive cadence. At
+    // 1 fps the frame-count geometry cadence would stretch to a minute,
+    // so keepalive iterations re-check geometry every frame instead
+    // (one cheap GetGeometry round-trip per second while idle).
+    let mut idle_paced = false;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -544,7 +575,7 @@ fn run_shm_capture(
         let start = std::time::Instant::now();
 
         // Periodically check for root window resize (e.g. xrandr change).
-        if frame_count > 0 && frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
+        if frame_count > 0 && (idle_paced || frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL)) {
             if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
                 if new_w != width || new_h != height {
                     eprintln!(
@@ -573,6 +604,7 @@ fn run_shm_capture(
                         frame_interval,
                         shared_width,
                         shared_height,
+                        demand,
                     );
                     return;
                 }
@@ -645,10 +677,11 @@ fn run_shm_capture(
             }
         }
 
-        let elapsed = start.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
-        }
+        // Demand-aware pacing: full fps while anything consumes frames,
+        // 1 fps keepalive otherwise, waking within one poll slice when
+        // demand returns. See [`pacing::pace_capture_interval`].
+        idle_paced = pacing::pace_capture_interval(demand, shutdown, start, frame_interval)
+            == PaceMode::Keepalive;
     }
 
     // Cleanup: detach from X server and shared memory.
@@ -670,6 +703,7 @@ fn run_getimage_capture(
     frame_interval: std::time::Duration,
     shared_width: &Arc<AtomicU32>,
     shared_height: &Arc<AtomicU32>,
+    demand: &Arc<DemandProbeSlot>,
 ) {
     use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
 
@@ -680,6 +714,8 @@ fn run_getimage_capture(
     const MAX_CONSECUTIVE_ERRORS: u32 = 30;
     // Re-query root window geometry every N frames to detect resolution changes.
     const GEOMETRY_CHECK_INTERVAL: u64 = 60;
+    // See the SHM loop: keepalive iterations re-check geometry every frame.
+    let mut idle_paced = false;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -688,7 +724,7 @@ fn run_getimage_capture(
         let start = std::time::Instant::now();
 
         // Periodically check for root window resize.
-        if frame_count > 0 && frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL) {
+        if frame_count > 0 && (idle_paced || frame_count.is_multiple_of(GEOMETRY_CHECK_INTERVAL)) {
             if let Some((new_w, new_h)) = query_root_geometry(conn, root) {
                 if new_w != width || new_h != height {
                     eprintln!(
@@ -769,10 +805,11 @@ fn run_getimage_capture(
             }
         }
 
-        let elapsed = start.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
-        }
+        // Demand-aware pacing: full fps while anything consumes frames,
+        // 1 fps keepalive otherwise, waking within one poll slice when
+        // demand returns. See [`pacing::pace_capture_interval`].
+        idle_paced = pacing::pace_capture_interval(demand, shutdown, start, frame_interval)
+            == PaceMode::Keepalive;
     }
 }
 

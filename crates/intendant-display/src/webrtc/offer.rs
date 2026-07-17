@@ -1028,6 +1028,11 @@ impl WebRtcPeer {
                 remote_inbound_health_rx,
                 twcc_health_rx,
                 active_rids: active_rids.to_vec(),
+                active_codec,
+                // Every peer starts demanding video; the display
+                // session's tile bridge engages standby only once the
+                // client is actually painting tiles.
+                video_standby: std::sync::atomic::AtomicBool::new(false),
                 shutdown,
             },
             encoded_frame_tx,

@@ -144,6 +144,31 @@ requires every active policy to agree**:
   (cheap `Arc` stash) instead of converting at capture rate for a stream
   nobody decodes, and the first tick after a viewer joins converts that
   retained frame on demand.
+
+  Demand also propagates one stage further upstream, into **capture pacing**
+  (`display/capture/pacing.rs`): the session composes a demand probe —
+  encoder-pool consumers, the peer-join burst window, tile subscribers,
+  external raw-frame subscribers, and recent external `latest_frame` reads or
+  injected input — and installs it on the backend. Polling backends (X11,
+  synthetic) then drop the capture copy itself from configured fps to a
+  **1 fps keepalive** while nothing consumes frames, waking within one 50 ms
+  poll slice when demand returns. It is a rate reduction, never a stop: a
+  stopped capture has cold-start latency and breaks `latest_frame` consumers,
+  while the 1 fps floor keeps `latest_frame` fresh enough for an instant
+  first paint, a ≤1 s-stale screenshot, and the FrameRegistry's 1 Hz sampler.
+  Event-driven backends (ScreenCaptureKit, PipeWire, DXGI) ignore the probe —
+  they already emit nothing while the desktop is idle.
+
+  Per-peer demand is released under **tile mode** as well: a federated viewer
+  whose client is painting tiles (video element hidden) enters *video
+  standby* — it stops contributing to the demanded/pinned layer sets, and an
+  on-demand encoder slot pauses once every holder is in standby — so a
+  tile-only session stops paying VP8/H.264 encode while any non-standby
+  viewer on the same display keeps its layers running. The
+  `fallback_to_video` edge restores demand *before* the browser is told to
+  switch surfaces, kicks the coordinator for an immediate resume (whose
+  paused→active edge forces a keyframe), and reuses the peer-join
+  keyframe + burst machinery, so the fallback still paints promptly.
 - **Aggregate-TWCC policy** — per-peer cascaded loss. On sustained packet loss it
   pauses the top layer first, then the middle, reversing on recovery. This is the
   actionable signal source on the current `rtc` 0.9 + WKWebView stack.
@@ -301,19 +326,26 @@ per-tile staleness check.
 - **Damage** comes from platform metadata when possible. On **X11**, XDamage
   (`display/capture/x11_damage.rs`) reports real OS-level dirty rects
   (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rect
-  extraction is implemented but opt-in via `INTENDANT_MACOS_SCK_DIRTY_RECTS=1`
-  while the full-display WebRTC hot path is being validated. Other paths use a
-  CPU-bound **frame-diff fallback** (`display/capture/frame_diff.rs`) that hashes
-  every tile and emits the ones whose hash changed; where neither is available
-  the capability reports `None` and the policy forces video mode, so the platform
-  keeps the proven VP8 path until its damage backend lands.
+  extraction is **on by default** (`INTENDANT_MACOS_SCK_DIRTY_RECTS=0` is the
+  opt-out escape hatch): frames carry SCK's native dirty rects, a frame whose
+  sample lacks the attachment ships a conservative full-frame rect (the
+  Chromium missing-attachment rule), and the composited cursor
+  (`shows_cursor(true)`) is content change inside the same pipeline that mints
+  the rects — so the X11 hardware-cursor hazard does not transfer. Other paths
+  use a CPU-bound **frame-diff fallback** (`display/capture/frame_diff.rs`)
+  that hashes every tile and emits the ones whose hash changed; where neither
+  is available the capability reports `None` and the policy forces video mode,
+  so the platform keeps the proven VP8 path until its damage backend lands.
 - **Tile ↔ video fallback policy** (`display/tile/policy.rs`) switches to
   whole-frame video on high-motion content and back to tiles when motion subsides,
   with hysteresis to prevent flapping: **enter video at 25% dirty fraction
   (`ENTER_VIDEO_THRESHOLD`), exit at 15% (`EXIT_VIDEO_THRESHOLD`)**, over a
   rolling window of 8 samples (`HISTORY_K`), with a **500 ms minimum dwell**
-  (`MIN_DWELL`) capping switches at 2/sec. The fallback target is the proven VP8-q
-  video track, which stays up the whole time.
+  (`MIN_DWELL`) capping switches at 2/sec. The fallback target is the proven
+  VP8-q video track, which stays **negotiated** the whole time; while a
+  viewer's tile stream is active its video *encoders* idle in per-peer
+  standby (see the layer-policy section above), and the fallback edge
+  restores demand + forces a keyframe before the surface switch.
 - **Cursor** is sent as a separate `CursorState` frame on the control channel and
   drawn as a browser overlay sprite (Path A). X11 typically renders the cursor as
   a hardware overlay that does *not* fire XDamage, so dirtying tiles for cursor
@@ -520,9 +552,9 @@ Rates are computed over the elapsed window and counters reset on read.
 
 - **Physical-key-only input** breaks non-US keyboard layouts (Phase 1).
 - **Tile streaming still depends on data-channel viewers.** X11 uses XDamage;
-  macOS can use ScreenCaptureKit dirty rects when
-  `INTENDANT_MACOS_SCK_DIRTY_RECTS=1` is set and otherwise falls back to
-  frame-diff; Wayland currently uses the CPU-bound frame-diff path.
+  macOS uses ScreenCaptureKit dirty rects by default
+  (`INTENDANT_MACOS_SCK_DIRTY_RECTS=0` opts out to frame-diff); Wayland
+  currently uses the CPU-bound frame-diff path.
 - **Wayland enumeration is portal-limited** — true multi-monitor identity before
   a session opens is not available.
 - **`rtc` 0.9 doesn't surface TWCC or populate RR stats**, hence the interceptor

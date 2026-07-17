@@ -68,13 +68,13 @@
 //! wiring at [`crate::DisplaySession::start`] capture the
 //! pool in one place.
 
-use crate::encode::pool::SimulcastRid;
+use crate::encode::pool::{CodecKind, EncoderId, SimulcastRid};
 use crate::webrtc::{PeerLayerHealth, WebRtcPeer};
 use crate::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -830,6 +830,78 @@ pub fn compose_effective_wanted(
 /// callers, which would otherwise each spell the boxed-closure type.
 pub type LayerPauseProbe = Box<dyn Fn(&SimulcastRid) -> Option<bool> + Send + Sync>;
 
+/// Injected pool access for the coordinator's **on-demand tile-standby
+/// reconcile** (the on-demand sibling of the `on_action` /
+/// `is_layer_paused` always-on hooks; same closure-injection rationale —
+/// keeps the reconcile pure and testable without a real pool).
+///
+/// The always-on bank's tile standby already falls out of the #48
+/// demanded-layer bound (a standby peer contributes no RIDs). On-demand
+/// slots sit outside that bound — they are lease-refcounted per peer,
+/// keyed `(codec, rid)` — so the coordinator reconciles them separately:
+/// a subscribed slot whose **every** holder is in video standby pauses;
+/// any non-standby holder resumes it (the pool forces a keyframe on the
+/// paused→active edge). Holders are attributed by the peers' frozen
+/// `active_codec` + `active_rids`.
+pub struct OnDemandStandbyHooks {
+    /// Snapshot of on-demand encoder IDs with at least one subscriber.
+    /// Production: [`crate::encode::pool::EncoderPool::subscribed_on_demand_ids`].
+    pub subscribed_ids: Box<dyn Fn() -> Vec<EncoderId> + Send + Sync>,
+    /// Pause-state probe for one slot (`None` = slot gone — e.g. torn
+    /// down between the snapshot and the probe; the reconcile skips it).
+    /// Production: [`crate::encode::pool::EncoderPool::is_layer_paused`].
+    pub is_paused: Box<dyn Fn(&EncoderId) -> Option<bool> + Send + Sync>,
+    /// Apply a pause (`true`) / resume (`false`) to one slot.
+    /// Production: [`crate::encode::pool::EncoderPool::pause_layer`] /
+    /// [`crate::encode::pool::EncoderPool::resume_layer`].
+    pub set_paused: Box<dyn Fn(&EncoderId, bool) + Send + Sync>,
+}
+
+/// Per-peer facts the standby reconcile needs, snapshotted while the
+/// coordinator holds the peers read guard (so the reconcile itself runs
+/// lock-free).
+#[derive(Clone, Debug)]
+pub struct PeerDemandSnapshot {
+    pub video_standby: bool,
+    pub active_codec: CodecKind,
+    pub active_rids: Vec<SimulcastRid>,
+}
+
+/// One reconcile pass over the subscribed on-demand slots (see
+/// [`OnDemandStandbyHooks`]). Pure aside from the injected hooks.
+///
+/// Per slot: holders = peers whose `active_codec` matches the slot's
+/// codec and whose `active_rids` contain the slot's RID. A slot with no
+/// attributable holder is left alone — its lifecycle belongs to the
+/// lease refcount (transient teardown states, or a subscription shape
+/// this attribution cannot see), and pausing an encoder some unseen
+/// consumer relies on would be the starvation bug. Diffed against
+/// actual pool state so an already-converged slot produces no action.
+pub fn reconcile_on_demand_standby(hooks: &OnDemandStandbyHooks, peers: &[PeerDemandSnapshot]) {
+    for id in (hooks.subscribed_ids)() {
+        let mut holders = peers
+            .iter()
+            .filter(|p| p.active_codec == id.codec && p.active_rids.contains(&id.rid))
+            .peekable();
+        if holders.peek().is_none() {
+            continue;
+        }
+        let wanted = holders.any(|p| !p.video_standby);
+        match ((hooks.is_paused)(&id), wanted) {
+            (Some(false), false) => {
+                eprintln!("[layer-policy] PauseOnDemand({id})");
+                (hooks.set_paused)(&id, true);
+            }
+            (Some(true), true) => {
+                eprintln!("[layer-policy] ResumeOnDemand({id})");
+                (hooks.set_paused)(&id, false);
+            }
+            // Converged, or the slot vanished between snapshot and probe.
+            _ => {}
+        }
+    }
+}
+
 /// Spawn the single layer-policy coordinator for one display.
 ///
 /// One task, three policies, one writer. Subscribes to each peer's
@@ -873,6 +945,8 @@ pub fn spawn_layer_policy_coordinator(
     get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync>,
     is_layer_paused: LayerPauseProbe,
     on_action: Box<dyn Fn(CapacityAction) + Send + Sync>,
+    on_demand: OnDemandStandbyHooks,
+    demand_kick: Arc<Notify>,
     config: CapacityPolicyConfig,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
@@ -910,212 +984,210 @@ pub fn spawn_layer_policy_coordinator(
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    let now = Instant::now();
+                // Interval tick: the steady-state evaluation cadence.
+                _ = tick.tick() => {}
+                // Demand-edge kick from the owning display session
+                // (tile-standby transitions, notably the
+                // `fallback_to_video` edge): run the same evaluation
+                // immediately instead of up to one TICK later, so the
+                // resume (and its forced keyframe) lands before the
+                // browser finishes switching surfaces. Notify has
+                // one-permit semantics, so kick storms coalesce.
+                _ = demand_kick.notified() => {}
+            }
+            let now = Instant::now();
 
-                    // ---- Snapshot peers + advance presence ----
-                    let current_peers = peers.read().await;
-                    let peer_count = current_peers.len();
+            // ---- Snapshot peers + advance presence ----
+            let current_peers = peers.read().await;
+            let peer_count = current_peers.len();
 
-                    presence_state = transition(presence_state, peer_count, now);
-                    let presence_active = !matches!(
-                        presence_state,
-                        AggregatorState::Idle
-                    );
+            presence_state = transition(presence_state, peer_count, now);
+            let presence_active = !matches!(presence_state, AggregatorState::Idle);
 
-                    // ---- Prune per-peer state on zero peers ----
-                    // Reconnects (same PeerId) start fresh: no stale
-                    // TWCC cascade or RR layer state can survive an
-                    // idle window.
-                    if peer_count == 0 {
-                        twcc_subs.clear();
-                        rr_subs.clear();
-                        twcc_state.clear();
-                        rr_state.clear();
-                        prev_measurement_count.clear();
-                    } else {
-                        twcc_subs.retain(|id, _| current_peers.contains_key(id));
-                        rr_subs.retain(|id, _| current_peers.contains_key(id));
-                        for (id, peer) in current_peers.iter() {
-                            twcc_subs
-                                .entry(*id)
-                                .or_insert_with(|| peer.subscribe_twcc_health());
-                            rr_subs
-                                .entry(*id)
-                                .or_insert_with(|| {
-                                    peer.subscribe_remote_inbound_health()
-                                });
-                        }
-                        twcc_state.retain(|pid, _| current_peers.contains_key(pid));
-                        rr_state
-                            .retain(|(pid, _), _| current_peers.contains_key(pid));
-                        prev_measurement_count
-                            .retain(|(pid, _), _| current_peers.contains_key(pid));
-                    }
-
-                    let peer_ids: Vec<PeerId> =
-                        current_peers.keys().cloned().collect();
-                    // #57: per-tick pinned-layer set. Each peer with
-                    // exactly one negotiated RID contributes that RID
-                    // to the pin set, which `compose_effective_wanted`
-                    // unions into the result regardless of TWCC/RR
-                    // loss. Multi-RID peers (`len() > 1`) don't pin —
-                    // they have the floor as fallback. Computed before
-                    // `drop(current_peers)` so we don't re-acquire the
-                    // peers lock just to read this.
-                    let pinned_layers: HashSet<SimulcastRid> = current_peers
-                        .values()
-                        .filter_map(|peer| {
-                            let rids = peer.active_rids();
-                            if rids.len() == 1 {
-                                Some(rids[0].clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    // #48: per-tick demanded-layer set (union of every
-                    // live peer's negotiated active_rids). The
-                    // composer uses this as a hard upper bound on the
-                    // effective wanted set — layers outside this set
-                    // produce frames no live peer can decode and are
-                    // pure CPU waste. Computed alongside pinned so we
-                    // walk peers once per tick. Zero peers ⇒ empty
-                    // demand ⇒ effective collapses to empty (encoders
-                    // pause immediately).
-                    let demanded_layers: HashSet<SimulcastRid> = current_peers
-                        .values()
-                        .flat_map(|peer| peer.active_rids().iter().cloned())
-                        .collect();
-                    drop(current_peers);
-
-                    // ---- Refresh current_rids; derive floor + upper ----
-                    let current_rids = get_current_rids();
-                    if current_rids.is_empty() {
-                        // No simulcast layers at all — nothing for the
-                        // pool actions to operate on. Per-peer state
-                        // would be meaningless without rids; advance
-                        // presence above and skip the rest.
-                        continue;
-                    }
-                    // Spec order: descending bitrate, last entry is
-                    // floor. Upper = everything before floor.
-                    let floor = current_rids.last().unwrap().clone();
-                    let upper_layers: Vec<SimulcastRid> =
-                        current_rids[..current_rids.len() - 1].to_vec();
-
-                    // ---- Aggregate-TWCC vote ----
-                    // No peers → no restriction (full current set).
-                    // With peers → step each peer's cascade state
-                    // against its current TWCC health, project to
-                    // wanted upper layers, add floor, union across
-                    // peers.
-                    let twcc_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
-                        current_rids.iter().cloned().collect()
-                    } else {
-                        let mut per_peer: Vec<HashSet<SimulcastRid>> =
-                            Vec::with_capacity(peer_ids.len());
-                        for peer_id in &peer_ids {
-                            let prev = twcc_state
-                                .get(peer_id)
-                                .copied()
-                                .unwrap_or(AggregateLayerCapacity::AllUpperWanted);
-                            // SAFE: peer_subs populated from
-                            // current_peers above; entry exists.
-                            let health =
-                                *twcc_subs.get(peer_id).unwrap().borrow();
-                            let next = step_aggregate_layer_capacity(
-                                prev,
-                                health.as_ref(),
-                                &config,
-                                now,
-                            );
-                            twcc_state.insert(*peer_id, next);
-                            let mut wanted = aggregate_state_wanted_upper_layers(
-                                next,
-                                &upper_layers,
-                            );
-                            wanted.insert(floor.clone());
-                            per_peer.push(wanted);
-                        }
-                        aggregate_wanted_layers(per_peer)
-                    };
-
-                    // ---- Per-RID RR vote ----
-                    // Same shape: no peers → no restriction. Per-peer
-                    // wanted = floor + per-RID Wanted-state-projection
-                    // for non-floor RIDs. Default per-RID state is
-                    // Wanted, so a peer with no RR ever yet votes for
-                    // every layer (no restriction).
-                    let rr_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
-                        current_rids.iter().cloned().collect()
-                    } else {
-                        let mut per_peer: Vec<HashSet<SimulcastRid>> =
-                            Vec::with_capacity(peer_ids.len());
-                        for peer_id in &peer_ids {
-                            let health_map =
-                                rr_subs.get(peer_id).unwrap().borrow().clone();
-                            let mut peer_wanted: HashSet<SimulcastRid> =
-                                HashSet::new();
-                            peer_wanted.insert(floor.clone());
-                            for rid in &upper_layers {
-                                let key = (*peer_id, rid.clone());
-                                let prev = rr_state
-                                    .get(&key)
-                                    .copied()
-                                    .unwrap_or(LayerCapacityState::Wanted);
-                                let raw_health = health_map.get(rid);
-                                let prev_count = prev_measurement_count
-                                    .get(&key)
-                                    .copied()
-                                    .unwrap_or(0);
-                                let fresh = fresh_health(raw_health, prev_count);
-                                let next = step_layer_capacity_state(
-                                    prev, fresh, &config, now,
-                                );
-                                rr_state.insert(key.clone(), next);
-                                if let Some(h) = raw_health {
-                                    prev_measurement_count.insert(
-                                        key,
-                                        h.round_trip_time_measurements,
-                                    );
-                                }
-                                if layer_state_is_wanted(&next) {
-                                    peer_wanted.insert(rid.clone());
-                                }
-                            }
-                            per_peer.push(peer_wanted);
-                        }
-                        aggregate_wanted_layers(per_peer)
-                    };
-
-                    // ---- Compose + diff + apply ----
-                    let effective_wanted = compose_effective_wanted(
-                        presence_active,
-                        &twcc_union,
-                        &rr_union,
-                        &current_rids,
-                        &pinned_layers,
-                        &demanded_layers,
-                    );
-
-                    let actual_active: HashSet<SimulcastRid> = current_rids
-                        .iter()
-                        .filter(|rid| {
-                            matches!(is_layer_paused(rid), Some(false))
-                        })
-                        .cloned()
-                        .collect();
-
-                    let actions = diff_wanted_aggregate(
-                        &actual_active,
-                        &effective_wanted,
-                        &current_rids,
-                    );
-                    for action in actions {
-                        on_action(action);
-                    }
+            // ---- Prune per-peer state on zero peers ----
+            // Reconnects (same PeerId) start fresh: no stale
+            // TWCC cascade or RR layer state can survive an
+            // idle window.
+            if peer_count == 0 {
+                twcc_subs.clear();
+                rr_subs.clear();
+                twcc_state.clear();
+                rr_state.clear();
+                prev_measurement_count.clear();
+            } else {
+                twcc_subs.retain(|id, _| current_peers.contains_key(id));
+                rr_subs.retain(|id, _| current_peers.contains_key(id));
+                for (id, peer) in current_peers.iter() {
+                    twcc_subs
+                        .entry(*id)
+                        .or_insert_with(|| peer.subscribe_twcc_health());
+                    rr_subs
+                        .entry(*id)
+                        .or_insert_with(|| peer.subscribe_remote_inbound_health());
                 }
+                twcc_state.retain(|pid, _| current_peers.contains_key(pid));
+                rr_state.retain(|(pid, _), _| current_peers.contains_key(pid));
+                prev_measurement_count.retain(|(pid, _), _| current_peers.contains_key(pid));
+            }
+
+            let peer_ids: Vec<PeerId> = current_peers.keys().cloned().collect();
+            // Per-peer demand facts under the read guard: standby
+            // flag + frozen codec/RID identity. Pinned, demanded,
+            // and the on-demand reconcile below all derive from
+            // this one walk.
+            let peer_demand: Vec<PeerDemandSnapshot> = current_peers
+                .values()
+                .map(|peer| PeerDemandSnapshot {
+                    video_standby: peer.video_standby(),
+                    active_codec: peer.active_codec(),
+                    active_rids: peer.active_rids().to_vec(),
+                })
+                .collect();
+            drop(current_peers);
+            // #57: per-tick pinned-layer set. Each peer with
+            // exactly one negotiated RID contributes that RID
+            // to the pin set, which `compose_effective_wanted`
+            // unions into the result regardless of TWCC/RR
+            // loss. Multi-RID peers (`len() > 1`) don't pin —
+            // they have the floor as fallback.
+            //
+            // Tile standby (per-peer video release): a peer whose
+            // client is painting tiles consumes no video encoder
+            // output, so it neither pins nor demands — its layers
+            // pause unless another live, non-standby peer can
+            // consume them, which is exactly the per-peer
+            // isolation the demand bound already provides. It
+            // still counts for presence (the peers map), so the
+            // zero-peer pause semantics are untouched.
+            let pinned_layers: HashSet<SimulcastRid> = peer_demand
+                .iter()
+                .filter(|peer| !peer.video_standby)
+                .filter_map(|peer| {
+                    if peer.active_rids.len() == 1 {
+                        Some(peer.active_rids[0].clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // #48: per-tick demanded-layer set (union of every
+            // live non-standby peer's negotiated active_rids).
+            // The composer uses this as a hard upper bound on the
+            // effective wanted set — layers outside this set
+            // produce frames no live peer can decode and are
+            // pure CPU waste. Zero peers (or all peers in tile
+            // standby) ⇒ empty demand ⇒ effective collapses to
+            // empty (encoders pause immediately).
+            let demanded_layers: HashSet<SimulcastRid> = peer_demand
+                .iter()
+                .filter(|peer| !peer.video_standby)
+                .flat_map(|peer| peer.active_rids.iter().cloned())
+                .collect();
+
+            // On-demand tile-standby reconcile. Runs before the
+            // `current_rids` empty-bank early-continue: sessions
+            // with an empty always-on bank (synthetic test rigs)
+            // still carry on-demand slots that must pause when
+            // their only holders are on tiles.
+            reconcile_on_demand_standby(&on_demand, &peer_demand);
+
+            // ---- Refresh current_rids; derive floor + upper ----
+            let current_rids = get_current_rids();
+            if current_rids.is_empty() {
+                // No simulcast layers at all — nothing for the
+                // pool actions to operate on. Per-peer state
+                // would be meaningless without rids; advance
+                // presence above and skip the rest.
+                continue;
+            }
+            // Spec order: descending bitrate, last entry is
+            // floor. Upper = everything before floor.
+            let floor = current_rids.last().unwrap().clone();
+            let upper_layers: Vec<SimulcastRid> = current_rids[..current_rids.len() - 1].to_vec();
+
+            // ---- Aggregate-TWCC vote ----
+            // No peers → no restriction (full current set).
+            // With peers → step each peer's cascade state
+            // against its current TWCC health, project to
+            // wanted upper layers, add floor, union across
+            // peers.
+            let twcc_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
+                current_rids.iter().cloned().collect()
+            } else {
+                let mut per_peer: Vec<HashSet<SimulcastRid>> = Vec::with_capacity(peer_ids.len());
+                for peer_id in &peer_ids {
+                    let prev = twcc_state
+                        .get(peer_id)
+                        .copied()
+                        .unwrap_or(AggregateLayerCapacity::AllUpperWanted);
+                    // SAFE: peer_subs populated from
+                    // current_peers above; entry exists.
+                    let health = *twcc_subs.get(peer_id).unwrap().borrow();
+                    let next = step_aggregate_layer_capacity(prev, health.as_ref(), &config, now);
+                    twcc_state.insert(*peer_id, next);
+                    let mut wanted = aggregate_state_wanted_upper_layers(next, &upper_layers);
+                    wanted.insert(floor.clone());
+                    per_peer.push(wanted);
+                }
+                aggregate_wanted_layers(per_peer)
+            };
+
+            // ---- Per-RID RR vote ----
+            // Same shape: no peers → no restriction. Per-peer
+            // wanted = floor + per-RID Wanted-state-projection
+            // for non-floor RIDs. Default per-RID state is
+            // Wanted, so a peer with no RR ever yet votes for
+            // every layer (no restriction).
+            let rr_union: HashSet<SimulcastRid> = if peer_ids.is_empty() {
+                current_rids.iter().cloned().collect()
+            } else {
+                let mut per_peer: Vec<HashSet<SimulcastRid>> = Vec::with_capacity(peer_ids.len());
+                for peer_id in &peer_ids {
+                    let health_map = rr_subs.get(peer_id).unwrap().borrow().clone();
+                    let mut peer_wanted: HashSet<SimulcastRid> = HashSet::new();
+                    peer_wanted.insert(floor.clone());
+                    for rid in &upper_layers {
+                        let key = (*peer_id, rid.clone());
+                        let prev = rr_state
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(LayerCapacityState::Wanted);
+                        let raw_health = health_map.get(rid);
+                        let prev_count = prev_measurement_count.get(&key).copied().unwrap_or(0);
+                        let fresh = fresh_health(raw_health, prev_count);
+                        let next = step_layer_capacity_state(prev, fresh, &config, now);
+                        rr_state.insert(key.clone(), next);
+                        if let Some(h) = raw_health {
+                            prev_measurement_count.insert(key, h.round_trip_time_measurements);
+                        }
+                        if layer_state_is_wanted(&next) {
+                            peer_wanted.insert(rid.clone());
+                        }
+                    }
+                    per_peer.push(peer_wanted);
+                }
+                aggregate_wanted_layers(per_peer)
+            };
+
+            // ---- Compose + diff + apply ----
+            let effective_wanted = compose_effective_wanted(
+                presence_active,
+                &twcc_union,
+                &rr_union,
+                &current_rids,
+                &pinned_layers,
+                &demanded_layers,
+            );
+
+            let actual_active: HashSet<SimulcastRid> = current_rids
+                .iter()
+                .filter(|rid| matches!(is_layer_paused(rid), Some(false)))
+                .cloned()
+                .collect();
+
+            let actions = diff_wanted_aggregate(&actual_active, &effective_wanted, &current_rids);
+            for action in actions {
+                on_action(action);
             }
         }
     })
@@ -2576,6 +2648,231 @@ mod tests {
 
     // ----- spawn_layer_policy_coordinator -----
 
+    /// Inert on-demand hooks for coordinator tests that only exercise
+    /// the always-on policy surface.
+    fn inert_on_demand_hooks() -> OnDemandStandbyHooks {
+        OnDemandStandbyHooks {
+            subscribed_ids: Box::new(Vec::new),
+            is_paused: Box::new(|_| None),
+            set_paused: Box::new(|_, _| {}),
+        }
+    }
+
+    // ----- tile-standby: on-demand reconcile (pure) -----
+
+    /// Recording hooks over a shared fake pause-state map, so reconcile
+    /// actions converge exactly like they would against the real pool.
+    struct RecordingOnDemand {
+        hooks: OnDemandStandbyHooks,
+        actions: Arc<std::sync::Mutex<Vec<(EncoderId, bool)>>>,
+    }
+
+    fn recording_on_demand_hooks(
+        ids: Vec<EncoderId>,
+        initially_paused: HashSet<EncoderId>,
+    ) -> RecordingOnDemand {
+        let actions: Arc<std::sync::Mutex<Vec<(EncoderId, bool)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let paused = Arc::new(std::sync::Mutex::new(initially_paused));
+        let paused_probe = Arc::clone(&paused);
+        let paused_apply = Arc::clone(&paused);
+        let actions_apply = Arc::clone(&actions);
+        RecordingOnDemand {
+            hooks: OnDemandStandbyHooks {
+                subscribed_ids: Box::new(move || ids.clone()),
+                is_paused: Box::new(move |id| Some(paused_probe.lock().unwrap().contains(id))),
+                set_paused: Box::new(move |id, pause| {
+                    if pause {
+                        paused_apply.lock().unwrap().insert(id.clone());
+                    } else {
+                        paused_apply.lock().unwrap().remove(id);
+                    }
+                    actions_apply.lock().unwrap().push((id.clone(), pause));
+                }),
+            },
+            actions,
+        }
+    }
+
+    fn h264_fed_id() -> EncoderId {
+        EncoderId::new(CodecKind::H264, SimulcastRid::federated())
+    }
+
+    fn snapshot(standby: bool, codec: CodecKind, rids: Vec<SimulcastRid>) -> PeerDemandSnapshot {
+        PeerDemandSnapshot {
+            video_standby: standby,
+            active_codec: codec,
+            active_rids: rids,
+        }
+    }
+
+    /// A subscribed on-demand slot whose only holder is on tiles pauses;
+    /// a second reconcile pass with unchanged inputs is convergent (no
+    /// duplicate action).
+    #[test]
+    fn on_demand_reconcile_pauses_when_all_holders_standby() {
+        let rec = recording_on_demand_hooks(vec![h264_fed_id()], HashSet::new());
+        let peers = vec![snapshot(
+            true,
+            CodecKind::H264,
+            vec![SimulcastRid::federated()],
+        )];
+        reconcile_on_demand_standby(&rec.hooks, &peers);
+        reconcile_on_demand_standby(&rec.hooks, &peers);
+        assert_eq!(
+            rec.actions.lock().unwrap().clone(),
+            vec![(h264_fed_id(), true)],
+            "one pause on the edge, none on the converged pass"
+        );
+    }
+
+    /// Any non-standby holder keeps a shared slot running (peer-level
+    /// isolation: one tile viewer must not starve a video viewer of the
+    /// same on-demand encoder), and resumes it if it was paused.
+    #[test]
+    fn on_demand_reconcile_keeps_slot_for_non_standby_holder() {
+        // Not paused + one active holder → untouched.
+        let rec = recording_on_demand_hooks(vec![h264_fed_id()], HashSet::new());
+        let peers = vec![
+            snapshot(true, CodecKind::H264, vec![SimulcastRid::federated()]),
+            snapshot(false, CodecKind::H264, vec![SimulcastRid::federated()]),
+        ];
+        reconcile_on_demand_standby(&rec.hooks, &peers);
+        assert!(rec.actions.lock().unwrap().is_empty());
+
+        // Paused (standby engaged earlier) + a holder leaves standby →
+        // resume. The pool's paused→active edge forces a keyframe
+        // (pinned by `pool_resume_layer_from_paused_sets_force_keyframe`),
+        // which is what the fallback-to-video SLA rides on.
+        let paused: HashSet<EncoderId> = std::iter::once(h264_fed_id()).collect();
+        let rec = recording_on_demand_hooks(vec![h264_fed_id()], paused);
+        reconcile_on_demand_standby(&rec.hooks, &peers);
+        assert_eq!(
+            rec.actions.lock().unwrap().clone(),
+            vec![(h264_fed_id(), false)],
+        );
+    }
+
+    /// A slot with no attributable holder is left alone — its lifecycle
+    /// belongs to the lease refcount, and pausing an encoder an unseen
+    /// consumer relies on would be the starvation bug. Codec and RID
+    /// must both match for attribution.
+    #[test]
+    fn on_demand_reconcile_skips_unattributed_slots() {
+        let rec = recording_on_demand_hooks(vec![h264_fed_id()], HashSet::new());
+        // Standby peer on a DIFFERENT codec/rid: not a holder.
+        let peers = vec![snapshot(
+            true,
+            CodecKind::Vp8,
+            vec![SimulcastRid::quarter()],
+        )];
+        reconcile_on_demand_standby(&rec.hooks, &peers);
+        // Zero peers at all: also untouched.
+        reconcile_on_demand_standby(&rec.hooks, &[]);
+        assert!(rec.actions.lock().unwrap().is_empty());
+    }
+
+    // ----- tile-standby: coordinator demand mask -----
+
+    /// End-to-end through the spawned coordinator: a tile-standby peer
+    /// contributes nothing to the demanded bound, so its only layer
+    /// pauses while a second (non-standby) peer's layer stays active;
+    /// clearing standby + kicking resumes it. This is the per-peer RTP
+    /// standby seam for the always-on bank.
+    #[tokio::test]
+    async fn spawn_coordinator_standby_peer_releases_only_its_layers() {
+        use std::sync::Mutex as StdMutex;
+
+        let peers: Arc<RwLock<HashMap<PeerId, Arc<WebRtcPeer>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        // Peer 1: local viewer on `f`. Peer 2: federated tile viewer on
+        // `q`, starting in video standby.
+        let local = Arc::new(WebRtcPeer::new_for_test(1, vec![SimulcastRid::full()]));
+        let federated = Arc::new(WebRtcPeer::new_for_test(2, vec![SimulcastRid::quarter()]));
+        federated.set_video_standby(true);
+        peers.write().await.insert(1, Arc::clone(&local));
+        peers.write().await.insert(2, Arc::clone(&federated));
+
+        let paused: Arc<StdMutex<HashSet<SimulcastRid>>> = Arc::new(StdMutex::new(HashSet::new()));
+        let paused_for_action = Arc::clone(&paused);
+        let on_action: Box<dyn Fn(CapacityAction) + Send + Sync> = Box::new(move |a| match a {
+            CapacityAction::PauseLayer(rid) => {
+                paused_for_action.lock().unwrap().insert(rid);
+            }
+            CapacityAction::ResumeLayer(rid) => {
+                paused_for_action.lock().unwrap().remove(&rid);
+            }
+        });
+        let get_current_rids: Box<dyn Fn() -> Vec<SimulcastRid> + Send + Sync> =
+            Box::new(vp8_three_layer_set);
+        let paused_for_probe = Arc::clone(&paused);
+        let is_layer_paused: LayerPauseProbe =
+            Box::new(move |rid| Some(paused_for_probe.lock().unwrap().contains(rid)));
+
+        let kick = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
+        let handle = spawn_layer_policy_coordinator(
+            Arc::clone(&peers),
+            get_current_rids,
+            is_layer_paused,
+            on_action,
+            inert_on_demand_hooks(),
+            Arc::clone(&kick),
+            CapacityPolicyConfig::default(),
+            shutdown.clone(),
+        );
+
+        // Converge: standby q-peer demands nothing, local f-peer keeps
+        // f — so exactly {h, q} pause.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let p = paused.lock().unwrap();
+                if p.contains(&SimulcastRid::quarter())
+                    && p.contains(&SimulcastRid::half())
+                    && !p.contains(&SimulcastRid::full())
+                {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                let p = paused.lock().unwrap().clone();
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!("standby peer's q (and undemanded h) must pause while f stays: {p:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Fallback edge: standby clears + kick → q resumes (f untouched,
+        // h stays paused — still undemanded).
+        federated.set_video_standby(false);
+        kick.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let p = paused.lock().unwrap();
+                if !p.contains(&SimulcastRid::quarter()) && !p.contains(&SimulcastRid::full()) {
+                    assert!(
+                        p.contains(&SimulcastRid::half()),
+                        "h stays paused: no peer demands it"
+                    );
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                let p = paused.lock().unwrap().clone();
+                shutdown.cancel();
+                let _ = handle.await;
+                panic!("clearing standby + kick must resume q: {p:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
     /// **Spawn-loop smoke test**: drive the coordinator through one
     /// `PAUSE_DEBOUNCE` window with no peers and verify it emits
     /// the expected `PauseLayer` actions when the presence policy
@@ -2624,6 +2921,8 @@ mod tests {
             get_current_rids,
             is_layer_paused,
             on_action,
+            inert_on_demand_hooks(),
+            Arc::new(Notify::new()),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
         );
@@ -2727,6 +3026,8 @@ mod tests {
             get_current_rids,
             is_layer_paused,
             on_action,
+            inert_on_demand_hooks(),
+            Arc::new(Notify::new()),
             CapacityPolicyConfig::default(),
             shutdown.clone(),
         );

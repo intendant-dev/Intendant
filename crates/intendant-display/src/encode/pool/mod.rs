@@ -1164,6 +1164,27 @@ impl EncoderPool {
             .collect()
     }
 
+    /// Snapshot the on-demand encoder IDs that currently have at least
+    /// one subscriber (`refcount > 0`) — the same active-encoder
+    /// universe [`Self::request_keyframe_all`] targets on the on-demand
+    /// side. Refcount-zero slots mid-teardown are excluded.
+    ///
+    /// Used by the layer-policy coordinator's tile-standby reconcile:
+    /// unlike the always-on bank (whose pause/resume the coordinator
+    /// already drives via the demanded-layer bound), on-demand slots
+    /// are lifecycle-tied to leases, so the coordinator needs their
+    /// live set to decide which slots every holder has put in video
+    /// standby. Returns a `Vec` (not a borrow) so callers never hold
+    /// the on-demand mutex across their loop body.
+    pub fn subscribed_on_demand_ids(&self) -> Vec<EncoderId> {
+        let on_demand = self.inner.on_demand.lock().unwrap();
+        on_demand
+            .iter()
+            .filter(|(_, slot)| slot.refcount > 0)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// **Phase 4d.0**: pause one encoder slot, identified by
     /// `(codec, rid)`. The slot's encoder thread keeps running and
     /// keeps draining its `i420_rx` broadcast subscription (so the
@@ -3424,6 +3445,46 @@ mod tests {
         assert!(
             pool.has_active_consumer(),
             "a single resumed layer re-establishes demand"
+        );
+    }
+
+    /// Tile-standby contract on the on-demand side: a paused on-demand
+    /// slot with a live subscriber is NOT an active consumer (so the
+    /// pool-feed bridge's F2 gate stops converting for a tile-only
+    /// session), while `subscribed_on_demand_ids` keeps listing it (the
+    /// lease — and therefore the encoder slot — is held through
+    /// standby; resume is a flag flip + forced keyframe, not an
+    /// encoder respawn).
+    #[tokio::test]
+    async fn paused_on_demand_slot_is_not_an_active_consumer_but_stays_subscribed() {
+        let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
+        assert!(pool.subscribed_on_demand_ids().is_empty());
+        assert!(!pool.has_active_consumer());
+
+        let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
+        let (_subs, lease) = pool.subscribe(&prefs).expect("subscribe");
+        let id = EncoderId::new(CodecKind::Vp8, SimulcastRid::full());
+        assert_eq!(pool.subscribed_on_demand_ids(), vec![id.clone()]);
+        assert!(pool.has_active_consumer());
+
+        assert!(pool.pause_layer(id.codec, id.rid.clone()));
+        assert!(
+            !pool.has_active_consumer(),
+            "a paused on-demand slot must not count as demand"
+        );
+        assert_eq!(
+            pool.subscribed_on_demand_ids(),
+            vec![id.clone()],
+            "standby holds the subscription; only the pause flag flips"
+        );
+
+        assert!(pool.resume_layer(id.codec, id.rid.clone()));
+        assert!(pool.has_active_consumer());
+
+        drop(lease);
+        assert!(
+            pool.subscribed_on_demand_ids().is_empty(),
+            "refcount-zero teardown must drop the slot from the listing"
         );
     }
 
