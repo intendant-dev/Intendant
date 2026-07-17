@@ -11,13 +11,42 @@
 use super::handle::AgendaHandle;
 use super::reminders::{
     plan, DueOccurrence, OccurrenceJournal, OccurrenceRecord, OccurrenceState, ReminderUrgency,
+    SpawnOccurrence,
 };
-use crate::event::AppEvent;
+use crate::event::{AppEvent, ControlMsg};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Upper bound between passes even with nothing scheduled: catches wall
 /// clock jumps (suspend/resume, NTP) that tokio's monotonic sleep cannot.
 const SAFETY_TICK: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Delegation-id namespace for scheduled-session dispatches. The task
+/// dispatcher acks a `StartTask` carrying this id with
+/// `TaskReceived { delegation_id, session_id }` and dedups repeats, which
+/// is exactly the RFC's "session creation is idempotent by occurrence id".
+const DELEGATION_PREFIX: &str = "agenda-occ-";
+
+/// In-flight scheduled-session bookkeeping (in-memory; the journal is the
+/// durable truth, and a restart resolves both maps fail-closed).
+#[derive(Default)]
+struct SchedulerState {
+    /// Dispatched, awaiting the `TaskReceived` receipt: occurrence →
+    /// its spawn facts.
+    awaiting: HashMap<String, SpawnOccurrence>,
+    /// Receipt seen, session running: session id → spawn facts.
+    running: HashMap<String, SpawnOccurrence>,
+}
+
+impl SchedulerState {
+    fn in_flight(&self) -> HashSet<String> {
+        self.awaiting
+            .keys()
+            .cloned()
+            .chain(self.running.values().map(|s| s.occurrence_id.clone()))
+            .collect()
+    }
+}
 
 pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -31,8 +60,11 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
                 return;
             }
         };
+        let mut state = SchedulerState::default();
+        let mut events = handle.bus().subscribe();
+        resolve_lost_sessions(&handle, &mut journal);
         loop {
-            let next_wake_ms = run_pass(&handle, &mut journal).await;
+            let next_wake_ms = run_pass(&handle, &mut journal, &mut state).await;
             let now = now_ms();
             let sleep_for = next_wake_ms
                 .map(|wake| std::time::Duration::from_millis(wake.saturating_sub(now)))
@@ -40,13 +72,51 @@ pub(crate) fn spawn_reminder_scheduler(handle: Arc<AgendaHandle>) -> tokio::task
             tokio::select! {
                 _ = handle.reminder_nudged() => {}
                 _ = tokio::time::sleep(sleep_for) => {}
+                event = events.recv() => match event {
+                    Ok(event) => observe_event(&handle, &mut journal, &mut state, &event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed events: receipts/completions may be gone.
+                        // The journal keeps ground truth; a restart (or the
+                        // next boot pass) resolves stragglers to Unknown.
+                        eprintln!("[agenda] scheduler lagged on the event bus");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
             }
         }
     })
 }
 
-/// One plan-and-deliver pass. Returns the next wake instant, if any.
-async fn run_pass(handle: &AgendaHandle, journal: &mut OccurrenceJournal) -> Option<u64> {
+/// Boot pass: `started`-without-terminal occurrences belong to a previous
+/// process — this executor lost sight of them. Fail-closed `Unknown`,
+/// never auto-retried (RFC §7.5); the sessions themselves, if alive, are
+/// still visible in the Sessions tab.
+fn resolve_lost_sessions(handle: &AgendaHandle, journal: &mut OccurrenceJournal) {
+    for (occurrence_id, session_id) in journal.started_unresolved() {
+        let _ = journal.append(&OccurrenceRecord {
+            v: 1,
+            at_ms: now_ms(),
+            occurrence_id: occurrence_id.clone(),
+            item_id: String::new(),
+            due_ms: 0,
+            state: OccurrenceState::Unknown,
+            urgency: None,
+            session_id: session_id.clone(),
+        });
+        eprintln!(
+            "[agenda] occurrence {occurrence_id} resolved to unknown \
+             (daemon restarted while session {} ran)",
+            session_id.as_deref().unwrap_or("?")
+        );
+    }
+}
+
+/// One plan-and-act pass. Returns the next wake instant, if any.
+async fn run_pass(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+) -> Option<u64> {
     if let Err(err) = journal.refresh_if_stale() {
         eprintln!("[agenda] occurrence journal refresh failed: {err}");
     }
@@ -57,7 +127,8 @@ async fn run_pass(handle: &AgendaHandle, journal: &mut OccurrenceJournal) -> Opt
         .quiet_hours
         .and_then(|quiet| quiet.ms_until_end(local_minute_of_day()))
         .map(|remaining| now + remaining);
-    let planned = plan(&items, journal, &policy, now, quiet_until);
+    let in_flight = state.in_flight();
+    let planned = plan(&items, journal, &policy, now, quiet_until, &in_flight);
 
     for occurrence in &planned.deliver {
         deliver_one(handle, journal, occurrence, now);
@@ -65,7 +136,196 @@ async fn run_pass(handle: &AgendaHandle, journal: &mut OccurrenceJournal) -> Opt
     if !planned.digest.is_empty() {
         deliver_digest(handle, journal, &planned.digest, now);
     }
+    for spawn in planned.spawn {
+        dispatch_session(handle, journal, state, spawn, now);
+    }
+    for missed in planned.missed_sessions {
+        resolve_spawnless(handle, journal, &missed, OccurrenceState::Missed, now,
+            "missed its window while the daemon was down — re-approve to reschedule");
+    }
+    for crashed in planned.crashed {
+        resolve_spawnless(handle, journal, &crashed, OccurrenceState::Unknown, now,
+            "crashed before launch confirmation — not retried; re-approve to reschedule");
+    }
     planned.next_wake_ms
+}
+
+/// Journal `prepared` (fsync'd) → dispatch a NORMAL supervised session via
+/// the task dispatcher's delegation-receipt lane. Nothing else — never raw
+/// actions: the session runs under its own agent-session principal, the
+/// daemon's autonomy/approval machinery, and the standard sandbox.
+fn dispatch_session(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    spawn: SpawnOccurrence,
+    now: u64,
+) {
+    if !session_record(journal, &spawn, now, OccurrenceState::Prepared, None) {
+        return; // cannot journal ⇒ do not spawn what we cannot dedup
+    }
+    handle
+        .bus()
+        .send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
+            task: spawn.goal.clone(),
+            orchestrate: Some(spawn.orchestrate),
+            direct: Some(true),
+            reference_frame_ids: Vec::new(),
+            display_target: None,
+            attachments: Vec::new(),
+            follow_up_id: None,
+            delegation_id: Some(format!("{DELEGATION_PREFIX}{}", spawn.occurrence_id)),
+        }));
+    state.awaiting.insert(spawn.occurrence_id.clone(), spawn);
+}
+
+/// Receipt + completion correlation, factored for tests.
+fn observe_event(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    state: &mut SchedulerState,
+    event: &AppEvent,
+) {
+    match event {
+        AppEvent::TaskReceived {
+            delegation_id,
+            session_id,
+        } => {
+            let Some(occurrence_id) = delegation_id.strip_prefix(DELEGATION_PREFIX) else {
+                return;
+            };
+            let Some(spawn) = state.awaiting.remove(occurrence_id) else {
+                return;
+            };
+            session_record(
+                journal,
+                &spawn,
+                now_ms(),
+                OccurrenceState::Started,
+                Some(session_id.clone()),
+            );
+            record_on_item(handle, &spawn, "started", Some(session_id.clone()), None);
+            state.running.insert(session_id.clone(), spawn);
+        }
+        AppEvent::TaskComplete {
+            session_id: Some(session_id),
+            reason,
+            summary,
+        } => {
+            let Some(spawn) = state.running.remove(session_id) else {
+                return;
+            };
+            session_record(
+                journal,
+                &spawn,
+                now_ms(),
+                OccurrenceState::Completed,
+                Some(session_id.clone()),
+            );
+            let note = summary.clone().unwrap_or_else(|| reason.clone());
+            record_on_item(handle, &spawn, "completed", Some(session_id.clone()), Some(note));
+        }
+        AppEvent::SessionEnded { session_id, reason, .. } => {
+            // Normal completion removes the entry first (supervised
+            // sessions park after done); reaching here running means the
+            // session stopped or errored before finishing.
+            let Some(spawn) = state.running.remove(session_id) else {
+                return;
+            };
+            session_record(
+                journal,
+                &spawn,
+                now_ms(),
+                OccurrenceState::Failed,
+                Some(session_id.clone()),
+            );
+            record_on_item(
+                handle,
+                &spawn,
+                "failed",
+                Some(session_id.clone()),
+                Some(reason.clone()),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Terminal resolution for occurrences that never spawned (missed window
+/// or pre-launch crash): journal + item write-back + owner notification.
+fn resolve_spawnless(
+    handle: &AgendaHandle,
+    journal: &mut OccurrenceJournal,
+    spawn: &SpawnOccurrence,
+    terminal: OccurrenceState,
+    now: u64,
+    why: &str,
+) {
+    if !session_record(journal, spawn, now, terminal, None) {
+        return;
+    }
+    let state = match terminal {
+        OccurrenceState::Missed => "missed",
+        _ => "unknown",
+    };
+    record_on_item(handle, spawn, state, None, Some(why.to_string()));
+    handle.bus().send(AppEvent::UserNotification {
+        session_id: None,
+        id: format!("agenda-session-{state}-{}", spawn.occurrence_id),
+        title: Some(format!("Scheduled session {state}")),
+        text: format!("{} — {}", spawn.goal, why),
+        urgency: crate::types::NotificationUrgency::Attention,
+        ts: now,
+    });
+}
+
+fn session_record(
+    journal: &mut OccurrenceJournal,
+    spawn: &SpawnOccurrence,
+    now: u64,
+    state: OccurrenceState,
+    session_id: Option<String>,
+) -> bool {
+    let result = journal.append(&OccurrenceRecord {
+        v: 1,
+        at_ms: now,
+        occurrence_id: spawn.occurrence_id.clone(),
+        item_id: spawn.item_id.clone(),
+        due_ms: spawn.fire_at_ms,
+        state,
+        urgency: None,
+        session_id,
+    });
+    if let Err(err) = &result {
+        eprintln!(
+            "[agenda] occurrence journal append failed ({state:?} {}): {err}",
+            spawn.occurrence_id
+        );
+    }
+    result.is_ok()
+}
+
+fn record_on_item(
+    handle: &AgendaHandle,
+    spawn: &SpawnOccurrence,
+    state: &str,
+    session_id: Option<String>,
+    note: Option<String>,
+) {
+    if let Err(err) = handle.record_occurrence(
+        &spawn.item_id,
+        &spawn.effect_id,
+        &spawn.occurrence_id,
+        state,
+        session_id,
+        note,
+    ) {
+        eprintln!(
+            "[agenda] occurrence write-back failed ({state} on {}): {err}",
+            spawn.item_id
+        );
+    }
 }
 
 /// Journal `prepared` (fsync'd) → notify → journal `delivered`. Muted
@@ -177,6 +437,7 @@ fn record(
         due_ms: occurrence.due_ms,
         state,
         urgency,
+        session_id: None,
     });
     if let Err(err) = &result {
         eprintln!(
@@ -267,7 +528,7 @@ mod tests {
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         let mut reminder_seen = false;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::UserNotification { id, urgency, .. } = event {
@@ -279,7 +540,7 @@ mod tests {
         assert!(reminder_seen, "overdue item must deliver");
 
         // Second pass: spent occurrence, no re-delivery.
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::UserNotification { .. }),
@@ -308,7 +569,7 @@ mod tests {
         handle
             .apply(AgendaCommand::Complete { id: item_id }, None)
             .unwrap();
-        let wake = run_pass(&handle, &mut journal).await;
+        let wake = run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         assert_eq!(wake, None, "no open due items ⇒ nothing scheduled");
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
@@ -324,7 +585,7 @@ mod tests {
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
 
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         let mut digest_seen = false;
         while let Ok(event) = rx.try_recv() {
             if let AppEvent::UserNotification { id, title, .. } = event {
@@ -335,7 +596,7 @@ mod tests {
         }
         assert!(digest_seen);
         // Spent: a second pass is silent.
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
         }
@@ -356,7 +617,7 @@ mod tests {
             .unwrap();
         let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
         let mut rx = handle.bus().subscribe();
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         while let Ok(event) = rx.try_recv() {
             assert!(
                 !matches!(event, AppEvent::UserNotification { .. }),
@@ -372,9 +633,251 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        run_pass(&handle, &mut journal).await;
+        run_pass(&handle, &mut journal, &mut SchedulerState::default()).await;
         while let Ok(event) = rx.try_recv() {
             assert!(!matches!(event, AppEvent::UserNotification { .. }));
         }
+    }
+
+    fn owner() -> Option<super::super::types::AgendaActor> {
+        Some(super::super::types::AgendaActor {
+            principal: Some("principal:root:dashboard".into()),
+            session_id: None,
+            kind: Some("dashboard".into()),
+        })
+    }
+
+    fn approved_effect_item(
+        handle: &AgendaHandle,
+        fire_at_ms: u64,
+    ) -> (String, String, String) {
+        let item = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Task,
+                    title: "scheduled work".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                },
+                None,
+            )
+            .unwrap();
+        let proposed = handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: item.id.clone(),
+                    goal: "run the nightly sweep".into(),
+                    fire_at_ms,
+                    orchestrate: false,
+                },
+                None,
+            )
+            .unwrap();
+        let digest = proposed.effects[0].digest.clone();
+        let effect_id = proposed.effects[0].effect_id.clone();
+        handle
+            .apply(
+                AgendaCommand::ApproveEffect {
+                    id: item.id.clone(),
+                    digest,
+                },
+                owner(),
+            )
+            .unwrap();
+        (item.id, effect_id, proposed.effects[0].digest.clone())
+    }
+
+    /// The A5 lifecycle at unit level: an approved due manifest dispatches
+    /// exactly one supervised-session StartTask (delegation-tagged), the
+    /// receipt journals `started`, completion journals `completed` and
+    /// writes the result back to the item; the spent occurrence never
+    /// re-fires. An unapproved proposal never dispatches anything.
+    #[tokio::test]
+    async fn approved_manifest_spawns_once_and_records_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
+
+        // An unapproved sibling proposal never fires.
+        let bystander = handle
+            .apply(
+                AgendaCommand::Add {
+                    kind: AgendaKind::Note,
+                    title: "unapproved".into(),
+                    body: String::new(),
+                    tags: Vec::new(),
+                    due_ms: None,
+                },
+                None,
+            )
+            .unwrap();
+        handle
+            .apply(
+                AgendaCommand::ProposeEffect {
+                    id: bystander.id.clone(),
+                    goal: "must not run".into(),
+                    fire_at_ms: now_ms() - 60_000,
+                    orchestrate: false,
+                },
+                None,
+            )
+            .unwrap();
+
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+
+        let mut dispatched = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(ControlMsg::StartTask {
+                task,
+                delegation_id: Some(delegation_id),
+                direct,
+                ..
+            }) = event
+            {
+                assert_eq!(direct, Some(true));
+                assert!(delegation_id.starts_with(DELEGATION_PREFIX));
+                dispatched.push((task, delegation_id));
+            }
+        }
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "exactly the approved manifest dispatches"
+        );
+        assert_eq!(dispatched[0].0, "run the nightly sweep");
+        let occurrence_id = dispatched[0]
+            .1
+            .strip_prefix(DELEGATION_PREFIX)
+            .unwrap()
+            .to_string();
+        assert!(state.awaiting.contains_key(&occurrence_id));
+
+        // Receipt → started, on the journal and the item.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: dispatched[0].1.clone(),
+                session_id: "sess-run".into(),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).started.as_deref(),
+            Some("sess-run")
+        );
+        let (items, _, _) = handle.snapshot();
+        let item = items.iter().find(|i| i.id == item_id).unwrap();
+        assert_eq!(item.effects[0].last_run.as_ref().unwrap().state, "started");
+
+        // Completion → terminal + result write-back.
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskComplete {
+                session_id: Some("sess-run".into()),
+                reason: "done".into(),
+                summary: Some("swept 4 certs".into()),
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).terminal,
+            Some(OccurrenceState::Completed)
+        );
+        let (items, _, _) = handle.snapshot();
+        let item = items.iter().find(|i| i.id == item_id).unwrap();
+        let run = item.effects[0].last_run.as_ref().unwrap();
+        assert_eq!(run.state, "completed");
+        assert_eq!(run.note.as_deref(), Some("swept 4 certs"));
+        assert_eq!(run.session_id.as_deref(), Some("sess-run"));
+
+        // Spent: another pass dispatches nothing.
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, AppEvent::ControlCommand(ControlMsg::StartTask { .. })),
+                "spent occurrence must not re-dispatch"
+            );
+        }
+    }
+
+    /// A session that stops or errors before finishing records `failed`;
+    /// an approved manifest whose window passed while the daemon was down
+    /// resolves `missed` without spawning.
+    #[tokio::test]
+    async fn failure_and_missed_window_paths_record_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let handle = Arc::new(AgendaHandle::new(
+            AgendaStore::open(dir.path()).unwrap(),
+            bus,
+            dir.path(),
+        ));
+        let mut journal = OccurrenceJournal::open(handle.dir()).unwrap();
+        let mut state = SchedulerState::default();
+        let (item_id, _, _) = approved_effect_item(&handle, now_ms() - 60_000);
+
+        run_pass(&handle, &mut journal, &mut state).await;
+        let occurrence_id = state.awaiting.keys().next().unwrap().clone();
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::TaskReceived {
+                delegation_id: format!("{DELEGATION_PREFIX}{occurrence_id}"),
+                session_id: "sess-dies".into(),
+            },
+        );
+        observe_event(
+            &handle,
+            &mut journal,
+            &mut state,
+            &AppEvent::SessionEnded {
+                session_id: "sess-dies".into(),
+                reason: "error".into(),
+                error_kind: None,
+            },
+        );
+        assert_eq!(
+            journal.progress(&occurrence_id).terminal,
+            Some(OccurrenceState::Failed)
+        );
+        let (items, _, _) = handle.snapshot();
+        let failed = items.iter().find(|i| i.id == item_id).unwrap();
+        assert_eq!(failed.effects[0].last_run.as_ref().unwrap().state, "failed");
+
+        // Missed window: approved 25h ago (past the 12h staleness default).
+        let (missed_item, _, _) = approved_effect_item(&handle, now_ms() - 25 * 3_600_000);
+        let mut rx = handle.bus().subscribe();
+        run_pass(&handle, &mut journal, &mut state).await;
+        let mut saw_start = false;
+        let mut saw_missed_note = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ControlCommand(ControlMsg::StartTask { .. }) => saw_start = true,
+                AppEvent::UserNotification { title, .. } => {
+                    if title.unwrap_or_default().contains("missed") {
+                        saw_missed_note = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(!saw_start, "missed windows never spawn");
+        assert!(saw_missed_note);
+        let (items, _, _) = handle.snapshot();
+        let missed = items.iter().find(|i| i.id == missed_item).unwrap();
+        assert_eq!(missed.effects[0].last_run.as_ref().unwrap().state, "missed");
     }
 }

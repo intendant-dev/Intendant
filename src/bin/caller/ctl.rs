@@ -1582,6 +1582,91 @@ async fn run_agenda(
             let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "schedule" => {
+            let args = parse_command_args(&raw[1..], &["--goal", "--at"], &["--orchestrate"])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda schedule requires an item id (a unique prefix is enough)",
+            )
+            .await?;
+            let goal = args
+                .one("--goal")
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+                .ok_or_else(|| "agenda schedule requires --goal TEXT".to_string())?;
+            let at = args
+                .one("--at")
+                .ok_or_else(|| "agenda schedule requires --at WHEN".to_string())?;
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("propose_effect".to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            map.insert("goal".to_string(), Value::String(goal.to_string()));
+            map.insert("fire_at_ms".to_string(), Value::from(parse_due_ms(at)?));
+            if args.has("--orchestrate") {
+                map.insert("orchestrate".to_string(), Value::Bool(true));
+            }
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+            println!(
+                "proposed — nothing fires until the owner approves the digest \
+                 (dashboard Agenda tab, or `agenda approve <id>` from an owner shell)"
+            );
+        }
+        "approve" => {
+            // Review-then-bind: without --digest this PRINTS the manifest
+            // and its digest for review; approving requires echoing the
+            // digest back, so what you approve is what you read.
+            let args = parse_command_args(&raw[1..], &["--digest"], &[])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda approve requires an item id (a unique prefix is enough)",
+            )
+            .await?;
+            let Some(digest) = args.one("--digest") else {
+                let (items, _) = agenda_fetch(client, config, Value::Object(Map::new())).await?;
+                let item = items
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    .ok_or_else(|| format!("item {id} not found"))?;
+                let Some(effect) = item
+                    .get("effects")
+                    .and_then(Value::as_array)
+                    .and_then(|effects| effects.first())
+                else {
+                    return Err(format!("{id} has no proposed scheduled session"));
+                };
+                println!("manifest under review for {id}:");
+                print_json(&effect["manifest"])?;
+                let digest = effect.get("digest").and_then(Value::as_str).unwrap_or("");
+                println!("\napprove exactly this revision with:\n  intendant ctl agenda approve {} --digest {digest}", &id[..12.min(id.len())]);
+                return Ok(());
+            };
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("approve_effect".to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            map.insert("digest".to_string(), Value::String(digest.to_string()));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
+        "revoke-schedule" => {
+            let args = parse_command_args(&raw[1..], &[], &[])?;
+            let id = agenda_resolve_id(
+                client,
+                config,
+                &args,
+                "agenda revoke-schedule requires an item id",
+            )
+            .await?;
+            let mut map = Map::new();
+            map.insert("op".to_string(), Value::String("revoke_effect".to_string()));
+            map.insert("id".to_string(), Value::String(id));
+            let response = call_tool(client, config, "agenda_op", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         "list" | "ls" => run_agenda_list(client, config, &raw[1..]).await?,
         "complete" | "done" => agenda_transition(client, config, "complete", &raw[1..]).await?,
         "reopen" => agenda_transition(client, config, "reopen", &raw[1..]).await?,

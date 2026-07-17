@@ -93,6 +93,97 @@ pub struct AgendaAnswer {
     pub(crate) kind: Option<String>,
 }
 
+/// A scheduled-session manifest (slice A5): the complete statement of
+/// what firing does — reviewed by the owner at approval time. Immutable
+/// per revision: [`manifest_digest`] binds the approval, and any edit
+/// mints a new digest that invalidates it. Fields are additive-only from
+/// here (sandbox/budget knobs arrive as later optional fields).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionManifest {
+    /// The task text the spawned session receives. Data under review —
+    /// never instructions to whoever reads the agenda.
+    pub(crate) goal: String,
+    /// When to fire (epoch ms). One-shot.
+    pub(crate) fire_at_ms: u64,
+    /// Orchestrate vs direct execution (defaults to direct).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) orchestrate: bool,
+}
+
+/// An owner's approval of one manifest revision. `digest` is the bound
+/// revision — the approval is void for any other bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaApproval {
+    pub(crate) digest: String,
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+}
+
+/// The latest occurrence outcome recorded against an effect (fold view
+/// of daemon-authored `record_occurrence` ops — full history in the log
+/// and the occurrence journal).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaRun {
+    pub(crate) occurrence_id: String,
+    /// `started` | `completed` | `failed` | `missed` | `unknown`.
+    pub(crate) state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+    pub(crate) at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+}
+
+/// A scheduled-session effect on an item — a separate object referencing
+/// the entry, per the ratified doctrine (never item fields). `effect_id`
+/// is the stable lineage identity; the digest names one revision. v1
+/// allows one session effect per item (the vocabulary supports more).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgendaEffect {
+    pub(crate) effect_id: String,
+    pub(crate) manifest: SessionManifest,
+    pub(crate) digest: String,
+    pub(crate) proposed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_principal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_kind: Option<String>,
+    /// Owner approval of exactly `digest`; cleared by any re-propose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval: Option<AgendaApproval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run: Option<AgendaRun>,
+}
+
+/// The digest an approval binds: effect identity + the manifest's
+/// canonical JSON (serde struct order is declaration order, stable).
+pub(crate) fn manifest_digest(
+    item_id: &str,
+    effect_id: &str,
+    manifest: &SessionManifest,
+) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"agenda-effect\0");
+    hasher.update(item_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(effect_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serde_json::to_string(manifest).unwrap_or_default().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Birth attribution carried on the item (from its `add` op).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgendaProvenance {
@@ -137,6 +228,10 @@ pub struct AgendaItem {
     /// (the log keeps every reply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) answer: Option<AgendaAnswer>,
+    /// Scheduled-session effects (A5). Separate objects referencing the
+    /// item; delivery/execution authority never rides item fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) effects: Vec<AgendaEffect>,
 }
 
 /// Field-level patch of presentation state (umbrella RFC §7.2: `Patch`
@@ -229,12 +324,37 @@ pub enum AgendaCommand {
         id: String,
         text: String,
     },
+    /// Propose (or revise) the item's scheduled-session manifest. Open to
+    /// every agenda writer — proposing carries no authority: nothing fires
+    /// without an owner-surface approval of the exact digest.
+    ProposeEffect {
+        id: String,
+        goal: String,
+        fire_at_ms: u64,
+        #[serde(default)]
+        orchestrate: bool,
+    },
+    /// Approve the current manifest revision by its digest. **An
+    /// owner-surface act** — the tenant edge refuses agent-session, peer,
+    /// and unattributed actors with a named denial.
+    ApproveEffect {
+        id: String,
+        digest: String,
+    },
+    /// Withdraw the approval (owner-surface, like granting it).
+    RevokeEffect {
+        id: String,
+    },
 }
 
 /// A durable op — the payload of one log line. Compatible with the
 /// umbrella RFC §7.2 vocabulary (`Answer` rides the `question` kind per
-/// §7.1); effect/occurrence/journal operations are reserved there and
-/// intentionally absent in v1.
+/// §7.1; `propose_effect`/`approve_effect`/`revoke_effect` are the lean
+/// projections of `ProposeEffect`/`ApproveEffectRevision`/
+/// `RevokeEffectApproval`, and `record_occurrence` of
+/// `RecordOccurrenceStarted`/`RecordOccurrenceResult`). `record_occurrence`
+/// deliberately has **no command twin**: only the daemon's scheduler
+/// authors it, so no external surface can forge run results.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AgendaOp {
@@ -266,6 +386,32 @@ pub(crate) enum AgendaOp {
         id: String,
         text: String,
     },
+    ProposeEffect {
+        id: String,
+        effect_id: String,
+        manifest: SessionManifest,
+    },
+    ApproveEffect {
+        id: String,
+        effect_id: String,
+        digest: String,
+    },
+    RevokeEffect {
+        id: String,
+        effect_id: String,
+    },
+    /// Daemon-authored occurrence outcome (scheduler only — see the enum
+    /// docs). Writes the run result back onto the item's effect.
+    RecordOccurrence {
+        id: String,
+        effect_id: String,
+        occurrence_id: String,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 impl AgendaOp {
@@ -277,7 +423,11 @@ impl AgendaOp {
             | AgendaOp::Complete { id }
             | AgendaOp::Reopen { id }
             | AgendaOp::Retire { id }
-            | AgendaOp::Answer { id, .. } => id,
+            | AgendaOp::Answer { id, .. }
+            | AgendaOp::ProposeEffect { id, .. }
+            | AgendaOp::ApproveEffect { id, .. }
+            | AgendaOp::RevokeEffect { id, .. }
+            | AgendaOp::RecordOccurrence { id, .. } => id,
         }
     }
 }
@@ -349,6 +499,7 @@ pub(crate) fn apply_op(
                     updated_ms: at_ms,
                     completed_ms: None,
                     answer: None,
+                    effects: Vec::new(),
                 },
             );
             None
@@ -418,6 +569,101 @@ pub(crate) fn apply_op(
                     None
                 }
             }
+        }
+        AgendaOp::ProposeEffect {
+            id,
+            effect_id,
+            manifest,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("propose_effect for unknown {id} ignored"));
+            };
+            let actor = rec.actor.clone().unwrap_or_default();
+            let effect = AgendaEffect {
+                effect_id: effect_id.clone(),
+                digest: manifest_digest(id, effect_id, manifest),
+                manifest: manifest.clone(),
+                proposed_ms: at_ms,
+                proposed_principal: actor.principal,
+                proposed_session_id: actor.session_id,
+                proposed_kind: actor.kind,
+                // A new revision voids any standing approval — the owner
+                // approved different bytes.
+                approval: None,
+                last_run: None,
+            };
+            match item.effects.iter_mut().find(|e| e.effect_id == *effect_id) {
+                Some(existing) => *existing = effect,
+                None => item.effects.push(effect),
+            }
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::ApproveEffect {
+            id,
+            effect_id,
+            digest,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("approve_effect for unknown {id} ignored"));
+            };
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
+            else {
+                return Some(format!("approve_effect for unknown effect on {id} ignored"));
+            };
+            if effect.digest != *digest {
+                return Some(format!(
+                    "approve_effect digest mismatch on {id} ignored (manifest superseded)"
+                ));
+            }
+            let actor = rec.actor.clone().unwrap_or_default();
+            effect.approval = Some(AgendaApproval {
+                digest: digest.clone(),
+                at_ms,
+                principal: actor.principal,
+                kind: actor.kind,
+            });
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RevokeEffect { id, effect_id } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("revoke_effect for unknown {id} ignored"));
+            };
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
+            else {
+                return Some(format!("revoke_effect for unknown effect on {id} ignored"));
+            };
+            effect.approval = None;
+            item.updated_ms = at_ms;
+            None
+        }
+        AgendaOp::RecordOccurrence {
+            id,
+            effect_id,
+            occurrence_id,
+            state,
+            session_id,
+            note,
+        } => {
+            let Some(item) = items.get_mut(id) else {
+                return Some(format!("record_occurrence for unknown {id} ignored"));
+            };
+            let Some(effect) = item.effects.iter_mut().find(|e| e.effect_id == *effect_id)
+            else {
+                return Some(format!(
+                    "record_occurrence for unknown effect on {id} ignored"
+                ));
+            };
+            effect.last_run = Some(AgendaRun {
+                occurrence_id: occurrence_id.clone(),
+                state: state.clone(),
+                session_id: session_id.clone(),
+                at_ms,
+                note: note.clone(),
+            });
+            item.updated_ms = at_ms;
+            None
         }
         AgendaOp::Answer { id, text } => {
             let Some(item) = items.get_mut(id) else {
