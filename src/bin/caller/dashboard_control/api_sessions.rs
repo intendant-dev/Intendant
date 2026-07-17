@@ -3020,6 +3020,7 @@ mod tests {
                             &hydrate_home,
                             requested_limit,
                         )
+                        .into()
                     },
                     tx,
                 );
