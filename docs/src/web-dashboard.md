@@ -154,7 +154,9 @@ window.qa = Object.assign(window.qa || {}, {
 Each entry is a cheap, side-effect-free function returning a
 JSON-serializable snapshot. Current probes: `qa.sessionsHydration()`
 (sessions-tab relationship-hydration termination, `40-session-launch.js`),
-`qa.sessionsFuel()` (new-session credential preflight, `55-files-ide.js`),
+`qa.sessionsFuel()` (new-session credential preflight,
+`55b-session-launch.js`), `qa.newSessionAgentPrefs()` (last-used
+launch-option prefill state, same fragment),
 and `qa.station()` — a pointer to `window.stationProbe`, which predates the
 namespace and keeps its legacy name (the validator's `--station-*` probes
 and smoke skills depend on it). `window.__intendantPaneDiag` above is the
@@ -563,7 +565,14 @@ directory is safe to delete; it rebuilds on the next scan.
   dropdowns for the model (version-safe aliases — `fable`, `opus`, `sonnet`,
   `haiku` — that the CLI resolves to the latest release, with a Custom-id escape
   for full model names), the permission mode, and the reasoning effort
-  (`low` … `max`).
+  (`low` … `max`). The backend pick, binary path, model ids, and effort
+  choices from the last launch submitted in this browser prefill the next
+  visit (per-browser localStorage; a remembered value that is no longer a
+  valid option — or a backend the daemon now reports missing — falls back
+  to the inherit default). The authority- and cost-shaped fields — sandbox,
+  approval policy, permission mode, managed context, context replay, Fast
+  tier — deliberately re-seed from the global Settings defaults on every
+  visit so a one-off escalation never becomes a sticky default.
 
 **Settings → Providers & models** exposes the daemon's global Codex and Claude
 defaults independently of whichever backend is currently selected. With an
