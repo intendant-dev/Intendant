@@ -295,16 +295,24 @@ Connect ever terminating TLS or seeing plaintext:
   `/api/dns/publish`). When a browser connects, the relay mints a
   single-use nonce, hands it to the daemon over the control channel, and
   the daemon **dials back** a data connection carrying that nonce. The
-  relay correlates the two and splices them 1:1.
+  relay correlates the two and splices them 1:1. On the daemon side the
+  tunnel opens a second connection to a dedicated, ephemeral,
+  loopback-only gateway ingress instead of the public gateway listener.
 - The browser's TLS handshake therefore completes end-to-end against the
   **daemon's own fleet certificate**. Connect moves only ciphertext.
 
 The relay is **availability-only**: it terminates no TLS, holds no
-certificate, mints no authority, and logs no plaintext. Routing a fleet
-SNI to a daemon does not change how the daemon classifies that
-connection — it still arrives bearing the fleet SNI, which the gateway
-already treats as discovery-only, so a relayed connection is refused at
-every protected route exactly as a direct one is.
+certificate, mints no authority, and logs no plaintext. The gateway
+records which listener accepted each connection before it parses TLS or
+HTTP. Connections from the relay-only ingress are always
+discovery-only: authority-free routes remain available as anonymous
+`role:none`, while protected HTTP/MCP/signaling routes and every
+WebSocket are refused. The tunnel's loopback last hop therefore cannot
+qualify for trusted-local authority even when the encrypted request
+contains `Host: localhost`; the existing fleet-SNI classification is an
+independent second gate. Non-TLS bytes are dropped before the gateway's
+raw ICE-TCP and cleartext-MCP demultiplexer, so the relay-only listener
+cannot reach either local lane.
 
 Enable it with the all-or-nothing `--relay-*` group (both flags or
 neither; default off, mirroring `--dns-*`):
@@ -333,8 +341,10 @@ Deployment notes:
 
 A daemon opts in through `[connect] relay_enabled` + `relay_endpoint`
 (see the configuration reference). It then holds the control channel,
-dials back browser connections into its own gateway, and publishes
-relay-mode fleet DNS while the tunnel is up.
+dials back browser connections into the gateway's private relay ingress,
+and publishes relay-mode fleet DNS while the tunnel is up. That ingress
+binds only to an ephemeral `127.0.0.1` port, is never advertised, and
+does not share the public listener's trusted-local classification.
 
 ## End-to-end transport validation
 

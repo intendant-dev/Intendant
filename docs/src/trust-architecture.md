@@ -54,11 +54,19 @@ squarely in the transport class (item 3) and does not enlarge Connect's trust.
 It routes a fleet name to a NAT'd daemon by peeking the TLS SNI and splicing
 ciphertext both ways — it terminates no TLS, holds no certificate, and sees no
 plaintext, so the browser's handshake completes end-to-end against the daemon's
-own fleet certificate. Because a relayed connection reaches the daemon bearing
-the same fleet SNI as a direct one, the gateway classifies it as discovery-only
-and refuses every protected route exactly as it does today. The relay is
-availability-only: at worst a compromised or coerced relay withholds or delays
-reachability, which is the denial-of-service Connect can already inflict.
+own fleet certificate. The daemon tunnel splices that ciphertext into a
+dedicated loopback-only gateway ingress, separate from the public listener.
+Which listener accepted the connection is immutable transport provenance: the
+gateway marks every such connection `ReachabilityRelay` before TLS or HTTP
+parsing, serves only authority-free discovery bytes under anonymous
+`role:none`, and refuses every protected HTTP, MCP, signaling, and WebSocket
+route. Thus neither the loopback address of the tunnel's last hop nor a
+browser-controlled `Host: localhost` can enter the trusted-local lane. Fleet
+SNI classification remains a second, independent discovery-only gate. The
+relay ingress also rejects non-TLS bytes before the gateway's raw ICE-TCP and
+cleartext-MCP demux. The relay is availability-only: at worst a compromised or
+coerced relay withholds, delays, or sends arbitrary TLS traffic to that
+authority-free ingress, which cannot mint a daemon principal or grant.
 
 Item 5 is the one the web platform will not let us escape. The browser binds
 code identity to *origin*, origin trust to TLS+DNS, and the server behind an

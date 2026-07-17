@@ -185,24 +185,33 @@ pub(crate) fn is_connect_dashboard_signaling_path(path: &str) -> bool {
 /// needs a verified client identity.
 /// TLS encryption, a bearer copied from the daemon page, and an
 /// `intendant://` Origin are transport/CSRF properties, not an IAM anchor.
-/// The local/debug exception requires all three facts the daemon can verify:
-/// a loopback socket peer, a loopback Host authority, and no reverse-proxy
-/// provenance headers. A proxy cannot inherit root merely because its upstream
-/// hop terminates on loopback.
+/// The local/debug exception requires all four facts the daemon can verify:
+/// the public gateway listener accepted the connection directly, its socket
+/// peer is loopback, its Host authority is loopback, and it carries no
+/// reverse-proxy provenance headers. A proxy or reachability-relay dial-back
+/// cannot inherit root merely because its last hop terminates on loopback.
 pub(crate) fn remote_dashboard_client_auth_missing(
+    gateway_ingress: GatewayIngress,
     peer_addr: std::net::SocketAddr,
     header_text: &str,
     tls_client_cert_fingerprint: Option<&str>,
     peer_identity: Option<&PeerConnectionIdentity>,
 ) -> bool {
-    !direct_loopback_dashboard_request(peer_addr, header_text)
+    !direct_loopback_dashboard_request(gateway_ingress, peer_addr, header_text)
         && tls_client_cert_fingerprint
             .map(str::trim)
             .is_none_or(str::is_empty)
         && peer_identity.is_none()
 }
 
-fn direct_loopback_dashboard_request(peer_addr: std::net::SocketAddr, header_text: &str) -> bool {
+fn direct_loopback_dashboard_request(
+    gateway_ingress: GatewayIngress,
+    peer_addr: std::net::SocketAddr,
+    header_text: &str,
+) -> bool {
+    if gateway_ingress != GatewayIngress::Direct {
+        return false;
+    }
     // A dual-stack wildcard listener reports a 127.0.0.1 client as
     // ::ffff:127.0.0.1 on several platforms. Canonicalize before the
     // loopback check so the trusted-local lane matches the actual network
@@ -699,18 +708,31 @@ mod tests {
         let remote = "192.0.2.44:4444".parse().unwrap();
         let local_headers = "GET /config HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
         assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             loopback,
             local_headers,
             None,
             None
         ));
+        assert!(
+            remote_dashboard_client_auth_missing(
+                GatewayIngress::ReachabilityRelay,
+                loopback,
+                local_headers,
+                None,
+                None,
+            ),
+            "a relay dial-back's loopback last hop must never synthesize trusted-local authority"
+        );
         assert!(remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             remote,
             local_headers,
             None,
             None
         ));
         assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             remote,
             "GET /config HTTP/1.1\r\nHost: daemon.example\r\n\r\n",
             Some("aa11"),
@@ -725,6 +747,7 @@ mod tests {
             record: None,
         };
         assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             remote,
             "GET /config HTTP/1.1\r\nHost: daemon.example\r\n\r\n",
             None,
@@ -743,24 +766,36 @@ mod tests {
             "GET /config HTTP/1.1\r\n\r\n",
         ] {
             assert!(
-                remote_dashboard_client_auth_missing(loopback, headers, None, None),
+                remote_dashboard_client_auth_missing(
+                    GatewayIngress::Direct,
+                    loopback,
+                    headers,
+                    None,
+                    None,
+                ),
                 "loopback upstream must not synthesize root for {headers:?}"
             );
         }
         for host in ["127.0.0.1:8765", "[::1]:8765", "LOCALHOST:8765"] {
             let headers = format!("GET /config HTTP/1.1\r\nHost: {host}\r\n\r\n");
             assert!(!remote_dashboard_client_auth_missing(
-                loopback, &headers, None, None
+                GatewayIngress::Direct,
+                loopback,
+                &headers,
+                None,
+                None
             ));
         }
         let mapped_loopback = "[::ffff:127.0.0.1]:4444".parse().unwrap();
         assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             mapped_loopback,
             "GET /config HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n",
             None,
             None,
         ));
         assert!(!remote_dashboard_client_auth_missing(
+            GatewayIngress::Direct,
             mapped_loopback,
             "GET /config HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:8765\r\n\r\n",
             None,

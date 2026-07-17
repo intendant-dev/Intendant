@@ -10,16 +10,19 @@
 //!     the fleet-DNS publishes. Each successful poll re-registers the tunnel.
 //!   - On a dial-back request (a single-use nonce), open a raw TCP connection
 //!     to the relay's passthrough port, announce the nonce, connect to this
-//!     daemon's own gateway on loopback, and splice bytes between them. The
-//!     browser's TLS therefore completes end-to-end against this daemon's
-//!     fleet certificate; the relay only ever moves ciphertext.
+//!     daemon's dedicated loopback-only relay ingress, and splice bytes
+//!     between them. The gateway tags connections accepted there as
+//!     reachability-relay provenance before TLS/HTTP parsing, so the local
+//!     dial-back hop cannot inherit trusted-local authority. The browser's TLS
+//!     still completes end-to-end against this daemon's fleet certificate; the
+//!     relay only ever moves ciphertext.
 //!   - Publish relay-mode fleet DNS so the fleet name resolves to the relay.
 //!
-//! No new authority: a relayed browser connection reaches the gateway bearing
-//! the fleet SNI, which the gateway already classifies as discovery-only. The
-//! relay changes reachability, not trust.
+//! No new authority: the dedicated ingress itself is discovery-only, and the
+//! fleet SNI remains an independent second gate. The relay changes
+//! reachability, not trust.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use reqwest::{Client, Url};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -47,9 +50,10 @@ const SPLICE_IDLE: Duration = Duration::from_secs(120);
 const SPLICE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Start the relay tunnel client when the config opts in. No-op otherwise.
-/// `gateway_port` is the daemon's own gateway TCP port — where dial-back
-/// connections are spliced so the fleet certificate serves the handshake.
-pub fn spawn_relay_tunnel_client(config: ConnectConfig, gateway_port: Option<u16>) {
+/// `gateway_ingress_addr` is the gateway's dedicated loopback-only relay
+/// listener. It serves the fleet-certificate handshake while preserving
+/// immutable relay provenance at the accept edge.
+pub fn spawn_relay_tunnel_client(config: ConnectConfig, gateway_ingress_addr: Option<SocketAddr>) {
     if !(config.enabled && config.relay_enabled) {
         return;
     }
@@ -63,11 +67,11 @@ pub fn spawn_relay_tunnel_client(config: ConnectConfig, gateway_port: Option<u16
         eprintln!("[relay] tunnel enabled but no relay_endpoint is configured");
         return;
     };
-    let Some(gateway_port) = gateway_port else {
-        eprintln!("[relay] tunnel enabled but the gateway port is unknown; not starting");
+    let Some(gateway_ingress_addr) = gateway_ingress_addr else {
+        eprintln!("[relay] tunnel enabled but its dedicated gateway ingress is unavailable");
         return;
     };
-    tokio::spawn(run_relay_tunnel(endpoint, gateway_port));
+    tokio::spawn(run_relay_tunnel(endpoint, gateway_ingress_addr));
     tokio::spawn(relay_dns_reassert_loop());
 }
 
@@ -83,7 +87,7 @@ async fn relay_dns_reassert_loop() {
     }
 }
 
-async fn run_relay_tunnel(relay_endpoint: String, gateway_port: u16) {
+async fn run_relay_tunnel(relay_endpoint: String, gateway_ingress_addr: SocketAddr) {
     let client = match Client::builder()
         .timeout(Duration::from_millis(CONTROL_POLL_TIMEOUT_MS + 10_000))
         .build()
@@ -112,7 +116,9 @@ async fn run_relay_tunnel(relay_endpoint: String, gateway_port: u16) {
                 backoff = BACKOFF_MIN;
                 let endpoint = relay_endpoint.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_dialback(&endpoint, gateway_port, &nonce).await {
+                    if let Err(error) =
+                        handle_dialback(&endpoint, gateway_ingress_addr, &nonce).await
+                    {
                         eprintln!("[relay] dial-back failed: {error}");
                     }
                 });
@@ -176,12 +182,14 @@ async fn poll_relay_next(
 }
 
 /// Dial back a browser connection: connect the relay's passthrough port,
-/// announce the nonce, connect this daemon's own gateway on loopback, and
-/// splice. The browser's ClientHello (fleet SNI and all) flows verbatim to the
-/// gateway, whose fleet certificate completes the handshake.
+/// announce the nonce, connect the daemon's dedicated loopback relay ingress,
+/// and splice. The browser's ClientHello (fleet SNI and all) flows verbatim to
+/// the gateway, whose fleet certificate completes the handshake. The
+/// dedicated accept edge, not any mutable byte in that ClientHello, records
+/// that the connection came through the relay.
 async fn handle_dialback(
     relay_endpoint: &str,
-    gateway_port: u16,
+    gateway_ingress_addr: SocketAddr,
     nonce: &str,
 ) -> Result<(), String> {
     let mut data = TcpStream::connect(relay_endpoint)
@@ -190,9 +198,9 @@ async fn handle_dialback(
     data.write_all(format!("{DIALBACK_MAGIC} {nonce}\n").as_bytes())
         .await
         .map_err(|e| format!("write dial-back hello: {e}"))?;
-    let gateway = TcpStream::connect(("127.0.0.1", gateway_port))
+    let gateway = TcpStream::connect(gateway_ingress_addr)
         .await
-        .map_err(|e| format!("connect loopback gateway :{gateway_port}: {e}"))?;
+        .map_err(|e| format!("connect dedicated gateway ingress {gateway_ingress_addr}: {e}"))?;
     splice(data, gateway).await;
     Ok(())
 }
@@ -249,14 +257,15 @@ mod tests {
     fn spawn_is_a_noop_when_relay_is_disabled() {
         // No panic, no task: disabled config returns immediately. (A running
         // tokio runtime is not required because we never spawn.)
-        spawn_relay_tunnel_client(relay_disabled(), Some(8765));
-        spawn_relay_tunnel_client(ConnectConfig::default(), Some(8765));
+        let ingress = Some(std::net::SocketAddr::from(([127, 0, 0, 1], 8765)));
+        spawn_relay_tunnel_client(relay_disabled(), ingress);
+        spawn_relay_tunnel_client(ConnectConfig::default(), ingress);
     }
 
-    /// The dial-back path splices the relay data connection to the loopback
-    /// gateway: bytes written by a fake "browser" at the relay end arrive at
-    /// the "gateway" end and vice versa, after the nonce hello is consumed by
-    /// the relay side.
+    /// The dial-back path splices the relay data connection to the dedicated
+    /// loopback gateway ingress: bytes written by a fake "browser" at the
+    /// relay end arrive at the "gateway" end and vice versa, after the nonce
+    /// hello is consumed by the relay side.
     #[tokio::test]
     async fn dialback_splices_relay_to_loopback_gateway() {
         // Stand in for the relay's passthrough port: accept one connection,
@@ -278,9 +287,13 @@ mod tests {
 
         // Drive the daemon dial-back side.
         let dial = tokio::spawn(async move {
-            handle_dialback(&relay_addr.to_string(), gateway_port, "the-nonce")
-                .await
-                .unwrap();
+            handle_dialback(
+                &relay_addr.to_string(),
+                std::net::SocketAddr::from(([127, 0, 0, 1], gateway_port)),
+                "the-nonce",
+            )
+            .await
+            .unwrap();
         });
 
         // The relay end: accept, verify the hello, then act as the browser.
