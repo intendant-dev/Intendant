@@ -10,12 +10,12 @@
 //! credentials are custody-managed off-box ([`custody_refusal`]).
 
 use super::*;
-use crate::claude_auth_ceremony::{
-    self, custody_refusal, CodeRefusal, StartRefusal, SUPPORTED_MODE,
-};
+use crate::auth_ceremony::{self, CodeRefusal, Provider, StartRefusal};
+use crate::claude_auth_ceremony::{self, custody_refusal, SUPPORTED_MODE};
 
-/// Mandated refusal copy for rendezvous-mediated clients.
-const HOSTED_REFUSAL: &str = "credential ceremonies require a trusted direct connection";
+/// Mandated refusal copy for rendezvous-mediated clients (shared with
+/// the Codex ceremony routes).
+pub(crate) const HOSTED_REFUSAL: &str = "credential ceremonies require a trusted direct connection";
 
 /// True when this request's session has hosted provenance
 /// ([`crate::access::iam::is_hosted_session`] when the IAM snapshot is on
@@ -30,7 +30,7 @@ pub(crate) fn request_authority_is_hosted(access: &RequestAuthority) -> bool {
     }
 }
 
-fn hosted_refusal_response() -> ApiResponse {
+pub(crate) fn hosted_refusal_response() -> ApiResponse {
     ApiResponse::json(
         403,
         JsonBody::Value(serde_json::json!({
@@ -69,7 +69,7 @@ pub(crate) fn claude_auth_start_api_response(
             200,
             JsonBody::Value(serde_json::json!({
                 "ok": true,
-                "status": claude_auth_ceremony::manager().status_value(),
+                "status": auth_ceremony::manager().status_value_for(Provider::Claude),
             })),
         ),
         Err(StartRefusal::Busy) => {
@@ -104,7 +104,7 @@ pub(crate) fn claude_auth_status_api_response(hosted_provenance: bool) -> ApiRes
     }
     ApiResponse::json(
         200,
-        JsonBody::Value(claude_auth_ceremony::manager().status_value()),
+        JsonBody::Value(auth_ceremony::manager().status_value_for(Provider::Claude)),
     )
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn claude_auth_code_api_response(
         },
         Err(e) => return ApiResponse::json_error(400, format!("invalid JSON body: {e}")),
     };
-    match claude_auth_ceremony::manager().submit_code(&code) {
+    match auth_ceremony::manager().submit_code(&code) {
         Ok(phase) => ApiResponse::json(
             200,
             JsonBody::Value(serde_json::json!({
@@ -141,7 +141,7 @@ pub(crate) fn claude_auth_cancel_api_response(hosted_provenance: bool) -> ApiRes
     if hosted_provenance {
         return hosted_refusal_response();
     }
-    match claude_auth_ceremony::manager().cancel() {
+    match auth_ceremony::manager().cancel() {
         Ok(()) => ApiResponse::json(
             200,
             JsonBody::Value(serde_json::json!({
@@ -207,10 +207,7 @@ mod tests {
     fn response_status_and_body(response: ApiResponse) -> (u16, serde_json::Value) {
         match response {
             ApiResponse::Json { status, body, .. } => {
-                let text = match body {
-                    JsonBody::Value(value) => value.to_string(),
-                    JsonBody::PreSerialized(text) => text,
-                };
+                let text = body.into_string();
                 (status, serde_json::from_str(&text).unwrap())
             }
             _ => panic!("claude-auth responses are JSON"),

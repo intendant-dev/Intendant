@@ -1277,6 +1277,35 @@ pub(crate) async fn serve_http_request(
                 )
                 .await;
             }
+            RouteHandlerId::CodexAuthStart => {
+                return handle_codex_auth_start(
+                    stream,
+                    route_body,
+                    project_root,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::CodexAuthStatus => {
+                return handle_codex_auth_status(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
+            RouteHandlerId::CodexAuthCancel => {
+                return handle_codex_auth_cancel(
+                    stream,
+                    &http_access_context,
+                    route.cors,
+                    fleet_cors_origin.as_deref(),
+                )
+                .await;
+            }
             RouteHandlerId::ExternalAgents => {
                 // The transport edge resolves the ambient home; the
                 // handler below it is path-parameterized (hermeticity
@@ -2244,6 +2273,29 @@ pub(crate) fn apply_cors_posture(
     }
 }
 
+/// Head of a shared-body JSON response — byte-identical to the head
+/// [`api_response_http_bytes`] renders for the same status/header
+/// tail/CORS posture (`with_content`'s Content-Type then
+/// Content-Length, the carried tail, the posture) — without the body:
+/// the write edge writes the shared bytes straight from the cache's
+/// allocation as a second write instead of concatenating a
+/// multi-hundred-KB body into a per-response buffer.
+fn shared_json_http_head(
+    status: u16,
+    body_len: usize,
+    headers: Vec<(&'static str, String)>,
+    cors: crate::gateway_routes::CorsPosture,
+    fleet_origin: Option<&str>,
+) -> Vec<u8> {
+    let mut http = HttpResponse::new(status_reason(status))
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body_len.to_string());
+    for (name, value) in headers {
+        http = http.header(name, value);
+    }
+    apply_cors_posture(http, cors, fleet_origin).into_bytes()
+}
+
 /// Head of a Stream-lane response: status line + Content-Type + the
 /// carried header tail under the row's CORS posture. Deliberately no
 /// Content-Length — the body is EOF-delimited (`Connection: close`)
@@ -2319,8 +2371,28 @@ pub(crate) async fn write_api_response(
                     ApiResponse::Stream { .. } => {}
                 }
             }
-            let bytes = api_response_http_bytes(buffered, cors, fleet_origin);
-            let write_ok = stream.write_all(&bytes).await.is_ok();
+            // Shared JSON bodies (the cached session list) skip the
+            // head+body concat: the head renders alone and the body
+            // writes as a second write from the cache's shared
+            // allocation, byte-identical on the wire (pinned by
+            // `shared_json_body_writes_the_buffered_bytes`).
+            let (bytes, shared_body) = match buffered {
+                ApiResponse::Json {
+                    status,
+                    body: JsonBody::Shared(body),
+                    headers,
+                } => (
+                    shared_json_http_head(status, body.len(), headers, cors, fleet_origin),
+                    Some(body),
+                ),
+                other => (api_response_http_bytes(other, cors, fleet_origin), None),
+            };
+            let mut write_ok = stream.write_all(&bytes).await.is_ok();
+            if write_ok {
+                if let Some(body) = &shared_body {
+                    write_ok = stream.write_all(body.as_bytes()).await.is_ok();
+                }
+            }
             if keep && write_ok {
                 stream.park().await;
             } else {
@@ -2345,6 +2417,52 @@ mod tests {
             None,
         );
         assert_eq!(String::from_utf8(rendered).unwrap(), legacy);
+    }
+
+    #[test]
+    fn shared_json_body_writes_the_buffered_bytes() {
+        // The write edge's shared fast path (head render + direct body
+        // write) must put the exact bytes on the wire that the buffered
+        // renderer concatenates for the same body — across every CORS
+        // posture and with a rewritten keep-alive tail.
+        let body: std::sync::Arc<str> = r#"[{"session_id":"shared"}]"#.into();
+        let keep_alive_headers = || {
+            let mut headers = vec![
+                ("Cache-Control", "no-cache".to_string()),
+                ("Connection", "close".to_string()),
+            ];
+            apply_keep_alive_header_tail(&mut headers);
+            headers
+        };
+        for (cors, fleet_origin) in [
+            (CorsPosture::OwnOrigin, None),
+            (CorsPosture::Public, None),
+            (CorsPosture::FleetOrLoopback, Some("https://fleet.example")),
+        ] {
+            for headers in [
+                vec![
+                    ("Cache-Control", "no-cache".to_string()),
+                    ("Connection", "close".to_string()),
+                ],
+                keep_alive_headers(),
+            ] {
+                let buffered = api_response_http_bytes(
+                    ApiResponse::Json {
+                        status: 200,
+                        body: JsonBody::PreSerialized(body.as_ref().to_string()),
+                        headers: headers.clone(),
+                    },
+                    cors,
+                    fleet_origin,
+                );
+                let mut split = shared_json_http_head(200, body.len(), headers, cors, fleet_origin);
+                split.extend_from_slice(body.as_bytes());
+                assert_eq!(
+                    String::from_utf8(split).unwrap(),
+                    String::from_utf8(buffered).unwrap()
+                );
+            }
+        }
     }
 
     #[test]

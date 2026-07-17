@@ -3915,8 +3915,10 @@ async fn api_sessions_response_from_home(
     // polls this with limit:'all' every 15s per tab, and the core already
     // serves the body from its serialized-string cache): a full validating
     // parse into `IgnoredAny` plus the leading-token check, then the body
-    // splices verbatim into a pre-serialized envelope.
-    let body = body.into_string();
+    // splices verbatim into a pre-serialized envelope. `as_text` borrows
+    // the cache's shared allocation — the splice below is this lane's
+    // only copy of the list text.
+    let body = body.as_text();
     let is_array = body.trim_start().starts_with('[')
         && serde_json::from_str::<serde::de::IgnoredAny>(&body).is_ok();
     if !is_array {
@@ -5617,12 +5619,15 @@ mod tests {
                 Residue,
                 Some(Op::CredentialsManage),
             ),
-            // The Claude sign-in ceremony is row-declared custody: every
-            // leaf (the status read included) gates on credentials.manage.
+            // The sign-in ceremonies are row-declared custody: every
+            // leaf (the status reads included) gates on credentials.manage.
             ("api_claude_auth_start", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_status", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_code", Row, Some(Op::CredentialsManage)),
             ("api_claude_auth_cancel", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_start", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_status", Row, Some(Op::CredentialsManage)),
+            ("api_codex_auth_cancel", Row, Some(Op::CredentialsManage)),
             (
                 "api_access_iam_upsert_user_client_grant",
                 Row,
@@ -6061,6 +6066,9 @@ mod tests {
             "api_claude_auth_status",
             "api_claude_auth_code",
             "api_claude_auth_cancel",
+            "api_codex_auth_start",
+            "api_codex_auth_status",
+            "api_codex_auth_cancel",
             "api_project_root",
             "api_external_agents",
             "api_displays",

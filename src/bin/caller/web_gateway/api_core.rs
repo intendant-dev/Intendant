@@ -128,17 +128,36 @@ pub(crate) enum ByteRange {
 
 /// JSON response body in whichever form the handler already has (risk
 /// R8: `PreSerialized` keeps today's string-building hot paths
-/// allocation-identical; `Value` is for structured code).
+/// allocation-identical; `Value` is for structured code; `Shared` is a
+/// refcounted pre-serialized body handed out by a response cache — the
+/// session list — so lanes borrow or write it without copying the
+/// multi-hundred-KB text per request).
 pub(crate) enum JsonBody {
     PreSerialized(String),
+    Shared(std::sync::Arc<str>),
     Value(serde_json::Value),
 }
 
 impl JsonBody {
+    /// Owned serialized text. `Shared` copies here — reach for
+    /// [`Self::as_text`] (read-only consumers) or the HTTP write
+    /// boundary's shared fast path when the copy matters.
     pub(crate) fn into_string(self) -> String {
         match self {
             JsonBody::PreSerialized(body) => body,
+            JsonBody::Shared(body) => body.as_ref().to_string(),
             JsonBody::Value(value) => value.to_string(),
+        }
+    }
+
+    /// Serialized text for read-only consumers: borrows when the body
+    /// is already serialized (`PreSerialized`, `Shared`); serializes
+    /// `Value` once.
+    pub(crate) fn as_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            JsonBody::PreSerialized(body) => std::borrow::Cow::Borrowed(body),
+            JsonBody::Shared(body) => std::borrow::Cow::Borrowed(body),
+            JsonBody::Value(value) => std::borrow::Cow::Owned(value.to_string()),
         }
     }
 }
@@ -285,10 +304,16 @@ mod tests {
     }
 
     #[test]
-    fn json_body_serializes_identically_from_both_forms() {
+    fn json_body_serializes_identically_from_all_forms() {
         let value = serde_json::json!({ "ok": true, "n": 7 });
-        let pre = JsonBody::PreSerialized(value.to_string());
+        let serialized = value.to_string();
+        let pre = JsonBody::PreSerialized(serialized.clone());
+        let shared = JsonBody::Shared(std::sync::Arc::from(serialized.as_str()));
+        assert_eq!(pre.as_text(), serialized);
+        assert_eq!(shared.as_text(), serialized);
+        assert_eq!(JsonBody::Value(value.clone()).as_text(), serialized);
         assert_eq!(pre.into_string(), JsonBody::Value(value).into_string());
+        assert_eq!(shared.into_string(), serialized);
     }
 
     #[test]
