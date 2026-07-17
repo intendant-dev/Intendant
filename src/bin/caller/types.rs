@@ -711,7 +711,11 @@ pub enum OutboundEvent {
     ModelResponseDelta {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
-        text: String,
+        /// Shared with `AppEvent::ModelResponseDelta` so the conversion is a
+        /// refcount bump. serde (with the `rc` feature) serializes `Arc<str>`
+        /// exactly like `String` — a plain JSON string — so the wire format
+        /// is unchanged.
+        text: std::sync::Arc<str>,
     },
     AgentStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]

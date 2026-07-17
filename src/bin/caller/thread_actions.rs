@@ -3188,9 +3188,10 @@ pub(crate) fn handle_idle_codex_subagent_event(
             // a Codex subagent child never re-keys the session.
         }
         external_agent::AgentEvent::MessageDelta { text } => {
-            config
-                .bus
-                .send(AppEvent::ModelResponseDelta { session_id, text });
+            config.bus.send(AppEvent::ModelResponseDelta {
+                session_id,
+                text: text.into(),
+            });
         }
         external_agent::AgentEvent::Message { text } => {
             persist_external_model_response_for_session_if_needed(

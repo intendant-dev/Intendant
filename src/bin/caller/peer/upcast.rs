@@ -678,7 +678,9 @@ impl AppEventUpcaster {
                 vec![PeerEvent::Message {
                     id,
                     role: MessageRole::Assistant,
-                    content: MessageContent::Text { text: text.clone() },
+                    content: MessageContent::Text {
+                        text: text.to_string(),
+                    },
                     partial: true,
                 }]
             }
@@ -2111,7 +2113,9 @@ impl WireEventUpcaster {
                 vec![PeerEvent::Message {
                     id,
                     role: MessageRole::Assistant,
-                    content: MessageContent::Text { text: text.clone() },
+                    content: MessageContent::Text {
+                        text: text.to_string(),
+                    },
                     partial: true,
                 }]
             }

@@ -714,7 +714,7 @@ mod tests {
         for _ in 0..10_000 {
             bus.send(AppEvent::ModelResponseDelta {
                 session_id: Some("flood".to_string()),
-                text: "x".to_string(),
+                text: "x".into(),
             });
         }
         bus.send(AppEvent::DoneSignal {
@@ -724,7 +724,7 @@ mod tests {
         for _ in 0..5_000 {
             bus.send(AppEvent::ModelResponseDelta {
                 session_id: Some("flood".to_string()),
-                text: "x".to_string(),
+                text: "x".into(),
             });
         }
 
