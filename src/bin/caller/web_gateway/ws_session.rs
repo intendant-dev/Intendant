@@ -155,13 +155,16 @@ pub(crate) const TERMINAL_FORWARD_LANE_CAP: usize = 16;
 /// the daemon -- only the resolved `you|other|unclaimed` state does.
 ///
 /// Two live-update guarantees ride here:
-/// - **Bootstrap ordering:** live broadcast events stay gated until the
-///   listener's bootstrap frames (queued on the direct lane before this task
-///   spawns) have drained — `bootstrap_flushed_rx` fires after the last
-///   enqueue, and the `biased` select drains the direct lane first, so no
-///   live event can precede or interleave the bootstrap. Heartbeats are
-///   unaffected: protocol pings ride the tungstenite stream itself and the
-///   direct/authority lanes are never gated.
+/// - **Bootstrap ordering:** live broadcast + authority events stay gated
+///   until the listener's bootstrap frames have drained. The task spawns
+///   *before* bootstrap generation and streams each frame as the listener
+///   queues it; `bootstrap_flushed_rx` fires after the last enqueue, and
+///   the `biased` select serves the direct lane ahead of the flush arm, so
+///   no live event can precede or interleave the bootstrap. A flush sender
+///   dropped without firing means generation died mid-bootstrap — possibly
+///   after frames reached the wire — and fails closed to a socket close.
+///   Heartbeats are unaffected: protocol pings ride the tungstenite stream
+///   itself and the direct lane is never gated.
 /// - **Loss visibility:** a lagged broadcast receiver no longer skips
 ///   silently — the connection gets an `event_gap` frame (same `skipped`
 ///   payload the tunnel's `event_gap` carries) followed by a cached-state
@@ -248,13 +251,27 @@ pub(crate) async fn ws_outbound_task(
                     None => terminal_lane_open = false,
                 }
             }
-            _ = &mut bootstrap_flushed_rx, if !bootstrap_flushed => {
-                // Fired after the listener queued the last bootstrap frame
-                // (a dropped sender reads the same way). The biased arm
-                // order above guarantees those frames drained before this
-                // branch can win, so the broadcast lane opens exactly at
-                // the bootstrap/live boundary.
-                bootstrap_flushed = true;
+            res = &mut bootstrap_flushed_rx, if !bootstrap_flushed => {
+                match res {
+                    Ok(()) => {
+                        // Fired after the listener queued the last bootstrap
+                        // frame. The biased arm order above guarantees those
+                        // frames drained before this branch can win, so the
+                        // broadcast lane opens exactly at the bootstrap/live
+                        // boundary.
+                        bootstrap_flushed = true;
+                    }
+                    Err(_) => {
+                        // Sender dropped without firing: bootstrap generation
+                        // died mid-way. This task spawns ahead of generation,
+                        // so part of the bootstrap may already be on the wire
+                        // — fail closed and end the connection rather than
+                        // follow a partial bootstrap with live events.
+                        let _ = ws_tx.send(Message::Close(None)).await;
+                        session_cancel.cancel();
+                        break;
+                    }
+                }
             }
             msg = outbound_rx.recv(), if bootstrap_flushed => {
                 if !grant.opening_authority_is_current() {
@@ -339,7 +356,14 @@ pub(crate) async fn ws_outbound_task(
                     }
                 }
             }
-            msg = authority_change_rx.recv() => {
+            // Gated like the broadcast lane: the writer is live during
+            // bootstrap generation, and an ungated authority change could
+            // beat the deferred bootstrap authority snapshot (computed
+            // early, queued after log replay) onto the wire — the stale
+            // snapshot would then overwrite the newer live state. Changes
+            // buffer in the receiver until the flush; `is_current` skips
+            // superseded revisions on drain, and the Lagged arm re-snapshots.
+            msg = authority_change_rx.recv(), if bootstrap_flushed => {
                 if !grant.opening_authority_is_current() {
                     let _ = ws_tx.send(Message::Close(None)).await;
                     session_cancel.cancel();
@@ -2719,5 +2743,264 @@ mod signaling_ownership_tests {
             !guard(),
             "a view-only display offer must not admit input or clipboard mutation"
         );
+    }
+}
+
+#[cfg(test)]
+mod outbound_bootstrap_ordering_tests {
+    use super::*;
+
+    /// Minimal display backend for the registry-backed authority test
+    /// (same shape as `input_authorizer_cache_tests`' local backend).
+    struct OrderingTestDisplayBackend;
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for OrderingTestDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, crate::error::CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn kind(&self) -> &'static str {
+            "outbound-ordering-test"
+        }
+    }
+
+    struct OutboundHarness {
+        broadcast_tx: broadcast::Sender<String>,
+        direct_tx: mpsc::UnboundedSender<String>,
+        /// Held open: the listener keeps the terminal lane's sender alive
+        /// (it moves into the inbound task) — dropping it here would close
+        /// the lane, which is not the mid-bootstrap shape under test.
+        _terminal_tx: mpsc::Sender<String>,
+        authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+        flush_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        client: tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Handshake a real client<->server WebSocket over an in-memory duplex
+    /// and spawn `ws_outbound_task` on the server's write half — the exact
+    /// early-spawn shape the listener uses: the writer is already running
+    /// while the "bootstrap" (the test body) is still queueing frames.
+    async fn spawn_outbound_harness(
+        session_registry: Option<crate::display::SharedSessionRegistry>,
+        display_input_authority: Arc<DisplayInputAuthority>,
+    ) -> OutboundHarness {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let (server_ws, client_ws) = tokio::join!(
+            tokio_tungstenite::accept_async(DemuxStream::new(Box::pin(server_io))),
+            tokio_tungstenite::client_async("ws://intendant.test/ws", client_io),
+        );
+        let server_ws = server_ws.expect("server handshake");
+        let (client_ws, _response) = client_ws.expect("client handshake");
+        let (ws_tx, mut server_rx) = server_ws.split();
+        // The read half normally lives in ws_inbound_task; parking it in a
+        // task keeps protocol frames (client close replies) drained without
+        // tearing the stream down under the writer.
+        tokio::spawn(async move { while let Some(Ok(_)) = server_rx.next().await {} });
+
+        let (broadcast_tx, outbound_rx) = broadcast::channel(64);
+        let (direct_tx, direct_rx) = mpsc::unbounded_channel();
+        let (terminal_tx, terminal_rx) = mpsc::channel(TERMINAL_FORWARD_LANE_CAP);
+        let (authority_change_tx, authority_change_rx) = broadcast::channel(64);
+        let (flush_tx, flush_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(ws_outbound_task(
+            outbound_rx,
+            direct_rx,
+            terminal_rx,
+            ws_tx,
+            authority_change_rx,
+            "conn-under-test".to_string(),
+            display_input_authority,
+            session_registry,
+            crate::dashboard_control::DashboardBootstrapCaches::default(),
+            flush_rx,
+            crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+            CancellationToken::new(),
+        ));
+        OutboundHarness {
+            broadcast_tx,
+            direct_tx,
+            _terminal_tx: terminal_tx,
+            authority_change_tx,
+            flush_tx: Some(flush_tx),
+            client: client_ws,
+            task,
+        }
+    }
+
+    /// Next text frame the client receives, strictly in arrival order (no
+    /// skipping), so ordering assertions stay exact.
+    async fn next_client_json(
+        client: &mut tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) -> serde_json::Value {
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+                .await
+                .expect("timed out waiting for a frame")
+                .expect("stream ended")
+                .expect("websocket error");
+            match msg {
+                Message::Text(text) => {
+                    return serde_json::from_str(&text).expect("text frame is JSON")
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("expected a text frame, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_stays_gated_until_flush_with_writer_live_mid_bootstrap() {
+        let mut h = spawn_outbound_harness(None, Arc::new(DisplayInputAuthority::default())).await;
+
+        // The first bootstrap frame streams immediately — before the
+        // "generation" (this test body) finishes, long before the flush.
+        h.direct_tx
+            .send(serde_json::json!({"t": "bootstrap", "n": 1}).to_string())
+            .unwrap();
+        assert_eq!(next_client_json(&mut h.client).await["n"], 1);
+
+        // The direct lane is now provably empty (frame 1 observed on the
+        // client) and the flush has not fired: a live broadcast event must
+        // not reach the wire yet.
+        h.broadcast_tx
+            .send(serde_json::json!({"event": "live", "n": 99}).to_string())
+            .unwrap();
+        // Give a broken (ungated) writer every chance to leak the event.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // A later bootstrap frame must still beat the buffered live event.
+        h.direct_tx
+            .send(serde_json::json!({"t": "bootstrap", "n": 2}).to_string())
+            .unwrap();
+        assert_eq!(
+            next_client_json(&mut h.client).await["n"],
+            2,
+            "every bootstrap frame must precede any live broadcast event"
+        );
+
+        // Flush opens the broadcast lane; the buffered event drains now.
+        h.flush_tx.take().unwrap().send(()).unwrap();
+        assert_eq!(next_client_json(&mut h.client).await["n"], 99);
+
+        h.task.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_flush_sender_fails_closed_instead_of_leaking_live_events() {
+        let mut h = spawn_outbound_harness(None, Arc::new(DisplayInputAuthority::default())).await;
+
+        h.direct_tx
+            .send(serde_json::json!({"t": "bootstrap", "n": 1}).to_string())
+            .unwrap();
+        assert_eq!(next_client_json(&mut h.client).await["n"], 1);
+
+        // A live event is pending when bootstrap generation "dies": the
+        // flush sender drops without firing.
+        h.broadcast_tx
+            .send(serde_json::json!({"event": "live", "n": 99}).to_string())
+            .unwrap();
+        drop(h.flush_tx.take());
+
+        // The connection must close without ever surfacing the live event —
+        // a partial bootstrap is never followed by live traffic.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match h.client.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        panic!("no frame may follow a partial bootstrap, got {text}")
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await
+        .expect("connection should close after the flush sender is dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), h.task)
+            .await
+            .expect("outbound task should exit")
+            .expect("outbound task should not panic");
+    }
+
+    #[tokio::test]
+    async fn authority_changes_hold_until_flush_so_deferred_snapshot_stays_last() {
+        let session_registry: crate::display::SharedSessionRegistry = Arc::new(
+            tokio::sync::RwLock::new(crate::display::SessionRegistry::new()),
+        );
+        session_registry.write().await.insert(
+            7,
+            Arc::new(crate::display::DisplaySession::new(
+                7,
+                Arc::new(OrderingTestDisplayBackend),
+            )),
+        );
+        let authority = Arc::new(DisplayInputAuthority::default());
+        let mut h = spawn_outbound_harness(Some(session_registry), Arc::clone(&authority)).await;
+
+        h.direct_tx
+            .send(serde_json::json!({"t": "bootstrap", "n": 1}).to_string())
+            .unwrap();
+        assert_eq!(next_client_json(&mut h.client).await["n"], 1);
+
+        // Another connection claims input authority mid-generation. Its
+        // personalized change must not beat the (already computed, still
+        // queued) bootstrap authority snapshot onto the wire.
+        let (other_tx, _other_rx) = mpsc::unbounded_channel();
+        apply_grant_input_authority(
+            7,
+            "some-other-connection".to_string(),
+            other_tx,
+            &authority,
+            &h.authority_change_tx,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The deferred bootstrap snapshot (stale by construction — it was
+        // computed before the claim) drains first...
+        h.direct_tx
+            .send(
+                serde_json::json!({
+                    "t": "display_input_authority_state",
+                    "display_id": 7,
+                    "state": "unclaimed",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let snapshot = next_client_json(&mut h.client).await;
+        assert_eq!(snapshot["t"], "display_input_authority_state");
+        assert_eq!(
+            snapshot["state"], "unclaimed",
+            "the queued bootstrap snapshot must precede any live authority frame"
+        );
+
+        // ...and the buffered live change lands after the flush, so the
+        // newer state wins on the client.
+        h.flush_tx.take().unwrap().send(()).unwrap();
+        let live = next_client_json(&mut h.client).await;
+        assert_eq!(live["t"], "display_input_authority_state");
+        assert_eq!(live["display_id"], 7);
+        assert_eq!(live["state"], "other");
+
+        h.task.abort();
     }
 }
