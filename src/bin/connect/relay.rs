@@ -832,6 +832,12 @@ async fn read_dialback_nonce(stream: &mut TcpStream) -> Option<String> {
     Some(nonce.to_string())
 }
 
+/// Interval between re-peeks while waiting for a fragmented ClientHello to
+/// complete. `peek` does not consume, so the buffered bytes keep the socket
+/// readable — polling on a fixed interval (rather than on readability) is what
+/// keeps a stalled partial ClientHello from spinning the CPU.
+const RELAY_CLIENT_HELLO_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Peek a complete ClientHello (up to a cap / timeout) and return its SNI.
 /// Handles fragmented ClientHellos by re-peeking as more bytes arrive.
 async fn peek_sni(stream: &TcpStream) -> Option<String> {
@@ -854,20 +860,12 @@ async fn peek_sni(stream: &TcpStream) -> Option<String> {
                 if tokio::time::Instant::now() >= deadline {
                     return None;
                 }
-                // Wait for more bytes to land, then re-peek.
-                if tokio::time::timeout(Duration::from_millis(50), readable(stream))
-                    .await
-                    .is_err()
-                {
-                    // Nothing new yet; loop re-checks the deadline.
-                }
+                // Poll on a fixed interval: peeked bytes stay buffered, so
+                // waiting on readability would busy-loop until the deadline.
+                tokio::time::sleep(RELAY_CLIENT_HELLO_POLL_INTERVAL).await;
             }
         }
     }
-}
-
-async fn readable(stream: &TcpStream) {
-    let _ = stream.readable().await;
 }
 
 /// Bidirectional byte splice with a per-direction byte cap and idle teardown.
@@ -1141,6 +1139,26 @@ mod tests {
         let (mut client, mut server) = connected_pair().await;
         client.write_all(b"NOPE abc\n").await.unwrap();
         assert_eq!(read_dialback_nonce(&mut server).await, None);
+    }
+
+    #[tokio::test]
+    async fn peek_sni_reassembles_a_fragmented_client_hello() {
+        let (mut client, server) = connected_pair().await;
+        let hello = build_client_hello(Some("d-frag.fleet.example.test"));
+        let mid = hello.len() / 2;
+        tokio::spawn(async move {
+            client.write_all(&hello[..mid]).await.unwrap();
+            // Land the remainder a few poll intervals later, exercising the
+            // re-peek path across TCP segments.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            client.write_all(&hello[mid..]).await.unwrap();
+            // Keep the peer open so the peeked bytes stay buffered.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let sni = tokio::time::timeout(Duration::from_secs(5), peek_sni(&server))
+            .await
+            .expect("peek completes");
+        assert_eq!(sni.as_deref(), Some("d-frag.fleet.example.test"));
     }
 
     // ── Registration / auth on the control channel ──────────────────────────
