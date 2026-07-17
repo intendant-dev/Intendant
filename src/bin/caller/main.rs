@@ -18,6 +18,7 @@ mod connect_rendezvous;
 mod context_rewind;
 mod control;
 mod control_plane;
+mod coordination;
 pub(crate) use intendant_core::conversation;
 mod credential_audit;
 mod credential_egress;
