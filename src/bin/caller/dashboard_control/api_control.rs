@@ -1919,9 +1919,7 @@ pub(crate) async fn api_codex_auth_status_response(
 ) -> serde_json::Value {
     frame_api_response(
         id,
-        crate::web_gateway::codex_auth_status_api_response(control_grant_is_hosted(
-            &runtime.grant,
-        )),
+        crate::web_gateway::codex_auth_status_api_response(control_grant_is_hosted(&runtime.grant)),
         "codex auth status",
     )
 }
@@ -1932,9 +1930,7 @@ pub(crate) async fn api_codex_auth_cancel_response(
 ) -> serde_json::Value {
     frame_api_response(
         id,
-        crate::web_gateway::codex_auth_cancel_api_response(control_grant_is_hosted(
-            &runtime.grant,
-        )),
+        crate::web_gateway::codex_auth_cancel_api_response(control_grant_is_hosted(&runtime.grant)),
         "codex auth cancel",
     )
 }

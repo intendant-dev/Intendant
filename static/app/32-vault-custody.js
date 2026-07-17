@@ -1531,183 +1531,295 @@ function renderAccessCustodySection() {
   }
 }
 
-/* ── Claude sign-in ceremony ──
-   The guided `claude auth login` card (/api/claude-auth/*): the daemon
-   runs the CLI's OAuth ceremony on a private PTY; this card walks the
-   owner through it — open the sign-in URL in THIS browser, paste the
-   code Anthropic shows, done. The PKCE verifier and the token exchange
-   stay inside the CLI on the daemon; this page only ever sees the
-   sign-in URL and passes the pasted code through. Custody-gated on the
-   daemon (credentials.manage + hosted-provenance + lease/egress tier
-   refusals) — this card renders whatever refusal the daemon states. */
-const CLAUDE_SIGNIN_BLAST_COPY =
-  'This changes the Claude account for every Claude Code session on this machine. ' +
-  'Running sessions keep the old account until reloaded.';
-const claudeSigninState = {
-  status: null, // last daemon status payload ({phase, url?, account?, error?…})
-  fetchedAt: 0,
-  busy: false,
-  lastError: '',
-  pollTimer: null,
-  sessions: [], // running claude-code sessions for the reload panel
-  sessionsFetchedAt: 0,
-  reloadRequested: new Set(),
+/* ── Agent account sign-in ceremonies ──
+   The guided sign-in cards (/api/claude-auth/* + /api/codex-auth/*):
+   the daemon runs each CLI's own login ceremony on a private PTY; a
+   card walks the owner through it. Claude: open the sign-in URL in
+   THIS browser, paste the code Anthropic shows back here. Codex: open
+   the verification URL, type the one-time code the card shows into
+   OpenAI's page — nothing comes back to the daemon. Token exchanges
+   stay inside the CLIs on the daemon; this page only ever sees the
+   sign-in URL (and, for Codex, the one-time code the owner must read).
+   Custody-gated on the daemon (credentials.manage + hosted-provenance
+   + lease/egress tier refusals) — the cards render whatever refusal
+   the daemon states. One credential ceremony runs at a time across
+   both providers (the daemon's status reports `busy_with`). */
+const AGENT_SIGNIN_PROVIDERS = {
+  claude: {
+    label: 'Claude',
+    statusMethod: 'api_claude_auth_status',
+    startMethod: 'api_claude_auth_start',
+    cancelMethod: 'api_claude_auth_cancel',
+    codeMethod: 'api_claude_auth_code',
+    startParams: { mode: 'claudeai' },
+    blastCopy:
+      'This changes the Claude account for every Claude Code session on this machine. ' +
+      'Running sessions keep the old account until reloaded.',
+    startLabel: 'Start Claude sign-in',
+    openLabel: 'Open Anthropic sign-in',
+    checkNote: 'Check that your browser shows claude.com before signing in.',
+    unsupportedNote:
+      'This daemon predates the Claude sign-in ceremony — upgrade it to sign in from here.',
+    backendMatch: backend => backend.includes('claude'),
+    sessionsTitle: 'Running Claude Code sessions',
+    noSessionsNote: 'No running Claude Code sessions — new sessions start on the new account.',
+    sessionKind: 'claude-code',
+    lines: {
+      idle: 'Sign this daemon into a Claude account (claude.ai subscription sign-in).',
+      starting: 'Starting the Claude CLI’s sign-in…',
+      awaiting_browser: 'Open the sign-in link, approve access, then paste the code back here.',
+      awaiting_code: 'Open the sign-in link, approve access, then paste the code back here.',
+      verifying: 'Verifying with Anthropic… the CLI is exchanging the code.',
+      success: 'This machine’s Claude Code now uses the new account.',
+    },
+  },
+  codex: {
+    label: 'Codex',
+    statusMethod: 'api_codex_auth_status',
+    startMethod: 'api_codex_auth_start',
+    cancelMethod: 'api_codex_auth_cancel',
+    codeMethod: null, // device flow: the code goes to OpenAI's page, never back here
+    startParams: { mode: 'chatgpt' },
+    blastCopy:
+      "This signs this machine's Codex into a ChatGPT account. Every Codex session on " +
+      'this machine uses it. Running sessions keep the old account until reloaded.',
+    startLabel: 'Start Codex sign-in',
+    openLabel: 'Open OpenAI sign-in',
+    checkNote: 'Check that your browser shows auth.openai.com before signing in.',
+    unsupportedNote:
+      'This daemon predates the Codex sign-in ceremony — upgrade it to sign in from here.',
+    backendMatch: backend => backend.includes('codex'),
+    sessionsTitle: 'Running Codex sessions',
+    noSessionsNote: 'No running Codex sessions — new sessions start on the new account.',
+    sessionKind: 'codex',
+    /* OpenAI's own device-flow warning, kept near-verbatim. */
+    deviceWarning:
+      'Continue only if you started this login in Codex. If a website or another person ' +
+      'gave you this code, cancel.',
+    lines: {
+      idle: 'Sign this daemon into a ChatGPT account (device sign-in for Codex).',
+      starting: 'Starting the Codex CLI’s sign-in…',
+      awaiting_user: 'Open the link, sign in, then type the one-time code below into OpenAI’s page.',
+      verifying: 'Confirming the sign-in with OpenAI…',
+      success: 'This machine’s Codex now uses the new account.',
+    },
+  },
 };
 
-function claudeSigninPhase() {
-  return String(claudeSigninState.status?.phase || 'idle');
+function agentSigninProviderState() {
+  return {
+    status: null, // last daemon status payload ({phase, url?, user_code?, account?, error?…})
+    fetchedAt: 0,
+    busy: false,
+    lastError: '',
+    pollTimer: null,
+    sessions: [], // running sessions of this provider's backend for the reload panel
+    sessionsFetchedAt: 0,
+    reloadRequested: new Set(),
+  };
+}
+const agentSigninState = {
+  claude: agentSigninProviderState(),
+  codex: agentSigninProviderState(),
+};
+
+function agentSigninPhase(provider) {
+  return String(agentSigninState[provider].status?.phase || 'idle');
 }
 
-function claudeSigninActive() {
-  return ['starting', 'awaiting_browser', 'awaiting_code', 'verifying'].includes(
-    claudeSigninPhase()
-  );
+function agentSigninActive(provider) {
+  return [
+    'starting',
+    'awaiting_browser',
+    'awaiting_code',
+    'awaiting_user',
+    'verifying',
+  ].includes(agentSigninPhase(provider));
 }
 
-async function claudeSigninRefresh({ force = false } = {}) {
-  const avail = daemonApi.availability('api_claude_auth_status');
+async function agentSigninRefresh(provider, { force = false } = {}) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
+  const avail = daemonApi.availability(spec.statusMethod);
   if (avail.reason === 'denied' || avail.reason === 'unsupported') return;
-  const freshFor = claudeSigninActive() ? 1500 : 15000;
-  if (!force && Date.now() - claudeSigninState.fetchedAt < freshFor) return;
-  claudeSigninState.fetchedAt = Date.now();
+  const freshFor = agentSigninActive(provider) ? 1500 : 15000;
+  if (!force && Date.now() - state.fetchedAt < freshFor) return;
+  state.fetchedAt = Date.now();
   try {
-    const resp = await daemonApi.request('api_claude_auth_status', {});
+    const resp = await daemonApi.request(spec.statusMethod, {});
     if (resp.ok) {
-      claudeSigninState.status = resp.body;
-      claudeSigninState.lastError = '';
+      state.status = resp.body;
+      state.lastError = '';
     } else {
-      claudeSigninState.lastError = String(resp.body?.error || `status ${resp.status}`);
+      state.lastError = String(resp.body?.error || `status ${resp.status}`);
     }
   } catch (err) {
-    claudeSigninState.lastError = String(err?.message || err);
+    state.lastError = String(err?.message || err);
   }
-  claudeSigninEnsurePoll();
-  renderClaudeSigninSection();
-  if (claudeSigninPhase() === 'success') claudeSigninRefreshSessions().catch(() => {});
+  agentSigninEnsurePoll(provider);
+  renderAgentSigninSection();
+  if (agentSigninPhase(provider) === 'success') {
+    agentSigninRefreshSessions(provider).catch(() => {});
+  }
 }
 
 /* 2s poll while a ceremony is in flight and the page is looking at it;
    self-clearing on terminal/idle phases (the render-time refresh with a
    15s freshness guard covers the rest). */
-function claudeSigninEnsurePoll() {
-  if (claudeSigninActive()) {
-    if (claudeSigninState.pollTimer) return;
-    claudeSigninState.pollTimer = window.setInterval(() => {
+function agentSigninEnsurePoll(provider) {
+  const state = agentSigninState[provider];
+  if (agentSigninActive(provider)) {
+    if (state.pollTimer) return;
+    state.pollTimer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       const watching =
         typeof paneIsVisible !== 'function' ||
         paneIsVisible('vault') ||
         paneIsVisible('access');
       if (!watching) return;
-      claudeSigninRefresh({ force: true }).catch(() => {});
+      agentSigninRefresh(provider, { force: true }).catch(() => {});
     }, 2000);
-  } else if (claudeSigninState.pollTimer) {
-    window.clearInterval(claudeSigninState.pollTimer);
-    claudeSigninState.pollTimer = null;
+  } else if (state.pollTimer) {
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
   }
 }
 
-async function claudeSigninStart() {
-  if (claudeSigninState.busy) return;
-  claudeSigninState.busy = true;
-  claudeSigninState.lastError = '';
-  renderClaudeSigninSection();
+/* 1s countdown ticker for the codex one-time code's expiry: updates the
+   countdown text in place (never a full re-render per tick). */
+let agentSigninTickTimer = null;
+function agentSigninCountdownText(deadlineMs) {
+  const left = deadlineMs - Date.now();
+  if (!Number.isFinite(left) || left <= 0) return 'code expired';
+  const totalSec = Math.floor(left / 1000);
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = String(totalSec % 60).padStart(2, '0');
+  return `code expires in ${minutes}:${seconds}`;
+}
+function agentSigninEnsureTicker() {
+  const needsTick = agentSigninPhase('codex') === 'awaiting_user';
+  if (needsTick && !agentSigninTickTimer) {
+    agentSigninTickTimer = window.setInterval(() => {
+      for (const el of document.querySelectorAll('[data-signin-countdown]')) {
+        el.textContent = agentSigninCountdownText(Number(el.dataset.signinCountdown));
+      }
+    }, 1000);
+  } else if (!needsTick && agentSigninTickTimer) {
+    window.clearInterval(agentSigninTickTimer);
+    agentSigninTickTimer = null;
+  }
+}
+
+async function agentSigninStart(provider) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
+  if (state.busy) return;
+  state.busy = true;
+  state.lastError = '';
+  renderAgentSigninSection();
   try {
-    const resp = await daemonApi.request('api_claude_auth_start', { mode: 'claudeai' });
+    const resp = await daemonApi.request(spec.startMethod, { ...spec.startParams });
     if (resp.ok) {
-      claudeSigninState.status = resp.body?.status || claudeSigninState.status;
+      state.status = resp.body?.status || state.status;
     } else {
-      claudeSigninState.lastError = String(resp.body?.error || `start failed (${resp.status})`);
-      if (resp.status === 409) await claudeSigninRefresh({ force: true });
+      state.lastError = String(resp.body?.error || `start failed (${resp.status})`);
+      if (resp.status === 409) await agentSigninRefresh(provider, { force: true });
     }
   } catch (err) {
-    claudeSigninState.lastError = String(err?.message || err);
+    state.lastError = String(err?.message || err);
   } finally {
-    claudeSigninState.busy = false;
-    claudeSigninEnsurePoll();
-    renderClaudeSigninSection();
+    state.busy = false;
+    agentSigninEnsurePoll(provider);
+    renderAgentSigninSection();
   }
 }
 
-async function claudeSigninSubmitCode(code) {
-  if (claudeSigninState.busy) return;
-  claudeSigninState.busy = true;
-  claudeSigninState.lastError = '';
-  renderClaudeSigninSection();
+async function agentSigninSubmitCode(provider, code) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
+  if (!spec.codeMethod || state.busy) return;
+  state.busy = true;
+  state.lastError = '';
+  renderAgentSigninSection();
   try {
-    const resp = await daemonApi.request('api_claude_auth_code', { code });
+    const resp = await daemonApi.request(spec.codeMethod, { code });
     if (resp.ok) {
-      if (claudeSigninState.status) claudeSigninState.status.phase = 'verifying';
+      if (state.status) state.status.phase = 'verifying';
     } else {
-      claudeSigninState.lastError = String(resp.body?.error || `code refused (${resp.status})`);
-      if (resp.status === 409) await claudeSigninRefresh({ force: true });
+      state.lastError = String(resp.body?.error || `code refused (${resp.status})`);
+      if (resp.status === 409) await agentSigninRefresh(provider, { force: true });
     }
   } catch (err) {
-    claudeSigninState.lastError = String(err?.message || err);
+    state.lastError = String(err?.message || err);
   } finally {
-    claudeSigninState.busy = false;
-    claudeSigninEnsurePoll();
-    renderClaudeSigninSection();
+    state.busy = false;
+    agentSigninEnsurePoll(provider);
+    renderAgentSigninSection();
   }
 }
 
-async function claudeSigninCancel() {
-  claudeSigninState.lastError = '';
+async function agentSigninCancel(provider) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
+  state.lastError = '';
   try {
-    const resp = await daemonApi.request('api_claude_auth_cancel', {});
+    const resp = await daemonApi.request(spec.cancelMethod, {});
     if (!resp.ok) {
-      claudeSigninState.lastError = String(resp.body?.error || `cancel failed (${resp.status})`);
+      state.lastError = String(resp.body?.error || `cancel failed (${resp.status})`);
     }
   } catch (err) {
-    claudeSigninState.lastError = String(err?.message || err);
+    state.lastError = String(err?.message || err);
   }
-  await claudeSigninRefresh({ force: true }).catch(() => {});
-  renderClaudeSigninSection();
+  await agentSigninRefresh(provider, { force: true }).catch(() => {});
+  renderAgentSigninSection();
 }
 
-/* The reload panel's corpus: live claude-code sessions on this daemon.
-   The daemon is the authority on reloadability — this list only decides
-   which chips to offer. */
-async function claudeSigninRefreshSessions({ force = false } = {}) {
-  if (!force && Date.now() - claudeSigninState.sessionsFetchedAt < 10000) return;
-  claudeSigninState.sessionsFetchedAt = Date.now();
+/* The reload panel's corpus: this provider's live sessions on this
+   daemon. The daemon is the authority on reloadability — this list only
+   decides which chips to offer. */
+async function agentSigninRefreshSessions(provider, { force = false } = {}) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
+  if (!force && Date.now() - state.sessionsFetchedAt < 10000) return;
+  state.sessionsFetchedAt = Date.now();
   try {
     const resp = await daemonApi.request('api_sessions', { limit: 100 });
     if (!resp.ok || !Array.isArray(resp.body)) return;
-    claudeSigninState.sessions = resp.body.filter(row => {
+    state.sessions = resp.body.filter(row => {
       if (String(row?.status || '') !== 'running') return false;
       const backend = String(row?.backend_source || row?.source || '').toLowerCase();
-      return backend.includes('claude');
+      return spec.backendMatch(backend);
     });
-    renderClaudeSigninSection();
+    renderAgentSigninSection();
   } catch (_) {
     /* the next poll or manual refresh recovers */
   }
 }
 
-function claudeSigninReloadSession(sessionId) {
-  claudeSigninState.reloadRequested.add(sessionId);
-  renderClaudeSigninSection();
+function agentSigninReloadSession(provider, sessionId) {
+  const state = agentSigninState[provider];
+  state.reloadRequested.add(sessionId);
+  renderAgentSigninSection();
   const sent = dispatchSessionControlMsg(
     { action: 'reload_credentials', session_id: sessionId },
     {
       onError: err => {
-        claudeSigninState.reloadRequested.delete(sessionId);
+        state.reloadRequested.delete(sessionId);
         showControlToast?.('error', `Reload failed: ${err?.message || err}`);
-        renderClaudeSigninSection();
+        renderAgentSigninSection();
       },
     }
   );
   if (sent === false) {
-    claudeSigninState.reloadRequested.delete(sessionId);
-    renderClaudeSigninSection();
+    state.reloadRequested.delete(sessionId);
+    renderAgentSigninSection();
     return;
   }
   showControlToast?.('success', 'Reload requested — the session restarts on the new account');
 }
 
-function renderClaudeSigninSection() {
-  const mount = document.getElementById('claude-signin-section');
+function renderAgentSigninSection() {
+  const mount = document.getElementById('agent-signin-section');
   if (!mount) return;
   // Never clobber a code paste mid-typing.
   if (
@@ -1717,9 +1829,17 @@ function renderClaudeSigninSection() {
     return;
   }
   mount.innerHTML = '';
+  for (const provider of Object.keys(AGENT_SIGNIN_PROVIDERS)) {
+    mount.appendChild(agentSigninProviderCard(provider));
+  }
+  agentSigninEnsureTicker();
+}
+
+function agentSigninProviderCard(provider) {
+  const spec = AGENT_SIGNIN_PROVIDERS[provider];
+  const state = agentSigninState[provider];
   const card = document.createElement('div');
-  card.className = 'vault-card claude-signin';
-  mount.appendChild(card);
+  card.className = `vault-card agent-signin agent-signin-${provider}`;
 
   const note = (text, cls = 'vault-note') => {
     const el = document.createElement('div');
@@ -1735,81 +1855,95 @@ function renderClaudeSigninSection() {
     card.appendChild(row);
     return row;
   };
+  const cancelButton = () =>
+    vaultButton('Cancel', () => agentSigninCancel(provider), { danger: true });
+
+  const head = document.createElement('div');
+  head.className = 'vault-status-line agent-signin-head';
+  const title = document.createElement('span');
+  title.className = 'lbl';
+  title.style.fontWeight = '600';
+  title.textContent = spec.label;
+  head.appendChild(title);
+  card.appendChild(head);
 
   // Availability honesty first (same pattern as the fueling panel).
-  const avail = daemonApi.availability('api_claude_auth_status');
+  const avail = daemonApi.availability(spec.statusMethod);
   if (avail.reason === 'denied') {
     note("This session's role can't run credential ceremonies — sign-in needs credentials.manage.");
-    return;
+    return card;
   }
   if (avail.reason === 'unsupported') {
-    note('This daemon predates the Claude sign-in ceremony — upgrade it to sign in from here.');
-    return;
+    note(spec.unsupportedNote);
+    return card;
   }
 
-  const status = claudeSigninState.status;
-  const phase = claudeSigninPhase();
-  const statusLine = document.createElement('div');
-  statusLine.className = 'vault-status-line';
-  const chip = document.createElement('span');
-  chip.className = 'vault-chip';
-  const CHIPS = {
+  const status = state.status;
+  const phase = agentSigninPhase(provider);
+  const chipDefs = {
     idle: ['ready', ''],
     starting: ['starting', ''],
     awaiting_browser: ['waiting for you', 'warn'],
     awaiting_code: ['waiting for the code', 'warn'],
+    awaiting_user: ['waiting for you', 'warn'],
     verifying: ['verifying', 'warn'],
     success: ['signed in', 'ok'],
     failed: ['failed', 'warn'],
     cancelled: ['cancelled', ''],
     timed_out: ['timed out', 'warn'],
   };
-  const [chipText, chipCls] = CHIPS[phase] || [phase, ''];
+  const [chipText, chipCls] = chipDefs[phase] || [phase, ''];
+  const chip = document.createElement('span');
+  chip.className = 'vault-chip';
   chip.textContent = chipText;
   if (chipCls) chip.classList.add(chipCls);
-  statusLine.appendChild(chip);
+  head.appendChild(chip);
   const lineText = {
-    idle: 'Sign this daemon into a Claude account (claude.ai subscription sign-in).',
-    starting: 'Starting the Claude CLI’s sign-in…',
-    awaiting_browser: 'Open the sign-in link, approve access, then paste the code back here.',
-    awaiting_code: 'Open the sign-in link, approve access, then paste the code back here.',
-    verifying: 'Verifying with Anthropic… the CLI is exchanging the code.',
-    success: 'This machine’s Claude Code now uses the new account.',
+    ...spec.lines,
     failed: 'The sign-in did not complete.',
     cancelled: 'Sign-in cancelled — the previous account (if any) still works.',
     timed_out: 'The sign-in timed out — nothing changed on this machine.',
   }[phase];
-  statusLine.appendChild(document.createTextNode(lineText || ''));
-  card.appendChild(statusLine);
+  head.appendChild(document.createTextNode(lineText || ''));
 
-  if (claudeSigninState.lastError) {
-    note(claudeSigninState.lastError, 'vault-error');
+  if (state.lastError) {
+    note(state.lastError, 'vault-error');
   }
   if (status?.error && ['failed', 'timed_out'].includes(phase)) {
     note(status.error, 'vault-error');
   }
 
   if (phase === 'idle' || ['failed', 'cancelled', 'timed_out'].includes(phase)) {
-    note(CLAUDE_SIGNIN_BLAST_COPY, 'vault-warning');
+    // The shared single-flight slot: the daemon reports which provider
+    // holds it, and a start here would 409 until that ceremony ends.
+    const busyWith = String(status?.busy_with || '');
+    if (busyWith) {
+      const other = AGENT_SIGNIN_PROVIDERS[busyWith]?.label || busyWith;
+      note(
+        `A ${other} sign-in ceremony is running — one credential ceremony at a time on this daemon.`
+      );
+      return card;
+    }
+    note(spec.blastCopy, 'vault-warning');
     actionsRow(
       vaultButton(
-        phase === 'idle' ? 'Start Claude sign-in' : 'Try again',
-        () => claudeSigninStart(),
+        phase === 'idle' ? spec.startLabel : 'Try again',
+        () => agentSigninStart(provider),
         { primary: true }
       )
     );
-    return;
+    return card;
   }
 
-  if (phase === 'starting') {
-    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
-    return;
+  if (phase === 'starting' || phase === 'verifying') {
+    actionsRow(cancelButton());
+    return card;
   }
 
-  if (phase === 'awaiting_browser' || phase === 'awaiting_code') {
+  if (['awaiting_browser', 'awaiting_code', 'awaiting_user'].includes(phase)) {
     const url = String(status?.url || '');
     const stepOne = document.createElement('div');
-    stepOne.className = 'claude-signin-step';
+    stepOne.className = 'agent-signin-step';
     const stepOneLabel = document.createElement('div');
     stepOneLabel.className = 'vault-note';
     stepOneLabel.textContent = '1. Sign in with your browser';
@@ -1818,7 +1952,7 @@ function renderClaudeSigninSection() {
       const openRow = document.createElement('div');
       openRow.className = 'vault-actions';
       openRow.appendChild(
-        vaultButton('Open Anthropic sign-in', () => {
+        vaultButton(spec.openLabel, () => {
           window.open(url, '_blank', 'noopener');
         }, { primary: true })
       );
@@ -1833,10 +1967,10 @@ function renderClaudeSigninSection() {
       stepOne.appendChild(openRow);
       const checkNote = document.createElement('div');
       checkNote.className = 'vault-note';
-      checkNote.textContent = 'Check that your browser shows claude.com before signing in.';
+      checkNote.textContent = spec.checkNote;
       stepOne.appendChild(checkNote);
       const urlLine = document.createElement('div');
-      urlLine.className = 'claude-signin-url';
+      urlLine.className = 'agent-signin-url';
       urlLine.textContent = url;
       stepOne.appendChild(urlLine);
     } else {
@@ -1847,43 +1981,88 @@ function renderClaudeSigninSection() {
     }
     card.appendChild(stepOne);
 
-    const stepTwo = document.createElement('div');
-    stepTwo.className = 'claude-signin-step';
-    const stepTwoLabel = document.createElement('div');
-    stepTwoLabel.className = 'vault-note';
-    stepTwoLabel.textContent = '2. Paste the code Anthropic shows you';
-    stepTwo.appendChild(stepTwoLabel);
-    const codeRow = document.createElement('div');
-    codeRow.className = 'vault-actions';
-    const codeInput = document.createElement('input');
-    codeInput.type = 'text';
-    codeInput.className = 'claude-signin-code';
-    codeInput.placeholder = 'Paste code here';
-    codeInput.autocomplete = 'off';
-    codeInput.spellcheck = false;
-    const submit = () => {
-      const code = codeInput.value.trim();
-      if (!code) return;
-      claudeSigninSubmitCode(code);
-    };
-    codeInput.addEventListener('keydown', event => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        submit();
+    if (phase === 'awaiting_user') {
+      // Codex device step: the owner reads the one-time code off this
+      // card and types it into OpenAI's page.
+      const stepTwo = document.createElement('div');
+      stepTwo.className = 'agent-signin-step';
+      const stepTwoLabel = document.createElement('div');
+      stepTwoLabel.className = 'vault-note';
+      stepTwoLabel.textContent = '2. Enter this one-time code on the OpenAI page';
+      stepTwo.appendChild(stepTwoLabel);
+      const userCode = String(status?.user_code || '');
+      if (userCode) {
+        const codeRow = document.createElement('div');
+        codeRow.className = 'vault-actions agent-signin-device-row';
+        const codeEl = document.createElement('div');
+        codeEl.className = 'agent-signin-device-code';
+        codeEl.textContent = userCode;
+        codeRow.appendChild(codeEl);
+        codeRow.appendChild(
+          vaultButton('Copy code', () => {
+            navigator.clipboard
+              ?.writeText(userCode)
+              .then(() => showControlToast?.('success', 'One-time code copied'))
+              .catch(() => showControlToast?.('error', 'Copy failed'));
+          })
+        );
+        stepTwo.appendChild(codeRow);
+        const deadlineMs = Number(status?.deadline_unix_ms || 0);
+        if (deadlineMs) {
+          const countdown = document.createElement('div');
+          countdown.className = 'vault-note agent-signin-countdown';
+          countdown.dataset.signinCountdown = String(deadlineMs);
+          countdown.textContent = agentSigninCountdownText(deadlineMs);
+          stepTwo.appendChild(countdown);
+        }
+      } else {
+        const waiting = document.createElement('div');
+        waiting.className = 'vault-note';
+        waiting.textContent = 'Waiting for the CLI to produce the one-time code…';
+        stepTwo.appendChild(waiting);
       }
-    });
-    codeRow.appendChild(codeInput);
-    codeRow.appendChild(vaultButton('Submit code', submit, { primary: true }));
-    stepTwo.appendChild(codeRow);
-    card.appendChild(stepTwo);
+      if (spec.deviceWarning) {
+        const warn = document.createElement('div');
+        warn.className = 'vault-warning';
+        warn.textContent = spec.deviceWarning;
+        stepTwo.appendChild(warn);
+      }
+      card.appendChild(stepTwo);
+    } else {
+      // Claude paste step: the code Anthropic shows comes back here.
+      const stepTwo = document.createElement('div');
+      stepTwo.className = 'agent-signin-step';
+      const stepTwoLabel = document.createElement('div');
+      stepTwoLabel.className = 'vault-note';
+      stepTwoLabel.textContent = '2. Paste the code Anthropic shows you';
+      stepTwo.appendChild(stepTwoLabel);
+      const codeRow = document.createElement('div');
+      codeRow.className = 'vault-actions';
+      const codeInput = document.createElement('input');
+      codeInput.type = 'text';
+      codeInput.className = 'agent-signin-code';
+      codeInput.placeholder = 'Paste code here';
+      codeInput.autocomplete = 'off';
+      codeInput.spellcheck = false;
+      const submit = () => {
+        const code = codeInput.value.trim();
+        if (!code) return;
+        agentSigninSubmitCode(provider, code);
+      };
+      codeInput.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          submit();
+        }
+      });
+      codeRow.appendChild(codeInput);
+      codeRow.appendChild(vaultButton('Submit code', submit, { primary: true }));
+      stepTwo.appendChild(codeRow);
+      card.appendChild(stepTwo);
+    }
 
-    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
-    return;
-  }
-
-  if (phase === 'verifying') {
-    actionsRow(vaultButton('Cancel', () => claudeSigninCancel(), { danger: true }));
-    return;
+    actionsRow(cancelButton());
+    return card;
   }
 
   if (phase === 'success') {
@@ -1907,30 +2086,36 @@ function renderClaudeSigninSection() {
         org.textContent = account.org_name;
         row.appendChild(org);
       }
+      if (account.auth_method && !account.subscription_type) {
+        const method = document.createElement('span');
+        method.className = 'vault-chip ok';
+        method.textContent = account.auth_method;
+        row.appendChild(method);
+      }
       card.appendChild(row);
     } else {
       note('Signed in (the CLI did not report account details).');
     }
 
-    // The value half: running Claude Code sessions keep the OLD account
-    // until their backend process restarts — offer the per-session
-    // reload (graceful in-place respawn, resume-attached).
-    claudeSigninRefreshSessions().catch(() => {});
+    // The value half: running sessions keep the OLD account until their
+    // backend process restarts — offer the per-session reload (graceful
+    // in-place respawn, resume-attached).
+    agentSigninRefreshSessions(provider).catch(() => {});
     const reloadHead = document.createElement('div');
     reloadHead.className = 'vault-status-line';
     const reloadTitle = document.createElement('span');
     reloadTitle.className = 'lbl';
     reloadTitle.style.fontWeight = '600';
-    reloadTitle.textContent = 'Running Claude Code sessions';
+    reloadTitle.textContent = spec.sessionsTitle;
     reloadHead.appendChild(reloadTitle);
     card.appendChild(reloadHead);
-    if (!claudeSigninState.sessions.length) {
-      note('No running Claude Code sessions — new sessions start on the new account.');
+    if (!state.sessions.length) {
+      note(spec.noSessionsNote);
     } else {
       note('Running sessions keep the old account until reloaded. Reloading restarts the backend on the same conversation; a mid-turn session is interrupted first.');
       const list = document.createElement('div');
       list.className = 'vault-entry-list';
-      for (const session of claudeSigninState.sessions) {
+      for (const session of state.sessions) {
         const sessionId = String(session.session_id || '');
         const row = document.createElement('div');
         row.className = 'vault-entry-row';
@@ -1939,17 +2124,17 @@ function renderClaudeSigninSection() {
         lbl.textContent = session.name || sessionId.slice(0, 12) || 'session';
         const kindChip = document.createElement('span');
         kindChip.className = 'vault-chip';
-        kindChip.textContent = 'claude-code';
+        kindChip.textContent = spec.sessionKind;
         const actions = document.createElement('span');
         actions.className = 'vault-entry-actions';
-        if (claudeSigninState.reloadRequested.has(sessionId)) {
+        if (state.reloadRequested.has(sessionId)) {
           const done = document.createElement('span');
           done.className = 'vault-chip ok';
           done.textContent = 'reload requested';
           actions.appendChild(done);
         } else {
           actions.appendChild(
-            vaultButton('Reload credentials', () => claudeSigninReloadSession(sessionId))
+            vaultButton('Reload credentials', () => agentSigninReloadSession(provider, sessionId))
           );
         }
         row.append(lbl, kindChip, actions);
@@ -1957,9 +2142,11 @@ function renderClaudeSigninSection() {
       }
       card.appendChild(list);
     }
-    actionsRow(vaultButton('Sign in again', () => claudeSigninStart()));
-    return;
+    actionsRow(vaultButton('Sign in again', () => agentSigninStart(provider)));
+    return card;
   }
+
+  return card;
 }
 
 async function vaultFuelEntry(entry) {
@@ -2936,8 +3123,9 @@ function renderAccessVaultSection() {
   renderAccessCustodySection();
   vaultRefreshCustody().catch(() => {});
   // So does the Claude sign-in card (its own mount + freshness guard).
-  renderClaudeSigninSection();
-  claudeSigninRefresh().catch(() => {});
+  renderAgentSigninSection();
+  agentSigninRefresh('claude').catch(() => {});
+  agentSigninRefresh('codex').catch(() => {});
 
   const card = document.createElement('div');
   card.className = 'vault-card';
@@ -3086,7 +3274,7 @@ function ui2VaultAdoptSections() {
   if (!host || !vaultMount || !custodyMount) return;
   const advancedBody = vaultMount.parentElement;
   const vaultHead = vaultMount.previousElementSibling;
-  const signinMount = document.getElementById('claude-signin-section');
+  const signinMount = document.getElementById('agent-signin-section');
   const signinHead = signinMount?.previousElementSibling;
   const custodyHead = custodyMount.previousElementSibling;
   if (vaultHead?.classList.contains('acc-section-head')) host.appendChild(vaultHead);

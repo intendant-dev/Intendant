@@ -583,11 +583,7 @@ impl CeremonyManager {
     /// reading a successor ceremony's phase.
     pub(crate) fn phase_of(&self, id: u64) -> Option<CeremonyPhase> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner
-            .state
-            .as_ref()
-            .filter(|s| s.id == id)
-            .map(|s| s.phase)
+        inner.state.as_ref().filter(|s| s.id == id).map(|s| s.phase)
     }
 
     #[cfg(test)]
@@ -836,7 +832,9 @@ pub(crate) mod tests {
         provider: Provider,
         transport: MockTransport,
     ) -> u64 {
-        let id = manager.begin(provider, "test-mode").expect("begin ceremony");
+        let id = manager
+            .begin(provider, "test-mode")
+            .expect("begin ceremony");
         manager.install_transport(id, Box::new(transport), None);
         id
     }
@@ -1326,9 +1324,7 @@ pub(crate) mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (dir, _) = write_browser_shim(tmp.path()).expect("shim");
         let manager = CeremonyManager::default();
-        let id = manager
-            .begin(Provider::Claude, "test-mode")
-            .expect("begin");
+        let id = manager.begin(Provider::Claude, "test-mode").expect("begin");
         manager.install_transport(id, Box::new(MockTransport::default()), Some(dir.clone()));
         assert!(dir.exists());
         manager.child_exited(id, false, None);

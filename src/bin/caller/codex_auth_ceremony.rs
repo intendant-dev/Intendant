@@ -119,10 +119,7 @@ fn validated_user_code(candidate: &str) -> Option<String> {
     if token.len() < 4 || token.len() > 64 {
         return None;
     }
-    if !token
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
+    if !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
@@ -515,23 +512,29 @@ pub(crate) fn configured_codex_command(project_root: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
-    /// Synthetic ceremony transcript — never captured output (the code
-    /// here is made up; real one-time codes are never committed).
+    /// Synthetic ceremony transcript in the live CLI's exact layout
+    /// (0.144.5, probed on a PTY): the URL and code lines are indented
+    /// and color-wrapped, and the code directly follows its anchor
+    /// line. The code itself is made up — real one-time codes are never
+    /// committed.
     const FIXTURE_URL: &str = "https://auth.openai.com/codex/device";
     const FIXTURE_CODE: &str = "ABCD-E12FG";
 
     fn fixture_transcript() -> String {
         format!(
-            "Follow these steps to sign in with ChatGPT using device code authorization:\n\
-             \n\
-             1. Open this link in your browser and sign in to your account\n\
-             {FIXTURE_URL}\n\
-             \n\
-             2. Enter this one-time code (expires in 15 minutes)\n\
-             {FIXTURE_CODE}\n\
-             \n\
-             Continue only if you started this login in Codex. If a website or another \
-             person gave you this code, cancel.\n"
+            "Welcome to Codex [v\u{1b}[90m0.144.5\u{1b}[0m]\r\n\
+             \u{1b}[90mOpenAI's command-line coding agent\u{1b}[0m\r\n\
+             \r\n\
+             Follow these steps to sign in with ChatGPT using device code authorization:\r\n\
+             \r\n\
+             1. Open this link in your browser and sign in to your account\r\n\
+             \x20  \u{1b}[94m{FIXTURE_URL}\u{1b}[0m\r\n\
+             \r\n\
+             2. Enter this one-time code \u{1b}[90m(expires in 15 minutes)\u{1b}[0m\r\n\
+             \x20  \u{1b}[94m{FIXTURE_CODE}\u{1b}[0m\r\n\
+             \r\n\
+             \u{1b}[90mContinue only if you started this login in Codex. If a website or \
+             another person gave you this code, cancel.\u{1b}[0m\r\n"
         )
     }
 
@@ -552,14 +555,19 @@ mod tests {
 
     #[test]
     fn user_code_found_via_anchor_line() {
-        let transcript = fixture_transcript();
+        // find_user_code sees ANSI-stripped text (the scanner strips).
+        let transcript = strip_ansi(&fixture_transcript());
         assert_eq!(
             find_user_code(&transcript, false).as_deref(),
             Some(FIXTURE_CODE)
         );
-        // Direct next line (no blank separator) works too.
-        let tight = format!("2. Enter this one-time code (expires in 15 minutes)\n{FIXTURE_CODE}\n");
-        assert_eq!(find_user_code(&tight, false).as_deref(), Some(FIXTURE_CODE));
+        // A blank line between anchor and code is tolerated too.
+        let spaced =
+            format!("2. Enter this one-time code (expires in 15 minutes)\n\n   {FIXTURE_CODE}\n");
+        assert_eq!(
+            find_user_code(&spaced, false).as_deref(),
+            Some(FIXTURE_CODE)
+        );
         // No anchor, no code.
         assert_eq!(find_user_code(FIXTURE_CODE, true), None);
     }
@@ -567,9 +575,9 @@ mod tests {
     #[test]
     fn user_code_at_buffer_tail_is_deferred_until_final() {
         // Streaming hazard: the code line may be mid-write.
-        let partial = format!("2. Enter this one-time code (expires in 15 minutes)\nABCD-E1");
-        assert_eq!(find_user_code(&partial, false), None);
-        assert_eq!(find_user_code(&partial, true).as_deref(), Some("ABCD-E1"));
+        let partial = "2. Enter this one-time code (expires in 15 minutes)\n   ABCD-E1";
+        assert_eq!(find_user_code(partial, false), None);
+        assert_eq!(find_user_code(partial, true).as_deref(), Some("ABCD-E1"));
         // The anchor line itself may be mid-write: nothing to read yet.
         assert_eq!(find_user_code("2. Enter this one-time code", true), None);
     }
@@ -579,9 +587,15 @@ mod tests {
         assert!(validated_user_code(FIXTURE_CODE).is_some());
         assert!(validated_user_code("AAAA-11111").is_some());
         assert!(validated_user_code("A1B2C3").is_some(), "digits qualify");
-        assert!(validated_user_code("ABCD-EFGHI").is_some(), "uppercase dash group");
+        assert!(
+            validated_user_code("ABCD-EFGHI").is_some(),
+            "uppercase dash group"
+        );
         assert!(validated_user_code("cancel").is_none(), "prose word");
-        assert!(validated_user_code("sign-in").is_none(), "lowercase dash prose");
+        assert!(
+            validated_user_code("sign-in").is_none(),
+            "lowercase dash prose"
+        );
         assert!(validated_user_code("abc").is_none(), "too short");
         assert!(validated_user_code(&"A1".repeat(40)).is_none(), "too long");
         assert!(validated_user_code("AB CD-12").is_none(), "spaces");
@@ -593,11 +607,10 @@ mod tests {
     #[test]
     fn scanner_finds_both_artifacts_across_chunks_and_ansi() {
         let transcript = fixture_transcript();
-        let decorated = transcript.replace('\n', "\u{1b}[0m\r\n\u{1b}[1m");
         let mut scanner = DeviceScanner::default();
-        // Feed in awkward small chunks that split the URL and the code.
-        let bytes = decorated.as_bytes();
-        for chunk in bytes.chunks(17) {
+        // Feed in awkward small chunks that split the URL, the code, and
+        // the ANSI escapes themselves across read boundaries.
+        for chunk in transcript.as_bytes().chunks(17) {
             scanner.push(chunk);
         }
         assert_eq!(scanner.url(), Some(FIXTURE_URL));
@@ -608,10 +621,8 @@ mod tests {
     fn scanner_defers_tail_artifacts_until_finish() {
         let mut scanner = DeviceScanner::default();
         scanner.push(
-            format!(
-                "1. Open this link in your browser and sign in to your account\n{FIXTURE_URL}"
-            )
-            .as_bytes(),
+            format!("1. Open this link in your browser and sign in to your account\n{FIXTURE_URL}")
+                .as_bytes(),
         );
         assert_eq!(scanner.url(), None, "unterminated URL tail is deferred");
         scanner.push(

@@ -15,8 +15,7 @@ use crate::claude_auth_ceremony::{self, custody_refusal, SUPPORTED_MODE};
 
 /// Mandated refusal copy for rendezvous-mediated clients (shared with
 /// the Codex ceremony routes).
-pub(crate) const HOSTED_REFUSAL: &str =
-    "credential ceremonies require a trusted direct connection";
+pub(crate) const HOSTED_REFUSAL: &str = "credential ceremonies require a trusted direct connection";
 
 /// True when this request's session has hosted provenance
 /// ([`crate::access::iam::is_hosted_session`] when the IAM snapshot is on
