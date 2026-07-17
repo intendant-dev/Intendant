@@ -84,12 +84,24 @@
   }
 
   // CSS cannot see overflow: entries whose body actually clips get the
-  // fade tag; short ones keep their last line un-washed.
+  // fade tag; short ones — and the never-clamped last entry — keep their
+  // final line un-washed. Toggle, not add: an entry's clamp state flips
+  // when a newer entry arrives and it stops being :last-child (or the
+  // reverse on a structural removal), so kept clones re-tag too.
   function peekTagClamped(clone) {
     const content = clone.querySelector('.log-content');
-    if (content && content.scrollHeight > content.clientHeight + 1) {
-      clone.classList.add('ui2-peek-clamped');
-    }
+    if (!content) return;
+    clone.classList.toggle('ui2-peek-clamped', content.scrollHeight > content.clientHeight + 1);
+  }
+
+  // The container-level "more below" fade must never obscure the tail:
+  // it shows only while unread content sits below the viewport and goes
+  // away at scroll-bottom. Re-synced on scroll and after every render
+  // (content growth changes scrollHeight without firing scroll).
+  function peekSyncMoreBelow() {
+    if (!peekRoot || !peekList) return;
+    const more = peekList.scrollHeight - peekList.scrollTop - peekList.clientHeight > 1;
+    peekRoot.classList.toggle('ui2-peek-more-below', more);
   }
 
   function peekRenderTail() {
@@ -102,11 +114,11 @@
       empty.className = 'ui2-peek-empty';
       empty.textContent = peekEmptyText();
       peekList.replaceChildren(empty);
+      peekSyncMoreBelow();
       return;
     }
     const prev = new Map(peekRendered.map(r => [r.source, r]));
     const next = [];
-    const fresh = [];
     for (const source of sources) {
       const kept = prev.get(source);
       if (kept && !peekPendingDirty.has(source)) {
@@ -115,7 +127,6 @@
       }
       const clone = peekCloneEntry(source);
       next.push({ source, clone });
-      fresh.push(clone);
     }
     peekRendered = next;
     // Surgical reconcile instead of replaceChildren: kept nodes never
@@ -132,9 +143,13 @@
       if (r.clone === cursor) cursor = cursor.nextElementSibling;
       else peekList.insertBefore(r.clone, cursor);
     }
-    for (const clone of fresh) peekTagClamped(clone);
+    // Every rendered clone, not just fresh ones: appending an entry
+    // moves the clamp off the old :last-child, and kept clones must
+    // gain/lose the fade tag with it.
+    for (const r of next) peekTagClamped(r.clone);
     peekPendingDirty.clear();
     if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    peekSyncMoreBelow();
   }
 
   function peekFlush() {
@@ -160,7 +175,10 @@
       touched = true;
     }
     peekPendingDirty.clear();
-    if (touched && peekFollow) peekList.scrollTop = peekList.scrollHeight;
+    if (touched) {
+      if (peekFollow) peekList.scrollTop = peekList.scrollHeight;
+      peekSyncMoreBelow();
+    }
   }
 
   function peekSchedule() {
@@ -241,6 +259,7 @@
       peekFlushTimer = 0;
     }
     if (peekList) peekList.replaceChildren();
+    peekRoot.classList.remove('ui2-peek-more-below');
   }
 
   // "Open in Activity" is a lie when the user is ALREADY on Activity —
@@ -406,6 +425,7 @@
     });
     peekList.addEventListener('scroll', () => {
       peekFollow = peekList.scrollTop + peekList.clientHeight >= peekList.scrollHeight - 24;
+      peekSyncMoreBelow();
     });
   }
 
