@@ -42,6 +42,8 @@ pub(crate) use relay::*;
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
 const REGISTER_PROOF_PROTOCOL: &str = "intendant-connect-register-proof-v1";
 const HOSTED_CONTROL_CAPABILITY_PROTOCOL: &str = "intendant-connect-hosted-control-capability-v1";
+const FLEET_CERTIFICATE_LEDGER_PROTOCOL: &str = "intendant-fleet-certificate-ledger-v1";
+const FLEET_CERTIFICATE_LEDGER_SERIALS_CAP: usize = 256;
 const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
 /// v2 claim proofs bind the claiming account (user id + handle at claim
 /// time) into the payload the daemon signs, so the account↔daemon binding
@@ -1126,6 +1128,32 @@ struct AttestationRecord {
     proof: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetCertificateLedgerRecord {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+    fleet_origin: String,
+    serials: Vec<String>,
+    issued_unix_ms: u64,
+    signature: String,
+}
+
+impl FleetCertificateLedgerRecord {
+    fn unsigned_payload(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            self.protocol,
+            self.daemon_id,
+            self.daemon_public_key,
+            self.fleet_origin,
+            self.serials.join(","),
+            self.issued_unix_ms,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonRecord {
     daemon_id: String,
@@ -1137,6 +1165,10 @@ struct DaemonRecord {
     /// and may refuse the route.
     #[serde(default)]
     hosted_control_enabled: bool,
+    /// Daemon-signed expected certificate serials for the exact fleet origin.
+    /// Connect stores and projects this document without becoming its signer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet_certificate_ledger: Option<FleetCertificateLedgerRecord>,
     /// Connect account association for discovery/routing. The legacy
     /// field name is retained for store compatibility; it is not a daemon
     /// IAM owner and carries no daemon authority.
@@ -1503,13 +1535,31 @@ fn fsync_parent_dir(parent: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Persist the current store synchronously, before the caller's response.
-/// Callers hold the store lock, so the bytes are a consistent snapshot and
+/// Persist the current store, before the caller's response. Callers hold
+/// the store lock, so the serialized bytes are a consistent snapshot and
 /// the write covers anything the debounced flusher had pending — hence the
 /// dirty flag is cleared on success (marks only ever happen under the same
 /// lock, so none can slip between the write and the clear).
-fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
-    save_store(&state.config.data_file, store).map_err(ApiError::internal)?;
+///
+/// The serialize happens under the lock; the blocking file I/O (tempfile
+/// write + fsync + rename + parent-dir fsync) runs on `spawn_blocking` so
+/// it never parks an async worker — with the store lock still HELD across
+/// the await. That lock-across-write is deliberate, not an oversight: as
+/// documented on `store_flush_monitor_with`, the single-writer ordering
+/// that keeps the file from ever regressing to an older snapshot IS the
+/// lock held over the write.
+async fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
+    let bytes = serialize_store(store).map_err(ApiError::internal)?;
+    let path = state.config.data_file.clone();
+    match tokio::task::spawn_blocking(move || write_store_bytes(&path, &bytes)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(ApiError::internal(err)),
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "store persist task failed: {err}"
+            )))
+        }
+    }
     state.store_dirty.clear();
     Ok(())
 }
@@ -1663,14 +1713,14 @@ async fn sweep_in_memory_state(state: &AppState) {
 /// next state first, then publish it to the in-memory store. A failed disk
 /// write therefore cannot leave memory ahead of durable state and poison an
 /// otherwise valid retry (notably account/daemon route release).
-fn update_store_transaction<R>(
+async fn update_store_transaction<R>(
     store: &mut Store,
     mutate: impl FnOnce(&mut Store) -> ApiResult<R>,
-    persist: impl FnOnce(&Store) -> ApiResult<()>,
+    persist: impl AsyncFnOnce(&Store) -> ApiResult<()>,
 ) -> ApiResult<R> {
     let mut next = store.clone();
     let result = mutate(&mut next)?;
-    persist(&next)?;
+    persist(&next).await?;
     *store = next;
     Ok(result)
 }
@@ -1761,6 +1811,7 @@ fn daemon_view(daemon: &DaemonRecord, hosted_control_url: Option<&str>) -> serde
         // This is navigation metadata; opening it still begins at the
         // daemon's public doorbell with no authority.
         "hosted_control_url": hosted_control_url,
+        "fleet_certificate_ledger": daemon.fleet_certificate_ledger,
     })
 }
 
@@ -1791,6 +1842,7 @@ fn daemon_fleet_target_view(config: &ServiceConfig, daemon: &DaemonRecord) -> se
         "online": online,
         "claimed_daemon": true,
         "daemon_public_key": daemon.daemon_public_key,
+        "fleet_certificate_ledger": daemon.fleet_certificate_ledger,
         // Route/account metadata is deliberately not an openable control
         // target in the default hosted build.
         "url": "",
@@ -1939,6 +1991,7 @@ mod tests {
             label: None,
             daemon_public_key: "daemon-key".to_string(),
             hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
             owner_user_id: None,
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -2046,13 +2099,32 @@ mod tests {
         let state = production_router_test_state(root.path(), store_with_marker());
         let store = state.store.lock().await;
         mark_store_dirty(&state);
-        persist_locked(&state, &store).unwrap();
+        persist_locked(&state, &store).await.unwrap();
         assert!(
             !state.store_dirty.take(),
             "successful sync persist covers pending marks"
         );
         let on_disk = load_store(&state.config.data_file).unwrap();
         assert_eq!(on_disk.users.len(), 1);
+    }
+
+    /// A failed write must NOT clear the debounce mark: the mutations are
+    /// still memory-only, and the mark is what makes the flusher retry.
+    #[tokio::test]
+    async fn persist_failure_keeps_the_dirty_mark() {
+        let root = tempfile::tempdir().unwrap();
+        // A regular file where the state dir should be makes every write
+        // attempt fail without touching anything outside the tempdir.
+        let blocked = root.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let state = production_router_test_state(&blocked, store_with_marker());
+        let store = state.store.lock().await;
+        mark_store_dirty(&state);
+        assert!(persist_locked(&state, &store).await.is_err());
+        assert!(
+            state.store_dirty.take(),
+            "failed persist must keep the dirty mark for the flusher retry"
+        );
     }
 
     #[tokio::test]
@@ -2070,6 +2142,7 @@ mod tests {
                 label: None,
                 daemon_public_key: "key".to_string(),
                 hosted_control_enabled: false,
+                fleet_certificate_ledger: None,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,
@@ -2150,6 +2223,7 @@ mod tests {
                 label: None,
                 daemon_public_key: "key".to_string(),
                 hosted_control_enabled: false,
+                fleet_certificate_ledger: None,
                 owner_user_id: None,
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,

@@ -2,7 +2,8 @@ use crate::access::access_policy::PeerOperation;
 use crate::access::iam::{AccessDecision, AccessPrincipal, LocalIamState};
 
 use super::{
-    HostedLeaseStatus, HostedPreset, HOSTED_AUTHN_KIND, HOSTED_PRINCIPAL_KIND, HOSTED_SOURCE,
+    compute_current_lane_guard, HostedLaneGuardStatus, HostedLeaseStatus, HostedPreset,
+    HOSTED_AUTHN_KIND, HOSTED_PRINCIPAL_KIND, HOSTED_SOURCE,
 };
 
 pub const HOSTED_RUNTIME_CONFIG_KEYS: &[&str] = &[
@@ -70,6 +71,9 @@ pub fn hosted_preset_for_principal(
 ) -> Result<HostedPreset, String> {
     if !is_hosted_lease_principal(principal) {
         return Err("principal is not a hosted lease principal".to_string());
+    }
+    if compute_current_lane_guard(state).status == HostedLaneGuardStatus::Suspended {
+        return Err("hosted control is suspended by the certificate guard".to_string());
     }
     let grant_id = principal
         .grant_id
@@ -302,9 +306,8 @@ pub fn hosted_tunnel_frame_classification(preset: HostedPreset, frame_type: &str
         | "terminal_share" | "display_input" | "upload_start" | "upload_chunk" | "upload_end" => {
             preset == HostedPreset::Operate
         }
-        "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error" => {
-            false
-        }
+        "presence_frame" | "egress_response" | "egress_chunk" | "egress_end" | "egress_error"
+        | "egress_request_ack" => false,
         _ => return None,
     })
 }
@@ -538,6 +541,7 @@ pub fn hosted_control_msg_allowed(
         | ControlMsg::SetDiagnosticsVisualMarker { .. }
         | ControlMsg::PeerFileTransferSignal { .. }
         | ControlMsg::PeerDashboardControlSignal { .. }
+        | ControlMsg::HostedCertificateWitness { .. }
         | ControlMsg::CreateBrowserWorkspace { .. }
         | ControlMsg::CloseBrowserWorkspace { .. }
         | ControlMsg::AcquireBrowserWorkspace { .. }

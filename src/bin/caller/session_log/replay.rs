@@ -1090,6 +1090,9 @@ pub fn session_log_entry_to_app_event(
                 round,
                 turns_in_round,
                 native_message_count: None,
+                // Replayed logs carry no live root; the file watcher's
+                // round routing fails open on `None`.
+                project_root: None,
             })
         }
         "safety_cap_reached" => Some(AppEvent::SafetyCapReached),

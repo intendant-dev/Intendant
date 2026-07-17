@@ -8,6 +8,8 @@ pub const LEASE_PROTOCOL: &str = "intendant-hosted-control-lease-v1";
 pub const REQUEST_PROOF_PROTOCOL: &str = "intendant-hosted-control-request-v1";
 pub const POLL_PROOF_PROTOCOL: &str = "intendant-hosted-control-poll-v1";
 pub const ANCHOR_DECISION_PROTOCOL: &str = "intendant-hosted-control-anchor-decision-v1";
+pub const CERTIFICATE_LEDGER_PROTOCOL: &str = "intendant-fleet-certificate-ledger-v1";
+pub const CERTIFICATE_WITNESS_PROTOCOL: &str = "intendant-hosted-certificate-witness-v1";
 
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 4 * 60 * 60;
 pub const HARD_MAX_LEASE_TTL_SECS: u64 = 24 * 60 * 60;
@@ -17,6 +19,15 @@ pub const HOSTED_REQUESTS_CAP: usize = 128;
 pub const HOSTED_LEASES_CAP: usize = 256;
 pub const HOSTED_ELIGIBLE_SESSIONS_CAP: usize = 2048;
 pub const HOSTED_ANCHORS_CAP: usize = 32;
+pub const HOSTED_CERTIFICATE_LEDGER_SERIALS_CAP: usize = 256;
+pub const HOSTED_WITNESS_REPORTS_CAP: usize = 256;
+pub const HOSTED_WITNESS_CORROBORATED_SERIALS_CAP: usize = 256;
+pub const HOSTED_WITNESS_CONFIRMED_SERIALS_CAP: usize = 64;
+pub const HOSTED_WITNESS_REPORT_BODY_CAP_BYTES: usize = 16 * 1024;
+pub const HOSTED_WITNESS_RATE_WINDOW_MS: i64 = 60 * 60 * 1000;
+pub const HOSTED_WITNESS_GLOBAL_PER_WINDOW: usize = 128;
+pub const HOSTED_WITNESS_PER_BINDING_PER_WINDOW: usize = 8;
+pub const HOSTED_WITNESS_RATE_BINDINGS_CAP: usize = 512;
 pub const REQUEST_PROOF_MAX_SKEW_MS: i64 = 60 * 1000;
 pub const WS_TICKET_TTL_MS: u64 = 15 * 1000;
 pub const PROOF_NONCES_GLOBAL_CAP: usize = 4096;
@@ -245,6 +256,188 @@ pub struct SignedAppAnchor {
     pub revoked_unix_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedCertificateLedger {
+    pub protocol: String,
+    pub daemon_id: String,
+    pub daemon_public_key: String,
+    pub fleet_origin: String,
+    pub serials: Vec<String>,
+    pub issued_unix_ms: u64,
+    pub signature: String,
+}
+
+impl HostedCertificateLedger {
+    pub fn unsigned_payload(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            self.protocol,
+            self.daemon_id,
+            self.daemon_public_key,
+            self.fleet_origin,
+            self.serials.join(","),
+            self.issued_unix_ms,
+        )
+    }
+
+    pub fn document_sha256(&self) -> String {
+        b64u(
+            ring::digest::digest(&ring::digest::SHA256, self.unsigned_payload().as_bytes())
+                .as_ref(),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedWitnessKind {
+    Peer,
+    SignedApp,
+}
+
+impl HostedWitnessKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::SignedApp => "signed_app",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedWitnessVantage {
+    SameLan,
+    Remote,
+    Cellular,
+    #[default]
+    Unknown,
+}
+
+impl HostedWitnessVantage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameLan => "same_lan",
+            Self::Remote => "remote",
+            Self::Cellular => "cellular",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_strong(self) -> bool {
+        matches!(self, Self::Remote | Self::Cellular)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedCertificateWitnessReport {
+    pub protocol: String,
+    pub report_id: String,
+    pub observer_kind: HostedWitnessKind,
+    pub observer_id: String,
+    pub observer_public_key: String,
+    pub target_daemon_id: String,
+    pub fleet_origin: String,
+    pub ledger_sha256: String,
+    pub observed_serial_hex: String,
+    #[serde(default)]
+    pub vantage: HostedWitnessVantage,
+    pub observed_unix_ms: u64,
+    pub signature: String,
+}
+
+impl HostedCertificateWitnessReport {
+    pub fn unsigned_payload(&self) -> String {
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.protocol,
+            self.report_id,
+            self.observer_kind.as_str(),
+            self.observer_id,
+            self.observer_public_key,
+            self.target_daemon_id,
+            self.fleet_origin,
+            self.ledger_sha256,
+            self.observed_serial_hex,
+            self.vantage.as_str(),
+            self.observed_unix_ms,
+        )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedWitnessRecord {
+    pub report: HostedCertificateWitnessReport,
+    pub observer_binding: String,
+    pub observer_label: String,
+    pub received_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedWitnessState {
+    #[serde(default)]
+    pub reports: Vec<HostedWitnessRecord>,
+    /// Serial mismatches that reached the distinct-observer quorum. This
+    /// latch keeps bounded report-history pruning from silently removing a
+    /// previously confirmed suspension.
+    #[serde(default)]
+    pub corroborated_serials: Vec<String>,
+    #[serde(default)]
+    pub owner_confirmed_serials: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_evidence_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedLaneGuardStatus {
+    #[default]
+    Clear,
+    Alert,
+    Suspended,
+    Overridden,
+}
+
+impl HostedLaneGuardStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Alert => "alert",
+            Self::Suspended => "suspended",
+            Self::Overridden => "overridden",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedLaneGuardSnapshot {
+    pub status: HostedLaneGuardStatus,
+    pub evidence_sha256: String,
+    pub unexpected_serials: Vec<String>,
+    pub corroborated_serials: Vec<String>,
+    pub ct_serials: Vec<String>,
+    #[serde(default)]
+    pub ct_state_unavailable: bool,
+    pub owner_confirmed_serials: Vec<String>,
+    #[serde(default)]
+    pub reports: Vec<HostedWitnessRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedPublicLaneGuard {
+    pub status: HostedLaneGuardStatus,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedControlState {
     #[serde(default)]
@@ -255,6 +448,8 @@ pub struct HostedControlState {
     pub leases: Vec<HostedLeaseRecord>,
     #[serde(default)]
     pub signed_app_anchors: Vec<SignedAppAnchor>,
+    #[serde(default)]
+    pub witnesses: HostedWitnessState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +465,7 @@ pub struct HostedControlBootstrap {
     pub max_ttl_secs: u64,
     pub request_ttl_ms: u64,
     pub display_media_relay_configured: bool,
+    pub lane_guard: HostedPublicLaneGuard,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +554,9 @@ pub struct HostedControlManagementSnapshot {
     pub pending_requests: Vec<HostedLeaseRequest>,
     pub active_leases: Vec<HostedLeaseRecord>,
     pub signed_app_anchors: Vec<SignedAppAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_ledger: Option<HostedCertificateLedger>,
+    pub lane_guard: HostedLaneGuardSnapshot,
 }
 
 impl HostedControlState {
@@ -385,7 +584,68 @@ impl HostedControlState {
         self.signed_app_anchors
             .retain(|anchor| valid_id_component(&anchor.device_id));
         retain_tail(&mut self.signed_app_anchors, HOSTED_ANCHORS_CAP);
+        self.witnesses.reports.retain(|record| {
+            valid_id_component(&record.report.report_id)
+                && valid_witness_binding(&record.observer_binding)
+                && valid_serial_hex(&record.report.observed_serial_hex)
+        });
+        self.witnesses
+            .corroborated_serials
+            .extend(corroborated_serials_from_reports(&self.witnesses.reports));
+        normalize_serial_set(
+            &mut self.witnesses.corroborated_serials,
+            HOSTED_WITNESS_CORROBORATED_SERIALS_CAP,
+        );
+        retain_tail(&mut self.witnesses.reports, HOSTED_WITNESS_REPORTS_CAP);
+        normalize_serial_set(
+            &mut self.witnesses.owner_confirmed_serials,
+            HOSTED_WITNESS_CONFIRMED_SERIALS_CAP,
+        );
     }
+}
+
+pub(crate) fn corroborated_serials_from_reports(reports: &[HostedWitnessRecord]) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    let mut observers: BTreeMap<&str, BTreeMap<&str, HostedWitnessVantage>> = BTreeMap::new();
+    for record in reports {
+        observers
+            .entry(&record.report.observed_serial_hex)
+            .or_default()
+            .entry(&record.observer_binding)
+            .and_modify(|vantage| {
+                if !vantage.is_strong() && record.report.vantage.is_strong() {
+                    *vantage = record.report.vantage;
+                }
+            })
+            .or_insert(record.report.vantage);
+    }
+    observers
+        .into_iter()
+        .filter(|(_, bindings)| {
+            bindings.len() >= 2 && bindings.values().any(|vantage| vantage.is_strong())
+        })
+        .map(|(serial, _)| serial.to_string())
+        .collect()
+}
+
+fn normalize_serial_set(serials: &mut Vec<String>, cap: usize) {
+    serials.retain(|serial| valid_serial_hex(serial));
+    serials.sort();
+    serials.dedup();
+    retain_tail(serials, cap);
+}
+
+fn valid_serial_hex(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_witness_binding(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 192
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
 }
 
 fn retain_request_tail(values: &mut Vec<HostedLeaseRequest>, cap: usize) {

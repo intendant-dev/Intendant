@@ -3845,6 +3845,7 @@ mod tests {
             client_key: None,
             pinned_fingerprints: Vec::new(),
             browser_tcp_via_url: None,
+            certificate_witness_vantage: crate::peer::PeerWitnessVantage::Unknown,
         }
     }
 

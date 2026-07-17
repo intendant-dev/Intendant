@@ -396,6 +396,7 @@ mod tests {
                 Vec::new(),
                 None,
                 None,
+                crate::peer::PeerWitnessVantage::Unknown,
                 crate::peer::transport::intendant::TransportCredentials::default(),
                 log_tx,
                 move |events_tx| {

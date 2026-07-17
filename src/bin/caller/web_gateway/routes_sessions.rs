@@ -921,7 +921,17 @@ pub(crate) fn handle_changes_request_inner(
         let records =
             load_external_change_records(snapshot_dir, project_root, !file_path.is_empty(), true);
         if file_path.is_empty() {
-            let changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
+            let mut changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
+            if changes.is_empty() {
+                // No session-scoped record source (native sessions have
+                // no external diff log, and this target never ran a
+                // watcher): answer from the working tree itself — the
+                // same git state the vitals dirty chip counted.
+                changes = git_fallback_change_records(project_root)
+                    .iter()
+                    .map(change_record_summary_json)
+                    .collect();
+            }
             return (
                 "200 OK",
                 serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string()),
@@ -930,6 +940,9 @@ pub(crate) fn handle_changes_request_inner(
 
         let decoded = url_path_decode(file_path);
         if let Some(record) = records.into_iter().find(|record| record.path == decoded) {
+            return ("200 OK", change_record_detail_json(&record).to_string());
+        }
+        if let Some(record) = git_fallback_change_record_detail(project_root, &decoded) {
             return ("200 OK", change_record_detail_json(&record).to_string());
         }
         return (
@@ -1031,11 +1044,24 @@ pub(crate) fn session_row_matches_changes_target(
 }
 
 pub(crate) fn changes_project_root_from_session(session: &serde_json::Value) -> Option<PathBuf> {
-    ["project_root", "cwd", "workdir", "workDir"]
-        .into_iter()
-        .find_map(|key| value_str(session, key))
+    // A worktree session's effective root is its checkout
+    // (`SessionWorktreeMeta.path`) — the same field the git-vitals
+    // restore scan prefers, so the dirty chip and the Changes tab resolve
+    // the same checkout for the same session.
+    session
+        .get("worktree")
+        .and_then(|worktree| worktree.get("path"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| {
+            ["project_root", "cwd", "workdir", "workDir"]
+                .into_iter()
+                .find_map(|key| value_str(session, key))
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+        })
 }
 
 pub(crate) fn changes_log_dir_from_session(session: &serde_json::Value) -> Option<PathBuf> {
@@ -1432,6 +1458,225 @@ pub(crate) fn load_external_change_records(
     records
 }
 
+/// Working-tree (git) fallback for the Changes surfaces. The vitals
+/// dirty chip counts `git status` entries for a session's checkout and
+/// its action navigates to the Changes tab — so when the tab's
+/// session-scoped sources (the rewind baseline, the external agent diff
+/// log) have no records while git says the checkout is dirty, the tab
+/// must not contradict the chip with an empty pane. These records derive
+/// from the SAME status invocation and parse the chip's count derives
+/// from (`session_vitals::git_working_tree_status`), so the two surfaces
+/// state the same file set by construction.
+///
+/// Line stats for tracked entries come from one `git diff HEAD
+/// --numstat` pass (`--no-renames` so every path keys exactly);
+/// untracked files synthesize created-file stats from their content.
+fn git_fallback_change_records(project_root: &Path) -> Vec<ChangeRecord> {
+    // Status paths are toplevel-relative whatever the invocation cwd, so
+    // every filesystem join and `--` pathspec below must use the checkout
+    // toplevel — the same resolution the vitals prober keys its probes by
+    // (a project root that is a subdirectory of a checkout probes, and
+    // now lists, that checkout).
+    let Some(toplevel) = git_checkout_toplevel(project_root) else {
+        return Vec::new();
+    };
+    let Some(facts) = crate::session_vitals::git_working_tree_status(&toplevel) else {
+        return Vec::new();
+    };
+    if facts.entries.is_empty() {
+        return Vec::new();
+    }
+    let numstat = git_diff_head_numstat(&toplevel);
+    facts
+        .entries
+        .iter()
+        .map(|entry| git_status_change_record(&toplevel, entry, numstat.get(&entry.path)))
+        .collect()
+}
+
+/// The checkout containing `root` (`rev-parse --show-toplevel`), the
+/// probe key the vitals prober uses. `None` when `root` is not inside
+/// any working tree — the fallback then states nothing, exactly like
+/// the chip's failed probe.
+fn git_checkout_toplevel(root: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!toplevel.is_empty()).then(|| PathBuf::from(toplevel))
+}
+
+/// Kind vocabulary bridge: the shared status parse speaks
+/// created/modified/deleted; ChangeRecord carries the same words.
+fn git_status_entry_kind_str(kind: crate::session_vitals::GitStatusEntryKind) -> &'static str {
+    match kind {
+        crate::session_vitals::GitStatusEntryKind::Created => "created",
+        crate::session_vitals::GitStatusEntryKind::Deleted => "deleted",
+        crate::session_vitals::GitStatusEntryKind::Modified => "modified",
+    }
+}
+
+/// `git diff HEAD --numstat` per-path (added, removed, binary) — one
+/// subprocess for the whole list. Empty on failure (unborn HEAD, no
+/// git): records then carry zero stats but stay listed.
+fn git_diff_head_numstat(toplevel: &Path) -> HashMap<String, (u32, u32, bool)> {
+    let mut stats = HashMap::new();
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(toplevel)
+        .args(["diff", "HEAD", "--no-renames", "--numstat"])
+        .output()
+    else {
+        return stats;
+    };
+    if !output.status.success() {
+        return stats;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut cols = line.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) = (cols.next(), cols.next(), cols.next())
+        else {
+            continue;
+        };
+        let binary = added == "-" || removed == "-";
+        let added = added.parse().unwrap_or(0);
+        let removed = removed.parse().unwrap_or(0);
+        stats.insert(
+            crate::session_vitals::unquote_git_path(path),
+            (added, removed, binary),
+        );
+    }
+    stats
+}
+
+/// Summary record for one git status entry (no diff body — the list
+/// lane). Untracked text files count their content as additions;
+/// untracked directories and binaries stay listed with an honest
+/// no-textual-diff reason, keeping the row count equal to the chip's.
+fn git_status_change_record(
+    toplevel: &Path,
+    entry: &crate::session_vitals::GitStatusEntry,
+    numstat: Option<&(u32, u32, bool)>,
+) -> ChangeRecord {
+    let kind = git_status_entry_kind_str(entry.kind);
+    if let Some((added, removed, binary)) = numstat {
+        return ChangeRecord {
+            path: entry.path.clone(),
+            kind,
+            lines_added: *added,
+            lines_removed: *removed,
+            diff_available: !binary,
+            reason: binary.then(|| "binary file (no textual diff)".to_string()),
+            diff: None,
+        };
+    }
+    if entry.path.ends_with('/') {
+        // Git spends one status line on a whole untracked directory; the
+        // chip counts it as one entry, so the list keeps that shape.
+        return unsupported_change_record(
+            &entry.path,
+            kind,
+            "untracked directory (git lists it as one entry)".to_string(),
+        );
+    }
+    // Untracked file (absent from diff HEAD): stats from its content.
+    match crate::file_watcher::inspect_file(&toplevel.join(&entry.path)) {
+        Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => ChangeRecord {
+            path: entry.path.clone(),
+            kind,
+            lines_added: snapshot.text.lines().count() as u32,
+            lines_removed: 0,
+            diff_available: true,
+            reason: None,
+            diff: None,
+        },
+        Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
+            unsupported_change_record(&entry.path, kind, snapshot.reason)
+        }
+        Err(_) => ChangeRecord {
+            path: entry.path.clone(),
+            kind,
+            lines_added: 0,
+            lines_removed: 0,
+            diff_available: true,
+            reason: None,
+            diff: None,
+        },
+    }
+}
+
+/// Single-file detail for the git fallback lane. Only paths git itself
+/// listed as dirty are served (the status entry set is the lookup key,
+/// so no request-supplied path ever reaches the filesystem directly).
+/// Tracked entries diff against HEAD (staged + unstaged in one body);
+/// untracked files synthesize a created-file diff from content.
+fn git_fallback_change_record_detail(project_root: &Path, decoded: &str) -> Option<ChangeRecord> {
+    let toplevel = git_checkout_toplevel(project_root)?;
+    let facts = crate::session_vitals::git_working_tree_status(&toplevel)?;
+    let entry = facts.entries.iter().find(|entry| entry.path == decoded)?;
+    let kind = git_status_entry_kind_str(entry.kind);
+    if entry.path.ends_with('/') {
+        return Some(unsupported_change_record(
+            &entry.path,
+            kind,
+            "untracked directory (git lists it as one entry)".to_string(),
+        ));
+    }
+    let tracked_diff = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["diff", "HEAD", "--no-renames", "--"])
+        .arg(&entry.path)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .filter(|diff| !diff.trim().is_empty());
+    if let Some(diff) = tracked_diff {
+        let (lines_added, lines_removed) = diff_stats_from_unified_diff(&diff);
+        return Some(ChangeRecord {
+            path: entry.path.clone(),
+            kind,
+            lines_added,
+            lines_removed,
+            diff_available: true,
+            reason: None,
+            diff: Some(diff),
+        });
+    }
+    // Untracked (invisible to `diff HEAD`): synthesize the created-file
+    // diff the snapshot lane would show.
+    match crate::file_watcher::inspect_file(&toplevel.join(&entry.path)) {
+        Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => {
+            let diff = crate::file_watcher::compute_unified_diff("", &snapshot.text, &entry.path);
+            let (lines_added, lines_removed) = diff_stats_from_unified_diff(&diff);
+            Some(ChangeRecord {
+                path: entry.path.clone(),
+                kind,
+                lines_added,
+                lines_removed,
+                diff_available: true,
+                reason: None,
+                diff: Some(diff),
+            })
+        }
+        Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => Some(
+            unsupported_change_record(&entry.path, kind, snapshot.reason),
+        ),
+        Err(_) => Some(unsupported_change_record(
+            &entry.path,
+            kind,
+            "file is not readable for a textual diff".to_string(),
+        )),
+    }
+}
+
 pub(crate) fn collect_baseline_text_paths(baseline_dir: &Path) -> HashSet<String> {
     let mut paths = HashSet::new();
     let mut stack = vec![baseline_dir.to_path_buf()];
@@ -1747,6 +1992,17 @@ pub(crate) fn handle_changes_list(
             changes.push(change_record_summary_json(&record));
         }
     }
+    if changes.is_empty() {
+        // The session-scoped sources are empty (nothing changed since the
+        // rewind baseline, no external diff log entries) — but the vitals
+        // dirty chip may still be pointing here for uncommitted state that
+        // predates the baseline. Fall back to the working tree so the two
+        // surfaces agree; a genuinely clean checkout stays empty.
+        changes = git_fallback_change_records(project_root)
+            .iter()
+            .map(change_record_summary_json)
+            .collect();
+    }
     serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -1953,6 +2209,13 @@ pub(crate) fn handle_changes_file_diff(
             .into_iter()
             .find(|record| record.path == decoded)
             {
+                return ("200 OK", change_record_detail_json(&record).to_string());
+            }
+            // Not a session-scoped change: serve the working-tree diff if
+            // git lists the file as dirty (the state the vitals chip
+            // counted) — the list lane's git fallback hands out exactly
+            // these paths.
+            if let Some(record) = git_fallback_change_record_detail(project_root, &decoded) {
                 return ("200 OK", change_record_detail_json(&record).to_string());
             }
             (
@@ -5726,6 +5989,242 @@ mod tests {
         assert!(json["diff"].as_str().unwrap().contains("+created"));
     }
 
+    fn test_git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@e2e",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git failed: {args:?}");
+    }
+
+    /// USER-REPORTED regression: a native session running in a linked git
+    /// worktree showed the vitals dirty chip, but clicking through to the
+    /// Changes tab rendered nothing — the tab had no session-scoped record
+    /// source (native sessions write no external diff log and never ran a
+    /// watcher), and before the session was targeted at all it served the
+    /// daemon head session's watcher (the wrong checkout entirely). The
+    /// target lane must answer from the session's own worktree via the
+    /// same git status parse the chip counts.
+    #[test]
+    fn changes_request_serves_git_dirty_state_for_native_worktree_session() {
+        let home = tempfile::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        let base = root.path().join("base");
+        let wt = root.path().join("wt");
+        std::fs::create_dir_all(&base).unwrap();
+        test_git(&base, &["init", "-q", "-b", "main"]);
+        std::fs::write(base.join("a.txt"), "one\n").unwrap();
+        test_git(&base, &["add", "."]);
+        test_git(&base, &["commit", "-qm", "base"]);
+        test_git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "session-branch",
+            ],
+        );
+        // Dirty the WORKTREE only; the base checkout stays clean, so a
+        // wrong-root resolution yields an empty list and fails the test.
+        std::fs::write(wt.join("a.txt"), "two\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "fresh\n").unwrap();
+
+        let session_id = "native-worktree-session";
+        let session_dir = home.path().join(".intendant/logs").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        // Native session meta: no external markers, no session.jsonl diff
+        // log, no file_snapshots baseline. project_root deliberately
+        // records the BASE root so the test pins the worktree-path
+        // preference (the field the git-vitals restore scan uses).
+        std::fs::write(
+            session_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-07-17T10:00:00",
+                "project_root": base.to_string_lossy(),
+                "task": "native worktree session",
+                "status": "idle",
+                "worktree": {
+                    "branch": "session-branch",
+                    "path": wt.to_string_lossy(),
+                    "base_root": base.to_string_lossy(),
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("session.jsonl"),
+            serde_json::json!({"event": "info", "message": "Session started"}).to_string(),
+        )
+        .unwrap();
+
+        // The daemon head session's live watcher lane: baseline exists,
+        // different project root — reaching it would be the old bug.
+        let live_snapshot = tempfile::TempDir::new().unwrap();
+        let live_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(live_snapshot.path().join("baseline")).unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={session_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let listed: Vec<(&str, &str)> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| {
+                (
+                    item["path"].as_str().unwrap(),
+                    item["kind"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![("a.txt", "modified"), ("new.txt", "created")],
+            "the session's worktree dirt must be listed: {body}"
+        );
+
+        // Derive-don't-mirror pin: the tab's row count IS the vitals dirty
+        // count — both surfaces come from one status parse of one root.
+        let facts = crate::session_vitals::git_working_tree_status(&wt)
+            .expect("worktree probes like the vitals chip");
+        assert_eq!(json.as_array().unwrap().len() as u32, facts.dirty_files());
+
+        // Single-file diffs: the tracked change diffs against HEAD, the
+        // untracked file synthesizes a created-file diff.
+        let request =
+            format!("GET /api/session/current/changes/a.txt?session_id={session_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let diff = json["diff"].as_str().unwrap();
+        assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
+        assert_eq!(json["lines_added"], 1);
+        assert_eq!(json["lines_removed"], 1);
+
+        let request =
+            format!("GET /api/session/current/changes/new.txt?session_id={session_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["kind"], "created");
+        assert!(json["diff"].as_str().unwrap().contains("+fresh"));
+
+        // A path git does not list stays a 404 — the status entry set is
+        // the only key into the filesystem.
+        let request =
+            format!("GET /api/session/current/changes/absent.txt?session_id={session_id} HTTP/1.1");
+        let (status, _) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+        );
+        assert_eq!(status, "404 Not Found");
+
+        // Committed clean: the fallback states nothing — the chip and the
+        // tab agree on clean too.
+        test_git(&wt, &["add", "."]);
+        test_git(&wt, &["commit", "-qm", "session work"]);
+        let request = format!("GET /api/session/current/changes?session_id={session_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(live_project.path()),
+            home.path(),
+        );
+        assert_eq!(status, "200 OK");
+        assert_eq!(body, "[]");
+    }
+
+    /// The live head lane's empty-list fallback: a baseline that already
+    /// captured the dirty content (uncommitted state predating the
+    /// daemon) leaves the watcher lane empty while the vitals chip counts
+    /// the dirt — the list must then answer from the working tree.
+    #[test]
+    fn changes_list_falls_back_to_git_when_snapshot_sources_are_empty() {
+        let repo = tempfile::TempDir::new().unwrap();
+        test_git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        test_git(repo.path(), &["add", "."]);
+        test_git(repo.path(), &["commit", "-qm", "base"]);
+        // Pre-daemon dirt, then a baseline that mirrors the CURRENT
+        // content — the snapshot lane sees nothing changed.
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let baseline = snapshot.path().join("baseline");
+        std::fs::create_dir_all(&baseline).unwrap();
+        std::fs::write(baseline.join("a.txt"), "two\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(repo.path()),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 1, "{body}");
+        assert_eq!(json[0]["path"], "a.txt");
+        assert_eq!(json[0]["kind"], "modified");
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/a.txt HTTP/1.1",
+            Some(snapshot.path()),
+            Some(repo.path()),
+        );
+        assert_eq!(status, "200 OK");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let diff = json["diff"].as_str().unwrap();
+        assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
+
+        // Session-scoped changes take precedence: once the watcher lane
+        // has a record, the list is the session's own change set again.
+        std::fs::write(repo.path().join("b.txt"), "b\n").unwrap();
+        std::fs::write(baseline.join("b.txt"), "old-b\n").unwrap();
+        let (_, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(repo.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let listed: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, vec!["b.txt"], "{body}");
+    }
+
     #[test]
     fn changes_request_prefers_matching_external_log_with_changes() {
         let home = tempfile::TempDir::new().unwrap();
@@ -6063,6 +6562,12 @@ mod tests {
     /// before this one must not surface as a phantom "deleted" row — the
     /// stale `baseline/` copy is reconciled away at watcher construction,
     /// keeping the full scan and the watcher-index fast path in agreement.
+    ///
+    /// The resumed instance opens a CLONE of the store (same bytes,
+    /// fresh path — `clone_store_for_resume`): reopening the same path
+    /// in-process races concurrently forked subprocesses pinning the
+    /// dropped store flock, which degraded this test's resumed watcher
+    /// to read-only on the CI Mac and ejected the merge queue.
     #[test]
     fn resume_after_delete_reconciles_stale_baselines() {
         let project = tempfile::TempDir::new().unwrap();
@@ -6081,15 +6586,17 @@ mod tests {
         // The file disappears between runs.
         std::fs::remove_file(root.join("stale.rs")).unwrap();
 
+        let resumed_store =
+            crate::file_watcher::FileWatcher::clone_store_for_resume(snapshot.path());
         let mut resumed = crate::file_watcher::FileWatcher::new(
             root.to_path_buf(),
-            snapshot.path().to_path_buf(),
+            resumed_store.path().to_path_buf(),
             crate::event::EventBus::new(),
         )
         .expect("resumed watcher");
         resumed.mark_live_index_healthy_for_tests();
 
-        let baseline_dir = snapshot.path().join("baseline");
+        let baseline_dir = resumed_store.path().join("baseline");
         let full = changes_list_summaries_full_scan(&baseline_dir, root);
         let index = resumed.changes_index_snapshot().expect("healthy index");
         let fast = changes_list_summaries_from_index(&baseline_dir, root, &index);

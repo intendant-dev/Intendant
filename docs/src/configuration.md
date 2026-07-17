@@ -718,6 +718,7 @@ is required.
 | `client_key` | string | installed access client key when present | Private key PEM for `client_cert`; must be paired with `client_cert` |
 | `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
 | `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
+| `certificate_witness_vantage` | `unknown`, `same_lan`, or `remote` | `unknown` | Local operator statement about this daemon's network relationship to the peer for certificate-witness weighting. Set `remote` only for an independently operated outside-network observer; public destination addresses are not sufficient. |
 
 Manual dashboard additions live only in the in-memory registry unless the
 operator checks **Save to intendant.toml**. Pairing flows are durable by default:
@@ -1013,6 +1014,7 @@ advertised_transport = "none"
 # client_cert = "/etc/intendant/peers/peer-client.crt"
 # client_key = "/etc/intendant/peers/peer-client.key"
 # bearer_token = "legacy-token-if-the-peer-requires-one"
+# certificate_witness_vantage = "remote" # only for a known outside-network peer
 
 [[mcp_servers]]
 name = "filesystem"

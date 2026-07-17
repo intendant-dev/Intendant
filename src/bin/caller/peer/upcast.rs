@@ -4332,6 +4332,7 @@ mod tests {
             round: 3,
             turns_in_round: 7,
             native_message_count: None,
+            project_root: None,
         });
     }
 

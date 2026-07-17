@@ -3360,7 +3360,10 @@ async fn main() -> Result<(), CallerError> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            credential_leases::sweep_now();
+            // The sweep's deferred half does synchronous filesystem work
+            // (staging scans, directory deletion) — keep it off the
+            // async workers.
+            let _ = tokio::task::spawn_blocking(credential_leases::sweep_now).await;
         }
     });
 

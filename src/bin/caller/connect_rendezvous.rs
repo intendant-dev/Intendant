@@ -64,6 +64,8 @@ struct RegisterRequest {
     signature: String,
     hosted_control_enabled: bool,
     hosted_control_signature: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fleet_certificate_ledger: Option<crate::access::hosted_control::HostedCertificateLedger>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +389,7 @@ fn register_nudge() -> &'static Notify {
 struct ClientState {
     handle: Option<JoinHandle<()>>,
     dashboard_control: Option<Arc<DashboardControlRegistry>>,
+    hosted_control: Option<Arc<crate::access::hosted_control::HostedControlRuntime>>,
     /// The web gateway's TCP port — combined with the rendezvous-observed
     /// IP to advertise an ICE-TCP candidate on Connect offers.
     gateway_tcp_port: Option<u16>,
@@ -398,6 +401,7 @@ fn client_state() -> &'static Mutex<ClientState> {
         Mutex::new(ClientState {
             handle: None,
             dashboard_control: None,
+            hosted_control: None,
             gateway_tcp_port: None,
         })
     })
@@ -407,15 +411,17 @@ pub fn spawn_connect_rendezvous_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
 ) {
     {
         let mut state = client_state()
             .lock()
             .expect("connect client state poisoned");
         state.dashboard_control = Some(dashboard_control.clone());
+        state.hosted_control = Some(Arc::clone(&hosted_control));
         state.gateway_tcp_port = gateway_tcp_port;
     }
-    start_client(config, dashboard_control, gateway_tcp_port);
+    start_client(config, dashboard_control, gateway_tcp_port, hosted_control);
 }
 
 /// Stop the running client task, if any. All of the task's awaits are
@@ -455,15 +461,22 @@ pub(crate) fn apply_config(config: ConnectConfig) -> Result<bool, String> {
         });
         return Ok(false);
     }
-    let (dashboard_control, gateway_tcp_port) = {
+    let (dashboard_control, gateway_tcp_port, hosted_control) = {
         let state = client_state()
             .lock()
             .expect("connect client state poisoned");
-        (state.dashboard_control.clone(), state.gateway_tcp_port)
+        (
+            state.dashboard_control.clone(),
+            state.gateway_tcp_port,
+            state.hosted_control.clone(),
+        )
     };
     let dashboard_control = dashboard_control
         .ok_or_else(|| "connect client cannot start before the web gateway".to_string())?;
-    start_client(config, dashboard_control, gateway_tcp_port);
+    let hosted_control = hosted_control.ok_or_else(|| {
+        "connect client cannot start before hosted control is initialized".to_string()
+    })?;
+    start_client(config, dashboard_control, gateway_tcp_port, hosted_control);
     Ok(client_state()
         .lock()
         .expect("connect client state poisoned")
@@ -477,6 +490,7 @@ fn start_client(
     config: ConnectConfig,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
 ) {
     with_status(|status| {
         status.configured = config.enabled;
@@ -526,7 +540,14 @@ fn start_client(
         }
     };
     let handle = tokio::spawn(async move {
-        run_connect_rendezvous_client(config, base_url, dashboard_control, gateway_tcp_port).await;
+        run_connect_rendezvous_client(
+            config,
+            base_url,
+            dashboard_control,
+            gateway_tcp_port,
+            hosted_control,
+        )
+        .await;
         // Natural exit (identity or HTTP-client construction failure) —
         // an abort via `stop_client` never reaches this line, but that
         // path flips the flag itself.
@@ -545,6 +566,7 @@ async fn run_connect_rendezvous_client(
     base_url: Url,
     dashboard_control: Arc<DashboardControlRegistry>,
     gateway_tcp_port: Option<u16>,
+    hosted_control: Arc<crate::access::hosted_control::HostedControlRuntime>,
 ) {
     let identity = match DaemonIdentity::load_or_create_default() {
         Ok(identity) => identity,
@@ -587,7 +609,16 @@ async fn run_connect_rendezvous_client(
     });
 
     loop {
-        match register(&client, &base_url, &config, &daemon_id, &identity).await {
+        match register(
+            &client,
+            &base_url,
+            &config,
+            &daemon_id,
+            &identity,
+            &hosted_control,
+        )
+        .await
+        {
             Ok(response) => note_register_response(&response, &base_url),
             Err(RegisterError::Rejected(e)) => {
                 eprintln!(
@@ -653,7 +684,16 @@ async fn run_connect_rendezvous_client(
                 _ = register_nudge().notified() => true,
             };
             if force_register || last_register.elapsed() >= REGISTER_REFRESH_INTERVAL {
-                match register(&client, &base_url, &config, &daemon_id, &identity).await {
+                match register(
+                    &client,
+                    &base_url,
+                    &config,
+                    &daemon_id,
+                    &identity,
+                    &hosted_control,
+                )
+                .await
+                {
                     Ok(response) => {
                         note_register_response(&response, &base_url);
                         last_register = Instant::now();
@@ -847,6 +887,7 @@ async fn register(
     config: &ConnectConfig,
     daemon_id: &str,
     identity: &DaemonIdentity,
+    hosted_control: &crate::access::hosted_control::HostedControlRuntime,
 ) -> Result<RegisterResponse, RegisterError> {
     let daemon_public_key = identity.public_key_b64u();
     let claim_code = current_route_claim_code().map_err(RegisterError::Transient)?;
@@ -865,6 +906,13 @@ async fn register(
         issued_at_unix_ms,
         config.hosted_control_enabled,
     );
+    let fleet_certificate_ledger = if config.hosted_control_enabled {
+        hosted_control.certificate_ledger().ok().filter(|ledger| {
+            ledger.daemon_id == daemon_id && ledger.daemon_public_key == daemon_public_key
+        })
+    } else {
+        None
+    };
     let request = RegisterRequest {
         protocol: "intendant-connect-rendezvous-v1",
         daemon_id: daemon_id.to_string(),
@@ -874,6 +922,7 @@ async fn register(
         signature: identity.sign_b64u(payload.as_bytes()),
         hosted_control_enabled: config.hosted_control_enabled,
         hosted_control_signature: identity.sign_b64u(hosted_control_payload.as_bytes()),
+        fleet_certificate_ledger,
     };
     authenticated(
         config,

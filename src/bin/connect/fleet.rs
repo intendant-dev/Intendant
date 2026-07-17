@@ -127,7 +127,7 @@ pub(crate) async fn api_fleet_targets_sync(
     }
     let mut store = state.store.lock().await;
     if merge_fleet_targets(&mut store, user.id, incoming) {
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     let targets = fleet_targets_for_user(&state.config, &store, user.id);
     Ok(Json(json!({
@@ -258,7 +258,7 @@ pub(crate) async fn api_fleet_target_forget(
             Some(target_id.clone()),
             json!({ "removed": removed }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     let targets = fleet_targets_for_user(&state.config, &store, user.id);
     Ok(Json(json!({
@@ -573,8 +573,9 @@ pub(crate) async fn api_daemon_revoke(
             );
             Ok(())
         },
-        |next| persist_locked(&state, next),
-    )?;
+        async |next| persist_locked(&state, next).await,
+    )
+    .await?;
     drop(store);
     close_active_dashboard_sessions(&state, &daemon_id, active_session_ids).await;
     log_json(
@@ -650,7 +651,7 @@ pub(crate) async fn api_daemon_label(
         Some(daemon_id.clone()),
         json!({ "label": label }),
     );
-    persist_locked(&state, &store)?;
+    persist_locked(&state, &store).await?;
     Ok(Json(json!({ "ok": true, "daemon": view })))
 }
 
@@ -815,7 +816,7 @@ pub(crate) async fn api_vault_publish(
         now_unix_ms(),
     )?;
     if stored {
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(
         json!({ "ok": true, "stored": stored, "revision": body.revision }),
@@ -904,6 +905,7 @@ mod tests {
             label: None,
             daemon_public_key: "key".to_string(),
             hosted_control_enabled: false,
+            fleet_certificate_ledger: None,
             owner_user_id: Some(user_id),
             claim_code_hash: None,
             claim_code_created_unix_ms: None,
@@ -1116,6 +1118,7 @@ mod tests {
                 label: Some("Live daemon".to_string()),
                 daemon_public_key: "daemon-key".to_string(),
                 hosted_control_enabled: false,
+                fleet_certificate_ledger: None,
                 owner_user_id: Some(user_id),
                 claim_code_hash: None,
                 claim_code_created_unix_ms: None,

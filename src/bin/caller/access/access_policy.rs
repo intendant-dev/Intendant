@@ -494,6 +494,12 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
 
 #[allow(dead_code)]
 pub fn profile_allows_control_msg(profile: &str, ctrl: &ControlMsg) -> bool {
+    if matches!(ctrl, ControlMsg::HostedCertificateWitness { .. }) {
+        // This transport-only verb is admitted from an authenticated peer
+        // certificate at the gateway edge, independent of general peer
+        // control profiles.
+        return false;
+    }
     if matches!(ctrl, ControlMsg::PeerDashboardControlSignal { .. }) {
         return profile_allows_dashboard_control_tunnel(profile);
     }
@@ -860,6 +866,14 @@ pub const FRAME_LANES: &[FrameLaneSpec] = &[
         tunnel: true,
         note: "error terminator — same gate",
     },
+    FrameLaneSpec {
+        frame: "egress_request_ack",
+        op: Some(PeerOperation::CredentialsManage),
+        ws: false,
+        tunnel: true,
+        note: "request-side credit refill from a relay page that declared request_credits — \
+               same gate and same per-request session binding as egress_response",
+    },
     // ---- both lanes: liveness ----
     FrameLaneSpec {
         frame: "ping",
@@ -896,6 +910,9 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         // through `profile_allows_dashboard_control_tunnel` (the tunnel is
         // multi-capability, so its door is any-of, not this single op).
         ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
+        // Fallback classification only: the gateway admits this exact
+        // transport verb solely from a verified peer identity.
+        ControlMsg::HostedCertificateWitness { .. } => PeerOperation::PresenceRead,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. }
@@ -1580,6 +1597,7 @@ mod tests {
             ("egress_chunk",                   None,                 Some(CredentialsManage)),
             ("egress_end",                     None,                 Some(CredentialsManage)),
             ("egress_error",                   None,                 Some(CredentialsManage)),
+            ("egress_request_ack",             None,                 Some(CredentialsManage)),
             // -- no-authority dispatch machinery + unknown kinds --
             ("ping",                           None,                 None),
             ("hello",                          None,                 None),

@@ -1167,31 +1167,50 @@ pub(crate) async fn run_agent_loop(
         // (the trait default errors — mock and custom providers), the
         // messages dump is the turn's ONLY exact input record, so it is
         // written regardless of the gate.
-        let request_snapshot = provider.request_snapshot(conversation.messages(), true);
-        if messages_json_dump_enabled() || request_snapshot.is_err() {
+        //
+        // ONE build per turn: the prepared request's bytes feed both the
+        // Context-tab snapshot below (parsed back from the same bytes, so
+        // "exact request payload" holds by construction) and every stream
+        // attempt in the retry loop — the old shape built the full request
+        // once for the snapshot and again per chat_stream call.
+        let prepared = provider.prepare_request(conversation.messages(), true);
+        if messages_json_dump_enabled() || prepared.is_err() {
             slog(&session_log, |l| {
                 if let Ok(json) = serde_json::to_string_pretty(conversation.messages()) {
                     l.messages_input(&json);
                 }
             });
         }
-        match request_snapshot {
-            Ok((context_format, raw_context)) => {
-                bus.send(AppEvent::ContextSnapshot {
-                    session_id: local_session_id.clone(),
-                    source: "native".to_string(),
-                    label: "Internal agent request payload".to_string(),
-                    request_id: Some(format!("native-turn-{turn}")),
-                    request_index: Some(turn as u64),
-                    turn: Some(turn),
-                    format: context_format,
-                    token_count: conversation.last_usage().map(|u| u.total_tokens),
-                    token_count_kind: None,
-                    context_window: Some(conversation.context_window()),
-                    hard_context_window: Some(conversation.context_window()),
-                    item_count: provider_request_item_count(&raw_context),
-                    raw: std::sync::Arc::new(raw_context),
-                });
+        let prepared = match prepared {
+            Ok(prepared) => {
+                match prepared.snapshot_value() {
+                    Ok(raw_context) => {
+                        bus.send(AppEvent::ContextSnapshot {
+                            session_id: local_session_id.clone(),
+                            source: "native".to_string(),
+                            label: "Internal agent request payload".to_string(),
+                            request_id: Some(format!("native-turn-{turn}")),
+                            request_index: Some(turn as u64),
+                            turn: Some(turn),
+                            format: prepared.format.clone(),
+                            token_count: conversation.last_usage().map(|u| u.total_tokens),
+                            token_count_kind: None,
+                            context_window: Some(conversation.context_window()),
+                            hard_context_window: Some(conversation.context_window()),
+                            item_count: provider_request_item_count(&raw_context),
+                            raw: std::sync::Arc::new(raw_context),
+                        });
+                    }
+                    Err(e) => {
+                        slog(&session_log, |l| {
+                            l.warn(&format!(
+                                "Failed to build provider request context snapshot: {}",
+                                e
+                            ))
+                        });
+                    }
+                }
+                Some(prepared)
             }
             Err(e) => {
                 slog(&session_log, |l| {
@@ -1200,8 +1219,9 @@ pub(crate) async fn run_agent_loop(
                         e
                     ))
                 });
+                None
             }
-        }
+        };
 
         // Streaming API call — wrapped in select! so an interrupt cancels
         // mid-stream without waiting for the provider to finish. The
@@ -1234,7 +1254,13 @@ pub(crate) async fn run_agent_loop(
                         }
                     }
                 };
-                let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
+                // The prepared bytes ride every attempt (Bytes refcount
+                // bumps); only providers without a prepare path (mock,
+                // custom) fall back to the rebuild-per-call shape.
+                let stream_fut = match prepared.as_ref() {
+                    Some(prepared) => provider.chat_stream_prepared(prepared, &on_stream_event),
+                    None => provider.chat_stream(conversation.messages(), &on_stream_event),
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel_token.cancelled() => {
@@ -1249,7 +1275,13 @@ pub(crate) async fn run_agent_loop(
                         break;
                     }
                     Err(e) => {
-                        let is_stream_error = e.to_string().contains("Stream error");
+                        // Typed classification first (the driver reports
+                        // mid-stream chunk failures as StreamChunk); the
+                        // string match stays as a compatibility fallback
+                        // for error paths that still stringify, not as
+                        // the contract.
+                        let is_stream_error = matches!(e, CallerError::StreamChunk(_))
+                            || e.to_string().contains("Stream error");
                         if is_stream_error && attempt < STREAM_RETRIES {
                             slog(&session_log, |l| {
                                 l.warn(&format!(
@@ -3020,6 +3052,7 @@ pub(crate) async fn run_round_loop(
                     round,
                     turns_in_round,
                     native_message_count,
+                    project_root: Some(project.root.clone()),
                 });
 
                 // Parked-steer pickup, half 1 (see claim_steer_injections):

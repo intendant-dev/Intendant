@@ -719,6 +719,15 @@ pub enum AppEvent {
         /// so a conversation-rollback request can truncate back to that
         /// length when rolling back to this round.
         native_message_count: Option<u32>,
+        /// Effective project root of the session that completed the round
+        /// (the emitter's `Project.root` / working root). The file
+        /// watcher's round listener routes on it: a round for a DIFFERENT
+        /// root (a worktree sub-agent, an external session elsewhere)
+        /// skips that watcher's stat walk + round persist entirely, while
+        /// `None` — an emitter that cannot resolve a root, or a replayed
+        /// log — fails open and records as before. In-process routing
+        /// metadata only: deliberately not mirrored to `OutboundEvent`.
+        project_root: Option<std::path::PathBuf>,
     },
 
     /// Presence layer responded — switch to follow-up mode without logging
@@ -2008,6 +2017,12 @@ pub enum ControlMsg {
     PeerDashboardControlSignal {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
+    },
+    /// An authenticated peer's certificate observation for this daemon's
+    /// hosted fleet name. The gateway consumes this at the peer transport
+    /// edge; it is never forwarded into the general control plane.
+    HostedCertificateWitness {
+        report: crate::access::hosted_control::HostedCertificateWitnessReport,
     },
     CreateBrowserWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]

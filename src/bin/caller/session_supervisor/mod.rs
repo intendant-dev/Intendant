@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+mod exec;
 mod launch;
 pub(crate) use launch::*;
 mod routing;
@@ -74,12 +75,23 @@ pub struct SessionSupervisorConfig {
     /// provenance before a hosted-created session becomes an eligible target.
     /// None in hermetic tests and non-hosted execution shapes.
     pub hosted_control_cert_dir: Option<PathBuf>,
+    /// Test seam for the off-intake launch executor: when set, the slow
+    /// launch bodies (session create / resume) await this gate flipping
+    /// true before doing any work — a deterministic stand-in for a
+    /// multi-second worktree checkout, so tests can hold a launch provably
+    /// in-flight while asserting what the intake still serves. None in
+    /// production (zero cost).
+    pub launch_gate_for_tests: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Clone)]
 pub struct SessionSupervisor {
     config: Arc<SessionSupervisorConfig>,
     state: Arc<AsyncMutex<SupervisorState>>,
+    /// Off-intake executor: per-session ordered queues for slow launch
+    /// bodies and the commands deferred behind them (see exec.rs and
+    /// `dispatch_control_msg`).
+    exec: Arc<exec::IntakeExecutor>,
 }
 
 const EXTERNAL_ATTACH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -505,6 +517,17 @@ impl SessionSupervisor {
         Self {
             config: Arc::new(config),
             state: Arc::new(AsyncMutex::new(SupervisorState::default())),
+            exec: exec::IntakeExecutor::new(),
+        }
+    }
+
+    /// Test seam (`SessionSupervisorConfig::launch_gate_for_tests`): hold
+    /// a slow launch body deterministically in-flight. No-op in
+    /// production.
+    async fn wait_for_launch_gate_in_tests(&self) {
+        if let Some(gate) = self.config.launch_gate_for_tests.as_ref() {
+            let mut gate = gate.clone();
+            let _ = gate.wait_for(|open| *open).await;
         }
     }
 
@@ -526,7 +549,7 @@ impl SessionSupervisor {
         match event {
             AppEvent::ControlCommand(msg) => {
                 if !filter_session_control || self.should_handle_session_control(&msg).await {
-                    self.handle_control_msg(msg).await;
+                    self.dispatch_control_msg(msg).await;
                 }
             }
             AppEvent::SessionIdentity {
@@ -571,6 +594,18 @@ impl SessionSupervisor {
     /// the observation side is display-only; intent-lane events are NOT
     /// re-observed here (they'd double-apply phase updates when the
     /// broadcast copy arrives).
+    ///
+    /// The lane is drained strictly in order, but a command's BODY no
+    /// longer necessarily runs inline: `dispatch_control_msg` does the
+    /// fast, ordering-critical work here (validate, reserve/mint identity,
+    /// dedup) and hands slow launch bodies — session create with a
+    /// worktree checkout, resume, restart, fork, delegation spawns — to
+    /// the per-session ordered executor (exec.rs), so one session's
+    /// multi-second checkout no longer head-of-line-blocks every other
+    /// session's approvals/steers/interrupts. Commands for one session
+    /// still execute in arrival order (a busy session's commands defer
+    /// onto its queue); the identity/relationship/end bookkeeping stays
+    /// inline, so routing state is always applied in lane order.
     ///
     /// Receivers are subscribed by the caller BEFORE the task is spawned:
     /// daemon startup sends `ResumeSession` immediately after `spawn()`
@@ -776,6 +811,7 @@ mod tests {
             ))),
             git_vitals_targets: None,
             hosted_control_cert_dir: None,
+            launch_gate_for_tests: None,
         })
     }
 

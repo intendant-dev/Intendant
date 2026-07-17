@@ -333,6 +333,7 @@ pub(crate) fn emit_context_rewind_resume_round_complete(
         round: resume.stats.rounds,
         turns_in_round,
         native_message_count: None,
+        project_root: Some(resume.config.project_root.to_path_buf()),
     });
 }
 
