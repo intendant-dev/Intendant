@@ -81,6 +81,13 @@ impl AgendaHandle {
         cmd: AgendaCommand,
         actor: Option<AgendaActor>,
     ) -> Result<AgendaItem, AgendaError> {
+        let asked = matches!(
+            &cmd,
+            AgendaCommand::Add {
+                kind: super::types::AgendaKind::Question,
+                ..
+            }
+        );
         let (item, counts) = {
             let mut store = self.lock();
             let item = store.apply_command(cmd, actor, now_ms())?;
@@ -91,6 +98,20 @@ impl AgendaHandle {
             item: item.clone(),
             counts,
         });
+        // A parked question is a durable ask: surface it on the attention
+        // rail (attention = tab badge + hidden-tab browser notification)
+        // so the owner finds it without watching the agenda tab. The
+        // notification is display-only; the reply rides the `answer` op.
+        if asked {
+            self.bus.send(AppEvent::UserNotification {
+                session_id: None,
+                id: format!("agenda-question-{}", item.id),
+                title: Some("Question parked on the agenda".to_string()),
+                text: item.title.clone(),
+                urgency: crate::types::NotificationUrgency::Attention,
+                ts: now_ms(),
+            });
+        }
         self.reminder_nudge.notify_waiters();
         Ok(item)
     }
