@@ -12,6 +12,12 @@ use std::sync::Mutex;
 use crate::event::{AppEvent, EventBus};
 
 use super::service::MemoryService;
+
+/// P1.8 storage-mode selector for [`MemoryHandle::bootstrap`].
+pub(crate) enum MemoryStorage {
+    Ephemeral,
+    Durable(std::path::PathBuf),
+}
 use super::types::{ClaimView, MemoryError, ProposeArgs, SearchArgs};
 
 pub(crate) struct MemoryHandle {
@@ -21,18 +27,31 @@ pub(crate) struct MemoryHandle {
 }
 
 impl MemoryHandle {
-    /// Bootstrap the ephemeral plane (the full `c.genesis` ceremony,
-    /// admitted by the stamped reducer) and wrap it single-writer.
-    /// Admitted writes broadcast `memory_changed` on `bus` so every
-    /// connected frontend updates live.
-    pub(crate) fn bootstrap(bus: EventBus) -> Result<MemoryHandle, MemoryError> {
-        let service = MemoryService::new()?;
+    /// Bootstrap the plane (the full `c.genesis` ceremony, admitted by
+    /// the stamped reducer) and wrap it single-writer. Admitted writes
+    /// broadcast `memory_changed` on `bus` so every connected frontend
+    /// updates live. `storage` picks the P1.8 mode: `Durable(dir)` on
+    /// the proven-custody OS, `Ephemeral` elsewhere (and in tests).
+    pub(crate) fn bootstrap(
+        bus: EventBus,
+        storage: MemoryStorage,
+    ) -> Result<MemoryHandle, MemoryError> {
+        let service = match storage {
+            MemoryStorage::Ephemeral => MemoryService::new()?,
+            MemoryStorage::Durable(dir) => MemoryService::new_durable(&dir)
+                .map_err(|e| MemoryError::InvalidArg(e.to_string()))?,
+        };
         let plane_id_hex = service.plane_id_hex();
         Ok(MemoryHandle {
             service: Mutex::new(service),
             plane_id_hex,
             bus,
         })
+    }
+
+    /// The mode label views carry ("durable" / "ephemeral").
+    pub(crate) fn durability_label(&self) -> &'static str {
+        self.lock().durability_label()
     }
 
     pub(crate) fn plane_id_hex(&self) -> &str {
@@ -90,7 +109,7 @@ mod tests {
     fn propose_broadcasts_memory_changed() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
-        let handle = MemoryHandle::bootstrap(bus).unwrap();
+        let handle = MemoryHandle::bootstrap(bus, MemoryStorage::Ephemeral).unwrap();
 
         let view = handle
             .propose(

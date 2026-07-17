@@ -338,19 +338,64 @@ pub(crate) fn spawn_mode_web_gateway(
     // tombed cutover). Bootstrap failure degrades to "memory
     // unavailable" instead of failing the gateway; the plane id is
     // logged so operators can tell incarnations apart across restarts.
-    mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap(bus.clone()) {
-        Ok(handle) => {
-            println!(
-                "[memory] ephemeral plane {} (nothing persists across restarts)",
-                &handle.plane_id_hex()[..16]
-            );
-            Some(Arc::new(handle))
+    // P1.8: the durable plane runs on the proven-custody OS (macOS);
+    // multi-platform custody stays full Gate B, so other OSes run
+    // ephemeral and say so on every view. INTENDANT_MEMORY_EPHEMERAL=1
+    // is the operator kill switch. Durable bootstrap failure fails
+    // SOFT to ephemeral (service stays available; the label stays
+    // honest) with the named outcome logged.
+    let durable_default = cfg!(target_os = "macos")
+        && std::env::var("INTENDANT_MEMORY_EPHEMERAL").map_or(true, |v| v != "1");
+    let storage = if durable_default {
+        match dirs::home_dir() {
+            Some(home) => {
+                crate::memory::MemoryStorage::Durable(home.join(".intendant").join("memory-plane"))
+            }
+            None => crate::memory::MemoryStorage::Ephemeral,
         }
-        Err(err) => {
-            eprintln!("[memory] ephemeral plane bootstrap failed: {err}");
-            None
-        }
+    } else {
+        crate::memory::MemoryStorage::Ephemeral
     };
+    let storage = match &storage {
+        crate::memory::MemoryStorage::Durable(dir) => {
+            match crate::memory::MemoryHandle::bootstrap(
+                bus.clone(),
+                crate::memory::MemoryStorage::Durable(dir.clone()),
+            ) {
+                Ok(handle) => {
+                    println!(
+                        "[memory] durable plane {} at {}",
+                        &handle.plane_id_hex()[..16],
+                        dir.display()
+                    );
+                    mcp_http_state.memory = Some(Arc::new(handle));
+                    None
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[memory] durable plane unavailable ({err}) — falling back to ephemeral"
+                    );
+                    Some(crate::memory::MemoryStorage::Ephemeral)
+                }
+            }
+        }
+        crate::memory::MemoryStorage::Ephemeral => Some(crate::memory::MemoryStorage::Ephemeral),
+    };
+    if let Some(storage) = storage {
+        mcp_http_state.memory = match crate::memory::MemoryHandle::bootstrap(bus.clone(), storage) {
+            Ok(handle) => {
+                println!(
+                    "[memory] ephemeral plane {} (nothing persists across restarts)",
+                    &handle.plane_id_hex()[..16]
+                );
+                Some(Arc::new(handle))
+            }
+            Err(err) => {
+                eprintln!("[memory] ephemeral plane bootstrap failed: {err}");
+                None
+            }
+        };
+    }
     let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
         Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
         bus.clone(),
