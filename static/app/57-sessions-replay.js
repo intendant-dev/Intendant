@@ -1494,6 +1494,18 @@ function closeSessionDetail() {
 }
 window.closeSessionDetail = closeSessionDetail;
 window.loadSessions = loadSessions;
+// QA readback (window.qa convention): the SPA is one module scope, so
+// harness probes cannot reach module functions — this is the scripted
+// route into a session's detail overlay (validate-dashboard drives it
+// instead of brittle card-click targeting).
+window.qa = Object.assign(window.qa || {}, {
+  openSessionDetailById: (sessionId, source) =>
+    openSessionDetail(
+      typeof sessionId === 'object' && sessionId !== null
+        ? sessionId
+        : { session_id: sessionId, source: source || 'intendant' }
+    ),
+});
 
 // ── Session Recording Replay ──
 let sessionRecPlayer = null;

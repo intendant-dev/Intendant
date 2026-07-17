@@ -393,3 +393,19 @@ function sessionForkSetStatus(statusEl, text, tone) {
   statusEl.textContent = text;
   statusEl.dataset.tone = tone || '';
 }
+
+// QA readback (window.qa convention): the inline-affordance join state
+// for the open session, as counted from the live DOM + the module index.
+window.qa = Object.assign(window.qa || {}, {
+  sessionForkInlineState: (sessionId) => {
+    const idx = sessionId ? _sessionForkInlineIndexes.get(sessionId) : null;
+    return {
+      indexed: idx ? idx.byRow.size : 0,
+      source: idx ? idx.source : null,
+      buttons: document.querySelectorAll('.log-fork-entry').length,
+      offChainRows: document.querySelectorAll('.off-chain-branch').length,
+      branchChips: document.querySelectorAll('.log-branch-chip').length,
+      panelPoints: document.querySelectorAll('.sd-fork-points .sd-fork-point').length,
+    };
+  },
+});
