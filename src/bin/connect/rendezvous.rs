@@ -103,8 +103,9 @@ pub(crate) async fn api_claim_start(
                     now_unix_ms(),
                 )
             },
-            |next| persist_locked(&state, next),
-        )?;
+            async |next| persist_locked(&state, next).await,
+        )
+        .await?;
     }
     state.pending_claims.lock().await.insert(
         claim_id.clone(),
@@ -704,7 +705,10 @@ pub(crate) async fn daemon_register(
     let registration = {
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
-        let durable_change = std::cell::Cell::new(true);
+        // AtomicBool, not Cell: the persist closure below is async and its
+        // borrow lives across `persist_locked`'s await, and `&Cell` is
+        // !Send (it would un-Send the whole handler future).
+        let durable_change = std::sync::atomic::AtomicBool::new(true);
         let registration = update_store_transaction(
             &mut store,
             |next| {
@@ -729,7 +733,7 @@ pub(crate) async fn daemon_register(
                         }
                     }
                 }
-                durable_change.set(outcome.durable_change);
+                durable_change.store(outcome.durable_change, std::sync::atomic::Ordering::Relaxed);
                 Ok(outcome)
             },
             // Everything with a security effect — including the proof
@@ -737,14 +741,15 @@ pub(crate) async fn daemon_register(
             // minted below — persists before publication, exactly as
             // before. Only proof-less presence refreshes (operator probes)
             // skip the fsync and ride the debounced flusher.
-            |next| {
-                if durable_change.get() {
-                    persist_locked(&state, next)
+            async |next| {
+                if durable_change.load(std::sync::atomic::Ordering::Relaxed) {
+                    persist_locked(&state, next).await
                 } else {
                     Ok(())
                 }
             },
-        )?;
+        )
+        .await?;
         if !registration.durable_change {
             mark_store_dirty(&state);
         }
@@ -1243,7 +1248,7 @@ pub(crate) async fn daemon_answer(
             Some(pending.daemon_id),
             json!({ "request_id": body.request_id, "session_id": answer_session_id }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(json!({ "ok": true })))
 }
@@ -1415,7 +1420,7 @@ pub(crate) async fn daemon_dry(
         store
             .push_subscriptions
             .retain(|record| !dead.contains(&record.endpoint));
-        let _ = persist_locked(&state, &store);
+        let _ = persist_locked(&state, &store).await;
     }
     Ok(Json(json!({ "ok": true, "notified": notified })))
 }
@@ -1587,8 +1592,9 @@ pub(crate) async fn daemon_claim_proof(
                     now,
                 )
             },
-            |next| persist_locked(&state, next),
-        )?;
+            async |next| persist_locked(&state, next).await,
+        )
+        .await?;
         // Publish approval only after the linked Store (including audit and
         // transparency leaves) is durable. A failed write leaves both live
         // Store and pending claim unchanged, so the exact proof can retry.
@@ -1826,8 +1832,9 @@ pub(crate) async fn daemon_unclaim(
                 }
                 Ok(snapshot_owner.is_some())
             },
-            |next| persist_locked(&state, next),
-        )?
+            async |next| persist_locked(&state, next).await,
+        )
+        .await?
     };
     if !changed {
         return Ok(Json(json!({ "ok": true, "changed": false })));
@@ -2075,7 +2082,7 @@ pub(crate) async fn dns_publish(
             Some(daemon_id.clone()),
             json!({ "name": name, "addresses": addresses.len() }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(Json(json!({
         "ok": true,
@@ -2518,8 +2525,8 @@ mod tests {
         assert!(state.rate_limits.lock().await.scopes.is_empty());
     }
 
-    #[test]
-    fn route_release_transaction_keeps_memory_retryable_after_persist_failure() {
+    #[tokio::test]
+    async fn route_release_transaction_keeps_memory_retryable_after_persist_failure() {
         let owner = Uuid::new_v4();
         let mut store = Store::default();
         store.daemons.push(daemon_record(
@@ -2537,8 +2544,9 @@ mod tests {
                 daemon.route_link_revision += 1;
                 Ok(())
             },
-            |_| Err(ApiError::internal("forced persist failure")),
-        );
+            async |_| Err(ApiError::internal("forced persist failure")),
+        )
+        .await;
         assert!(failed.is_err());
         assert_eq!(store.daemons[0].owner_user_id, Some(owner));
         assert_eq!(store.daemons[0].route_link_revision, 0);
@@ -2551,15 +2559,16 @@ mod tests {
                 daemon.route_link_revision += 1;
                 Ok(())
             },
-            |_| Ok(()),
+            async |_| Ok(()),
         )
+        .await
         .unwrap();
         assert_eq!(store.daemons[0].owner_user_id, None);
         assert_eq!(store.daemons[0].route_link_revision, 1);
     }
 
-    #[test]
-    fn registration_persist_failure_does_not_consume_proof_or_route_code() {
+    #[tokio::test]
+    async fn registration_persist_failure_does_not_consume_proof_or_route_code() {
         let mut store = Store::default();
         let claim_hash = "A".repeat(43);
         let failed = update_store_transaction(
@@ -2574,8 +2583,9 @@ mod tests {
                     1_700_000_000_100,
                 )
             },
-            |_| Err(ApiError::internal("forced persist failure")),
-        );
+            async |_| Err(ApiError::internal("forced persist failure")),
+        )
+        .await;
         assert!(failed.is_err());
         assert!(store.daemons.is_empty());
 
@@ -2591,8 +2601,9 @@ mod tests {
                     1_700_000_000_100,
                 )
             },
-            |_| Ok(()),
+            async |_| Ok(()),
         )
+        .await
         .unwrap();
         assert!(!retried.claimed);
         assert_eq!(store.daemons.len(), 1);
@@ -2842,8 +2853,8 @@ mod tests {
         assert_eq!(store.daemons.len(), MAX_UNCLAIMED_DAEMONS);
     }
 
-    #[test]
-    fn claim_start_persist_failure_publishes_no_durable_start_and_retries_exactly() {
+    #[tokio::test]
+    async fn claim_start_persist_failure_publishes_no_durable_start_and_retries_exactly() {
         let code = "abandon-ability-able-about-above-absent-absorb";
         let daemon = daemon_record("daemon-1", None, Some(code), Some(42));
         let hash = daemon.claim_code_hash.clone().unwrap();
@@ -2854,8 +2865,9 @@ mod tests {
         let failed = update_store_transaction(
             &mut store,
             |next| apply_claim_start_audit(next, "daemon-1", &hash, 42, user_id, "claim-1", 43),
-            |_| Err(ApiError::internal("forced persist failure")),
-        );
+            async |_| Err(ApiError::internal("forced persist failure")),
+        )
+        .await;
         assert!(failed.is_err());
         assert!(store.audit.is_empty());
         assert_eq!(
@@ -2866,8 +2878,9 @@ mod tests {
         update_store_transaction(
             &mut store,
             |next| apply_claim_start_audit(next, "daemon-1", &hash, 42, user_id, "claim-1", 43),
-            |_| Ok(()),
+            async |_| Ok(()),
         )
+        .await
         .unwrap();
         assert_eq!(store.audit.len(), 1);
         assert_eq!(store.audit[0].event, "daemon_claim_started");
@@ -2877,8 +2890,8 @@ mod tests {
         assert_eq!(store.audit[0].detail["authority"], "none");
     }
 
-    #[test]
-    fn claim_persist_failure_keeps_store_and_pending_status_retryable() {
+    #[tokio::test]
+    async fn claim_persist_failure_keeps_store_and_pending_status_retryable() {
         let code = "abandon-ability-able-about-above-absent-absorb";
         let daemon = daemon_record("daemon-1", None, Some(code), Some(42));
         let claim = pending_claim_for(&daemon);
@@ -2910,8 +2923,9 @@ mod tests {
                     100,
                 )
             },
-            |_| Err(ApiError::internal("forced persist failure")),
-        );
+            async |_| Err(ApiError::internal("forced persist failure")),
+        )
+        .await;
         assert!(failed.is_err());
         assert!(matches!(status, ClaimStatus::Pending));
         assert_eq!(store.daemons[0].owner_user_id, None);
@@ -2935,8 +2949,9 @@ mod tests {
                     100,
                 )
             },
-            |_| Ok(()),
+            async |_| Ok(()),
         )
+        .await
         .unwrap();
         status = ClaimStatus::Approved {
             daemon_id: "daemon-1".to_string(),

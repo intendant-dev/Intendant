@@ -1045,7 +1045,7 @@ pub(crate) async fn release_manifest_submit(
         ReleaseRecordOutcome::Duplicate { index } => (false, index),
     };
     if logged {
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
         eprintln!(
             "[connect] release manifest logged: {} ({} artifacts, {})",
             manifest.tag,
@@ -1278,7 +1278,7 @@ pub(crate) async fn orl_publish(
             "org_orl_published",
             json!({ "handle": handle, "root_key": root_key, "seq": seq }),
         );
-        persist_locked(&state, &store)?;
+        persist_locked(&state, &store).await?;
     }
     Ok(orl_cors(
         Json(json!({ "ok": true, "stored": stored, "seq": seq })).into_response(),
