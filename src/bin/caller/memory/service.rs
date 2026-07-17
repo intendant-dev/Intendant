@@ -274,7 +274,7 @@ impl MemoryService {
             labels: rec.labels.clone(),
             created_ms: rec.created_ms,
             proposed_by: rec.proposed_by.clone(),
-            durability: "ephemeral",
+            durability: "ephemeral".into(),
         }
     }
 
@@ -591,6 +591,41 @@ mod tests {
             svc.plane.held_ops(),
             held_before,
             "a denied write must never reach the kernel"
+        );
+    }
+
+    /// The Memory Explorer's kind/sensitivity selects are an unavoidable
+    /// static mirror of the kernel's closed vocabularies (the SPA can't
+    /// import `Kind::ALL`), so per the derive-don't-mirror convention a
+    /// daemon-side parity test pins the option values to the source —
+    /// a vocabulary change that forgets the fragment fails here instead
+    /// of shipping as drift.
+    #[test]
+    fn explorer_vocab_selects_mirror_the_kernel() {
+        let app = include_str!("../../../../static/app.html");
+        let options = |select_id: &str| -> Vec<String> {
+            let start = app
+                .find(&format!("<select id=\"{select_id}\""))
+                .unwrap_or_else(|| panic!("{select_id} select not found in static/app.html"));
+            let block = &app[start..start + app[start..].find("</select>").unwrap()];
+            block
+                .match_indices("value=\"")
+                .map(|(at, _)| {
+                    let rest = &block[at + "value=\"".len()..];
+                    rest[..rest.find('"').unwrap()].to_string()
+                })
+                .collect()
+        };
+        let kernel = |all: &[&str]| all.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            options("memory-add-kind"),
+            kernel(&Kind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>()),
+            "memory-add-kind options drifted from Kind::ALL"
+        );
+        assert_eq!(
+            options("memory-add-sensitivity"),
+            kernel(&Class::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>()),
+            "memory-add-sensitivity options drifted from Class::ALL"
         );
     }
 }

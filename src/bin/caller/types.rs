@@ -1084,6 +1084,11 @@ pub enum OutboundEvent {
         item: crate::agenda::AgendaItem,
         counts: crate::agenda::AgendaCounts,
     },
+    /// The Memory plane admitted a claim; frontends refresh their
+    /// memory views. The view is quoted data, never instructions.
+    MemoryChanged {
+        claim: crate::memory::ClaimView,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.
