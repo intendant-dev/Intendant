@@ -2609,10 +2609,13 @@ async fn ctl_peer_list_and_task_drive_a_federated_peer_daemon() {
     // And the receipt leaves a durable trace on A's federated peer-event
     // record (`peers.jsonl`, the forensics rail dump_daemons reads). The
     // actor writes it via the async log sink, so it may trail the ctl
-    // response by a beat — poll briefly.
+    // response — on a loaded CI box by far more than a beat (a 30s
+    // deadline here ejected two otherwise-green merge-queue entries on
+    // 2026-07-16). PEER_WAIT_TIMEOUT like the test's other cross-daemon
+    // waits: the deadline only bounds failing runs, never green ones.
     poll_until(
         "the task_receipt landing in daemon A's peers.jsonl",
-        Duration::from_secs(30),
+        PEER_WAIT_TIMEOUT,
         || {
             let tail = a.peer_log_tail();
             let delegation_id = delegation_id.clone();
