@@ -2306,12 +2306,14 @@ function materializeSessionDetailRow(view, row, index) {
     });
     if (!outputEntry) return null;
     outputEntry.dataset.detailRowIndex = String(index);
+    if (e.off_active_chain === true) outputEntry.classList.add('off-chain-branch');
     return outputEntry;
   }
   if (isReasoningLog(e)) {
     const reasoningEntry = buildReasoningLogEntryNode(e);
     if (reasoningEntry) {
       reasoningEntry.dataset.detailRowIndex = String(index);
+      if (e.off_active_chain === true) reasoningEntry.classList.add('off-chain-branch');
       return reasoningEntry;
     }
   }
@@ -2333,6 +2335,9 @@ function materializeSessionDetailRow(view, row, index) {
     entry.classList.add('superseded');
     entry.dataset.superseded = 'true';
   }
+  // Abandoned claude-code branch rows (sibling chains the active chain
+  // left behind) — visually parked, still forkable at their tips.
+  if (e.off_active_chain === true) entry.classList.add('off-chain-branch');
 
   const ts = document.createElement('span');
   ts.className = 'log-ts';
@@ -2392,6 +2397,7 @@ function materializeSessionDetailRow(view, row, index) {
   entry.appendChild(lvl);
   entry.appendChild(cnt);
   appendEditUserMessageButton(entry, e);
+  appendSessionForkRowAffordance(entry, e, view);
 
   if (e.content.split('\n').length > 3 || e.content.length > 300) {
     const expanded = view.expandedRows.has(index);
@@ -2406,7 +2412,7 @@ function materializeSessionDetailRow(view, row, index) {
     toggle.querySelector('.arrow-up').style.display = expanded ? '' : 'none';
     entry.appendChild(toggle);
     entry.addEventListener('click', (event) => {
-      if (event.target?.closest?.('.log-edit-message')) return;
+      if (event.target?.closest?.('.log-edit-message, .log-fork-entry, .log-fork-form-host')) return;
       const nextExpanded = cnt.style.maxHeight !== 'none';
       cnt.style.maxHeight = nextExpanded ? 'none' : '1.5em';
       cnt.style.overflow = nextExpanded ? 'visible' : 'hidden';
